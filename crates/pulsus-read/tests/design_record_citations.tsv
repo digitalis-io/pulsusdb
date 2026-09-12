@@ -48,9 +48,9 @@ docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:3302	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:3336	crates/pulsus-read/src/logql/plan.rs	3336		line	/// The gap this closes is narrow and was measured, not reasoned: in a
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:80	crates/pulsus-read/src/logql/plan.rs	80		prose	fetch_until_limit
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	crates/pulsus-read/src/logql/post_agg.rs	3307	3350	line	fn merge_matrix_collisions( items: Vec<MatrixSeries>, l: &Ledger<'_>, ) -> Result<Vec<MatrixSeries>, ReadError> { // Ent
-docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:410	crates/pulsus-read/src/logql/sql.rs	410		line	}
-docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:447	crates/pulsus-read/src/logql/sql.rs	447		line	};
-docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:789	crates/pulsus-read/src/logql/sql.rs	789		line	///
+docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:419	crates/pulsus-read/src/logql/sql.rs	419		line	}
+docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:456	crates/pulsus-read/src/logql/sql.rs	456		line	};
+docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:798	crates/pulsus-read/src/logql/sql.rs	798		line	///
 docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:274	crates/pulsus-read/src/metrics/labels.rs	274		line	let re = pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(&m.value))
 docs/query-lowering.md	crates/pulsus-read/src/metrics/re2_authority.rs:89	crates/pulsus-read/src/metrics/re2_authority.rs	89		line	let rewritten = re2_pattern_to_rust(&m.value);
 docs/query-lowering.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		prose	MAX_QUERY_TEXT_BYTES
@@ -127,7 +127,6 @@ docs/query-lowering.md	search_plan.rs:961-1040	crates/pulsus-read/src/traces/sea
 docs/query-lowering.md	search_response.rs:504	crates/pulsus-server/src/traces_api/search_response.rs	504		line	// one-entry list and is served by `group_json` above, so the
 docs/query-lowering.md	search_sql.rs:325	crates/pulsus-read/src/traces/search_sql.rs	325		prose	attr_values_sql
 docs/query-lowering.md	search_sql.rs:345	crates/pulsus-read/src/traces/search_sql.rs	345		line	None => String::new(),
-docs/query-lowering.md	sql.rs:489	crates/pulsus-read/src/metrics/sql.rs	489		prose	fingerprint
 docs/query-lowering.md	traces/compile.rs:169	crates/pulsus-read/src/traces/compile.rs	169		prose	Hydrate
 docs/query-lowering.md	traces/compile.rs:1745	crates/pulsus-read/src/traces/compile.rs	1745		line	fn evaluator_owned(mut rel: Relation<Tql>, name: &str) -> Relation<Tql> {
 docs/query-lowering.md	traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		prose	ReadError::QueryTooBroad(_)
@@ -162,7 +161,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:157-189	crates/pulsu
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:363	crates/pulsus-read/src/logql/labels.rs	363		prose	structured_metadata
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		prose	DURATION_UNITS
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6099	crates/pulsus-read/src/logql/pipeline.rs	6099		line	serde_json::Value::Number(n) => n.to_string(),
-docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:653	crates/pulsus-read/src/logql/sql.rs	653		line	/// `" OR "`-joins a fragment list — the one place [`stage1`]'s `HAVING`
+docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:662	crates/pulsus-read/src/logql/sql.rs	662		line	/// `" OR "`-joins a fragment list — the one place [`stage1`]'s `HAVING`
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2869	crates/pulsus-read/src/traces/exec.rs	2869		prose	generator_settings
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1083	crates/pulsus-read/src/traces/search_plan.rs	1083		line	Ok(parts.join(" AND "))
@@ -261,14 +260,16 @@ docs/query-to-sql.md	search_sql.rs:385	crates/pulsus-read/src/traces/search_sql.
 docs/query-to-sql.md	search_sql.rs:401-408	crates/pulsus-read/src/traces/search_sql.rs	401	408	line	window: TimeWindow, ) -> String { let (value_col, extra) = if set.is_numeric() { ("val_num AS v".to_string(), "\n AND is
 docs/query-to-sql.md	search_sql.rs:409	crates/pulsus-read/src/traces/search_sql.rs	409		line	"SELECT trace_id, span_id, {value_col}\n\
 docs/query-to-sql.md	sql.rs:105	crates/pulsus-read/src/logql/sql.rs	105		prose	sum
-docs/query-to-sql.md	sql.rs:1066-1072	crates/pulsus-read/src/logql/sql.rs	1066	1072	prose	structured_metadata
 docs/query-to-sql.md	sql.rs:107	crates/pulsus-read/src/logql/sql.rs	107		prose	sum(bytes)
+docs/query-to-sql.md	sql.rs:1075-1081	crates/pulsus-read/src/logql/sql.rs	1075	1081	prose	structured_metadata
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	count()
 docs/query-to-sql.md	sql.rs:111	crates/pulsus-read/src/logql/sql.rs	111		prose	sum(length(body))
 docs/query-to-sql.md	sql.rs:1130-1153	crates/pulsus-read/src/metrics/sql.rs	1130	1153	prose	LIMIT
+docs/query-to-sql.md	sql.rs:404	crates/pulsus-read/src/logql/sql.rs	404		prose	count()
 docs/query-to-sql.md	sql.rs:489	crates/pulsus-read/src/metrics/sql.rs	489		prose	SELECT
-docs/query-to-sql.md	sql.rs:684	crates/pulsus-read/src/logql/sql.rs	684		prose	ORDER
-docs/query-to-sql.md	sql.rs:746	crates/pulsus-read/src/logql/sql.rs	746		prose	stage3_keyset
+docs/query-to-sql.md	sql.rs:693	crates/pulsus-read/src/logql/sql.rs	693		prose	ORDER
+docs/query-to-sql.md	sql.rs:755	crates/pulsus-read/src/logql/sql.rs	755		prose	stage3_keyset
+docs/query-to-sql.md	sql.rs:970	crates/pulsus-read/src/logql/sql.rs	970		prose	log_samples
 docs/query-to-sql.md	sql.rs:996	crates/pulsus-read/src/metrics/sql.rs	996		prose	SELECT
 docs/query-to-sql.md	traces/exec.rs:119	crates/pulsus-read/src/traces/exec.rs	119		line	/// Per-trace hydration span cap; the `+1` probe detects overflow, which
 docs/query-to-sql.md	traces/exec.rs:144	crates/pulsus-read/src/traces/exec.rs	144		line	/// (and merge tuples / root summaries) survive the per-batch charge

@@ -166,7 +166,7 @@ pub use exec::{
     StreamResult, StreamsFastPathProbe, StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
     WireArity, bucketed_fallback_client_agg, final_series_gate_applies, read_query_settings,
-    run_pipeline_rows,
+    run_pipeline_rows, unwrapped_fallback_client_agg,
 };
 pub use explain::{ExplainStage, PlanExplain};
 /// The structured-metadata context [`pipeline::CompiledPipeline::run_into_with_sm`]

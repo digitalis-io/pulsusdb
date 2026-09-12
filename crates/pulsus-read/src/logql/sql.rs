@@ -288,11 +288,11 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
 /// over-rejection, and a fallback rather than a wrong answer.
 ///
 /// **Class C is NOT accepted after all**, and the correction is recorded
-/// where the reading was made: see [`UNWRAP_TEXT_HAS_AN_EXPONENT`].
+/// where the reading was made: see [`UNWRAP_TEXT_DENOTES_NON_ZERO`].
 const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
 
-/// **The exponent forms that convert to zero** — the second half of the
-/// underflow closure (issue #507, W4, review round 1).
+/// **A text that denotes a non-zero number** — the second half of the
+/// underflow closure (issue #507, W4, review rounds 1 and 2).
 ///
 /// `toFloat64OrNull` returns `0` for a value whose exponent underflows,
 /// where our own parser keeps a subnormal. Measured on 26.3.29.7 against
@@ -312,12 +312,21 @@ const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
 /// difference already accepted, holds only for a corpus where the value is
 /// not the sum.
 ///
-/// **It tests one fact about the TEXT and one about the VALUE, and neither
-/// is a float grammar:** the value converted to zero, and the text carrying
-/// an exponent. A zero written as a zero — `0`, `0.0`, `-0` — has no
-/// exponent and still lowers, which is the common case this must not cost.
-/// A zero written with an exponent falls back whether or not it underflowed.
-const UNWRAP_TEXT_HAS_AN_EXPONENT: &str = "[eE]";
+/// **The condition is UNDERFLOW, and this expresses it rather than its
+/// spellings.** Round 1 tested for an exponent, which is a rule about how
+/// a number is written: the 326-character fixed-point spelling of
+/// `5e-324` carries no `e`, converts to database zero, and parses to bits
+/// `0x1` in Rust — so it passed a guard built for exactly that case.
+///
+/// What holds for every notation: **a decimal literal denotes zero if and
+/// only if none of its digits is non-zero.** So a conversion to zero from
+/// a text containing a non-zero digit is an underflow, whatever the
+/// notation, and a zero written as a zero — `0`, `0.0`, `-0`, `+0.000` —
+/// is not. That is one character class and one fact, not a parse.
+///
+/// The over-rejections are texts that denote zero but carry a non-zero
+/// digit somewhere, `"0e5"` being the shape of them; those fall back.
+const UNWRAP_TEXT_DENOTES_NON_ZERO: &str = "[1-9]";
 
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
@@ -1346,13 +1355,13 @@ pub fn metric_range_unwrapped(
     let key = name.as_sql();
     let prefix = unwrap_prefix_literal();
     let prefix = prefix.as_sql();
-    let exponent = super::predicate::literal(UNWRAP_TEXT_HAS_AN_EXPONENT);
-    let exponent = exponent.as_sql();
+    let non_zero = super::predicate::literal(UNWRAP_TEXT_DENOTES_NON_ZERO);
+    let non_zero = non_zero.as_sql();
     let t = format!("trim(BOTH '\"' FROM JSONExtractRaw(body, {key}))");
     let raw = format!("toFloat64OrNull({t})");
     let q = format!(
         "(match({t}, {prefix}) AND isNotNull({raw}) AND isFinite({raw}) AND abs({raw}) != \
-         {UNWRAP_OVERFLOW_CUTOFF} AND ({raw} != 0 OR NOT match({t}, {exponent})))"
+         {UNWRAP_OVERFLOW_CUTOFF} AND ({raw} != 0 OR NOT match({t}, {non_zero})))"
     );
     let f = reducer.function();
     let mut sql = format!(
@@ -3112,7 +3121,7 @@ mod tests {
         let raw = format!("toFloat64OrNull({t})");
         let q = format!(
             "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND isFinite({raw}) \
-             AND abs({raw}) != 1.7976931348623157e308 AND ({raw} != 0 OR NOT match({t}, '[eE]')))"
+             AND abs({raw}) != 1.7976931348623157e308 AND ({raw} != 0 OR NOT match({t}, '[1-9]')))"
         );
         let expected = format!(
             "SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - \

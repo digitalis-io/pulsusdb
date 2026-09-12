@@ -177,7 +177,8 @@ eval instant at 60s sum_over_time({service_name="sum_single"} | logfmt | unwrap 
 
 clear
 
-# THE TOLERANCE VERB, on a sum that is not exactly representable.
+# THE TOLERANCE VERB, on a query that LOWERS and a sum that is not
+# exactly representable.
 #
 # `0.1 + 0.2 + 0.3` accumulated left to right in timestamp order — the
 # order the reference accumulates in — is `0.6000000000000001`, and a
@@ -186,19 +187,25 @@ clear
 # so an entry over one of them is written with the tolerance the bound
 # gives: `2(n-1)*u*sum|v|` = `2*2*2^-53*0.6`, which is `2.66e-16`.
 #
+# THE CHAIN AND THE WINDOW ARE BOTH PART OF IT. `eval_approx` is refused
+# at parse time unless the PLANNER lowers this query at this window, so
+# the entry is a `range` eval whose range equals its step, over a targeted
+# `| json` extraction and an unconverted `| unwrap` — the one shape whose
+# aggregation moves to the database. A `| logfmt` chain, an instant
+# window, or a step that is not the range is refused, because none of them
+# has a summation order to excuse the tolerance.
+#
 # The value is DERIVED rather than captured: it is IEEE-754 addition in a
-# stated order, not a figure read off a container. `eval_approx` is
-# refused at parse time on any reducer outside those four, so this verb
-# cannot spread to an entry that has no summation order to excuse it.
+# stated order, not a figure read off a container.
 load
   {env="prod", service_name="approx_sum"}
-  5s  v=0.1
-  10s  v=0.2
-  15s  v=0.3
+  5s  {"v":"0.1"}
+  10s  {"v":"0.2"}
+  15s  {"v":"0.3"}
 
 # provenance: derived
-eval_approx 2.7e-16 instant at 60s sum_over_time({service_name="approx_sum"} | logfmt | unwrap v [1m])
-  {env="prod", service_name="approx_sum"} 0.6000000000000001
+eval_approx 2.7e-16 range from 60s to 60s step 1m sum_over_time({service_name="approx_sum"} | json v="v" | unwrap v [1m])
+  {env="prod", service_name="approx_sum"} 60s 0.6000000000000001
 
 clear
 

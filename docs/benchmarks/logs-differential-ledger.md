@@ -6419,9 +6419,21 @@ gated by
     both constant within their condition. The part layout decides it too —
     the same rows in 1, 2 and 8 parts give three different answers.
   - `avg_over_time` additionally uses a different accumulation from the
-    reference's incremental mean, so it differs in the last bits **even on
-    a single thread**. Its row has two causes and pinning the thread count
-    removes neither.
+    reference's incremental mean — a sum divided by a count — so it
+    differs **even on a single thread**. Its row has two causes and
+    pinning the thread count removes neither.
+
+    **Not "in the last bits", and the earlier wording here said so
+    wrongly.** The two are different algorithms over the same values, so
+    their difference is bounded by the same `2(n−1)·u·Σ|vᵢ|` as the sums
+    and not by one unit in the last place. And the database's sum can
+    reach a magnitude the incremental mean never does: two samples of
+    `1e308` average to `inf` there and to `1e308` here. **That case is
+    refused rather than answered** — a non-finite aggregate sends the
+    whole query to the client path (`exec.rs`'s `PushdownUnwrappedGroups`)
+    — so the divergence that remains is inside the bound above, but the
+    row is written this way because a recorded divergence that understates
+    its own size is worse than none.
 - **The bound.** Two answers differ by at most `2(n−1)·u·Σ|vᵢ|` with
   `u = 2⁻⁵³`. Measured against it: 1, 8 and 31 ULPs at `n` = 1e3, 1e5,
   1e6, against derived bounds of 3.29e-5, 2.90e-1 and 2.86e+1.

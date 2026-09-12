@@ -4939,6 +4939,24 @@ impl<'a> PushdownUnwrappedGroups<'a> {
         &mut self,
         row: &MetricRangeUnwrappedRow,
     ) -> Result<(), ReadError> {
+        // **A non-finite aggregate falls back**, and `avg` is why (review
+        // round 2). The database computes an average as a sum divided by
+        // a count, so two samples of `1e308` overflow the sum and answer
+        // `inf` where the evaluator's INCREMENTAL mean answers `1e308` —
+        // a finite number turned into infinity, which no tolerance
+        // covers. The check is on the RESULT rather than on the reducer
+        // because an overflow is absorbing: once a partial sum reaches
+        // `inf` it stays `inf` or becomes `NaN`, so any aggregate that
+        // overflowed anywhere arrives non-finite here. A genuinely
+        // infinite answer falls back too, and the client path then
+        // computes the same infinity a statement slower.
+        if !row.v.is_finite() {
+            self.fall_back = Some(
+                "the database's aggregate is not finite, which a sum over finite samples can \
+                 be where the evaluator's incremental form is not",
+            );
+            return Ok(());
+        }
         if row.all_numeric == 0 {
             self.fall_back = Some(
                 "a row's unwrapped value is absent, null, or does not parse, and the statement \

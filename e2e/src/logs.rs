@@ -4555,7 +4555,18 @@ mod tests {
         let client = match mp.client.as_ref() {
             Some(client) => client,
             None => {
-                fallback = pulsus_read::logql::bucketed_fallback_client_agg(mp);
+                // Which fallback depends on what the plan lowers: an
+                // unwrapped plan is not equivalent to an empty pipeline,
+                // and taking the counting one for it answers the sample
+                // count (review round 2).
+                fallback = match &mp.value {
+                    pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
+                        pulsus_read::logql::unwrapped_fallback_client_agg(mp, &u.label)
+                    }
+                    pulsus_read::logql::sql::MetricValue::Shaped(_) => {
+                        pulsus_read::logql::bucketed_fallback_client_agg(mp)
+                    }
+                };
                 &fallback
             }
         };

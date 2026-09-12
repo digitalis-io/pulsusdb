@@ -72,7 +72,7 @@ use pulsus_read::logql::{
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, Warnings,
     apply_label_replace, apply_vector_aggs, bucketed_fallback_client_agg, combine_binary,
     ensure_result_series, final_series_gate_applies, materialize_vector_lit, plan,
-    run_client_agg_rows_folded, run_variants_rows,
+    run_client_agg_rows_folded, run_variants_rows, unwrapped_fallback_client_agg,
 };
 
 /// A sorted label set.
@@ -670,63 +670,55 @@ fn strip_eval_prefix(directive: &str) -> Option<(EvalMode, &str)> {
     }
 }
 
-/// The five reducers `eval_approx` is admitted for (issue #507 W4 §1):
-/// the ones whose aggregate the database accumulates in an order it
-/// chooses, so two runs may differ in the last bits.
+/// **`eval_approx` is admitted only for a query the DATABASE aggregates**
+/// (issue #507 W4, review round 2).
 ///
-/// **Every other query is refused at parse time**, with the reducer named.
-/// A tolerance that can be written on any entry is a tolerance that gets
-/// reached for when an unrelated comparison fails; this is the control
-/// that stops that, and it is mechanical rather than a convention.
+/// Round 1 checked the reducer name, which is not the condition: a
+/// `| logfmt | unwrap` chain names one of the four and is evaluated here,
+/// in one order, exactly. The condition is whether the planner lowers the
+/// aggregation, and the only thing that knows is the planner — so this
+/// PLANS the entry's own query at the entry's own window and requires
+/// `MetricValue::Unwrapped`.
 ///
-/// A query with no range aggregation at all — a log selector, a scalar, a
-/// `vector(...)` — is refused for the same reason: there is no summation
-/// whose order the database chooses.
-fn approx_reducer_is_eligible(query: &str) -> Result<(), String> {
-    use pulsus_logql::{Expr, MeNode, MetricExpr, MetricScc, RangeAggOp, walk};
+/// **Asking the planner rather than restating it** is what stops this
+/// drifting from `plan.rs`'s `unwrapped_chain`: the parser, the
+/// conversion, the underscore rule, the range-equals-step rule and the
+/// reducer set are all one answer here, and a change to any of them moves
+/// this check with it.
+///
+/// A tolerance that could be written on any entry would be reached for
+/// whenever an unrelated comparison failed. The refusal names what it saw.
+fn approx_query_lowers(query: &str, spec: QuerySpec) -> Result<(), String> {
+    use pulsus_read::logql::sql::MetricValue;
     let expr = pulsus_logql::parse(query).map_err(|e| format!("eval_approx: {e}"))?;
-    let Expr::Metric(m) = &expr else {
-        return Err(
-            "eval_approx applies to a range aggregation; this query is a log selector".to_string(),
-        );
+    let params = QueryParams {
+        spec,
+        limit: 100,
+        direction: Direction::Backward,
     };
-    // The crate's own walk, not a hand-rolled stack: `Child` is opaque by
-    // construction and opening one needs a walk token, which is what stops
-    // a second traversal drifting from the one the planner uses.
-    let mut ops: Vec<RangeAggOp> = Vec::new();
-    walk::preorder::<MetricScc>(MeNode::Expr(m), |node| {
-        if let MeNode::Expr(MetricExpr::Range { op, .. }) = node {
-            ops.push(*op);
-        }
-    });
-    if ops.is_empty() {
-        return Err("eval_approx applies to a range aggregation; this query has none".to_string());
+    let planned = plan(&expr, &params, &ctx()).map_err(|e| format!("eval_approx: {e}"))?;
+    let leaves: Vec<&MetricPlan> = match &planned {
+        Plan::Metric(mp) => vec![mp],
+        Plan::MetricBinary(node) => node.leaves(),
+        Plan::Streams(_) => Vec::new(),
+    };
+    if leaves.is_empty() {
+        return Err(
+            "eval_approx applies to a range aggregation the database can compute; this query \
+             has none"
+                .to_string(),
+        );
     }
-    let ineligible: Vec<String> = ops
+    let client_side: Vec<String> = leaves
         .iter()
-        .filter(|op| {
-            // The FOUR the database aggregates, which is the set
-            // `sql::UnwrapReducer` has variants for. `rate_counter` was in
-            // an earlier reading of the scope and is not one of them — it
-            // never lowers, so a tolerance on it could only hide a
-            // mismatch on a path that already answers exactly (review
-            // round 1, finding 4).
-            !matches!(
-                **op,
-                RangeAggOp::SumOverTime
-                    | RangeAggOp::AvgOverTime
-                    | RangeAggOp::StddevOverTime
-                    | RangeAggOp::StdvarOverTime
-            )
-        })
-        .map(|op| op.to_string())
+        .filter(|mp| !matches!(mp.value, MetricValue::Unwrapped(_)))
+        .map(|mp| format!("{} ({})", mp.op, mp.routing.reason))
         .collect();
-    if !ineligible.is_empty() {
+    if !client_side.is_empty() {
         return Err(format!(
-            "eval_approx is admitted only for the four reducers the database aggregates, and so \
-             accumulates in an order it chooses (sum_over_time, avg_over_time, \
-             stddev_over_time, stdvar_over_time); this query uses {}",
-            ineligible.join(", ")
+            "eval_approx is admitted only where the aggregation moves to the database, so its \
+             summation order is the database's; this query is evaluated here instead: {}",
+            client_side.join(", ")
         ));
     }
     Ok(())
@@ -990,11 +982,20 @@ fn parse_eval(
     }
 
     // The control that stops the tolerance being reached for: it is
-    // admitted only where the database chooses the summation order.
-    if mode == EvalMode::Approx
-        && let Err(e) = approx_reducer_is_eligible(&query)
-    {
-        return Err(fmt_err(file, directive_idx, e));
+    // admitted only where the database chooses the summation order, which
+    // is the PLANNER's answer over this entry's own window.
+    if mode == EvalMode::Approx {
+        let spec = match range {
+            Some(r) => QuerySpec::Range {
+                start_ns: r.start_ns,
+                end_ns: r.end_ns,
+                step_ns: r.step_ns,
+            },
+            None => QuerySpec::Instant { at_ns },
+        };
+        if let Err(e) = approx_query_lowers(&query, spec) {
+            return Err(fmt_err(file, directive_idx, e));
+        }
     }
     if mode == EvalMode::Fail && fail_msg.is_none() {
         return Err(fmt_err(
@@ -1328,7 +1329,19 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     let client = match mp.client.as_ref() {
         Some(client) => client,
         None => {
-            fallback = bucketed_fallback_client_agg(mp);
+            // **Which fallback depends on what the plan lowers.** A
+            // counting plan is equivalent to an empty pipeline; an
+            // unwrapped one is not, and taking the counting fallback for
+            // it answers the SAMPLE COUNT instead of the aggregate —
+            // measured at three where the answer is `0.6000000000000001`
+            // (review round 2, found by the first corpus entry that
+            // lowers).
+            fallback = match &mp.value {
+                pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
+                    unwrapped_fallback_client_agg(mp, &u.label)
+                }
+                pulsus_read::logql::sql::MetricValue::Shaped(_) => bucketed_fallback_client_agg(mp),
+            };
             &fallback
         }
     };

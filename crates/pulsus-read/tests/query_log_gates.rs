@@ -3455,6 +3455,9 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
 ///  under_exp   "9999999999999999e-324"     FALLS BACK   0 here, 0x000730d67819e8d2 in ours
 ///  shadowed    metadata latency=5, bodies 7 and 8       FALLS BACK   TWO series, keyed by the
 ///                                                       parsed value under latency_extracted
+///  fixed_sub   "0.000…0005", 326 chars     FALLS BACK   the same underflow, no exponent
+///  avg_over    two × 1e308, avg_over_time  FALLS BACK   inf here, 1e308 in ours — a FINITE
+///                                                       mean turned into infinity
 /// ```
 ///
 /// **Class C falls back now and did not before**, and the earlier reading
@@ -3512,38 +3515,102 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
     // Each class gets its own stream, so one class's fallback cannot
     // decide another's.
-    // `(name, fingerprint, values, metadata on every row, expect a fallback)`
-    let cases: [(&str, u64, &[&str], &str, bool); 8] = [
-        ("ordinary", 201, &["45.25", "\"2.25\"", "4"], "", false),
-        ("class_a", 202, &["1", "\"E12\""], "", true),
+    // The 326-character fixed-point spelling of `5e-324`: no exponent, so
+    // round 1's `[eE]` clause did not see it (review round 2).
+    let fixed_subnormal = format!("\"0.{}5\"", "0".repeat(323));
+    /// One case of the differential: its name and stream, the values every
+    /// row carries, the structured metadata on every row, the reducer, and
+    /// whether the lowered query is expected to fall back.
+    type UnwrapCase<'a> = (&'a str, u64, &'a [&'a str], &'a str, &'a str, bool);
+    let cases: [UnwrapCase<'_>; 10] = [
+        (
+            "ordinary",
+            201,
+            &["45.25", "\"2.25\"", "4"],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        ("class_a", 202, &["1", "\"E12\""], "", "sum_over_time", true),
         (
             "class_b",
             203,
             &["1", "\"1.7976931348623159e308\""],
             "",
+            "sum_over_time",
             true,
         ),
-        ("class_c", 204, &["1", "\"5e-324\""], "", true),
-        ("over_reject", 205, &["1", "\"inf\""], "", true),
+        (
+            "class_c",
+            204,
+            &["1", "\"5e-324\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        (
+            "over_reject",
+            205,
+            &["1", "\"inf\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
         // Review round 1: a digit with an exponent that overflows, and one
         // that underflows. Both pass the anchored prefix test, so the hole
         // was never in that test.
-        ("nan_exp", 206, &["1", "\"0e999999\""], "", true),
+        (
+            "nan_exp",
+            206,
+            &["1", "\"0e999999\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
         (
             "under_exp",
             207,
             &["1", "\"9999999999999999e-324\""],
             "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 2: the same underflow written WITHOUT an exponent,
+        // which is why the guard now asks what the text DENOTES.
+        (
+            "fixed_subnormal",
+            209,
+            &["1", fixed_subnormal.as_str()],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 2: two accepted samples whose SUM overflows where
+        // the reference's incremental mean does not — the database
+        // answers `inf`, the evaluator `1e308`.
+        (
+            "avg_overflow",
+            210,
+            &["1e308", "1e308"],
+            "",
+            "avg_over_time",
             true,
         ),
         // Review round 1: the metadata carries the unwrapped name, so the
         // evaluator keys its series by the PARSED value under
         // `latency_extracted` — two series here, which no group key the
         // statement has can express.
-        ("shadowed", 208, &["7", "8"], r#"{"latency":"5"}"#, true),
+        (
+            "shadowed",
+            208,
+            &["7", "8"],
+            r#"{"latency":"5"}"#,
+            "sum_over_time",
+            true,
+        ),
     ];
     let mut rows: Vec<BucketedSeedRow> = Vec::new();
-    for (name, fp, values, sm, _) in cases {
+    for (name, fp, values, sm, _, _) in cases {
         client
             .execute(
                 &format!(
@@ -3600,12 +3667,12 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     };
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
 
-    for (name, _fp, _values, _sm, expect_fallback) in cases {
+    for (name, _fp, _values, _sm, op, expect_fallback) in cases {
         let lowered_q = format!(
-            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
         );
         let client_q = format!(
-            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
         );
         // Two paths, asserted to BE two paths.
         let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
@@ -3806,12 +3873,17 @@ async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus(
     };
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
 
-    // `avg_over_time` is deliberately NOT here. It differs from the
-    // reference by one ULP on this corpus and on any other, because the
-    // reference computes an incremental mean and `avg` is a sum divided by
-    // a count — a documented divergence with its own ledger clause, and a
-    // different claim from the one this test makes. Measured on this
-    // fixture: `4846369599423283203` lowered against `…202` client-side.
+    // `avg_over_time` is deliberately NOT here, and the reason is narrower
+    // than an earlier version of this comment claimed. It differs from the
+    // reference because `avg` is a sum divided by a count and the
+    // reference computes an incremental mean — a documented divergence
+    // with its own ledger clause, and a different claim from the one this
+    // test makes. Measured on this fixture: `4846369599423283203` lowered
+    // against `…202` client-side, which is one ULP HERE and is not a
+    // bound: the two are different algorithms, and their difference is
+    // bounded by the same `2(n−1)·u·Σ|vᵢ|` as the sums. The overflow case
+    // it used to under-describe has its own row in the live differential
+    // (`avg_overflow`), where the database answers `inf`.
     for op in ["stddev_over_time", "stdvar_over_time"] {
         let lowered_q = format!(
             r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency [1m])"#
@@ -3880,14 +3952,19 @@ async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus(
 ///  corpus       values                        κ      the two paths
 ///  exact        1, 2, 4, 8                    1      the same bits; no order can round
 ///  mild         55 × +1e9+δ, 5 × −1e9+δ       1.2    inside 2(n−1)·u·Σ|vᵢ|
-///  cancelling   32 × (1e16, −1e16+1)          ∞      the same wrong answer: 0, where the
-///                                                    true sum is 32
+///  cancelling   21 × (1e16, 1, −1e16)         huge   the same wrong answer, where the exact
+///                                                    sum of the STORED samples is 21
 /// ```
 ///
 /// **The cancelling corpus is shared behaviour, not a divergence**, and it
 /// is here to be recorded as such: the reference's own summation is a plain
 /// accumulation with no compensation, so it loses the same digits. A
-/// compensated sum would answer 32. Nothing in this build promises
+/// compensated sum would answer 21.
+///
+/// **Every value is exactly representable, and the residual survives the
+/// INSERT.** An earlier fixture stored `-1e16 + 1.0`, which is already
+/// `-1e16` as an `f64`, so its sum was exactly zero before any
+/// accumulation and the agreement it asserted followed from the data. Nothing in this build promises
 /// otherwise, and the ledger carries no row for it.
 #[tokio::test]
 async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
@@ -3922,9 +3999,14 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
             if i < 55 { m } else { -m }
         })
         .collect();
-    let cancelling: Vec<f64> = (0..64)
-        .map(|i| if i % 2 == 0 { 1e16 } else { -1e16 + 1.0 })
-        .collect();
+    // **Every value is exactly representable and the residual is NOT
+    // rounded away before insertion** (review round 2): `-1e16 + 1.0` is
+    // already `-1e16` as an `f64`, so the earlier fixture stored exactly
+    // opposing values and its agreement on zero followed from the data
+    // rather than from the accumulation. Here each triple is
+    // `1e16, 1, -1e16` — the `1` survives in the stored samples, and it is
+    // the ACCUMULATION that loses it, which is the thing being measured.
+    let cancelling: Vec<f64> = (0..21).flat_map(|_| [1e16f64, 1.0, -1e16f64]).collect();
 
     let mut out: Vec<(String, f64, u64, u64)> = Vec::new();
     for (name, fp, values) in [
@@ -4063,18 +4145,43 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
             // is shared behaviour, not a divergence: the reference's own
             // summation is a plain accumulation with no compensation.
             "cancelling" => {
-                assert!(kappa.is_infinite(), "{name}: κ = {kappa}");
+                // **The exact sum is DERIVED FROM THE STORED VALUES, not
+                // stated**, because an earlier fixture stated `32` for
+                // samples whose exact sum was `0`: `-1e16 + 1.0` is
+                // already `-1e16` as an `f64`, so the residual it claimed
+                // had been rounded away before the insert. A compensated
+                // (Neumaier) sum recovers the exact total that a plain
+                // accumulation of the same values loses, and the two
+                // together are what say the corpus is what it claims.
+                let mut acc = 0.0f64;
+                let mut comp = 0.0f64;
+                for v in values.iter() {
+                    let t = acc + v;
+                    comp += if acc.abs() >= v.abs() {
+                        (acc - t) + v
+                    } else {
+                        (v - t) + acc
+                    };
+                    acc = t;
+                }
+                let exact_sum = acc + comp;
+                assert_eq!(
+                    exact_sum, 21.0,
+                    "{name}: the stored values must carry a residual a plain accumulation \
+                     loses; their exact sum is {exact_sum}"
+                );
+                assert!(kappa > 1e14, "{name}: κ = {kappa}");
+                assert_ne!(
+                    lowered, exact_sum,
+                    "{name}: the fixture must be one an accumulation loses, or it is not \
+                     testing cancellation"
+                );
                 assert_eq!(
                     lowered.to_bits(),
                     client_ans.to_bits(),
-                    "{name}: both paths must lose the same digits"
-                );
-                assert_eq!(lowered, 0.0, "{name}: and the shared answer is zero");
-                let exact_sum: f64 = 32.0;
-                assert_ne!(
-                    lowered, exact_sum,
-                    "{name}: the fixture must be one where a compensated sum would differ, or \
-                     it is not testing cancellation"
+                    "{name}: both paths lose the same digits — the reference's own summation \
+                     is a plain accumulation with no compensation, so this is shared \
+                     behaviour and not a divergence"
                 );
             }
             other => panic!("unnamed corpus {other}"),

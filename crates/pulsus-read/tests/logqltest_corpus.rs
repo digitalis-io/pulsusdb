@@ -855,35 +855,34 @@ fn only_the_397_section_has_a_wrapped_variant_with_a_pipeline() {
 }
 
 /// Issue #507 W4 — **`eval_approx` is admitted only where the database
-/// chooses the summation order, and it is not weaker than `eval` in any
-/// dimension that is not that order.**
+/// AGGREGATES the query, and it is not weaker than `eval` in any dimension
+/// that is not summation order.**
 ///
-/// The tolerance exists because the four unwrapped reducers the database
-/// AGGREGATES pick an accumulation order there, and may pick differently
-/// between two executions. A tolerance that could be written on any entry
-/// would be reached for whenever an unrelated comparison failed, so the
-/// verb is refused at parse time on every other query, and the refusal
-/// names what it saw. `rate_counter` is refused with the rest: it never
-/// lowers, so a tolerance on it could only hide a mismatch on a path that
-/// answers exactly (review round 1).
+/// Round 1 checked the reducer name, which is not the condition: a
+/// `| logfmt | unwrap` chain names one of the four and is evaluated here,
+/// exactly, in one order. The verb now asks the PLANNER whether this
+/// query at this window lowers, so the parser, the conversion, the
+/// underscore rule, the range-equals-step rule and the reducer set are one
+/// answer rather than a restatement of five.
 #[test]
-fn eval_approx_is_admitted_only_for_the_four_and_is_not_weaker_than_exact() {
+fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
     use driver::runner::values_agree;
 
-    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
-                   \t10s  c=10\n\t20s  c=30\n\t30s  c=5\n\t40s  c=12\n\n";
-    // `sum_over_time` over the four values in the window `(0, 60s]` is
-    // `10 + 30 + 5 + 12`, which is exact in binary — so the pinned value
-    // is arithmetic rather than a capture, and the perturbation below is
-    // one ULP of it.
+    // JSON bodies and a targeted extraction: the one chain shape whose
+    // aggregation moves to the database.
+    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"}\n\
+                   \t10s  {\"c\":\"10\"}\n\t20s  {\"c\":\"30\"}\n\
+                   \t30s  {\"c\":\"5\"}\n\t40s  {\"c\":\"12\"}\n\n";
+    let lowerable = r#"sum_over_time({service_name="checkout"} | json c="c" | unwrap c [1m])"#;
+    // The window's four values sum to `10 + 30 + 5 + 12`, exact in binary,
+    // so the pinned value is arithmetic rather than a capture.
     let exact = 57.0_f64;
     let perturbed = f64::from_bits(exact.to_bits() + 1);
 
-    // The exact verb rejects one ULP — the property this corpus has
-    // always had, restated here as the control for the two rows below.
+    // The exact verb rejects one ULP — the control for the two rows below.
     let control = format!(
-        "{dataset}eval instant at 60s sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+        "{dataset}eval range from 60s to 60s step 1m {lowerable}\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 60s {perturbed}\n"
     );
     let run = run_file("inline/approx_control.test", &control).expect("parse");
     assert!(
@@ -893,9 +892,8 @@ fn eval_approx_is_admitted_only_for_the_four_and_is_not_weaker_than_exact() {
 
     // `eval_approx` with a tolerance above one ULP accepts it.
     let approx = format!(
-        "{dataset}eval_approx 1e-9 instant at 60s \
-         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+        "{dataset}eval_approx 1e-9 range from 60s to 60s step 1m {lowerable}\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 60s {perturbed}\n"
     );
     let run = run_file("inline/approx_ok.test", &approx).expect("parse");
     assert!(
@@ -912,9 +910,8 @@ fn eval_approx_is_admitted_only_for_the_four_and_is_not_weaker_than_exact() {
     // A tolerance is a NUMBER, not a licence: at zero it rejects the same
     // one ULP the exact verb rejects.
     let tight = format!(
-        "{dataset}eval_approx 0 instant at 60s \
-         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+        "{dataset}eval_approx 0 range from 60s to 60s step 1m {lowerable}\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 60s {perturbed}\n"
     );
     let run = run_file("inline/approx_zero.test", &tight).expect("parse");
     assert!(
@@ -922,61 +919,75 @@ fn eval_approx_is_admitted_only_for_the_four_and_is_not_weaker_than_exact() {
         "at t = 0 the tolerance path must reject what the exact path rejects"
     );
 
-    // A positive case at the EXACT value, so the verb is exercised as an
-    // entry would use it rather than only through a perturbation.
+    // And the exact value passes, so the verb is exercised as an entry
+    // would use it rather than only through a perturbation.
     let ok = format!(
-        "{dataset}eval_approx 1e-9 instant at 60s \
-         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} {exact}\n"
+        "{dataset}eval_approx 1e-9 range from 60s to 60s step 1m {lowerable}\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 60s {exact}\n"
     );
     let run = run_file("inline/approx_exact.test", &ok).expect("parse");
     assert!(run.cases[0].passed, "{}", run.cases[0].detail);
 
-    // The control against sprinkling: a reducer outside the four is a
-    // GRAMMAR error, naming what it saw, so the verb cannot be reached
-    // for to silence an unrelated failure. `rate_counter` is refused with
-    // the rest, and it is the one this test used to be written on.
-    for (q, named) in [
-        (r#"count_over_time({env="prod"}[1m])"#, "count_over_time"),
+    // **The control against sprinkling, over every way a query can fail to
+    // lower** — not only the reducer name, which is what round 1 checked.
+    // Each is a GRAMMAR error naming what it saw.
+    for (what, directive) in [
         (
-            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
-            "rate_counter",
+            "a reducer the database does not aggregate",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             count_over_time({service_name=\"checkout\"}[1m])",
+        ),
+        (
+            "a reducer that never lowers at all",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             rate_counter({service_name=\"checkout\"} | json c=\"c\" | unwrap c [1m])",
+        ),
+        (
+            "a parser with no extractor in the database",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             sum_over_time({service_name=\"checkout\"} | logfmt | unwrap c [1m])",
+        ),
+        (
+            "a bare json, whose other keys name the series",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             sum_over_time({service_name=\"checkout\"} | json | unwrap c [1m])",
+        ),
+        (
+            "a conversion, which is a grammar",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap duration(c) [1m])",
+        ),
+        (
+            "an instant window, which has no grid",
+            "eval_approx 1e-9 instant at 60s \
+             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap c [1m])",
+        ),
+        (
+            "a range that is not the step",
+            "eval_approx 1e-9 range from 60s to 120s step 1m \
+             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap c [2m])",
+        ),
+        (
+            "a log selector, which has no aggregation",
+            "eval_approx 1e-9 instant at 60s {env=\"prod\"}",
         ),
     ] {
-        let refused = format!(
-            "{dataset}eval_approx 1e-9 instant at 60s {q}\n\
-             \t{{env=\"prod\", service_name=\"checkout\"}} 4\n"
-        );
-        let err = run_file("inline/approx_refused.test", &refused)
-            .expect_err("a non-qualifying reducer must be a grammar error");
+        let refused =
+            format!("{dataset}{directive}\n\t{{env=\"prod\", service_name=\"checkout\"}} 60s 4\n");
+        let err = match run_file("inline/approx_refused.test", &refused) {
+            Err(e) => e,
+            Ok(run) => panic!("{what}: must be a grammar error, got {run:?}"),
+        };
         assert!(
-            err.contains(named) && err.contains("eval_approx"),
-            "the refusal must name the reducer it saw: {err}"
+            err.contains("eval_approx"),
+            "{what}: the refusal must name the verb: {err}"
         );
     }
 
-    let wrong = format!(
-        "{dataset}eval_approx 1e-9 instant at 60s count_over_time({{env=\"prod\"}}[1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} 4\n"
-    );
-    let err = run_file("inline/approx_wrong.test", &wrong)
-        .expect_err("a non-qualifying reducer must be a grammar error");
-    assert!(
-        err.contains("count_over_time") && err.contains("eval_approx"),
-        "the refusal must name the reducer it saw: {err}"
-    );
-
-    // And a query with no range aggregation at all.
-    let selector = format!("{dataset}eval_approx 1e-9 instant at 60s {{env=\"prod\"}}\n");
-    let err = run_file("inline/approx_selector.test", &selector)
-        .expect_err("a log selector must be a grammar error");
-    assert!(err.contains("range aggregation"), "{err}");
-
     // A malformed tolerance is a grammar error rather than a default.
     let bad_t = format!(
-        "{dataset}eval_approx wat instant at 60s \
-         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} 57\n"
+        "{dataset}eval_approx wat range from 60s to 60s step 1m {lowerable}\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 60s 57\n"
     );
     let err = run_file("inline/approx_badt.test", &bad_t).expect_err("not a number");
     assert!(err.contains("is not a number"), "{err}");

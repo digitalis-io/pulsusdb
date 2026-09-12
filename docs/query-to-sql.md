@@ -123,7 +123,7 @@ Nine builder functions produce every LogQL statement. All are in
 | `stage1` | `sql.rs:367` | `log_streams_idx` | every LogQL read. Resolves the selector to fingerprints |
 | `stage2` | `sql.rs:489` | `log_streams` | every LogQL read. Fetches each fingerprint's service and label set |
 | `stage3` | `sql.rs:659` | `log_samples` | a log query whose every stage either compiles to SQL or drops no lines. One statement, with `LIMIT` |
-| `stage3_keyset` | `sql.rs:746` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
+| `stage3_keyset` | `sql.rs:755` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
 | `metric_instant` | `sql.rs:970` | `log_samples` | an instant metric query with no stage beyond a line filter |
 | `metric_range` | `sql.rs:921` | `log_metrics_<res>` | **no production caller reaches it** — see the note below |
 | `metric_raw_samples` | `sql.rs:1069` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
@@ -266,7 +266,7 @@ come from the request.
 | `sum by (level) (…)` | none | *evaluated after the read*. `grouping.is_some()` forces the client path (`plan.rs:1942`) |
 | `topk(3, …)` | none | *evaluated after the read* |
 | `label_replace(…)` | none | *evaluated after the read* |
-| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:684`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
+| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:693`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
 | ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` | *emitted today*, `sql.rs:1138`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing |
 | `limit=100`, log query | `LIMIT 100` | *emitted today*, `sql.rs:659`. Present only when no stage drops lines after the read; otherwise the page loop asks for `limit × reader.logql_pipeline_scan_factor` rows a page (`plan.rs:1644`) |
 | limit, metric query | none | *emitted today* — deliberately no `LIMIT`: an aggregation must see every matching line or stop on the byte budget, never silently cut (`metric_raw_samples_sliding`, `sql.rs:1130-1153`, appends none) |
@@ -743,7 +743,7 @@ only ever **adds** lines.
 label of that name**. If one does, the stream's own label wins and the parsed value is renamed
 (`labels.rs:363`), so a predicate over the line would drop lines the answer keeps. The label sets of
 every selected stream are already in hand when the third statement is built — the second statement
-fetched them (`crates/pulsus-read/src/logql/sql.rs:653`) — so this costs no extra read.
+fetched them (`crates/pulsus-read/src/logql/sql.rs:662`) — so this costs no extra read.
 
 **What none of this buys.** No skip index prunes a predicate over a parsed field. Measured with
 `EXPLAIN indexes=1` over 3,000,000 rows on the container: for
@@ -756,7 +756,7 @@ measured in §2.8: the page loop shrinks.
 
 `<start>`, `<end>` are the window bounds in nanoseconds; `<fps>` the resolved fingerprint list.
 "third statement" means the read of `log_samples` — `stage3` (`sql.rs:659`) when nothing drops lines
-after the read, `stage3_keyset` (`sql.rs:746`) when something does.
+after the read, `stage3_keyset` (`sql.rs:755`) when something does.
 
 | stage as written | the fragment it contributes | where it lands | what the database does less of |
 |---|---|---|---|
@@ -802,7 +802,7 @@ after the read, `stage3_keyset` (`sql.rs:746`) when something does.
 | `sum by (k) (…)`, `k` a parsed label | | — | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The reason this cell used to give is false.** `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, but `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0` — the reference's own bytes (measured, 26.3.29.7). The claim was about all ClickHouse expressions and was checked against two. What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
 | `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
-| ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:684` |
+| ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:693` |
 | `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it depends on the filter's `Fidelity`** (`docs/query-lowering.md` §2.7.7, and §10's answered open question 5). A filter over a **parser-produced** name is `Fidelity::Wider` — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter that is `Fidelity::Equivalent` — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement |
 | the response | none | — | *evaluated after the read* |
 
@@ -2358,7 +2358,7 @@ renders exactly as written (`escape.rs:157-160`).
 {service_name="ipcase"} |= ip("10.0.0.0/8")
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3336`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1685`), so the read becomes a page loop.
+**SQL today** — one statement per page, `sql.rs:755`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3336`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1685`), so the read becomes a page loop.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2392,7 +2392,7 @@ An implementation emitting any `body` predicate here drops entries the evaluator
 and the second must be skipped. Ending the walk at the second turns one statement into a page loop
 over every line in the window.
 
-**SQL today** — one statement per page, `sql.rs:746`, carrying **both** literal predicates. The address filter is skipped through the empty arm at `plan.rs:3063` and the walk continues.
+**SQL today** — one statement per page, `sql.rs:755`, carrying **both** literal predicates. The address filter is skipped through the empty arm at `plan.rs:3063` and the walk continues.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2425,7 +2425,7 @@ alone does not discriminate. LogQL15 does.
 {service_name="ipcase"} |= "CONN_REFUSED" |= ip("10.0.0.0/8") |= "zzz"
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, carrying both literal predicates.
+**SQL today** — one statement per page, `sql.rs:755`, carrying both literal predicates.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2491,7 +2491,7 @@ implementation treating a parse failure as a drop returns fewer than four.
 
 **No SQL is shown for either stage after this work, and that is the point of this entry.**
 
-**SQL today** — one statement **per page**, `sql.rs:746`, with no `body` term. `plan.rs:1705` names `json`; `plan.rs:1682` returns `true` at the label filter, so the read pages at `limit × reader.logql_pipeline_scan_factor` = 1,000 rows a page (`plan.rs:1644`).
+**SQL today** — one statement **per page**, `sql.rs:755`, with no `body` term. `plan.rs:1705` names `json`; `plan.rs:1682` returns `true` at the label filter, so the read pages at `limit × reader.logql_pipeline_scan_factor` = 1,000 rows a page (`plan.rs:1644`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2525,7 +2525,7 @@ One entry either way. Whoever fills those two cells must keep this answer identi
 {service_name="checkout"} | json | status >= 500
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, with no `body` term.
+**SQL today** — one statement per page, `sql.rs:755`, with no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2562,7 +2562,7 @@ fixes the answer, and the discriminating case is LogQL19.
 {service_name="checkout"} | json | dur_ms > 1e1
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`. **We answer `400` here and the reference answers `200`** — part 7, row 4.
+**SQL today** — one statement per page, `sql.rs:755`. **We answer `400` here and the reference answers `200`** — part 7, row 4.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2625,7 +2625,7 @@ return two entries in one stream. This is the clearest case that a parser is not
 {service_name="checkout"} | json | line_format "{{.msg}}" |= "pod-044"
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, with **no `body` term**. `compile_line_filters` ends its walk at `line_format` (`plan.rs:3067`), so the filter after it emits nothing; `has_unpushed_dropping_stage` returns `true` at that filter (`plan.rs:1666`), so the read pages.
+**SQL today** — one statement per page, `sql.rs:755`, with **no `body` term**. `compile_line_filters` ends its walk at `line_format` (`plan.rs:3067`), so the filter after it emits nothing; `has_unpushed_dropping_stage` returns `true` at that filter (`plan.rs:1666`), so the read pages.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2716,7 +2716,7 @@ One entry, with the escape sequences removed. The stored line is the 37 bytes
 
 **The reference returns zero entries, and this is the case part 7's last row is about.**
 
-**SQL today** — one statement per page, `sql.rs:746`, with **no `body` term**: the walk ends at `decolorize` (`plan.rs:3067`) and the filter after it is evaluated after the read.
+**SQL today** — one statement per page, `sql.rs:755`, with **no `body` term**: the walk ends at `decolorize` (`plan.rs:3067`) and the filter after it is evaluated after the read.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2748,7 +2748,7 @@ make it faster.
 {service_name="colors"} | decolorize |= "ok after"
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, with no `body` term.
+**SQL today** — one statement per page, `sql.rs:755`, with no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2778,7 +2778,7 @@ when the phrase straddles a code: it tests the raw line always.
 {service_name="colors"} | decolorize | line_format "{{.__line__}}" |= "upstream ok"
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, no `body` term.
+**SQL today** — one statement per page, `sql.rs:755`, no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2904,7 +2904,7 @@ different label sets and fails here.
 {service_name="checkout"} | json | label_format lvl=level | lvl="warn"
 ```
 
-**SQL today** — one statement per page, `sql.rs:746`, no `body` term. `plan.rs:1711` names `label_format`; the label filter at `plan.rs:1682` makes the read page.
+**SQL today** — one statement per page, `sql.rs:755`, no `body` term. `plan.rs:1711` names `label_format`; the label filter at `plan.rs:1682` makes the read page.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -3184,7 +3184,7 @@ implementation formatting floats with a fixed number of places fails here.
 absent_over_time({service_name="nosuch"}[1m])
 ```
 
-**SQL today** — one statement, `sql.rs:996`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1066-1072`).
+**SQL today** — one statement, `sql.rs:996`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1075-1081`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body
@@ -4993,8 +4993,11 @@ order. Three things decide the result, and the second is the one a user meets:
   accumulate differently because something else was running at the time.** The part layout decides it
   too: the same rows in one part and in eight give different final digits;
 - `avg_over_time` additionally accumulates differently from the reference, which uses an incremental
-  mean rather than a sum divided by a count, so it differs in the last bits **even on a single
-  thread**.
+  mean rather than a sum divided by a count, so it differs **even on a single thread** — by the same
+  bound below rather than by one unit in the last place, because the two are different algorithms
+  over the same values. An average whose sum would reach a magnitude the incremental mean never does
+  — two samples of `1e308` average to infinity in the database and to `1e308` here — is refused
+  rather than answered: a non-finite aggregate sends the whole query to the evaluator.
 
 Two answers of the same query differ by at most `2(n−1)·u·Σ|vᵢ|`, where `n` is the number of samples in
 the window, `u = 2⁻⁵³`, and `Σ|vᵢ|` is the sum of their absolute values — the last bits for ordinary
