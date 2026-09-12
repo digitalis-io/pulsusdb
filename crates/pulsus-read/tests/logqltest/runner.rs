@@ -70,9 +70,9 @@ use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, Warnings,
-    apply_label_replace, apply_vector_aggs, combine_binary, ensure_result_series,
-    final_series_gate_applies, materialize_vector_lit, plan, run_client_agg_rows_folded,
-    run_variants_rows,
+    apply_label_replace, apply_vector_aggs, bucketed_fallback_client_agg, combine_binary,
+    ensure_result_series, final_series_gate_applies, materialize_vector_lit, plan,
+    run_client_agg_rows_folded, run_variants_rows, unwrapped_fallback_client_agg,
 };
 
 /// A sorted label set.
@@ -378,6 +378,25 @@ pub enum EvalMode {
     /// produced error text — `msg:` as a substring, `msg_exact:`
     /// byte-exactly (issue #240).
     Fail,
+    /// Compare as a set, like [`EvalMode::Value`], but **within the
+    /// tolerance the entry carries** (issue #507 W4): `eval_approx
+    /// <tolerance> instant at <T> <query>`.
+    ///
+    /// Admitted for the FOUR reducers the database aggregates, and no
+    /// others.
+    ///
+    /// A NEW verb rather than a flag on `eval`, so every entry written
+    /// before this one parses and compares through exactly the code it
+    /// did before — the extension point this grammar already used three
+    /// times.
+    ///
+    /// The tolerance is `2(n−1)·u·Σ|vᵢ|`, the most two evaluation orders
+    /// of the same values can differ by, and it exists because the
+    /// database chooses the summation order for the five unwrapped
+    /// reducers. It is REFUSED on any other query — see
+    /// [`approx_reducer_is_eligible`], which is what stops it being
+    /// reached for to silence an unrelated failure.
+    Approx,
 }
 
 /// A range eval's grid: `range from <T0> to <T1> step <S>` (issue #227).
@@ -415,6 +434,10 @@ pub struct EvalCmd {
     /// `eval_fail` only: the required error assertion (issue #240 —
     /// exactly one per `eval_fail`, enforced at parse time).
     pub fail_msg: Option<FailAssert>,
+    /// `eval_approx` only (issue #507 W4): the per-entry tolerance. `None`
+    /// for every other verb, and `None` is what selects the `to_bits()`
+    /// comparison, so no existing entry can reach the tolerance path.
+    pub tolerance: Option<f64>,
     /// `eval`/`eval_ordered` only: the `warning: <text>` assertion lines
     /// (issue #277), in the order written. Compared for EXACT equality
     /// including order against the accumulated
@@ -452,6 +475,8 @@ pub struct DirectiveCounts {
     pub eval_value: usize,
     pub eval_ordered: usize,
     pub eval_fail: usize,
+    /// `eval_approx <tolerance>` (issue #507 W4).
+    pub eval_approx: usize,
     pub streams_cases: usize,
     pub vector_cases: usize,
     pub scalar_cases: usize,
@@ -623,18 +648,80 @@ fn parse_sample_metadata(rest: &str) -> Result<(String, String), String> {
     Ok((labels_to_json(&pairs), body))
 }
 
-/// Strips the `eval`/`eval_ordered`/`eval_fail` verb; returns
-/// `(mode, "instant at <T> <query>")`.
+/// Strips the `eval`/`eval_ordered`/`eval_fail`/`eval_approx` verb;
+/// returns `(mode, "instant at <T> <query>")`.
+///
+/// `eval_approx` is matched BEFORE `eval `, because the verbs are matched
+/// by prefix and `"eval_approx "` does not start with `"eval "` — the
+/// ordering is what the two existing underscore verbs already rely on.
+/// Its tolerance token is consumed by [`parse_eval`], not here, so this
+/// function keeps returning a pair.
 fn strip_eval_prefix(directive: &str) -> Option<(EvalMode, &str)> {
     if let Some(rest) = directive.strip_prefix("eval_ordered ") {
         Some((EvalMode::Ordered, rest))
     } else if let Some(rest) = directive.strip_prefix("eval_fail ") {
         Some((EvalMode::Fail, rest))
+    } else if let Some(rest) = directive.strip_prefix("eval_approx ") {
+        Some((EvalMode::Approx, rest))
     } else if let Some(rest) = directive.strip_prefix("eval ") {
         Some((EvalMode::Value, rest))
     } else {
         None
     }
+}
+
+/// **`eval_approx` is admitted only for a query the DATABASE aggregates**
+/// (issue #507 W4, review round 2).
+///
+/// Round 1 checked the reducer name, which is not the condition: a
+/// `| logfmt | unwrap` chain names one of the four and is evaluated here,
+/// in one order, exactly. The condition is whether the planner lowers the
+/// aggregation, and the only thing that knows is the planner — so this
+/// PLANS the entry's own query at the entry's own window and requires
+/// `MetricValue::Unwrapped`.
+///
+/// **Asking the planner rather than restating it** is what stops this
+/// drifting from `plan.rs`'s `unwrapped_chain`: the parser, the
+/// conversion, the underscore rule, the range-equals-step rule and the
+/// reducer set are all one answer here, and a change to any of them moves
+/// this check with it.
+///
+/// A tolerance that could be written on any entry would be reached for
+/// whenever an unrelated comparison failed. The refusal names what it saw.
+fn approx_query_lowers(query: &str, spec: QuerySpec) -> Result<(), String> {
+    use pulsus_read::logql::sql::MetricValue;
+    let expr = pulsus_logql::parse(query).map_err(|e| format!("eval_approx: {e}"))?;
+    let params = QueryParams {
+        spec,
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let planned = plan(&expr, &params, &ctx()).map_err(|e| format!("eval_approx: {e}"))?;
+    let leaves: Vec<&MetricPlan> = match &planned {
+        Plan::Metric(mp) => vec![mp],
+        Plan::MetricBinary(node) => node.leaves(),
+        Plan::Streams(_) => Vec::new(),
+    };
+    if leaves.is_empty() {
+        return Err(
+            "eval_approx applies to a range aggregation the database can compute; this query \
+             has none"
+                .to_string(),
+        );
+    }
+    let client_side: Vec<String> = leaves
+        .iter()
+        .filter(|mp| !matches!(mp.value, MetricValue::Unwrapped(_)))
+        .map(|mp| format!("{} ({})", mp.op, mp.routing.reason))
+        .collect();
+    if !client_side.is_empty() {
+        return Err(format!(
+            "eval_approx is admitted only where the aggregation moves to the database, so its \
+             summation order is the database's; this query is evaluated here instead: {}",
+            client_side.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn parse_eval(
@@ -643,6 +730,35 @@ fn parse_eval(
     lines: &[&str],
     directive_idx: usize,
 ) -> Result<(EvalCmd, usize), String> {
+    // Issue #507 W4: `eval_approx` carries its tolerance between the verb
+    // and the window, so it is consumed here and every other verb sees the
+    // `rest` it saw before — the whole grammar below is untouched.
+    let (tolerance, rest) = if mode == EvalMode::Approx {
+        let (tok, tail) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+            fmt_err(
+                file,
+                directive_idx,
+                "eval_approx needs `<tolerance> instant at <T> <query>`".into(),
+            )
+        })?;
+        let t: f64 = tok.parse().map_err(|e| {
+            fmt_err(
+                file,
+                directive_idx,
+                format!("eval_approx tolerance {tok:?} is not a number: {e}"),
+            )
+        })?;
+        if !t.is_finite() || t < 0.0 {
+            return Err(fmt_err(
+                file,
+                directive_idx,
+                format!("eval_approx tolerance must be finite and non-negative, got {tok:?}"),
+            ));
+        }
+        (Some(t), tail.trim_start())
+    } else {
+        (None, rest)
+    };
     let (at_ns, range, detected, query) = if let Some(rest) = rest.strip_prefix("instant at ") {
         let (at_tok, query) = rest
             .split_once(char::is_whitespace)
@@ -865,6 +981,22 @@ fn parse_eval(
         idx += 1;
     }
 
+    // The control that stops the tolerance being reached for: it is
+    // admitted only where the database chooses the summation order, which
+    // is the PLANNER's answer over this entry's own window.
+    if mode == EvalMode::Approx {
+        let spec = match range {
+            Some(r) => QuerySpec::Range {
+                start_ns: r.start_ns,
+                end_ns: r.end_ns,
+                step_ns: r.step_ns,
+            },
+            None => QuerySpec::Instant { at_ns },
+        };
+        if let Err(e) = approx_query_lowers(&query, spec) {
+            return Err(fmt_err(file, directive_idx, e));
+        }
+    }
     if mode == EvalMode::Fail && fail_msg.is_none() {
         return Err(fmt_err(
             file,
@@ -883,6 +1015,7 @@ fn parse_eval(
             query,
             expected,
             fail_msg,
+            tolerance,
             expected_warnings,
         },
         idx,
@@ -1176,12 +1309,42 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
     }
 }
 
-/// Evaluates one client-aggregated metric leaf over the store — the
-/// engine's exact post-fetch sequence (compile → aggregate → vector aggs).
+/// Evaluates one metric leaf over the store — the engine's exact
+/// post-fetch sequence (compile → aggregate → vector aggs).
+///
+/// **A plan with no client aggregation is evaluated down the fallback the
+/// engine itself takes** (issue #507). Since W2 a clean bucketed chain
+/// lowers the aggregation into SQL and plans `client: None`; this runner
+/// holds its rows in memory and never issues a statement, so it cannot
+/// execute that path. It builds the client aggregation the lowered chain
+/// is equivalent to — `bucketed_fallback_client_agg`, the SAME function
+/// the engine's capability join uses — and evaluates that.
+///
+/// So the corpus checks the ANSWER these queries must give and does not
+/// check that the lowered statement gives it. That second half is the
+/// live differential's, and the two are not interchangeable: a defect in
+/// the grid column would leave this suite green.
 fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
-    let client = mp.client.as_ref().ok_or_else(|| {
-        "logqltest supports only client-aggregated (raw-scan) metric plans (Batch 0)".to_string()
-    })?;
+    let fallback;
+    let client = match mp.client.as_ref() {
+        Some(client) => client,
+        None => {
+            // **Which fallback depends on what the plan lowers.** A
+            // counting plan is equivalent to an empty pipeline; an
+            // unwrapped one is not, and taking the counting fallback for
+            // it answers the SAMPLE COUNT instead of the aggregate —
+            // measured at three where the answer is `0.6000000000000001`
+            // (review round 2, found by the first corpus entry that
+            // lowers).
+            fallback = match &mp.value {
+                pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
+                    unwrapped_fallback_client_agg(mp, &u.label)
+                }
+                pulsus_read::logql::sql::MetricValue::Shaped(_) => bucketed_fallback_client_agg(mp),
+            };
+            &fallback
+        }
+    };
     let compiled = compile_for_corpus(&client.pipeline)?;
     // Issue #236 Part B: the folded seam, so the corpus exercises the
     // engine's ACTUAL sequence — innermost aggregation folded at the leaf
@@ -1318,7 +1481,7 @@ fn judge(cmd: &EvalCmd, outcome: Result<Outcome, String>) -> (bool, String) {
                 _ => (true, String::new()),
             },
         },
-        EvalMode::Value | EvalMode::Ordered => match outcome {
+        EvalMode::Value | EvalMode::Ordered | EvalMode::Approx => match outcome {
             Err(text) => (false, format!("query errored: {text}")),
             Ok(Outcome::Streams(actual)) => {
                 judge_warnings(cmd, &[], compare_streams(&cmd.expected, actual))
@@ -1514,11 +1677,11 @@ fn compare_metric(cmd: &EvalCmd, result: QueryResult) -> (bool, String) {
                 }
             }
             if cmd.mode == EvalMode::Ordered {
-                compare_vector_ordered(&want, &actual)
+                compare_vector_ordered(&want, &actual, cmd.tolerance)
             } else {
                 want.sort_by(|a, b| a.0.cmp(&b.0));
                 actual.sort_by(|a, b| a.0.cmp(&b.0));
-                compare_vector_ordered(&want, &actual)
+                compare_vector_ordered(&want, &actual, cmd.tolerance)
             }
         }
         QueryResult::Scalar(v) => {
@@ -1532,7 +1695,7 @@ fn compare_metric(cmd: &EvalCmd, result: QueryResult) -> (bool, String) {
                 );
             }
             match cmd.expected[0].trim().parse::<f64>() {
-                Ok(want) if want.to_bits() == v.to_bits() => (true, String::new()),
+                Ok(want) if values_agree(want, v, cmd.tolerance) => (true, String::new()),
                 Ok(want) => (false, format!("scalar mismatch: got {v}, want {want}")),
                 Err(e) => (
                     false,
@@ -1540,7 +1703,7 @@ fn compare_metric(cmd: &EvalCmd, result: QueryResult) -> (bool, String) {
                 ),
             }
         }
-        QueryResult::Matrix(series) => compare_matrix(&cmd.expected, series),
+        QueryResult::Matrix(series) => compare_matrix(&cmd.expected, series, cmd.tolerance),
         other => (
             false,
             format!("unexpected result kind for an instant eval: {other:?}"),
@@ -1553,7 +1716,11 @@ fn compare_metric(cmd: &EvalCmd, result: QueryResult) -> (bool, String) {
 /// sorted `(timestamp_ns, value)` points, compared with EXACT-f64 equality.
 /// An empty window emits no point, so the offsets are explicit (gaps show as
 /// missing offsets, never as zeros).
-fn compare_matrix(expected: &[String], series: Vec<MatrixSeries>) -> (bool, String) {
+fn compare_matrix(
+    expected: &[String],
+    series: Vec<MatrixSeries>,
+    tolerance: Option<f64>,
+) -> (bool, String) {
     let mut want: Vec<(Labels, Vec<(i64, f64)>)> = Vec::new();
     for line in expected {
         match parse_expected_matrix(line) {
@@ -1606,7 +1773,7 @@ fn compare_matrix(expected: &[String], series: Vec<MatrixSeries>) -> (bool, Stri
             );
         }
         for ((wt, wv), (gt, gv)) in w.1.iter().zip(&g.1) {
-            if wt != gt || wv.to_bits() != gv.to_bits() {
+            if wt != gt || !values_agree(*wv, *gv, tolerance) {
                 return (
                     false,
                     format!(
@@ -1641,7 +1808,45 @@ fn parse_expected_matrix(line: &str) -> Result<(Labels, Vec<(i64, f64)>), String
     Ok((labels, points))
 }
 
-fn compare_vector_ordered(want: &[VectorEntry], actual: &[VectorEntry]) -> (bool, String) {
+/// Whether an expected value and a produced one agree (issue #507 W4).
+///
+/// `None` — every verb but `eval_approx` — is the `f64::to_bits()`
+/// equality this corpus has always used, reached through the same
+/// comparison sites as before, so no existing entry's verdict can move.
+///
+/// `Some(t)` is a magnitude comparison, **and it is not weaker than the
+/// exact one in any dimension that is not summation order**. Two cases
+/// have to be taken out of the magnitude test to keep that true, and both
+/// are live rather than defensive:
+///
+/// * **NaN.** `NaN <= t` is false in Rust, so a magnitude test would
+///   reject a NaN against an IDENTICAL NaN, which the exact path accepts.
+///   Left to the magnitude test the tolerance path would be stricter here,
+///   not weaker — and stricter for a reason that has nothing to do with
+///   rounding. The exact rule is the right one: a NaN is not a rounding
+///   difference.
+/// * **Signed zero.** `(+0.0 − −0.0).abs()` is `0`, so the magnitude test
+///   accepts `+0.0` against `−0.0` at any tolerance **including `t = 0`**,
+///   where the exact path rejects them. That is the dimension the
+///   tolerance must not silently widen.
+pub fn values_agree(want: f64, got: f64, tolerance: Option<f64>) -> bool {
+    let Some(t) = tolerance else {
+        return want.to_bits() == got.to_bits();
+    };
+    if want.is_nan() || got.is_nan() {
+        return want.to_bits() == got.to_bits();
+    }
+    if want == 0.0 && got == 0.0 {
+        return want.is_sign_negative() == got.is_sign_negative();
+    }
+    (want - got).abs() <= t
+}
+
+fn compare_vector_ordered(
+    want: &[VectorEntry],
+    actual: &[VectorEntry],
+    tolerance: Option<f64>,
+) -> (bool, String) {
     if want.len() != actual.len() {
         return (
             false,
@@ -1665,7 +1870,7 @@ fn compare_vector_ordered(want: &[VectorEntry], actual: &[VectorEntry]) -> (bool
                 ),
             );
         }
-        if w.1.to_bits() != g.1.to_bits() {
+        if !values_agree(w.1, g.1, tolerance) {
             return (
                 false,
                 format!(
@@ -1739,6 +1944,7 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                     EvalMode::Value => counts.eval_value += 1,
                     EvalMode::Ordered => counts.eval_ordered += 1,
                     EvalMode::Fail => counts.eval_fail += 1,
+                    EvalMode::Approx => counts.eval_approx += 1,
                 }
                 let outcome = if let Some(de) = cmd.detected {
                     // Issue #244 step (d): the duplicate-timestamp check is

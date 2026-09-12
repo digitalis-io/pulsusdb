@@ -142,6 +142,264 @@ impl MetricShape {
     }
 }
 
+/// The reducers W4 lowers — **two**, closed so the SQL function name stays
+/// a `&'static str` and the wildcard-free property [`MetricShape`] has is
+/// not lost on the way in (issue #507, W4).
+///
+/// **Three reducers are absent, and each is absent AT THIS TYPE so that a
+/// variant cannot be added back without deciding.**
+///
+/// * `rate_counter` is not an aggregate at all: `client_agg.rs`'s
+///   `rate_counter_over_sorted` is `last − first` plus a reset walk in
+///   timestamp order plus an extrapolation over the window, so expressing
+///   it here would be a second implementation of that algorithm.
+/// * `stddev_over_time` and `stdvar_over_time` were lowered through
+///   `stddevPopStable`/`varPopStable` and are **withdrawn** (review round
+///   3). The stable variants fixed the catastrophic cancellation the plain
+///   ones have — measured over `{1e16, 1e16+2, +4, +8, +16}`, where
+///   `varPop`/`stddevPop` answer `0` and `0` against the evaluator's
+///   `31.2` and `5.585696017507576` — but they did not make the two
+///   accumulations the same. Over 300,000 samples at `max_threads = 8`
+///   and `max_block_size = 65536` the database's variance came back
+///   **finite** and wrong: bits `9090485321501537692` against the client's
+///   `9090485321501537553`, a difference of `1.0334767513920592e286`,
+///   which is larger than the bound this build documents.
+///
+///   **That is why the withdrawal is at the type rather than in a guard.**
+///   The reader's "a non-finite aggregate falls back" rule rests on
+///   overflow being absorbing, which is true of a sum and is NOT true of a
+///   variance: a partial-moment algorithm can lose the answer and stay
+///   finite. Keeping these two would mean a second numerical argument on a
+///   path that has produced a high-severity finding in two of three review
+///   rounds, and the client path already computes them correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapReducer {
+    Sum,
+    Avg,
+}
+
+impl UnwrapReducer {
+    /// Wildcard-free, the [`MetricShape::agg_expr`] arrangement.
+    pub const fn function(self) -> &'static str {
+        match self {
+            UnwrapReducer::Sum => "sum",
+            UnwrapReducer::Avg => "avg",
+        }
+    }
+}
+
+/// What a metric statement aggregates (issue #507, W4).
+///
+/// **A sibling of [`MetricShape`], not a fifth variant of it.** A fifth
+/// variant would make [`MetricShape::from_columns`] — and therefore
+/// `exec.rs`'s `metric_source` panic — reachable for a pair it cannot
+/// serve, because the unwrapped form has no fixed `agg_expr` at all.
+///
+/// **The unwrapped arm carries CHECKED VALUES, never statement text.**
+/// A field holding rendered SQL would walk around `predicate.rs`'s seal —
+/// the property that SQL text is minted in one module — and turn it into a
+/// convention. The only runtime component here is a [`CheckedLiteral`]
+/// minted by `predicate::literal`, and the statement is assembled by
+/// [`metric_range_unwrapped`], which is the one place that text exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricValue {
+    /// `count()` / `sum(length(body))` over the sealed column pairs —
+    /// every plan before W4, unchanged.
+    Shaped(MetricShape),
+    /// `<reducer>(…JSONExtractRaw(body, '<name>')…)` over a
+    /// `| json <name>="<name>" | unwrap <name>` chain with no conversion.
+    ///
+    /// **Boxed, and the reason is measured.** This arm carries 56 bytes
+    /// and the other carries one; inline, `MetricPlan` grows from 368 to
+    /// 424 bytes and `Plan::Metric` exceeds `clippy::large_enum_variant`'s
+    /// 200-byte spread against `Plan::Streams` (176). Boxed, the arm is a
+    /// pointer, `MetricPlan` grows by 8, and `Plan` stays inside it — at
+    /// the cost of one allocation per LOWERED plan, which is one per
+    /// query and not one per row.
+    Unwrapped(Box<UnwrappedValue>),
+}
+
+/// [`MetricValue::Unwrapped`]'s payload — a separate struct only so the
+/// variant can be one pointer wide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwrappedValue {
+    pub reducer: UnwrapReducer,
+    /// The label as the query wrote it — what the READER compares a
+    /// row's structured-metadata keys against.
+    pub label: String,
+    /// The same name, minted for the STATEMENT.
+    ///
+    /// Two fields for one name because they are read by two different
+    /// things: one is bytes this process compares, the other is bytes
+    /// ClickHouse parses. [`MetricValue::unwrapped`] is the only
+    /// constructor and mints both from one argument, so they cannot
+    /// drift; `the_unwrapped_value_mints_both_spellings_from_one_name`
+    /// is the test that fails if a second construction site appears.
+    pub name: CheckedLiteral,
+}
+
+impl MetricValue {
+    /// The ONE constructor of the unwrapped arm (issue #507, W4).
+    pub fn unwrapped(reducer: UnwrapReducer, label: &str) -> Self {
+        MetricValue::Unwrapped(Box::new(UnwrappedValue {
+            reducer,
+            label: label.to_string(),
+            name: super::predicate::literal(label),
+        }))
+    }
+}
+
+/// **The mantissa-has-a-digit test, and it asserts exactly one fact**
+/// (issue #507, W4).
+///
+/// `toFloat64OrNull` alone is not a sufficient guard, and the case it
+/// misses is the one that matters: `"E12"` — a rack name, an error code, a
+/// firmware revision — comes back as `0` rather than `NULL`, so a
+/// null-based check admits it and a zero joins the sum where the evaluator
+/// would have produced an error series. Measured on 26.3.29.7 across the
+/// family `"e3"`, `"E3"`, `"e+3"`, `"E12"`, `"."`, `"+."`, `".e3"`,
+/// `"+e3"`, and `"e999999"`, which returns a negative NaN.
+///
+/// **This is not a float grammar in SQL.** It asserts that the mantissa
+/// starts with a digit and leaves every other decision to
+/// `toFloat64OrNull`; it is anchored, so no suffix defeats it; and it
+/// rejects a structural family rather than an enumerated list, so a new
+/// member of that family is rejected too. **A second clause added here is
+/// a float grammar and stops being this.**
+///
+/// Its known over-rejections are the `inf`/`Inf`/`NaN` spellings, which
+/// our own parser accepts: those queries fall back rather than being
+/// answered wrongly.
+///
+/// **The `0`-rather-than-`NULL` reading above was measured under the
+/// default parser.** Under [`UNWRAP_PARSER_SETTING`], which the statement
+/// now carries, that whole family converts to NULL and `isNotNull` refuses
+/// it. This test is kept because it is the clause that refuses the
+/// `inf`/`NaN` spellings, which do convert under the setting — and because
+/// it refuses on the text rather than on what one parser happens to do with
+/// it.
+const UNWRAP_MANTISSA_HAS_A_DIGIT: &str = r"^[+-]?([0-9]|\.[0-9])";
+
+/// Rendered through the string escaper, so the regex's backslash reaches
+/// the matcher as one backslash rather than being eaten by ClickHouse's
+/// own string-literal unescaping — `\.` must stay a literal dot and not
+/// become "any character".
+fn unwrap_prefix_literal() -> CheckedLiteral {
+    super::predicate::literal(UNWRAP_MANTISSA_HAS_A_DIGIT)
+}
+
+/// **The parser the statement runs under** (issue #507, W4, review round 4).
+///
+/// `toFloat64OrNull` uses a fast approximate parser by default, and it is
+/// not correctly rounded. One row is enough for that to be a wrong answer,
+/// because the summation-order bound `2(n−1)·u·Σ|vᵢ|` this lowering is
+/// justified by is ZERO at `n = 1`. Measured on 26.3.29.7:
+///
+/// ```text
+///   SELECT hex(reinterpretAsUInt64(assumeNotNull(
+///       toFloat64OrNull('9367469347402735e292'))))
+///
+///   default                             -> 7FE0ACB5CADC2918
+///   SETTINGS precise_float_parsing = 1  -> 7FE0ACB5CADC2917
+///   "9367469347402735e292".parse::<f64>() ->  7FE0ACB5CADC2917
+/// ```
+///
+/// **It is rendered into the statement text rather than sent as a
+/// connection setting**, so the EXPLAIN payload reports the query that
+/// executes.
+///
+/// **What it does to the rest of the guard.** Measured over every text this
+/// module's classes name — the class A spellings (`"E12"`, `"e3"`, `"."`,
+/// `"e999999"`), the overflow and underflow boundaries, the infinity and
+/// NaN spellings, and ordinary values — under the setting each text either
+/// converts to the same bits as `f64::from_str` or converts to NULL, and
+/// NULL is what `isNotNull` refuses. Class A converts to NULL (it was `0`);
+/// `"1.7976931348623159e308"` converts to NULL (it was `f64::MAX`);
+/// `"0e999999"` converts to `+0` (it was a negative NaN); `"5e-324"`
+/// converts to bits `0x1` (it was `0`); an underflow past the smallest
+/// subnormal, `"2e-324"` or `"1e-400"`, converts to NULL where Rust gives
+/// `0`.
+///
+/// So the four conjuncts beside `isNotNull` have no measured disagreement
+/// left to catch, and each is kept as an over-rejection — a fallback, never
+/// a wrong answer. See [`UNWRAP_OVERFLOW_CUTOFF`] and
+/// [`UNWRAP_TEXT_DENOTES_NON_ZERO`] for what each still refuses.
+/// **Widening the lowered set by dropping them is a change to make on its
+/// own evidence, not at the end of a wave.**
+const UNWRAP_PARSER_SETTING: &str = "precise_float_parsing = 1";
+
+/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
+///
+/// Under the default parser `"1.7976931348623159e308"` converted to
+/// `f64::MAX` here and to `inf` in Rust, and no tolerance absorbs that: a
+/// sum holding `inf` is `inf`, a sum holding `f64::MAX` may be finite. One
+/// equality test closed it, over-rejecting a genuine `f64::MAX` with it.
+///
+/// **Under [`UNWRAP_PARSER_SETTING`] that text converts to NULL** and
+/// `isNotNull` refuses it, so what this clause still does is the
+/// over-rejection: a row whose value really is `f64::MAX` falls back. Kept
+/// (review round 4), because dropping it widens the lowered set.
+///
+/// `isFinite` is the same shape. It was the other half of the family —
+/// `"0e999999"` converted to a negative NaN here and to `+0` in Rust — and
+/// under the setting that text converts to `+0`. Of the texts measured, the
+/// only ones that still convert to a non-finite value are the `inf`,
+/// `Infinity` and `NaN` spellings, which the anchored prefix test refuses
+/// first and which our own parser accepts. Kept for the same reason.
+const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
+
+/// **A text that denotes a non-zero number** — the underflow clause
+/// (issue #507, W4, review rounds 1 to 4).
+///
+/// Under the default parser `toFloat64OrNull` returned `0` for a value
+/// whose exponent underflows, where our own parser keeps a subnormal.
+/// Measured on 26.3.29.7 against `f64::from_str`, with and without
+/// [`UNWRAP_PARSER_SETTING`]:
+///
+/// ```text
+///  text                      default   precise   ours (bits)
+///  "5e-324"                  0         0x1       0x1
+///  "7.5e-324"                0         0x2       0x2
+///  "9999999999999999e-324"   0         0x730d67819e8d2  0x730d67819e8d2
+///  "0.000…0005" (326 chars)  0         0x1       0x1
+/// ```
+///
+/// **The stated bound does not absorb these**, which is why the clause was
+/// written: `2(n−1)·u·Σ|vᵢ|` is ZERO at `n = 1`, and `Σ|vᵢ|` is the
+/// underflowing value itself when it is the only sample — so the difference
+/// is the whole answer.
+///
+/// **Under the setting the disagreement is gone**, and an underflow past
+/// the smallest subnormal (`"2e-324"`, `"1e-400"`) converts to NULL rather
+/// than to `0`, which `isNotNull` refuses. What this clause still does is
+/// refuse a text that converts to zero while carrying a non-zero digit —
+/// `"0e5"`, `"0.0e9"`, `"0e-1"` — where both parsers answer `+0` and the
+/// lowering would have been correct. Those fall back: a wasted statement,
+/// never a wrong answer. Kept (review round 4).
+///
+/// **The rule it expresses is about denotation, not spelling.** Review
+/// round 1 tested for an exponent, which is a rule about how a number is
+/// written: the 326-character fixed-point spelling of `5e-324` carries no
+/// `e`, converted to database zero, and parses to bits `0x1` in Rust — so
+/// it passed a guard built for exactly that case. What holds for every
+/// notation is that **a decimal literal denotes zero if and only if none of
+/// its digits is non-zero**, and that is one character class and one fact
+/// rather than a parse.
+///
+/// **One consequence a reader should not have to discover: the same value
+/// takes two routes depending on how it was STORED.** `JSONExtractRaw`
+/// returns a JSON *number* as the database normalised it and a JSON
+/// *string* as it was written, so
+///
+/// ```text
+///   {"latency":0e5}     -> raw text `0`     -> lowers
+///   {"latency":"0e5"}   -> raw text `0e5`   -> falls back
+/// ```
+///
+/// Same number, same query, two routes and the same answer. It is visible
+/// only as a statement that did or did not run.
+const UNWRAP_TEXT_DENOTES_NON_ZERO: &str = "[1-9]";
+
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
 /// [`super::plan::metric_plan`] makes, grouped into one parameter (same
@@ -1018,6 +1276,187 @@ pub fn metric_raw_samples_sliding(
     sql
 }
 
+/// The scan bounds and the emit grid one bucketed range read is rendered
+/// from (issue #507, W2), grouped into one parameter for the same reason
+/// [`TimeWindow`] is.
+///
+/// `lo_ns` is `grid_start_ns - step_ns` — the plan's start-anchored emit
+/// grid, one step below its first point — and **not** `window.start_ns`,
+/// which is the scan start and has been widened backwards by the range
+/// selector's duration. They are equal only when the range equals the
+/// step.
+#[derive(Debug, Clone, Copy)]
+pub struct BucketedScan {
+    pub window: TimeWindow,
+    pub lower: ScanLowerBound,
+    pub lo_ns: i64,
+    pub step_ns: i64,
+}
+
+/// The bucketed range metric read (issue #507, W2): one row per
+/// `(fingerprint, grid point, structured_metadata)` instead of one row per
+/// log line.
+///
+/// **What it is for.** A range aggregation over a counting reducer is a
+/// per-window count, and the database can count. Today every range query
+/// reads every matching line across the metered hop and counts them in our
+/// process; this returns the counts.
+///
+/// **Why the grid column is not the shipped one.** [`metric_range`] buckets
+/// with `intDiv(<col>, step) * step`, a floor onto a grid anchored at the
+/// epoch. The reference's window is `(g - range, g]` on a grid anchored at
+/// the query's start, which is a ceiling onto that grid — see
+/// [`super::predicate::bucket_expr`], which mints the expression and holds
+/// the reason. `metric_range` is untouched: it has no production caller,
+/// and its rollup half buckets an already-bucketed column, which is a
+/// different question nobody has answered.
+///
+/// **`structured_metadata` is carried unconditionally**, in the `SELECT`
+/// list and the `GROUP BY`, in the trailing position [`metric_instant`]
+/// puts it in. It is part of the output series identity even when no error
+/// is involved — two entries of one stream differing only in a metadata
+/// value are two series, and dropping the column would merge them into one
+/// of twice the value. **No expression here interprets the column**: it is
+/// named and grouped, never read into, and the one reader decides what it
+/// means after the rows arrive.
+///
+/// **Raw source only.** The rollup table has no `structured_metadata`
+/// column at all, so a rollup shape cannot reach this builder with the
+/// projection it needs. The `bucket_col` the grid is computed over is the
+/// shape's own, so the `WHERE` bound and the grid always name one column.
+pub fn metric_range_bucketed(
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    let MetricSource { table, shape } = source;
+    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
+    let BucketedScan {
+        window,
+        lower,
+        lo_ns,
+        step_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    let bucket = super::predicate::bucket_expr(bucket_col, lo_ns, step_ns, start_ns, end_ns)?;
+    let fp_list = fp_list(fingerprints);
+    let lower_op = lower.sql_op();
+    let prewhere = metric_prewhere(services);
+    let sm = projection.column_suffix();
+    let bucket_sql = bucket.as_sql();
+    let mut sql = format!(
+        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause.as_sql());
+    }
+    sql.push_str(match projection {
+        ScanProjection::Lean => "\nGROUP BY fingerprint, bucket_ns",
+        ScanProjection::WithStructuredMetadata => {
+            "\nGROUP BY fingerprint, bucket_ns, structured_metadata"
+        }
+    });
+    Ok(sql)
+}
+
+/// The bucketed range read over an UNWRAPPED value (issue #507, W4): one
+/// row per `(fingerprint, grid point, structured_metadata)`, whose
+/// aggregate is over the number a `| json | unwrap <name>` chain extracts
+/// rather than over a count of rows.
+///
+/// ```text
+/// t   trim(BOTH '"' FROM JSONExtractRaw(body, '<name>'))   the raw value, unquoted
+/// q   t's mantissa starts with a digit
+///     AND toFloat64OrNull(t) is not null
+///     AND its magnitude is not the f64 overflow cutoff
+/// v   <reducer>If(ifNull(toFloat64OrNull(t), 0), q)        the aggregate, over qualifying rows
+/// n   count()                                              every row, qualifying or not
+/// all_numeric  countIf(NOT q) = 0                          whether the reader may use `v`
+///
+/// SETTINGS precise_float_parsing = 1                       every conversion above
+/// ```
+///
+/// **The trailing `SETTINGS` is not decoration.** Without it
+/// `toFloat64OrNull` is not correctly rounded, and a single row is enough
+/// to answer one ulp away from the client path — see
+/// [`UNWRAP_PARSER_SETTING`], which also records what the setting does to
+/// the four remaining conjuncts of `q`.
+///
+/// **`trim` is what makes the common case reachable.** `JSONExtractRaw`
+/// returns `45.2` for a JSON number and `"45.2"` for a JSON string, and a
+/// logging agent wrapping a plain line writes the second. Trimming the
+/// quotes reads both; a type check on `JSONExtractFloat` read only the
+/// first.
+///
+/// **`all_numeric` is one column and it conflates two outcomes on
+/// purpose.** An absent key, a JSON `null` and an unparseable value are
+/// three different behaviours in the evaluator — no series, no series, and
+/// an error series — and this column says only "not all of them
+/// qualified". That is sound ONLY because the fallback is whole-query: the
+/// reader discards the result and re-runs on the client path, where the
+/// evaluator makes the distinction itself. **There is no version of this
+/// where the lowered path reproduces an error series.**
+///
+/// **Why the fallback cannot be per group.** A group that fails the guard
+/// needs its rows re-read and they were aggregated away; and the value's
+/// shape is a property of each row, so nothing at plan time can predict
+/// it. The price is one wasted statement, paid exactly on the corpora
+/// where the lowering does not help.
+///
+/// Raw source only, as [`metric_range_bucketed`] — the rollup table has no
+/// `body` column to extract from.
+pub fn metric_range_unwrapped(
+    table: &str,
+    reducer: UnwrapReducer,
+    name: &CheckedLiteral,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    let BucketedScan {
+        window,
+        lower,
+        lo_ns,
+        step_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    // The grid column is the raw table's own, as the counting form's: this
+    // builder is raw-only, so there is one column it can be.
+    let bucket = super::predicate::bucket_expr("timestamp_ns", lo_ns, step_ns, start_ns, end_ns)?;
+    let fp_list = fp_list(fingerprints);
+    let lower_op = lower.sql_op();
+    let prewhere = metric_prewhere(services);
+    let bucket_sql = bucket.as_sql();
+    let key = name.as_sql();
+    let prefix = unwrap_prefix_literal();
+    let prefix = prefix.as_sql();
+    let non_zero = super::predicate::literal(UNWRAP_TEXT_DENOTES_NON_ZERO);
+    let non_zero = non_zero.as_sql();
+    let t = format!("trim(BOTH '\"' FROM JSONExtractRaw(body, {key}))");
+    let raw = format!("toFloat64OrNull({t})");
+    let q = format!(
+        "(match({t}, {prefix}) AND isNotNull({raw}) AND isFinite({raw}) AND abs({raw}) != \
+         {UNWRAP_OVERFLOW_CUTOFF} AND ({raw} != 0 OR NOT match({t}, {non_zero})))"
+    );
+    let f = reducer.function();
+    let mut sql = format!(
+        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {f}If(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS all_numeric, structured_metadata\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause.as_sql());
+    }
+    sql.push_str("\nGROUP BY fingerprint, bucket_ns, structured_metadata");
+    sql.push_str("\nSETTINGS ");
+    sql.push_str(UNWRAP_PARSER_SETTING);
+    Ok(sql)
+}
+
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).
@@ -1766,6 +2205,1168 @@ mod tests {
         assert!(
             !sliding.contains(">="),
             "no inclusive lower bound: {sliding}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W0 (issue #507): the two metric raw-scan builders and the
+    // selectivity probe, frozen byte for byte over every argument.
+    //
+    // Why these three. Measured, one builder at a time: an extra column
+    // added to the builder's leading `SELECT` list, then
+    // `cargo nextest run -p pulsus-read --no-fail-fast`. Before the three
+    // tests below existed, TWO of these builders were reddened by nothing
+    // in the crate —
+    //
+    //     metric_raw_samples           nothing reddened
+    //     probe                        nothing reddened
+    //     metric_raw_samples_sliding   sql_snapshots::an_unwrapped_sum_over_time_
+    //                                  renders_a_sliding_raw_scan_with_no_aggregate_and_no_limit
+    //
+    // so the sliding builder is here because it shares its four argument
+    // axes with `metric_raw_samples`, not because it was uncovered. The
+    // gap in the other two is a property of what the existing tests
+    // assert, not of the builders: `metric_raw_samples`'s only caller in
+    // `tests/sql_snapshots.rs` compares two of its OWN renderings against
+    // each other, and a relational equality between two productions of
+    // one function cannot see a change to that function.
+    //
+    // Each test enumerates its builder's arguments rather than sampling
+    // them, so a change confined to one argument value cannot pass by
+    // landing outside the fixture.
+    // -----------------------------------------------------------------
+
+    /// The 36 statements W0 freezes, in the order the three tests below
+    /// enumerate them: 16 `metric_raw_samples`, then 16
+    /// `metric_raw_samples_sliding`, then 4 `probe`. Each entry is its
+    /// axis label and the statement written out line by line.
+    #[allow(clippy::type_complexity)]
+    const W0_STATEMENTS: [(&str, &[&str]); 36] = [
+        (
+            "metric_raw_samples Lean Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "probe 1mo plain",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month = '2026-07-01' AND key = 'service_name'",
+            ],
+        ),
+        (
+            "probe 1mo escaped",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month = '2026-07-01' AND key = 'a\'b\\c'",
+            ],
+        ),
+        (
+            "probe 2mo plain",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'service_name'",
+            ],
+        ),
+        (
+            "probe 2mo escaped",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'a\'b\\c'",
+            ],
+        ),
+    ];
+
+    /// The emit grid and scan bounds every bucketed statement below is
+    /// rendered from: a one-minute step on a grid whose first point is
+    /// `1700000000000000000`, so `lo_ns` is one step below it, and a scan
+    /// start that equals `lo_ns` because this fixture's range equals its
+    /// step.
+    const BUCKETED_SCAN: BucketedScan = BucketedScan {
+        window: TimeWindow {
+            start_ns: 1_699_999_940_000_000_000,
+            end_ns: 1_700_003_600_000_000_000,
+        },
+        lower: ScanLowerBound::Exclusive,
+        lo_ns: 1_699_999_940_000_000_000,
+        step_ns: 60_000_000_000,
+    };
+
+    /// One statement of [`W0_STATEMENTS`], joined back into the text the
+    /// builder produces.
+    fn w0_expected(index: usize) -> String {
+        W0_STATEMENTS[index].1.join("\n")
+    }
+
+    /// Every argument of the three frozen builders, given a value. These
+    /// are held FIXED across all 36 rows, so a difference between two
+    /// rendered statements is a difference the builder made and not one
+    /// the fixture made.
+    ///
+    /// **Not enumerated, named here so the tests are not read as
+    /// exhaustive:** the fingerprint count and values, the table names,
+    /// the concrete window bounds, a second or third extra predicate,
+    /// zero or more than two months, and broader key spellings.
+    struct W0Fixtures {
+        fingerprints: Vec<u64>,
+        window: TimeWindow,
+        no_service: Vec<CheckedLiteral>,
+        one_service: Vec<CheckedLiteral>,
+        three_services: Vec<CheckedLiteral>,
+        no_predicate: Vec<CheckedFragment>,
+        one_predicate: Vec<CheckedFragment>,
+        one_month: Vec<MonthLiteral>,
+        two_months: Vec<MonthLiteral>,
+        plain_key: CheckedLiteral,
+        escaped_key: CheckedLiteral,
+    }
+
+    impl W0Fixtures {
+        fn new() -> Self {
+            let one_predicate = vec![
+                crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+                    op: pulsus_logql::LineFilterOp::Contains,
+                    value: "CONN_REFUSED".to_string(),
+                    value_is_ip: false,
+                    or_matches: Vec::new(),
+                })
+                .expect("a Contains filter compiles no regex"),
+            ];
+            W0Fixtures {
+                fingerprints: vec![18374, 99120],
+                window: TimeWindow {
+                    start_ns: 1_782_906_900_000_000_000,
+                    end_ns: 1_782_928_800_000_000_000,
+                },
+                no_service: Vec::new(),
+                one_service: vec![literal("checkout")],
+                three_services: vec![literal("checkout"), literal("edge"), literal("ipcase")],
+                no_predicate: Vec::new(),
+                one_predicate,
+                one_month: vec![month_literal(2026, 7)],
+                two_months: vec![month_literal(2026, 7), month_literal(2026, 8)],
+                plain_key: literal("service_name"),
+                escaped_key: literal("a'b\\c"),
+            }
+        }
+
+        /// The scan builders' four axes, in the order [`W0_STATEMENTS`]
+        /// lists them: projection, then lower bound, then service count,
+        /// then predicate presence.
+        fn scan_axes(
+            &self,
+        ) -> Vec<(
+            ScanProjection,
+            ScanLowerBound,
+            &[CheckedLiteral],
+            &[CheckedFragment],
+        )> {
+            let mut rows = Vec::new();
+            for projection in [ScanProjection::Lean, ScanProjection::WithStructuredMetadata] {
+                for lower in [ScanLowerBound::Exclusive, ScanLowerBound::Inclusive] {
+                    for services in [&self.one_service, &self.three_services] {
+                        for predicates in [&self.no_predicate, &self.one_predicate] {
+                            rows.push((
+                                projection,
+                                lower,
+                                services.as_slice(),
+                                predicates.as_slice(),
+                            ));
+                        }
+                    }
+                }
+            }
+            rows
+        }
+    }
+
+    /// Asserts that each of `rendered` equals its [`W0_STATEMENTS`] entry
+    /// and that no entry outside this block renders the same text — so
+    /// the 36 statements are distinct as a whole rather than only within
+    /// one builder's block.
+    fn assert_w0_block(rendered: &[String], first_index: usize) {
+        for (offset, sql) in rendered.iter().enumerate() {
+            let index = first_index + offset;
+            let (label, _) = W0_STATEMENTS[index];
+            assert_eq!(
+                *sql,
+                w0_expected(index),
+                "W0 statement {} ({label}) is not the frozen text",
+                index + 1
+            );
+            for (other, (other_label, other_lines)) in W0_STATEMENTS.iter().enumerate() {
+                if other == index {
+                    continue;
+                }
+                assert_ne!(
+                    other_lines.join("\n"),
+                    *sql,
+                    "W0 statements {} ({label}) and {} ({other_label}) render the same text, so \
+                     one of them proves nothing",
+                    index + 1,
+                    other + 1,
+                );
+            }
+        }
+    }
+
+    /// W0, criterion 1 (issue #507): 16 rows — `ScanProjection` ×
+    /// `ScanLowerBound` × {one service, three services} × {no extra
+    /// predicate, one}.
+    #[test]
+    fn metric_raw_samples_is_byte_exact_over_projection_lower_bound_service_count_and_predicate_presence()
+     {
+        let f = W0Fixtures::new();
+        let rendered: Vec<String> = f
+            .scan_axes()
+            .into_iter()
+            .map(|(projection, lower, services, predicates)| {
+                metric_raw_samples(
+                    "log_samples",
+                    services,
+                    &f.fingerprints,
+                    f.window,
+                    lower,
+                    predicates,
+                    projection,
+                )
+            })
+            .collect();
+        assert_eq!(rendered.len(), 16);
+        assert_w0_block(&rendered, 0);
+    }
+
+    /// W0, criterion 1 (issue #507): the same 16 rows through the sliding
+    /// builder, whose `ORDER BY` is the physical primary key.
+    #[test]
+    fn metric_raw_samples_sliding_is_byte_exact_over_the_same_four_axes() {
+        let f = W0Fixtures::new();
+        let rendered: Vec<String> = f
+            .scan_axes()
+            .into_iter()
+            .map(|(projection, lower, services, predicates)| {
+                metric_raw_samples_sliding(
+                    "log_samples",
+                    services,
+                    &f.fingerprints,
+                    f.window,
+                    lower,
+                    predicates,
+                    projection,
+                )
+            })
+            .collect();
+        assert_eq!(rendered.len(), 16);
+        assert_w0_block(&rendered, 16);
+    }
+
+    /// W0, criterion 1 (issue #507): 4 rows — {one month, two months} ×
+    /// {a plain key, a key needing escaping}.
+    #[test]
+    fn probe_is_byte_exact_over_month_count_and_key_escaping() {
+        let f = W0Fixtures::new();
+        let mut rendered = Vec::new();
+        for months in [&f.one_month, &f.two_months] {
+            for key in [&f.plain_key, &f.escaped_key] {
+                rendered.push(probe("log_streams_idx", months, key));
+            }
+        }
+        assert_eq!(rendered.len(), 4);
+        assert_w0_block(&rendered, 32);
+    }
+
+    // -----------------------------------------------------------------
+    // W2 (issue #507): the bucketed range read, frozen byte for byte, and
+    // the three ways its grid can refuse.
+    //
+    // The statement in row 1 is the one the plan prints. Nothing else in
+    // the crate renders this text, so these assertions pin a decision
+    // rather than confirming one — the decision being that the grid is an
+    // anchored ceiling and not the epoch-anchored floor the shipped range
+    // renderer emits. What confirms it is
+    // `the_anchored_bucket_expression_is_the_grid_the_window_implies` on
+    // the live leg, which executes the expression.
+    // -----------------------------------------------------------------
+
+    /// The eleven statements W2's bucketed builder freezes, in the order
+    /// the test below enumerates them.
+    #[allow(clippy::type_complexity)]
+    const BUCKETED_STATEMENTS: [(&str, &[&str]); 11] = [
+        (
+            "Lean RawCount Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns",
+            ],
+        ),
+        (
+            "Lean RawCount Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns",
+            ],
+        ),
+        (
+            "Lean RawBytes Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns",
+            ],
+        ),
+        (
+            "Lean RawBytes Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawBytes Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawBytes Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 0svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
+            ],
+        ),
+    ];
+
+    /// W2 (issue #507): the bucketed builder is byte-exact over its
+    /// projection, its reducer shape, its scan lower bound, its service
+    /// count — including the empty list, which renders no `PREWHERE` line
+    /// at all — and the presence of an extra predicate.
+    ///
+    /// **Not enumerated**, so the test is not read as exhaustive: the
+    /// fingerprint list, the table name, the window, the grid, more than
+    /// one extra predicate, and the two rollup shapes, which cannot reach
+    /// this builder because the rollup table has no `structured_metadata`
+    /// column.
+    #[test]
+    fn metric_range_bucketed_is_byte_exact_over_projection_shape_bound_services_and_predicate() {
+        let f = W0Fixtures::new();
+        let mut rendered: Vec<String> = Vec::new();
+        for projection in [ScanProjection::Lean, ScanProjection::WithStructuredMetadata] {
+            for shape in [MetricShape::RawCount, MetricShape::RawBytes] {
+                for lower in [ScanLowerBound::Exclusive, ScanLowerBound::Inclusive] {
+                    let mut scan = BUCKETED_SCAN;
+                    scan.lower = lower;
+                    rendered.push(
+                        metric_range_bucketed(
+                            MetricSource::new("log_samples", shape),
+                            &f.one_service,
+                            &f.fingerprints,
+                            scan,
+                            &f.no_predicate,
+                            projection,
+                        )
+                        .expect("a renderable grid"),
+                    );
+                }
+            }
+        }
+        for (services, predicates) in [
+            (&f.three_services, &f.no_predicate),
+            (&f.one_service, &f.one_predicate),
+            (&f.no_service, &f.no_predicate),
+        ] {
+            rendered.push(
+                metric_range_bucketed(
+                    MetricSource::new("log_samples", MetricShape::RawCount),
+                    services,
+                    &f.fingerprints,
+                    BUCKETED_SCAN,
+                    predicates,
+                    ScanProjection::WithStructuredMetadata,
+                )
+                .expect("a renderable grid"),
+            );
+        }
+        assert_eq!(rendered.len(), BUCKETED_STATEMENTS.len());
+        for (i, sql) in rendered.iter().enumerate() {
+            let (label, lines) = BUCKETED_STATEMENTS[i];
+            assert_eq!(
+                *sql,
+                lines.join("\n"),
+                "bucketed statement {} ({label}) is not the frozen text",
+                i + 1
+            );
+        }
+        // The eleven differ from one another, so no row proves nothing by
+        // being a duplicate of its neighbour.
+        let mut seen: Vec<&String> = rendered.iter().collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), rendered.len(), "two rows render the same text");
+    }
+
+    /// W2 (issue #507): the grid anchor is the emit grid's, never the
+    /// scan's own start.
+    ///
+    /// The two coincide exactly when the range equals the step, which is
+    /// the case that would make a wrong implementation look right. Here
+    /// the range is half the step, so the widened scan start sits half a
+    /// step above `lo_ns` and the two anchors render different text.
+    #[test]
+    fn the_bucket_anchor_is_the_emit_grid_not_the_widened_scan_start() {
+        let f = W0Fixtures::new();
+        let grid_start_ns = 1_700_000_000_000_000_000i64;
+        let step_ns = 60_000_000_000i64;
+        let range_ns = 30_000_000_000i64;
+        let lo_ns = grid_start_ns - step_ns;
+        let scan_start_ns = grid_start_ns - range_ns;
+        assert_ne!(lo_ns, scan_start_ns, "the fixture must separate the two");
+
+        let render = |lo: i64| {
+            metric_range_bucketed(
+                MetricSource::new("log_samples", MetricShape::RawCount),
+                &f.one_service,
+                &f.fingerprints,
+                BucketedScan {
+                    window: TimeWindow {
+                        start_ns: scan_start_ns,
+                        end_ns: 1_700_003_600_000_000_000,
+                    },
+                    lower: ScanLowerBound::Exclusive,
+                    lo_ns: lo,
+                    step_ns,
+                },
+                &f.no_predicate,
+                ScanProjection::WithStructuredMetadata,
+            )
+            .expect("a renderable grid")
+        };
+        assert!(
+            render(lo_ns).contains(
+                "1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 \
+                 - 1, 60000000000) * 60000000000"
+            ),
+            "the emit grid's anchor is `grid_start_ns - step_ns`"
+        );
+        assert_ne!(
+            render(lo_ns),
+            render(scan_start_ns),
+            "anchoring on the scan start must render different text, or this test cannot see \
+             the substitution it exists to catch"
+        );
+    }
+
+    /// W2 (issue #507): the three ways an anchored grid refuses, each with
+    /// its own input.
+    ///
+    /// None of them is a client error — the query is valid and the link
+    /// stays residual, so the evaluator answers as it does today.
+    #[test]
+    fn an_unrenderable_bucket_grid_refuses_rather_than_wrapping() {
+        use crate::logql::predicate::BucketGridRefusal;
+        let f = W0Fixtures::new();
+        let render = |lo_ns: i64, step_ns: i64, start_ns: i64, end_ns: i64| {
+            metric_range_bucketed(
+                MetricSource::new("log_samples", MetricShape::RawCount),
+                &f.one_service,
+                &f.fingerprints,
+                BucketedScan {
+                    window: TimeWindow { start_ns, end_ns },
+                    lower: ScanLowerBound::Exclusive,
+                    lo_ns,
+                    step_ns,
+                },
+                &f.no_predicate,
+                ScanProjection::WithStructuredMetadata,
+            )
+        };
+        // A zero or negative step has no grid points.
+        for step in [0i64, -1] {
+            assert_eq!(
+                render(0, step, 0, 1_000),
+                Err(BucketGridRefusal::StepNotPositive),
+                "step {step}"
+            );
+        }
+        // An anchor above the scan start: `intDiv` truncates toward zero,
+        // which is a floor only for a non-negative numerator, so a row
+        // below the anchor would bucket upward.
+        assert_eq!(
+            render(1_000, 60, 999, 10_000),
+            Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
+        // The plan's own overflow input.
+        assert_eq!(
+            render(i64::MAX - 1, 60_000_000_000, 0, 1_700_000_000_000_000_000),
+            Err(BucketGridRefusal::AnchorAboveScanStart),
+            "an anchor at the top of the axis is refused before any arithmetic is attempted"
+        );
+        // Genuine overflow: the widest numerator the statement can
+        // evaluate is not representable.
+        assert_eq!(
+            render(i64::MIN, 60_000_000_000, i64::MIN, i64::MAX),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // And the control: an ordinary grid renders.
+        assert!(
+            render(
+                1_699_999_940_000_000_000,
+                60_000_000_000,
+                1_699_999_940_000_000_000,
+                1_700_003_600_000_000_000
+            )
+            .is_ok(),
+            "the refusals must not be reachable from an ordinary grid"
+        );
+    }
+
+    /// Issue #507, W4 — the unwrapped statement, frozen, and the row type
+    /// named for its columns.
+    ///
+    /// The text is asserted whole rather than by parts, because every part
+    /// of it is load-bearing: the `trim` that reads a quoted number, the
+    /// anchored prefix test that rejects `"E12"`, the overflow equality
+    /// that excludes the one-ulp class, the `ifNull` that keeps the
+    /// aggregate's argument non-nullable, and the `all_numeric` column the
+    /// reader refuses on.
+    #[test]
+    fn the_unwrapped_statement_is_byte_exact_and_its_row_type_names_its_columns() {
+        use crate::logql::rows::MetricRangeUnwrappedRow;
+        use pulsus_clickhouse::Row;
+
+        let f = W0Fixtures::new();
+        let sql = metric_range_unwrapped(
+            "log_samples",
+            UnwrapReducer::Sum,
+            &crate::logql::predicate::literal("latency"),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
+                },
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+        )
+        .expect("an ordinary grid renders");
+
+        let t = "trim(BOTH '\"' FROM JSONExtractRaw(body, 'latency'))";
+        let raw = format!("toFloat64OrNull({t})");
+        let q = format!(
+            "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND isFinite({raw}) \
+             AND abs({raw}) != 1.7976931348623157e308 AND ({raw} != 0 OR NOT match({t}, '[1-9]')))"
+        );
+        let expected = format!(
+            "SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - \
+             1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, \
+             sumIf(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS \
+             all_numeric, structured_metadata\nFROM log_samples\nPREWHERE service = \
+             'checkout'\nWHERE fingerprint IN (18374, 99120)\n  AND timestamp_ns > \
+             1699999940000000000 AND timestamp_ns <= 1700003600000000000\nGROUP BY fingerprint, \
+             bucket_ns, structured_metadata\nSETTINGS precise_float_parsing = 1"
+        );
+        assert_eq!(sql, expected);
+
+        // The parser setting travels IN the statement, so the reported
+        // query is the executed one (review round 4). Without it
+        // `toFloat64OrNull('9367469347402735e292')` converts to
+        // `0x7fe0acb5cadc2918` where `f64::from_str` gives
+        // `0x7fe0acb5cadc2917`, and at `n = 1` the summation-order bound
+        // that justifies this lowering is zero.
+        assert!(
+            sql.ends_with("\nSETTINGS precise_float_parsing = 1"),
+            "{sql}"
+        );
+
+        // The regex reaches the matcher with ONE backslash — `\.` must
+        // stay a literal dot rather than becoming "any character".
+        assert!(sql.contains(r"'^[+-]?([0-9]|\\.[0-9])'"), "{sql}");
+
+        // The OTHER reducer renders its own function name and nothing else
+        // about the statement moves. There are two, and the loop this
+        // replaced was written when there were four (review round 3).
+        let other = metric_range_unwrapped(
+            "log_samples",
+            UnwrapReducer::Avg,
+            &crate::logql::predicate::literal("latency"),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
+                },
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+        )
+        .expect("renders");
+        assert_eq!(other, sql.replace("sumIf(", "avgIf("));
+        // And the enum has exactly the two: a third variant makes this
+        // match non-exhaustive and the test stops compiling, which is
+        // where the decision to add one has to be taken.
+        for r in [UnwrapReducer::Sum, UnwrapReducer::Avg] {
+            match r {
+                UnwrapReducer::Sum => assert_eq!(r.function(), "sum"),
+                UnwrapReducer::Avg => assert_eq!(r.function(), "avg"),
+            }
+        }
+
+        // The decode binds on the column NAME, so the aliases and the
+        // derive's names must agree in order — the `metric_range_bucketed`
+        // arrangement, for the row type that carries three more columns.
+        let select = sql
+            .strip_prefix("SELECT ")
+            .expect("the statement opens with its projection")
+            .lines()
+            .next()
+            .expect("the projection is one line");
+        let mut items: Vec<&str> = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        for (i, c) in select.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(&select[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(&select[start..]);
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item.trim().rsplit(" AS ").next().expect("a column name"))
+            .collect();
+        assert_eq!(names, <MetricRangeUnwrappedRow as Row>::COLUMN_NAMES);
+    }
+
+    /// Issue #507, W2 — **the row type's field names ARE the statement's
+    /// column aliases, and the two are written in different languages.**
+    ///
+    /// The reader decodes with `RowBinaryWithNamesAndTypes` (validation is
+    /// on by default in `pulsus_clickhouse::ChClient::query_stream`), so
+    /// the database checks each returned column's NAME against the
+    /// derive's `COLUMN_NAMES`. A renamed alias in `sql.rs` or a renamed
+    /// field in `rows.rs` is therefore a runtime decode failure against a
+    /// live database, and nothing else in the tree notices. This is the
+    /// check that notices, without one.
+    ///
+    /// It compares the aliases the renderer emits, in order, with the
+    /// derive's names — not a snapshot of the statement text, which would
+    /// also move for a hundred reasons that are not this one.
+    #[test]
+    fn the_bucketed_row_type_is_named_for_the_statements_own_columns() {
+        use crate::logql::rows::MetricRangeBucketRow;
+        use pulsus_clickhouse::Row;
+
+        let f = W0Fixtures::new();
+        let sql = metric_range_bucketed(
+            MetricSource::new("log_samples", MetricShape::RawCount),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
+                },
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+            ScanProjection::WithStructuredMetadata,
+        )
+        .expect("an ordinary grid renders");
+
+        // The SELECT list, split on TOP-LEVEL commas: the grid expression
+        // carries a comma of its own inside `intDiv(...)`, so a plain
+        // `split(',')` would read it as two columns.
+        let select = sql
+            .strip_prefix("SELECT ")
+            .expect("the statement opens with its projection")
+            .lines()
+            .next()
+            .expect("the projection is one line");
+        let mut items: Vec<&str> = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (i, c) in select.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(&select[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(&select[start..]);
+        // An aliased column is named by its alias; a bare one by itself.
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item.trim().rsplit(" AS ").next().expect("a column name"))
+            .collect();
+
+        assert_eq!(
+            names,
+            <MetricRangeBucketRow as Row>::COLUMN_NAMES,
+            "the statement's columns and `MetricRangeBucketRow`'s fields must agree by \
+             NAME and in ORDER — the decode binds on the name, and one of these two is \
+             SQL text the compiler never reads"
         );
     }
 }

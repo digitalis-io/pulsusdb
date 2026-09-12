@@ -1,0 +1,58 @@
+# Issue #507 W3 — the rows each pushed-down parsed-name filter must not drop.
+#
+# A `Fidelity::Wider` predicate may emit rows the evaluator discards and may
+# NEVER discard a row the evaluator keeps. This file is that rule as data:
+# one row per (filter, stored body), with the answer the shipped pipeline
+# gives for that body.
+#
+# `keeps` is hand-written and machine-verified. `logql::predicate::tests::
+# every_witness_row_states_the_answer_the_pipeline_gives` runs the real
+# compiled pipeline over each body and reddens on a wrong value, so a typo
+# here cannot become a false expectation.
+#
+# The live half is `query_log_gates.rs::
+# a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps`, which
+# executes the rendered fragment against the database over the same bodies
+# and asserts the one-directional rule.
+#
+# form   = string | neq | numeric
+# parser = json | logfmt | regexp | pattern
+# arg    = the parser's argument, or `-`
+# keeps  = 1 when the pipeline emits the line, 0 when it drops it
+form	parser	arg	name	value	body	keeps
+string	json	-	level	error	{"level":"error"}	1
+string	json	-	level	error	{"level":"info"}	0
+string	json	-	level	error	{"level":500}	0
+string	json	-	level	error	{"msg":"x"}	0
+string	json	-	level	error	plain text, not json at all	0
+string	json	-	level	error	{"level":"error"}junk	1
+string	json	-	level	error	{"level":{"a":1}}	0
+string	json	-	level	error	{"level":"\u0065rror"}	1
+string	json	-	level	error	{"level":"error"}	1
+string	json	-	level		{"msg":"x"}	1
+string	logfmt	-	level	error	level=error	1
+string	logfmt	-	level	error	level=info	0
+string	logfmt	-	level	error	msg=x	0
+string	logfmt	-	level	error	level="error"	1
+string	regexp	(?P<a>[a-z]+)	a	err	err 500	1
+string	regexp	(?P<a>[a-z]+)	a	err	inf 500	0
+numeric	json	-	status	500	{"status":500}	1
+numeric	json	-	status	500	{"status":499}	0
+numeric	json	-	status	500	{"status":"500"}	1
+numeric	json	-	status	500	{"status":"12abc"}	1
+numeric	json	-	status	500	{"msg":"x"}	0
+numeric	json	-	status	500	plain text, not json at all	0
+neq	json	-	level	error	{"msg":"x"}	1
+neq	json	-	level	error	plain text, not json at all	1
+neq	json	-	level	error	{"level":"error"}	0
+neq	json	-	level	error	{"level":"info"}	1
+neq	json	-	level	error	{"level":500}	1
+neq	json	-	level	error	{"level":{"a":1}}	1
+neq	json	-	level	error	{"level":["a"]}	1
+neq	json	-	level	error	{"level":"error"}junk	0
+neq	json	-	level	error	{"level":"\u0065rror"}	0
+neq	json	-	level		{"msg":"x"}	0
+neq	logfmt	-	level	error	msg=x	1
+neq	logfmt	-	level	error	level=error	0
+neq	logfmt	-	level	error	level=other	1
+neq	logfmt	-	level	error	level=""	1

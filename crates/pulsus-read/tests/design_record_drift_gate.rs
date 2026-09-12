@@ -1555,6 +1555,13 @@ enum ReviewedVerdict {
 /// found three where the resolver was the one pointing at the wrong
 /// file. So no rate is published. These are the cases, and the note on
 /// each is the reasoning.
+// Issue #507 W4, review round 4: this was `; 10]`. The `sql.rs:996` case
+// left the table because the two rules now agree on it — a line shift in
+// `logql/sql.rs` moved the anchor the resolver reads, and the resolver's
+// answer became the one the reviewed note already called right
+// (`metric_raw_samples_sliding`, in `crates/pulsus-read/src/logql/sql.rs`).
+// The gate demands the removal: a judgement about a citation that no
+// longer diverges is a judgement about nothing.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 9] = [
     (
         "docs/query-lowering.md",
@@ -1607,17 +1614,17 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "sql.rs:996",
-        2,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes metric_raw_samples_sliding, in          crates/pulsus-read/src/logql/sql.rs — the fallback's answer",
-    ),
-    (
-        "docs/query-to-sql.md",
         "sql.rs:489",
         3,
         ReviewedVerdict::FallbackRight,
         "the citing prose describes stage2, in crates/pulsus-read/src/logql/sql.rs — the          fallback's answer; metrics/sql.rs:489 is a test literal",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "sql.rs:1130-1153",
+        0,
+        ReviewedVerdict::FallbackRight,
+        "the citing prose names metric_raw_samples_sliding and says it appends no LIMIT;          that function is in crates/pulsus-read/src/logql/sql.rs, the fallback's answer.          The same sentence's bare-token neighbour is the entry above it, read the same          way",
     ),
 ];
 

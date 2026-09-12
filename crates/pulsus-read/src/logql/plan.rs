@@ -17,9 +17,9 @@ use std::ops::ControlFlow;
 
 use pulsus_logql::walk;
 use pulsus_logql::{
-    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LogExpr, LogRange, MatchOp,
-    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
-    VectorMatching,
+    BinModifier, BinOp, Expr, Grouping, GroupingKind, LabelFilterExpr, LineFilter, LogExpr,
+    LogRange, MatchOp, Matcher, MetricExpr, ParserStage, RangeAggOp, Stage, StreamSelector,
+    VariantsExpr, VectorAggOp, VectorMatching,
 };
 
 use super::charge::AggCaps;
@@ -239,8 +239,22 @@ pub struct MetricPlan {
     pub stage1_sql: String,
     pub streams_table: String,
     pub table: String,
-    pub bucket_col: &'static str,
-    pub agg_expr: &'static str,
+    /// What the metric statement AGGREGATES (issue #507, W4).
+    ///
+    /// **This replaces the `bucket_col`/`agg_expr` pair**, which held the
+    /// two `&'static str`s of a sealed [`sql::MetricShape`] and could not
+    /// express an aggregate over a name the query supplies. `Shaped(..)`
+    /// carries exactly that pair and every plan that existed before W4
+    /// takes it; `Unwrapped(..)` carries a closed reducer and a
+    /// [`sql::CheckedLiteral`] minted by `predicate::literal`, so the only
+    /// runtime component of a statement is an escaped one and the text
+    /// itself is assembled in `sql.rs` and nowhere else.
+    ///
+    /// Replacing the pair rather than joining it is what keeps
+    /// [`MetricPlan::source_shape`] total-by-construction: an unwrapped
+    /// plan answers `None` because it HAS no column pair, instead of
+    /// carrying a vestigial one that reads as a fact.
+    pub value: sql::MetricValue,
     pub rollup: bool,
     /// The single routing decision `rollup` is derived from
     /// (`rollup == matches!(routing.chosen, RouteChoice::Rollup)`); kept
@@ -360,12 +374,16 @@ impl MetricPlan {
     /// #293's frozen `tests/golden/plan_build_differential.txt` — must not
     /// move (see the type's own doc).
     ///
-    /// Total for every plan [`metric_plan`] builds, because that function
-    /// writes `bucket_col`/`agg_expr` out of [`super::sql::MetricShape`];
-    /// `None` only for a `MetricPlan` assembled by hand with a column pair
-    /// no shape renders.
+    /// `Some` for every plan whose statement is one of the four sealed
+    /// column pairs, `None` for an unwrapped one — which has no pair at
+    /// all, rather than a pair that happens not to render. Since issue
+    /// #507 W4 this is a read of [`MetricPlan::value`], so it cannot
+    /// disagree with what the statement builders take.
     pub fn source_shape(&self) -> Option<sql::MetricShape> {
-        sql::MetricShape::from_columns(self.bucket_col, self.agg_expr)
+        match &self.value {
+            sql::MetricValue::Shaped(shape) => Some(*shape),
+            sql::MetricValue::Unwrapped(_) => None,
+        }
     }
 }
 
@@ -1700,6 +1718,102 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     })
 }
 
+/// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
+/// CONVERSION — `duration(x)`, `duration_seconds(x)`, `bytes(x)`?
+///
+/// Each conversion is a grammar implemented in Rust
+/// (`pipeline.rs`'s `convert_label_value`), and reimplementing it in SQL
+/// would be a third site for a rule that lives in one place. The
+/// no-conversion form is the whole of W4's serveable set, and this is
+/// what keeps the rest out.
+fn has_unwrap_conversion(pipeline: &[Stage]) -> bool {
+    pipeline
+        .iter()
+        .any(|s| matches!(s, Stage::Unwrap(u) if u.conversion.is_some()))
+}
+
+/// Issue #507 (W4): the chain shape the unwrapped read serves, or `None`.
+///
+/// **Exactly** a run of pushable line filters, then a `| json` whose ONE
+/// targeted extraction names the unwrapped label, then `| unwrap <name>`,
+/// and nothing after it:
+///
+/// ```text
+///  {app="x"} |= "boom" | json latency="latency" | unwrap latency   lowers
+///  {app="x"} | json | unwrap latency                               NO — see below
+///  {app="x"} | logfmt | unwrap latency                             no — no logfmt extractor in SQL
+///  {app="x"} | json latency="latency" | unwrap latency | lvl="x"   no — a stage after the unwrap
+///  {app="x"} | json latency="lat" | unwrap latency                 no — the label and the key differ
+/// ```
+///
+/// **The BARE `| json` is the one that cannot be lowered, and this is the
+/// opposite of what it looks like.** A bare `| json` puts **every**
+/// top-level key of the document into the label set, so the output series
+/// are keyed by those values and a statement grouping by
+/// `(fingerprint, grid point, structured_metadata)` cannot express them.
+/// Measured, two lines differing only in a second key:
+///
+/// ```text
+///  {"latency":1,"code":"a"}    | json | unwrap latency
+///  {"latency":2,"code":"b"}
+///    ->  {code="a", env=…} 1   AND  {code="b", env=…} 2      two series
+///
+///  the same lines             | json latency="latency" | unwrap latency
+///    ->  {env=…} 3                                           one series
+/// ```
+///
+/// The targeted form extracts exactly one label and `| unwrap` then
+/// removes it, so the surviving label set is the stream labels plus the
+/// structured metadata — **which is precisely the statement's group key**.
+/// That is the whole reason this shape is lowerable and the bare one is
+/// not.
+///
+/// The name must be underscore-free, for the reason W3 established and
+/// measured: sanitisation and flattening both write `_`, so a name
+/// carrying one has more than one preimage and SQL cannot say which the
+/// evaluator took ([`super::predicate::name_is_unambiguous`]).
+fn unwrapped_chain(op: RangeAggOp, pipeline: &[Stage]) -> Option<(sql::UnwrapReducer, String)> {
+    use pulsus_logql::ParserStage;
+    let reducer = match op {
+        RangeAggOp::SumOverTime => sql::UnwrapReducer::Sum,
+        RangeAggOp::AvgOverTime => sql::UnwrapReducer::Avg,
+        _ => return None,
+    };
+    let mut stages = pipeline.iter();
+    let mut next = stages.next();
+    while let Some(Stage::LineFilter(lf)) = next {
+        if !is_pushable_line_filter(lf) {
+            return None;
+        }
+        next = stages.next();
+    }
+    let extracted = match next {
+        Some(Stage::Parser(ParserStage::Json { extractions })) if extractions.len() == 1 => {
+            &extractions[0]
+        }
+        _ => return None,
+    };
+    let name = match stages.next() {
+        Some(Stage::Unwrap(u)) if u.conversion.is_none() => u.label.as_str(),
+        _ => return None,
+    };
+    if stages.next().is_some() {
+        return None;
+    }
+    // The label, the source key and the unwrapped name are one string, so
+    // the statement extracts the key the evaluator extracted and the
+    // label `| unwrap` removes is the one `| json` added. A differing
+    // source key would be sound too, but its expression is a grammar
+    // (`a.b`, `arr[0]`, quoted segments) and this build does not read one.
+    if extracted.label != name || extracted.expression != name {
+        return None;
+    }
+    if !super::predicate::name_is_unambiguous(name) {
+        return None;
+    }
+    Some((reducer, name.to_string()))
+}
+
 /// `force_client` (issue #221): `true` ONLY for the `variants(...)` scan
 /// plan — the routing decision becomes `Raw` with its own named reason and
 /// `client` is always `Some`, so the multi-extractor scan reads raw
@@ -1959,6 +2073,118 @@ fn metric_plan(
     let probes = build_probes(ctx, &months, &normalized.probe_keys);
 
     let extra_predicates = compile_line_filters(&range.selector.pipeline)?;
+
+    // Issue #507 (W2): **the clean bucketed shape lowers the aggregation
+    // into the statement.** The read returns one row per `(fingerprint,
+    // grid point, structured_metadata)` instead of one row per log line,
+    // so the plan carries no client aggregation at all and
+    // `super::exec`'s range arm reads the counts.
+    //
+    // Every condition below is the fold model's
+    // (`super::compile::RangeAggLower::capability` and
+    // `WindowLower::capability`), restated here because the routing
+    // decision is taken before any fold runs:
+    //
+    //   the reducer is one of the four that accumulate INTEGERS
+    //   nothing in the pipeline beyond a pushable line filter
+    //   step > 0, range == step, and `grid_start - step` is representable
+    //
+    // **Why the range must EQUAL the step rather than merely fit inside
+    // it.** The grid column (`super::predicate::bucket_expr`) is
+    // `lo + ceil((t - lo) / step) * step`, which gives every scanned row
+    // the smallest grid point at or above it — the window `(g - step, g]`.
+    // The reference's window is `(g - range, g]`. Those are the same set
+    // of rows only when `range == step`; with a shorter range the rows in
+    // `(g - step, g - range]` belong to no window at all, and one column
+    // cannot say so:
+    //
+    //   step 60s, range 10s, grid points 0 and 60
+    //     reference windows   (-10, 0]   (50, 60]
+    //     the grid column     (-60, 0]   ( 0, 60]   <- a row at 30 counted
+    //
+    // **Widening this equality moves a frozen golden, and the fact that it
+    // does not move one today is luck.** Every range in
+    // `tests/golden/plan_build_differential.txt`'s corpus is `[5m]` against
+    // a 60 s step, so nothing in it lowers and the golden and its digest
+    // are untouched by this issue. A corpus row with a range equal to its
+    // step, or a relaxation here, changes `client` on those plans and
+    // moves the golden — which `tests/characterization_freeze.rs` refuses
+    // and `logql_plan_build_differential.rs`'s replay refuses with it.
+    let bucketed_range = is_range
+        && !force_client
+        && !has_beyond_line_filter
+        && !has_unwrap
+        // Implied by the reducer set below — none of the four requires
+        // `| unwrap` and none is `absent_over_time` — but named so that a
+        // future change to `requires_unwrap` disables the lowering rather
+        // than silently widening it.
+        && !client_only_op
+        && matches!(
+            op,
+            RangeAggOp::CountOverTime
+                | RangeAggOp::BytesOverTime
+                | RangeAggOp::Rate
+                | RangeAggOp::BytesRate
+        )
+        // A range aggregation's own `by`/`without` is carried on
+        // `ClientAgg` and nothing on this path applies it. The parser
+        // already refuses a grouping on all four reducers
+        // (`RangeAggOp::allows_grouping`), so this is unreachable today —
+        // read it as the assertion that makes that unreachability a
+        // compile-time fact rather than a parser convention.
+        && client.as_ref().is_none_or(|c| c.grouping.is_none())
+        && match step_ns {
+            Some(step) => {
+                let step = step.get();
+                step > 0
+                    && range_ns.get() == step
+                    && grid_start_ns.checked_sub(step).is_some()
+            }
+            None => false,
+        };
+    let client = if bucketed_range { None } else { client };
+
+    // Issue #507 (W4): **the unwrapped bucketed shape** — the same
+    // arrangement as `bucketed_range` above, over the number a
+    // `| json | unwrap <name>` chain extracts rather than over a count of
+    // rows. **Two reducers lower**, `sum_over_time` and `avg_over_time`,
+    // and `sql::UnwrapReducer` has exactly those two variants. The rest are
+    // excluded at the type: `rate_counter` is not an aggregate, and
+    // `stddev_over_time`/`stdvar_over_time` were withdrawn in review round 3
+    // after the database's stable variance came back FINITE and wrong over
+    // 300,000 samples — which is the one error shape the reader's
+    // non-finite guard cannot see. The test that fails if they come back is
+    // `tests/query_log_gates.rs`'s
+    // `the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value`.
+    //
+    // Both REQUIRE `| unwrap`, so `client_only_op` is true for each of them
+    // and the counting shape above can never admit them. That is why this
+    // is a second predicate rather than another clause.
+    //
+    // The grouping conjunct below is live here rather than an assertion:
+    // `avg_over_time` admits a postfix `by`/`without`
+    // (`RangeAggOp::allows_grouping`), where none of the counting four
+    // does, and nothing on this path applies one.
+    let unwrapped_range = if is_range
+        && !force_client
+        && !has_unwrap_conversion(pipeline)
+        && client.as_ref().is_none_or(|c| c.grouping.is_none())
+        && match step_ns {
+            Some(step) => {
+                let step = step.get();
+                step > 0 && range_ns.get() == step && grid_start_ns.checked_sub(step).is_some()
+            }
+            None => false,
+        } {
+        unwrapped_chain(*op, pipeline)
+    } else {
+        None
+    };
+    let client = if unwrapped_range.is_some() {
+        None
+    } else {
+        client
+    };
     // A line filter constrains which log lines count; the rollup table
     // (`log_metrics_<res>`) has no `body` column to re-filter, so any
     // pipeline stage forces the raw fallback (docs/schemas.md §3.2: metric
@@ -2002,6 +2228,30 @@ fn metric_plan(
         RoutingDecision {
             chosen: RouteChoice::Raw,
             reason,
+        }
+    } else if let Some((reducer, _)) = &unwrapped_range {
+        // Issue #507 (W4). RAW for the same forced reason as the counting
+        // shape, and named distinctly so `X-Pulsus-Explain` says which of
+        // the two lowered reads ran.
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: format!(
+                "raw: bucketed unwrapped range aggregation, {} (issue #507)",
+                reducer.function()
+            ),
+        }
+    } else if bucketed_range {
+        // Issue #507 (W2). RAW, not rollup, and the choice is forced
+        // rather than preferred: the rollup table has no
+        // `structured_metadata` column, which is part of the output
+        // series identity on this path, and its 5 s buckets cannot
+        // express a window that is open below and closed above. Without
+        // this branch a bucketed plan would fall into the rollup
+        // eligibility test below, whose only input is whether the step
+        // divides the resolution.
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: bucketed range aggregation (issue #507)".to_string(),
         }
     } else {
         match p.spec {
@@ -2060,14 +2310,16 @@ fn metric_plan(
     } else {
         ctx.samples.to_string()
     };
-    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
+    let value = match unwrapped_range {
+        Some((reducer, label)) => sql::MetricValue::unwrapped(reducer, &label),
+        None => sql::MetricValue::Shaped(shape),
+    };
 
     Ok(MetricPlan {
         stage1_sql,
         streams_table: ctx.streams.to_string(),
         table,
-        bucket_col,
-        agg_expr,
+        value,
         rollup: rollup_eligible,
         routing,
         extra_predicates,
@@ -3184,6 +3436,138 @@ pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// Issue #507, W3, arm 3: the parsed-name label filter's compilation.
+//
+// Declared here, at the end of the module, rather than beside
+// `compile_line_filters` which it sits alongside logically. Forty-six
+// design-record citations name a bare `plan.rs:<line>` and are FROZEN as
+// unresolvable, because the basename matches several tracked files; a
+// frozen row carries no file, so if one of them means this file its line
+// number cannot be repaired when the file shifts. Every citation into this
+// module is above this point, so declaring the three items here moves
+// none of them.
+// ---------------------------------------------------------------------
+
+/// A pushed-down predicate whose soundness is conditional on state the
+/// planner cannot see (issue #507, W3).
+///
+/// A parsed-name filter's fragment reads a key of the line. That is the
+/// label the evaluator resolved **provided no selected stream carries a
+/// label of the same name** — where one does, the stream label wins the
+/// collision and the line's key is renamed, so the fragment would compare
+/// the wrong value and drop a row the evaluator keeps.
+///
+/// A stream label is constant across every row the statement reads, so no
+/// per-row predicate can test the proviso; it is knowable exactly once,
+/// after stage 2 resolves the label sets. The other half of the same
+/// hazard — a structured-metadata key of the same name — is per row, and
+/// the fragment's own whole-value guard tests it inside the statement.
+/// Two facts with two lifetimes, each checked where it is knowable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisoPredicate {
+    /// The label name the fragment reads.
+    pub(crate) name: String,
+    pub(crate) fragment: CheckedFragment,
+}
+
+/// Compiles the parsed-name label filters of `pipeline` into fragments for
+/// the third statement (issue #507, W3, arm 3).
+///
+/// # The chain shape this serves
+///
+/// ```text
+/// {selector} <line filters> | <one parser> | <name> = "v"
+///                                          | <name> <cmp> <number>
+/// ```
+///
+/// **Two independent conditions stop the walk, and neither implies the
+/// other:**
+///
+/// * a **line-rewriting** stage — `| line_format`, `| decolorize`,
+///   `| unpack` — ends it, because a filter after one reads rewritten text
+///   that no expression over the stored line reproduces. Same rule and
+///   same reason as [`compile_line_filters`]' own `break`;
+/// * a **parser-ordering** rule: the name must come from a parser that has
+///   run, and from exactly one. With no parser the name is a stream label
+///   or a metadata key, neither of which the fragment reads; with two, the
+///   name could come from either and the fragment reads only one.
+///
+/// A stage that renames or removes a label — `| label_format`, `| drop`,
+/// `| keep` — also ends the walk, because the name stops meaning what the
+/// parser gave it.
+///
+/// # Rows it drops
+///
+/// **None the evaluator keeps, provided no selected stream carries the
+/// name as a label.** That proviso travels on [`ProvisoPredicate`] and is
+/// checked by `exec`'s `stage3_predicates`, immediately after stage 2.
+/// Everything else is inside the fragment — see
+/// [`super::predicate::parsed_string_filter`].
+pub(crate) fn compile_parsed_label_filters(pipeline: &[Stage]) -> Vec<ProvisoPredicate> {
+    let mut parser: Option<&ParserStage> = None;
+    let mut out = Vec::new();
+    for stage in pipeline {
+        match stage {
+            Stage::LineFilter(_) => {}
+            Stage::Parser(p) => {
+                if parser.is_some() {
+                    // A second parser: a later name could come from
+                    // either, and a fragment reads only one.
+                    return out;
+                }
+                parser = Some(p);
+            }
+            Stage::LabelFilter(expr) => {
+                let Some(p) = parser else { return out };
+                // A filter this cell cannot serve still RUNS in the
+                // evaluator, and it rewrites nothing and renames nothing,
+                // so the walk continues past it.
+                if let Some(pred) = compile_one_parsed_filter(expr, p) {
+                    out.push(pred);
+                }
+            }
+            // A line rewrite, or a stage that renames or removes a label.
+            _ => return out,
+        }
+    }
+    out
+}
+
+/// One label-filter leaf, or `None` when this cell does not serve it.
+///
+/// A conjunction or a disjunction is refused: each leaf would carry its
+/// own proviso, and one fragment carries one name.
+fn compile_one_parsed_filter(
+    expr: &LabelFilterExpr,
+    parser: &ParserStage,
+) -> Option<ProvisoPredicate> {
+    match expr {
+        LabelFilterExpr::Match(m) => {
+            super::predicate::parsed_string_filter(&m.name, m.op, &m.value, parser)
+                .ok()
+                .map(|fragment| ProvisoPredicate {
+                    name: m.name.clone(),
+                    fragment,
+                })
+        }
+        LabelFilterExpr::Compare { name, op, rhs } => {
+            // The threshold is the `f64` OUR unit parser produced, never a
+            // re-parse of the literal's text: a duration or size suffix is
+            // interpreted by that parser and the database has no
+            // equivalent function.
+            let threshold = super::pipeline::numeric_literal_value(rhs)?;
+            super::predicate::parsed_numeric_filter(name, *op, threshold, parser)
+                .ok()
+                .map(|fragment| ProvisoPredicate {
+                    name: name.clone(),
+                    fragment,
+                })
+        }
+        LabelFilterExpr::Ip { .. } | LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => None,
+    }
 }
 
 // NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.
@@ -4320,27 +4704,45 @@ mod tests {
             let shape = mp
                 .source_shape()
                 .unwrap_or_else(|| panic!("no renderable shape for {query}"));
-            assert_eq!(shape.bucket_col(), mp.bucket_col);
-            assert_eq!(shape.agg_expr(), mp.agg_expr);
+            // Issue #507 W4: the plan carries the SHAPE rather than the
+            // two strings, so this reads the shape back out of the value
+            // it was written into.
+            assert_eq!(sql::MetricValue::Shaped(shape), mp.value);
         }
     }
 
-    /// The `None` arm exists, is reachable only by hand-building a plan
-    /// outside `metric_plan`, and is what `exec::metric_source`'s `.expect`
-    /// fails closed on.
+    /// The `None` arm, which since issue #507 W4 is the UNWRAPPED plan
+    /// rather than a hand-built one carrying a foreign column pair: an
+    /// unwrapped statement has no sealed column pair at all.
+    ///
+    /// It is also why `exec`'s `metric_source` is called inside the arms
+    /// that need a shape rather than before the branch — the `.expect`
+    /// there is now reachable by an ordinary query, and moving the call
+    /// is what keeps it unreachable.
     #[test]
-    fn source_shape_is_none_for_a_hand_built_plan_carrying_a_foreign_column_pair() {
-        let mut mp = metric_mp(
+    fn source_shape_is_none_for_an_unwrapped_plan_and_some_for_every_other() {
+        let counting = metric_mp(
             r#"count_over_time({env="prod"}[5m])"#,
             QuerySpec::Instant { at_ns: 1_000 },
         )
         .unwrap();
-        assert!(mp.source_shape().is_some());
-        mp.agg_expr = "match(body, '(')";
-        assert!(mp.source_shape().is_none());
-        mp.agg_expr = "count()";
-        mp.bucket_col = "not_a_column";
-        assert!(mp.source_shape().is_none());
+        assert!(counting.source_shape().is_some());
+
+        let unwrapped = metric_mp(
+            r#"sum_over_time({env="prod"} | json latency="latency" | unwrap latency [1m])"#,
+            QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(unwrapped.value, sql::MetricValue::Unwrapped(_)),
+            "the fixture must be a lowered unwrapped plan: {:?}",
+            unwrapped.value
+        );
+        assert!(unwrapped.source_shape().is_none());
     }
 
     /// Issue #227: a non-dividing step is also the sliding raw path (there is
@@ -4620,6 +5022,133 @@ mod tests {
             Plan::Streams(sp) => sp,
             Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #507, W3, arm 3: which chains compile a parsed-name filter.
+    // -----------------------------------------------------------------
+
+    /// The number of parsed-name fragments `query`'s pipeline compiles.
+    fn parsed_count(query: &str) -> usize {
+        let sp = streams_sp(query);
+        compile_parsed_label_filters(&sp.pipeline).len()
+    }
+
+    /// Issue #507, W3 — **a line-rewriting stage ends the walk, and this
+    /// is one of two independent conditions.**
+    ///
+    /// A filter after `| line_format`, `| decolorize` or `| unpack` reads
+    /// rewritten text, which no expression over the stored line
+    /// reproduces. The control above each row is the same chain without
+    /// the rewrite, so a row cannot pass because the filter was refused
+    /// for some other reason.
+    ///
+    /// **Its break:** delete the line-rewriting arm from
+    /// `compile_parsed_label_filters` and keep the parser rule — this
+    /// reddens and `a_filter_with_no_parser_before_it_does_not_compile`
+    /// stays green. That pair is what shows the two conditions are
+    /// independent.
+    #[test]
+    fn a_filter_after_a_line_rewrite_does_not_compile() {
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level="error""#),
+            1,
+            "the control: with no rewrite between them, the filter compiles"
+        );
+        for rewrite in [r#"| line_format "{{.msg}}""#, "| decolorize", "| unpack"] {
+            let q = format!(r#"{{service_name="a"}} | json {rewrite} | level="error""#);
+            assert_eq!(parsed_count(&q), 0, "{q}");
+        }
+    }
+
+    /// Issue #507, W3 — **the name must come from a parser, and from
+    /// exactly one, and this is the other of the two conditions.**
+    ///
+    /// With no parser the name is a stream label or a
+    /// structured-metadata key, neither of which the fragment reads. With
+    /// two, the name could come from either and the fragment reads only
+    /// one.
+    ///
+    /// **Its break:** delete the parser rule and keep the line-rewriting
+    /// arm — this reddens and
+    /// `a_filter_after_a_line_rewrite_does_not_compile` stays green.
+    #[test]
+    fn a_filter_with_no_parser_before_it_does_not_compile() {
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level="error""#),
+            1,
+            "the control: one parser before the filter compiles it"
+        );
+        assert_eq!(parsed_count(r#"{service_name="a"} | level="error""#), 0);
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} |= "x" | level="error""#),
+            0,
+            "a line filter is not a parser"
+        );
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | logfmt | level="error""#),
+            0,
+            "two parsers: the name could come from either"
+        );
+    }
+
+    /// Issue #507, W3 — a stage that renames or removes a label ends the
+    /// walk, because the name stops meaning what the parser gave it.
+    #[test]
+    fn a_filter_after_a_rename_or_a_drop_does_not_compile() {
+        for stage in ["| label_format lvl=level", "| drop level", "| keep level"] {
+            let q = format!(r#"{{service_name="a"}} | json {stage} | level="error""#);
+            assert_eq!(parsed_count(&q), 0, "{q}");
+        }
+    }
+
+    /// Issue #507, W3 — what the compiled fragment is, and the filters
+    /// the cell does not serve, which fall through and run in the
+    /// evaluator exactly as they do today.
+    #[test]
+    fn a_compiled_parsed_filter_carries_its_name_and_its_fragment() {
+        let sp = streams_sp(r#"{service_name="a"} | json | level="error""#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "level");
+        assert_eq!(
+            got[0].fragment.as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') = 'error' OR structured_metadata != '')"
+        );
+        // Unserved shapes: an ambiguous name, an operator with no cell, a
+        // conjunction, and an address filter.
+        for q in [
+            r#"{service_name="a"} | json | trace_id="x""#,
+            r#"{service_name="a"} | json | level="error" and app="x""#,
+            r#"{service_name="a"} | json | level=ip("10.0.0.0/8")"#,
+        ] {
+            assert_eq!(parsed_count(q), 0, "{q}");
+        }
+        // `!=` is served on the key-precise route.
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level!="error""#),
+            1
+        );
+        // A numeric comparison is served, with the threshold rendered as a
+        // float literal from OUR unit parser's value.
+        let sp = streams_sp(r#"{service_name="a"} | json | status >= 500"#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].fragment.as_sql().contains(">= 500.0 OR"),
+            "{}",
+            got[0].fragment.as_sql()
+        );
+        // A duration literal is converted by our unit parser, not by
+        // re-reading the text: `250ms` is 0.25 seconds.
+        let sp = streams_sp(r#"{service_name="a"} | json | took > 250ms"#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].fragment.as_sql().contains("> 0.25 OR"),
+            "{}",
+            got[0].fragment.as_sql()
+        );
     }
 
     // --- AC9(i), issue M6-09: scan_limit oversample eligibility. ---
@@ -6486,5 +7015,305 @@ mod tests {
             assert_eq!(sp.probes.len(), row.probes, "{}: probes", row.query);
             assert_eq!(sp.result_limit, row.limit, "{}: result_limit", row.query);
         }
+    }
+
+    /// Issue #507, W2 — **the routing relaxation, one clause at a time.**
+    ///
+    /// A clean bucketed chain plans no client aggregation, which is what
+    /// sends it down `exec.rs`'s bucketed range read. Every other row
+    /// differs from the lowering row in ONE clause, so no row keeps its
+    /// client aggregation because a different clause refused first.
+    ///
+    /// The `rollup` assertion is not decoration: a `client: None` range
+    /// plan falls into the rollup-eligibility test, whose only input is
+    /// whether the step divides the resolution — and 60s divides the
+    /// fixture's 5s. Without the branch this issue adds, this plan would
+    /// route to a table that has no `structured_metadata` column.
+    #[test]
+    fn a_clean_bucketed_chain_plans_no_client_aggregation() {
+        const MIN: u64 = 60_000_000_000;
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: MIN,
+        };
+        let lowers = |query: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                mp.client.is_none(),
+                "{query} must lower its aggregation into the statement"
+            );
+            assert_eq!(
+                mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                "{query}"
+            );
+            assert!(!mp.rollup, "{query} must route RAW, never rollup");
+            assert!(matches!(mp.routing.chosen, RouteChoice::Raw), "{query}");
+            mp
+        };
+        let stays_client = |query: &str, why: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                mp.client.is_some(),
+                "{query} must stay client-aggregated: {why}"
+            );
+            assert_ne!(
+                mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                "{query}"
+            );
+        };
+
+        // The row every other row is a one-clause perturbation of, and its
+        // three siblings among the four counting reducers.
+        lowers(r#"count_over_time({a="b"}[1m])"#);
+        lowers(r#"bytes_over_time({a="b"}[1m])"#);
+        lowers(r#"rate({a="b"}[1m])"#);
+        lowers(r#"bytes_rate({a="b"}[1m])"#);
+        // A PUSHABLE line filter is already in the statement, so it does
+        // not stop the aggregation from joining it.
+        let filtered = lowers(r#"count_over_time({a="b"} |= "boom" [1m])"#);
+        assert_eq!(
+            filtered.extra_predicates.len(),
+            1,
+            "the line filter is pushed, not dropped"
+        );
+        // A vector aggregation is finished over the returned series and
+        // does not block the leaf.
+        lowers(r#"sum(count_over_time({a="b"}[1m]))"#);
+
+        // The range is WIDER than the step: one entry would belong to
+        // several windows and one grid column cannot say which.
+        stays_client(r#"count_over_time({a="b"}[2m])"#, "range > step");
+        // The range is SHORTER than the step: the entries between the
+        // windows belong to none of them, and the grid column would count
+        // them into the next point.
+        stays_client(r#"count_over_time({a="b"}[30s])"#, "range < step");
+        // A stage beyond a pushable line filter.
+        stays_client(r#"count_over_time({a="b"} | json [1m])"#, "a parser");
+        stays_client(
+            r#"count_over_time({a="b"} | logfmt | lvl="x" [1m])"#,
+            "a label filter",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} |= ip("10.0.0.0/8") [1m])"#,
+            "a line filter that cannot be pushed",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} | decolorize [1m])"#,
+            "decolorize",
+        );
+        // `| drop` and `| keep` act on the label set rather than on what
+        // the statement counts, so they could in principle lower. **They
+        // are blocking by decision, not by omission** (issue #507): the
+        // reader has no channel to receive the stages, because `ClientAgg`
+        // is the only carrier of the pipeline and a lowered chain has
+        // none, and giving it one means a new `MetricPlan` field and a
+        // ~180-line regeneration of a golden whose own doc says not to
+        // regenerate it. These two queries keep working exactly as they do
+        // today, on the client path, correct and unaccelerated.
+        stays_client(
+            r#"count_over_time({a="b"} | drop x [1m])"#,
+            "drop, by decision",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} | keep x [1m])"#,
+            "keep, by decision",
+        );
+        // A reducer outside the four, and the one permanent refusal.
+        stays_client(
+            r#"sum_over_time({a="b"} | unwrap v [1m])"#,
+            "an f64 accumulator",
+        );
+        stays_client(r#"absent_over_time({a="b"}[1m])"#, "no row to compute from");
+        stays_client(
+            r#"rate({a="b"} | unwrap v [1m])"#,
+            "`rate` over an unwrap sums f64s",
+        );
+
+        // `grid_start - step` must be representable. At the bottom of the
+        // axis it is not, and the widened scan start saturates with it.
+        let low = QuerySpec::Range {
+            start_ns: i64::MIN + 1,
+            end_ns: i64::MIN + 1 + 600_000_000_000,
+            step_ns: MIN,
+        };
+        let mp = metric_mp(r#"count_over_time({a="b"}[1m])"#, low).expect("plan");
+        assert!(
+            mp.client.is_some(),
+            "an unrepresentable anchor keeps the client path"
+        );
+
+        // An instant query has no grid at all and is unaffected.
+        let mp = metric_mp(
+            r#"count_over_time({a="b"}[1m])"#,
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plan");
+        assert!(mp.step_ns.is_none());
+        assert_eq!(mp.routing.reason, "raw: instant query");
+    }
+
+    /// Issue #507, W4 — **the two reducers that lower, the eight that do
+    /// not, and the chain shape**, one clause at a time.
+    ///
+    /// `rate_counter` is in the "does not" list for a reason no check
+    /// enforces: `sql::UnwrapReducer` has no variant for it, so the match
+    /// in `unwrapped_chain` cannot produce one.
+    #[test]
+    fn an_unwrapped_chain_lowers_for_two_reducers_and_one_pipeline_shape() {
+        const MIN: u64 = 60_000_000_000;
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: MIN,
+        };
+        let value = |query: &str| {
+            metric_mp(query, spec)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .value
+        };
+        let lowers = |query: &str, want: sql::UnwrapReducer| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            match &mp.value {
+                sql::MetricValue::Unwrapped(u) => {
+                    assert_eq!(u.reducer, want, "{query}");
+                    assert_eq!(u.label, "latency", "{query}");
+                    assert_eq!(u.name.as_sql(), "'latency'", "{query}");
+                }
+                other => panic!("{query} must lower, got {other:?}"),
+            }
+            assert!(mp.client.is_none(), "{query}");
+            assert!(
+                mp.routing
+                    .reason
+                    .starts_with("raw: bucketed unwrapped range aggregation"),
+                "{query}: {}",
+                mp.routing.reason
+            );
+        };
+        let stays_client = |query: &str, why: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                matches!(mp.value, sql::MetricValue::Shaped(_)),
+                "{query} must not lower an unwrapped value: {why}"
+            );
+            assert!(
+                mp.client.is_some(),
+                "{query} must stay client-aggregated: {why}"
+            );
+        };
+
+        // --- the two -------------------------------------------------
+        let pipe = r#"| json latency="latency" | unwrap latency"#;
+        lowers(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::Sum,
+        );
+        lowers(
+            &format!(r#"avg_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::Avg,
+        );
+        // A pushable line filter is already in the statement.
+        lowers(
+            &format!(r#"sum_over_time({{a="b"}} |= "boom" {pipe} [1m])"#),
+            sql::UnwrapReducer::Sum,
+        );
+
+        // --- the eight that do not -----------------------------------
+        for (op, why) in [
+            ("min_over_time", "order-independent, and out of W4's scope"),
+            ("max_over_time", "the same"),
+            ("first_over_time", "selects rather than accumulates"),
+            ("last_over_time", "the same"),
+            (
+                "rate_counter",
+                "not an aggregate: a reset walk and an extrapolation",
+            ),
+            (
+                "stddev_over_time",
+                "withdrawn in review round 3: a partial-moment algorithm can lose the answer \
+                 and stay FINITE, so the reader's non-finite rule does not cover it",
+            ),
+            ("stdvar_over_time", "the same"),
+        ] {
+            stays_client(&format!(r#"{op}({{a="b"}} {pipe} [1m])"#), why);
+        }
+        stays_client(
+            &format!(r#"quantile_over_time(0.9, {{a="b"}} {pipe} [1m])"#),
+            "the exact quantile is not lowered either",
+        );
+
+        // --- the chain shape -----------------------------------------
+        stays_client(
+            r#"sum_over_time({a="b"} | json | unwrap latency [1m])"#,
+            "a BARE json puts every key of the document in the label set, so the output \
+             series are not the statement's group key",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | logfmt | unwrap latency [1m])"#,
+            "no logfmt extractor in the database",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json latency="lat" | unwrap latency [1m])"#,
+            "the label and the source key differ, and the expression is a grammar",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json latency="latency" | unwrap duration(latency) [1m])"#,
+            "a conversion is a grammar implemented in Rust",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json app_id="app_id" | unwrap app_id [1m])"#,
+            "an underscore-bearing name has more than one preimage",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} | lvl="warn" [1m])"#),
+            "a stage after the unwrap",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [2m])"#),
+            "the range is not the step",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} |= ip("10.0.0.0/8") {pipe} [1m])"#),
+            "a line filter that cannot be pushed",
+        );
+
+        // An instant query has no grid and keeps its existing route.
+        assert!(matches!(
+            value(&format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#)),
+            sql::MetricValue::Unwrapped(_)
+        ));
+        let mp = metric_mp(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plan");
+        assert!(matches!(mp.value, sql::MetricValue::Shaped(_)));
+    }
+
+    /// Issue #507, W4 — the two spellings of the unwrapped name come from
+    /// ONE argument, so a statement and the reader's metadata comparison
+    /// cannot be about different strings.
+    #[test]
+    fn the_unwrapped_value_mints_both_spellings_from_one_name() {
+        let v = sql::MetricValue::unwrapped(sql::UnwrapReducer::Sum, "it's");
+        let sql::MetricValue::Unwrapped(u) = &v else {
+            panic!("the constructor builds the unwrapped arm");
+        };
+        assert_eq!(u.label, "it's");
+        assert_eq!(
+            u.name.as_sql(),
+            crate::logql::predicate::literal("it's").as_sql(),
+            "the statement's spelling is the escaper's, not the raw one"
+        );
+        assert_ne!(
+            u.name.as_sql(),
+            u.label,
+            "and the two are not the same bytes"
+        );
     }
 }

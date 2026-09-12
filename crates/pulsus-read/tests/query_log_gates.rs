@@ -2275,3 +2275,2041 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         end_ns: 1_700_003_600_000_000_000,
     }
 }
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the anchored bucket expression, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketRow {
+    label: String,
+    t: i64,
+    got: i64,
+    expected: i64,
+}
+
+/// **The grid the reference's window implies, computed by the database
+/// from the expression this repository renders** (issue #507, W2).
+///
+/// The window for grid point `g` is `(g - range, g]` on a grid anchored at
+/// the query's start, so a sample belongs to the SMALLEST grid point at or
+/// above it — a ceiling. The shipped range renderer instead floors onto a
+/// grid anchored at the epoch. The two are not spellings of one function:
+/// with a grid start that is not a multiple of the step, the floor form's
+/// output is not a grid point at all.
+///
+/// Six inputs, four of which are the four boundary pairs the design states
+/// and two of which extend them past the next grid point. The expression
+/// under test comes from `predicate::bucket_expr` — the renderer, not a
+/// retyped copy — so a change to the renderer moves this test.
+///
+/// **What makes it discriminating.** The floor form's answer for each input
+/// is computed alongside and asserted to DIFFER at every row, so the test
+/// cannot pass against the expression it exists to reject. That check
+/// matters more than usual here: the only other exercise of the shipped
+/// range renderer puts the same expression on both sides of a comparison,
+/// and a differential between two paths that share a defect cannot see it.
+#[tokio::test]
+async fn the_anchored_bucket_expression_is_the_grid_the_window_implies() {
+    skip_unless_live!();
+    // No corpus and no run database: the expression is evaluated over a
+    // literal row set, so there is nothing to seed and nothing to drop.
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    const G: i64 = 1_700_000_000_000_000_000;
+    const STEP: i64 = 60_000_000_000;
+    let lo = G - STEP;
+
+    // The renderer's own text, minted through the sealed fragment.
+    let bucket =
+        pulsus_read::logql::predicate::bucket_expr("timestamp_ns", lo, STEP, lo, G + 10 * STEP)
+            .expect("a renderable grid");
+
+    let cases: [(&str, i64, i64); 6] = [
+        ("G - 59.999999999s", G - 59_999_999_999, G),
+        ("G", G, G),
+        ("G + 1ns", G + 1, G + STEP),
+        ("G + 30s", G + 30_000_000_000, G + STEP),
+        ("G + 60s", G + STEP, G + STEP),
+        ("G + 60s + 1ns", G + STEP + 1, G + 2 * STEP),
+    ];
+    let rows_sql = cases
+        .iter()
+        .map(|(label, t, expected)| {
+            format!("SELECT '{label}' AS label, {t}::Int64 AS timestamp_ns, {expected}::Int64 AS expected")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!(
+        "SELECT label, timestamp_ns AS t, ({}) AS got, expected FROM ({rows_sql}) ORDER BY t ASC",
+        bucket.as_sql()
+    );
+
+    let mut stream = client
+        .query_stream::<BucketRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("execute the bucket expression");
+    let mut got = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("decode a bucket row"));
+    }
+    assert_eq!(got.len(), cases.len(), "one row per input: {got:?}");
+
+    for row in &got {
+        assert_eq!(
+            row.got, row.expected,
+            "`{}` at {} must bucket to {}, got {}",
+            row.label, row.t, row.expected, row.got
+        );
+        // The grid point is on the query's grid, which the floor form's
+        // answer need not be.
+        assert_eq!(
+            (row.got - G).rem_euclid(STEP),
+            0,
+            "`{}` must bucket to a point of the query's own grid",
+            row.label
+        );
+        // The expression this replaces gives a different answer here, so a
+        // build that kept it fails this test rather than passing it.
+        let floored = row.t.div_euclid(STEP) * STEP;
+        assert_ne!(
+            floored, row.got,
+            "`{}`: the epoch-anchored floor must not agree, or this test cannot reject it",
+            row.label
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// W3 (issue #507): the rule every pushdown cell is built to, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct KeptRow {
+    kept: u8,
+}
+
+/// **A pushed parsed-name filter never drops a row the evaluator keeps**
+/// (issue #507, W3).
+///
+/// A `Fidelity::Wider` predicate may emit rows the evaluator discards and
+/// may never discard one it keeps. The two halves of that claim live in
+/// one file, `tests/logql_parsed_filter_witnesses.tsv`: its `keeps` column
+/// is the shipped pipeline's own answer, verified by
+/// `logql::predicate::tests::every_witness_row_states_the_answer_the_pipeline_gives`,
+/// and this test executes the rendered fragment against the database over
+/// the same bodies.
+///
+/// **The assertion is one-directional on purpose.** A row the database
+/// keeps and the evaluator drops is the predicate being wider, which is
+/// allowed and is counted rather than failed — the count is asserted to be
+/// non-zero, because a predicate that admitted exactly the evaluator's set
+/// would mean the witnesses cannot tell the two directions apart.
+#[tokio::test]
+async fn a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/logql_parsed_filter_witnesses.tsv"
+    );
+    let text = std::fs::read_to_string(path).expect("the witness table is readable");
+    let mut checked = 0usize;
+    let mut wider = 0usize;
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() || line.starts_with("form\t") {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 7, "seven columns: {line:?}");
+        let (form, parser_name, arg, name, value, body) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+        let evaluator_keeps = f[6] == "1";
+
+        let parser = match parser_name {
+            "json" => pulsus_logql::ParserStage::Json {
+                extractions: Vec::new(),
+            },
+            "logfmt" => pulsus_logql::ParserStage::Logfmt {
+                strict: false,
+                keep_empty: false,
+                extractions: Vec::new(),
+            },
+            "regexp" => pulsus_logql::ParserStage::Regexp(arg.to_string()),
+            "pattern" => pulsus_logql::ParserStage::Pattern(arg.to_string()),
+            other => panic!("unknown parser {other}"),
+        };
+        let fragment = if form == "neq" {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Neq,
+                value,
+                &parser,
+            )
+        } else if form == "numeric" {
+            pulsus_read::logql::predicate::parsed_numeric_filter(
+                name,
+                pulsus_logql::CompareOp::Gte,
+                value.parse::<f64>().expect("a numeric witness value"),
+                &parser,
+            )
+        } else {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Eq,
+                value,
+                &parser,
+            )
+        };
+        // A refused filter emits nothing, so there is no predicate to be
+        // wrong about; the evaluator answers as it does today.
+        let Ok(fragment) = fragment else { continue };
+        checked += 1;
+
+        let body_literal = pulsus_read::logql::predicate::literal(body);
+        let sql = format!(
+            "SELECT toUInt8({}) AS kept FROM (SELECT {} AS body, '' AS structured_metadata)",
+            fragment.as_sql(),
+            body_literal.as_sql()
+        );
+        let mut stream = client
+            .query_stream::<KeptRow>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let row = stream
+            .next()
+            .await
+            .expect("one row")
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let sql_keeps = row.kept == 1;
+
+        if evaluator_keeps {
+            assert!(
+                sql_keeps,
+                "`{form} {parser_name} {name} {value}` over `{body}`: the evaluator keeps this \
+                 row and the pushed predicate drops it, which a Wider predicate may never do.\n\
+                 {sql}"
+            );
+        } else if sql_keeps {
+            wider += 1;
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} witness rows reached a fragment"
+    );
+    assert!(
+        wider > 0,
+        "no witness row is kept by the predicate and dropped by the evaluator, so these \
+         witnesses cannot tell a wider predicate from an exact one"
+    );
+}
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the bucketed range read, end to end.
+// ---------------------------------------------------------------------
+
+/// One series of a matrix answer: its sorted labels, and its points as
+/// `(timestamp, value bits)` so "bit for bit" is literally that.
+type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketedSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+/// Seeds the two-stream fixture the bucketed differential reads, into a
+/// fresh database, and returns `(admin, db, T)` where `T` is the emit
+/// grid's first point.
+///
+/// **The two streams fold into ONE output series**, which is the shape
+/// that separates folding before emission from folding after it:
+///
+/// ```text
+/// fp 111   {app=a,           service_name=…}   rows carry metadata lvl=info
+/// fp 222   {app=a, lvl=info, service_name=…}   rows carry none
+/// ```
+///
+/// ```text
+/// grid            T        T+60    T+120   T+180   T+240
+/// fp 111 rows     2 (info)   -        -      1       -
+/// fp 222 rows     -          -        3      -       -
+/// folded series   2          -        3      1       -
+/// ```
+///
+/// Two further rows on fp 111 at the first grid point — one with
+/// `lvl=warn`, one with no metadata at all — make three output series, so
+/// "everything at this grid point" is not the same answer as "this
+/// series at this grid point".
+async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
+    const STEP: i64 = 60_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_bucket_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    // A grid point on a round multiple of the step, an hour back, so the
+    // whole fixture sits inside one partition and one retention window.
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507bucket";
+    for (fp, labels) in [
+        (
+            111u64,
+            format!(r#"{{"app":"a","service_name":"{service}"}}"#),
+        ),
+        (
+            222u64,
+            format!(r#"{{"app":"a","lvl":"info","service_name":"{service}"}}"#),
+        ),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), \
+                     {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+    }
+
+    let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
+        service: service.to_string(),
+        fingerprint: fp,
+        timestamp_ns: ts,
+        severity: 0,
+        body: body.to_string(),
+        structured_metadata: sm.to_string(),
+    };
+    let info = r#"{"lvl":"info"}"#;
+    let rows = vec![
+        // Grid point T, window (T-60s, T].
+        row(111, t - 30_000_000_000, "a", info),
+        row(111, t - 20_000_000_000, "b", info),
+        row(111, t - 25_000_000_000, "c", r#"{"lvl":"warn"}"#),
+        row(111, t - 10_000_000_000, "d", ""),
+        // Grid point T+120s: fp 222 only — the point fp 111 has a gap at.
+        row(222, t + 90_000_000_000, "e", ""),
+        row(222, t + 95_000_000_000, "f", ""),
+        row(222, t + 100_000_000_000, "g", ""),
+        // Grid point T+180s: fp 111 only.
+        row(111, t + 150_000_000_000, "h", info),
+    ];
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the bucketed fixture");
+    (admin, db, t)
+}
+
+/// **The lowered answer is the client answer, bit for bit — and the two
+/// answers come from two different code paths** (issue #507, W2).
+///
+/// `count_over_time({…}[1m])` at a 1m step is a clean bucketed chain and
+/// plans `client: None`, so the database counts. The same selector with
+/// `| drop zzz` — a label the corpus does not carry, so the stage changes
+/// no label set — is a pipeline, so it plans `client: Some(..)` and every
+/// line crosses the wire to be counted here. The answers must be
+/// identical, which is what `Fidelity::Equivalent` claims for the four
+/// counting reducers.
+///
+/// The plan shapes are asserted first. Without that the test could be
+/// comparing one path against itself and would pass for the wrong reason.
+///
+/// It also pins the GAP: the folded series carries a point wherever
+/// either fingerprint had a row and no point at the two grid points where
+/// neither did — not a zero, not a NaN, no point.
+#[tokio::test]
+async fn a_bucketed_range_read_answers_exactly_what_the_client_path_answers() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lowered_query = format!(r#"count_over_time({{service_name="{service}"}}[1m])"#);
+    let client_query = format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1m])"#);
+
+    // The two paths, asserted to BE two paths.
+    let shape = |query: &str| match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db))
+        .expect("plan")
+    {
+        Plan::Metric(mp) => mp,
+        _ => panic!("expected a metric plan"),
+    };
+    assert!(
+        shape(&lowered_query).client.is_none(),
+        "the fixture query must lower its aggregation into the statement"
+    );
+    assert!(
+        shape(&client_query).client.is_some(),
+        "the control query must stay on the client path, or this compares one path with itself"
+    );
+
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let answer = |query: String| {
+        let engine = &engine;
+        let params = &params;
+        async move {
+            let (result, _warnings) = engine
+                .query(&parse(&query).expect("parse"), params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let QueryResult::Matrix(series) = result else {
+                panic!("{query}: expected a matrix");
+            };
+            let mut out: Vec<AnswerSeries> = series
+                .into_iter()
+                .map(|s| {
+                    let mut labels = s.labels;
+                    labels.sort();
+                    (
+                        labels,
+                        s.points
+                            .into_iter()
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    let lowered = answer(lowered_query).await;
+    let client = answer(client_query).await;
+
+    assert_eq!(
+        lowered, client,
+        "the lowered answer and the client answer must agree bit for bit"
+    );
+
+    // The fixture's own expectation, so a shared defect in both paths
+    // cannot pass this test: three series, and the folded one carries
+    // points only where a contributing row exists.
+    assert_eq!(lowered.len(), 3, "{lowered:?}");
+    let folded = lowered
+        .iter()
+        .find(|(labels, _)| labels.contains(&("lvl".to_string(), "info".to_string())))
+        .expect("the folded series");
+    assert_eq!(
+        folded.1,
+        vec![
+            (t, 2.0f64.to_bits()),
+            (t + 2 * STEP, 3.0f64.to_bits()),
+            (t + 3 * STEP, 1.0f64.to_bits()),
+        ],
+        "a grid point with no contributing row is not emitted at all"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The grid-resolution guard holds on the bucketed path too** (issue
+/// #507, W2).
+///
+/// The client path reaches `window::ensure_grid_resolution` by building a
+/// `ClientWindow::Range`; the bucketed path builds no window, so the guard
+/// is called from the arm itself. Without that call an over-cap grid would
+/// be answered instead of refused — a query that 422s today would start
+/// returning a matrix — and no other assertion in the tree would notice.
+///
+/// Both queries below ask for 14 400 intervals against a cap of 11 000:
+/// the lowered one and the client-path control, which must refuse the same
+/// way. The corpus must resolve at least one stream, because the guard
+/// sits after stream resolution on both paths.
+#[tokio::test]
+async fn an_over_cap_grid_is_refused_on_the_bucketed_path_as_on_the_client_path() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    // 4 hours at a 1s step: 14 400 intervals, against MAX_CLIENT_AGG_BUCKETS.
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 14_400_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    for (query, path) in [
+        (
+            format!(r#"count_over_time({{service_name="{service}"}}[1s])"#),
+            "the bucketed path",
+        ),
+        (
+            format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1s])"#),
+            "the client path",
+        ),
+    ] {
+        let err = engine
+            .query(&parse(&query).expect("parse"), &params)
+            .await
+            .expect_err("an over-cap grid must be refused");
+        assert!(
+            matches!(err, ReadError::QueryTooBroad(_)),
+            "{path}: expected the named buckets refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("11000"),
+            "{path}: the refusal must name the cap, got {err}"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The `/explain` seam reports the statement the engine issues** (issue
+/// #507, W2).
+///
+/// `LogQlEngine::explain` refused a range plan with no client aggregation
+/// until W2, arguing — correctly at the time — that the engine would
+/// refuse it too. The engine now serves it, so an EXPLAIN that still
+/// refused would be a wrong answer on a route a user can reach.
+///
+/// **This is the only caller of that seam in the repository**: the
+/// `X-Pulsus-Explain` header routes through `query_explained`, which
+/// collects the payload from the EXECUTION path. So the twin had no
+/// coverage at all, and a break placed in it stayed green everywhere —
+/// measured, which is why this test exists.
+///
+/// The assertion is equality with the executing path's own reported
+/// statement, not a snapshot: the two come from one function and this is
+/// what holds them there.
+#[tokio::test]
+async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let expr = parse(&format!(
+        r#"count_over_time({{service_name="{service}"}}[1m])"#
+    ))
+    .expect("parse");
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    let explained = engine.explain(&expr, &params).await.expect("explain");
+    let reported = explained
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the explain payload names the metric read");
+    assert!(
+        reported.contains("AS bucket_ns") && reported.contains("GROUP BY fingerprint, bucket_ns"),
+        "the explain seam must report the BUCKETED statement, got:\n{reported}"
+    );
+    assert_eq!(
+        explained.routing.as_ref().map(|r| r.reason.as_str()),
+        Some("raw: bucketed range aggregation (issue #507)")
+    );
+
+    // The executing path's own reported statement, for the same query.
+    let (_r, _w, executed) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query with explain");
+    let issued = executed
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the execution payload names the metric read");
+    assert_eq!(
+        reported, issued,
+        "the explain seam and the executing path must report ONE statement"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct UnwrapSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SumRow {
+    s: f64,
+    /// XOR of every extracted value's bit pattern — order-independent, so
+    /// it compares the VALUE SET and cannot be confused with a summation
+    /// order difference.
+    x: u64,
+    n: u64,
+}
+
+/// **The claim W4's exact comparison rested on, measured — and it is
+/// false** (issue #507 W4 §6).
+///
+/// The claim was: at `max_threads = 1` the database's `sum` accumulates a
+/// single fingerprint's rows in `(service, fingerprint, timestamp_ns)`
+/// order, which within one fingerprint is timestamp order, so the two
+/// summations are the same summation and agree bit for bit.
+///
+/// **They do not agree, at any of the three sizes**, measured on
+/// `clickhouse/clickhouse-server:26.3` (server 26.3.29.7):
+///
+/// ```text
+///  N        ours                 the database         ULPs   |diff|      bound
+///  1e3      0xc16bd86f1537bba1   0xc16bd86f1537bba2      1   1.86e-9   3.29e-5
+///  1e5      0x41b936b66d98bf1a   0x41b936b66d98bf12      8   4.77e-7   2.90e-1
+///  1e6      0x41ac0f9d50e2fd32   0x41ac0f9d50e2fd51     31   9.24e-7   2.86e+1
+/// ```
+///
+/// **The cause is the block, not the thread.** At `max_threads = 1` and
+/// `max_block_size = 1` the database reproduces the left-to-right sum
+/// exactly; every larger block size differs, and not monotonically —
+/// measured over 100 000 of these values against a strictly sequential
+/// `arrayFold` in the database itself:
+///
+/// ```text
+///  left to right (arrayFold)  C193FE7B56D2A381
+///  max_block_size = 1         C193FE7B56D2A381   equal
+///  max_block_size = 64        C193FE7B56D2A394
+///  max_block_size = 1024      C193FE7B56D2A3A9
+///  max_block_size = 8192      C193FE7B56D2A3AE
+///  max_block_size = 65505     C193FE7B56D2A193
+/// ```
+///
+/// A block size of one is not a setting a read path can carry, so pinning
+/// the thread count does not recover a bit-exact comparison.
+///
+/// **What this test therefore asserts** is the property that does hold and
+/// that a reader needs: the two answers differ by at most
+/// `2(n−1)·u·Σ|vᵢ|`, the bound any two evaluation orders of the same `n`
+/// values obey. It also rules out the one confound that would make the
+/// sums incomparable — a value set that is not the same on both sides —
+/// before reading anything from them.
+///
+/// The values are generated once, in Rust, and written with `{:?}` —
+/// Rust's shortest round-tripping float form — so the bytes the database
+/// parses decode back to exactly the `f64` this test summed.
+#[tokio::test]
+async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4sum_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4sum_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let mut results: Vec<(u64, f64, f64, f64, f64)> = Vec::new();
+    for (n, fp) in [(1_000u64, 901u64), (100_000, 902), (1_000_000, 903)] {
+        // Mixed magnitude and sign, deterministic (the splitmix64 pattern).
+        let values: Vec<f64> = (0..n)
+            .map(|i| {
+                let r = splitmix64(i);
+                let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+                let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+                let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+                sign * mag * (1.0 + frac)
+            })
+            .collect();
+        // Recent, not a fixed epoch: `log_samples` carries a TTL on
+        // `timestamp_ns` with `ttl_only_drop_parts`, so a part written at a
+        // date older than the retention window is dropped on arrival and
+        // the query answers `0` with no error. Measured: a 2023 timestamp
+        // inserted, reported success, and left zero rows.
+        let t0 = now_ns() - 3_600_000_000_000;
+        let rows: Vec<UnwrapSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| UnwrapSeedRow {
+                service: "w4".to_string(),
+                fingerprint: fp,
+                timestamp_ns: t0 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"v":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+
+        // Left to right, in timestamp order — the evaluator's accumulation.
+        let mut ours = 0.0f64;
+        for v in &values {
+            ours += *v;
+        }
+
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n \
+             FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let settings = QuerySettings::new().set("max_threads", 1);
+        let mut stream = client
+            .query_stream::<SumRow>(&sql, &settings)
+            .await
+            .expect("execute");
+        let row = stream.next().await.expect("one row").expect("decode");
+        drop(stream);
+
+        // The confound, ruled out first: if the database decoded even one
+        // value differently from the bytes we wrote, the sums would differ
+        // for a reason that has nothing to do with order. The XOR of the
+        // bit patterns is order-independent, so it compares the value SET.
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        assert_eq!(row.n, n, "N={n}: every row must be present");
+        assert_eq!(
+            row.x, our_xor,
+            "N={n}: the database decoded a different value set, so nothing \
+             about summation order can be read from the sums"
+        );
+
+        let theirs = row.s;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let bound = 2.0 * ((n - 1) as f64) * (f64::EPSILON / 2.0) * sum_abs;
+        let ulps = (ours.to_bits() as i64 - theirs.to_bits() as i64).abs();
+        eprintln!(
+            "N={n}: ours={ours:?} ({:#018x})  theirs={theirs:?} ({:#018x})  \
+             ulps={ulps}  diff={:e}  bound={bound:e}  sum|v|={sum_abs:e}",
+            ours.to_bits(),
+            theirs.to_bits(),
+            (ours - theirs).abs()
+        );
+        results.push((n, ours, theirs, sum_abs, bound));
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+
+    for (n, ours, theirs, sum_abs, bound) in &results {
+        eprintln!(
+            "N={n}: agree={}  |diff|={:e}  bound={:e}  sum|v|={:e}",
+            ours.to_bits() == theirs.to_bits(),
+            (ours - theirs).abs(),
+            bound,
+            sum_abs
+        );
+    }
+    // The property that holds, and the one a reader can rely on.
+    for (n, ours, theirs, _sum_abs, bound) in &results {
+        let diff = (ours - theirs).abs();
+        assert!(
+            diff <= *bound,
+            "N={n}: two evaluation orders of the same {n} values may differ by \
+             at most 2(n-1)*u*sum|v| = {bound:e}, got {diff:e}"
+        );
+    }
+    // And the non-vacuity of the sentence above: they DO differ, so the
+    // bound is doing work rather than passing on equality. If this ever
+    // stops holding, the database has changed its accumulation and W4's
+    // comparison can be tightened — which is good news and should not be
+    // discovered by a silent pass.
+    assert!(
+        results
+            .iter()
+            .any(|(_, o, t, _, _)| o.to_bits() != t.to_bits()),
+        "every size agreed bit for bit: re-read this test's doc comment, the \
+         measurement it records has changed"
+    );
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the spread gate and the reproducibility gate.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PartCountRow {
+    n: u64,
+}
+
+/// One database name, for [`drop_leftovers_of`].
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DbNameRow {
+    name: String,
+}
+
+/// Drops every database whose name starts with `stem`, then returns how
+/// many it dropped.
+///
+/// **Why a suite needs this at all.** A test that names its database with
+/// a UUID and drops it on the last line leaves that database behind
+/// whenever it fails — and a break test, which is how this suite's
+/// assertions are shown to work, fails on purpose. Each such run would
+/// leak one database for good.
+///
+/// **What it can reach.** `stem` is composed through
+/// `pulsus_testkit::test_db`, so it begins with this checkout's
+/// `PULSUS_TEST_CH_DATABASE_PREFIX` and the sweep cannot see another
+/// agent's databases — whose live run is indistinguishable from their
+/// leftovers.
+async fn drop_leftovers_of(admin: &ChClient, stem: &str) -> usize {
+    let mut names = admin
+        .query_stream::<DbNameRow>(
+            &format!("SELECT name FROM system.databases WHERE startsWith(name, '{stem}')"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("list leftover databases");
+    let mut found = Vec::new();
+    while let Some(row) = names.next().await {
+        found.push(row.expect("decode a database name").name);
+    }
+    drop(names);
+    for name in &found {
+        admin
+            .execute(
+                &format!("DROP DATABASE IF EXISTS {name}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop a leftover database");
+    }
+    found.len()
+}
+
+/// The unwrapped-value corpus both W4 gates read: `n` deterministic values
+/// of mixed magnitude and sign, one fingerprint, one JSON body each.
+///
+/// Returns the values in timestamp order. **The caller asserts the row
+/// count against `n` before measuring anything** — the standing rule this
+/// issue adopted after an insert that reported success and left zero rows
+/// (a fixed 2023 timestamp against the table's retention rule, which drops
+/// whole parts).
+fn unwrap_values(n: u64) -> Vec<f64> {
+    (0..n)
+        .map(|i| {
+            let r = splitmix64(i);
+            let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+            let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+            let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+            sign * mag * (1.0 + frac)
+        })
+        .collect()
+}
+
+fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| UnwrapSeedRow {
+            service: "w4".to_string(),
+            fingerprint: fp,
+            timestamp_ns: t0 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"v":{v:?}}}"#),
+            structured_metadata: String::new(),
+        })
+        .collect()
+}
+
+/// `2(n−1)·u·Σ|vᵢ|` with `u = 2⁻⁵³` — the most two evaluation orders of the
+/// same `n` values can differ by (issue #507 W4 §5).
+fn summation_spread_bound(values: &[f64]) -> f64 {
+    let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+    2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+}
+
+/// **The gate that would tell us the ruling was wrong** (issue #507 W4 §6).
+///
+/// The owner accepted that the database chooses the summation order and may
+/// choose differently between two executions. What that ruling assumes is
+/// that the resulting answers stay within a rounding difference of each
+/// other. This asserts exactly that, and against nothing foreign: it
+/// compares our own answers at four thread counts **with each other**, so
+/// it needs no tolerance against another implementation, and it is
+/// scale-invariant, so it is a Tier-1 gate.
+///
+/// It fails precisely when the accepted divergence stops being last-bits.
+#[tokio::test]
+async fn the_thread_count_spread_stays_inside_the_summation_bound() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let values = unwrap_values(N);
+    let rows = unwrap_rows(1, now_ns() - 3_600_000_000_000, &values);
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert");
+
+    let sql = format!(
+        "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+         groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+         count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = 1"
+    );
+    let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+
+    let mut answers: Vec<(u64, f64)> = Vec::new();
+    for threads in [1u64, 2, 4, 8] {
+        for _rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", threads);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            // The standing rule: the input is asserted present, and the
+            // same values, before the result is read for anything.
+            assert_eq!(
+                row.n, N,
+                "max_threads={threads}: the corpus must be present"
+            );
+            assert_eq!(row.x, our_xor, "max_threads={threads}: the same value set");
+            answers.push((threads, row.s));
+        }
+    }
+
+    let bound = summation_spread_bound(&values);
+    for (ta, a) in &answers {
+        for (tb, b) in &answers {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= bound,
+                "max_threads={ta} answered {a:?} and max_threads={tb} answered {b:?}: two \
+                 evaluation orders of the same {N} values may differ by at most \
+                 2(n-1)*u*sum|v| = {bound:e}, got {diff:e} — the accepted divergence has \
+                 stopped being a rounding difference"
+            );
+        }
+    }
+    // Non-vacuity: the thread count DOES move the answer, so the bound is
+    // doing work rather than passing on equality.
+    let distinct: std::collections::BTreeSet<u64> =
+        answers.iter().map(|(_, v)| v.to_bits()).collect();
+    assert!(
+        distinct.len() > 1,
+        "every thread count answered the same bits: the spread this bounds no longer \
+         exists, and the gate is passing on equality rather than on the bound"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
+
+/// **Repeated executions of the same query on unchanged data agree bit for
+/// bit, at `max_threads = 1` and a fixed part layout** (issue #507 W4 §3).
+///
+/// Its failure means a source of nondeterminism exists that is neither the
+/// thread count nor the part count — which is a thing we would want to know
+/// and currently could not learn. It is exact, not tolerance-based: the
+/// claim is reproducibility, not closeness.
+///
+/// **The scope was measured rather than assumed**, because the plan scoped
+/// it to one part and named the measurement that would widen it. Six
+/// repetitions per cell, over 1 000 000 identical values laid out in 1, 2
+/// and 8 parts with merges stopped, **on an otherwise idle server**:
+///
+/// ```text
+///  parts  threads=1           threads=4           threads=8
+///  1      C1B845C49C9466C4    C1B845C49C9465EC    C1B845C49C946670
+///  2      C1B845C49C94663A    C1B845C49C946623    C1B845C49C946622
+///  8      C1B845C49C946663    C1B845C49C946662    C1B845C49C946663
+/// ```
+///
+/// Constant in every cell, and different between cells. So the part count
+/// is a **third source of divergence**, alongside the thread count and the
+/// block accumulation that separates us from the database in the first
+/// place.
+///
+/// **`max_threads = 1` is not a detail of this test, it is its subject.**
+/// The first version pinned four threads and passed alone and failed
+/// inside the suite, fourteen ULPs apart. The cause is not scheduling
+/// jitter: `max_threads` is an UPPER BOUND, and the server reduces the
+/// EFFECTIVE degree of parallelism when it is busy, so the answer moves
+/// with the load rather than with the setting. Measured directly, six
+/// repetitions each, with six concurrent heavy queries as the load:
+///
+/// ```text
+///  quiet,     threads=4   C1B845C49C9465EC   constant
+///  under load, threads=4  C1B845C49C9465E6   constant, and DIFFERENT
+///  under load, threads=1  C1B845C49C9466C4   constant, and equal to quiet
+/// ```
+///
+/// At one thread the effective degree is one whatever the server is doing,
+/// which is what makes the claim below reproducible rather than merely
+/// usually true. **The user-visible consequence is worth stating: two
+/// refreshes of an unchanged dashboard can differ because the server was
+/// busier, not because anything was configured differently.**
+///
+/// `SYSTEM STOP MERGES` is what makes the part count an input rather than a
+/// race: without it a background merge rewrites eight parts into three
+/// while the test runs, which was measured before this test was written.
+#[tokio::test]
+async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    const THREADS: u64 = 1;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4parts_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4parts_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.log_samples"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+
+    let values = unwrap_values(N);
+    let t0 = now_ns() - 3_600_000_000_000;
+    let mut per_layout: Vec<(usize, u64)> = Vec::new();
+    for (parts, fp) in [(1usize, 11u64), (2, 12), (8, 13)] {
+        let chunk = values.len() / parts;
+        for c in 0..parts {
+            let lo = c * chunk;
+            let hi = if c + 1 == parts {
+                values.len()
+            } else {
+                lo + chunk
+            };
+            let rows = unwrap_rows(fp, t0 + lo as i64, &values[lo..hi]);
+            client
+                .insert_block("log_samples", &rows)
+                .await
+                .expect("insert");
+        }
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        let mut seen: Vec<u64> = Vec::new();
+        for rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", THREADS);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            assert_eq!(row.n, N, "parts={parts}: the corpus must be present");
+            assert_eq!(row.x, our_xor, "parts={parts}: the same value set");
+            seen.push(row.s.to_bits());
+            assert_eq!(
+                seen[0], seen[rep],
+                "parts={parts}, max_threads={THREADS}: repetition {rep} answered different \
+                 bits from repetition 0, so a source of nondeterminism exists that is \
+                 neither the thread count nor the part count"
+            );
+        }
+        // The layout is the one asked for, not the one a merge left behind.
+        let layout_sql = format!(
+            "SELECT count() AS n FROM system.parts WHERE database = '{db}' \
+             AND table = 'log_samples' AND active AND rows > 0"
+        );
+        let mut stream = admin
+            .query_stream::<PartCountRow>(&layout_sql, &QuerySettings::new())
+            .await
+            .expect("read the part layout");
+        let observed = stream.next().await.expect("one row").expect("decode").n;
+        drop(stream);
+        per_layout.push((parts, seen[0]));
+        assert!(
+            observed >= parts as u64,
+            "parts={parts}: the table holds {observed} active parts, so the layout this cell \
+             names was merged away before it was measured"
+        );
+    }
+    // The measured finding this gate's scope rests on: the part layout
+    // moves the answer. If it stopped doing so, the scope could be widened
+    // and the user-facing sentence loses a clause — which should be a
+    // decision, not a silent pass.
+    let distinct: std::collections::BTreeSet<u64> = per_layout.iter().map(|(_, b)| *b).collect();
+    assert!(
+        distinct.len() > 1,
+        "every part layout answered the same bits: {per_layout:?} — the part count is no \
+         longer a source of divergence and the documentation says it is"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the unwrapped read, end to end, one case per measured
+// class of parser disagreement.
+// ---------------------------------------------------------------------
+
+/// **One case per measured class, each with the value that produces it**
+/// (issue #507 W4, review round 4).
+///
+/// ```text
+///  case        value                       expected     the two parsers
+///  ordinary    45.25, "2.25", 4            LOWERS       agree; the quoted form is the point
+///  one_ulp     "9367469347402735e292"      LOWERS       agree ONLY under the parser setting
+///  class A     "E12"                       FALLS BACK   NULL here, a parse error in ours
+///  class B     "1.7976931348623159e308"    FALLS BACK   NULL here, inf in ours
+///  class C     "5e-324"                    LOWERS       bits 0x1 on both sides
+///  over        "inf"                       FALLS BACK   both parse it; the prefix test does not
+///  nan_exp     "0e999999"                  FALLS BACK   both +0; the denotation clause refuses it
+///  under_exp   "9999999999999999e-324"     LOWERS       bits 0x730d67819e8d2 on both sides
+///  shadowed    metadata latency=5, bodies 7 and 8       FALLS BACK   TWO series, keyed by the
+///                                                       parsed value under latency_extracted
+///  fixed_sub   "0.000…0005", 326 chars     LOWERS       bits 0x1 on both sides
+///  avg_over    two × 1e308, avg_over_time  FALLS BACK   inf here, 1e308 in ours — a FINITE
+///                                                       mean turned into infinity
+/// ```
+///
+/// **Three cases moved from FALLS BACK to LOWERS in review round 4**, and
+/// the reason is one statement-level setting rather than a change to the
+/// guard. `sql::UNWRAP_PARSER_SETTING` renders `precise_float_parsing = 1`
+/// into the statement; under it C, `under_exp` and `fixed_sub` convert to
+/// the same bits as `f64::from_str` and qualify. `one_ulp` is the case that
+/// makes the setting necessary rather than tidy: with `n = 1` the
+/// summation-order bound `2(n−1)·u·Σ|vᵢ|` is ZERO, so the default parser's
+/// `0x7fe0acb5cadc2918` against our `0x7fe0acb5cadc2917` is a wrong answer
+/// with nothing to absorb it. Delete the setting from `metric_range_unwrapped`
+/// and this case is what goes red.
+///
+/// A and B are still refused, now by `isNotNull`: both texts convert to
+/// NULL under the setting. `over` and `nan_exp` are over-rejections — the
+/// two parsers agree on `"inf"` and on `"0e999999"` — kept because dropping
+/// a conjunct widens the lowered set, which is not a thing to do on one
+/// setting at the end of a wave.
+///
+/// **The control is the same query with `| drop zzz` after the unwrap** —
+/// a label filter after the unwrap blocks the lowering, and one naming a label the
+/// corpus does not carry keeps every line (an absent label reads as empty). The plan shapes are
+/// asserted to differ first, so the test cannot compare one path with
+/// itself.
+///
+/// The fallback is observed rather than inferred: on a fallback the
+/// explain payload's LAST `metric_read` is the client sliding scan, whose
+/// `ORDER BY service ASC` no lowered statement carries.
+#[tokio::test]
+async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4unwrap_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4unwrap_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    // Each class gets its own stream, so one class's fallback cannot
+    // decide another's.
+    // The 326-character fixed-point spelling of `5e-324`: no exponent, so
+    // round 1's `[eE]` clause did not see it (review round 2).
+    let fixed_subnormal = format!("\"0.{}5\"", "0".repeat(323));
+    /// One case of the differential: its name and stream, the values every
+    /// row carries, the structured metadata on every row, the reducer, and
+    /// whether the lowered query is expected to fall back.
+    type UnwrapCase<'a> = (&'a str, u64, &'a [&'a str], &'a str, &'a str, bool);
+    let cases: [UnwrapCase<'_>; 11] = [
+        (
+            "ordinary",
+            201,
+            &["45.25", "\"2.25\"", "4"],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 4: ONE row, so the summation-order bound is zero
+        // and the only slack is the parser's. The default parser converts
+        // this text to `0x7fe0acb5cadc2918` and `f64::from_str` gives
+        // `0x7fe0acb5cadc2917`; the statement's
+        // `SETTINGS precise_float_parsing = 1` is what makes the two sides
+        // equal, and this case is what reddens without it.
+        (
+            "one_ulp",
+            211,
+            &["\"9367469347402735e292\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        ("class_a", 202, &["1", "\"E12\""], "", "sum_over_time", true),
+        (
+            "class_b",
+            203,
+            &["1", "\"1.7976931348623159e308\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 4: under the parser setting this converts to bits
+        // `0x1`, which is what `f64::from_str` gives, so it QUALIFIES and
+        // the two paths must answer the same bits. It fell back before the
+        // setting, when the conversion was `0`.
+        (
+            "class_c",
+            204,
+            &["1", "\"5e-324\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        (
+            "over_reject",
+            205,
+            &["1", "\"inf\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 1: a digit with an exponent that overflows, and one
+        // that underflows. Both pass the anchored prefix test, so the hole
+        // was never in that test. Review round 4: under the parser setting
+        // `"0e999999"` converts to `+0` rather than to a negative NaN, and
+        // what refuses it now is the denotation clause — an over-rejection,
+        // since our parser also gives `+0`.
+        (
+            "nan_exp",
+            206,
+            &["1", "\"0e999999\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 4: the same move as `class_c` at a magnitude where
+        // the old divergence was obvious — `0` against
+        // `0x730d67819e8d2`. Under the setting both sides convert to
+        // `0x730d67819e8d2`.
+        (
+            "under_exp",
+            207,
+            &["1", "\"9999999999999999e-324\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 2: the same underflow written WITHOUT an exponent,
+        // which is why the guard asks what the text DENOTES rather than how
+        // it is spelled. Review round 4: under the parser setting this
+        // converts to bits `0x1` on both sides, so it lowers.
+        (
+            "fixed_subnormal",
+            209,
+            &["1", fixed_subnormal.as_str()],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 2: two accepted samples whose SUM overflows where
+        // the reference's incremental mean does not — the database
+        // answers `inf`, the evaluator `1e308`.
+        (
+            "avg_overflow",
+            210,
+            &["1e308", "1e308"],
+            "",
+            "avg_over_time",
+            true,
+        ),
+        // Review round 1: the metadata carries the unwrapped name, so the
+        // evaluator keys its series by the PARSED value under
+        // `latency_extracted` — two series here, which no group key the
+        // statement has can express.
+        (
+            "shadowed",
+            208,
+            &["7", "8"],
+            r#"{"latency":"5"}"#,
+            "sum_over_time",
+            true,
+        ),
+    ];
+    let mut rows: Vec<BucketedSeedRow> = Vec::new();
+    for (name, fp, values, sm, _, _) in cases {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        for (i, v) in values.iter().enumerate() {
+            rows.push(BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v}}}"#),
+                structured_metadata: sm.to_string(),
+            });
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the unwrapped fixture");
+    // The standing rule: the input is asserted present before anything is
+    // read from it.
+    let seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let seeded = {
+        let mut s = seeded;
+        let n = s.next().await.expect("one row").expect("decode").n;
+        drop(s);
+        n
+    };
+    assert_eq!(seeded, rows.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    for (name, _fp, _values, _sm, op, expect_fallback) in cases {
+        let lowered_q = format!(
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        let client_q = format!(
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        );
+        // Two paths, asserted to BE two paths.
+        let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => mp,
+            other => panic!("{q}: {other:?}"),
+        };
+        assert!(
+            shape(&lowered_q).client.is_none(),
+            "{name}: the fixture query must plan the lowered read"
+        );
+        assert!(
+            shape(&client_q).client.is_some(),
+            "{name}: the control must stay on the client path"
+        );
+
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                match engine
+                    .query_explained(&parse(&q).expect("parse"), params)
+                    .await
+                {
+                    Ok((result, _w, explain)) => {
+                        let QueryResult::Matrix(series) = result else {
+                            panic!("{q}: expected a matrix");
+                        };
+                        let last_read = explain
+                            .stages
+                            .iter()
+                            .rfind(|s| s.name == "metric_read")
+                            .map(|s| s.sql.clone())
+                            .unwrap_or_default();
+                        let points: Vec<(i64, u64)> = series
+                            .into_iter()
+                            .flat_map(|s| s.points)
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect();
+                        Ok((points, last_read))
+                    }
+                    // A value the EVALUATOR rejects is a 400 for the whole
+                    // series, and the lowered statement cannot produce one:
+                    // it would have summed a `0` and answered a number. So
+                    // an error here is itself the proof that the query fell
+                    // back — a stronger observable than the reported SQL.
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        let lowered_res = answer(lowered_q.clone()).await;
+        let client_res = answer(client_q).await;
+
+        if let (Err(le), Err(ce)) = (&lowered_res, &client_res) {
+            assert_eq!(le, ce, "{name}: both paths must refuse the same way");
+            assert!(
+                expect_fallback,
+                "{name}: a refusal means the lowered path fell back, which this case did not \
+                 expect"
+            );
+            continue;
+        }
+        let (lowered, last_read) = lowered_res.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (client_ans, _) = client_res.unwrap_or_else(|e| panic!("{name} control: {e}"));
+
+        let fell_back = last_read.contains("ORDER BY service ASC");
+        assert_eq!(
+            fell_back, expect_fallback,
+            "{name}: expected fallback={expect_fallback}; the last reported metric_read was:\n\
+             {last_read}"
+        );
+
+        assert_eq!(
+            lowered, client_ans,
+            "{name}: the two paths must answer the same bits"
+        );
+        if name == "shadowed" {
+            // And the shape the collapse would have produced: TWO series,
+            // because the parsed value survives as `latency_extracted` and
+            // its two values are two series. A recomputed group answers
+            // ONE series of 10 here, which is what an earlier round did.
+            assert_eq!(
+                lowered.len(),
+                2,
+                "{name}: the parsed collision label splits the series: {lowered:?}"
+            );
+            for (_, v) in &lowered {
+                assert_eq!(
+                    *v,
+                    5.0f64.to_bits(),
+                    "{name}: each series is the metadata's own value"
+                );
+            }
+        }
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The spread reducers are NOT lowered, and the high-offset corpus is
+/// why** (issue #507 W4, review rounds 1 and 3).
+///
+/// They were lowered through `stddevPopStable`/`varPopStable`, which fixed
+/// the catastrophic cancellation the plain `stddevPop`/`varPop` have —
+/// over `{1e16, 1e16+2, +4, +8, +16}` those answer `0` and `0` against the
+/// evaluator's `31.2` and `5.585696017507576`. The stable variants
+/// returned the evaluator's bits on that corpus, and **that was not
+/// enough**: over 300,000 samples at `max_threads = 8` and
+/// `max_block_size = 65536` the database's variance came back FINITE and
+/// wrong — bits `9090485321501537692` against the client's
+/// `9090485321501537553`, a difference of `1.0334767513920592e286`.
+///
+/// **A finite wrong answer is what the reader's guard cannot see.** The
+/// non-finite fallback rests on overflow being absorbing, which holds for
+/// a sum and not for a partial-moment algorithm. So the pair is withdrawn
+/// at `sql::UnwrapReducer`, and this test is what fails if it comes back:
+/// the reported statement must be the client scan, and the answer must be
+/// the evaluator's.
+#[tokio::test]
+async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread2_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread2_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507spread";
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 301, \
+                 '{service}', '{{\"service_name\":\"{service}\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    let offsets = [0.0f64, 2.0, 4.0, 8.0, 16.0];
+    let rows: Vec<BucketedSeedRow> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, d)| BucketedSeedRow {
+            service: service.to_string(),
+            fingerprint: 301,
+            timestamp_ns: t - 30_000_000_000 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"latency":{:?}}}"#, 1e16f64 + d),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the high-offset fixture");
+    let mut seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let n = seeded.next().await.expect("one row").expect("decode").n;
+    drop(seeded);
+    assert_eq!(n, offsets.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    // The evaluator's own answers on this corpus, which are also the
+    // reference's: the variance of five values 0, 2, 4, 8, 16 above a
+    // shared offset is 31.2, and its square root 5.585696017507576.
+    for (op, want) in [
+        ("stdvar_over_time", 31.2f64),
+        ("stddev_over_time", 5.585696017507576f64),
+    ] {
+        let q = format!(
+            r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        match plan(&parse(&q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => assert!(
+                mp.client.is_some(),
+                "{op} must stay client-side: the database's partial-moment aggregate can be \
+                 finite and wrong"
+            ),
+            other => panic!("{q}: {other:?}"),
+        }
+        let (result, _w, explain) = engine
+            .query_explained(&parse(&q).expect("parse"), &params)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let QueryResult::Matrix(series) = result else {
+            panic!("{q}: expected a matrix");
+        };
+        let read = explain
+            .stages
+            .iter()
+            .rfind(|s| s.name == "metric_read")
+            .map(|s| s.sql.clone())
+            .unwrap_or_default();
+        assert!(
+            read.contains("ORDER BY service ASC"),
+            "{op}: the statement must be the client sliding scan, got:\n{read}"
+        );
+        let points: Vec<(i64, u64)> = series
+            .into_iter()
+            .flat_map(|s| s.points)
+            .map(|(ts, v)| (ts, v.to_bits()))
+            .collect();
+        assert_eq!(
+            points,
+            vec![(t, want.to_bits())],
+            "{op}: the evaluator's value, bit for bit"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The three boundary corpora of W4 §8** (issue #507), each chosen for
+/// where the two summations can differ rather than for being realistic.
+///
+/// The condition number `κ = Σ|vᵢ| / |Σvᵢ|` is what decides whether the
+/// summation-order bound is tight or vacuous: the absolute bound
+/// `2(n−1)·u·Σ|vᵢ|` is the same either way, but as a FRACTION of the answer
+/// it grows with `κ` without limit.
+///
+/// ```text
+///  corpus       values                        κ      the two paths
+///  exact        1, 2, 4, 8                    1      the same bits; no order can round
+///  mild         55 × +1e9+δ, 5 × −1e9+δ       1.2    inside 2(n−1)·u·Σ|vᵢ|
+///  cancelling   21 × (1e16, 1, −1e16)         huge   the same wrong answer, where the exact
+///                                                    sum of the STORED samples is 21
+/// ```
+///
+/// **The cancelling corpus is shared behaviour, not a divergence**, and it
+/// is here to be recorded as such: the reference's own summation is a plain
+/// accumulation with no compensation, so it loses the same digits. A
+/// compensated sum would answer 21.
+///
+/// **Every value is exactly representable, and the residual survives the
+/// INSERT.** An earlier fixture stored `-1e16 + 1.0`, which is already
+/// `-1e16` as an `f64`, so its sum was exactly zero before any
+/// accumulation and the agreement it asserted followed from the data. Nothing in this build promises
+/// otherwise, and the ledger carries no row for it.
+#[tokio::test]
+async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    // Review round 4: this test had no teardown at all, so every run left
+    // its database behind. The end of the test drops it; this sweeps what
+    // earlier runs left, including the deliberate failures a break test
+    // produces, which never reach the end.
+    let stem = pulsus_testkit::test_db("pulsus_read_it_qlg_w4kappa_");
+    let swept = drop_leftovers_of(&admin, &stem).await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4kappa_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+
+    // exactly representable | well conditioned | catastrophic cancellation
+    let exact: Vec<f64> = vec![1.0, 2.0, 4.0, 8.0];
+    // 55 positive and 5 negative of the same magnitude gives
+    // `κ = 60/50 = 1.2`; the fractional parts are what force the rounding
+    // the two orders can differ on.
+    let mild: Vec<f64> = (0..60)
+        .map(|i| {
+            let m = 1e9 + (i as f64) / 8.0;
+            if i < 55 { m } else { -m }
+        })
+        .collect();
+    // **Every value is exactly representable and the residual is NOT
+    // rounded away before insertion** (review round 2): `-1e16 + 1.0` is
+    // already `-1e16` as an `f64`, so the earlier fixture stored exactly
+    // opposing values and its agreement on zero followed from the data
+    // rather than from the accumulation. Here each triple is
+    // `1e16, 1, -1e16` — the `1` survives in the stored samples, and it is
+    // the ACCUMULATION that loses it, which is the thing being measured.
+    let cancelling: Vec<f64> = (0..21).flat_map(|_| [1e16f64, 1.0, -1e16f64]).collect();
+
+    let mut out: Vec<(String, f64, u64, u64)> = Vec::new();
+    for (name, fp, values) in [
+        ("exact", 401u64, &exact),
+        ("mild", 402, &mild),
+        ("cancelling", 403, &cancelling),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        let rows: Vec<BucketedSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+        let mut seeded = admin
+            .query_stream::<PartCountRow>(
+                &format!("SELECT count() AS n FROM {db}.log_samples WHERE service = '{name}'"),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("count");
+        let n = seeded.next().await.expect("one row").expect("decode").n;
+        drop(seeded);
+        assert_eq!(n, values.len() as u64, "{name}: the corpus must be present");
+
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: t,
+                step_ns: STEP as u64,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                let (result, _w) = engine
+                    .query(&parse(&q).expect("parse"), params)
+                    .await
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                let QueryResult::Matrix(series) = result else {
+                    panic!("{q}: expected a matrix");
+                };
+                series
+                    .into_iter()
+                    .flat_map(|s| s.points)
+                    .map(|(_, v)| v)
+                    .next()
+                    .expect("one point")
+            }
+        };
+        let lowered = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        ))
+        .await;
+        let client_ans = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        ))
+        .await;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let mut lr = 0.0f64;
+        for v in values.iter() {
+            lr += *v;
+        }
+        let kappa = sum_abs / lr.abs();
+        eprintln!(
+            "{name}: kappa={kappa:e} lowered={lowered:?} ({:#018x}) client={client_ans:?} \
+             ({:#018x}) bound={:e}",
+            lowered.to_bits(),
+            client_ans.to_bits(),
+            2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+        );
+        out.push((
+            name.to_string(),
+            kappa,
+            lowered.to_bits(),
+            client_ans.to_bits(),
+        ));
+
+        let bound = 2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+        match name {
+            // κ = 1 and every partial sum exactly representable: no order
+            // can round, so the two answers are the same bits.
+            "exact" => {
+                assert_eq!(kappa, 1.0, "the fixture must be perfectly conditioned");
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: an exactly representable sum cannot depend on the order"
+                );
+                assert_eq!(lowered, 15.0);
+            }
+            // κ ≈ 1.2: the bound is meaningful and both answers are inside
+            // it. Measured on this corpus they are also equal; the
+            // assertion is the bound, because equality here is the
+            // corpus's size and not a property of the two paths.
+            "mild" => {
+                assert!(
+                    (kappa - 1.2).abs() < 0.01,
+                    "{name}: the fixture's condition number is {kappa}"
+                );
+                assert!(
+                    (lowered - client_ans).abs() <= bound,
+                    "{name}: {lowered:?} vs {client_ans:?} exceeds {bound:e}"
+                );
+            }
+            // The accumulated sum is zero, so the bound is vacuous as a
+            // fraction of the answer. **Both sides return the same wrong
+            // number** — the exact total of the stored values is 21, and
+            // each triple `1e16`, `1`, `−1e16` loses its `1` to rounding
+            // in either order. That is shared behaviour, not a divergence:
+            // the reference's own summation is a plain accumulation with
+            // no compensation. (This comment described the DISCARDED pair
+            // fixture and its stated `32` until review round 3.)
+            "cancelling" => {
+                // **The exact sum is DERIVED FROM THE STORED VALUES, not
+                // stated**, because an earlier fixture stated `32` for
+                // samples whose exact sum was `0`: `-1e16 + 1.0` is
+                // already `-1e16` as an `f64`, so the residual it claimed
+                // had been rounded away before the insert. A compensated
+                // (Neumaier) sum recovers the exact total that a plain
+                // accumulation of the same values loses, and the two
+                // together are what say the corpus is what it claims.
+                let mut acc = 0.0f64;
+                let mut comp = 0.0f64;
+                for v in values.iter() {
+                    let t = acc + v;
+                    comp += if acc.abs() >= v.abs() {
+                        (acc - t) + v
+                    } else {
+                        (v - t) + acc
+                    };
+                    acc = t;
+                }
+                let exact_sum = acc + comp;
+                assert_eq!(
+                    exact_sum, 21.0,
+                    "{name}: the stored values must carry a residual a plain accumulation \
+                     loses; their exact sum is {exact_sum}"
+                );
+                assert!(kappa > 1e14, "{name}: κ = {kappa}");
+                assert_ne!(
+                    lowered, exact_sum,
+                    "{name}: the fixture must be one an accumulation loses, or it is not \
+                     testing cancellation"
+                );
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: both paths lose the same digits — the reference's own summation \
+                     is a plain accumulation with no compensation, so this is shared \
+                     behaviour and not a divergence"
+                );
+            }
+            other => panic!("unnamed corpus {other}"),
+        }
+    }
+    assert_eq!(out.len(), 3, "all three corpora ran");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}

@@ -45,10 +45,12 @@ Site	Literal	crates/pulsus-logql/src/ast.rs:249	-	-	<p>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> <status>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/charge.rs:548	-	-	, 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/compile.rs:1010	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:4710	-	-	<x> y	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:5963	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/charge.rs:549	-	-	, 	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1337	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1716	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:5239	-	-	<x> y	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:6492	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/predicate.rs:1188	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1013	-	-	<method> <_> <status> took <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1032	-	-	level=<level> msg	accept	accept	-	-	-
@@ -89,9 +91,9 @@ Site	Literal	docs/benchmarks/logs-differential-ledger.md:4173	-	-	<1a> x	accept	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4174	-	-		reject	reject	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4190	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	docs/features.md:72	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
-Site	Literal	docs/query-to-sql.md:230	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
-Site	Literal	docs/query-to-sql.md:501	-	-	p	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:731	-	-	) | write the comparison as 	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:763	-	-	p	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:764	-	-	 the group may be empty where the reference still produced a value, so it is 	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:996	-	-	path=<path> status=<code>	accept	accept	-	-	-
+Site	Literal	docs/query-to-sql.md:1005	-	-	path=<path> status=<code>	accept	accept	-	-	-
+Site	Literal	docs/query-to-sql.md:239	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
+Site	Literal	docs/query-to-sql.md:510	-	-	p	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:740	-	-	) | write the comparison as 	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:772	-	-	p	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:773	-	-	 the group may be empty where the reference still produced a value, so it is 	reject	reject	-	-	-
