@@ -142,42 +142,48 @@ impl MetricShape {
     }
 }
 
-/// The four reducers W4 lowers, closed so the SQL function name stays a
-/// `&'static str` and the wildcard-free property [`MetricShape`] has is
+/// The reducers W4 lowers — **two**, closed so the SQL function name stays
+/// a `&'static str` and the wildcard-free property [`MetricShape`] has is
 /// not lost on the way in (issue #507, W4).
 ///
-/// `rate_counter` is deliberately absent and it is not an oversight:
-/// `client_agg.rs`'s `rate_counter_over_sorted` is `last − first` plus a
-/// reset walk in timestamp order plus an extrapolation over the window, so
-/// it is not an aggregate and expressing it here would be a second
-/// implementation of that algorithm.
+/// **Three reducers are absent, and each is absent AT THIS TYPE so that a
+/// variant cannot be added back without deciding.**
+///
+/// * `rate_counter` is not an aggregate at all: `client_agg.rs`'s
+///   `rate_counter_over_sorted` is `last − first` plus a reset walk in
+///   timestamp order plus an extrapolation over the window, so expressing
+///   it here would be a second implementation of that algorithm.
+/// * `stddev_over_time` and `stdvar_over_time` were lowered through
+///   `stddevPopStable`/`varPopStable` and are **withdrawn** (review round
+///   3). The stable variants fixed the catastrophic cancellation the plain
+///   ones have — measured over `{1e16, 1e16+2, +4, +8, +16}`, where
+///   `varPop`/`stddevPop` answer `0` and `0` against the evaluator's
+///   `31.2` and `5.585696017507576` — but they did not make the two
+///   accumulations the same. Over 300,000 samples at `max_threads = 8`
+///   and `max_block_size = 65536` the database's variance came back
+///   **finite** and wrong: bits `9090485321501537692` against the client's
+///   `9090485321501537553`, a difference of `1.0334767513920592e286`,
+///   which is larger than the bound this build documents.
+///
+///   **That is why the withdrawal is at the type rather than in a guard.**
+///   The reader's "a non-finite aggregate falls back" rule rests on
+///   overflow being absorbing, which is true of a sum and is NOT true of a
+///   variance: a partial-moment algorithm can lose the answer and stay
+///   finite. Keeping these two would mean a second numerical argument on a
+///   path that has produced a high-severity finding in two of three review
+///   rounds, and the client path already computes them correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnwrapReducer {
     Sum,
     Avg,
-    StddevPop,
-    VarPop,
 }
 
 impl UnwrapReducer {
     /// Wildcard-free, the [`MetricShape::agg_expr`] arrangement.
-    ///
-    /// **The spread pair is the STABLE variant, and the plain one is a
-    /// wrong answer rather than a slower one.** `varPop`/`stddevPop`
-    /// accumulate `Σx²` and subtract, which cancels catastrophically on
-    /// values that share a large offset. Measured on 26.3.29.7 over
-    /// `{1e16, 1e16+2, +4, +8, +16}`: `varPop` and `stddevPop` answer
-    /// `0` and `0` where the evaluator answers `31.2` and
-    /// `5.585696017507576`; `varPopStable` and `stddevPopStable` answer
-    /// the evaluator's bits. The evaluator's own accumulator is the
-    /// incremental `delta · (v − mean)` form, which is what the stable
-    /// variants compute.
     pub const fn function(self) -> &'static str {
         match self {
             UnwrapReducer::Sum => "sum",
             UnwrapReducer::Avg => "avg",
-            UnwrapReducer::StddevPop => "stddevPopStable",
-            UnwrapReducer::VarPop => "varPopStable",
         }
     }
 }
@@ -325,7 +331,24 @@ const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
 /// is not. That is one character class and one fact, not a parse.
 ///
 /// The over-rejections are texts that denote zero but carry a non-zero
-/// digit somewhere, `"0e5"` being the shape of them; those fall back.
+/// digit somewhere, `"0e5"` being the shape of them; those fall back. That
+/// costs a wasted statement and never a wrong answer, and narrowing it to
+/// "a non-zero digit in the MANTISSA" would put the exponent marker back
+/// into the rule — the spelling dependency review round 2 removed. Left as
+/// it is, deliberately (review round 3).
+///
+/// **One consequence a reader should not have to discover: the same value
+/// takes two routes depending on how it was STORED.** `JSONExtractRaw`
+/// returns a JSON *number* as the database normalised it and a JSON
+/// *string* as it was written, so
+///
+/// ```text
+///   {"latency":0e5}     -> raw text `0`     -> lowers
+///   {"latency":"0e5"}   -> raw text `0e5`   -> falls back
+/// ```
+///
+/// Same number, same query, two routes and the same answer. It is visible
+/// only as a statement that did or did not run.
 const UNWRAP_TEXT_DENOTES_NON_ZERO: &str = "[1-9]";
 
 /// Which physical table a metric read targets, and that table's
@@ -3138,32 +3161,36 @@ mod tests {
         // stay a literal dot rather than becoming "any character".
         assert!(sql.contains(r"'^[+-]?([0-9]|\\.[0-9])'"), "{sql}");
 
-        // The four reducers render their own function name and nothing
-        // else about the statement moves.
-        for (reducer, f_name) in [
-            (UnwrapReducer::Avg, "avgIf("),
-            (UnwrapReducer::StddevPop, "stddevPopStableIf("),
-            (UnwrapReducer::VarPop, "varPopStableIf("),
-        ] {
-            let other = metric_range_unwrapped(
-                "log_samples",
-                reducer,
-                &crate::logql::predicate::literal("latency"),
-                &f.one_service,
-                &f.fingerprints,
-                BucketedScan {
-                    window: TimeWindow {
-                        start_ns: 1_699_999_940_000_000_000,
-                        end_ns: 1_700_003_600_000_000_000,
-                    },
-                    lower: ScanLowerBound::Exclusive,
-                    lo_ns: 1_699_999_940_000_000_000,
-                    step_ns: 60_000_000_000,
+        // The OTHER reducer renders its own function name and nothing else
+        // about the statement moves. There are two, and the loop this
+        // replaced was written when there were four (review round 3).
+        let other = metric_range_unwrapped(
+            "log_samples",
+            UnwrapReducer::Avg,
+            &crate::logql::predicate::literal("latency"),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
                 },
-                &f.no_predicate,
-            )
-            .expect("renders");
-            assert_eq!(other, sql.replace("sumIf(", f_name), "{reducer:?}");
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+        )
+        .expect("renders");
+        assert_eq!(other, sql.replace("sumIf(", "avgIf("));
+        // And the enum has exactly the two: a third variant makes this
+        // match non-exhaustive and the test stops compiling, which is
+        // where the decision to add one has to be taken.
+        for r in [UnwrapReducer::Sum, UnwrapReducer::Avg] {
+            match r {
+                UnwrapReducer::Sum => assert_eq!(r.function(), "sum"),
+                UnwrapReducer::Avg => assert_eq!(r.function(), "avg"),
+            }
         }
 
         // The decode binds on the column NAME, so the aliases and the

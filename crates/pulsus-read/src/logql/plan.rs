@@ -1777,8 +1777,6 @@ fn unwrapped_chain(op: RangeAggOp, pipeline: &[Stage]) -> Option<(sql::UnwrapRed
     let reducer = match op {
         RangeAggOp::SumOverTime => sql::UnwrapReducer::Sum,
         RangeAggOp::AvgOverTime => sql::UnwrapReducer::Avg,
-        RangeAggOp::StddevOverTime => sql::UnwrapReducer::StddevPop,
-        RangeAggOp::StdvarOverTime => sql::UnwrapReducer::VarPop,
         _ => return None,
     };
     let mut stages = pipeline.iter();
@@ -7146,14 +7144,14 @@ mod tests {
         assert_eq!(mp.routing.reason, "raw: instant query");
     }
 
-    /// Issue #507, W4 — **the four reducers that lower, the six that do
+    /// Issue #507, W4 — **the two reducers that lower, the eight that do
     /// not, and the chain shape**, one clause at a time.
     ///
     /// `rate_counter` is in the "does not" list for a reason no check
     /// enforces: `sql::UnwrapReducer` has no variant for it, so the match
     /// in `unwrapped_chain` cannot produce one.
     #[test]
-    fn an_unwrapped_chain_lowers_for_four_reducers_and_one_pipeline_shape() {
+    fn an_unwrapped_chain_lowers_for_two_reducers_and_one_pipeline_shape() {
         const MIN: u64 = 60_000_000_000;
         let spec = QuerySpec::Range {
             start_ns: 600_000_000_000,
@@ -7196,7 +7194,7 @@ mod tests {
             );
         };
 
-        // --- the four ------------------------------------------------
+        // --- the two -------------------------------------------------
         let pipe = r#"| json latency="latency" | unwrap latency"#;
         lowers(
             &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
@@ -7206,21 +7204,13 @@ mod tests {
             &format!(r#"avg_over_time({{a="b"}} {pipe} [1m])"#),
             sql::UnwrapReducer::Avg,
         );
-        lowers(
-            &format!(r#"stddev_over_time({{a="b"}} {pipe} [1m])"#),
-            sql::UnwrapReducer::StddevPop,
-        );
-        lowers(
-            &format!(r#"stdvar_over_time({{a="b"}} {pipe} [1m])"#),
-            sql::UnwrapReducer::VarPop,
-        );
         // A pushable line filter is already in the statement.
         lowers(
             &format!(r#"sum_over_time({{a="b"}} |= "boom" {pipe} [1m])"#),
             sql::UnwrapReducer::Sum,
         );
 
-        // --- the six that do not -------------------------------------
+        // --- the eight that do not -----------------------------------
         for (op, why) in [
             ("min_over_time", "order-independent, and out of W4's scope"),
             ("max_over_time", "the same"),
@@ -7230,6 +7220,12 @@ mod tests {
                 "rate_counter",
                 "not an aggregate: a reset walk and an extrapolation",
             ),
+            (
+                "stddev_over_time",
+                "withdrawn in review round 3: a partial-moment algorithm can lose the answer \
+                 and stay FINITE, so the reader's non-finite rule does not cover it",
+            ),
+            ("stdvar_over_time", "the same"),
         ] {
             stays_client(&format!(r#"{op}({{a="b"}} {pipe} [1m])"#), why);
         }

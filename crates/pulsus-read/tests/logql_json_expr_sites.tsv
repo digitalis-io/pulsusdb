@@ -104,11 +104,11 @@ Site	Literal	crates/pulsus-read/src/logql/plan.rs:1742	-	-	latency	accept	accept
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:1745	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:1746	-	-	lat	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:1761	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:4723	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:7200	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:7252	-	-	lat	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:7256	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:7260	-	-	app_id	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:4721	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:7198	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:7248	-	-	lat	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:7252	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:7256	-	-	app_id	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:268	-	-	{key}.k00000	accept	reject	-	-	a `format!` PLACEHOLDER (logql_json_flatten_budget.rs). Its real domain is `a`*32761 `.k00000`, FIELD DOT FIELD, which the reference accepts; that the generator produces only that is read out of the generator, not run (reading R4)
 Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:30	-	-	b.c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:157	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
@@ -235,10 +235,9 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b3_metric_range.test:207	
 Site	Literal	crates/pulsus-read/tests/logqltest_corpus.rs:876	-	-	c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3672	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3675	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3889	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3892	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4087	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4091	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3882	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4075	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4079	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	lvl	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	tid	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2672	-	-	a	accept	accept	-	-	

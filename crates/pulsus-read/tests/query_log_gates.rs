@@ -3778,22 +3778,27 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         .expect("drop the run database");
 }
 
-/// **The spread reducers on a high-offset corpus** (issue #507 W4, review
-/// round 1, finding 2).
+/// **The spread reducers are NOT lowered, and the high-offset corpus is
+/// why** (issue #507 W4, review rounds 1 and 3).
 ///
-/// `varPop`/`stddevPop` accumulate `Σx²` and subtract, which cancels
-/// catastrophically when the values share a large offset. Over
-/// `{1e16, 1e16+2, +4, +8, +16}` they answer `0` and `0` where the
-/// evaluator answers `31.2` and `5.585696017507576` — not a rounding
-/// difference and not inside any bound. The `Stable` variants compute the
-/// incremental `delta · (v − mean)` form the evaluator itself uses, and
-/// return its bits.
+/// They were lowered through `stddevPopStable`/`varPopStable`, which fixed
+/// the catastrophic cancellation the plain `stddevPop`/`varPop` have —
+/// over `{1e16, 1e16+2, +4, +8, +16}` those answer `0` and `0` against the
+/// evaluator's `31.2` and `5.585696017507576`. The stable variants
+/// returned the evaluator's bits on that corpus, and **that was not
+/// enough**: over 300,000 samples at `max_threads = 8` and
+/// `max_block_size = 65536` the database's variance came back FINITE and
+/// wrong — bits `9090485321501537692` against the client's
+/// `9090485321501537553`, a difference of `1.0334767513920592e286`.
 ///
-/// The corpus is what makes this discriminating: on ordinary values the
-/// two algorithms agree, so a fixture without the offset cannot tell a
-/// stable variant from an unstable one.
+/// **A finite wrong answer is what the reader's guard cannot see.** The
+/// non-finite fallback rests on overflow being absorbing, which holds for
+/// a sum and not for a partial-moment algorithm. So the pair is withdrawn
+/// at `sql::UnwrapReducer`, and this test is what fails if it comes back:
+/// the reported statement must be the client scan, and the answer must be
+/// the evaluator's.
 #[tokio::test]
-async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus() {
+async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
@@ -3801,22 +3806,15 @@ async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus(
         "pulsus_read_it_qlg_w4spread2_{}",
         uuid::Uuid::new_v4().simple()
     ));
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop");
-    admin
-        .execute(
-            &format!("CREATE DATABASE {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create");
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
     run_init(&admin, &test_ctx(&db)).await.expect("run_init");
     let client = data_client(&db).await;
 
@@ -3873,60 +3871,50 @@ async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus(
     };
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
 
-    // `avg_over_time` is deliberately NOT here, and the reason is narrower
-    // than an earlier version of this comment claimed. It differs from the
-    // reference because `avg` is a sum divided by a count and the
-    // reference computes an incremental mean — a documented divergence
-    // with its own ledger clause, and a different claim from the one this
-    // test makes. Measured on this fixture: `4846369599423283203` lowered
-    // against `…202` client-side, which is one ULP HERE and is not a
-    // bound: the two are different algorithms, and their difference is
-    // bounded by the same `2(n−1)·u·Σ|vᵢ|` as the sums. The overflow case
-    // it used to under-describe has its own row in the live differential
-    // (`avg_overflow`), where the database answers `inf`.
-    for op in ["stddev_over_time", "stdvar_over_time"] {
-        let lowered_q = format!(
+    // The evaluator's own answers on this corpus, which are also the
+    // reference's: the variance of five values 0, 2, 4, 8, 16 above a
+    // shared offset is 31.2, and its square root 5.585696017507576.
+    for (op, want) in [
+        ("stdvar_over_time", 31.2f64),
+        ("stddev_over_time", 5.585696017507576f64),
+    ] {
+        let q = format!(
             r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency [1m])"#
         );
-        let client_q = format!(
-            r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
-        );
-        let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
-            Ok(Plan::Metric(mp)) => mp,
+        match plan(&parse(&q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => assert!(
+                mp.client.is_some(),
+                "{op} must stay client-side: the database's partial-moment aggregate can be \
+                 finite and wrong"
+            ),
             other => panic!("{q}: {other:?}"),
+        }
+        let (result, _w, explain) = engine
+            .query_explained(&parse(&q).expect("parse"), &params)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let QueryResult::Matrix(series) = result else {
+            panic!("{q}: expected a matrix");
         };
-        assert!(shape(&lowered_q).client.is_none(), "{op} must lower");
-        assert!(shape(&client_q).client.is_some(), "{op}'s control must not");
-
-        let answer = |q: String| {
-            let engine = &engine;
-            let params = &params;
-            async move {
-                let (result, _w) = engine
-                    .query(&parse(&q).expect("parse"), params)
-                    .await
-                    .unwrap_or_else(|e| panic!("{q}: {e}"));
-                let QueryResult::Matrix(series) = result else {
-                    panic!("{q}: expected a matrix");
-                };
-                series
-                    .into_iter()
-                    .flat_map(|s| s.points)
-                    .map(|(ts, v)| (ts, v.to_bits()))
-                    .collect::<Vec<_>>()
-            }
-        };
-        let lowered = answer(lowered_q).await;
-        let client_ans = answer(client_q).await;
-        assert_eq!(
-            lowered, client_ans,
-            "{op}: the two paths must answer the same bits on a high-offset corpus"
-        );
-        // And the answer is not the degenerate one the unstable algorithm
-        // returns, so the fixture can tell them apart.
+        let read = explain
+            .stages
+            .iter()
+            .rfind(|s| s.name == "metric_read")
+            .map(|s| s.sql.clone())
+            .unwrap_or_default();
         assert!(
-            lowered.iter().all(|(_, v)| *v != 0.0f64.to_bits()),
-            "{op}: a zero here is the cancelling algorithm's answer, not the data's: {lowered:?}"
+            read.contains("ORDER BY service ASC"),
+            "{op}: the statement must be the client sliding scan, got:\n{read}"
+        );
+        let points: Vec<(i64, u64)> = series
+            .into_iter()
+            .flat_map(|s| s.points)
+            .map(|(ts, v)| (ts, v.to_bits()))
+            .collect();
+        assert_eq!(
+            points,
+            vec![(t, want.to_bits())],
+            "{op}: the evaluator's value, bit for bit"
         );
     }
 
@@ -4138,12 +4126,14 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
                     "{name}: {lowered:?} vs {client_ans:?} exceeds {bound:e}"
                 );
             }
-            // κ = ∞: the values cancel exactly, so the bound is vacuous as
-            // a fraction of the answer. **Both sides return the same wrong
-            // number** — the true sum is 32, and each pair `1e16` then
-            // `−1e16 + 1` loses its `1` to rounding in either order. That
-            // is shared behaviour, not a divergence: the reference's own
-            // summation is a plain accumulation with no compensation.
+            // The accumulated sum is zero, so the bound is vacuous as a
+            // fraction of the answer. **Both sides return the same wrong
+            // number** — the exact total of the stored values is 21, and
+            // each triple `1e16`, `1`, `−1e16` loses its `1` to rounding
+            // in either order. That is shared behaviour, not a divergence:
+            // the reference's own summation is a plain accumulation with
+            // no compensation. (This comment described the DISCARDED pair
+            // fixture and its stated `32` until review round 3.)
             "cancelling" => {
                 // **The exact sum is DERIVED FROM THE STORED VALUES, not
                 // stated**, because an earlier fixture stated `32` for

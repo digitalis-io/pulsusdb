@@ -6399,9 +6399,8 @@ gated by
   one label, an `unwrap` of that label with no conversion, an
   underscore-free name, a range equal to the step, no row whose structured
   metadata carries that same name, and every row carrying a value both
-  float parsers agree on — `sum_over_time`,
-  `avg_over_time`, `stddev_over_time` and `stdvar_over_time` are summed by
-  the database. The database chooses the summation order, so **the same
+  float parsers agree on — `sum_over_time` and `avg_over_time` are summed
+  by the database. The database chooses the summation order, so **the same
   query on the same data can answer different final digits between two
   executions.**
 - **What the reference does:** accumulates in one order, in one process,
@@ -6447,18 +6446,23 @@ gated by
   exact in any order. `min_over_time`, `max_over_time`, `first_over_time`,
   `last_over_time`, `quantile_over_time` and `rate_counter` are not
   lowered.
-- **The spread pair is computed by the STABLE variants**, and that is a
-  correctness choice rather than a performance one: `varPop`/`stddevPop`
-  accumulate `Σx²` and subtract, which over `{1e16, 1e16+2, +4, +8, +16}`
-  answers `0` and `0` where the evaluator answers `31.2` and
-  `5.585696017507576`. `varPopStable`/`stddevPopStable` compute the
-  incremental form the evaluator itself uses and return its bits on that
-  corpus.
+- **The spread pair is NOT lowered, and the stable variants were not
+  enough.** `varPop`/`stddevPop` accumulate `Σx²` and subtract, which over
+  `{1e16, 1e16+2, +4, +8, +16}` answers `0` and `0` where the evaluator
+  answers `31.2` and `5.585696017507576`. `varPopStable`/`stddevPopStable`
+  returned the evaluator's bits on that corpus — and over 300,000 samples
+  at `max_threads = 8`, `max_block_size = 65536` the database's variance
+  came back FINITE and wrong: bits `9090485321501537692` against the
+  client's `9090485321501537553`, a difference of `1.0334767513920592e286`.
+  The bound above is a statement about sums; a partial-moment algorithm can
+  lose the answer without leaving the finite range, so nothing in the
+  reader sees it. `stddev_over_time` and `stdvar_over_time` are therefore
+  withdrawn at `sql::UnwrapReducer` and evaluated here.
 - **Pinned by** `query_log_gates.rs`'s
   `the_thread_count_spread_stays_inside_the_summation_bound`, which fails
   when the accepted divergence stops being a rounding difference,
   `repeated_executions_agree_bit_for_bit_at_a_fixed_layout`, which fails
   when a source of nondeterminism appears that is neither the thread count
   nor the part layout, and
-  `the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus`,
-  which fails if the unstable aggregate functions come back.
+  `the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value`,
+  which fails if either of the withdrawn pair comes back.
