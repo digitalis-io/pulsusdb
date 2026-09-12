@@ -831,7 +831,7 @@ measurement.
 **Two shipped instances, and they are the whole of today's multi-statement structure.**
 
 - LogQL resolves the selector to fingerprints over `log_streams_idx`
-  (`crates/pulsus-read/src/logql/sql.rs:367`), then reads `log_streams` and `log_samples` filtered
+  (`crates/pulsus-read/src/logql/sql.rs:410`), then reads `log_streams` and `log_samples` filtered
   on `fingerprint IN (…)` (`sql.rs:489`, `sql.rs:538`). Three statements, two cuts. The seed is the
   fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -954,7 +954,7 @@ instance below is LogQL's, and it is the only one.
 
 **Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
 set at `:1625` from `has_unpushed_dropping_stage`, `:1655`), and when it is set the read is one
-statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:746`) with
+statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:789`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. §2.7.7 is what can turn this cut
 off.
 
@@ -1128,7 +1128,7 @@ on every run.
 | the request's limit, window and step | **yes** |
 | a seed's plan-time upper bound | **yes** — every one is a request parameter, a config field or a named constant |
 | a seed's rendered size against the two ceilings | **yes**, O(1), no round trip |
-| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:404`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
+| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:447`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
 | the per-row cost of a database-side expression against the cost of transporting the row | **no.** Nothing measures it. Under the cost model of §9.1 it does not matter; if that model is ever revised this is the first number needed |
 | behaviour across shards | **out of scope** by owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) |
 | behaviour at 1 TB | **no** — [#25](https://github.com/digitalis-io/pulsusdb/issues/25) |
@@ -5437,16 +5437,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 |---|---|
 | citation occurrences in the five artefacts | 608 |
 | of those, citing a bare basename | 477 |
-| `(document, token)` pairs the rule resolves | 279 |
-| occurrences those resolved pairs cover | 380 |
-| `(document, token)` pairs it cannot resolve | 126 |
-| occurrences those frozen pairs cover | 228 |
-| resolved rows anchored on a token the citing prose prints | 113 |
+| `(document, token)` pairs the rule resolves | 282 |
+| occurrences those resolved pairs cover | 396 |
+| `(document, token)` pairs it cannot resolve | 123 |
+| occurrences those frozen pairs cover | 212 |
+| resolved rows anchored on a token the citing prose prints | 116 |
 | resolved rows anchored on a snapshot of the cited line | 166 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 119 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 116 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 | `occurrences_disagree` | 1 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
@@ -5454,7 +5454,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
 | the fallback answers a file the citing prose does not describe | 5 |
-| the fallback is right and the anchor rule points elsewhere | 3 |
+| the fallback is right and the anchor rule points elsewhere | 4 |
 | the sentence describes both candidates, so neither answer is wrong | 1 |
 
 | anchor kind | what a row of that kind can show |
@@ -5462,9 +5462,9 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 279 `(document, token)` pairs covering 380 occurrences, and cannot resolve 126 covering 228. Of the resolved rows, 113 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
+Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 282 `(document, token)` pairs covering 396 occurrences, and cannot resolve 123 covering 212. Of the resolved rows, 116 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 10 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
 The citations pointing at an empty line are `crates/pulsus-read/src/traces/exec.rs:1968` (in `docs/query-lowering.md`), `search_plan.rs:1042` (in `docs/query-lowering.md`), `traces/exec.rs:114` (cited from 2 documents).
 

@@ -6397,8 +6397,9 @@ gated by
 
 - **What we do:** on a query that **lowers** — a `json` extraction naming
   one label, an `unwrap` of that label with no conversion, an
-  underscore-free name, a range equal to the step, and every row in the
-  window carrying a value both float parsers agree on — `sum_over_time`,
+  underscore-free name, a range equal to the step, no row whose structured
+  metadata carries that same name, and every row carrying a value both
+  float parsers agree on — `sum_over_time`,
   `avg_over_time`, `stddev_over_time` and `stdvar_over_time` are summed by
   the database. The database chooses the summation order, so **the same
   query on the same data can answer different final digits between two
@@ -6434,9 +6435,18 @@ gated by
   exact in any order. `min_over_time`, `max_over_time`, `first_over_time`,
   `last_over_time`, `quantile_over_time` and `rate_counter` are not
   lowered.
+- **The spread pair is computed by the STABLE variants**, and that is a
+  correctness choice rather than a performance one: `varPop`/`stddevPop`
+  accumulate `Σx²` and subtract, which over `{1e16, 1e16+2, +4, +8, +16}`
+  answers `0` and `0` where the evaluator answers `31.2` and
+  `5.585696017507576`. `varPopStable`/`stddevPopStable` compute the
+  incremental form the evaluator itself uses and return its bits on that
+  corpus.
 - **Pinned by** `query_log_gates.rs`'s
   `the_thread_count_spread_stays_inside_the_summation_bound`, which fails
-  when the accepted divergence stops being a rounding difference, and
+  when the accepted divergence stops being a rounding difference,
   `repeated_executions_agree_bit_for_bit_at_a_fixed_layout`, which fails
   when a source of nondeterminism appears that is neither the thread count
-  nor the part layout.
+  nor the part layout, and
+  `the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus`,
+  which fails if the unstable aggregate functions come back.

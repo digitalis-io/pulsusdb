@@ -3445,13 +3445,24 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
 /// W4).
 ///
 /// ```text
-///  class  value                        what the two float parsers do        expected here
-///  -      45.2 and "2.25"              agree exactly                        LOWERS, bit-equal
-///  A      "E12"                        ClickHouse 0, ours rejects           FALLS BACK
-///  B      "1.7976931348623159e308"     ClickHouse f64::MAX, ours inf        FALLS BACK
-///  C      "5e-324"                     ClickHouse 0, ours 1 ulp             LOWERS, within the bound
-///  over   "inf"                        both parse it; the prefix test does not   FALLS BACK
+///  case        value                       expected     the two parsers
+///  ordinary    45.25, "2.25", 4            LOWERS       agree; the quoted form is the point
+///  class A     "E12"                       FALLS BACK   0 here, a parse error in ours
+///  class B     "1.7976931348623159e308"    FALLS BACK   f64::MAX here, inf in ours
+///  class C     "5e-324"                    FALLS BACK   0 here, 1 ulp in ours
+///  over        "inf"                       FALLS BACK   both parse it; the prefix test does not
+///  nan_exp     "0e999999"                  FALLS BACK   a negative NaN here, +0 in ours
+///  under_exp   "9999999999999999e-324"     FALLS BACK   0 here, 0x000730d67819e8d2 in ours
+///  shadowed    metadata latency=5, bodies 7 and 8       FALLS BACK   TWO series, keyed by the
+///                                                       parsed value under latency_extracted
 /// ```
+///
+/// **Class C falls back now and did not before**, and the earlier reading
+/// was wrong rather than merely narrow: the bound `2(n−1)·u·Σ|vᵢ|` is ZERO
+/// at `n = 1` and is `Σ|vᵢ|`-relative otherwise, so a value that underflows
+/// to zero on one side is only "absorbed" in a corpus where it is not the
+/// sum. `"9999999999999999e-324"` is the same family at a magnitude where
+/// that is obvious.
 ///
 /// A and B are what the guard is FOR: without the anchored prefix test a
 /// `"E12"` contributes `0` to a sum where the evaluator makes an error
@@ -3501,15 +3512,38 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
     // Each class gets its own stream, so one class's fallback cannot
     // decide another's.
-    let cases: [(&str, u64, &[&str], bool); 5] = [
-        ("ordinary", 201, &["45.25", "\"2.25\"", "4"], false),
-        ("class_a", 202, &["1", "\"E12\""], true),
-        ("class_b", 203, &["1", "\"1.7976931348623159e308\""], true),
-        ("class_c", 204, &["1", "\"5e-324\""], false),
-        ("over_reject", 205, &["1", "\"inf\""], true),
+    // `(name, fingerprint, values, metadata on every row, expect a fallback)`
+    let cases: [(&str, u64, &[&str], &str, bool); 8] = [
+        ("ordinary", 201, &["45.25", "\"2.25\"", "4"], "", false),
+        ("class_a", 202, &["1", "\"E12\""], "", true),
+        (
+            "class_b",
+            203,
+            &["1", "\"1.7976931348623159e308\""],
+            "",
+            true,
+        ),
+        ("class_c", 204, &["1", "\"5e-324\""], "", true),
+        ("over_reject", 205, &["1", "\"inf\""], "", true),
+        // Review round 1: a digit with an exponent that overflows, and one
+        // that underflows. Both pass the anchored prefix test, so the hole
+        // was never in that test.
+        ("nan_exp", 206, &["1", "\"0e999999\""], "", true),
+        (
+            "under_exp",
+            207,
+            &["1", "\"9999999999999999e-324\""],
+            "",
+            true,
+        ),
+        // Review round 1: the metadata carries the unwrapped name, so the
+        // evaluator keys its series by the PARSED value under
+        // `latency_extracted` — two series here, which no group key the
+        // statement has can express.
+        ("shadowed", 208, &["7", "8"], r#"{"latency":"5"}"#, true),
     ];
     let mut rows: Vec<BucketedSeedRow> = Vec::new();
-    for (name, fp, values, _) in cases {
+    for (name, fp, values, sm, _) in cases {
         client
             .execute(
                 &format!(
@@ -3530,7 +3564,7 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
                 timestamp_ns: t - 30_000_000_000 + i as i64,
                 severity: 0,
                 body: format!(r#"{{"latency":{v}}}"#),
-                structured_metadata: String::new(),
+                structured_metadata: sm.to_string(),
             });
         }
     }
@@ -3566,7 +3600,7 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     };
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
 
-    for (name, _fp, values, expect_fallback) in cases {
+    for (name, _fp, _values, _sm, expect_fallback) in cases {
         let lowered_q = format!(
             r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
         );
@@ -3643,29 +3677,27 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
              {last_read}"
         );
 
-        if name == "class_c" {
-            // The accepted divergence, asserted against the bound rather
-            // than bit for bit: `"5e-324"` is `0` on one side and one ulp
-            // of the smallest subnormal on the other.
-            assert_eq!(lowered.len(), client_ans.len(), "{name}");
-            let sum_abs: f64 = values
-                .iter()
-                .map(|v| v.trim_matches('"').parse::<f64>().unwrap_or(0.0).abs())
-                .sum();
-            let bound = 2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
-            for ((lt, lv), (ct, cv)) in lowered.iter().zip(&client_ans) {
-                assert_eq!(lt, ct, "{name}");
-                let d = (f64::from_bits(*lv) - f64::from_bits(*cv)).abs();
-                assert!(
-                    d <= bound.max(f64::MIN_POSITIVE),
-                    "{name}: {d:e} exceeds the bound {bound:e}"
+        assert_eq!(
+            lowered, client_ans,
+            "{name}: the two paths must answer the same bits"
+        );
+        if name == "shadowed" {
+            // And the shape the collapse would have produced: TWO series,
+            // because the parsed value survives as `latency_extracted` and
+            // its two values are two series. A recomputed group answers
+            // ONE series of 10 here, which is what an earlier round did.
+            assert_eq!(
+                lowered.len(),
+                2,
+                "{name}: the parsed collision label splits the series: {lowered:?}"
+            );
+            for (_, v) in &lowered {
+                assert_eq!(
+                    *v,
+                    5.0f64.to_bits(),
+                    "{name}: each series is the metadata's own value"
                 );
             }
-        } else {
-            assert_eq!(
-                lowered, client_ans,
-                "{name}: the two paths must answer the same bits"
-            );
         }
     }
 
@@ -3677,4 +3709,376 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         )
         .await
         .expect("drop the run database");
+}
+
+/// **The spread reducers on a high-offset corpus** (issue #507 W4, review
+/// round 1, finding 2).
+///
+/// `varPop`/`stddevPop` accumulate `Σx²` and subtract, which cancels
+/// catastrophically when the values share a large offset. Over
+/// `{1e16, 1e16+2, +4, +8, +16}` they answer `0` and `0` where the
+/// evaluator answers `31.2` and `5.585696017507576` — not a rounding
+/// difference and not inside any bound. The `Stable` variants compute the
+/// incremental `delta · (v − mean)` form the evaluator itself uses, and
+/// return its bits.
+///
+/// The corpus is what makes this discriminating: on ordinary values the
+/// two algorithms agree, so a fixture without the offset cannot tell a
+/// stable variant from an unstable one.
+#[tokio::test]
+async fn the_spread_reducers_agree_with_the_client_path_on_a_high_offset_corpus() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread2_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507spread";
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 301, \
+                 '{service}', '{{\"service_name\":\"{service}\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    let offsets = [0.0f64, 2.0, 4.0, 8.0, 16.0];
+    let rows: Vec<BucketedSeedRow> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, d)| BucketedSeedRow {
+            service: service.to_string(),
+            fingerprint: 301,
+            timestamp_ns: t - 30_000_000_000 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"latency":{:?}}}"#, 1e16f64 + d),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the high-offset fixture");
+    let mut seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let n = seeded.next().await.expect("one row").expect("decode").n;
+    drop(seeded);
+    assert_eq!(n, offsets.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    // `avg_over_time` is deliberately NOT here. It differs from the
+    // reference by one ULP on this corpus and on any other, because the
+    // reference computes an incremental mean and `avg` is a sum divided by
+    // a count — a documented divergence with its own ledger clause, and a
+    // different claim from the one this test makes. Measured on this
+    // fixture: `4846369599423283203` lowered against `…202` client-side.
+    for op in ["stddev_over_time", "stdvar_over_time"] {
+        let lowered_q = format!(
+            r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        let client_q = format!(
+            r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        );
+        let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => mp,
+            other => panic!("{q}: {other:?}"),
+        };
+        assert!(shape(&lowered_q).client.is_none(), "{op} must lower");
+        assert!(shape(&client_q).client.is_some(), "{op}'s control must not");
+
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                let (result, _w) = engine
+                    .query(&parse(&q).expect("parse"), params)
+                    .await
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                let QueryResult::Matrix(series) = result else {
+                    panic!("{q}: expected a matrix");
+                };
+                series
+                    .into_iter()
+                    .flat_map(|s| s.points)
+                    .map(|(ts, v)| (ts, v.to_bits()))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let lowered = answer(lowered_q).await;
+        let client_ans = answer(client_q).await;
+        assert_eq!(
+            lowered, client_ans,
+            "{op}: the two paths must answer the same bits on a high-offset corpus"
+        );
+        // And the answer is not the degenerate one the unstable algorithm
+        // returns, so the fixture can tell them apart.
+        assert!(
+            lowered.iter().all(|(_, v)| *v != 0.0f64.to_bits()),
+            "{op}: a zero here is the cancelling algorithm's answer, not the data's: {lowered:?}"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The three boundary corpora of W4 §8** (issue #507), each chosen for
+/// where the two summations can differ rather than for being realistic.
+///
+/// The condition number `κ = Σ|vᵢ| / |Σvᵢ|` is what decides whether the
+/// summation-order bound is tight or vacuous: the absolute bound
+/// `2(n−1)·u·Σ|vᵢ|` is the same either way, but as a FRACTION of the answer
+/// it grows with `κ` without limit.
+///
+/// ```text
+///  corpus       values                        κ      the two paths
+///  exact        1, 2, 4, 8                    1      the same bits; no order can round
+///  mild         55 × +1e9+δ, 5 × −1e9+δ       1.2    inside 2(n−1)·u·Σ|vᵢ|
+///  cancelling   32 × (1e16, −1e16+1)          ∞      the same wrong answer: 0, where the
+///                                                    true sum is 32
+/// ```
+///
+/// **The cancelling corpus is shared behaviour, not a divergence**, and it
+/// is here to be recorded as such: the reference's own summation is a plain
+/// accumulation with no compensation, so it loses the same digits. A
+/// compensated sum would answer 32. Nothing in this build promises
+/// otherwise, and the ledger carries no row for it.
+#[tokio::test]
+async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4kappa_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+
+    // exactly representable | well conditioned | catastrophic cancellation
+    let exact: Vec<f64> = vec![1.0, 2.0, 4.0, 8.0];
+    // 55 positive and 5 negative of the same magnitude gives
+    // `κ = 60/50 = 1.2`; the fractional parts are what force the rounding
+    // the two orders can differ on.
+    let mild: Vec<f64> = (0..60)
+        .map(|i| {
+            let m = 1e9 + (i as f64) / 8.0;
+            if i < 55 { m } else { -m }
+        })
+        .collect();
+    let cancelling: Vec<f64> = (0..64)
+        .map(|i| if i % 2 == 0 { 1e16 } else { -1e16 + 1.0 })
+        .collect();
+
+    let mut out: Vec<(String, f64, u64, u64)> = Vec::new();
+    for (name, fp, values) in [
+        ("exact", 401u64, &exact),
+        ("mild", 402, &mild),
+        ("cancelling", 403, &cancelling),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        let rows: Vec<BucketedSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+        let mut seeded = admin
+            .query_stream::<PartCountRow>(
+                &format!("SELECT count() AS n FROM {db}.log_samples WHERE service = '{name}'"),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("count");
+        let n = seeded.next().await.expect("one row").expect("decode").n;
+        drop(seeded);
+        assert_eq!(n, values.len() as u64, "{name}: the corpus must be present");
+
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: t,
+                step_ns: STEP as u64,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                let (result, _w) = engine
+                    .query(&parse(&q).expect("parse"), params)
+                    .await
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                let QueryResult::Matrix(series) = result else {
+                    panic!("{q}: expected a matrix");
+                };
+                series
+                    .into_iter()
+                    .flat_map(|s| s.points)
+                    .map(|(_, v)| v)
+                    .next()
+                    .expect("one point")
+            }
+        };
+        let lowered = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        ))
+        .await;
+        let client_ans = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        ))
+        .await;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let mut lr = 0.0f64;
+        for v in values.iter() {
+            lr += *v;
+        }
+        let kappa = sum_abs / lr.abs();
+        eprintln!(
+            "{name}: kappa={kappa:e} lowered={lowered:?} ({:#018x}) client={client_ans:?} \
+             ({:#018x}) bound={:e}",
+            lowered.to_bits(),
+            client_ans.to_bits(),
+            2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+        );
+        out.push((
+            name.to_string(),
+            kappa,
+            lowered.to_bits(),
+            client_ans.to_bits(),
+        ));
+
+        let bound = 2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+        match name {
+            // κ = 1 and every partial sum exactly representable: no order
+            // can round, so the two answers are the same bits.
+            "exact" => {
+                assert_eq!(kappa, 1.0, "the fixture must be perfectly conditioned");
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: an exactly representable sum cannot depend on the order"
+                );
+                assert_eq!(lowered, 15.0);
+            }
+            // κ ≈ 1.2: the bound is meaningful and both answers are inside
+            // it. Measured on this corpus they are also equal; the
+            // assertion is the bound, because equality here is the
+            // corpus's size and not a property of the two paths.
+            "mild" => {
+                assert!(
+                    (kappa - 1.2).abs() < 0.01,
+                    "{name}: the fixture's condition number is {kappa}"
+                );
+                assert!(
+                    (lowered - client_ans).abs() <= bound,
+                    "{name}: {lowered:?} vs {client_ans:?} exceeds {bound:e}"
+                );
+            }
+            // κ = ∞: the values cancel exactly, so the bound is vacuous as
+            // a fraction of the answer. **Both sides return the same wrong
+            // number** — the true sum is 32, and each pair `1e16` then
+            // `−1e16 + 1` loses its `1` to rounding in either order. That
+            // is shared behaviour, not a divergence: the reference's own
+            // summation is a plain accumulation with no compensation.
+            "cancelling" => {
+                assert!(kappa.is_infinite(), "{name}: κ = {kappa}");
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: both paths must lose the same digits"
+                );
+                assert_eq!(lowered, 0.0, "{name}: and the shared answer is zero");
+                let exact_sum: f64 = 32.0;
+                assert_ne!(
+                    lowered, exact_sum,
+                    "{name}: the fixture must be one where a compensated sum would differ, or \
+                     it is not testing cancellation"
+                );
+            }
+            other => panic!("unnamed corpus {other}"),
+        }
+    }
+    assert_eq!(out.len(), 3, "all three corpora ran");
 }

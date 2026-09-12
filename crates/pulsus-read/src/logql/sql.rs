@@ -161,12 +161,23 @@ pub enum UnwrapReducer {
 
 impl UnwrapReducer {
     /// Wildcard-free, the [`MetricShape::agg_expr`] arrangement.
+    ///
+    /// **The spread pair is the STABLE variant, and the plain one is a
+    /// wrong answer rather than a slower one.** `varPop`/`stddevPop`
+    /// accumulate `Σx²` and subtract, which cancels catastrophically on
+    /// values that share a large offset. Measured on 26.3.29.7 over
+    /// `{1e16, 1e16+2, +4, +8, +16}`: `varPop` and `stddevPop` answer
+    /// `0` and `0` where the evaluator answers `31.2` and
+    /// `5.585696017507576`; `varPopStable` and `stddevPopStable` answer
+    /// the evaluator's bits. The evaluator's own accumulator is the
+    /// incremental `delta · (v − mean)` form, which is what the stable
+    /// variants compute.
     pub const fn function(self) -> &'static str {
         match self {
             UnwrapReducer::Sum => "sum",
             UnwrapReducer::Avg => "avg",
-            UnwrapReducer::StddevPop => "stddevPop",
-            UnwrapReducer::VarPop => "varPop",
+            UnwrapReducer::StddevPop => "stddevPopStable",
+            UnwrapReducer::VarPop => "varPopStable",
         }
     }
 }
@@ -270,11 +281,43 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
 /// `inf` is `inf`, a sum holding `MAX` may be finite. One equality test,
 /// which over-rejects a genuine `f64::MAX` into the fallback.
 ///
-/// **Class C needs no test and is an accepted divergence with its
-/// boundary stated**: `"5e-324"` parses to `0` here and to one ulp of the
-/// smallest subnormal (`4.94e-324`) in Rust, which is smaller than any
-/// rounding difference the summation order already produces.
+/// **A non-finite result is refused outright** (`isFinite`), which closes
+/// the other half of the same family: `"0e999999"` converts to a NEGATIVE
+/// NaN here and to `+0` in Rust, and no tolerance absorbs a NaN. It also
+/// refuses `"1e400"`, which both parsers take to `inf` — a conservative
+/// over-rejection, and a fallback rather than a wrong answer.
+///
+/// **Class C is NOT accepted after all**, and the correction is recorded
+/// where the reading was made: see [`UNWRAP_TEXT_HAS_AN_EXPONENT`].
 const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
+
+/// **The exponent forms that convert to zero** — the second half of the
+/// underflow closure (issue #507, W4, review round 1).
+///
+/// `toFloat64OrNull` returns `0` for a value whose exponent underflows,
+/// where our own parser keeps a subnormal. Measured on 26.3.29.7 against
+/// `f64::from_str`:
+///
+/// ```text
+///  text                      here   ours (bits)
+///  "5e-324"                  0      1
+///  "7.5e-324"                0      2
+///  "9999999999999999e-324"   0      0x000730d67819e8d2
+/// ```
+///
+/// **The stated bound does not absorb these.** `2(n−1)·u·Σ|vᵢ|` is ZERO at
+/// `n = 1`, and `Σ|vᵢ|` is the underflowing value itself when it is the
+/// only sample — so the difference is the whole answer. The earlier
+/// reading, that the smallest subnormal is smaller than any rounding
+/// difference already accepted, holds only for a corpus where the value is
+/// not the sum.
+///
+/// **It tests one fact about the TEXT and one about the VALUE, and neither
+/// is a float grammar:** the value converted to zero, and the text carrying
+/// an exponent. A zero written as a zero — `0`, `0.0`, `-0` — has no
+/// exponent and still lowers, which is the common case this must not cost.
+/// A zero written with an exponent falls back whether or not it underflowed.
+const UNWRAP_TEXT_HAS_AN_EXPONENT: &str = "[eE]";
 
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
@@ -1303,10 +1346,13 @@ pub fn metric_range_unwrapped(
     let key = name.as_sql();
     let prefix = unwrap_prefix_literal();
     let prefix = prefix.as_sql();
+    let exponent = super::predicate::literal(UNWRAP_TEXT_HAS_AN_EXPONENT);
+    let exponent = exponent.as_sql();
     let t = format!("trim(BOTH '\"' FROM JSONExtractRaw(body, {key}))");
     let raw = format!("toFloat64OrNull({t})");
     let q = format!(
-        "(match({t}, {prefix}) AND isNotNull({raw}) AND abs({raw}) != {UNWRAP_OVERFLOW_CUTOFF})"
+        "(match({t}, {prefix}) AND isNotNull({raw}) AND isFinite({raw}) AND abs({raw}) != \
+         {UNWRAP_OVERFLOW_CUTOFF} AND ({raw} != 0 OR NOT match({t}, {exponent})))"
     );
     let f = reducer.function();
     let mut sql = format!(
@@ -3065,8 +3111,8 @@ mod tests {
         let t = "trim(BOTH '\"' FROM JSONExtractRaw(body, 'latency'))";
         let raw = format!("toFloat64OrNull({t})");
         let q = format!(
-            "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND abs({raw}) != \
-             1.7976931348623157e308)"
+            "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND isFinite({raw}) \
+             AND abs({raw}) != 1.7976931348623157e308 AND ({raw} != 0 OR NOT match({t}, '[eE]')))"
         );
         let expected = format!(
             "SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - \
@@ -3087,8 +3133,8 @@ mod tests {
         // else about the statement moves.
         for (reducer, f_name) in [
             (UnwrapReducer::Avg, "avgIf("),
-            (UnwrapReducer::StddevPop, "stddevPopIf("),
-            (UnwrapReducer::VarPop, "varPopIf("),
+            (UnwrapReducer::StddevPop, "stddevPopStableIf("),
+            (UnwrapReducer::VarPop, "varPopStableIf("),
         ] {
             let other = metric_range_unwrapped(
                 "log_samples",

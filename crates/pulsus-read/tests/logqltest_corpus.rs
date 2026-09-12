@@ -47,7 +47,7 @@ fn count_eval_directives(text: &str) -> usize {
     text.lines()
         .filter(|l| {
             let tok = l.split_whitespace().next().unwrap_or("");
-            matches!(tok, "eval" | "eval_ordered" | "eval_fail")
+            matches!(tok, "eval" | "eval_ordered" | "eval_fail" | "eval_approx")
         })
         .count()
 }
@@ -858,28 +858,34 @@ fn only_the_397_section_has_a_wrapped_variant_with_a_pipeline() {
 /// chooses the summation order, and it is not weaker than `eval` in any
 /// dimension that is not that order.**
 ///
-/// The tolerance exists because the five unwrapped reducers sum in the
-/// database, which picks an accumulation order and may pick differently
+/// The tolerance exists because the four unwrapped reducers the database
+/// AGGREGATES pick an accumulation order there, and may pick differently
 /// between two executions. A tolerance that could be written on any entry
 /// would be reached for whenever an unrelated comparison failed, so the
 /// verb is refused at parse time on every other query, and the refusal
-/// names what it saw.
+/// names what it saw. `rate_counter` is refused with the rest: it never
+/// lowers, so a tolerance on it could only hide a mismatch on a path that
+/// answers exactly (review round 1).
 #[test]
-fn eval_approx_is_admitted_only_for_the_five_and_is_not_weaker_than_exact() {
+fn eval_approx_is_admitted_only_for_the_four_and_is_not_weaker_than_exact() {
     use driver::runner::values_agree;
 
     let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
                    \t10s  c=10\n\t20s  c=30\n\t30s  c=5\n\t40s  c=12\n\n";
-    // The value `eval` pins exactly, and a one-ULP perturbation of it.
-    let perturbed = f64::from_bits(0.5333344_f64.to_bits() + 1);
+    // `sum_over_time` over the four values in the window `(0, 60s]` is
+    // `10 + 30 + 5 + 12`, which is exact in binary — so the pinned value
+    // is arithmetic rather than a capture, and the perturbation below is
+    // one ULP of it.
+    let exact = 57.0_f64;
+    let perturbed = f64::from_bits(exact.to_bits() + 1);
 
     // The exact verb rejects one ULP — the property this corpus has
     // always had, restated here as the control for the two rows below.
-    let exact = format!(
-        "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+    let control = format!(
+        "{dataset}eval instant at 60s sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
          \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
     );
-    let run = run_file("inline/approx_control.test", &exact).expect("parse");
+    let run = run_file("inline/approx_control.test", &control).expect("parse");
     assert!(
         !run.cases[0].passed,
         "the control must still reject one ULP"
@@ -888,7 +894,7 @@ fn eval_approx_is_admitted_only_for_the_five_and_is_not_weaker_than_exact() {
     // `eval_approx` with a tolerance above one ULP accepts it.
     let approx = format!(
         "{dataset}eval_approx 1e-9 instant at 60s \
-         rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
          \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
     );
     let run = run_file("inline/approx_ok.test", &approx).expect("parse");
@@ -907,7 +913,7 @@ fn eval_approx_is_admitted_only_for_the_five_and_is_not_weaker_than_exact() {
     // one ULP the exact verb rejects.
     let tight = format!(
         "{dataset}eval_approx 0 instant at 60s \
-         rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
          \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
     );
     let run = run_file("inline/approx_zero.test", &tight).expect("parse");
@@ -916,9 +922,39 @@ fn eval_approx_is_admitted_only_for_the_five_and_is_not_weaker_than_exact() {
         "at t = 0 the tolerance path must reject what the exact path rejects"
     );
 
-    // The control against sprinkling: a reducer outside the five is a
+    // A positive case at the EXACT value, so the verb is exercised as an
+    // entry would use it rather than only through a perturbation.
+    let ok = format!(
+        "{dataset}eval_approx 1e-9 instant at 60s \
+         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} {exact}\n"
+    );
+    let run = run_file("inline/approx_exact.test", &ok).expect("parse");
+    assert!(run.cases[0].passed, "{}", run.cases[0].detail);
+
+    // The control against sprinkling: a reducer outside the four is a
     // GRAMMAR error, naming what it saw, so the verb cannot be reached
-    // for to silence an unrelated failure.
+    // for to silence an unrelated failure. `rate_counter` is refused with
+    // the rest, and it is the one this test used to be written on.
+    for (q, named) in [
+        (r#"count_over_time({env="prod"}[1m])"#, "count_over_time"),
+        (
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            "rate_counter",
+        ),
+    ] {
+        let refused = format!(
+            "{dataset}eval_approx 1e-9 instant at 60s {q}\n\
+             \t{{env=\"prod\", service_name=\"checkout\"}} 4\n"
+        );
+        let err = run_file("inline/approx_refused.test", &refused)
+            .expect_err("a non-qualifying reducer must be a grammar error");
+        assert!(
+            err.contains(named) && err.contains("eval_approx"),
+            "the refusal must name the reducer it saw: {err}"
+        );
+    }
+
     let wrong = format!(
         "{dataset}eval_approx 1e-9 instant at 60s count_over_time({{env=\"prod\"}}[1m])\n\
          \t{{env=\"prod\", service_name=\"checkout\"}} 4\n"

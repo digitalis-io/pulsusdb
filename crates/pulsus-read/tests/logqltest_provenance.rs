@@ -2002,7 +2002,7 @@ const CAPTURED: usize = 1_513;
 /// from the container, so they are `derived` and not `captured`. Its
 /// boundary fix added the domain-edge rows (each off-axis row with its
 /// on-axis control), same file default.
-const DERIVED: usize = 31;
+const DERIVED: usize = 32;
 /// Issue #389's residual rows — the mid-line-malformed class, and its
 /// bound where both sides answer the empty string — all name
 /// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
@@ -2020,7 +2020,7 @@ const PORTED: usize = 30;
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
 /// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
 /// `b25_pattern_expr_reject.test` and `b26_json_expr.test`.
-const TOTAL: usize = 1_604;
+const TOTAL: usize = 1_605;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------
@@ -2042,7 +2042,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/exec.rs", 3),
     ("pulsus-read/src/logql/plan.rs", 1),
     ("pulsus-read/src/logql/predicate.rs", 8),
-    ("pulsus-read/src/logql/sql.rs", 4),
+    ("pulsus-read/src/logql/sql.rs", 6),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     ("pulsus-read/src/metrics/series_where.rs", 10),
     ("pulsus-read/src/metrics/sql.rs", 14),
@@ -2059,7 +2059,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 61;
+const MATCH_RENDER_TOTAL: usize = 63;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

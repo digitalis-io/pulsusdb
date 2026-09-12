@@ -231,8 +231,12 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:85	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:91	-	-	b["0"]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:94	-	-	b[0]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-	arr["0"]	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3571	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3574	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3605	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3608	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3817	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3820	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4005	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4009	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	lvl	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	tid	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2672	-	-	a	accept	accept	-	-	

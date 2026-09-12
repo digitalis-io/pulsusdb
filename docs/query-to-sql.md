@@ -743,7 +743,7 @@ only ever **adds** lines.
 label of that name**. If one does, the stream's own label wins and the parsed value is renamed
 (`labels.rs:363`), so a predicate over the line would drop lines the answer keeps. The label sets of
 every selected stream are already in hand when the third statement is built — the second statement
-fetched them (`crates/pulsus-read/src/logql/sql.rs:610`) — so this costs no extra read.
+fetched them (`crates/pulsus-read/src/logql/sql.rs:653`) — so this costs no extra read.
 
 **What none of this buys.** No skip index prunes a predicate over a parsed field. Measured with
 `EXPLAIN indexes=1` over 3,000,000 rows on the container: for
@@ -3184,7 +3184,7 @@ implementation formatting floats with a fixed number of places fails here.
 absent_over_time({service_name="nosuch"}[1m])
 ```
 
-**SQL today** — one statement, `sql.rs:996`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1023-1029`).
+**SQL today** — one statement, `sql.rs:996`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1066-1072`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body
@@ -5003,8 +5003,9 @@ final digits, and so may the same dashboard viewed when the system is quiet and 
 Nothing here says the answer is wrong; it says which digits are not reproducible.
 
 **A query that does not lower is unaffected**, and that is most of them: anything with a conversion,
-an underscore in the name, a parser other than `json`, a bare `json`, a range that is not the step, or
-one row in the window whose value the two float parsers do not agree on. Those are evaluated here, in
+an underscore in the name, a parser other than `json`, a bare `json`, a range that is not the step, one
+row whose structured metadata carries the unwrapped name, or one row whose value the two float parsers
+do not agree on. Those are evaluated here, in
 one accumulation order, and answer the same bits every time. The other six reducers are unaffected on
 every path: `count_over_time` and `bytes_over_time` sum integers, `min_over_time` and `max_over_time`
 are order-independent, `first_over_time` and `last_over_time` select rather than accumulate, and

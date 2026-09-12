@@ -382,6 +382,9 @@ pub enum EvalMode {
     /// tolerance the entry carries** (issue #507 W4): `eval_approx
     /// <tolerance> instant at <T> <query>`.
     ///
+    /// Admitted for the FOUR reducers the database aggregates, and no
+    /// others.
+    ///
     /// A NEW verb rather than a flag on `eval`, so every entry written
     /// before this one parses and compares through exactly the code it
     /// did before — the extension point this grammar already used three
@@ -702,22 +705,27 @@ fn approx_reducer_is_eligible(query: &str) -> Result<(), String> {
     let ineligible: Vec<String> = ops
         .iter()
         .filter(|op| {
+            // The FOUR the database aggregates, which is the set
+            // `sql::UnwrapReducer` has variants for. `rate_counter` was in
+            // an earlier reading of the scope and is not one of them — it
+            // never lowers, so a tolerance on it could only hide a
+            // mismatch on a path that already answers exactly (review
+            // round 1, finding 4).
             !matches!(
                 **op,
                 RangeAggOp::SumOverTime
                     | RangeAggOp::AvgOverTime
                     | RangeAggOp::StddevOverTime
                     | RangeAggOp::StdvarOverTime
-                    | RangeAggOp::RateCounter
             )
         })
         .map(|op| op.to_string())
         .collect();
     if !ineligible.is_empty() {
         return Err(format!(
-            "eval_approx is admitted only for the five reducers the database accumulates in an \
-             order it chooses (sum_over_time, avg_over_time, stddev_over_time, stdvar_over_time, \
-             rate_counter); this query uses {}",
+            "eval_approx is admitted only for the four reducers the database aggregates, and so \
+             accumulates in an order it chooses (sum_over_time, avg_over_time, \
+             stddev_over_time, stdvar_over_time); this query uses {}",
             ineligible.join(", ")
         ));
     }

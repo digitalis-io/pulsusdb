@@ -6622,22 +6622,6 @@ pub(in crate::logql) fn numeric_literal_value(lit: &NumericLiteral) -> Option<f6
     classify_numeric_literal(lit).ok().map(|(_, v)| v)
 }
 
-/// Issue #507 (W4): `| unwrap <name>`'s number conversion and its failure
-/// detail, for the one caller that must reproduce a row's sample **without
-/// running the pipeline** — the bucketed reader's shadowed group, where the
-/// value comes from structured metadata that no SQL expression may read.
-///
-/// `Ok` is the sample; `Err` is the `__error_details__` text the failed
-/// line carries beside `__error__="SampleExtractionErr"`. Both come from
-/// the same two functions the pipeline itself calls, so the reader cannot
-/// diverge from it by retyping either.
-pub(in crate::logql) fn unwrap_number_sample(raw: &str) -> Result<f64, String> {
-    match convert_label_value(UnitKind::Number, raw) {
-        Some(v) => Ok(v),
-        None => Err(label_filter_error_details(UnitKind::Number, raw)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1293,7 +1293,7 @@ struct Mismatch<'a> {
 const ARTIFACT_CREATE_RETRIES: u32 = 8;
 
 /// Writes one pre-built artifact `serde_json::Value` under
-/// `target/e2e-artifacts/<area>/<variant>/<prefix>-<unique_id>.json`
+/// `<target dir>/e2e-artifacts/<area>/<variant>/<prefix>-<unique_id>.json`
 /// — the shared file-creation mechanics both [`dump_mismatch`] (the
 /// value-matrix path) and `assert_discovery_contract_window`'s
 /// documented-contract dump share (`area = "metrics-diff"`), and the
@@ -1309,10 +1309,17 @@ pub(crate) fn write_artifact(
         Variant::Single => "single",
         Variant::Cluster => "cluster",
     };
-    let dir = crate::engine::workspace_root()
-        .join("target/e2e-artifacts")
-        .join(area)
-        .join(variant_dir);
+    // **The target directory, not the source tree.** `CARGO_TARGET_DIR`
+    // is what a caller sets to keep build output off a checkout, and an
+    // artefact written under the source tree anyway fails on a read-only
+    // one — found by the issue #507 implementation review, which ran with
+    // an external target directory. Unset (CI, and an ordinary `cargo
+    // test`) resolves to the same `target/e2e-artifacts/**` the workflow
+    // uploads.
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::engine::workspace_root().join("target"));
+    let dir = base.join("e2e-artifacts").join(area).join(variant_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create artifact dir {}", dir.display()))?;
     let body = serde_json::to_string_pretty(artifact)?;

@@ -1731,7 +1731,6 @@ impl LogQlEngine {
             meta,
             AggCaps::DEFAULT,
             label,
-            reducer,
             mp.grid_start_ns,
             mp.end_ns,
         );
@@ -4868,22 +4867,37 @@ impl PushdownRangeGroups {
 /// ```text
 /// all_numeric = 0   some row's value is absent, null, or does not parse
 /// a second group reaching one (series, grid point)
-/// a shadowed group whose metadata value does not parse -> an ERROR, not a fallback
+/// a row whose metadata carries the unwrapped name
 /// ```
 ///
-/// **The shadowed group is recomputed rather than refused.** When a row's
-/// structured metadata carries a key equal to the unwrapped name, the
-/// evaluator takes the metadata's value and the parsed one is renamed
-/// away — measured in `logqltest_corpus.rs`'s
+/// **A shadowed group falls back, and recomputing it is not enough.**
+/// When a row's structured metadata carries a key equal to the unwrapped
+/// name, the evaluator takes the metadata's value AND keeps the parsed one
+/// under `<name>_extracted` — measured in `logqltest_corpus.rs`'s
 /// `unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name`.
-/// The metadata string is constant within a group by construction, so the
-/// group's sample set is `n` copies of one value and the reader computes
-/// the answer exactly, with no SQL expression reading that column.
+/// So the parsed field does not only supply a value it also **names the
+/// series**, and its value comes from the body:
+///
+/// ```text
+///  metadata x=5, bodies x=7 and x=8, sum_over_time(… | unwrap x)
+///    the evaluator   {…, x_extracted="7"} 5   AND  {…, x_extracted="8"} 5
+///    one group       {…} 10
+/// ```
+///
+/// Recomputing the group's VALUE from the metadata gets `5` right and the
+/// series wrong: two series collapse into one. The statement's group key
+/// cannot carry `x_extracted`, because its value is per row and the body
+/// is not transported — the same reason a bare `| json` chain does not
+/// lower at all (`plan.rs`'s `unwrapped_chain`). So the whole query falls
+/// back, which is the only sound answer and is what an earlier round's
+/// recomputation got wrong.
 pub(in crate::logql) struct PushdownUnwrappedGroups<'a> {
     base_labels: HashMap<u64, LabelSet>,
-    /// The unwrapped label, as the query wrote it.
+    /// The unwrapped label, as the query wrote it. **The only thing this
+    /// fold needs to know about the query** — the reducer is the
+    /// statement's business, because a group's aggregate is used as it
+    /// arrives or the query falls back.
     label: &'a str,
-    reducer: super::sql::UnwrapReducer,
     /// Rendered final label set -> `(labels, grid point -> value)`.
     groups: HashMap<String, (LabelSet, HashMap<i64, f64>)>,
     grid_start_ns: i64,
@@ -4903,14 +4917,12 @@ impl<'a> PushdownUnwrappedGroups<'a> {
         meta: &HashMap<u64, StreamMetaRow>,
         caps: AggCaps,
         label: &'a str,
-        reducer: super::sql::UnwrapReducer,
         grid_start_ns: i64,
         end_ns: i64,
     ) -> Self {
         PushdownUnwrappedGroups {
             base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
             label,
-            reducer,
             groups: HashMap::new(),
             grid_start_ns,
             end_ns,
@@ -4920,29 +4932,6 @@ impl<'a> PushdownUnwrappedGroups<'a> {
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
             sm_ctx: StructuredMetadataCtx::default(),
-        }
-    }
-
-    /// The value a SHADOWED group takes — `n` samples of one value,
-    /// computed the way the evaluator computes them rather than the way
-    /// the arithmetic would let us.
-    ///
-    /// | reducer | value | why, from the evaluator |
-    /// |---|---|---|
-    /// | `sum_over_time` | `mv` added to itself `n` times | **not `n · mv`.** Adding `0.1` ten times gives `0.9999999999999999` where `10 × 0.1` gives `1.0`; `SimpleAcc::add` is a running `+=`, so the loop is the bit-exact reproduction and the multiply is a different number |
-    /// | `avg_over_time` | `mv` | the incremental mean sets `mean = v` on the first sample and adds `(v − v)/count = 0` thereafter (`acc.avg_mean`) |
-    /// | `stddev` / `stdvar` | `0` | `acc.m2` accumulates `delta · (v − mean)`: the first sample contributes `v · (v − v)` and every later one `0 · 0`. **The zero is the algorithm's**, not the mathematical variance of a constant set — a zero justified by the second argument would survive a change to the first |
-    fn shadowed_value(&self, mv: f64, n: u64) -> f64 {
-        match self.reducer {
-            super::sql::UnwrapReducer::Sum => {
-                let mut acc = 0.0f64;
-                for _ in 0..n {
-                    acc += mv;
-                }
-                acc
-            }
-            super::sql::UnwrapReducer::Avg => mv,
-            super::sql::UnwrapReducer::StddevPop | super::sql::UnwrapReducer::VarPop => 0.0,
         }
     }
 
@@ -4963,7 +4952,7 @@ impl<'a> PushdownUnwrappedGroups<'a> {
         let Some(base) = self.base_labels.get(&row.fingerprint) else {
             return Ok(());
         };
-        let mut labels: LabelSet = if row.structured_metadata.is_empty() {
+        let labels: LabelSet = if row.structured_metadata.is_empty() {
             base.clone()
         } else {
             merge_labels_with_structured_metadata(
@@ -4978,39 +4967,21 @@ impl<'a> PushdownUnwrappedGroups<'a> {
             merged.sort();
             merged
         };
-        // The metadata's own value for the unwrapped name, if it carries
-        // one. Read BEFORE the label is removed, because removing it is
-        // what `| unwrap` does.
-        let shadow: Option<String> = labels
-            .iter()
-            .find(|(k, _): &&(String, String)| k == self.label)
-            .map(|(_, v)| v.clone());
-        let value = match shadow {
-            Some(raw) => match super::pipeline::unwrap_number_sample(&raw) {
-                Ok(mv) => self.shadowed_value(mv, row.n),
-                Err(details) => {
-                    // The evaluator's failed-unwrap shape: the raw label
-                    // STAYS, `__error__`/`__error_details__` are tagged,
-                    // and the whole series is an error. The metadata is
-                    // constant within the group, so every row of it fails
-                    // together — this is not a partial state.
-                    labels.push((
-                        super::pipeline::ERROR_LABEL.to_string(),
-                        super::pipeline::SAMPLE_EXTRACTION_ERROR.to_string(),
-                    ));
-                    labels.push((super::pipeline::ERROR_DETAILS_LABEL.to_string(), details));
-                    labels.sort();
-                    check_surviving_error(&labels)?;
-                    unreachable!("the error label was just pushed, so the check raises");
-                }
-            },
-            None => row.v,
-        };
-        // `| unwrap <name>` deletes the unwrapped label from the result
-        // series (oracle-probed, `pipeline.rs`'s unwrap arm). On an
-        // unshadowed row the name is not in this set at all — the reader
-        // never saw the body — so the removal is the shadowed case's.
-        labels.retain(|(k, _)| k != self.label);
+        // **The shadowed row.** Its metadata carries the unwrapped name,
+        // so the evaluator takes the metadata's value and keeps the
+        // PARSED one under `<name>_extracted` — a label whose value comes
+        // from the body, which this statement does not transport. The
+        // series the evaluator produces cannot be built from these
+        // columns at all, so the query falls back rather than answering
+        // with fewer series than it should.
+        if labels.iter().any(|(k, _)| k == self.label) {
+            self.fall_back = Some(
+                "a row's structured metadata carries the unwrapped name, so the evaluator's \
+                 series are keyed by a parsed label the statement does not return",
+            );
+            return Ok(());
+        }
+        let value = row.v;
         check_surviving_error(&labels)?;
         let key = render_series_labels(&labels);
         match self.groups.entry(key) {
@@ -8753,14 +8724,12 @@ mod tests {
 
     fn unwrapped_series(
         rows: &[MetricRangeUnwrappedRow],
-        reducer: crate::logql::sql::UnwrapReducer,
     ) -> Result<Vec<RangeSeries>, &'static str> {
         let meta = range_meta();
         let mut g = PushdownUnwrappedGroups::new(
             &meta,
             AggCaps::DEFAULT,
             "latency",
-            reducer,
             RANGE_GRID_START_NS,
             RANGE_END_NS,
         );
@@ -8789,13 +8758,10 @@ mod tests {
     /// the group key is the series identity.
     #[test]
     fn an_unwrapped_group_becomes_one_point_of_the_statements_own_value() {
-        let series = unwrapped_series(
-            &[
-                unwrapped_row(10, 60_000_000_000, 12.5, 3, 1, ""),
-                unwrapped_row(10, 120_000_000_000, 0.25, 1, 1, ""),
-            ],
-            crate::logql::sql::UnwrapReducer::Sum,
-        )
+        let series = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 12.5, 3, 1, ""),
+            unwrapped_row(10, 120_000_000_000, 0.25, 1, 1, ""),
+        ])
         .expect("no fallback");
         assert_eq!(series.len(), 1, "{series:?}");
         assert_eq!(
@@ -8807,113 +8773,48 @@ mod tests {
         );
     }
 
-    /// **A shadowed group is recomputed, and `sum` is an addition loop
-    /// rather than a multiply.**
+    /// **A shadowed row sends the whole query to the client path.**
     ///
-    /// `0.1` added to itself ten times is `0.9999999999999999`; `10 × 0.1`
-    /// is `1.0`. The evaluator adds, so this adds — the test asserts the
-    /// answer is the LOOP's, and asserts the two differ first, so it
-    /// cannot pass against the multiply it exists to reject.
+    /// The evaluator keeps the parsed value under `<name>_extracted`, so
+    /// its series are keyed by a label whose value comes from the body —
+    /// which this statement does not return. Recomputing the group's
+    /// VALUE from the metadata (an earlier round did) gets the number
+    /// right and collapses two series into one; the live differential
+    /// `the_unwrapped_read_agrees_with_the_client_path_or_falls_back`'s
+    /// `shadowed` case is what shows the collapse against a real client
+    /// answer.
     #[test]
-    fn a_shadowed_sum_reproduces_the_evaluators_addition_loop() {
-        let mut looped = 0.0f64;
-        for _ in 0..10 {
-            looped += 0.1f64;
-        }
-        assert_ne!(
-            looped.to_bits(),
-            (10.0f64 * 0.1f64).to_bits(),
-            "the fixture must distinguish the loop from the multiply, or it proves nothing"
-        );
-        let series = unwrapped_series(
-            // `v` is deliberately a wrong number: the statement computed it
-            // from the BODY, and a shadowed group must not use it.
-            &[unwrapped_row(
-                10,
-                60_000_000_000,
-                999.0,
-                10,
-                1,
-                r#"{"latency":"0.1"}"#,
-            )],
-            crate::logql::sql::UnwrapReducer::Sum,
-        )
-        .expect("no fallback");
-        assert_eq!(series.len(), 1, "{series:?}");
-        assert_eq!(series[0].1, vec![(60_000_000_000, looped.to_bits())]);
-        // And the unwrapped label is not in the output series — `| unwrap`
-        // deletes it.
+    fn a_shadowed_row_falls_back_rather_than_being_recomputed() {
+        let e = unwrapped_series(&[unwrapped_row(
+            10,
+            60_000_000_000,
+            999.0,
+            10,
+            1,
+            r#"{"latency":"0.1"}"#,
+        )])
+        .expect_err("a shadowed row must fall back");
+        assert!(e.contains("carries the unwrapped name"), "{e}");
+
+        // The control: the SAME row with metadata that does not carry the
+        // name is an ordinary point, so what the row above rejects is the
+        // collision and not the presence of metadata.
+        let ok = unwrapped_series(&[unwrapped_row(
+            10,
+            60_000_000_000,
+            12.5,
+            10,
+            1,
+            r#"{"lvl":"info"}"#,
+        )])
+        .expect("metadata that does not collide is ordinary");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].1, vec![(60_000_000_000, 12.5f64.to_bits())]);
         assert!(
-            !series[0].0.iter().any(|(k, _)| k == "latency"),
-            "the unwrapped label must be deleted from the series: {:?}",
-            series[0].0
+            ok[0].0.iter().any(|(k, v)| k == "lvl" && v == "info"),
+            "and its metadata is still merged into the series: {:?}",
+            ok[0].0
         );
-    }
-
-    /// The other three shadowed values, each with the reason its zero or
-    /// its identity comes from the evaluator's algorithm.
-    #[test]
-    fn a_shadowed_avg_is_the_value_and_a_shadowed_spread_is_zero() {
-        let row = |sm: &str| vec![unwrapped_row(10, 60_000_000_000, 999.0, 7, 1, sm)];
-        let sm = r#"{"latency":"2.5"}"#;
-        let avg =
-            unwrapped_series(&row(sm), crate::logql::sql::UnwrapReducer::Avg).expect("no fallback");
-        assert_eq!(avg[0].1, vec![(60_000_000_000, 2.5f64.to_bits())]);
-        for reducer in [
-            crate::logql::sql::UnwrapReducer::StddevPop,
-            crate::logql::sql::UnwrapReducer::VarPop,
-        ] {
-            let s = unwrapped_series(&row(sm), reducer).expect("no fallback");
-            assert_eq!(
-                s[0].1,
-                vec![(60_000_000_000, 0.0f64.to_bits())],
-                "{reducer:?}: a constant sample set contributes v·(v − v) then 0·0"
-            );
-            assert!(
-                !s[0].1[0].1 == 0 || s[0].1[0].1 == 0.0f64.to_bits(),
-                "and it is POSITIVE zero, which is what the accumulator produces"
-            );
-        }
-    }
-
-    /// A shadowed value that does not parse is an ERROR for the series,
-    /// not a fallback and not a skipped group — the evaluator's shape,
-    /// with the parse message it renders.
-    #[test]
-    fn a_shadowed_value_that_does_not_parse_is_the_evaluators_error() {
-        let meta = range_meta();
-        let mut g = PushdownUnwrappedGroups::new(
-            &meta,
-            AggCaps::DEFAULT,
-            "latency",
-            crate::logql::sql::UnwrapReducer::Sum,
-            RANGE_GRID_START_NS,
-            RANGE_END_NS,
-        );
-        let err = g
-            .push_row(&unwrapped_row(
-                10,
-                60_000_000_000,
-                0.0,
-                1,
-                1,
-                r#"{"latency":"abc"}"#,
-            ))
-            .expect_err("an unparseable sample fails the query");
-        match err {
-            ReadError::MetricPipelineError { error_type, series } => {
-                assert_eq!(error_type, "SampleExtractionErr");
-                assert!(
-                    series.contains("strconv.ParseFloat: parsing \\\"abc\\\": invalid syntax"),
-                    "the details must be the pipeline's own text: {series}"
-                );
-                assert!(
-                    series.contains(r#"latency="abc""#),
-                    "the raw label stays on a failed unwrap: {series}"
-                );
-            }
-            other => panic!("expected the pipeline error, got {other:?}"),
-        }
     }
 
     /// **Two ways the lowered answer cannot be used**, each reported by
@@ -8921,38 +8822,29 @@ mod tests {
     #[test]
     fn the_unwrapped_fold_falls_back_rather_than_answering() {
         // A row whose value did not qualify.
-        let e = unwrapped_series(
-            &[
-                unwrapped_row(10, 60_000_000_000, 1.0, 2, 1, ""),
-                unwrapped_row(10, 120_000_000_000, 1.0, 2, 0, ""),
-            ],
-            crate::logql::sql::UnwrapReducer::Sum,
-        )
+        let e = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 2, 1, ""),
+            unwrapped_row(10, 120_000_000_000, 1.0, 2, 0, ""),
+        ])
         .expect_err("a non-qualifying row must fall back");
         assert!(e.contains("does not parse"), "{e}");
 
         // Two groups folding into one series at one grid point: fp 10's
         // metadata makes its label set fp 11's, and these reducers cannot
         // be merged from their aggregates.
-        let e = unwrapped_series(
-            &[
-                unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
-                unwrapped_row(11, 60_000_000_000, 2.0, 1, 1, ""),
-            ],
-            crate::logql::sql::UnwrapReducer::Avg,
-        )
+        let e = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+            unwrapped_row(11, 60_000_000_000, 2.0, 1, 1, ""),
+        ])
         .expect_err("two groups in one series must fall back");
         assert!(e.contains("fold into one series"), "{e}");
 
         // The control: the SAME two rows at DIFFERENT grid points are two
         // points of one series and do not fall back.
-        let ok = unwrapped_series(
-            &[
-                unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
-                unwrapped_row(11, 120_000_000_000, 2.0, 1, 1, ""),
-            ],
-            crate::logql::sql::UnwrapReducer::Avg,
-        )
+        let ok = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+            unwrapped_row(11, 120_000_000_000, 2.0, 1, 1, ""),
+        ])
         .expect("one group per point");
         assert_eq!(ok.len(), 1, "{ok:?}");
         assert_eq!(ok[0].1.len(), 2);
