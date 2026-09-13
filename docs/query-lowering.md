@@ -953,7 +953,7 @@ carries `Issue::PerSeed(Driver::Keyset { .. })` and none carries `Cut::InexactLi
 instance below is LogQL's, and it is the only one.
 
 **Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
-set at `:1625` from `has_unpushed_dropping_stage`, `:1655`), and when it is set the read is one
+set at `:1643` from `has_unpushed_dropping_stage`, `:1673`), and when it is set the read is one
 statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:897`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. §2.7.7 is what can turn this cut
 off.
@@ -4889,7 +4889,7 @@ measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
 (`crates/pulsus-read/src/logql/plan.rs:3304`) and `has_unpushed_dropping_stage` (`:1673`) and
-`metric_pipeline_construct` (`:1680`) are private — an integration test cannot call any of them.
+`metric_pipeline_construct` (`:1698`) are private — an integration test cannot call any of them.
 **They go in `plan.rs`'s existing `mod tests` (`plan.rs:3590`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
 directly, and again through its `use super::*` (`plan.rs:3593`). An earlier version of this section
