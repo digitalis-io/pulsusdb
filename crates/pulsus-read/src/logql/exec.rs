@@ -14,11 +14,12 @@ use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
 use super::pipeline::CompiledPipeline;
-use super::plan::{self, ClientAgg, MetricNode, MetricPlan, Plan, StreamsPlan};
-use super::predicate::CheckedLiteral;
+use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
+use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
-    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow, MetricScanRow,
-    PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
+    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
+    MetricRangeBucketRow, MetricRangeUnwrappedRow, MetricScanRow, PatternFetchRow, SampleRow,
+    StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -26,8 +27,9 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
 use pulsus_logql::{Expr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector};
 
 use super::charge::{
-    MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, StreamsResultBudget, charge_group_bytes,
-    group_entry_bytes,
+    MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_POINT_SLOT,
+    PUSHDOWN_RANGE_SLOT, StreamsResultBudget, charge_group_bytes, group_entry_bytes,
+    map_entry_bytes,
 };
 use super::client_agg::check_surviving_error;
 use super::labels::render_series_labels;
@@ -39,6 +41,7 @@ use super::agg::{InstantSeries, LabelSet};
 use super::charge::{AggCaps, ensure_result_series};
 use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
+    shift_emitted_points,
 };
 use super::detected_probe::{
     DetectedPagedState, DetectedRowFeeder, FanOutGroup, GroupKey, LabelScratch,
@@ -1188,7 +1191,7 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &sp.line_filters,
+            &stage3_predicates(sp, &meta),
             sp.direction,
             sp.scan_limit,
         );
@@ -1381,7 +1384,7 @@ impl LogQlEngine {
                 window,
                 ks_lower,
                 sp.direction,
-                &sp.line_filters,
+                &stage3_predicates(sp, meta),
                 st.page_size,
             );
 
@@ -1514,11 +1517,14 @@ impl LogQlEngine {
         } else {
             distinct_escaped_services(&meta)
         };
-        let source = metric_source(mp);
 
         if is_instant {
+            // Issue #507 W4: the shape is read INSIDE the arms that need
+            // one. An unwrapped plan has no sealed column pair, so
+            // `metric_source`'s `.expect` would be reachable by an
+            // ordinary query if this stayed above the branch.
             let sql = super::sql::metric_instant(
-                source,
+                metric_source(mp),
                 &services,
                 &fingerprints,
                 super::sql::TimeWindow {
@@ -1569,34 +1575,188 @@ impl LogQlEngine {
                     .collect(),
             ))
         } else {
-            // **Structurally unreachable, and removed rather than charged
-            // (issues #241 / #257).** Reaching here needs `client.is_none()`
-            // (the arm above returned otherwise) AND `step_ns.is_some()`.
-            // `metric_plan` forces `client = Some(..)` for every
-            // `QuerySpec::Range` (`plan.rs`'s `metric_plan`, the `|| is_range`
-            // disjunct) and derives `step_ns = None` for exactly
-            // `QuerySpec::Instant` (the same function's `match p.spec` binding
-            // `step_ns`; both `Range` arms yield `Some(step)`), so
-            // the conjunction is unsatisfiable — and it already was on the day
-            // #257 was filed against the SQL-aggregated range arm that stood
-            // here (`git show 8d1f4519:…/exec.rs`, lines 1004-1021).
+            // **The bucketed range read** (issue #507, W2). Reaching here
+            // needs `client.is_none()` (the arm above returned otherwise)
+            // AND `step_ns.is_some()`, which is exactly the shape
+            // `metric_plan`'s `bucketed_range` admits: one of the four
+            // counting reducers, nothing in the pipeline beyond a pushable
+            // line filter, and a range equal to the step.
             //
-            // #257's remedy is therefore removal: there is nothing to charge
-            // because the code cannot run. `sql::metric_range` is untouched —
-            // it is `pub`, `docs/schemas.md` §3.2 documents its shape, and
-            // `tests/rollup_differential.rs` drives it live.
-            //
-            // A refusal rather than a deletion because the planner could
-            // reintroduce the state; the tripwire that would catch that
-            // BEFORE a request does is
+            // Until #507 this state was unreachable and the arm refused,
+            // because `metric_plan` forced `client = Some(..)` for every
+            // `QuerySpec::Range` (issues #241 / #257). The tripwire that
+            // named the refusal —
             // `logql_plan_build_differential.rs::
-            // every_planned_range_leaf_is_client_aggregated`.
-            Err(ReadError::PipelineInvalid {
-                reason: "internal: a range metric plan reached the SQL-aggregated path; every \
-                         QuerySpec::Range forces client aggregation (plan.rs)"
-                    .to_string(),
-            })
+            // every_planned_range_leaf_is_client_aggregated` — now states
+            // the relaxed property instead.
+            //
+            // **The capability join.** The grid expression can refuse for
+            // three reasons, all of them decided by the request's own time
+            // bounds, and each is a fall back to the client path rather
+            // than an error: the query is valid and the aggregation simply
+            // does not lower. `metric_plan` asserts the chain-decidable
+            // half, so none of the three is reachable through the planner;
+            // the arm is what makes that a property of the code rather
+            // than of the reasoning.
+            // **The grid-resolution guard, which no other call on this
+            // path applies.** The client path reaches it through
+            // `ClientWindow::Range`; this path builds no `ClientWindow`,
+            // so without this line an over-cap grid would be answered
+            // instead of refused, and a query that 422s today would start
+            // returning a matrix. Same constant, same named refusal, no
+            // round trip: it runs before the statement is issued.
+            if let Some(step) = mp.step_ns {
+                super::window::ensure_grid_resolution(mp.grid_start_ns, mp.end_ns, step.as_u64())?;
+            }
+            // Issue #507 (W4): the unwrapped read is a second lowered
+            // shape with its own statement, its own row type and its own
+            // fold. It is a `match` on the plan's `value` rather than a
+            // flag, so a third shape is a compile error here.
+            if let super::sql::MetricValue::Unwrapped(u) = &mp.value {
+                return self
+                    .run_unwrapped_range(
+                        mp,
+                        u.reducer,
+                        &u.label,
+                        &u.name,
+                        &services,
+                        &fingerprints,
+                        &meta,
+                        explain,
+                    )
+                    .await;
+            }
+            match bucketed_range_sql(mp, &services, &fingerprints) {
+                Ok(sql) => {
+                    if let Some(e) = explain.as_mut() {
+                        e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+                    }
+                    let mut groups = PushdownRangeGroups::new(
+                        &meta,
+                        AggCaps::DEFAULT,
+                        mp.grid_start_ns,
+                        mp.end_ns,
+                    );
+                    {
+                        // Scoped: the row stream holds its pooled
+                        // connection until dropped (the `ChRowStream`
+                        // lease rule), and nothing else queries inside.
+                        let mut stream = self
+                            .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
+                            .await?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| {
+                                map_read_error(
+                                    e,
+                                    self.config.scan_budget_bytes,
+                                    self.config.read_max_memory_bytes,
+                                )
+                            })?;
+                            groups.push_row(&row)?;
+                        }
+                    }
+                    let series = groups.finish(mp.rate_window_ns);
+                    // The emitted points are on the SHIFTED grid; this
+                    // puts them back on the caller's, the one place the
+                    // offset is added back on this path (issue #343).
+                    let result = shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
+                    apply_vector_aggs(result, &mp.vector_aggs)
+                }
+                Err(
+                    BucketGridRefusal::StepNotPositive
+                    | BucketGridRefusal::AnchorAboveScanStart
+                    | BucketGridRefusal::WouldOverflow,
+                ) => {
+                    // No `_` arm: a fourth refusal reason fails to compile
+                    // here rather than falling through to a behaviour
+                    // nobody chose for it.
+                    let client = bucketed_fallback_client_agg(mp);
+                    let compiled = CompiledPipeline::compile(&client.pipeline)?;
+                    self.run_metric_client(mp, &client, &compiled, &fingerprints, explain)
+                        .await
+                }
+            }
         }
+    }
+
+    /// The unwrapped bucketed range read (issue #507, W4).
+    ///
+    /// Three things send it to the client path instead of answering, and
+    /// each is reported by the statement or by the fold rather than
+    /// guessed: the grid cannot be rendered, a row's value does not
+    /// qualify, or two returned groups fold into one series at one grid
+    /// point. All three are **whole-query** fallbacks — a group that falls
+    /// back needs rows the statement aggregated away — and the price is
+    /// one wasted statement, paid on the corpora where the lowering does
+    /// not help.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_unwrapped_range(
+        &self,
+        mp: &MetricPlan,
+        reducer: super::sql::UnwrapReducer,
+        label: &str,
+        name: &CheckedLiteral,
+        services: &[CheckedLiteral],
+        fingerprints: &[u64],
+        meta: &HashMap<u64, StreamMetaRow>,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        // The one fallback body, named once: the reconstructed client
+        // aggregation over the same plan. Every `return` below reaches it.
+        macro_rules! fall_back {
+            ($why:expr, $explain:expr) => {{
+                let _why: &str = $why;
+                let client = unwrapped_fallback_client_agg(mp, label);
+                let compiled = CompiledPipeline::compile(&client.pipeline)?;
+                return self
+                    .run_metric_client(mp, &client, &compiled, fingerprints, $explain)
+                    .await;
+            }};
+        }
+
+        let sql = match unwrapped_range_sql(mp, reducer, name, services, fingerprints) {
+            Ok(sql) => sql,
+            Err(
+                BucketGridRefusal::StepNotPositive
+                | BucketGridRefusal::AnchorAboveScanStart
+                | BucketGridRefusal::WouldOverflow,
+            ) => {
+                fall_back!("the grid is not renderable", explain)
+            }
+        };
+        if let Some(e) = explain.as_mut() {
+            e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+        }
+        let mut groups = PushdownUnwrappedGroups::new(
+            meta,
+            AggCaps::DEFAULT,
+            label,
+            mp.grid_start_ns,
+            mp.end_ns,
+        );
+        {
+            // Scoped: the row stream holds its pooled connection until
+            // dropped, and the fallback below issues a second query.
+            let mut stream = self
+                .query_stream::<MetricRangeUnwrappedRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
+                groups.push_row(&row)?;
+            }
+        }
+        let series = match groups.finish() {
+            Ok(series) => series,
+            Err(why) => fall_back!(why, explain),
+        };
+        let result = shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
+        apply_vector_aggs(result, &mp.vector_aggs)
     }
 
     /// The client-aggregated metric path (issue M6-10): fetch every
@@ -1950,7 +2110,7 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &sp.line_filters,
+            &stage3_predicates(sp, &meta),
             sp.direction,
             sp.scan_limit,
         );
@@ -2015,23 +2175,43 @@ impl LogQlEngine {
             // `explain_indexes` gates validate a query we never issue.
             client_metric_read_sql(mp, &services, &fingerprints, window)
         } else {
-            let source = metric_source(mp);
             match mp.step_ns {
-                // The execution twin's unreachable arm, refused for the same
-                // reason and by the same condition (issues #241 / #257): an
-                // EXPLAIN of a plan the engine would refuse must refuse too,
-                // or the explain payload would name SQL that can never run.
-                // See `run_metric_inner`'s `else` arm for the derivation.
+                // The execution twin's range arm (issue #507, W2). It
+                // refused with the engine while the state was unreachable;
+                // now that the engine serves it, an EXPLAIN that still
+                // refused would be a wrong answer on a route a user can
+                // reach. Both the statement and the fallback come from the
+                // same two functions the engine calls, so the payload is
+                // the query that runs — including the capability join,
+                // whose three refusals report the client path's scan
+                // because that is what would execute.
+                // Issue #507 W4: the unwrapped shape has its own
+                // statement, so the twin matches the plan's `value` here
+                // exactly as the reader does. The fallback text is the
+                // client scan in both arms, because that is what would
+                // execute.
                 Some(_) => {
-                    return Err(ReadError::PipelineInvalid {
-                        reason: "internal: a range metric plan reached the SQL-aggregated \
-                                 path; every QuerySpec::Range forces client aggregation \
-                                 (plan.rs)"
-                            .to_string(),
-                    });
+                    let rendered = match &mp.value {
+                        super::sql::MetricValue::Unwrapped(u) => {
+                            unwrapped_range_sql(mp, u.reducer, &u.name, &services, &fingerprints)
+                        }
+                        super::sql::MetricValue::Shaped(_) => {
+                            bucketed_range_sql(mp, &services, &fingerprints)
+                        }
+                    };
+                    match rendered {
+                        Ok(sql) => sql,
+                        Err(
+                            BucketGridRefusal::StepNotPositive
+                            | BucketGridRefusal::AnchorAboveScanStart
+                            | BucketGridRefusal::WouldOverflow,
+                        ) => client_metric_read_sql(mp, &services, &fingerprints, window),
+                    }
                 }
+                // The shape is read here rather than above the match,
+                // for the reason `run_metric_inner`'s instant arm gives.
                 None => super::sql::metric_instant(
-                    source,
+                    metric_source(mp),
                     &services,
                     &fingerprints,
                     window,
@@ -4487,6 +4667,557 @@ impl PushdownInstantGroups {
     }
 }
 
+/// The bucketed range read's client-side fold (issue #507, W2).
+///
+/// ```text
+/// row (fingerprint, bucket_ns, n, structured_metadata)
+///   -> the base label set for that fingerprint   stage 2, snapshotted once
+///   -> merge the row's structured metadata in    the `PushdownInstantGroups` rule
+///   -> group by (final label set, bucket_ns), summing `n`
+///   -> apply_rate once per point, over the summed count
+/// ```
+///
+/// **Fold first, then emit.** A grid point is emitted for a folded series
+/// exactly where at least one of its contributing rows exists. Two
+/// fingerprints whose final label sets are equal — one stream's metadata
+/// value making its set equal to another stream's — are ONE series, and
+/// that series has a point wherever either of them had a row. Emitting per
+/// fingerprint and folding afterwards gives the same values at a different
+/// set of points, which is a wrong answer at every gap.
+///
+/// **A grid point with no contributing row is not emitted at all** — not a
+/// zero, not a NaN, no point. The statement returns no row for an empty
+/// `(fingerprint, bucket_ns, metadata)` group, so this state's obligation
+/// is not to fill; the reference deletes a series from its window map when
+/// its sample list empties and emits one sample per series still in it
+/// (`pkg/logql/range_vector.go` @ `v3.7.4`).
+///
+/// Summing `u64` partials is exact, which is what lets the four counting
+/// reducers claim `Fidelity::Equivalent`: see
+/// `super::compile::RangeAggLower::fidelity`.
+pub(in crate::logql) struct PushdownRangeGroups {
+    /// Each resolved stream's base label set, snapshotted ONCE — one
+    /// fingerprint returns up to (grid points x metadata variants) rows.
+    base_labels: HashMap<u64, LabelSet>,
+    /// Rendered final label set -> `(labels, grid point -> summed count)`.
+    groups: HashMap<String, (LabelSet, HashMap<i64, u64>)>,
+    /// The emit grid's first point and the query's end. A row can arrive
+    /// outside them and must not become a point — see [`Self::push_row`].
+    grid_start_ns: i64,
+    end_ns: i64,
+    /// Query-lifetime bytes, never discharged: the groups ARE the result
+    /// (the `PushdownInstantGroups` precedent).
+    charged: u64,
+    caps: AggCaps,
+    merge_buf: Vec<(String, String)>,
+    sm_buf: Vec<(String, String)>,
+    sm_ctx: StructuredMetadataCtx,
+}
+
+impl PushdownRangeGroups {
+    pub(in crate::logql) fn new(
+        meta: &HashMap<u64, StreamMetaRow>,
+        caps: AggCaps,
+        grid_start_ns: i64,
+        end_ns: i64,
+    ) -> Self {
+        PushdownRangeGroups {
+            base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
+            groups: HashMap::new(),
+            grid_start_ns,
+            end_ns,
+            charged: 0,
+            caps,
+            merge_buf: Vec::new(),
+            sm_buf: Vec::new(),
+            sm_ctx: StructuredMetadataCtx::default(),
+        }
+    }
+
+    /// Folds one returned row. A row whose fingerprint did not hydrate is
+    /// skipped, as on the instant path.
+    ///
+    /// **Rows outside the emit grid are dropped here, and they are rows
+    /// the reference never counts.** The scan is bounded by the query's
+    /// `end`, which need not sit on the grid; a row in
+    /// `(last grid point, end]` buckets to `last + step`, a point the
+    /// reference does not evaluate, so its rows are in no window:
+    ///
+    /// ```text
+    /// grid   ... g_last |          end
+    /// rows              |  x  x    |   <- bucket to g_last + step, no window
+    /// ```
+    ///
+    /// The lower test is the mirror image, and reachable only when the
+    /// scan's lower bound is INCLUSIVE (`widen_scan_start` saturated at
+    /// `i64::MIN`): a row at exactly `grid_start - step` buckets below the
+    /// grid's first point, where the first window `(grid_start - range,
+    /// grid_start]` is open below and excludes it.
+    pub(in crate::logql) fn push_row(
+        &mut self,
+        row: &MetricRangeBucketRow,
+    ) -> Result<(), ReadError> {
+        if row.bucket_ns < self.grid_start_ns || row.bucket_ns > self.end_ns {
+            return Ok(());
+        }
+        let Some(base) = self.base_labels.get(&row.fingerprint) else {
+            return Ok(());
+        };
+        // No pipeline runs on this path by construction (`client == None`
+        // and every lowered stage is a pushed line filter), so the merge
+        // IS the whole label computation — the instant path's derivation,
+        // and the same `visible()` rule for the out-of-band error slots.
+        let labels: LabelSet = if row.structured_metadata.is_empty() {
+            base.clone()
+        } else {
+            merge_labels_with_structured_metadata(
+                base,
+                &row.structured_metadata,
+                &mut self.merge_buf,
+                &mut self.sm_buf,
+                &mut self.sm_ctx,
+            );
+            let mut merged = std::mem::take(&mut self.merge_buf);
+            self.sm_ctx.append_visible(&mut merged);
+            merged.sort();
+            merged
+        };
+        // A surviving `__error__` fails the whole query, exactly as on the
+        // instant pushdown path.
+        check_surviving_error(&labels)?;
+        let key = render_series_labels(&labels);
+        match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let (_, points) = e.get_mut();
+                match points.entry(row.bucket_ns) {
+                    std::collections::hash_map::Entry::Occupied(mut p) => {
+                        *p.get_mut() = p.get().saturating_add(row.n);
+                    }
+                    std::collections::hash_map::Entry::Vacant(p) => {
+                        p.insert(row.n);
+                        charge_group_bytes(
+                            &mut self.charged,
+                            map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT),
+                            self.caps.group_bytes,
+                        )?;
+                    }
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let cost = group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_SLOT)
+                    .saturating_add(map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT));
+                charge_group_bytes(&mut self.charged, cost, self.caps.group_bytes)?;
+                let mut points = HashMap::new();
+                points.insert(row.bucket_ns, row.n);
+                e.insert((labels, points));
+            }
+        }
+        Ok(())
+    }
+
+    /// How many bytes this state has charged.
+    #[cfg(test)]
+    pub(in crate::logql) fn charged_bytes(&self) -> u64 {
+        self.charged
+    }
+
+    /// The rate divisor is applied ONCE per point, to the summed count —
+    /// one division of an exact integer sum, never a sum of divided
+    /// values. Emitted in rendered-label order, and each series' points
+    /// ascending by grid point, so the value a downstream `sum`
+    /// accumulates is reproducible run to run (a `HashMap` drain is not).
+    pub(in crate::logql) fn finish(self, rate_window_ns: Option<u64>) -> Vec<MatrixSeries> {
+        let mut out: Vec<(String, LabelSet, HashMap<i64, u64>)> = self
+            .groups
+            .into_iter()
+            .map(|(key, (labels, points))| (key, labels, points))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.into_iter()
+            .map(|(_, labels, points)| {
+                let mut points: Vec<(i64, f64)> = points
+                    .into_iter()
+                    .map(|(ts, n)| (ts, apply_rate(n as f64, rate_window_ns)))
+                    .collect();
+                points.sort_by_key(|(ts, _)| *ts);
+                MatrixSeries { labels, points }
+            })
+            .collect()
+    }
+}
+
+/// The bucketed range read's client-side fold over an UNWRAPPED value
+/// (issue #507, W4).
+///
+/// The counting form's fold sums `u64` partials, which is exact in any
+/// order. **This one cannot merge partials at all**: `avg`, `stddevPop`
+/// and `varPop` are not combinable from two group aggregates without their
+/// counts and their intermediate moments, and even `sum` would be a
+/// different accumulation order from the evaluator's. So the rule is
+/// **one returned group per emitted point, or the whole query falls
+/// back** — which holds whenever the statement's group key
+/// `(fingerprint, grid point, structured_metadata)` and the output series
+/// identity are the same partition, and that is exactly what the targeted
+/// `| json <name>="<name>"` extraction buys (`plan.rs`'s
+/// `unwrapped_chain`).
+///
+/// Three conditions send the query to the client path, and each one is a
+/// property the statement reports rather than a guess:
+///
+/// ```text
+/// all_numeric = 0   some row's value is absent, null, or does not parse
+/// a second group reaching one (series, grid point)
+/// a row whose metadata carries the unwrapped name
+/// ```
+///
+/// **A shadowed group falls back, and recomputing it is not enough.**
+/// When a row's structured metadata carries a key equal to the unwrapped
+/// name, the evaluator takes the metadata's value AND keeps the parsed one
+/// under `<name>_extracted` — measured in `logqltest_corpus.rs`'s
+/// `unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name`.
+/// So the parsed field does not only supply a value it also **names the
+/// series**, and its value comes from the body:
+///
+/// ```text
+///  metadata x=5, bodies x=7 and x=8, sum_over_time(… | unwrap x)
+///    the evaluator   {…, x_extracted="7"} 5   AND  {…, x_extracted="8"} 5
+///    one group       {…} 10
+/// ```
+///
+/// Recomputing the group's VALUE from the metadata gets `5` right and the
+/// series wrong: two series collapse into one. The statement's group key
+/// cannot carry `x_extracted`, because its value is per row and the body
+/// is not transported — the same reason a bare `| json` chain does not
+/// lower at all (`plan.rs`'s `unwrapped_chain`). So the whole query falls
+/// back, which is the only sound answer and is what an earlier round's
+/// recomputation got wrong.
+pub(in crate::logql) struct PushdownUnwrappedGroups<'a> {
+    base_labels: HashMap<u64, LabelSet>,
+    /// The unwrapped label, as the query wrote it. **The only thing this
+    /// fold needs to know about the query** — the reducer is the
+    /// statement's business, because a group's aggregate is used as it
+    /// arrives or the query falls back.
+    label: &'a str,
+    /// Rendered final label set -> `(labels, grid point -> value)`.
+    groups: HashMap<String, (LabelSet, HashMap<i64, f64>)>,
+    grid_start_ns: i64,
+    end_ns: i64,
+    /// Set when the lowered answer cannot be used and the query must be
+    /// re-run on the client path.
+    fall_back: Option<&'static str>,
+    charged: u64,
+    caps: AggCaps,
+    merge_buf: Vec<(String, String)>,
+    sm_buf: Vec<(String, String)>,
+    sm_ctx: StructuredMetadataCtx,
+}
+
+impl<'a> PushdownUnwrappedGroups<'a> {
+    pub(in crate::logql) fn new(
+        meta: &HashMap<u64, StreamMetaRow>,
+        caps: AggCaps,
+        label: &'a str,
+        grid_start_ns: i64,
+        end_ns: i64,
+    ) -> Self {
+        PushdownUnwrappedGroups {
+            base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
+            label,
+            groups: HashMap::new(),
+            grid_start_ns,
+            end_ns,
+            fall_back: None,
+            charged: 0,
+            caps,
+            merge_buf: Vec::new(),
+            sm_buf: Vec::new(),
+            sm_ctx: StructuredMetadataCtx::default(),
+        }
+    }
+
+    pub(in crate::logql) fn push_row(
+        &mut self,
+        row: &MetricRangeUnwrappedRow,
+    ) -> Result<(), ReadError> {
+        // **A non-finite aggregate falls back**, and `avg` is why (review
+        // round 2). The database computes an average as a sum divided by
+        // a count, so two samples of `1e308` overflow the sum and answer
+        // `inf` where the evaluator's INCREMENTAL mean answers `1e308` —
+        // a finite number turned into infinity, which no tolerance
+        // covers. The check is on the RESULT rather than on the reducer
+        // because an overflow is absorbing: once a partial sum reaches
+        // `inf` it stays `inf` or becomes `NaN`, so any aggregate that
+        // overflowed anywhere arrives non-finite here. A genuinely
+        // infinite answer falls back too, and the client path then
+        // computes the same infinity a statement slower.
+        if !row.v.is_finite() {
+            self.fall_back = Some(
+                "the database's aggregate is not finite, which a sum over finite samples can \
+                 be where the evaluator's incremental form is not",
+            );
+            return Ok(());
+        }
+        if row.all_numeric == 0 {
+            self.fall_back = Some(
+                "a row's unwrapped value is absent, null, or does not parse, and the statement \
+                 cannot tell those apart",
+            );
+            return Ok(());
+        }
+        if row.bucket_ns < self.grid_start_ns || row.bucket_ns > self.end_ns {
+            return Ok(());
+        }
+        let Some(base) = self.base_labels.get(&row.fingerprint) else {
+            return Ok(());
+        };
+        let labels: LabelSet = if row.structured_metadata.is_empty() {
+            base.clone()
+        } else {
+            merge_labels_with_structured_metadata(
+                base,
+                &row.structured_metadata,
+                &mut self.merge_buf,
+                &mut self.sm_buf,
+                &mut self.sm_ctx,
+            );
+            let mut merged = std::mem::take(&mut self.merge_buf);
+            self.sm_ctx.append_visible(&mut merged);
+            merged.sort();
+            merged
+        };
+        // **The shadowed row.** Its metadata carries the unwrapped name,
+        // so the evaluator takes the metadata's value and keeps the
+        // PARSED one under `<name>_extracted` — a label whose value comes
+        // from the body, which this statement does not transport. The
+        // series the evaluator produces cannot be built from these
+        // columns at all, so the query falls back rather than answering
+        // with fewer series than it should.
+        if labels.iter().any(|(k, _)| k == self.label) {
+            self.fall_back = Some(
+                "a row's structured metadata carries the unwrapped name, so the evaluator's \
+                 series are keyed by a parsed label the statement does not return",
+            );
+            return Ok(());
+        }
+        let value = row.v;
+        check_surviving_error(&labels)?;
+        let key = render_series_labels(&labels);
+        match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let (_, points) = e.get_mut();
+                match points.entry(row.bucket_ns) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        self.fall_back = Some(
+                            "two returned groups fold into one series at one grid point, and \
+                             these reducers cannot be merged from their aggregates",
+                        );
+                    }
+                    std::collections::hash_map::Entry::Vacant(p) => {
+                        p.insert(value);
+                        charge_group_bytes(
+                            &mut self.charged,
+                            map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT),
+                            self.caps.group_bytes,
+                        )?;
+                    }
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let cost = group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_SLOT)
+                    .saturating_add(map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT));
+                charge_group_bytes(&mut self.charged, cost, self.caps.group_bytes)?;
+                let mut points = HashMap::new();
+                points.insert(row.bucket_ns, value);
+                e.insert((labels, points));
+            }
+        }
+        Ok(())
+    }
+
+    /// `None` = the lowered answer cannot be used and the caller must
+    /// re-run on the client path, with the reason for the explain payload.
+    pub(in crate::logql) fn finish(self) -> Result<Vec<MatrixSeries>, &'static str> {
+        if let Some(why) = self.fall_back {
+            return Err(why);
+        }
+        let mut out: Vec<(String, LabelSet, HashMap<i64, f64>)> = self
+            .groups
+            .into_iter()
+            .map(|(key, (labels, points))| (key, labels, points))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out
+            .into_iter()
+            .map(|(_, labels, points)| {
+                let mut points: Vec<(i64, f64)> = points.into_iter().collect();
+                points.sort_by_key(|(ts, _)| *ts);
+                MatrixSeries { labels, points }
+            })
+            .collect())
+    }
+}
+
+/// The bucketed range read's statement for a planned metric leaf (issue
+/// #507, W2) — the ONE implementation shared by execution and EXPLAIN, the
+/// [`client_metric_read_sql`] precedent, so an EXPLAIN cannot report a
+/// statement the engine would not issue.
+///
+/// `lo_ns` is `grid_start_ns - step_ns`: the emit grid one step below its
+/// first point, and never `mp.start_ns`, which is the SCAN start and has
+/// been widened backwards by the range selector. They are equal exactly
+/// when the range equals the step, which is the only case `metric_plan`
+/// lowers, so a defect here would be invisible from this path alone —
+/// `super::predicate::bucket_expr` holds the derivation and
+/// `sql.rs`'s `the_bucket_anchor_is_the_emit_grid_not_the_widened_scan_start`
+/// is the test that separates them.
+///
+/// `Err` is a fall back to the client path, never a failed query — see the
+/// call site's capability join.
+fn bucketed_range_sql(
+    mp: &MetricPlan,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+) -> Result<String, BucketGridRefusal> {
+    // A plan with no step has no grid at all. Expressed as a refusal
+    // rather than an assertion so the statement cannot be built for one.
+    let Some(step) = mp.step_ns else {
+        return Err(BucketGridRefusal::StepNotPositive);
+    };
+    let step_ns = step.get();
+    let lo_ns = mp
+        .grid_start_ns
+        .checked_sub(step_ns)
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    super::sql::metric_range_bucketed(
+        metric_source(mp),
+        services,
+        fingerprints,
+        super::sql::BucketedScan {
+            window: super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            lo_ns,
+            step_ns,
+        },
+        &mp.extra_predicates,
+        // `Lean` drops the metadata column and its only caller is
+        // `absent_over_time`, which never lowers onto this path
+        // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
+        ScanProjection::WithStructuredMetadata,
+    )
+}
+
+/// The unwrapped bucketed read's statement (issue #507, W4) — the sibling
+/// of [`bucketed_range_sql`], sharing its anchor derivation so the two
+/// grids cannot differ.
+fn unwrapped_range_sql(
+    mp: &MetricPlan,
+    reducer: super::sql::UnwrapReducer,
+    name: &CheckedLiteral,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+) -> Result<String, BucketGridRefusal> {
+    let Some(step) = mp.step_ns else {
+        return Err(BucketGridRefusal::StepNotPositive);
+    };
+    let step_ns = step.get();
+    let lo_ns = mp
+        .grid_start_ns
+        .checked_sub(step_ns)
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    super::sql::metric_range_unwrapped(
+        &mp.table,
+        reducer,
+        name,
+        services,
+        fingerprints,
+        super::sql::BucketedScan {
+            window: super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            lo_ns,
+            step_ns,
+        },
+        &mp.extra_predicates,
+    )
+}
+
+/// The client aggregation an UNWRAPPED bucketed chain is equivalent to
+/// (issue #507, W4) — what the reader falls back to when the grid cannot
+/// be rendered, when a row's value does not qualify, or when two groups
+/// fold into one series.
+///
+/// **The pipeline is RECONSTRUCTED, and that is exact rather than a
+/// guess.** `plan.rs`'s `unwrapped_chain` admits exactly one shape — a run
+/// of pushable line filters, then `| json <name>="<name>"`, then
+/// `| unwrap <name>` with no conversion, and nothing after it — so the
+/// label is the whole of what distinguishes one admitted chain from
+/// another. The line filters are already compiled into
+/// `mp.extra_predicates`, which the client scan pushes too, exactly as the
+/// counting form's fallback does.
+/// `the_reconstructed_fallback_pipeline_is_the_planned_one` is the test
+/// that fails if the admitted shape ever widens.
+pub fn unwrapped_fallback_client_agg(mp: &MetricPlan, label: &str) -> ClientAgg {
+    use pulsus_logql::{LabelExtraction, ParserStage, Unwrap};
+    ClientAgg {
+        pipeline: vec![
+            Stage::Parser(ParserStage::Json {
+                extractions: vec![LabelExtraction {
+                    label: label.to_string(),
+                    expression: label.to_string(),
+                }],
+            }),
+            Stage::Unwrap(Unwrap {
+                label: label.to_string(),
+                conversion: None,
+            }),
+        ],
+        value: ClientValue::Unwrap,
+        range_op: mp.op,
+        param: None,
+        absent_labels: Vec::new(),
+        grouping: None,
+    }
+}
+
+/// The client aggregation a clean bucketed chain is equivalent to (issue
+/// #507, W2) — what the capability join falls back to when the grid cannot
+/// be rendered.
+///
+/// **The pipeline is empty, and that is the whole chain, not a truncation
+/// of it.** `metric_plan` lowers only a chain whose every stage is a
+/// PUSHABLE line filter, and those are already compiled into
+/// `mp.extra_predicates`, which [`client_metric_read_sql`] pushes into the
+/// raw scan too. So the fallback re-reads the same rows and counts them
+/// in-engine, which is what this query did before #507.
+///
+/// No grouping and no `absent_labels`: a range aggregation's `by`/`without`
+/// is refused by the parser on all four lowered reducers, and
+/// `absent_over_time` is not one of them.
+///
+/// `pub` because the hermetic corpus runner needs the same object: it has
+/// no database, so it cannot issue the statement, and it evaluates a
+/// lowered plan down this same fallback. Two expressions of "what a
+/// lowered chain is equivalent to" would be free to drift.
+pub fn bucketed_fallback_client_agg(mp: &MetricPlan) -> ClientAgg {
+    ClientAgg {
+        pipeline: Vec::new(),
+        value: if matches!(mp.op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate) {
+            ClientValue::Bytes
+        } else {
+            ClientValue::Count
+        },
+        range_op: mp.op,
+        param: None,
+        absent_labels: Vec::new(),
+        grouping: None,
+    }
+}
+
 /// The client-aggregated raw fetch SQL for a planned metric leaf — the ONE
 /// implementation shared by execution (`run_metric_client`) and EXPLAIN
 /// (`explain_metric`), so the reported query is by construction the query
@@ -4870,6 +5601,57 @@ fn pop_value(vals: &mut Vec<QueryResult>) -> QueryResult {
         // already pushed their values.
         None => unreachable!("a post-order metric fold has its children's values on the stack"),
     }
+}
+
+/// The third statement's predicate list: the plan's line filters, plus
+/// every parsed-name filter whose proviso holds over the streams this
+/// request actually resolved (issue #507, W3, arm 3).
+///
+/// **This is where a cell that is sound GIVEN NAMED STATE has its proviso
+/// checked.** A parsed-name fragment reads a key of the line, which is the
+/// label the evaluator resolved only while no selected stream carries a
+/// label of that name. Where one does, the stream label wins the collision
+/// and the line's key is renamed, so the fragment would compare the wrong
+/// value and drop a row the evaluator keeps.
+///
+/// It is checked HERE, and nowhere else, because a stream label is
+/// constant across every row the statement reads: no per-row predicate can
+/// test it, and it is not knowable before stage 2 resolves the label sets.
+/// The other half of the same hazard — a structured-metadata key of the
+/// same name — is per row, and the fragment's own whole-value guard tests
+/// it inside the statement. Two facts with two lifetimes, each checked in
+/// the one place it is knowable.
+///
+/// **Every call site has already run stage 2**, so the proviso costs no
+/// round trip, and EXPLAIN reports the statement execution issues because
+/// both go through here.
+///
+/// **Why the fragments are minted here rather than carried on the plan**,
+/// which is bookkeeping rather than design: forty-six design-record
+/// citations name a bare `plan.rs:<line>` and are FROZEN as unresolvable,
+/// because the basename matches several tracked files. A frozen row
+/// carries no file, so a field added to `StreamsPlan` would move lines
+/// those citations point at and no rule could repair them. The text is
+/// still produced by one function — `plan::compile_parsed_label_filters`,
+/// over the plan's own pipeline — so there is no second renderer.
+fn stage3_predicates(sp: &StreamsPlan, meta: &HashMap<u64, StreamMetaRow>) -> Vec<CheckedFragment> {
+    let mut out = sp.line_filters.clone();
+    let candidates = super::plan::compile_parsed_label_filters(&sp.pipeline);
+    if candidates.is_empty() {
+        return out;
+    }
+    let mut stream_label_names: BTreeSet<String> = BTreeSet::new();
+    for m in meta.values() {
+        for (k, _) in series_labels(m) {
+            stream_label_names.insert(k);
+        }
+    }
+    for pred in candidates {
+        if !stream_label_names.contains(&pred.name) {
+            out.push(pred.fragment);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -7373,6 +8155,717 @@ mod tests {
             "per-partial division would be a DIFFERENT double — that is why \
              the sum happens first"
         );
+    }
+
+    /// Issue #507, condition 3 — **the rate divisor is applied once per
+    /// series, before the outer vector aggregation consumes the series**,
+    /// and the two orders give different answers.
+    ///
+    /// The reader's order over pre-aggregated rows ends
+    ///
+    /// ```text
+    /// 5  sum the integer partials for the series
+    /// 6  apply the rate divisor ONCE, per series      <- here
+    /// 7  the outer vector aggregation consumes the divided series
+    /// ```
+    ///
+    /// Step 6 before step 7 is a choice with an observable consequence,
+    /// because floating-point addition is not associative. With counts 1
+    /// and 4 over a 3-second window:
+    ///
+    /// ```text
+    /// divide first   1/3 + 4/3  =  1.6666666666666665   bits 0x3FFAAAAAAAAAAAAA
+    /// divide after   (1 + 4)/3  =  1.6666666666666667   bits 0x3FFAAAAAAAAAAAAB
+    /// ```
+    ///
+    /// The fixture is asserted to distinguish the two before either answer
+    /// is checked, so the test cannot pass by both sides collapsing
+    /// together.
+    ///
+    /// **What this reaches, and what it does not.** It drives the shipped
+    /// `PushdownInstantGroups::finish` and the shipped instant
+    /// vector-aggregation chain, so removing the divisor from `finish`, or
+    /// changing what `finish` divides, reddens it. It does **not** reach
+    /// the two statements in `run_metric_instant_pushdown` that put those
+    /// two functions in that order — reaching those needs a database
+    /// stream, and no hermetic test reaches them.
+    #[test]
+    fn ac32_divisor_precedes_the_vector_aggregation() {
+        const DIVIDE_FIRST_BITS: u64 = 0x3FFA_AAAA_AAAA_AAAA;
+        const DIVIDE_AFTER_BITS: u64 = 0x3FFA_AAAA_AAAA_AAAB;
+        let window_ns = Some(3_000_000_000u64);
+
+        // The fixture can tell the two orders apart at all.
+        assert_eq!((1.0f64 / 3.0 + 4.0f64 / 3.0).to_bits(), DIVIDE_FIRST_BITS);
+        assert_eq!((5.0f64 / 3.0).to_bits(), DIVIDE_AFTER_BITS);
+        assert_ne!(
+            DIVIDE_FIRST_BITS, DIVIDE_AFTER_BITS,
+            "1/3 + 4/3 and 5/3 must be different doubles, or this fixture \
+             asserts nothing about the order"
+        );
+
+        // Two streams, so the outer aggregation has two series to fold.
+        let rows = vec![
+            MetricInstantRow {
+                fingerprint: 1,
+                n: 1,
+                structured_metadata: String::new(),
+            },
+            MetricInstantRow {
+                fingerprint: 2,
+                n: 4,
+                structured_metadata: String::new(),
+            },
+        ];
+        let fold = |rate_window_ns: Option<u64>| -> Vec<InstantSeries> {
+            let meta = sm_meta();
+            let mut g = PushdownInstantGroups::new(&meta, AggCaps::DEFAULT);
+            for r in &rows {
+                g.push_row(r).expect("under the cap");
+            }
+            g.finish(rate_window_ns)
+        };
+        let sum_chain = |series: Vec<InstantSeries>| -> Vec<InstantSeries> {
+            charged_instant_chain(
+                series,
+                &[(pulsus_logql::VectorAggOp::Sum, None, None)],
+                MAX_POST_AGG_BYTES,
+            )
+            .expect("under the cap")
+        };
+
+        // Step 6: `finish` hands back series that are ALREADY divided.
+        let divided = fold(window_ns);
+        assert_eq!(divided.len(), 2, "two streams must give two series");
+        let mut per_series: Vec<u64> = divided.iter().map(|s| s.value.to_bits()).collect();
+        per_series.sort_unstable();
+        assert_eq!(
+            per_series,
+            vec![(1.0f64 / 3.0).to_bits(), (4.0f64 / 3.0).to_bits()],
+            "the divisor must already have been applied per series"
+        );
+
+        // Step 7 over the divided series is the shipped answer.
+        let shipped = sum_chain(divided);
+        assert_eq!(shipped.len(), 1, "an ungrouped sum is one series");
+        assert_eq!(
+            shipped[0].value.to_bits(),
+            DIVIDE_FIRST_BITS,
+            "the shipped order divides each series before summing them"
+        );
+        assert_ne!(
+            shipped[0].value.to_bits(),
+            DIVIDE_AFTER_BITS,
+            "dividing after the vector aggregation would be a different double"
+        );
+
+        // The other order, built from the same two functions: sum the
+        // undivided counts, then divide. It is the value the shipped order
+        // must NOT produce.
+        let after = sum_chain(fold(None));
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].value.to_bits(), 5.0f64.to_bits());
+        assert_eq!(
+            apply_rate(after[0].value, window_ns).to_bits(),
+            DIVIDE_AFTER_BITS,
+            "the reversed order is the other double, so the assertion above \
+             is about the order and not about the arithmetic"
+        );
+    }
+
+    /// Issue #507, W3, arm 3 — **the proviso is checked, and a stream
+    /// label of the same name suppresses the fragment.**
+    ///
+    /// The parsed-name fragment reads a key of the line, which is the
+    /// label the evaluator resolved only while no selected stream carries
+    /// a label of that name. Measured through the shipped pipeline: over
+    /// `{"s":"linevalue","x":1}` with a stream label `s="streamvalue"`,
+    /// `| json` yields `s = streamvalue` and `s_extracted = linevalue` —
+    /// the stream label wins and the line's key is renamed — so a
+    /// fragment comparing `JSONExtractString(body,'s')` would drop a row
+    /// the evaluator keeps.
+    ///
+    /// The two halves of this test differ ONLY in whether a resolved
+    /// stream carries the name, so neither passes for another reason.
+    #[test]
+    fn a_stream_label_of_the_same_name_suppresses_the_parsed_fragment() {
+        let query = r#"{service_name="sm"} | json | lvl="error""#;
+        let expr = pulsus_logql::parse(query).expect("parse");
+        let params = QueryParams {
+            spec: QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let ctx = PlanCtx {
+            db: "d",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1 << 30,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let Plan::Streams(sp) = plan::plan(&expr, &params, &ctx).expect("plan") else {
+            panic!("expected a streams plan")
+        };
+        assert_eq!(
+            super::super::plan::compile_parsed_label_filters(&sp.pipeline).len(),
+            1,
+            "the control: this chain compiles a fragment at plan time"
+        );
+
+        // No resolved stream carries `lvl`, so the proviso holds.
+        let without = stage3_predicates(&sp, &sm_meta());
+        assert_eq!(
+            without.len(),
+            sp.line_filters.len() + 1,
+            "the fragment is included when no stream carries the name"
+        );
+        assert!(
+            without
+                .last()
+                .expect("a fragment")
+                .as_sql()
+                .contains("'lvl'")
+        );
+
+        // One resolved stream carries `lvl` as a label, so it does not.
+        let mut meta = sm_meta();
+        meta.insert(
+            3,
+            StreamMetaRow {
+                fingerprint: 3,
+                service: "sm".to_string(),
+                labels: r#"{"lvl":"warn","service_name":"sm"}"#.to_string(),
+            },
+        );
+        let with = stage3_predicates(&sp, &meta);
+        assert_eq!(
+            with.len(),
+            sp.line_filters.len(),
+            "one stream carrying the name is enough to suppress it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #507, W2 — the bucketed range read's fold.
+    // -----------------------------------------------------------------
+
+    /// Two streams, and the SECOND one's base label set is what the
+    /// FIRST one's rows fold into once their metadata is merged:
+    ///
+    /// ```text
+    /// fp 10   {app=x,            service_name=r}   + metadata lvl=info
+    /// fp 11   {app=x, lvl=info,  service_name=r}
+    /// ```
+    ///
+    /// So a row of fp 10 carrying `lvl=info` and a row of fp 11 carrying
+    /// none are the SAME output series — which is the only shape that can
+    /// tell fold-then-emit from emit-then-fold.
+    fn range_meta() -> HashMap<u64, StreamMetaRow> {
+        let mut m = HashMap::new();
+        m.insert(
+            10,
+            StreamMetaRow {
+                fingerprint: 10,
+                service: "r".to_string(),
+                labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
+            },
+        );
+        m.insert(
+            11,
+            StreamMetaRow {
+                fingerprint: 11,
+                service: "r".to_string(),
+                labels: r#"{"app":"x","lvl":"info","service_name":"r"}"#.to_string(),
+            },
+        );
+        m
+    }
+
+    const RANGE_GRID_START_NS: i64 = 60_000_000_000;
+    const RANGE_END_NS: i64 = 300_000_000_000;
+    const RANGE_STEP_NS: i64 = 60_000_000_000;
+
+    fn bucket_row(fp: u64, bucket_ns: i64, n: u64, sm: &str) -> MetricRangeBucketRow {
+        MetricRangeBucketRow {
+            fingerprint: fp,
+            bucket_ns,
+            n,
+            structured_metadata: sm.to_string(),
+        }
+    }
+
+    /// One emitted series: its sorted labels, and its points as
+    /// `(grid point, value bits)` so a float comparison is never a float
+    /// comparison.
+    type RangeSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+    fn range_series(
+        rows: &[MetricRangeBucketRow],
+        rate_window_ns: Option<u64>,
+    ) -> Vec<RangeSeries> {
+        let meta = range_meta();
+        let mut g =
+            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, RANGE_GRID_START_NS, RANGE_END_NS);
+        for r in rows {
+            g.push_row(r).expect("under the cap");
+        }
+        g.finish(rate_window_ns)
+            .into_iter()
+            .map(|s| {
+                let mut l = s.labels;
+                l.sort();
+                (
+                    l,
+                    s.points
+                        .into_iter()
+                        .map(|(t, v)| (t, v.to_bits()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// **The fold happens before the emission, and the gap is the
+    /// evidence.**
+    ///
+    /// Two fingerprints fold into one series. Only fp 11 has a row at the
+    /// second grid point and only fp 10 has one at the first and third, so
+    /// the folded series carries a point wherever EITHER contributed —
+    /// and no point at all at the two grid points where neither did.
+    ///
+    /// ```text
+    /// grid           60    120   180   240   300
+    /// fp 10 rows      2      -     1     -     -
+    /// fp 11 rows      -      3     -     -     -
+    /// folded series   2      3     1    (none)(none)
+    /// ```
+    ///
+    /// Emitting per fingerprint and folding afterwards would answer the
+    /// same three values; it is the ABSENT points this pins.
+    #[test]
+    fn a_folded_series_has_a_point_wherever_either_fingerprint_had_a_row() {
+        let series = range_series(
+            &[
+                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
+                bucket_row(11, 120_000_000_000, 3, ""),
+                bucket_row(10, 180_000_000_000, 1, r#"{"lvl":"info"}"#),
+            ],
+            None,
+        );
+        assert_eq!(series.len(), 1, "one folded series: {series:?}");
+        assert_eq!(
+            series[0].0,
+            vec![
+                ("app".to_string(), "x".to_string()),
+                ("lvl".to_string(), "info".to_string()),
+                ("service_name".to_string(), "r".to_string()),
+            ]
+        );
+        assert_eq!(
+            series[0].1,
+            vec![
+                (60_000_000_000, 2.0f64.to_bits()),
+                (120_000_000_000, 3.0f64.to_bits()),
+                (180_000_000_000, 1.0f64.to_bits()),
+            ],
+            "a grid point with no contributing row is not emitted at all"
+        );
+    }
+
+    /// Two metadata variants at one grid point are one point of the summed
+    /// count — the addition that makes `Fidelity::Equivalent` true.
+    #[test]
+    fn two_metadata_variants_at_one_grid_point_sum_into_one_point() {
+        let series = range_series(
+            &[
+                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
+                bucket_row(11, 60_000_000_000, 5, ""),
+                // A THIRD variant that is a different series, so the sum
+                // above is not merely "everything at this grid point".
+                bucket_row(10, 60_000_000_000, 4, r#"{"lvl":"warn"}"#),
+            ],
+            None,
+        );
+        assert_eq!(series.len(), 2, "{series:?}");
+        let info = series
+            .iter()
+            .find(|(l, _)| l.contains(&("lvl".to_string(), "info".to_string())))
+            .expect("the info series");
+        assert_eq!(info.1, vec![(60_000_000_000, 7.0f64.to_bits())]);
+        let warn = series
+            .iter()
+            .find(|(l, _)| l.contains(&("lvl".to_string(), "warn".to_string())))
+            .expect("the warn series");
+        assert_eq!(warn.1, vec![(60_000_000_000, 4.0f64.to_bits())]);
+    }
+
+    /// A row whose grid point is outside the emit grid is dropped, and it
+    /// is a row the evaluator never counts: the scan runs to the query's
+    /// `end`, which need not sit on the grid, so rows after the last grid
+    /// point bucket one step PAST it, where no window is evaluated.
+    #[test]
+    fn a_row_bucketed_outside_the_emit_grid_is_not_a_point() {
+        let series = range_series(
+            &[
+                bucket_row(10, RANGE_GRID_START_NS - RANGE_STEP_NS, 9, ""),
+                bucket_row(10, 60_000_000_000, 2, ""),
+                bucket_row(10, RANGE_END_NS + RANGE_STEP_NS, 9, ""),
+            ],
+            None,
+        );
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert_eq!(
+            series[0].1,
+            vec![(60_000_000_000, 2.0f64.to_bits())],
+            "only the in-grid row becomes a point"
+        );
+    }
+
+    /// The rate divisor is applied ONCE per point, to the summed count —
+    /// `(2 + 5) / 60`, never `2/60 + 5/60`. They agree here to the bit,
+    /// and the point is that the code divides once: the `Equivalent`
+    /// claim is about the order, and this is the order.
+    #[test]
+    fn the_rate_divisor_is_applied_to_the_summed_count() {
+        let series = range_series(
+            &[
+                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
+                bucket_row(11, 60_000_000_000, 5, ""),
+            ],
+            Some(60_000_000_000),
+        );
+        assert_eq!(series.len(), 1);
+        assert_eq!(
+            series[0].1,
+            vec![(60_000_000_000, (7.0f64 / 60.0).to_bits())]
+        );
+    }
+
+    /// A surviving `__error__` in the metadata fails the bucketed query
+    /// too, with the same named error the instant pushdown and the client
+    /// paths raise.
+    #[test]
+    fn a_metadata_error_fails_the_bucketed_query_too() {
+        let meta = range_meta();
+        let mut g =
+            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, RANGE_GRID_START_NS, RANGE_END_NS);
+        let err = g
+            .push_row(&bucket_row(
+                10,
+                60_000_000_000,
+                1,
+                r#"{"__error__":"boom"}"#,
+            ))
+            .expect_err("a surviving __error__ fails the query");
+        assert!(
+            matches!(err, ReadError::MetricPipelineError { ref error_type, .. } if error_type == "boom"),
+            "{err:?}"
+        );
+    }
+
+    /// The bucketed fold is bounded BEFORE it allocates, with the client
+    /// paths' named 422 — the `PushdownInstantGroups` arrangement, and
+    /// nothing is retained when the charge refuses.
+    #[test]
+    fn the_bucketed_regrouping_refuses_before_it_retains_the_breaching_group() {
+        let meta = range_meta();
+        let tiny = AggCaps {
+            group_bytes: 4096,
+            ..AggCaps::DEFAULT
+        };
+        let mut g = PushdownRangeGroups::new(&meta, tiny, RANGE_GRID_START_NS, RANGE_END_NS);
+        let fat = "v".repeat(64 * 1024);
+        let err = g
+            .push_row(&bucket_row(
+                10,
+                60_000_000_000,
+                1,
+                &format!(r#"{{"big":"{fat}"}}"#),
+            ))
+            .expect_err("the group must be refused");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(g.charged_bytes(), 0, "a refused charge is not accumulated");
+        assert!(
+            g.finish(None).is_empty(),
+            "and the output vector never held it"
+        );
+    }
+
+    /// Issue #507, W2 — **the capability join, one case per refusal
+    /// reason.**
+    ///
+    /// The grid expression can refuse for three reasons and the arm falls
+    /// back to the client path on each, never to an error. None of the
+    /// three is reachable through the planner — `metric_plan` asserts the
+    /// chain-decidable half and the request boundary caps the span — so
+    /// the plans here are BUILT: a real planned plan with one field moved,
+    /// which is the only way to reach the arm at all.
+    ///
+    /// What this pins is the join's two halves: that each reason is
+    /// produced, and that the fallback object the arm hands to the client
+    /// path is the aggregation the lowered chain is equivalent to. The
+    /// round trip itself — that the request then answers 200 — needs a
+    /// database and a seam that takes a hand-built plan; there is no such
+    /// seam, and this test says so rather than implying it covers it.
+    #[test]
+    fn each_bucket_grid_refusal_falls_back_to_the_client_path() {
+        let planned = |query: &str| {
+            let expr = pulsus_logql::parse(query).expect("parse");
+            let params = QueryParams {
+                spec: QuerySpec::Range {
+                    start_ns: 600_000_000_000,
+                    end_ns: 1_200_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            let ctx = PlanCtx {
+                db: "pulsus",
+                streams_idx: "log_streams_idx",
+                streams: "log_streams",
+                samples: "log_samples",
+                rollup_table: "log_metrics_5s",
+                rollup_res_ns: 5_000_000_000,
+                scan_budget_bytes: 1024,
+                max_streams: 100_000,
+                pipeline_scan_factor: 10,
+            };
+            match plan::plan(&expr, &params, &ctx).expect("plan") {
+                Plan::Metric(mp) => mp,
+                _ => panic!("expected a metric plan"),
+            }
+        };
+        let services: Vec<CheckedLiteral> = Vec::new();
+        let fingerprints = [1u64];
+
+        // The control: the planned shape renders.
+        let base = planned(r#"count_over_time({a="b"}[1m])"#);
+        assert!(base.client.is_none(), "the fixture must be a lowered plan");
+        assert!(bucketed_range_sql(&base, &services, &fingerprints).is_ok());
+
+        // No step at all: no grid.
+        let mut mp = base.clone();
+        mp.step_ns = None;
+        assert_eq!(
+            bucketed_range_sql(&mp, &services, &fingerprints),
+            Err(BucketGridRefusal::StepNotPositive)
+        );
+
+        // The scan starts BELOW the anchor, so the early rows would
+        // bucket below the grid's first point.
+        let mut mp = base.clone();
+        mp.start_ns = base.grid_start_ns - base.step_ns.expect("a step").get() - 1;
+        assert_eq!(
+            bucketed_range_sql(&mp, &services, &fingerprints),
+            Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
+
+        // The widest numerator the statement could evaluate is not
+        // representable.
+        let mut mp = base.clone();
+        mp.grid_start_ns = i64::MIN + base.step_ns.expect("a step").get();
+        mp.start_ns = i64::MIN;
+        mp.end_ns = i64::MAX;
+        assert_eq!(
+            bucketed_range_sql(&mp, &services, &fingerprints),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+
+        // The ANCHOR itself is not representable — `grid_start - step` is
+        // computed here rather than by the grid expression, so it is this
+        // function's own arithmetic that has to refuse. A wrapping
+        // subtraction would put the anchor at the TOP of the axis and
+        // report the wrong reason, which is what this row separates.
+        let mut mp = base.clone();
+        mp.grid_start_ns = i64::MIN;
+        mp.start_ns = i64::MIN;
+        assert_eq!(
+            bucketed_range_sql(&mp, &services, &fingerprints),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+
+        // The fallback the arm hands to the client path: the aggregation
+        // this chain is equivalent to, with an EMPTY pipeline, because
+        // every stage a lowered chain may carry is a pushable line filter
+        // and those are already in `extra_predicates`.
+        let fallback = bucketed_fallback_client_agg(&base);
+        assert!(fallback.pipeline.is_empty());
+        assert!(fallback.grouping.is_none());
+        assert!(fallback.absent_labels.is_empty());
+        assert_eq!(fallback.range_op, RangeAggOp::CountOverTime);
+        assert!(matches!(fallback.value, ClientValue::Count));
+        assert!(
+            CompiledPipeline::compile(&fallback.pipeline).is_ok(),
+            "the arm compiles this before running it"
+        );
+        // The bytes family takes the other value, and it is read off the
+        // plan's own `op` rather than re-derived from the query text.
+        let bytes = bucketed_fallback_client_agg(&planned(r#"bytes_rate({a="b"}[1m])"#));
+        assert!(matches!(bytes.value, ClientValue::Bytes));
+        assert_eq!(bytes.range_op, RangeAggOp::BytesRate);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #507, W4 — the unwrapped fold.
+    // -----------------------------------------------------------------
+
+    fn unwrapped_row(
+        fp: u64,
+        bucket_ns: i64,
+        v: f64,
+        n: u64,
+        all_numeric: u8,
+        sm: &str,
+    ) -> MetricRangeUnwrappedRow {
+        MetricRangeUnwrappedRow {
+            fingerprint: fp,
+            bucket_ns,
+            v,
+            n,
+            all_numeric,
+            structured_metadata: sm.to_string(),
+        }
+    }
+
+    fn unwrapped_series(
+        rows: &[MetricRangeUnwrappedRow],
+    ) -> Result<Vec<RangeSeries>, &'static str> {
+        let meta = range_meta();
+        let mut g = PushdownUnwrappedGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            "latency",
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+        );
+        for r in rows {
+            g.push_row(r).expect("under the cap");
+        }
+        g.finish().map(|series| {
+            series
+                .into_iter()
+                .map(|s| {
+                    let mut l = s.labels;
+                    l.sort();
+                    (
+                        l,
+                        s.points
+                            .into_iter()
+                            .map(|(t, v)| (t, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// The ordinary case: the statement's number is the series' value, and
+    /// the group key is the series identity.
+    #[test]
+    fn an_unwrapped_group_becomes_one_point_of_the_statements_own_value() {
+        let series = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 12.5, 3, 1, ""),
+            unwrapped_row(10, 120_000_000_000, 0.25, 1, 1, ""),
+        ])
+        .expect("no fallback");
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert_eq!(
+            series[0].1,
+            vec![
+                (60_000_000_000, 12.5f64.to_bits()),
+                (120_000_000_000, 0.25f64.to_bits()),
+            ]
+        );
+    }
+
+    /// **A shadowed row sends the whole query to the client path.**
+    ///
+    /// The evaluator keeps the parsed value under `<name>_extracted`, so
+    /// its series are keyed by a label whose value comes from the body —
+    /// which this statement does not return. Recomputing the group's
+    /// VALUE from the metadata (an earlier round did) gets the number
+    /// right and collapses two series into one; the live differential
+    /// `the_unwrapped_read_agrees_with_the_client_path_or_falls_back`'s
+    /// `shadowed` case is what shows the collapse against a real client
+    /// answer.
+    #[test]
+    fn a_shadowed_row_falls_back_rather_than_being_recomputed() {
+        let e = unwrapped_series(&[unwrapped_row(
+            10,
+            60_000_000_000,
+            999.0,
+            10,
+            1,
+            r#"{"latency":"0.1"}"#,
+        )])
+        .expect_err("a shadowed row must fall back");
+        assert!(e.contains("carries the unwrapped name"), "{e}");
+
+        // The control: the SAME row with metadata that does not carry the
+        // name is an ordinary point, so what the row above rejects is the
+        // collision and not the presence of metadata.
+        let ok = unwrapped_series(&[unwrapped_row(
+            10,
+            60_000_000_000,
+            12.5,
+            10,
+            1,
+            r#"{"lvl":"info"}"#,
+        )])
+        .expect("metadata that does not collide is ordinary");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].1, vec![(60_000_000_000, 12.5f64.to_bits())]);
+        assert!(
+            ok[0].0.iter().any(|(k, v)| k == "lvl" && v == "info"),
+            "and its metadata is still merged into the series: {:?}",
+            ok[0].0
+        );
+    }
+
+    /// **Two ways the lowered answer cannot be used**, each reported by
+    /// the statement or by the fold rather than guessed.
+    #[test]
+    fn the_unwrapped_fold_falls_back_rather_than_answering() {
+        // A row whose value did not qualify.
+        let e = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 2, 1, ""),
+            unwrapped_row(10, 120_000_000_000, 1.0, 2, 0, ""),
+        ])
+        .expect_err("a non-qualifying row must fall back");
+        assert!(e.contains("does not parse"), "{e}");
+
+        // Two groups folding into one series at one grid point: fp 10's
+        // metadata makes its label set fp 11's, and these reducers cannot
+        // be merged from their aggregates.
+        let e = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+            unwrapped_row(11, 60_000_000_000, 2.0, 1, 1, ""),
+        ])
+        .expect_err("two groups in one series must fall back");
+        assert!(e.contains("fold into one series"), "{e}");
+
+        // The control: the SAME two rows at DIFFERENT grid points are two
+        // points of one series and do not fall back.
+        let ok = unwrapped_series(&[
+            unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+            unwrapped_row(11, 120_000_000_000, 2.0, 1, 1, ""),
+        ])
+        .expect("one group per point");
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].1.len(), 2);
     }
 
     /// Issue #249 — a structured-metadata `__error__` fails the pushdown

@@ -6605,6 +6605,23 @@ fn walk_pattern<'n, 't>(
     true
 }
 
+/// The `f64` a numeric label-filter literal denotes, as OUR unit parser
+/// reads it — `None` when the literal does not convert.
+///
+/// Exposed for issue #507's parsed-name pushdown, which must render the
+/// threshold from this value and never from the literal's source text: a
+/// duration or size suffix is interpreted here and the database has no
+/// equivalent function.
+///
+/// **Declared at the end of the module rather than beside
+/// `classify_numeric_literal`**, which it wraps. Eight design-record
+/// citations point at lines of this file, and every one of them is above
+/// this point; declaring it next to the function it wraps would move all
+/// eight for no other reason.
+pub(in crate::logql) fn numeric_literal_value(lit: &NumericLiteral) -> Option<f64> {
+    classify_numeric_literal(lit).ok().map(|(_, v)| v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::logql::predicate::{self, literal, month_literal};
-use pulsus_read::logql::sql::{self, ScanLowerBound, ScanProjection, TimeWindow};
+use pulsus_read::logql::sql::{
+    self, BucketedScan, MetricShape, MetricSource, ScanLowerBound, ScanProjection, TimeWindow,
+};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -836,29 +838,38 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         &[],
     );
     let stage2_sql = sql::stage2("log_streams", &[FP_A]);
-    // Issue #227: a range aggregation slides raw — the explain reports the
-    // PK-ordered sliding scan over `log_samples`, its lower bound widened
-    // a full `[1h]` range (== POST_GOLDEN_STEP_NS here) before
-    // `window_start` so the first grid point sees its whole lookback.
-    let metric_sql = sql::metric_raw_samples_sliding(
-        "log_samples",
+    // Issue #507 (W2): `count_over_time` at a step EQUAL to its range is a
+    // clean bucketed chain, so the aggregation is lowered into the
+    // statement and the explain reports the bucketed read — one row per
+    // `(fingerprint, grid point, structured_metadata)`, not one row per
+    // log line. The lower bound is still widened a full `[1h]` range
+    // before `window_start`, and the grid's anchor `lo` is
+    // `grid_start - step`, which for `range == step` is that same widened
+    // bound. The `values` above are unchanged: what moved is the route,
+    // not the answer.
+    //
+    // Issue #249: the metric path merges structured metadata into the
+    // label set, so the column is projected and grouped. Derived through
+    // the SAME builder the engine calls, so the expectation cannot drift
+    // from what runs.
+    let metric_sql = sql::metric_range_bucketed(
+        MetricSource::new("log_samples", MetricShape::RawCount),
         &[literal("checkout")],
         &[FP_A],
-        TimeWindow {
-            start_ns: window_start - POST_GOLDEN_STEP_NS,
-            end_ns: window_end,
+        BucketedScan {
+            window: TimeWindow {
+                start_ns: window_start - POST_GOLDEN_STEP_NS,
+                end_ns: window_end,
+            },
+            lower: ScanLowerBound::Exclusive,
+            lo_ns: window_start - POST_GOLDEN_STEP_NS,
+            step_ns: POST_GOLDEN_STEP_NS,
         },
-        ScanLowerBound::Exclusive,
         &[],
-        // Issue #249: the metric path merges structured metadata into the
-        // label set, so every reducer but `absent_over_time` projects the
-        // column. This leg's query is `sum(rate(...))`, so the EXPLAIN's
-        // reported SQL gains `structured_metadata` in the SELECT list — and
-        // it is derived through the SAME builder the engine calls, so the
-        // expectation cannot drift from what runs.
         ScanProjection::WithStructuredMetadata,
-    );
-    let routing_reason = "raw: sliding-window range aggregation (issue #227)".to_string();
+    )
+    .expect("a renderable grid");
+    let routing_reason = "raw: bucketed range aggregation (issue #507)".to_string();
 
     let mut expected = String::new();
     expected.push_str(r#"{"status":"success","data":{"resultType":"matrix","result":["#);

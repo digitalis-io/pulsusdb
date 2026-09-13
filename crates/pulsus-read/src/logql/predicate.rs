@@ -224,7 +224,7 @@
 //! and a `Checked`-shaped name on an unchecked value is worse than an honest
 //! `&str`, because the next reader would trust it.
 
-use pulsus_logql::{LineFilter, LineFilterOp};
+use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
 
 use super::escape::ch_like_contains;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
@@ -269,7 +269,7 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// some unrelated reason breaks this one.
 ///
 /// ```
-/// use pulsus_logql::{LineFilter, LineFilterOp};
+/// use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
 /// use pulsus_read::logql::{escape, predicate};
 ///
 /// let sql = format!("match(body, {})", escape::ch_string("boom"));
@@ -523,6 +523,414 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     })
 }
 
+/// The ONLY two ways an emitted statement may NAME the
+/// structured-metadata column (issue #507, condition 6).
+///
+/// The column name is not reachable as a string from this module's public
+/// API: it lives in [`METADATA_COLUMN`], which is private, and every
+/// renderer that mentions the column takes one of these variants or calls
+/// the private guard mint below. An alias or a subquery cannot get around
+/// that, because no function renders an extraction over the column in the
+/// first place.
+///
+/// **No SQL this module emits reads INSIDE the column.** It may be
+/// projected, grouped by, and compared whole against a literal — nothing
+/// else. Two readers of a stored value disagree; one reader cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataTerm {
+    /// `structured_metadata` in a `SELECT` list.
+    Project,
+    /// `structured_metadata` in a `GROUP BY`.
+    Group,
+}
+
+/// The one place the column's name is written.
+const METADATA_COLUMN: &str = "structured_metadata";
+
+impl MetadataTerm {
+    /// The column reference this term renders. Both variants render the
+    /// bare name; they differ in where the caller puts it, which is why
+    /// they are two variants and not one.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            MetadataTerm::Project | MetadataTerm::Group => METADATA_COLUMN,
+        }
+    }
+}
+
+/// `structured_metadata != ''` — the whole-value guard.
+///
+/// **Private, and takes no argument.** A key-specific guard would be a
+/// second reader of the column, and a second reader disagrees with the
+/// first: our flat scanner accepts shapes a JSON parser rejects and
+/// decodes escapes differently, measured in both directions. This term
+/// reads no key. It is true on every row carrying any metadata at all,
+/// which is a superset of every row where the two readers could differ.
+///
+/// **Rows it drops: none the evaluator keeps.** It only ever adds a
+/// disjunct, so it can only widen the predicate it sits in.
+///
+/// Its cost is stated rather than hidden: on a corpus where every row
+/// carries metadata the term is true everywhere, so the predicate it
+/// guards keeps every row and buys nothing.
+fn metadata_non_empty_guard() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("{METADATA_COLUMN} != ''"),
+    }
+}
+
+/// Why a parsed-name label filter is not pushed down (issue #507, W3).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the filter is evaluated after the read, exactly as it is
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedFilterRefusal {
+    /// The operator has no specified fragment. Only `=` on the string
+    /// form is served; `!=`, `=~` and `!~` are not.
+    OperatorNotServed,
+    /// The label name can be produced by more than one raw key of this
+    /// parser's input, and no key-precise expression reads the one the
+    /// evaluator resolved. See [`name_is_unambiguous`].
+    AmbiguousName,
+    /// This parser has no key-precise expression at all — a capture's
+    /// value comes from running a regular expression over the line, which
+    /// the database cannot reproduce — and the value probe does not serve
+    /// this operator.
+    NoKeyExpression,
+    /// A non-finite threshold. `| k > 1e400` parses to an infinity here,
+    /// and the database refuses the literal with a syntax error.
+    ThresholdNotFinite,
+    /// The label name is not one a fragment may name.
+    NameNotRenderable,
+}
+
+/// Can this label name have been produced by more than one raw key?
+///
+/// **No, exactly when it contains no `_`.** `sanitize_label_key`
+/// (`pipeline.rs:3939-3952`) does three things and no more: it prepends
+/// `_` when the first character is an ASCII digit, keeps ASCII
+/// alphanumerics and `_`, and replaces every other character with `_`. It
+/// never deletes and never shortens. A bare `| json` additionally flattens
+/// nested objects, inserting `_` between levels (`pipeline.rs:27`).
+///
+/// So **every transformation either preserves the string or introduces a
+/// `_`.** A name with no `_` had nothing introduced, so it was not
+/// transformed, so its only preimage is that same key at the top level.
+///
+/// The bound is tight in that direction only. A name containing `_` is
+/// merely *capable* of ambiguity — it is actually ambiguous only when one
+/// document carries two of its preimages, which no plan-time predicate can
+/// know. Measured: `{"a":{"b":"nested"},"a_b":"top"}` gives the label
+/// `a_b = nested`, because extraction skips an already-extracted name and
+/// the first raw key in document order wins, while
+/// `JSONExtractString(body,'a_b')` reads `top` — the one the evaluator
+/// discarded.
+pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool {
+    !name.contains('_')
+}
+
+/// A label name a fragment may render. The parser cannot produce anything
+/// else, and a fragment builder does not take the word of a caller that
+/// did not come through it.
+fn name_is_renderable(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The expression a parser makes a name resolve to, for the two parsers
+/// that have one.
+fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String> {
+    let key = ch_string(name);
+    match parser {
+        ParserStage::Json { .. } => Some(format!("JSONExtractString(body, {key})")),
+        ParserStage::Logfmt { .. } => Some(format!(
+            "extractKeyValuePairs(body, '=', ' \\t\\r\\n', '\"')[{key}]"
+        )),
+        // A capture's value is produced by running a regular expression
+        // over the line. There is no key-precise expression to write.
+        ParserStage::Regexp(_) | ParserStage::Pattern(_) => None,
+    }
+}
+
+/// `| <parser> | NAME = "VALUE"`, pushed down (issue #507, W3).
+///
+/// # The rule every cell here is built to
+///
+/// A `Fidelity::Wider` predicate **may emit rows the evaluator discards,
+/// and may never discard a row the evaluator keeps.** Each route below
+/// states which it does.
+///
+/// # Route A — a key-precise comparison, for a name with no `_`
+///
+/// ```text
+/// | json    (JSONType(body,'k') != 'String' OR JSONExtractString(body,'k') = 'v' OR structured_metadata != '')
+/// | logfmt  (extractKeyValuePairs(body,'=',' \t\r\n','"')['k'] IN ('', 'v') OR position(body, '\\') > 0 OR structured_metadata != '')
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** The name has exactly one
+/// preimage ([`name_is_unambiguous`]), so the expression reads the key the
+/// evaluator resolved. Every other kind of stored value reaches the type
+/// guard or the empty alternative: a key that is absent, a line that is not
+/// JSON at all, a line with trailing bytes after the object, a number, an
+/// object, an array. Both sides decode `\uXXXX` the same way — measured,
+/// `{"k":"A"}` gives the label `A` here and `JSONExtractString` gives `A`
+/// there — so an escaped value is compared, not missed.
+///
+/// # Route B — a value probe, for a parser with no key expression
+///
+/// ```text
+/// | regexp, | pattern    body LIKE '%v%'
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** A capture is a literal
+/// byte slice of the line, so if the evaluator kept the row its capture
+/// equalled `v` and those bytes are in the body. Rows without `v` anywhere
+/// are dropped, and the evaluator drops them too.
+///
+/// It reaches the body skip indexes, so for a selective value it prunes
+/// better than a key-precise comparison would.
+///
+/// **Route B is NOT offered for `| json` or `| logfmt`**, and the reason is
+/// measured rather than assumed: those two decode their values, so a body
+/// may hold `A` where the label is `A` and the probe would miss a row
+/// the evaluator keeps. No test on the value alone can exclude that, since
+/// JSON permits any character to be written as an escape.
+pub fn parsed_string_filter(
+    name: &str,
+    op: MatchOp,
+    value: &str,
+    parser: &ParserStage,
+) -> Result<CheckedFragment, ParsedFilterRefusal> {
+    let cmp = match op {
+        MatchOp::Eq => "=",
+        MatchOp::Neq => "!=",
+        // The two regular-expression operators are not served, and the
+        // reason is not the SQL. Our label-filter regex semantics already
+        // differ from the reference at a width this plan records and has
+        // not repaired; pushing them down would bind that difference into
+        // a statement before anyone has decided about it.
+        MatchOp::Re | MatchOp::Nre => return Err(ParsedFilterRefusal::OperatorNotServed),
+    };
+    if !name_is_renderable(name) {
+        return Err(ParsedFilterRefusal::NameNotRenderable);
+    }
+    let guard = metadata_non_empty_guard();
+    let guard = guard.as_sql();
+    let Some(expr) = parsed_name_expr(name, parser) else {
+        // Route B, and it serves `=` alone.
+        //
+        // **Rows `=` drops: none the evaluator keeps.** A capture is a
+        // literal slice of the line, so a kept row's bytes are in the
+        // body.
+        //
+        // **`!=` has no probe form and is refused.** The evaluator keeps a
+        // row whose capture differs from the value; `NOT (body LIKE
+        // '%v%')` drops every row holding the value ANYWHERE, including a
+        // row where it sits outside the capture and the capture differs.
+        // That is the forbidden direction, and no test on the value
+        // repairs it — a substring probe cannot say where in the line the
+        // bytes sat.
+        if matches!(op, MatchOp::Neq) {
+            return Err(ParsedFilterRefusal::OperatorNotServed);
+        }
+        return Ok(CheckedFragment {
+            sql: contains_predicate(value),
+        });
+    };
+    if !name_is_unambiguous(name) {
+        return Err(ParsedFilterRefusal::AmbiguousName);
+    }
+    let v = ch_string(value);
+    let key = ch_string(name);
+    Ok(CheckedFragment {
+        sql: match parser {
+            ParserStage::Json { .. } => {
+                format!("(JSONType(body, {key}) != 'String' OR {expr} {cmp} {v} OR {guard})")
+            }
+            // Two extra alternatives, each for a case the comparison
+            // alone would get wrong. The empty one is the sanitising
+            // case: a raw key the database reads under a different
+            // spelling renders `''` here, and the evaluator decides. The
+            // backslash one is the escaping case: a quoted logfmt value
+            // may carry an escape that the two decoders resolve
+            // differently, so any line holding one is kept whole.
+            //
+            // **The empty alternative belongs to `=` and must NOT be
+            // carried over to `!=`.** For `!=` it would keep a row whose
+            // value EQUALS the filter's — harmless — and drop one whose
+            // value is neither empty nor equal, which the evaluator
+            // keeps. Checked rather than mirrored: with the label
+            // `other`, `!= "error"`, the evaluator keeps and the reused
+            // form drops.
+            _ if matches!(op, MatchOp::Neq) => {
+                format!("({expr} != {v} OR position(body, '\\\\') > 0 OR {guard})")
+            }
+            _ => format!("({expr} IN ('', {v}) OR position(body, '\\\\') > 0 OR {guard})"),
+        },
+    })
+}
+
+/// `| json | NAME <op> <number>`, pushed down (issue #507, W3).
+///
+/// ```text
+/// (JSONType(body,'k') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body,'k') >= 500.0 OR structured_metadata != '')
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** It drops only a row whose
+/// key holds a JSON number failing the comparison, and the evaluator drops
+/// that row too. Every other type reaches the guard, including a
+/// numeric-looking STRING — which matters, because `JSONExtractFloat` of
+/// `"12abc"` is `0` while our conversion of the label text is not a number
+/// at all.
+///
+/// # The threshold is rendered as a float literal, and that is not cosmetic
+///
+/// `threshold` is rendered with `{:?}` — Rust's shortest round-tripping
+/// decimal, which always carries a `.` or an exponent, so the database
+/// lexes it as `Float64` and both sides have taken the same rounding.
+/// Written bare it would lex as `UInt64` and be compared against a
+/// `Float64` **exactly**: measured, `toTypeName(9007199254740993)` is
+/// `UInt64`, `toTypeName(9007199254740993.0)` is `Float64`, and
+/// `9007199254740992.0 = 9007199254740993` is false — so a bare literal at
+/// that magnitude returns no rows where the answer is two.
+///
+/// **`threshold` must be the `f64` OUR unit parser produced**, never a
+/// re-parse of the source text: a duration or size literal is interpreted
+/// by that parser and the database has no equivalent.
+///
+/// A non-finite threshold is refused. `| k > 1e400` parses to an infinity
+/// here and the database refuses the literal outright, so there is no
+/// fragment to emit and the filter is evaluated after the read.
+pub fn parsed_numeric_filter(
+    name: &str,
+    op: CompareOp,
+    threshold: f64,
+    parser: &ParserStage,
+) -> Result<CheckedFragment, ParsedFilterRefusal> {
+    if !name_is_renderable(name) {
+        return Err(ParsedFilterRefusal::NameNotRenderable);
+    }
+    if !threshold.is_finite() {
+        return Err(ParsedFilterRefusal::ThresholdNotFinite);
+    }
+    if !matches!(parser, ParserStage::Json { .. }) {
+        // The specified numeric cell reads `JSONExtractFloat`, which is a
+        // JSON reader. No other parser has one, and the value probe is a
+        // substring test that cannot serve an inequality.
+        return Err(ParsedFilterRefusal::NoKeyExpression);
+    }
+    if !name_is_unambiguous(name) {
+        return Err(ParsedFilterRefusal::AmbiguousName);
+    }
+    let key = ch_string(name);
+    let guard = metadata_non_empty_guard();
+    let guard = guard.as_sql();
+    let cmp = match op {
+        CompareOp::Eq => "=",
+        CompareOp::Neq => "!=",
+        CompareOp::Gt => ">",
+        CompareOp::Gte => ">=",
+        CompareOp::Lt => "<",
+        CompareOp::Lte => "<=",
+    };
+    Ok(CheckedFragment {
+        sql: format!(
+            "(JSONType(body, {key}) NOT IN ('Int64','UInt64','Double') OR \
+             JSONExtractFloat(body, {key}) {cmp} {threshold:?} OR {guard})"
+        ),
+    })
+}
+
+/// Why an anchored bucket grid cannot be rendered (issue #507, W2).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the range aggregation does not lower here, so the link stays
+/// residual and the evaluator answers exactly as it does today. A
+/// `PipelineError` would surface as a 400 for a query nothing is wrong
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketGridRefusal {
+    /// `step_ns` is zero or negative, so the grid has no points.
+    StepNotPositive,
+    /// The anchor does not sit at or below the first row the statement can
+    /// admit. `intDiv` truncates toward zero, which is a floor only for a
+    /// non-negative numerator, so an anchor above the scan start would
+    /// bucket the early rows upward instead of downward.
+    AnchorAboveScanStart,
+    /// The worst-case arithmetic is not representable in `Int64`.
+    WouldOverflow,
+}
+
+/// The anchored bucket expression: the grid point a row belongs to under a
+/// window that is **open below and closed above**.
+///
+/// ```text
+/// <lo> + intDiv(<col> - <lo> + <step> - 1, <step>) * <step>
+/// ```
+///
+/// **`lo` is `grid_start_ns - step_ns` and never the scan's own start.**
+/// The scan start is widened backwards by the range selector's duration
+/// (`plan.rs`'s `widen_scan_start`) so the first grid point's window is
+/// complete; using it as the anchor would shift the whole grid by one
+/// range. The two coincide exactly when the range equals the step, which
+/// is the case that would make a wrong implementation look right.
+///
+/// **Why a ceiling and not the floor the shipped range renderer uses.**
+/// The window for grid point `g` is `(g - range, g]`, on a grid anchored
+/// at the query's start. A floor onto a grid anchored at the epoch is a
+/// different function: it is closed below rather than above, and its
+/// output is a multiple of the step rather than a point of the query's
+/// grid. The two agree only when the grid start happens to be a multiple
+/// of the step, and then only at the grid points themselves.
+///
+/// `bucket_col` is a `&'static str` and its only callers pass
+/// [`super::sql::MetricShape::bucket_col`], which returns one of two
+/// literals — no caller text can reach it.
+///
+/// # Refusals
+///
+/// Three, each with its own reason and none of them a client error. The
+/// overflow bound is taken over the newest row the statement can admit,
+/// which is the same `scan_end_ns` the statement's own `WHERE` enforces —
+/// so "this statement's arithmetic cannot wrap" is a property of the pair,
+/// not of the expression alone.
+pub fn bucket_expr(
+    bucket_col: &'static str,
+    lo_ns: i64,
+    step_ns: i64,
+    scan_start_ns: i64,
+    scan_end_ns: i64,
+) -> Result<CheckedFragment, BucketGridRefusal> {
+    if step_ns <= 0 {
+        return Err(BucketGridRefusal::StepNotPositive);
+    }
+    if lo_ns > scan_start_ns {
+        return Err(BucketGridRefusal::AnchorAboveScanStart);
+    }
+    // The widest numerator the statement can evaluate, and the grid point
+    // it produces. Both checked: a wrapped bucket is a silently wrong
+    // answer, where a refusal is today's behaviour.
+    let numerator = scan_end_ns
+        .checked_sub(lo_ns)
+        .and_then(|d| d.checked_add(step_ns))
+        .and_then(|d| d.checked_sub(1))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    (numerator / step_ns)
+        .checked_mul(step_ns)
+        .and_then(|t| lo_ns.checked_add(t))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    Ok(CheckedFragment {
+        sql: format!(
+            "{lo_ns} + intDiv({bucket_col} - {lo_ns} + {step_ns} - 1, {step_ns}) * {step_ns}"
+        ),
+    })
+}
+
 /// `countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, '<UUID_RE>'))` —
 /// `/detected_labels`' non-ID-value aggregate. **Takes no argument**, so no
 /// user string can enter it; [`UUID_RE`] is a module constant.
@@ -725,5 +1133,276 @@ mod tests {
                 expected
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // W3 (issue #507): the parsed-name filter's fragments, its refusals,
+    // and the rule every cell is built to.
+    // -----------------------------------------------------------------
+
+    /// One row of `tests/logql_parsed_filter_witnesses.tsv`.
+    pub(crate) struct Witness {
+        pub(crate) form: String,
+        pub(crate) parser: String,
+        pub(crate) arg: String,
+        pub(crate) name: String,
+        pub(crate) value: String,
+        pub(crate) body: String,
+        pub(crate) keeps: bool,
+    }
+
+    /// The witness table, read from the file both halves of the rule read.
+    pub(crate) fn witnesses() -> Vec<Witness> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/logql_parsed_filter_witnesses.tsv"
+        );
+        let text = std::fs::read_to_string(path).expect("the witness table is readable");
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() || line.starts_with("form\t") {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 7, "seven columns: {line:?}");
+            out.push(Witness {
+                form: f[0].to_string(),
+                parser: f[1].to_string(),
+                arg: f[2].to_string(),
+                name: f[3].to_string(),
+                value: f[4].to_string(),
+                body: f[5].to_string(),
+                keeps: f[6] == "1",
+            });
+        }
+        assert!(!out.is_empty(), "the witness table is not empty");
+        out
+    }
+
+    /// The LogQL query one witness row describes.
+    pub(crate) fn witness_query(w: &Witness) -> String {
+        let stage = match w.parser.as_str() {
+            "json" => "| json".to_string(),
+            "logfmt" => "| logfmt".to_string(),
+            "regexp" => format!(r#"| regexp "{}""#, w.arg),
+            "pattern" => format!(r#"| pattern "{}""#, w.arg),
+            other => panic!("unknown parser {other}"),
+        };
+        let filter = match w.form.as_str() {
+            "numeric" => format!("| {} >= {}", w.name, w.value),
+            "neq" => format!(r#"| {}!="{}""#, w.name, w.value),
+            _ => format!(r#"| {}="{}""#, w.name, w.value),
+        };
+        format!(r#"{{s="m"}} {stage} {filter}"#)
+    }
+
+    /// W3 (issue #507) — **the `keeps` column is the answer the shipped
+    /// pipeline gives**, not a value someone typed and nobody ran.
+    ///
+    /// The column is hand-written, because it is the claim the live half
+    /// checks the database against; this test is what stops a typo in it
+    /// becoming a false expectation there.
+    #[test]
+    fn every_witness_row_states_the_answer_the_pipeline_gives() {
+        for w in witnesses() {
+            let query = witness_query(&w);
+            let expr = pulsus_logql::parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let pulsus_logql::Expr::Log(log) = expr else {
+                panic!("{query} is not a log expression")
+            };
+            let compiled = super::super::pipeline::CompiledPipeline::compile(&log.pipeline)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let mut out = Vec::new();
+            let kept = compiled
+                .run_into(&w.body, &[], 0, &mut out)
+                .expect("within budget")
+                .is_some();
+            assert_eq!(
+                kept, w.keeps,
+                "`{query}` over `{}`: the table says keeps={}, the pipeline says {kept}",
+                w.body, w.keeps
+            );
+        }
+    }
+
+    fn json_parser() -> ParserStage {
+        ParserStage::Json {
+            extractions: Vec::new(),
+        }
+    }
+
+    fn logfmt_parser() -> ParserStage {
+        ParserStage::Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: Vec::new(),
+        }
+    }
+
+    /// W3 (issue #507) — the three served fragments, byte for byte.
+    #[test]
+    fn a_parsed_name_filter_renders_the_specified_fragment() {
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Eq, "error", &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') = 'error' OR structured_metadata != '')"
+        );
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Neq, "error", &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') != 'error' OR structured_metadata != '')"
+        );
+        // The logfmt form BRANCHES on the operator: the empty alternative
+        // belongs to `=` and would drop a kept row under `!=`.
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Neq, "error", &logfmt_parser())
+                .expect("served")
+                .as_sql(),
+            concat!(
+                r#"(extractKeyValuePairs(body, '=', ' \t\r\n', "#,
+                r#"'"'"#,
+                r#")['level'] != 'error' OR position(body, '\\') > 0 "#,
+                r#"OR structured_metadata != '')"#,
+            )
+        );
+        assert_eq!(
+            parsed_string_filter(
+                "a",
+                MatchOp::Eq,
+                "err",
+                &ParserStage::Regexp("(?P<a>[a-z]+)".to_string())
+            )
+            .expect("served")
+            .as_sql(),
+            "body LIKE '%err%'"
+        );
+        assert_eq!(
+            parsed_numeric_filter("status", CompareOp::Gte, 500.0, &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'status') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body, 'status') >= 500.0 OR structured_metadata != '')"
+        );
+    }
+
+    /// W3 (issue #507) — **a numeric threshold is a float literal, and
+    /// that is not cosmetic.**
+    ///
+    /// Written bare, `9007199254740993` lexes as `UInt64` and is compared
+    /// against a `Float64` exactly. Measured on 26.3.29.7:
+    /// `toTypeName(9007199254740993)` is `UInt64`,
+    /// `toTypeName(9007199254740993.0)` is `Float64`, and
+    /// `9007199254740992.0 = 9007199254740993` is false — so the bare form
+    /// returns no rows at that magnitude where the answer is two.
+    ///
+    /// The four values are chosen where the two readings differ by the
+    /// least, on both sides of the point where they start to differ.
+    #[test]
+    fn a_numeric_threshold_renders_as_a_float_literal() {
+        for (threshold, want) in [
+            (500.0f64, "500.0"),
+            (0.25, "0.25"),
+            (9007199254740992.0, "9007199254740992.0"),
+            (9007199254740993.0, "9007199254740992.0"),
+            (9007199254740994.0, "9007199254740994.0"),
+            // The smallest positive subnormal, written as its bits so no
+            // decimal spelling is involved: `{:?}` renders it `5e-324`,
+            // and the database reads `5e-324` back as the same double.
+            // A string cast does not — `toFloat64('4.9406564584124654e-324')`
+            // is `0` on 26.3.29.7 — which is why the literal is a decimal
+            // and not a cast.
+            (f64::from_bits(1), "5e-324"),
+        ] {
+            let sql = parsed_numeric_filter("status", CompareOp::Gte, threshold, &json_parser())
+                .expect("served");
+            assert!(
+                sql.as_sql()
+                    .contains(&format!("JSONExtractFloat(body, 'status') >= {want} OR")),
+                "threshold {threshold} must render as `{want}`: {}",
+                sql.as_sql()
+            );
+        }
+    }
+
+    /// W3 (issue #507) — every refusal, each with the input that reaches
+    /// it and no other.
+    #[test]
+    fn a_parsed_name_filter_refuses_with_the_stated_reason() {
+        let json = json_parser();
+        let re = ParserStage::Regexp("(?P<a>.*)".to_string());
+        // The two regular-expression operators are not served, because
+        // our regex label-filter semantics already differ from the
+        // reference and pushing them down would bind that difference into
+        // a statement.
+        for op in [MatchOp::Re, MatchOp::Nre] {
+            assert_eq!(
+                parsed_string_filter("level", op, "error", &json),
+                Err(ParsedFilterRefusal::OperatorNotServed),
+                "{op:?}"
+            );
+        }
+        // A name with `_` can be produced by more than one raw key.
+        assert_eq!(
+            parsed_string_filter("trace_id", MatchOp::Eq, "x", &json),
+            Err(ParsedFilterRefusal::AmbiguousName)
+        );
+        assert_eq!(
+            parsed_numeric_filter("status_code", CompareOp::Gte, 500.0, &json),
+            Err(ParsedFilterRefusal::AmbiguousName)
+        );
+        // The value probe serves `=` alone: for `!=` it would drop every
+        // row holding the value anywhere, including a row where it sits
+        // outside the capture and the capture differs.
+        assert_eq!(
+            parsed_string_filter("a", MatchOp::Neq, "v", &re),
+            Err(ParsedFilterRefusal::OperatorNotServed)
+        );
+        assert!(
+            parsed_string_filter("a", MatchOp::Eq, "v", &re).is_ok(),
+            "the control: the probe serves `=` on the same input"
+        );
+        // A capture has no key-precise expression, so the numeric form has
+        // nothing to compare.
+        assert_eq!(
+            parsed_numeric_filter("a", CompareOp::Gte, 500.0, &re),
+            Err(ParsedFilterRefusal::NoKeyExpression)
+        );
+        assert_eq!(
+            parsed_numeric_filter("status", CompareOp::Gte, 500.0, &logfmt_parser()),
+            Err(ParsedFilterRefusal::NoKeyExpression)
+        );
+        // A non-finite threshold has no literal the database accepts.
+        for t in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(
+                parsed_numeric_filter("status", CompareOp::Gt, t, &json),
+                Err(ParsedFilterRefusal::ThresholdNotFinite)
+            );
+        }
+        // A name a fragment may not render.
+        for bad in ["1abc", "a-b", "", "a b"] {
+            assert_eq!(
+                parsed_string_filter(bad, MatchOp::Eq, "x", &json),
+                Err(ParsedFilterRefusal::NameNotRenderable),
+                "{bad:?}"
+            );
+        }
+        // The controls: the refusals must not be reachable from an
+        // ordinary filter.
+        assert!(parsed_string_filter("level", MatchOp::Eq, "error", &json).is_ok());
+        assert!(parsed_numeric_filter("status", CompareOp::Gte, 500.0, &json).is_ok());
+    }
+
+    /// W3 (issue #507), condition 6 — the metadata column is named in one
+    /// private constant, and the two public ways to name it both render
+    /// the bare column.
+    #[test]
+    fn the_metadata_column_is_named_in_one_place() {
+        assert_eq!(MetadataTerm::Project.as_sql(), "structured_metadata");
+        assert_eq!(MetadataTerm::Group.as_sql(), "structured_metadata");
+        assert_eq!(
+            metadata_non_empty_guard().as_sql(),
+            "structured_metadata != ''"
+        );
     }
 }

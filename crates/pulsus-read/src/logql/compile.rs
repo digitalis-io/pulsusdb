@@ -83,16 +83,16 @@ impl SourceName for LqlSource {
     }
 }
 
-/// LogQL's shapes. Not a shared enum: one enum over both languages would
-/// be a union with per-language invalid states.
+/// LogQL's row kinds. Not a shared enum: one enum over both languages
+/// would be a union with per-language invalid states. The accumulated
+/// shape pairs one of these with the pipeline-error state, so both it
+/// and [`LqlShape`] are declared under "the pipeline-error state" below.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LqlShape {
+pub enum LqlKind {
     Lines,
     Samples,
     Series,
 }
-
-impl Shape for LqlShape {}
 
 /// What crosses between two LogQL parts: the resolved fingerprint list,
 /// bounded by `DEFAULT_MAX_STREAMS`.
@@ -388,17 +388,27 @@ impl Lower<Lql> for ParserLower {
     /// failure keeps the line with an `__error__` label, so a parser
     /// removes no line.
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
-        let id = match s {
-            LqlLink::Pipe(Stage::Parser(ParserStage::Json { .. })) => "parser:json",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Logfmt { .. })) => "parser:logfmt",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Regexp(_))) => "parser:regexp",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Pattern(_))) => "parser:pattern",
-            _ => "parser",
+        // The four forms share this dispatcher and DIFFER here: only the
+        // JSON and logfmt arms write the error slot
+        // (`pipeline.rs:4732`, `:4791`, `:6428`, reached from the arms at
+        // `:1743` and `:1752`). A non-matching `| regexp` or `| pattern`
+        // extracts nothing and raises nothing — measured, the reference
+        // answers `200` with an unlabelled group for both.
+        let (id, raises) = match s {
+            LqlLink::Pipe(Stage::Parser(ParserStage::Json { .. })) => ("parser:json", true),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Logfmt { .. })) => ("parser:logfmt", true),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Regexp(_))) => ("parser:regexp", false),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Pattern(_))) => ("parser:pattern", false),
+            _ => ("parser", false),
         };
         rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId(id),
         )));
-        rel
+        if raises {
+            mark_error_raisable(rel)
+        } else {
+            rel
+        }
     }
 }
 
@@ -461,9 +471,15 @@ impl Lower<Lql> for LabelFilterLower {
     ) -> Result<Relation<Lql>, super::ReadError> {
         Ok(rel)
     }
-    /// It drops lines in the evaluator.
-    fn residual_effect(&self, _s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
+    /// It drops lines in the evaluator, and a NUMERIC comparison in it can
+    /// raise a pipeline error on a value that does not convert.
+    fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         rel.exact = false;
+        if let LqlLink::Pipe(Stage::LabelFilter(expr)) = s
+            && holds_a_numeric_comparison(expr)
+        {
+            return mark_error_raisable(rel);
+        }
         rel
     }
 }
@@ -483,9 +499,11 @@ impl Lower<Lql> for LineFormatLower {
     }
     /// Sets the line's provenance with NO resolvable expression, so every
     /// later link needing the line goes residual. It does **not** clear
-    /// `exact` — it removes no line.
+    /// `exact` — it removes no line — and it CAN raise: a template that
+    /// fails while rendering writes the error slot (`pipeline.rs:1995`,
+    /// inside the arm at `:1897`).
     fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>) -> Relation<Lql> {
-        mark_line_rewritten(rel)
+        mark_error_raisable(mark_line_rewritten(rel))
     }
 }
 
@@ -502,7 +520,8 @@ impl Lower<Lql> for LabelFormatLower {
         Ok(rel)
     }
     /// `cols` rewritten with evaluator-only provenance for each rewritten
-    /// name; `exact` untouched.
+    /// name; `exact` untouched. It CAN raise, for the same reason
+    /// `line_format` can (`pipeline.rs:2208`, inside the arm at `:2000`).
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         if let LqlLink::Pipe(Stage::LabelFormat(fmts)) = s {
             for f in fmts {
@@ -510,7 +529,7 @@ impl Lower<Lql> for LabelFormatLower {
                     .set_provenance(&Name::new(label_fmt_dst(f)), Provenance::EvaluatorOnly);
             }
         }
-        rel
+        mark_error_raisable(rel)
     }
 }
 
@@ -544,7 +563,9 @@ impl Lower<Lql> for UnwrapLower {
             rel.cols
                 .set_provenance(&Name::new(u.label.clone()), Provenance::EvaluatorOnly);
         }
-        rel
+        // A sample conversion can fail the same way a numeric label filter
+        // can (`pipeline.rs:2252`, inside the arm at `:2216`).
+        mark_error_raisable(rel)
     }
 }
 
@@ -562,12 +583,20 @@ impl Lower<Lql> for UnpackLower {
     }
     /// Rewrites the line, and the promoted labels arrive as an open
     /// source the evaluator owns.
+    ///
+    /// **It raises**, which two earlier derivations of this table missed:
+    /// its two error writes sit inside `run_unpack`
+    /// (`pipeline.rs:6158`, `:6166`), which is a helper reached from the
+    /// `Unpack` arm at `:2263`, so walking backwards to the nearest
+    /// preceding `CompiledStage::` line attributes them to a different
+    /// stage entirely. Measured on both engines: `| unpack` over a
+    /// malformed line answers `400`.
     fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>) -> Relation<Lql> {
         let mut rel = mark_line_rewritten(rel);
         rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId("unpack:labels"),
         )));
-        rel
+        mark_error_raisable(rel)
     }
 }
 
@@ -637,23 +666,132 @@ fn elem_names(elems: &[DropKeepElem]) -> Vec<Name> {
     elems.iter().map(|e| Name::new(e.label.clone())).collect()
 }
 
+/// The column a lowered window groups by — the alias the bucketed
+/// statement gives its grid-point expression. The expression itself is
+/// rendered by [`super::predicate::bucket_expr`] and never here: it needs
+/// the request's time bounds, which [`Lower::capability`] does not
+/// receive, and the statement's own `GROUP BY` names the alias rather than
+/// the expression.
+pub const BUCKET_NS: &str = "bucket_ns";
+
+/// The metadata column, which a lowered aggregation carries in its
+/// grouping unconditionally: it is part of the output series identity even
+/// when no error is involved.
+pub const STRUCTURED_METADATA: &str = "structured_metadata";
+
 impl Lower<Lql> for WindowLower {
-    fn capability(&self, _s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
-        Capability::No(BlockReason::NotYetLowered)
+    /// **The chain-decidable half of a two-part decision, and the other
+    /// half is not expressible here.**
+    ///
+    /// Whether a window can be bucketed depends on two things. One is a
+    /// property of the chain — the grid's step and the selector's range —
+    /// and this answers it. The other is whether the grid's arithmetic is
+    /// representable over the newest row the statement admits, which
+    /// depends on the request's time bounds. **This method cannot see
+    /// them**, and there is no other channel: `capability` is the fold's
+    /// only producer of `Capability::No`, which is its only way to say
+    /// *fall back*; `apply` does receive the bounds, but `lower_chain`
+    /// propagates its error with `?`, so an error there fails the query
+    /// rather than falling back; and widening this signature is a change
+    /// to the shared core.
+    ///
+    /// So the decision is a PARTITION, not a duplication: this asserts the
+    /// necessary condition, [`super::predicate::bucket_expr`] asserts the
+    /// sufficient one, neither can express the other's input, and their
+    /// conjunction is taken by the planner. A partition has no shared
+    /// content to drift; its one failure mode is the join dropping a half,
+    /// which is what the planner's own exhaustive match is for.
+    ///
+    /// **Why the range must equal the step, in both directions.** The
+    /// expression gives one grid point per row: the smallest grid point at
+    /// or above it, which is the window `(g - step, g]`. The window being
+    /// evaluated is `(g - range, g]`.
+    ///
+    /// * With a range WIDER than the step an entry belongs to several
+    ///   windows at once, and no single column can say which.
+    /// * With a range SHORTER than the step the entries in
+    ///   `(g - step, g - range]` belong to no window at all, and the
+    ///   column counts them into `g` anyway:
+    ///
+    /// ```text
+    ///   step 60s, range 10s, grid points 0 and 60
+    ///     the window        (-10, 0]   (50, 60]
+    ///     the grid column   (-60, 0]   ( 0, 60]   <- a row at 30 counted
+    /// ```
+    ///
+    /// This condition was `range <= step` when the model was written and
+    /// nothing executed from it; the shorter-range case is the one the
+    /// `<=` admitted and the statement answers wrongly (issue #507, the
+    /// W2 execution path).
+    ///
+    /// **Widening it again moves a frozen golden**, and the fact that
+    /// narrowing it did not is luck rather than design: every range in
+    /// `tests/golden/plan_build_differential.txt`'s corpus is `[5m]`
+    /// against a 60 s step, so no plan in it lowers. See the same note at
+    /// `plan.rs`'s `bucketed_range`, which is the other half of this
+    /// decision.
+    fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
+        let LqlLink::Window {
+            range_ns,
+            step_ns,
+            grid_start_ns,
+            ..
+        } = s
+        else {
+            return Capability::No(BlockReason::NotYetLowered);
+        };
+        if *step_ns <= 0 || *range_ns <= 0 || range_ns != step_ns {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        if grid_start_ns.checked_sub(*step_ns).is_none() {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        Capability::Yes
     }
+    /// Groups by the grid-point column and by the metadata column, and
+    /// makes the grid point resolvable so the aggregation above it can
+    /// read it. The `GROUP BY` names the alias, so no expression is built
+    /// here — see [`BUCKET_NS`].
     fn apply(
         &self,
         _s: &LqlLink,
-        rel: Relation<Lql>,
+        mut rel: Relation<Lql>,
         _cx: &LowerCx<'_, Lql>,
     ) -> Result<Relation<Lql>, super::ReadError> {
+        rel.cols.set_provenance(
+            &Name::from(BUCKET_NS),
+            Provenance::Computed(SqlExpr::new(BUCKET_NS)),
+        );
+        rel.grouping = Some(crate::compile::fold::Grouping {
+            keys: vec![
+                FINGERPRINT.to_string(),
+                BUCKET_NS.to_string(),
+                STRUCTURED_METADATA.to_string(),
+            ],
+        });
         Ok(rel)
     }
-    /// Records the bucketing as evaluator-owned, so a following
-    /// aggregation cannot lower.
+    /// A grid-point column removes no row and computes no aggregate: the
+    /// SQL assigns each row the same grid point the window's own rule
+    /// assigns it, so the evaluator must not re-apply the link.
+    ///
+    /// This is the window's fidelity alone. **The range aggregation above
+    /// it keeps the conservative `Wider` default**, because whether
+    /// summing the database's per-group partials reproduces the single
+    /// accumulator is a per-reducer argument the reader's design owes, and
+    /// `Wider` cannot make a plan wrong — only no better than today.
+    fn fidelity(&self, _s: &LqlLink, _rel: &Relation<Lql>) -> Fidelity {
+        Fidelity::Equivalent
+    }
+    /// Records the grid point as evaluator-owned, so the aggregation above
+    /// cannot lower: the name exists and SQL cannot see it.
+    ///
+    /// It is the same name the lowered arm makes resolvable. Two names for
+    /// one concept is the defect class this issue has spent three rounds
+    /// on, so the marker is [`BUCKET_NS`] and not a second spelling.
     fn residual_effect(&self, _s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         rel.cols
-            .set_provenance(&Name::from("__bucket"), Provenance::EvaluatorOnly);
+            .set_provenance(&Name::from(BUCKET_NS), Provenance::EvaluatorOnly);
         rel
     }
 }
@@ -661,23 +799,95 @@ impl Lower<Lql> for WindowLower {
 impl Lower<Lql> for RangeAggLower {
     /// `AbsentOverTime` is `Never`: the answer is a statement about rows
     /// that are **absent**, so there is no row to compute it from.
-    fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
-        if let LqlLink::RangeAgg {
-            op: RangeAggOp::AbsentOverTime,
-            ..
-        } = s
-        {
+    fn capability(&self, s: &LqlLink, rel: &Relation<Lql>) -> Capability {
+        let LqlLink::RangeAgg { op, .. } = s else {
+            return Capability::No(BlockReason::NotYetLowered);
+        };
+        if matches!(op, RangeAggOp::AbsentOverTime) {
             return Capability::Never(NeverReason::NoRowToComputeFrom);
         }
-        Capability::No(BlockReason::NotYetLowered)
+        // Four of the fifteen reducers accumulate INTEGERS, so summing the
+        // database's per-group partials reproduces the single accumulator
+        // exactly. The other ten take an `f64` sample through `| unwrap`,
+        // and a sum of `f64`s is not associative.
+        if !matches!(
+            op,
+            RangeAggOp::CountOverTime
+                | RangeAggOp::BytesOverTime
+                | RangeAggOp::Rate
+                | RangeAggOp::BytesRate
+        ) {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        // `rate` is the one of the four that ADMITS `| unwrap`, and with
+        // one its accumulator is an `f64` sum. The exclusion is carried by
+        // the error state rather than by a second test: `| unwrap` can
+        // fail a sample conversion, so it makes the pipeline error
+        // raisable, and the check below refuses the chain.
+        // `a_rate_over_an_unwrap_does_not_lower` is the test that reddens
+        // if that ever stops being true.
+        if rel.shape.error != PipelineError::Clean {
+            return Capability::No(BlockReason::NameNotResolvable);
+        }
+        // A count computed before a row filter is simply wrong, not merely
+        // wide, so a superset is not good enough here the way it is for a
+        // pushed-down filter.
+        if !rel.exact {
+            return Capability::No(BlockReason::NotExact);
+        }
+        // The window above it must have lowered, or there is no grid-point
+        // column to group by.
+        if rel.cols.resolve(&Name::from(BUCKET_NS)).is_none() {
+            return Capability::No(BlockReason::NameNotResolvable);
+        }
+        Capability::Yes
     }
     fn apply(
         &self,
-        _s: &LqlLink,
-        rel: Relation<Lql>,
+        s: &LqlLink,
+        mut rel: Relation<Lql>,
         _cx: &LowerCx<'_, Lql>,
     ) -> Result<Relation<Lql>, super::ReadError> {
+        if let LqlLink::RangeAgg { op, .. } = s {
+            let agg = match op {
+                RangeAggOp::BytesOverTime | RangeAggOp::BytesRate => "sum(length(body))",
+                _ => "count()",
+            };
+            rel.projection.push((Name::from("n"), agg.to_string()));
+            rel.shape.kind = LqlKind::Series;
+        }
         Ok(rel)
+    }
+    /// `Equivalent` for the four reducers [`RangeAggLower::capability`]
+    /// admits, and the argument is per reducer rather than inherited.
+    ///
+    /// | reducer | lowered aggregate | why the client's sum is bit-identical |
+    /// |---|---|---|
+    /// | `count_over_time` | `count()` | the reader sums `u64` partials; integer addition is associative and exact, so the sum over the metadata variants equals a single accumulator |
+    /// | `bytes_over_time` | `sum(length(body))` | same, over byte lengths, also `u64` |
+    /// | `rate` | `count()` | the divisor is applied ONCE per folded series, after summing — one division of an exact integer sum, never a sum of divided values |
+    /// | `bytes_rate` | `sum(length(body))` | same |
+    ///
+    /// No float is summed anywhere on this path, which is what makes
+    /// `Equivalent` available at all; the ten reducers that take an `f64`
+    /// through `| unwrap` never reach here (`capability` refuses them), so
+    /// this says nothing about them.
+    ///
+    /// Any other link is residual, and the fold does not consult
+    /// `fidelity` for a residual link — the `Wider` fallback is
+    /// unobservable rather than a claim.
+    fn fidelity(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Fidelity {
+        match s {
+            LqlLink::RangeAgg {
+                op:
+                    RangeAggOp::CountOverTime
+                    | RangeAggOp::BytesOverTime
+                    | RangeAggOp::Rate
+                    | RangeAggOp::BytesRate,
+                ..
+            } => Fidelity::Equivalent,
+            _ => Fidelity::Wider,
+        }
     }
     /// **Shape unchanged** — `Lines` whenever the `Unwrap` above went
     /// residual, which is the case its own row describes; clears `exact`.
@@ -830,6 +1040,103 @@ impl Lower<Lql> for EmitLower {
     }
 }
 
+// ---------------------------------------------------------------------
+// The pipeline-error state
+//
+// Declared here rather than beside [`LqlKind`] because the state, the
+// shape that carries it and the two rules that write it are one
+// concern, and splitting them across the file put half of it under a
+// heading about the language's types.
+// ---------------------------------------------------------------------
+
+/// Whether a pipeline error can still be raised over the rows a chain has
+/// accumulated (issue #507, W2).
+///
+/// **Why the state lives on the shape and not in `cols`.** `ColSet`'s
+/// whole mutating surface — `set_provenance`, `widen`, `without`, `only`,
+/// `known_mut` — is about ordinary label names, and the error is not one.
+/// `| keep level, __error__` removes every other marker column while
+/// leaving the engine's error slot set, so a `cols` marker would report
+/// that chain clean; measured, both engines answer `400` there.
+/// `Lang::Shape` is per language and the core only requires
+/// `Clone + Eq + Debug` ([`crate::compile::fold::Shape`]), so the state
+/// goes here and the core does not move.
+///
+/// **What reads it.** A range or vector aggregation may only lower while
+/// the state is [`PipelineError::Clean`]: a lowered `GROUP BY` answers
+/// `200` with a group where the reference answers `400` for a pipeline
+/// error, and SQL has no way to refuse a whole request over one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// No stage folded so far can write the engine's error slot.
+    Clean,
+    /// Some stage can.
+    Raisable,
+}
+
+/// LogQL's accumulated shape: what a row IS, and whether a pipeline error
+/// can still be raised over it. Two questions, so two fields — a fourth
+/// `LqlKind` variant would have put the error concern inside the type that
+/// answers "lines, samples or series".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LqlShape {
+    pub kind: LqlKind,
+    pub error: PipelineError,
+}
+
+impl LqlShape {
+    /// The shape a chain seeds with: lines, and nothing has raised yet.
+    pub fn lines() -> Self {
+        LqlShape {
+            kind: LqlKind::Lines,
+            error: PipelineError::Clean,
+        }
+    }
+}
+
+impl Shape for LqlShape {}
+
+/// Marks the accumulated rows as ones a pipeline error can still be
+/// raised over.
+///
+/// **Seven of `run_mode_into`'s thirteen `CompiledStage` arms can write
+/// the engine's error slot**, and this is the state that records it. The
+/// seven were derived by taking every call of the slot's two mutators,
+/// workspace-wide, and mapping each call site to the arm it is reached
+/// FROM rather than to the nearest preceding `CompiledStage::` line — the
+/// two writes for `| unpack` sit inside `run_unpack`
+/// (`crates/pulsus-read/src/logql/pipeline.rs:6143`), reached from the
+/// `Unpack` arm at `:2258`, and a nearest-line reading attributes them to
+/// the JSON parser.
+///
+/// The seven: `Json`, `Logfmt`, `LabelFilter` (a numeric comparison
+/// only — see [`holds_a_numeric_comparison`]), `LineFormat`,
+/// `LabelFormat`, `Unwrap`, `Unpack`. `Regexp` and `Pattern` write
+/// nothing, which is why the four parser forms do not share one answer
+/// here even though they share a dispatcher.
+fn mark_error_raisable(mut rel: Relation<Lql>) -> Relation<Lql> {
+    rel.shape.error = PipelineError::Raisable;
+    rel
+}
+
+/// Does this label-filter expression hold a numeric comparison leaf?
+///
+/// `CompiledStage::LabelFilter`'s only write to the error slot is the
+/// conversion failure of a numeric comparison: `eval_label_filter`
+/// assigns its `failed` slot in exactly one arm, `LfOp::Compare`
+/// (`crates/pulsus-read/src/logql/pipeline.rs:4117-4137`), and the stage
+/// calls `set_err` only when that slot is filled (`:1888-1891`). A filter
+/// made only of string matchers therefore raises nothing.
+fn holds_a_numeric_comparison(expr: &LabelFilterExpr) -> bool {
+    let mut found = false;
+    pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| {
+        if matches!(node, LabelFilterExpr::Compare { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Parses `{service_name="x"} <atom>` and returns the single pipeline
 /// stage, so that every payload a gate uses comes from the real parser
 /// rather than from a hand-built AST. Test-only, and crate-visible
@@ -873,7 +1180,7 @@ pub fn seed_relation() -> Relation<Lql> {
         grouping: None,
         ordering: None,
         limit: None,
-        shape: LqlShape::Lines,
+        shape: LqlShape::lines(),
         exact: true,
         depth: 0,
         // Issue #492 part 4 added the slot; the LogQL fit lowers no
@@ -921,9 +1228,19 @@ mod tests {
 
     // --- the residual state effects -----------------------------------
 
-    fn base(shape: LqlShape) -> Relation<Lql> {
+    /// Written out at every seed and every expectation below, so a row's
+    /// error transition is legible in the row rather than defaulted.
+    const CLEAN: PipelineError = PipelineError::Clean;
+    const RAISABLE: PipelineError = PipelineError::Raisable;
+
+    /// A seed relation with an explicit row kind AND an explicit pipeline
+    /// error state. Both are written out at every use below rather than
+    /// defaulted: the error state is the field W2's aggregation rule
+    /// reads, and a row whose seeds agreed on it could not tell a link
+    /// that PRESERVES it from one that ASSIGNS it.
+    fn base(kind: LqlKind, error: PipelineError) -> Relation<Lql> {
         let mut rel = seed_relation();
-        rel.shape = shape;
+        rel.shape = LqlShape { kind, error };
         rel
     }
 
@@ -991,10 +1308,10 @@ mod tests {
         rows.push(EffectRow {
             name: "LineFilter",
             link: LqlLink::Pipe(stage(r#"|= ip("10.0.0.0/8")"#)),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1003,19 +1320,32 @@ mod tests {
         // evaluator-only open source, and `exact` is NOT cleared — a
         // parse failure keeps the line with an `__error__` label, so a
         // parser removes no line. The seeds therefore differ in `exact`.
-        for (name, atom, id) in [
-            ("Parser(Json)", "| json", "parser:json"),
-            ("Parser(Logfmt)", "| logfmt", "parser:logfmt"),
-            ("Parser(Regexp)", r#"| regexp "(?P<a>.*)""#, "parser:regexp"),
-            ("Parser(Pattern)", r#"| pattern "<a>""#, "parser:pattern"),
+        // Json and logfmt ADDITIONALLY make the pipeline error raisable;
+        // regexp and pattern do not. The four share one dispatcher, so
+        // this column is the only place the split is visible.
+        for (name, atom, id, raises) in [
+            ("Parser(Json)", "| json", "parser:json", RAISABLE),
+            ("Parser(Logfmt)", "| logfmt", "parser:logfmt", RAISABLE),
+            (
+                "Parser(Regexp)",
+                r#"| regexp "(?P<a>.*)""#,
+                "parser:regexp",
+                CLEAN,
+            ),
+            (
+                "Parser(Pattern)",
+                r#"| pattern "<a>""#,
+                "parser:pattern",
+                CLEAN,
+            ),
         ] {
             rows.push(EffectRow {
                 name,
                 link: LqlLink::Pipe(stage(atom)),
-                s1: with_exact(base(LqlShape::Lines), true),
-                s2: with_exact(base(LqlShape::Samples), false),
-                e1: widened(with_exact(base(LqlShape::Lines), true), id),
-                e2: widened(with_exact(base(LqlShape::Samples), false), id),
+                s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+                s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
+                e1: widened(with_exact(base(LqlKind::Lines, raises), true), id),
+                e2: widened(with_exact(base(LqlKind::Samples, RAISABLE), false), id),
                 effect_is_constant: false,
                 has_effect: true,
             });
@@ -1024,10 +1354,10 @@ mod tests {
         rows.push(EffectRow {
             name: "LabelFilter",
             link: LqlLink::Pipe(stage(r#"| level="error""#)),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1035,22 +1365,25 @@ mod tests {
         // A line rewrite leaves the line with no resolvable expression
         // and does NOT clear `exact` — it removes no line — so the seeds
         // differ in `exact` as well as in shape.
-        for (name, atom) in [
-            ("LineFormat", r#"| line_format "{{.msg}}""#),
-            ("Decolorize", "| decolorize"),
+        // `line_format` renders a template and a failing render writes the
+        // error slot; `decolorize` strips escape sequences and writes
+        // nothing. Same line rewrite, different error column.
+        for (name, atom, raises) in [
+            ("LineFormat", r#"| line_format "{{.msg}}""#, RAISABLE),
+            ("Decolorize", "| decolorize", CLEAN),
         ] {
             rows.push(EffectRow {
                 name,
                 link: LqlLink::Pipe(stage(atom)),
-                s1: with_exact(base(LqlShape::Lines), true),
-                s2: with_exact(base(LqlShape::Samples), false),
+                s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+                s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
                 e1: with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, raises), true),
                     BODY,
                     Provenance::EvaluatorOnly,
                 ),
                 e2: with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     BODY,
                     Provenance::EvaluatorOnly,
                 ),
@@ -1062,15 +1395,15 @@ mod tests {
         rows.push(EffectRow {
             name: "LabelFormat",
             link: LqlLink::Pipe(label_format),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             e1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, RAISABLE), true),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
@@ -1084,11 +1417,15 @@ mod tests {
         rows.push(EffectRow {
             name: "Unwrap",
             link: LqlLink::Pipe(unwrap),
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
-            e1: with_col(base(LqlShape::Lines), "latency", Provenance::EvaluatorOnly),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
+            e1: with_col(
+                base(LqlKind::Lines, RAISABLE),
+                "latency",
+                Provenance::EvaluatorOnly,
+            ),
             e2: with_col(
-                base(LqlShape::Samples),
+                base(LqlKind::Samples, RAISABLE),
                 "latency",
                 Provenance::EvaluatorOnly,
             ),
@@ -1099,14 +1436,22 @@ mod tests {
         rows.push(EffectRow {
             name: "Unpack",
             link: LqlLink::Pipe(stage("| unpack")),
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
             e1: widened(
-                with_col(base(LqlShape::Lines), BODY, Provenance::EvaluatorOnly),
+                with_col(
+                    base(LqlKind::Lines, RAISABLE),
+                    BODY,
+                    Provenance::EvaluatorOnly,
+                ),
                 "unpack:labels",
             ),
             e2: widened(
-                with_col(base(LqlShape::Samples), BODY, Provenance::EvaluatorOnly),
+                with_col(
+                    base(LqlKind::Samples, RAISABLE),
+                    BODY,
+                    Provenance::EvaluatorOnly,
+                ),
                 "unpack:labels",
             ),
             effect_is_constant: false,
@@ -1120,18 +1465,18 @@ mod tests {
             name: "Drop",
             link: LqlLink::Pipe(dropkeep),
             s1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, CLEAN), true),
                 "level",
                 Provenance::Stored,
             ),
             s2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "level",
                 Provenance::Stored,
             ),
             e1: without_col(
                 with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, CLEAN), true),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1139,7 +1484,7 @@ mod tests {
             ),
             e2: without_col(
                 with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1153,18 +1498,18 @@ mod tests {
             name: "Keep",
             link: LqlLink::Pipe(keep),
             s1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, CLEAN), true),
                 "level",
                 Provenance::Stored,
             ),
             s2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "level",
                 Provenance::Stored,
             ),
             e1: only_cols(
                 with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, CLEAN), true),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1172,7 +1517,7 @@ mod tests {
             ),
             e2: only_cols(
                 with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1190,12 +1535,16 @@ mod tests {
                 offset_ns: 0,
                 grid_start_ns: 0,
             },
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
-            e1: with_col(base(LqlShape::Lines), "__bucket", Provenance::EvaluatorOnly),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
+            e1: with_col(
+                base(LqlKind::Lines, CLEAN),
+                BUCKET_NS,
+                Provenance::EvaluatorOnly,
+            ),
             e2: with_col(
-                base(LqlShape::Samples),
-                "__bucket",
+                base(LqlKind::Samples, RAISABLE),
+                BUCKET_NS,
                 Provenance::EvaluatorOnly,
             ),
             effect_is_constant: false,
@@ -1209,10 +1558,10 @@ mod tests {
                 grouping: None,
                 param: None,
             },
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1224,10 +1573,10 @@ mod tests {
                 grouping: None,
                 param: None,
             },
-            s1: with_exact(base(LqlShape::Series), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Series), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Series, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Series, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1240,15 +1589,15 @@ mod tests {
                 src: "src".to_string(),
                 regex: "(.*)".to_string(),
             },
-            s1: with_exact(base(LqlShape::Series), true),
-            s2: with_exact(base(LqlShape::Samples), true),
+            s1: with_exact(base(LqlKind::Series, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
             e1: with_col(
-                with_exact(base(LqlShape::Series), false),
+                with_exact(base(LqlKind::Series, CLEAN), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
@@ -1259,10 +1608,10 @@ mod tests {
         rows.push(EffectRow {
             name: "Order",
             link: LqlLink::Order,
-            s1: ordered(base(LqlShape::Lines), "timestamp_ns"),
-            s2: ordered(base(LqlShape::Series), "t"),
-            e1: base(LqlShape::Lines),
-            e2: base(LqlShape::Series),
+            s1: ordered(base(LqlKind::Lines, CLEAN), "timestamp_ns"),
+            s2: ordered(base(LqlKind::Series, RAISABLE), "t"),
+            e1: base(LqlKind::Lines, CLEAN),
+            e2: base(LqlKind::Series, RAISABLE),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1270,10 +1619,10 @@ mod tests {
         rows.push(EffectRow {
             name: "Limit",
             link: LqlLink::Limit(100),
-            s1: limited(base(LqlShape::Lines), 100),
-            s2: limited(base(LqlShape::Series), 101),
-            e1: base(LqlShape::Lines),
-            e2: base(LqlShape::Series),
+            s1: limited(base(LqlKind::Lines, CLEAN), 100),
+            s2: limited(base(LqlKind::Series, RAISABLE), 101),
+            e1: base(LqlKind::Lines, CLEAN),
+            e2: base(LqlKind::Series, RAISABLE),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1281,15 +1630,15 @@ mod tests {
         rows.push(EffectRow {
             name: "Emit",
             link: LqlLink::Emit,
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Series),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Series, RAISABLE),
             e1: with_col(
-                base(LqlShape::Lines),
+                base(LqlKind::Lines, CLEAN),
                 "__response",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                base(LqlShape::Series),
+                base(LqlKind::Series, RAISABLE),
                 "__response",
                 Provenance::EvaluatorOnly,
             ),
@@ -1298,6 +1647,355 @@ mod tests {
         });
 
         assert_every_residual_state_effect::<Lql>(&rows, 20);
+    }
+
+    /// Issue #507, W2 — a label filter makes the pipeline error raisable
+    /// only when it holds a NUMERIC comparison.
+    ///
+    /// The twenty-row gate above carries one row per link, and the
+    /// `LabelFilter` row's payload is a string matcher, so that gate
+    /// structurally cannot see this split. `LabelFilter` is the one stage
+    /// whose error answer depends on the PAYLOAD rather than on the
+    /// variant: `eval_label_filter` fills its failure slot in exactly one
+    /// arm, `LfOp::Compare`, and the stage calls `set_err` only when that
+    /// slot is filled.
+    ///
+    /// The table carries both answers, so neither "every label filter
+    /// raises" nor "no label filter raises" passes it.
+    #[test]
+    fn a_numeric_label_comparison_raises_and_a_string_matcher_does_not() {
+        for (atom, want) in [
+            (r#"| level="error""#, CLEAN),
+            (r#"| level!="error""#, CLEAN),
+            (r#"| level=~"err.*""#, CLEAN),
+            (r#"| level="error" and app="x""#, CLEAN),
+            ("| status >= 500", RAISABLE),
+            ("| duration > 1s", RAISABLE),
+            ("| size > 1kb", RAISABLE),
+            (r#"| level="error" and status >= 500"#, RAISABLE),
+            (r#"| status >= 500 or level="error""#, RAISABLE),
+        ] {
+            let link = LqlLink::Pipe(stage(atom));
+            let got = Lql::lower_of(&link).residual_effect(&link, base(LqlKind::Lines, CLEAN));
+            assert_eq!(
+                got.shape.error, want,
+                "`{atom}` must leave the pipeline error {want:?}"
+            );
+        }
+    }
+
+    /// Issue #507, W2 — the pipeline error state a whole chain
+    /// accumulates, which is what a range or vector aggregation will read
+    /// before it may lower.
+    ///
+    /// Seven of the thirteen compiled stage arms can write the engine's
+    /// error slot; the state is `Raisable` if any link in the chain is one
+    /// of the seven and `Clean` otherwise. Nothing clears it: `|
+    /// drop __error__` clears the engine's slot per ROW, over the metadata
+    /// the statement transports, which is the reader's job and not a
+    /// plan-time fact — and a matcher form such as
+    /// `| drop __error__="JSONParserErr"` clears only when the row raised
+    /// that class, which no plan-time state can decide. Leaving those
+    /// `Raisable` refuses the lowering, which is the safe direction.
+    ///
+    /// The seven raising stages appear here in a chain and the six
+    /// non-raising ones appear too, so an implementation that marks every
+    /// stage raisable fails the second half of the table.
+    #[test]
+    fn the_chains_pipeline_error_state_is_the_one_the_seven_raising_arms_give() {
+        let chain = |atoms: &[&str]| -> PipelineError {
+            let mut links = vec![LqlLink::Source];
+            links.extend(atoms.iter().map(|a| LqlLink::Pipe(stage(a))));
+            fold(&links, &bounds(None)).rel.shape.error
+        };
+        // Clean: the seed, and every stage that writes no error slot.
+        for atoms in [
+            &[][..],
+            &[r#"|= "CONN_REFUSED""#][..],
+            &[r#"| regexp "(?P<a>.*)""#][..],
+            &[r#"| pattern "<a>""#][..],
+            &["| decolorize"][..],
+            &["| drop level"][..],
+            &["| keep body"][..],
+            &[r#"| level="error""#][..],
+            &[r#"|= "x""#, "| decolorize", "| drop level"][..],
+        ] {
+            assert_eq!(chain(atoms), CLEAN, "{atoms:?} raises nothing");
+        }
+        // Raisable: each of the seven, alone.
+        for atoms in [
+            &["| json"][..],
+            &["| logfmt"][..],
+            &["| status >= 500"][..],
+            &[r#"| line_format "{{.msg}}""#][..],
+            &["| label_format dst=src"][..],
+            &["| unwrap latency"][..],
+            &["| unpack"][..],
+        ] {
+            assert_eq!(chain(atoms), RAISABLE, "{atoms:?} raises");
+        }
+        // It does not un-raise, and a clearing stage after one does not
+        // either: `| json | drop __error__` stays `Raisable`, which is the
+        // cell the two-value state is chosen to get right.
+        assert_eq!(chain(&["| json", "| drop __error__"]), RAISABLE);
+        assert_eq!(chain(&["| json", r#"| __error__="""#]), RAISABLE);
+        assert_eq!(chain(&["| json", "| keep level"]), RAISABLE);
+        assert_eq!(chain(&["| json", "| decolorize"]), RAISABLE);
+        // And the order does not matter: clearing first then raising is
+        // the same state as raising first.
+        assert_eq!(chain(&["| drop __error__", "| json"]), RAISABLE);
+    }
+
+    /// A chain ending in a window and a range aggregation, with `atoms` as
+    /// its pipeline. `range_ns`/`step_ns` are the selector's width and the
+    /// emit grid's spacing.
+    fn metric_chain(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Vec<LqlLink> {
+        let mut links = vec![LqlLink::Source];
+        links.extend(atoms.iter().map(|a| LqlLink::Pipe(stage(a))));
+        links.push(LqlLink::Window {
+            range_ns,
+            step_ns,
+            offset_ns: 0,
+            grid_start_ns: 1_700_000_000_000_000_000,
+        });
+        links.push(LqlLink::RangeAgg {
+            op,
+            grouping: None,
+            param: None,
+        });
+        links
+    }
+
+    /// The window link's own disposition in a folded chain.
+    fn window_how(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Disposition {
+        let chain = metric_chain(atoms, op, range_ns, step_ns);
+        let how = fold(&chain, &bounds(None)).how;
+        how[chain.len() - 2]
+    }
+
+    /// The range aggregation's own disposition in a folded chain.
+    fn agg_how(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Disposition {
+        let chain = metric_chain(atoms, op, range_ns, step_ns);
+        let how = fold(&chain, &bounds(None)).how;
+        how[chain.len() - 1]
+    }
+
+    /// Issue #507, W2 — a window lowers when the selector's range is
+    /// exactly the emit grid's step, and not otherwise.
+    ///
+    /// The expression gives one grid point per row — the smallest grid
+    /// point at or above it, i.e. the window `(g - step, g]`. A range
+    /// WIDER than the step would put an entry in several windows at once
+    /// and no single column could say which; a range SHORTER than the step
+    /// leaves the entries in `(g - step, g - range]` in no window at all,
+    /// and the column counts them into `g` regardless.
+    ///
+    /// **This is the chain-decidable half of a two-part decision.** Whether
+    /// the grid's arithmetic is representable depends on the request's time
+    /// bounds, which `Lower::capability` does not receive;
+    /// `logql::predicate::bucket_expr` answers that half and the planner
+    /// takes the conjunction.
+    #[test]
+    fn a_window_lowers_only_when_its_range_is_exactly_the_step() {
+        const MIN: i64 = 60_000_000_000;
+        let lowered = Disposition::Lowered(Fidelity::Equivalent);
+        let blocked = Disposition::Residual(ResidualReason::Blocked(BlockReason::NotYetLowered));
+        // range == step.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
+            lowered
+        );
+        // range < step: the entries between the windows belong to none of
+        // them, and the grid column cannot say so.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN / 2, MIN),
+            blocked
+        );
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN - 1, MIN),
+            blocked
+        );
+        // range > step: one entry, several windows.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN + 1, MIN),
+            blocked
+        );
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, 5 * MIN, MIN),
+            blocked
+        );
+        // A step that is not positive has no grid points.
+        assert_eq!(window_how(&[], RangeAggOp::CountOverTime, MIN, 0), blocked);
+        // An anchor one step below the grid start must be representable.
+        let mut chain = metric_chain(&[], RangeAggOp::CountOverTime, MIN, MIN);
+        chain[1] = LqlLink::Window {
+            range_ns: MIN,
+            step_ns: MIN,
+            offset_ns: 0,
+            grid_start_ns: i64::MIN,
+        };
+        let how = fold(&chain, &bounds(None)).how;
+        assert_eq!(how[1], blocked, "`grid_start - step` must be representable");
+    }
+
+    /// Issue #507, W2 — a range aggregation lowers only on a clean, exact
+    /// chain whose window lowered, and only for a reducer whose
+    /// accumulator is an integer.
+    ///
+    /// Each clause is exercised by a row that differs from the lowering row
+    /// in that clause alone, so no row passes because another clause
+    /// happened to refuse first.
+    #[test]
+    fn a_range_aggregation_lowers_only_on_a_clean_exact_bucketed_chain() {
+        const MIN: i64 = 60_000_000_000;
+        let count = RangeAggOp::CountOverTime;
+        // `Equivalent` since the execution path landed: the reader sums
+        // `u64` partials, which is exact — see `RangeAggLower::fidelity`.
+        let lowered = Disposition::Lowered(Fidelity::Equivalent);
+
+        // The row every other row is a one-clause perturbation of.
+        assert_eq!(agg_how(&[], count, MIN, MIN), lowered);
+        // A pushable line filter is `Equivalent`, so it keeps `exact` and
+        // raises nothing: the aggregation still lowers over it.
+        assert_eq!(agg_how(&[r#"|= "boom""#], count, MIN, MIN), lowered);
+
+        // The window did not lower, so there is no grid-point column.
+        assert_eq!(
+            agg_how(&[], count, MIN + 1, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
+        // A stage that can raise a pipeline error. A lowered `GROUP BY`
+        // answers 200 with a group where the reference answers 400, and SQL
+        // cannot refuse a request over one row.
+        assert_eq!(
+            agg_how(&["| json"], count, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
+        // A residual dropping stage clears `exact`. A count taken before a
+        // row filter is wrong, not merely wide.
+        assert_eq!(
+            agg_how(&[r#"|= ip("10.0.0.0/8")"#], count, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NotExact))
+        );
+    }
+
+    /// Issue #507, W2 — **the four lowered reducers are `Equivalent`, and
+    /// the claim is per reducer.**
+    ///
+    /// `Equivalent` means the evaluator must NOT re-apply the link: the
+    /// database's per-group partials ARE the answer. That is true here
+    /// because every one of the four accumulates a `u64` — `count()` or
+    /// `sum(length(body))` — and integer addition is associative and
+    /// exact, and because the rate divisor is applied once per folded
+    /// series after the sum rather than per partial.
+    ///
+    /// `exec.rs`'s `the_rate_divisor_is_applied_to_the_summed_count` and
+    /// `two_metadata_variants_at_one_grid_point_sum_into_one_point` are
+    /// the reader-side halves of the same claim; this is the disposition
+    /// the fold reports.
+    #[test]
+    fn the_four_lowered_reducers_are_equivalent_not_wider() {
+        const MIN: i64 = 60_000_000_000;
+        for op in [
+            RangeAggOp::CountOverTime,
+            RangeAggOp::BytesOverTime,
+            RangeAggOp::Rate,
+            RangeAggOp::BytesRate,
+        ] {
+            assert_eq!(
+                agg_how(&[], op, MIN, MIN),
+                Disposition::Lowered(Fidelity::Equivalent),
+                "{op}"
+            );
+        }
+        // And the window above them, whose `Equivalent` is a different
+        // statement — a grid column removes no row — asserted here so the
+        // two are not read as one.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
+            Disposition::Lowered(Fidelity::Equivalent)
+        );
+    }
+
+    /// Issue #507, W2, AC33 — the reducer census, taken from the type.
+    ///
+    /// `RangeAggOp`'s variants are emitted by a macro invocation, so the
+    /// match below is exhaustive with no `_` arm: a sixteenth variant is a
+    /// build failure here rather than a silent absence from the census.
+    ///
+    /// Four lower. Ten require `| unwrap`, whose sample is an `f64`, and a
+    /// sum of `f64`s is not associative, so summing the database's
+    /// per-group partials need not reproduce the single accumulator.
+    /// `absent_over_time` is the one permanent refusal: its answer is about
+    /// rows that are absent, and there is no row to compute it from.
+    #[test]
+    fn ac33_reducer_census() {
+        const MIN: i64 = 60_000_000_000;
+        let mut lowered = Vec::new();
+        let mut never = Vec::new();
+        let mut blocked = Vec::new();
+        for op in RangeAggOp::ALL.iter().copied() {
+            let name = match op {
+                RangeAggOp::CountOverTime => "count_over_time",
+                RangeAggOp::BytesOverTime => "bytes_over_time",
+                RangeAggOp::Rate => "rate",
+                RangeAggOp::BytesRate => "bytes_rate",
+                RangeAggOp::AbsentOverTime => "absent_over_time",
+                RangeAggOp::SumOverTime => "sum_over_time",
+                RangeAggOp::AvgOverTime => "avg_over_time",
+                RangeAggOp::MinOverTime => "min_over_time",
+                RangeAggOp::MaxOverTime => "max_over_time",
+                RangeAggOp::StddevOverTime => "stddev_over_time",
+                RangeAggOp::StdvarOverTime => "stdvar_over_time",
+                RangeAggOp::QuantileOverTime => "quantile_over_time",
+                RangeAggOp::FirstOverTime => "first_over_time",
+                RangeAggOp::LastOverTime => "last_over_time",
+                RangeAggOp::RateCounter => "rate_counter",
+            };
+            match agg_how(&[], op, MIN, MIN) {
+                Disposition::Lowered(_) => lowered.push(name),
+                Disposition::Residual(ResidualReason::Never(_)) => never.push(name),
+                Disposition::Residual(ResidualReason::Blocked(_)) => blocked.push(name),
+            }
+        }
+        assert_eq!(
+            RangeAggOp::ALL.len(),
+            15,
+            "the census is over every variant the declaring macro emits"
+        );
+        // Sorted, so the census is about the SET and not about the order
+        // the declaring macro happens to list its variants in.
+        lowered.sort_unstable();
+        assert_eq!(
+            lowered,
+            vec!["bytes_over_time", "bytes_rate", "count_over_time", "rate"]
+        );
+        assert_eq!(never, vec!["absent_over_time"]);
+        assert_eq!(blocked.len(), 10, "{blocked:?}");
+    }
+
+    /// Issue #507, W2 — `rate` is the one lowered reducer that ADMITS
+    /// `| unwrap`, and with one its accumulator is an `f64` sum rather
+    /// than a count.
+    ///
+    /// The exclusion is carried by the pipeline-error state rather than by
+    /// a second test in `RangeAggLower::capability`: `| unwrap` can fail a
+    /// sample conversion, so it makes the state raisable. **This test is
+    /// what reddens if that ever stops being true** — two different reasons
+    /// travelling on one mechanism is exactly the arrangement that breaks
+    /// silently.
+    #[test]
+    fn a_rate_over_an_unwrap_does_not_lower() {
+        const MIN: i64 = 60_000_000_000;
+        assert_eq!(
+            agg_how(&[], RangeAggOp::Rate, MIN, MIN),
+            Disposition::Lowered(Fidelity::Equivalent),
+            "the control: a rate over no unwrap lowers, so the row below is about the unwrap"
+        );
+        assert_eq!(
+            agg_how(&["| unwrap latency"], RangeAggOp::Rate, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
     }
 
     /// Issue #492: `Drop` and `Keep` share the payload type
@@ -1328,7 +2026,7 @@ mod tests {
             "Drop and Keep must not reach the same dispatcher"
         );
 
-        let seed = with_col(base(LqlShape::Lines), "level", Provenance::Stored);
+        let seed = with_col(base(LqlKind::Lines, RAISABLE), "level", Provenance::Stored);
         let expected_drop = without_col(seed.clone(), "level");
         let expected_keep = only_cols(seed.clone(), &["level"]);
 

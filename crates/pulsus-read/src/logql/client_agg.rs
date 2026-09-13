@@ -3251,7 +3251,7 @@ impl<'q> RangeSlideState<'q> {
 /// (`ts := r.current/1e+6 + r.offset/1e+6`, tag `v3.7.4` /
 /// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) — the one place the offset
 /// is added back.
-fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
+pub(in crate::logql) fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
     if offset_ns == 0 {
         return result;
     }

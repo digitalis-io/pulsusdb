@@ -30,6 +30,7 @@
 use super::error::{ReadError, TooBroadReason};
 use pulsus_logql::RangeAggOp;
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use super::agg::{InstantSeries, LabelSet, VectorAccum};
 use super::client_agg::{BucketAcc, MutGroup, WinSample};
@@ -681,6 +682,25 @@ pub(in crate::logql) const SERIES_OUT_SLOT: usize = size_of::<MatrixSeries>();
 /// vocabulary ([`group_entry_bytes`]) — the [`SERIES_OUT_SLOT`] precedent.
 pub(in crate::logql) const PUSHDOWN_INSTANT_SLOT: usize =
     size_of::<(String, InstantSeries)>() + size_of::<InstantSeries>();
+
+/// The SQL-pushdown BUCKETED RANGE path's per-SERIES slot (issue #507,
+/// W2), the [`PUSHDOWN_INSTANT_SLOT`] precedent. Prices both live
+/// containers in one term, because both are live while the re-grouping map
+/// drains into the result vector: the map entry (`(rendered key, LabelSet,
+/// point map)`) AND the [`MatrixSeries`] element the group becomes.
+pub(in crate::logql) const PUSHDOWN_RANGE_SLOT: usize =
+    size_of::<(String, (LabelSet, HashMap<i64, u64>))>() + size_of::<MatrixSeries>();
+
+/// One retained GRID POINT on that path: the point map's `(i64, u64)`
+/// entry and the `(i64, f64)` it becomes in the emitted series. Charged
+/// through [`map_entry_bytes`], the same table-share model the group
+/// charge uses — the point map is a `HashMap` for exactly that reason.
+///
+/// The point COUNT is bounded before any of this runs: every range request
+/// passes `window::ensure_grid_resolution` at the HTTP boundary, so a
+/// served grid holds at most [`MAX_ADMITTED_GRID_POINTS`] points.
+pub(in crate::logql) const PUSHDOWN_RANGE_POINT_SLOT: usize =
+    size_of::<(i64, u64)>() + size_of::<(i64, f64)>();
 
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
@@ -2498,7 +2518,24 @@ mod tests {
             // `MetricAggState` arms and with the variants path — so
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 1),
+            // Issue #507 (W2): `PushdownRangeGroups::charged`, the
+            // SQL-pushdown BUCKETED RANGE path's re-grouping map (x2: the
+            // new-series arm and the new-grid-point arm, which charge the
+            // same counter in the same units). A further XOR arm of the
+            // same cap for the same reason: it runs only when
+            // `client == None` AND `step_ns.is_some()`, which excludes the
+            // instant pushdown arm above it as well as both
+            // `MetricAggState` arms and the variants path. So
+            // `LEAF_COUNTERS.group_bytes` stays 2 and
+            // `MAX_LEAF_RETAINED_BYTES` is unmoved.
+            // Issue #507 (W4): `PushdownUnwrappedGroups::charged`, the
+            // unwrapped bucketed path's re-grouping map (x2, the same two
+            // arms). A further XOR arm of the same cap for the same
+            // reason: it runs only when `client == None` AND the plan's
+            // value is `Unwrapped`, which excludes the counting bucketed
+            // arm beside it as well as the instant one and both
+            // `MetricAggState` arms. `LEAF_COUNTERS.group_bytes` stays 2.
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 5),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.
@@ -2634,8 +2671,9 @@ mod tests {
             (
                 "exec.rs",
                 "group_bytes",
-                1,
-                "PushdownInstantGroups::charged",
+                5,
+                "PushdownInstantGroups::charged | PushdownRangeGroups::charged | \
+                 PushdownUnwrappedGroups::charged",
             ),
             // Issue #249 cost work: 2 -> 3. `fan_out_sample_base`'s HIT
             // path accumulates straight into the cached group and so

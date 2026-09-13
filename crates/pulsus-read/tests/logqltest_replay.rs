@@ -974,7 +974,7 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// rows, so they move this figure and [`PROVENANCE_PERMITS`] together
 /// and leave [`REACHABLE`] alone: the template files carry an absolute
 /// timestamp, which is the largest unreachable bucket.
-const TOTAL_DIRECTIVES: usize = 1_604;
+const TOTAL_DIRECTIVES: usize = 1_605;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -1045,7 +1045,7 @@ const REACHABLE: usize = 247;
 /// `b25_pattern_expr_reject.test` and `b26_json_expr.test` (issue #388)
 /// need no config delta, so their `eval_fail` rows enlarge
 /// `our-error-text` alone and their `eval` rows are permitted.
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=29, \
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=30, \
 not a capture claim (ported)=27, our-error-text (eval_fail)=148, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
