@@ -190,6 +190,8 @@ docs/query-to-sql.md	exec.rs:3421	crates/pulsus-read/src/traces/exec.rs	3421		pr
 docs/query-to-sql.md	filter.rs:76-79	crates/pulsus-read/src/traces/filter.rs	76	79	prose	unsupported field:
 docs/query-to-sql.md	filter.rs:817	crates/pulsus-read/src/traces/filter.rs	817		line	/// fragment. Fallible for the same reason as [`physical_sql`] (issue
 docs/query-to-sql.md	filter.rs:827	crates/pulsus-read/src/traces/filter.rs	827		line	ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
+docs/query-to-sql.md	filter.rs:834	crates/pulsus-read/src/traces/filter.rs	834		prose	ValuePred::KeyExists
+docs/query-to-sql.md	filter.rs:844	crates/pulsus-read/src/traces/filter.rs	844		prose	AttrScope::Unscoped => None
 docs/query-to-sql.md	labels.rs:157-189	crates/pulsus-model/src/labels.rs	157	189	prose	structured_metadata
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted
 docs/query-to-sql.md	logql/charge.rs:1290	crates/pulsus-read/src/logql/charge.rs	1290		line	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -199,14 +201,17 @@ docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	
 docs/query-to-sql.md	logql/pipeline.rs:1168	crates/pulsus-read/src/logql/pipeline.rs	1168		line	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
+docs/query-to-sql.md	metrics_plan.rs:384	crates/pulsus-read/src/traces/metrics_plan.rs	384		line	pub fn plan_trace_metrics(
 docs/query-to-sql.md	metrics_plan.rs:948	crates/pulsus-read/src/traces/metrics_plan.rs	948		line	PipelineStage::MetricSecondStage(second),
 docs/query-to-sql.md	metrics_sql.rs:414	crates/pulsus-read/src/traces/metrics_sql.rs	414		line	// `filter::compile_leaf` (gated, see the doc comment above), so
 docs/query-to-sql.md	metrics_sql.rs:528	crates/pulsus-read/src/traces/metrics_sql.rs	528		line	WHERE {} AND {} AND {predicate})",
-docs/query-to-sql.md	metrics_sql.rs:676	crates/pulsus-read/src/traces/metrics_sql.rs	676		line	AggFn::Min => "min",
 docs/query-to-sql.md	metrics_sql.rs:68	crates/pulsus-read/src/traces/metrics_sql.rs	68		line	/// hundred lines below — changes the row bound too and moves every
-docs/query-to-sql.md	metrics_sql.rs:750	crates/pulsus-read/src/traces/metrics_sql.rs	750		line	filter: &FilterSql,
-docs/query-to-sql.md	metrics_sql.rs:833	crates/pulsus-read/src/traces/metrics_sql.rs	833		line	push_prewhere_where_indented(&mut inner, filter, window);
+docs/query-to-sql.md	metrics_sql.rs:703	crates/pulsus-read/src/traces/metrics_sql.rs	703		line	pub fn metrics_count_range_sql(
+docs/query-to-sql.md	metrics_sql.rs:748	crates/pulsus-read/src/traces/metrics_sql.rs	748		line	pub fn metrics_agg_range_sql(
+docs/query-to-sql.md	metrics_sql.rs:821	crates/pulsus-read/src/traces/metrics_sql.rs	821		line	pub fn metrics_quantile_range_sql(
 docs/query-to-sql.md	metrics_sql.rs:90	crates/pulsus-read/src/traces/metrics_sql.rs	90		line	fn date_clause(w: SnappedWindow) -> String {
+docs/query-to-sql.md	metrics_sql.rs:903	crates/pulsus-read/src/traces/metrics_sql.rs	903		line	pub fn metrics_log2_bucket_range_sql(
+docs/query-to-sql.md	metrics_sql.rs:95	crates/pulsus-read/src/traces/metrics_sql.rs	95		line	fn time_clause(w: SnappedWindow) -> String {
 docs/query-to-sql.md	model.rs:376	crates/pulsus-config/src/model.rs	376		line	pub logql_pipeline_scan_factor: u32,
 docs/query-to-sql.md	model.rs:388	crates/pulsus-config/src/model.rs	388		line	pub traceql_max_candidates: u64,
 docs/query-to-sql.md	model.rs:431	crates/pulsus-config/src/model.rs	431		line	pub logql_read_max_memory_bytes: u64,
@@ -220,12 +225,18 @@ docs/query-to-sql.md	pipeline.rs:5934	crates/pulsus-read/src/logql/pipeline.rs	5
 docs/query-to-sql.md	pipeline.rs:6018-6038	crates/pulsus-read/src/logql/pipeline.rs	6018	6038	line	fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) { if prefix.is_empty() { if part.as_bytes().first().i
 docs/query-to-sql.md	plan.rs:1644	crates/pulsus-read/src/logql/plan.rs	1644		prose	limit
 docs/query-to-sql.md	plan.rs:1682	crates/pulsus-read/src/logql/plan.rs	1682		prose	true
+docs/query-to-sql.md	plan.rs:1706	crates/pulsus-read/src/logql/plan.rs	1706		prose	"json"
 docs/query-to-sql.md	plan.rs:1775	crates/pulsus-read/src/logql/plan.rs	1775		prose	unwrapped_chain
 docs/query-to-sql.md	plan.rs:1936-1941	crates/pulsus-read/src/logql/plan.rs	1936	1941	prose	has_beyond_line_filter
+docs/query-to-sql.md	plan.rs:1941	crates/pulsus-read/src/logql/plan.rs	1941		prose	grouping.is_some()
 docs/query-to-sql.md	plan.rs:2113	crates/pulsus-read/src/logql/plan.rs	2113		prose	bucketed_range
 docs/query-to-sql.md	plan.rs:2168	crates/pulsus-read/src/logql/plan.rs	2168		prose	unwrapped_range
 docs/query-to-sql.md	plan.rs:2232	crates/pulsus-read/src/logql/plan.rs	2232		prose	else
+docs/query-to-sql.md	plan.rs:2243	crates/pulsus-read/src/logql/plan.rs	2243		prose	else if bucketed_range
+docs/query-to-sql.md	plan.rs:2272	crates/pulsus-read/src/logql/plan.rs	2272		prose	RouteChoice::Rollup
+docs/query-to-sql.md	plan.rs:3304	crates/pulsus-read/src/logql/plan.rs	3304		prose	compile_line_filters
 docs/query-to-sql.md	plan.rs:3304-3322	crates/pulsus-read/src/logql/plan.rs	3304	3322	prose	_ => {}
+docs/query-to-sql.md	plan.rs:3338	crates/pulsus-read/src/logql/plan.rs	3338		prose	is_pushable_line_filter
 docs/query-to-sql.md	predicate.rs:1117-1124	crates/pulsus-read/src/logql/predicate.rs	1117	1124	prose	LIKE
 docs/query-to-sql.md	predicate.rs:1123	crates/pulsus-read/src/logql/predicate.rs	1123		prose	'%%'
 docs/query-to-sql.md	predicate.rs:466-482	crates/pulsus-read/src/logql/predicate.rs	466	482	prose	BAD_ARGUMENTS
@@ -242,6 +253,7 @@ docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/quer
 docs/query-to-sql.md	pulsus-server/src/logs_api/mod.rs:55-59	crates/pulsus-server/src/logs_api/mod.rs	55	59	line	fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> { router .route( &format!("{prefix
 docs/query-to-sql.md	query_lowering_doc_gate.rs:340	crates/pulsus-read/tests/query_lowering_doc_gate.rs	340		line	}
 docs/query-to-sql.md	search_eval.rs:2420	crates/pulsus-read/src/traces/search_eval.rs	2420		line	.get(*field_idx)
+docs/query-to-sql.md	search_eval.rs:3108	crates/pulsus-read/src/traces/search_eval.rs	3108		line	SpansetStage::Aggregate(agg) => {
 docs/query-to-sql.md	search_eval.rs:878	crates/pulsus-read/src/traces/search_eval.rs	878		line	/// happens in the compare (keeping it out of the per-span hot loop).
 docs/query-to-sql.md	search_plan.rs:1057-1058	crates/pulsus-read/src/traces/search_plan.rs	1057	1058	line	/// /// Derived from the stored spanset rather than from a second stored
 docs/query-to-sql.md	search_plan.rs:1125-1126	crates/pulsus-read/src/traces/search_plan.rs	1125	1126	line	// Issue #291: through the shared compile budget; the message // prefix is unchanged, and `RegexCompileError::Display` r
@@ -251,34 +263,53 @@ docs/query-to-sql.md	search_plan.rs:1218	crates/pulsus-read/src/traces/search_pl
 docs/query-to-sql.md	search_plan.rs:1277	crates/pulsus-read/src/traces/search_plan.rs	1277		line	items.push(item.clone());
 docs/query-to-sql.md	search_plan.rs:1322-1323	crates/pulsus-read/src/traces/search_plan.rs	1322	1323	line	CompareOperand::Service => PlannedOperand::Service, CompareOperand::Duration => PlannedOperand::Duration,
 docs/query-to-sql.md	search_plan.rs:1435-1436	crates/pulsus-read/src/traces/search_plan.rs	1435	1436	line	/// bound the other way round: that function refuses to push unless the /// exact integer is one this `f64` reproduces e
+docs/query-to-sql.md	search_plan.rs:1843	crates/pulsus-read/src/traces/search_plan.rs	1843		line	post_stages.push(SpansetStage::Aggregate(PlannedAggregate {
 docs/query-to-sql.md	search_plan.rs:1854	crates/pulsus-read/src/traces/search_plan.rs	1854		line	PipelineStage::Metric(stage) => {
 docs/query-to-sql.md	search_plan.rs:1861	crates/pulsus-read/src/traces/search_plan.rs	1861		line	PipelineStage::MetricSecondStage(stage) => {
 docs/query-to-sql.md	search_sql.rs:111-113	crates/pulsus-read/src/traces/search_sql.rs	111	113	line	/// returns, which is what keeps the day-partition prune agreeing with /// the row bound. Changing the constructor here
+docs/query-to-sql.md	search_sql.rs:136	crates/pulsus-read/src/traces/search_sql.rs	136		line	fn time_clause(w: TimeWindow) -> String {
 docs/query-to-sql.md	search_sql.rs:153	crates/pulsus-read/src/traces/search_sql.rs	153		line	for b in id {
-docs/query-to-sql.md	search_sql.rs:182	crates/pulsus-read/src/traces/search_sql.rs	182		line	/// every statement no aggregate compiled into, which is every statement
-docs/query-to-sql.md	search_sql.rs:183	crates/pulsus-read/src/traces/search_sql.rs	183		line	/// the corpus rendered before part 4.
+docs/query-to-sql.md	search_sql.rs:184	crates/pulsus-read/src/traces/search_sql.rs	184		prose	generator_sql
 docs/query-to-sql.md	search_sql.rs:194	crates/pulsus-read/src/traces/search_sql.rs	194		line	GenTable::Spans => {
+docs/query-to-sql.md	search_sql.rs:218	crates/pulsus-read/src/traces/search_sql.rs	218		prose	ORDER BY bound_ts DESC, trace_id ASC
+docs/query-to-sql.md	search_sql.rs:219	crates/pulsus-read/src/traces/search_sql.rs	219		line	gen_cap + 1
 docs/query-to-sql.md	search_sql.rs:222	crates/pulsus-read/src/traces/search_sql.rs	222		line	}
+docs/query-to-sql.md	search_sql.rs:230	crates/pulsus-read/src/traces/search_sql.rs	230		prose	hydration_sql
 docs/query-to-sql.md	search_sql.rs:242	crates/pulsus-read/src/traces/search_sql.rs	242		line	LIMIT {} BY trace_id",
-docs/query-to-sql.md	search_sql.rs:314	crates/pulsus-read/src/traces/search_sql.rs	314		line	/// without `FINAL`.
+docs/query-to-sql.md	search_sql.rs:286	crates/pulsus-read/src/traces/search_sql.rs	286		prose	membership_sql
+docs/query-to-sql.md	search_sql.rs:325	crates/pulsus-read/src/traces/search_sql.rs	325		prose	attr_values_sql
 docs/query-to-sql.md	search_sql.rs:345	crates/pulsus-read/src/traces/search_sql.rs	345		line	None => String::new(),
 docs/query-to-sql.md	search_sql.rs:356-368	crates/pulsus-read/src/traces/search_sql.rs	356	368	line	} /// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span values over /// one batch (issue #351): the values `{ .
-docs/query-to-sql.md	search_sql.rs:385	crates/pulsus-read/src/traces/search_sql.rs	385		line	/// against the retention budget BEFORE retaining it.
+docs/query-to-sql.md	search_sql.rs:397	crates/pulsus-read/src/traces/search_sql.rs	397		prose	event_set_sql
 docs/query-to-sql.md	search_sql.rs:401-408	crates/pulsus-read/src/traces/search_sql.rs	401	408	line	window: TimeWindow, ) -> String { let (value_col, extra) = if set.is_numeric() { ("val_num AS v".to_string(), "\n AND is
-docs/query-to-sql.md	search_sql.rs:409	crates/pulsus-read/src/traces/search_sql.rs	409		line	"SELECT trace_id, span_id, {value_col}\n\
+docs/query-to-sql.md	search_sql.rs:428	crates/pulsus-read/src/traces/search_sql.rs	428		prose	root_sql
+docs/query-to-sql.md	search_sql.rs:468	crates/pulsus-read/src/traces/search_sql.rs	468		prose	trace_ctx_sql
+docs/query-to-sql.md	search_sql.rs:492	crates/pulsus-read/src/traces/search_sql.rs	492		prose	child_count_sql
 docs/query-to-sql.md	sql.rs:1010	crates/pulsus-read/src/logql/sql.rs	1010		prose	fingerprint
 docs/query-to-sql.md	sql.rs:105	crates/pulsus-read/src/logql/sql.rs	105		prose	sum
-docs/query-to-sql.md	sql.rs:1056	crates/pulsus-read/src/logql/sql.rs	1056		prose	log_samples
 docs/query-to-sql.md	sql.rs:107	crates/pulsus-read/src/logql/sql.rs	107		prose	sum(bytes)
+docs/query-to-sql.md	sql.rs:1072	crates/pulsus-read/src/logql/sql.rs	1072		prose	metric_range
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	count()
 docs/query-to-sql.md	sql.rs:111	crates/pulsus-read/src/logql/sql.rs	111		prose	sum(length(body))
-docs/query-to-sql.md	sql.rs:1130-1153	crates/pulsus-read/src/metrics/sql.rs	1130	1153	prose	LIMIT
+docs/query-to-sql.md	sql.rs:1121	crates/pulsus-read/src/logql/sql.rs	1121		prose	metric_instant
 docs/query-to-sql.md	sql.rs:1161-1167	crates/pulsus-read/src/logql/sql.rs	1161	1167	prose	structured_metadata
+docs/query-to-sql.md	sql.rs:1220	crates/pulsus-read/src/logql/sql.rs	1220		prose	metric_raw_samples
+docs/query-to-sql.md	sql.rs:1268	crates/pulsus-read/src/logql/sql.rs	1268		prose	metric_raw_samples_sliding
+docs/query-to-sql.md	sql.rs:1268-1291	crates/pulsus-read/src/logql/sql.rs	1268	1291	prose	metric_raw_samples_sliding
+docs/query-to-sql.md	sql.rs:1283	crates/pulsus-read/src/logql/sql.rs	1283		prose	timestamp_ns
+docs/query-to-sql.md	sql.rs:1289	crates/pulsus-read/src/logql/sql.rs	1289		prose	ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 docs/query-to-sql.md	sql.rs:1341	crates/pulsus-read/src/logql/sql.rs	1341		prose	metric_range_bucketed
 docs/query-to-sql.md	sql.rs:1426	crates/pulsus-read/src/logql/sql.rs	1426		prose	metric_range_unwrapped
 docs/query-to-sql.md	sql.rs:489	crates/pulsus-read/src/metrics/sql.rs	489		prose	SELECT
-docs/query-to-sql.md	sql.rs:779	crates/pulsus-read/src/logql/sql.rs	779		prose	ORDER
+docs/query-to-sql.md	sql.rs:518	crates/pulsus-read/src/logql/sql.rs	518		prose	stage1
+docs/query-to-sql.md	sql.rs:555	crates/pulsus-read/src/logql/sql.rs	555		prose	probe
+docs/query-to-sql.md	sql.rs:761	crates/pulsus-read/src/logql/sql.rs	761		prose	stage2
+docs/query-to-sql.md	sql.rs:779	crates/pulsus-read/src/logql/sql.rs	779		prose	ORDER BY
+docs/query-to-sql.md	sql.rs:810	crates/pulsus-read/src/logql/sql.rs	810		prose	stage3
+docs/query-to-sql.md	sql.rs:835	crates/pulsus-read/src/logql/sql.rs	835		prose	ORDER
+docs/query-to-sql.md	sql.rs:836	crates/pulsus-read/src/logql/sql.rs	836		prose	LIMIT
 docs/query-to-sql.md	sql.rs:841	crates/pulsus-read/src/logql/sql.rs	841		prose	stage3_keyset
+docs/query-to-sql.md	sql.rs:897	crates/pulsus-read/src/logql/sql.rs	897		prose	stage3_keyset
 docs/query-to-sql.md	traces/exec.rs:119	crates/pulsus-read/src/traces/exec.rs	119		line	/// Per-trace hydration span cap; the `+1` probe detects overflow, which
 docs/query-to-sql.md	traces/exec.rs:144	crates/pulsus-read/src/traces/exec.rs	144		line	/// (and merge tuples / root summaries) survive the per-batch charge
 docs/query-to-sql.md	traces/exec.rs:161	crates/pulsus-read/src/traces/exec.rs	161		line	/// server-side before the driver materializes anything; the

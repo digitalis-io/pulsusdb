@@ -122,23 +122,23 @@ and every range metric query read raw lines.
 
 | builder | line | what it reads | when it is used |
 |---|---|---|---|
-| `stage1` | `sql.rs:367` | `log_streams_idx` | every LogQL read. Resolves the selector to fingerprints |
-| `stage2` | `sql.rs:489` | `log_streams` | every LogQL read. Fetches each fingerprint's service and label set |
-| `stage3` | `sql.rs:659` | `log_samples` | a log query whose every stage either compiles to SQL or drops no lines. One statement, with `LIMIT` |
-| `stage3_keyset` | `sql.rs:841` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
-| `metric_instant` | `sql.rs:1056` | `log_samples` | an instant metric query with no stage beyond a line filter |
-| `metric_range` | `sql.rs:921` | `log_metrics_<res>` | **no production caller reaches it** — see the note below |
-| `metric_raw_samples` | `sql.rs:1069` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
-| `metric_raw_samples_sliding` | `sql.rs:1010` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
+| `stage1` | `sql.rs:518` | `log_streams_idx` | every LogQL read. Resolves the selector to fingerprints |
+| `stage2` | `sql.rs:761` | `log_streams` | every LogQL read. Fetches each fingerprint's service and label set |
+| `stage3` | `sql.rs:810` | `log_samples` | a log query whose every stage either compiles to SQL or drops no lines. One statement, with `LIMIT` |
+| `stage3_keyset` | `sql.rs:897` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
+| `metric_instant` | `sql.rs:1121` | `log_samples` | an instant metric query with no stage beyond a line filter |
+| `metric_range` | `sql.rs:1072` | `log_metrics_<res>` | **no production caller reaches it** — see the note below |
+| `metric_raw_samples` | `sql.rs:1220` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
+| `metric_raw_samples_sliding` | `sql.rs:1268` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
 | `metric_range_bucketed` | `sql.rs:1341` | `log_samples` | a range `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose range equals its step, with no stage beyond a line filter (issue #507 W2) |
 | `metric_range_unwrapped` | `sql.rs:1426` | `log_samples` | a range `sum_over_time` or `avg_over_time` over `\| json <n>="<n>" \| unwrap <n>`, whose range equals its step (issue #507 W4) |
-| `probe` | `sql.rs:404` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
+| `probe` | `sql.rs:555` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
-The three statements a plain log query produces, in order. Text from `sql.rs:367`, `:489` and `:538`;
+The three statements a plain log query produces, in order. Text from `sql.rs:518`, `:761` and `:810`;
 the values are those of part 4's corpus.
 
 ```sql
--- emitted today, sql.rs:246 — resolve the selector to fingerprints
+-- emitted today, sql.rs:518 — resolve the selector to fingerprints
 SELECT fingerprint
 FROM log_streams_idx
 WHERE month = '2026-09-01'
@@ -148,12 +148,12 @@ HAVING uniqExact(key, val) = 1
 ```
 
 ```sql
--- emitted today, sql.rs:489 — fetch each fingerprint's service and label set
+-- emitted today, sql.rs:761 — fetch each fingerprint's service and label set
 SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (18374, 99120)
 ```
 
 ```sql
--- emitted today, sql.rs:538 — read the lines. One statement, with the request limit.
+-- emitted today, sql.rs:810 — read the lines. One statement, with the request limit.
 SELECT fingerprint, timestamp_ns, body, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -168,7 +168,7 @@ When any stage drops lines after the read, that third statement is replaced by a
 each round resuming from the previous round's last sort key:
 
 ```sql
--- emitted today, sql.rs:625 — one page. The `LIMIT` is the request limit times
+-- emitted today, sql.rs:897 — one page. The `LIMIT` is the request limit times
 -- `reader.logql_pipeline_scan_factor`, so that after the dropping stage has run
 -- the response can still hold `limit` entries.
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -183,7 +183,7 @@ LIMIT 1000
 An instant metric query with no stage beyond a line filter is aggregated by ClickHouse:
 
 ```sql
--- emitted today, sql.rs:849 — an instant metric query
+-- emitted today, sql.rs:1121 — an instant metric query
 SELECT fingerprint, count() AS n, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -242,7 +242,7 @@ or two, and the answer comes from exactly one of them.
 column and no `LIMIT`, and is aggregated in `pulsus-server`:
 
 ```sql
--- emitted today, sql.rs:1010 — every range metric query neither shape above serves
+-- emitted today, sql.rs:1268 — every range metric query neither shape above serves
 SELECT fingerprint, timestamp_ns, body, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -252,15 +252,15 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 ```
 
 The `ORDER BY` there is the table's own primary key `(service, fingerprint, timestamp_ns)`, so
-ClickHouse streams the rows and sorts nothing (`sql.rs:973-985`).
+ClickHouse streams the rows and sorts nothing (`sql.rs:1245-1250`).
 
 **`metric_range` is unreachable from a request, and issue #507 W2 changed the reason without
 changing the conclusion.** It renders `intDiv(bucket_ns, <step>) * <step> AS step` over a rollup
-table, and reaching it needs `RouteChoice::Rollup` (`plan.rs:2264`). Two separate things now keep
+table, and reaching it needs `RouteChoice::Rollup` (`plan.rs:2272`). Two separate things now keep
 that arm away from it. A range query that is **not** a clean bucketed chain is still put on the
-client-aggregated path by `let client = if … || is_range` (`plan.rs:1941`), unchanged. A range query
+client-aggregated path by `let client = if … || is_range` (`plan.rs:1940`), unchanged. A range query
 that **is** one no longer takes that path in substance — it is served by a lowered statement — but it
-is routed by the `else if bucketed_range` arm (`plan.rs:2235`), which chooses `RouteChoice::Raw`
+is routed by the `else if bucketed_range` arm (`plan.rs:2243`), which chooses `RouteChoice::Raw`
 unconditionally and sits **before** the rollup-eligibility test, and the statement it renders is
 `metric_range_bucketed`, not `metric_range`. The unwrapped shape's arm, `else if let Some(..) = &unwrapped_range` (`plan.rs:2232`), sits
 before it and also chooses `RouteChoice::Raw` unconditionally. The function is kept and tested; no request reaches it.
@@ -272,9 +272,9 @@ The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes
 `Stage` has exactly ten variants (`crates/pulsus-logql/src/ast.rs:133`); `Parser` has four of its
 own (`ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
 
-Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3302`) walks the
+Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3304`) walks the
 stages and collects the ones that become predicates on `body`. `has_unpushed_dropping_stage`
-(`plan.rs:1672`) decides whether the read is one statement or a page loop.
+(`plan.rs:1673`) decides whether the read is one statement or a page loop.
 
 | stage as written | SQL emitted today | marking and source |
 |---|---|---|
@@ -283,19 +283,19 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:950`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
-| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3336`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none, except in the unwrapped shape | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1705`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` whose chain is `\| json <n>="<n>" \| unwrap <n>`, the extraction becomes `trim(BOTH '"' FROM JSONExtractRaw(body, '<n>'))` inside `metric_range_unwrapped` (`sql.rs:1426`); the chain rule is `unwrapped_chain` (`plan.rs:1775`) |
-| `\| logfmt` | none | *evaluated after the read*, `plan.rs:1706` |
-| `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1707` |
-| `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1691` |
-| `\| level="error"` | none | *evaluated after the read*, `plan.rs:1692`. Also makes `has_unpushed_dropping_stage` return `true` (`plan.rs:1682`), which turns the read into a page loop |
-| `\| line_format "…"` | none | *evaluated after the read*, `plan.rs:1693`. **Ends the line-filter walk** (`plan.rs:3067`), so every line filter after it is evaluated after the read too |
-| `\| label_format k="…"` | none | *evaluated after the read*, `plan.rs:1711` |
-| `\| unwrap x` | none, except in the unwrapped shape | *evaluated after the read*, `plan.rs:1695`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in that one chain, it becomes the aggregate's argument `ifNull(toFloat64OrNull(<t>), 0)` under the per-row test `<q>` (`sql.rs:1426`) |
-| `\| unpack` | none | *evaluated after the read*, `plan.rs:1696`. Ends the line-filter walk, `plan.rs:3067` |
-| `\| decolorize` | none | *evaluated after the read*, `plan.rs:1697`. Ends the line-filter walk, `plan.rs:3067` |
-| `\| drop a, b` | none | *evaluated after the read*, `plan.rs:1698` |
-| `\| keep a` | none | *evaluated after the read*, `plan.rs:1699` |
+| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3338`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
+| `\| json` | none, except in the unwrapped shape | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1706`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` whose chain is `\| json <n>="<n>" \| unwrap <n>`, the extraction becomes `trim(BOTH '"' FROM JSONExtractRaw(body, '<n>'))` inside `metric_range_unwrapped` (`sql.rs:1426`); the chain rule is `unwrapped_chain` (`plan.rs:1775`) |
+| `\| logfmt` | none | *evaluated after the read*, `plan.rs:1707` |
+| `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1708` |
+| `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1709` |
+| `\| level="error"` | none | *evaluated after the read*, `plan.rs:1710`. Also makes `has_unpushed_dropping_stage` return `true` (`plan.rs:1682`), which turns the read into a page loop |
+| `\| line_format "…"` | none | *evaluated after the read*, `plan.rs:1711`. **Ends the line-filter walk** (`plan.rs:3319`), so every line filter after it is evaluated after the read too |
+| `\| label_format k="…"` | none | *evaluated after the read*, `plan.rs:1712` |
+| `\| unwrap x` | none, except in the unwrapped shape | *evaluated after the read*, `plan.rs:1713`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in that one chain, it becomes the aggregate's argument `ifNull(toFloat64OrNull(<t>), 0)` under the per-row test `<q>` (`sql.rs:1426`) |
+| `\| unpack` | none | *evaluated after the read*, `plan.rs:1714`. Ends the line-filter walk, `plan.rs:3319` |
+| `\| decolorize` | none | *evaluated after the read*, `plan.rs:1715`. Ends the line-filter walk, `plan.rs:3319` |
+| `\| drop a, b` | none | *evaluated after the read*, `plan.rs:1716` |
+| `\| keep a` | none | *evaluated after the read*, `plan.rs:1717` |
 
 **Line filters compile to SQL on every route; two other stage kinds compile on one.** `\| json` and
 `\| unwrap` compile inside the unwrapped range read and nowhere else, and only in the exact chain §1.1
@@ -309,43 +309,43 @@ come from the request.
 
 | part | SQL emitted today | marking and source |
 |---|---|---|
-| the `[5m]` window | `timestamp_ns > <grid_start - 5m> AND timestamp_ns <= <end>` | *emitted today*, `sql.rs:1131-1132`. The window widens to cover the first grid point. On the raw read there is **no bucket column at all**; on the two lowered reads, where the range equals the step, the same bound carries the bucket column `<lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step>` (§1.1) |
-| `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1056`) |
+| the `[5m]` window | `timestamp_ns > <grid_start - 5m> AND timestamp_ns <= <end>` | *emitted today*, `sql.rs:1283`. The window widens to cover the first grid point. On the raw read there is **no bucket column at all**; on the two lowered reads, where the range equals the step, the same bound carries the bucket column `<lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step>` (§1.1) |
+| `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1121`) |
 | `bytes_over_time`, instant | `sum(length(body))` | *emitted today*, `sql.rs:111` |
-| `count_over_time`, range | `count() AS n`, per grid point | *emitted today* when the range equals the step and no stage goes beyond a line filter — `metric_range_bucketed` (`sql.rs:1341`); `bytes_over_time`, `rate` and `bytes_rate` take the same statement. Otherwise *evaluated after the read* over the raw scan (`plan.rs:1941`) |
-| any `_over_time` with `\| unwrap` | `sumIf`/`avgIf` over the converted value, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the unwrapped shape — `metric_range_unwrapped` (`sql.rs:1426`). Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1695` |
+| `count_over_time`, range | `count() AS n`, per grid point | *emitted today* when the range equals the step and no stage goes beyond a line filter — `metric_range_bucketed` (`sql.rs:1341`); `bytes_over_time`, `rate` and `bytes_rate` take the same statement. Otherwise *evaluated after the read* over the raw scan (`plan.rs:1940`) |
+| any `_over_time` with `\| unwrap` | `sumIf`/`avgIf` over the converted value, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the unwrapped shape — `metric_range_unwrapped` (`sql.rs:1426`). Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1713` |
 | `absent_over_time` | none | *never becomes SQL*. The answer is a statement about rows that are **absent**, so there is no row to compute it from |
-| `sum by (level) (…)` | none | *evaluated after the read*. `grouping.is_some()` forces the client path (`plan.rs:1942`) |
+| `sum by (level) (…)` | none | *evaluated after the read*. `grouping.is_some()` forces the client path (`plan.rs:1941`) |
 | `topk(3, …)` | none | *evaluated after the read* |
 | `label_replace(…)` | none | *evaluated after the read* |
-| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:779`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
-| ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` on the raw read; none on the two lowered reads | *emitted today*, `sql.rs:1138`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing. The lowered reads return groups, which the reader folds without an order |
-| `limit=100`, log query | `LIMIT 100` | *emitted today*, `sql.rs:659`. Present only when no stage drops lines after the read; otherwise the page loop asks for `limit × reader.logql_pipeline_scan_factor` rows a page (`plan.rs:1644`) |
-| limit, metric query | none | *emitted today* — deliberately no `LIMIT`: an aggregation must see every matching line or stop on the byte budget, never silently cut (`metric_raw_samples_sliding`, `sql.rs:1130-1153`, appends none) |
+| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:835`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
+| ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` on the raw read; none on the two lowered reads | *emitted today*, `sql.rs:1289`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing. The lowered reads return groups, which the reader folds without an order |
+| `limit=100`, log query | `LIMIT 100` | *emitted today*, `sql.rs:836`. Present only when no stage drops lines after the read; otherwise the page loop asks for `limit × reader.logql_pipeline_scan_factor` rows a page (`plan.rs:1644`) |
+| limit, metric query | none | *emitted today* — deliberately no `LIMIT`: an aggregation must see every matching line or stop on the byte budget, never silently cut (`metric_raw_samples_sliding`, `sql.rs:1268-1291`, appends none) |
 | the response | none | *evaluated after the read* |
 
 ### 1.4 TraceQL — the statements a search request produces
 
 Eight builder functions, all in `crates/pulsus-read/src/traces/search_sql.rs`. A search issues one
 statement per selector branch, then **two to five statements per batch of 32 candidate traces**
-(`exec.rs:114`), then one final statement.
+(`exec.rs:117`), then one final statement.
 
 | builder | line | what it reads | when it is used |
 |---|---|---|---|
-| `generator_sql` | `search_sql.rs:153` | `trace_attrs_idx` or `trace_spans` | once per selector branch, before any batch |
-| `hydration_sql` | `search_sql.rs:194` | `trace_spans` | once per batch. Reads the spans of the batch's traces |
-| `membership_sql` | `search_sql.rs:222` | `trace_attrs_idx` | once per batch per attribute condition |
-| `attr_values_sql` | `search_sql.rs:242` | `trace_attrs_idx` | once per batch per attribute the query aggregates, groups by or selects |
-| `event_set_sql` | `search_sql.rs:314` | `trace_attrs_idx` | once per batch, for a span-event or span-link intrinsic |
-| `trace_ctx_sql` | `search_sql.rs:385` | `trace_spans` | once per batch, only if the query names `traceDuration`, `rootName` or `rootServiceName`. **No time bound** |
-| `child_count_sql` | `search_sql.rs:409` | `trace_spans` | once per batch, only if the query names `span:childCount`. **No time bound** |
-| `root_sql` | `search_sql.rs:345` | `trace_spans` | once, at the end, over the traces that won. **No time bound** |
+| `generator_sql` | `search_sql.rs:184` | `trace_attrs_idx` or `trace_spans` | once per selector branch, before any batch |
+| `hydration_sql` | `search_sql.rs:230` | `trace_spans` | once per batch. Reads the spans of the batch's traces |
+| `membership_sql` | `search_sql.rs:286` | `trace_attrs_idx` | once per batch per attribute condition |
+| `attr_values_sql` | `search_sql.rs:325` | `trace_attrs_idx` | once per batch per attribute the query aggregates, groups by or selects |
+| `event_set_sql` | `search_sql.rs:397` | `trace_attrs_idx` | once per batch, for a span-event or span-link intrinsic |
+| `trace_ctx_sql` | `search_sql.rs:468` | `trace_spans` | once per batch, only if the query names `traceDuration`, `rootName` or `rootServiceName`. **No time bound** |
+| `child_count_sql` | `search_sql.rs:492` | `trace_spans` | once per batch, only if the query names `span:childCount`. **No time bound** |
+| `root_sql` | `search_sql.rs:428` | `trace_spans` | once, at the end, over the traces that won. **No time bound** |
 
 The first statement of a selector-only search, byte-exact from
 `crates/pulsus-read/tests/golden/traces_search/unscoped_attr.sql`:
 
 ```sql
--- emitted today, search_sql.rs:153; query { .k = "v" }
+-- emitted today, search_sql.rs:184; query { .k = "v" }
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
@@ -367,11 +367,11 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 
 | written as | SQL emitted today | marking and source |
 |---|---|---|
-| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:153`. An unscoped attribute adds **no** `scope` term (`filter.rs:827`, `AttrScope::Unscoped => None`) |
+| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:184`. An unscoped attribute adds **no** `scope` term (`filter.rs:844`, `AttrScope::Unscoped => None`) |
 | `{ resource.service.name = "checkout" }` | `PREWHERE service = 'checkout'` over `trace_spans` | *emitted today*, golden `count_pipeline.sql`. This one attribute is a physical column, so it reads the span table directly |
 | `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, golden `val_num_range.sql`. Skips granules on the `key` prefix only: `val_num` is not part of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:382`) |
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | *emitted today*, golden `service_regex.sql`. Anchored, unlike a LogQL line filter |
-| `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, golden `existence_present.sql`. `ValuePred::KeyExists` renders the constant `1` (`filter.rs:817`), leaving a pure `key` prefix scan |
+| `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, golden `existence_present.sql`. `ValuePred::KeyExists` renders the constant `1` (`filter.rs:834`), leaving a pure `key` prefix scan |
 | `{ .env != "prod" }` | the **positive** form `(key = 'env' AND val = 'prod')` as a membership read; the first statement has no predicate at all | *emitted today*, golden `negated_attr.sql`. The negation is applied after the read, against the set of spans that matched the positive form |
 | `{ a && b }` | one statement for **one** of the two conditions | *emitted today*, golden `nested_boolean.sql`: `{ (.a="1" \|\| .b="2") && (.c="3" \|\| .d="4") }` produces two statements, for `a` and `b` only. `c` and `d` are applied after the read |
 | `{ a \|\| b }` | **two statements**, one per side, merged in `pulsus-server` | *emitted today*, golden `mixed_or.sql`. Not one `OR` predicate |
@@ -380,16 +380,16 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `{ traceDuration > 2s }` | none, plus one extra statement per batch reading each trace's full time span with **no time bound** | *emitted today*, golden `trace_duration.sql` |
 | `{ span:childCount > 2 }` | none, plus one extra statement per batch counting children with **no time bound** | *emitted today*, golden `child_count.sql` |
 | `{ a } > { b }` and every other structural relation | none — one statement per side, both applied after the read | *emitted today*, golden `structural_child.sql` |
-| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:1218` records it; `search_eval.rs:2420` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
+| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:1843` records it; `search_eval.rs:3108` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
 | `\| count() > 2` | none | *evaluated after the read*, golden `count_pipeline.sql` |
 | `\| by(span.foo)` | none — but it adds a per-batch statement reading `foo`'s value for every candidate span | *evaluated after the read*, golden `spanset_by_attr.sql` shows the value read and **no** `GROUP BY` |
 | `\| coalesce()` | none | *evaluated after the read*, golden `spanset_coalesce.sql` is byte-identical to the plain selector case |
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. On the **search** route they are refused with `400` (`search_plan.rs:1854`, `:1861`, `:1867`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:384`. On the **search** route they are refused with `400` (`search_plan.rs:1854`, `:1861`, `:1867`) |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:948` records it as the plan's `reduce` and `exec.rs:3421` applies it to the framed series (called at `:825` for range, `:1510` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:1861`) |
-| ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:182`. The final ordering across statements is done in `pulsus-server` |
-| `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:183`. The request limit is applied after the read |
+| ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:218`. The final ordering across statements is done in `pulsus-server` |
+| `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:219`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
 
 ### 1.6 TraceQL — the metrics routes, which already compile everything
@@ -398,7 +398,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 Byte-exact from `crates/pulsus-read/tests/golden/traces_metrics/`.
 
 ```sql
--- emitted today, metrics_sql.rs:528; query { span.http.status_code >= 500 } | rate()
+-- emitted today, metrics_sql.rs:703; query { span.http.status_code >= 500 } | rate()
 -- golden traces_metrics/attr_semi_join.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
        uniqExact(trace_id, span_id) AS n
@@ -410,7 +410,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:676; query { span.http.status_code >= 500 } | sum_over_time(duration)
+-- emitted today, metrics_sql.rs:748; query { span.http.status_code >= 500 } | sum_over_time(duration)
 -- golden traces_metrics/sum_over_time_duration.sql
 SELECT t, toFloat64(sum(val)) AS v
 FROM (
@@ -426,7 +426,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:528; query { duration > 1s } | rate() by(resource.service.name)
+-- emitted today, metrics_sql.rs:703; query { duration > 1s } | rate() by(resource.service.name)
 -- golden traces_metrics/rate_by_service.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, service AS g0,
        uniqExact(trace_id, span_id) AS n
@@ -438,7 +438,7 @@ ORDER BY t ASC, g0
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:750; query {} | quantile_over_time(duration, 0.5, 0.9, 0.99)
+-- emitted today, metrics_sql.rs:821; query {} | quantile_over_time(duration, 0.5, 0.9, 0.99)
 -- golden traces_metrics/quantile_over_time_multi.sql
 SELECT t, CAST(quantilesTDigest(0.5, 0.9, 0.99)(val) AS Array(Float64)) AS qs
 FROM (
@@ -453,7 +453,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:833; query { span.http.status_code >= 500 } | histogram_over_time(duration)
+-- emitted today, metrics_sql.rs:903; query { span.http.status_code >= 500 } | histogram_over_time(duration)
 -- golden traces_metrics/histogram_over_time_duration.sql
 SELECT t, toUInt64(roundToExp2(val - 1)) * 2 AS bucket, count() AS n
 FROM (
@@ -470,7 +470,7 @@ ORDER BY t ASC, bucket ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:414; query { nestedSetParent < 0 } | rate()
+-- emitted today, metrics_sql.rs:703; query { nestedSetParent < 0 } | rate()
 -- golden traces_metrics/nested_set_root_rate.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
        uniqExact(trace_id, span_id) AS n
@@ -482,8 +482,8 @@ ORDER BY t ASC
 ```
 
 **The two routes bound the window in opposite directions, deliberately.** Search uses
-`timestamp_ns > start AND timestamp_ns <= end` (`search_sql.rs:111-113`); metrics uses
-`timestamp_ns >= start AND timestamp_ns < end` (`metrics_sql.rs:68`). A span whose timestamp equals
+`timestamp_ns > start AND timestamp_ns <= end` (`search_sql.rs:136`); metrics uses
+`timestamp_ns >= start AND timestamp_ns < end` (`metrics_sql.rs:95`). A span whose timestamp equals
 `start` is counted by the metrics route and not by the search route.
 
 ---
