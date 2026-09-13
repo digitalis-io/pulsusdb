@@ -1574,6 +1574,14 @@ enum ReviewedVerdict {
 // remain at occurrences 0 and 1 both say "the second statement, which has
 // already read every selected stream's label set (`sql.rs:489`)", which is
 // `stage2`, so the note below reads the same against either.
+//
+// Review round 7: every citation in both design documents that this pull
+// request's code moves had broken was recomputed. Two consequences here. The
+// `sql.rs:489` case left the table: no occurrence of that token remains, each
+// now reads `sql.rs:761`, `stage2`'s own line, where the two rules agree. And
+// ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
+// candidate files and recorded with its reasoning below; the count of cases
+// is unchanged at eight and so are the counted verdicts.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 8] = [
     (
         "docs/query-lowering.md",
@@ -1626,10 +1634,10 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "sql.rs:489",
-        1,
+        "plan.rs:3319",
+        3,
         ReviewedVerdict::FallbackRight,
-        "the citing prose describes stage2, in crates/pulsus-read/src/logql/sql.rs — the          fallback's answer; metrics/sql.rs:489 is a test literal",
+        "the citing prose says compile_line_filters ends its walk at line_format, which is          the break arm at crates/pulsus-read/src/logql/plan.rs:3319 — the fallback's answer.          The anchor rule picks crates/pulsus-promql/src/plan.rs:3319,          `experimental_functions: true,`, because the same sentence prints `true` for          has_unpushed_dropping_stage's return value",
     ),
 ];
 
