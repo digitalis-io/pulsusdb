@@ -831,7 +831,7 @@ measurement.
 **Two shipped instances, and they are the whole of today's multi-statement structure.**
 
 - LogQL resolves the selector to fingerprints over `log_streams_idx`
-  (`crates/pulsus-read/src/logql/sql.rs:491`), then reads `log_streams` and `log_samples` filtered
+  (`crates/pulsus-read/src/logql/sql.rs:505`), then reads `log_streams` and `log_samples` filtered
   on `fingerprint IN (…)` (`sql.rs:489`, `sql.rs:538`). Three statements, two cuts. The seed is the
   fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -954,7 +954,7 @@ instance below is LogQL's, and it is the only one.
 
 **Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
 set at `:1625` from `has_unpushed_dropping_stage`, `:1655`), and when it is set the read is one
-statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:870`) with
+statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:884`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. §2.7.7 is what can turn this cut
 off.
 
@@ -1128,7 +1128,7 @@ on every run.
 | the request's limit, window and step | **yes** |
 | a seed's plan-time upper bound | **yes** — every one is a request parameter, a config field or a named constant |
 | a seed's rendered size against the two ceilings | **yes**, O(1), no round trip |
-| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:528`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
+| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:542`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
 | the per-row cost of a database-side expression against the cost of transporting the row | **no.** Nothing measures it. Under the cost model of §9.1 it does not matter; if that model is ever revised this is the first number needed |
 | behaviour across shards | **out of scope** by owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) |
 | behaviour at 1 TB | **no** — [#25](https://github.com/digitalis-io/pulsusdb/issues/25) |
@@ -5435,13 +5435,13 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 608 |
-| of those, citing a bare basename | 477 |
-| `(document, token)` pairs the rule resolves | 285 |
-| occurrences those resolved pairs cover | 403 |
+| citation occurrences in the five artefacts | 621 |
+| of those, citing a bare basename | 490 |
+| `(document, token)` pairs the rule resolves | 291 |
+| occurrences those resolved pairs cover | 416 |
 | `(document, token)` pairs it cannot resolve | 120 |
 | occurrences those frozen pairs cover | 205 |
-| resolved rows anchored on a token the citing prose prints | 119 |
+| resolved rows anchored on a token the citing prose prints | 125 |
 | resolved rows anchored on a snapshot of the cited line | 166 |
 
 | reason it cannot be resolved | pairs | what it means |
@@ -5462,7 +5462,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 285 `(document, token)` pairs covering 403 occurrences, and cannot resolve 120 covering 205. Of the resolved rows, 119 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
+Of the 621 citation occurrences the five artefacts make, 490 name a bare basename. The rule resolves 291 `(document, token)` pairs covering 416 occurrences, and cannot resolve 120 covering 205. Of the resolved rows, 125 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

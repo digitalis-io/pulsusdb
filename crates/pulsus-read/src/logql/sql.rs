@@ -326,6 +326,20 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
 /// [`UNWRAP_TEXT_DENOTES_NON_ZERO`] for what each still refuses.
 /// **Widening the lowered set by dropping them is a change to make on its
 /// own evidence, not at the end of a wave.**
+///
+/// **The setting belongs to this one statement, and nothing carries it to
+/// the next.** Review round 5 enumerated every LogQL statement builder in
+/// this module and found that [`metric_range_unwrapped`] is the only one
+/// that converts text to a float in SQL: the raw scans send text for our
+/// own parser, and the rest read labels, counts or byte lengths. **A
+/// future builder that converts text to a float does not get this setting
+/// by being written here.** It has to append it itself, and it needs its
+/// own one-row test of the shape of `query_log_gates.rs`'s `one_ulp` case,
+/// because the byte-exact test that checks the suffix checks only this
+/// builder. Nothing in the type system enforces either half. The setting
+/// was measured on `toFloat64OrNull` only; whether it governs another
+/// conversion function (`JSONExtractFloat`, say) is not measured, so such a
+/// builder starts from its own measurement rather than from this one.
 const UNWRAP_PARSER_SETTING: &str = "precise_float_parsing = 1";
 
 /// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).

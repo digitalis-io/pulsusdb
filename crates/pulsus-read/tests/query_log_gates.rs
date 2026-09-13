@@ -882,6 +882,17 @@ async fn fetch_until_limit_pages_issue_strictly_decrementing_positive_scan_caps(
         );
         running += p.read;
     }
+
+    // Review round 5: this test returned without dropping its run
+    // database, so a PASSING run left one behind.
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }
 
 #[tokio::test]
@@ -919,6 +930,17 @@ async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page
         "the zero-budget guard must return before issuing any keyset page (got {} page(s))",
         pages.len()
     );
+
+    // Review round 5: this test returned without dropping its run
+    // database, so a PASSING run left one behind.
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }
 
 // ---------------------------------------------------------------------
@@ -2966,14 +2988,11 @@ struct SumRow {
 async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound() {
     skip_unless_live!();
     let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let swept = drop_leftovers_of(
+    sweep_leftovers(
         &admin,
         &pulsus_testkit::test_db("pulsus_read_it_qlg_w4sum_"),
     )
     .await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4sum_{}",
         uuid::Uuid::new_v4().simple()
@@ -3128,27 +3147,67 @@ struct PartCountRow {
     n: u64,
 }
 
-/// One database name, for [`drop_leftovers_of`].
+/// One database name, for [`sweep_leftovers`].
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct DbNameRow {
     name: String,
 }
 
-/// Drops every database whose name starts with `stem`, then returns how
-/// many it dropped.
+/// The name prefix a leftover sweep may match, or `None` when the sweep
+/// must not run.
 ///
-/// **Why a suite needs this at all.** A test that names its database with
-/// a UUID and drops it on the last line leaves that database behind
-/// whenever it fails — and a break test, which is how this suite's
-/// assertions are shown to work, fails on purpose. Each such run would
-/// leak one database for good.
+/// **Why a suite sweeps at all.** A test that names its database with a
+/// UUID and drops it on the last line leaves that database behind whenever
+/// it fails — and a break test, which is how this suite's assertions are
+/// shown to work, fails on purpose. Each such run would leak one database
+/// for good.
 ///
-/// **What it can reach.** `stem` is composed through
-/// `pulsus_testkit::test_db`, so it begins with this checkout's
-/// `PULSUS_TEST_CH_DATABASE_PREFIX` and the sweep cannot see another
-/// agent's databases — whose live run is indistinguishable from their
-/// leftovers.
-async fn drop_leftovers_of(admin: &ChClient, stem: &str) -> usize {
+/// **Why it refuses without a prefix** (issue #507 W4, review round 5).
+/// The sweep matches every database whose name starts with `stem`. With
+/// `PULSUS_TEST_CH_DATABASE_PREFIX` unset, `pulsus_testkit::test_db` leaves
+/// the name as written, so the stem is the same in every checkout, and one
+/// checkout's sweep would drop the database another checkout's run of the
+/// same test is using at that moment — a live run and a leftover look
+/// identical from the server. The prefix is the one thing that makes the
+/// stem this checkout's own, so without it nothing is known to be ours,
+/// and the leftovers are the lesser harm.
+///
+/// Blank is read as unset and surrounding whitespace is trimmed, exactly as
+/// `test_db` reads the same variable. With a prefix set, `stem` must begin
+/// with it — a stem that does not was not composed by `test_db` under this
+/// prefix, and sweeping it would reach names this checkout does not own.
+///
+/// `stem` must end in `_`, so that one test's stem cannot be a prefix of a
+/// sibling's (`…_w4spread_` against `…_w4spread2_`).
+fn leftover_stem<'a>(prefix: Option<&str>, stem: &'a str) -> Option<&'a str> {
+    assert!(
+        stem.ends_with('_'),
+        "a sweep stem must end in `_`, or it matches a sibling test's names: {stem:?}"
+    );
+    let prefix = prefix.map(str::trim).filter(|p| !p.is_empty())?;
+    assert!(
+        stem.starts_with(&format!("{prefix}_")),
+        "a sweep stem must be composed by test_db under the prefix {prefix:?}: {stem:?}"
+    );
+    Some(stem)
+}
+
+/// Drops the databases earlier runs of ONE test left behind, and only when
+/// this checkout has a database-name prefix — see [`leftover_stem`] for why
+/// both halves of that sentence are load-bearing.
+///
+/// `stem` is `pulsus_testkit::test_db(<the test's name stem>)`, the string
+/// its database name is composed from before the UUID.
+async fn sweep_leftovers(admin: &ChClient, stem: &str) {
+    let prefix = std::env::var(pulsus_testkit::DATABASE_PREFIX_VAR).ok();
+    let Some(stem) = leftover_stem(prefix.as_deref(), stem) else {
+        eprintln!(
+            "not sweeping leftovers of {stem}: {} is unset, so the stem is shared with every \
+             other checkout and a sweep could drop a database another run is using",
+            pulsus_testkit::DATABASE_PREFIX_VAR
+        );
+        return;
+    };
     let mut names = admin
         .query_stream::<DbNameRow>(
             &format!("SELECT name FROM system.databases WHERE startsWith(name, '{stem}')"),
@@ -3171,7 +3230,50 @@ async fn drop_leftovers_of(admin: &ChClient, stem: &str) -> usize {
             .await
             .expect("drop a leftover database");
     }
-    found.len()
+    if !found.is_empty() {
+        eprintln!(
+            "dropped {} database(s) an earlier run of this test left behind",
+            found.len()
+        );
+    }
+}
+
+/// [`leftover_stem`]'s refusal, hermetically: every reading of the prefix
+/// that `test_db` treats as unset refuses the sweep, and a set prefix
+/// admits a stem composed under it.
+#[test]
+fn the_leftover_sweep_refuses_without_a_prefix() {
+    let bare = "sweep_fixture_stem_";
+    for unset in [None, Some(""), Some("   "), Some("\t")] {
+        assert_eq!(
+            leftover_stem(unset, bare),
+            None,
+            "prefix {unset:?}: the stem would be shared with every checkout"
+        );
+    }
+    let composed = "wt3_sweep_fixture_stem_";
+    assert_eq!(leftover_stem(Some("wt3"), composed), Some(composed));
+    assert_eq!(
+        leftover_stem(Some(" wt3 "), composed),
+        Some(composed),
+        "trimmed, as test_db trims"
+    );
+}
+
+/// A stem without its trailing `_` would let `…_w4spread` sweep
+/// `…_w4spread2_…`, a different test's databases.
+#[test]
+#[should_panic(expected = "must end in `_`")]
+fn a_sweep_stem_without_its_trailing_underscore_is_refused() {
+    let _ = leftover_stem(Some("wt3"), "wt3_sweep_fixture_stem");
+}
+
+/// A set prefix and a stem that does not carry it: the stem was not
+/// composed under this prefix, so it may name another checkout's databases.
+#[test]
+#[should_panic(expected = "must be composed by test_db under the prefix")]
+fn a_sweep_stem_the_prefix_did_not_compose_is_refused() {
+    let _ = leftover_stem(Some("wt3"), "sweep_fixture_stem_");
 }
 
 /// The unwrapped-value corpus both W4 gates read: `n` deterministic values
@@ -3232,14 +3334,11 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
     skip_unless_live!();
     const N: u64 = 1_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let swept = drop_leftovers_of(
+    sweep_leftovers(
         &admin,
         &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread_"),
     )
     .await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4spread_{}",
         uuid::Uuid::new_v4().simple()
@@ -3385,14 +3484,11 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
     const N: u64 = 1_000_000;
     const THREADS: u64 = 1;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let swept = drop_leftovers_of(
+    sweep_leftovers(
         &admin,
         &pulsus_testkit::test_db("pulsus_read_it_qlg_w4parts_"),
     )
     .await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4parts_{}",
         uuid::Uuid::new_v4().simple()
@@ -3562,14 +3658,11 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let swept = drop_leftovers_of(
+    sweep_leftovers(
         &admin,
         &pulsus_testkit::test_db("pulsus_read_it_qlg_w4unwrap_"),
     )
     .await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4unwrap_{}",
         uuid::Uuid::new_v4().simple()
@@ -3910,14 +4003,11 @@ async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let swept = drop_leftovers_of(
+    sweep_leftovers(
         &admin,
         &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread2_"),
     )
     .await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4spread2_{}",
         uuid::Uuid::new_v4().simple()
@@ -4079,11 +4169,11 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
     // its database behind. The end of the test drops it; this sweeps what
     // earlier runs left, including the deliberate failures a break test
     // produces, which never reach the end.
-    let stem = pulsus_testkit::test_db("pulsus_read_it_qlg_w4kappa_");
-    let swept = drop_leftovers_of(&admin, &stem).await;
-    if swept > 0 {
-        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
-    }
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4kappa_"),
+    )
+    .await;
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4kappa_{}",
         uuid::Uuid::new_v4().simple()

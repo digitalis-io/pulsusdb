@@ -233,11 +233,11 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:94	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-	arr["0"]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b3_metric_range.test:211	-	-	v	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest_corpus.rs:876	-	-	c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3780	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3783	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3998	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4200	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4204	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3873	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:3876	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4088	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4290	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:4294	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	lvl	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	tid	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2672	-	-	a	accept	accept	-	-	
@@ -254,4 +254,5 @@ Site	Literal	docs/benchmarks/logs-differential-ledger.md:6368	-	-	b]	accept	reje
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6368	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	["b]"]	reject	reject	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/query-to-sql.md:223	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/reference-defects-we-do-not-copy.md:667	-	-	o	accept	accept	-	-	

@@ -115,19 +115,23 @@ are the request window bounds in nanoseconds, `<step>` is the request step in na
 
 ### 1.1 The statements a LogQL request produces
 
-Nine builder functions produce every LogQL statement. All are in
-`crates/pulsus-read/src/logql/sql.rs`.
+Eleven builder functions produce every LogQL statement. All are in
+`crates/pulsus-read/src/logql/sql.rs`. Two of them, `metric_range_bucketed` and
+`metric_range_unwrapped`, are the range metric reads issue #507 lowered; until then this list was nine
+and every range metric query read raw lines.
 
 | builder | line | what it reads | when it is used |
 |---|---|---|---|
 | `stage1` | `sql.rs:367` | `log_streams_idx` | every LogQL read. Resolves the selector to fingerprints |
 | `stage2` | `sql.rs:489` | `log_streams` | every LogQL read. Fetches each fingerprint's service and label set |
 | `stage3` | `sql.rs:659` | `log_samples` | a log query whose every stage either compiles to SQL or drops no lines. One statement, with `LIMIT` |
-| `stage3_keyset` | `sql.rs:827` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
-| `metric_instant` | `sql.rs:1042` | `log_samples` | an instant metric query with no stage beyond a line filter |
+| `stage3_keyset` | `sql.rs:841` | `log_samples` | a log query with a stage that drops lines after the read. One statement **per page**, each resuming from the previous page's last sort key |
+| `metric_instant` | `sql.rs:1056` | `log_samples` | an instant metric query with no stage beyond a line filter |
 | `metric_range` | `sql.rs:921` | `log_metrics_<res>` | **no production caller reaches it** — see the note below |
 | `metric_raw_samples` | `sql.rs:1069` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
-| `metric_raw_samples_sliding` | `sql.rs:996` | `log_samples` | **every** range metric query |
+| `metric_raw_samples_sliding` | `sql.rs:1010` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
+| `metric_range_bucketed` | `sql.rs:1341` | `log_samples` | a range `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose range equals its step, with no stage beyond a line filter (issue #507 W2) |
+| `metric_range_unwrapped` | `sql.rs:1426` | `log_samples` | a range `sum_over_time` or `avg_over_time` over `\| json <n>="<n>" \| unwrap <n>`, whose range equals its step (issue #507 W4) |
 | `probe` | `sql.rs:404` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
 The three statements a plain log query produces, in order. Text from `sql.rs:367`, `:489` and `:538`;
@@ -176,10 +180,10 @@ ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC
 LIMIT 1000
 ```
 
-A metric query produces one of two statements. An instant query is aggregated by ClickHouse:
+An instant metric query with no stage beyond a line filter is aggregated by ClickHouse:
 
 ```sql
--- emitted today, sql.rs:849 — the only LogQL metric form that aggregates in ClickHouse
+-- emitted today, sql.rs:849 — an instant metric query
 SELECT fingerprint, count() AS n, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -187,12 +191,58 @@ WHERE fingerprint IN (18374, 99120) AND timestamp_ns > <start> AND timestamp_ns 
 GROUP BY fingerprint, structured_metadata
 ```
 
-A **range** query is not. Every one reads raw lines over the whole window, with no aggregation, no
-bucket column and no `LIMIT`, and is aggregated in `pulsus-server`:
+A **range** query is aggregated by ClickHouse in two shapes, and read raw in every other case.
+
+**The counting shape** (`metric_range_bucketed`, routed by `bucketed_range`, `plan.rs:2113`). A range
+`count_over_time`, `bytes_over_time`, `rate` or `bytes_rate`, with no stage beyond a line filter, no
+`by`/`without` on the range aggregation, and a range equal to the step. One row per fingerprint, grid
+point and structured-metadata value; `bytes_*` aggregates `sum(length(body))` in place of `count()`,
+and `rate`/`bytes_rate` divide by the range in `pulsus-server`:
 
 ```sql
--- emitted today, sql.rs:996 — every range metric query EXCEPT a clean
--- bucketed chain, which metric_range_bucketed serves (issue #507 W2)
+-- emitted today, sql.rs:1341 — count_over_time({service_name="checkout"} |= "x" [1m]), step 1m.
+-- <lo> is the first grid point minus one step. The bucket is a ceiling onto the query's own grid,
+-- so a row at <lo> + 30s belongs to the window (<lo>, <lo> + 1m].
+SELECT fingerprint, <lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step> AS bucket_ns,
+       count() AS n, structured_metadata
+FROM log_samples
+PREWHERE service = 'checkout'
+WHERE fingerprint IN (18374, 99120)
+  AND timestamp_ns > <lo> AND timestamp_ns <= <end>
+  AND body LIKE '%x%'
+GROUP BY fingerprint, bucket_ns, structured_metadata
+```
+
+**The unwrapped shape** (`metric_range_unwrapped`, routed by `unwrapped_range`, `plan.rs:2168`). A
+range `sum_over_time` or `avg_over_time` whose chain is exactly: line filters, then `| json <n>="<n>"`
+extracting one underscore-free name, then `| unwrap <n>` with no conversion and nothing after it, with
+a range equal to the step. `<q>` is the per-row test that the value converts the way our own parser
+converts it (`sql.rs:1426`'s doc gives each conjunct); the trailing `SETTINGS` is part of that test:
+
+```sql
+-- emitted today, sql.rs:1426 — sum_over_time({service_name="checkout"} | json latency="latency"
+-- | unwrap latency [1m]), step 1m. <t> is trim(BOTH '"' FROM JSONExtractRaw(body, 'latency')).
+SELECT fingerprint, <lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step> AS bucket_ns,
+       sumIf(ifNull(toFloat64OrNull(<t>), 0), <q>) AS v, count() AS n,
+       countIf(NOT <q>) = 0 AS all_numeric, structured_metadata
+FROM log_samples
+PREWHERE service = 'checkout'
+WHERE fingerprint IN (18374, 99120)
+  AND timestamp_ns > <lo> AND timestamp_ns <= <end>
+GROUP BY fingerprint, bucket_ns, structured_metadata
+SETTINGS precise_float_parsing = 1
+```
+
+Its result is discarded, and the query re-run as the raw read below, when any group has
+`all_numeric = 0`, any aggregate is not finite, two groups fold into one series at one grid point, or
+a row's structured metadata carries the unwrapped name. So a query of this shape issues one statement
+or two, and the answer comes from exactly one of them.
+
+**Every other range query** reads raw lines over the whole window, with no aggregation, no bucket
+column and no `LIMIT`, and is aggregated in `pulsus-server`:
+
+```sql
+-- emitted today, sql.rs:1010 — every range metric query neither shape above serves
 SELECT fingerprint, timestamp_ns, body, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -212,7 +262,8 @@ client-aggregated path by `let client = if … || is_range` (`plan.rs:1941`), un
 that **is** one no longer takes that path in substance — it is served by a lowered statement — but it
 is routed by the `else if bucketed_range` arm (`plan.rs:2235`), which chooses `RouteChoice::Raw`
 unconditionally and sits **before** the rollup-eligibility test, and the statement it renders is
-`metric_range_bucketed`, not `metric_range`. The function is kept and tested; no request reaches it.
+`metric_range_bucketed`, not `metric_range`. The unwrapped shape's arm, `else if let Some(..) = &unwrapped_range` (`plan.rs:2232`), sits
+before it and also chooses `RouteChoice::Raw` unconditionally. The function is kept and tested; no request reaches it.
 The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes` — `sum(count)` and
 `sum(bytes)`, `sql.rs:105`, `sql.rs:107` — unreachable text.
 
@@ -233,21 +284,22 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3336`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1705`) |
+| `\| json` | none, except in the unwrapped shape | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1705`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` whose chain is `\| json <n>="<n>" \| unwrap <n>`, the extraction becomes `trim(BOTH '"' FROM JSONExtractRaw(body, '<n>'))` inside `metric_range_unwrapped` (`sql.rs:1426`); the chain rule is `unwrapped_chain` (`plan.rs:1775`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1706` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1707` |
 | `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1691` |
 | `\| level="error"` | none | *evaluated after the read*, `plan.rs:1692`. Also makes `has_unpushed_dropping_stage` return `true` (`plan.rs:1682`), which turns the read into a page loop |
 | `\| line_format "…"` | none | *evaluated after the read*, `plan.rs:1693`. **Ends the line-filter walk** (`plan.rs:3067`), so every line filter after it is evaluated after the read too |
 | `\| label_format k="…"` | none | *evaluated after the read*, `plan.rs:1711` |
-| `\| unwrap x` | none | *evaluated after the read*, `plan.rs:1695`. In a bare log query it is a `400` — see part 6 |
+| `\| unwrap x` | none, except in the unwrapped shape | *evaluated after the read*, `plan.rs:1695`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in that one chain, it becomes the aggregate's argument `ifNull(toFloat64OrNull(<t>), 0)` under the per-row test `<q>` (`sql.rs:1426`) |
 | `\| unpack` | none | *evaluated after the read*, `plan.rs:1696`. Ends the line-filter walk, `plan.rs:3067` |
 | `\| decolorize` | none | *evaluated after the read*, `plan.rs:1697`. Ends the line-filter walk, `plan.rs:3067` |
 | `\| drop a, b` | none | *evaluated after the read*, `plan.rs:1698` |
 | `\| keep a` | none | *evaluated after the read*, `plan.rs:1699` |
 
-**Only line filters compile to SQL today.** Every one of the other nine stage kinds is evaluated
-after the read, without exception, on every LogQL route.
+**Line filters compile to SQL on every route; two other stage kinds compile on one.** `\| json` and
+`\| unwrap` compile inside the unwrapped range read and nowhere else, and only in the exact chain §1.1
+gives. The other seven stage kinds are evaluated after the read on every LogQL route.
 
 ### 1.3 LogQL — the parts that are not stages
 
@@ -257,17 +309,17 @@ come from the request.
 
 | part | SQL emitted today | marking and source |
 |---|---|---|
-| the `[5m]` window | `timestamp_ns > <grid_start - 5m> AND timestamp_ns <= <end>` | *emitted today*, `sql.rs:1131-1132`. The window widens to cover the first grid point; there is **no bucket column at all** |
-| `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1042`) |
+| the `[5m]` window | `timestamp_ns > <grid_start - 5m> AND timestamp_ns <= <end>` | *emitted today*, `sql.rs:1131-1132`. The window widens to cover the first grid point. On the raw read there is **no bucket column at all**; on the two lowered reads, where the range equals the step, the same bound carries the bucket column `<lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step>` (§1.1) |
+| `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1056`) |
 | `bytes_over_time`, instant | `sum(length(body))` | *emitted today*, `sql.rs:111` |
-| `count_over_time`, range | none | *evaluated after the read*. Every range metric query reads raw lines and is aggregated in `pulsus-server` (`plan.rs:1941`) |
-| any `_over_time` with `\| unwrap` | none | *evaluated after the read*, `plan.rs:1695` |
+| `count_over_time`, range | `count() AS n`, per grid point | *emitted today* when the range equals the step and no stage goes beyond a line filter — `metric_range_bucketed` (`sql.rs:1341`); `bytes_over_time`, `rate` and `bytes_rate` take the same statement. Otherwise *evaluated after the read* over the raw scan (`plan.rs:1941`) |
+| any `_over_time` with `\| unwrap` | `sumIf`/`avgIf` over the converted value, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the unwrapped shape — `metric_range_unwrapped` (`sql.rs:1426`). Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1695` |
 | `absent_over_time` | none | *never becomes SQL*. The answer is a statement about rows that are **absent**, so there is no row to compute it from |
 | `sum by (level) (…)` | none | *evaluated after the read*. `grouping.is_some()` forces the client path (`plan.rs:1942`) |
 | `topk(3, …)` | none | *evaluated after the read* |
 | `label_replace(…)` | none | *evaluated after the read* |
-| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:765`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
-| ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` | *emitted today*, `sql.rs:1138`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing |
+| ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:779`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
+| ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` on the raw read; none on the two lowered reads | *emitted today*, `sql.rs:1138`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing. The lowered reads return groups, which the reader folds without an order |
 | `limit=100`, log query | `LIMIT 100` | *emitted today*, `sql.rs:659`. Present only when no stage drops lines after the read; otherwise the page loop asks for `limit × reader.logql_pipeline_scan_factor` rows a page (`plan.rs:1644`) |
 | limit, metric query | none | *emitted today* — deliberately no `LIMIT`: an aggregation must see every matching line or stop on the byte budget, never silently cut (`metric_raw_samples_sliding`, `sql.rs:1130-1153`, appends none) |
 | the response | none | *evaluated after the read* |
@@ -743,7 +795,7 @@ only ever **adds** lines.
 label of that name**. If one does, the stream's own label wins and the parsed value is renamed
 (`labels.rs:363`), so a predicate over the line would drop lines the answer keeps. The label sets of
 every selected stream are already in hand when the third statement is built — the second statement
-fetched them (`crates/pulsus-read/src/logql/sql.rs:734`) — so this costs no extra read.
+fetched them (`crates/pulsus-read/src/logql/sql.rs:748`) — so this costs no extra read.
 
 **What none of this buys.** No skip index prunes a predicate over a parsed field. Measured with
 `EXPLAIN indexes=1` over 3,000,000 rows on the container: for
@@ -756,7 +808,7 @@ measured in §2.8: the page loop shrinks.
 
 `<start>`, `<end>` are the window bounds in nanoseconds; `<fps>` the resolved fingerprint list.
 "third statement" means the read of `log_samples` — `stage3` (`sql.rs:659`) when nothing drops lines
-after the read, `stage3_keyset` (`sql.rs:827`) when something does.
+after the read, `stage3_keyset` (`sql.rs:841`) when something does.
 
 | stage as written | the fragment it contributes | where it lands | what the database does less of |
 |---|---|---|---|
@@ -793,7 +845,7 @@ after the read, `stage3_keyset` (`sql.rs:827`) when something does.
 | part | the fragment it contributes | where it lands | what the database does less of |
 |---|---|---|---|
 | the `[5m]` window, as a bucket | `<lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step> AS bucket_ns` | the `SELECT` list and the `GROUP BY` | **decided here.** It rounds a timestamp **up** to the next grid point, which is what the reference's half-open interval `(g - range, g]` requires; a rounding-down expression puts an entry at `g + 30s` in bucket `g` and is wrong, which is why part 4's LogQL33 states the rule as four input/output pairs. The numerator is positive on every row the statement can read, because the statement's own lower bound is `timestamp_ns > <lo>`, so the integer division needs no sign handling. Executed: the four pairs come out `G`, `G`, `G+60s`, `G+60s` as required. **Compiles only when the range is at most the step.** With a range under the step the statement also carries `AND timestamp_ns > bucket_ns - <range>` to drop the gaps between windows; with a range over the step one entry belongs to several buckets and no single column can say which |
-| `count_over_time`, range | `count() AS n`, with `bucket_ns`, `fingerprint` and `structured_metadata` in the `GROUP BY` | `SELECT` and `GROUP BY` | *from the design*, `docs/query-lowering.md:1062`. `fingerprint` and `structured_metadata` are in the grouping because they are what a series is identified by — the same pair the shipped instant-query builder groups on (`sql.rs:1042`). This is the change that stops every range metric query shipping raw lines: today one statement returns every matching line with no aggregation and no `LIMIT` (`sql.rs:996`) |
+| `count_over_time`, range | `count() AS n`, with `bucket_ns`, `fingerprint` and `structured_metadata` in the `GROUP BY` | `SELECT` and `GROUP BY` | *from the design*, `docs/query-lowering.md:1062`. `fingerprint` and `structured_metadata` are in the grouping because they are what a series is identified by — the same pair the shipped instant-query builder groups on (`sql.rs:1056`). This is the change that stops every range metric query shipping raw lines: today one statement returns every matching line with no aggregation and no `LIMIT` (`sql.rs:1010`) |
 | `bytes_over_time`, range | `sum(length(body)) AS n` | as above | *from the design*. `length` counts bytes, which part 4's LogQL36 pins with a two-byte `é` |
 | `sum_over_time(… \| unwrap x …)` | `sum(<x's expression>) AS n` | as above | *from the design*, `docs/query-lowering.md:1051`. `\| unwrap x` now has an expression, and the conditions an aggregate over it must meet are in that row of §2.7.1 — they are not weakened here |
 | `absent_over_time` | | — | **cannot become SQL.** The answer is about lines that are **absent**; there is no row to compute it from |
@@ -802,7 +854,7 @@ after the read, `stage3_keyset` (`sql.rs:827`) when something does.
 | `sum by (k) (…)`, `k` a parsed label | | — | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The reason this cell used to give is false.** `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, but `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0` — the reference's own bytes (measured, 26.3.29.7). The claim was about all ClickHouse expressions and was checked against two. What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
 | `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
-| ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:765` |
+| ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:779` |
 | `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it depends on the filter's `Fidelity`** (`docs/query-lowering.md` §2.7.7, and §10's answered open question 5). A filter over a **parser-produced** name is `Fidelity::Wider` — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter that is `Fidelity::Equivalent` — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement |
 | the response | none | — | *evaluated after the read* |
 
@@ -1195,7 +1247,7 @@ Returned `1788256800000000000 → 1` and `1788256860000000000 → 2`. **The answ
 ```
 
 **What it avoids.** Everything. Today this query reads every matching line over the whole window
-with no aggregation, no bucket column and no `LIMIT` (`sql.rs:996`), and counts them in
+with no aggregation, no bucket column and no `LIMIT` (`sql.rs:1010`), and counts them in
 `pulsus-server`; the number of rows crossing the network is the number of log lines. After, it is
 the number of buckets — here two rows instead of three. Measured on the container over 3,000,000
 rows, a window holding 192,956 matching lines: today's shape returns **192,956 rows and reads
@@ -2358,7 +2410,7 @@ renders exactly as written (`escape.rs:157-160`).
 {service_name="ipcase"} |= ip("10.0.0.0/8")
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3336`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1685`), so the read becomes a page loop.
+**SQL today** — one statement per page, `sql.rs:841`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3336`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1685`), so the read becomes a page loop.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2392,7 +2444,7 @@ An implementation emitting any `body` predicate here drops entries the evaluator
 and the second must be skipped. Ending the walk at the second turns one statement into a page loop
 over every line in the window.
 
-**SQL today** — one statement per page, `sql.rs:827`, carrying **both** literal predicates. The address filter is skipped through the empty arm at `plan.rs:3063` and the walk continues.
+**SQL today** — one statement per page, `sql.rs:841`, carrying **both** literal predicates. The address filter is skipped through the empty arm at `plan.rs:3063` and the walk continues.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2425,7 +2477,7 @@ alone does not discriminate. LogQL15 does.
 {service_name="ipcase"} |= "CONN_REFUSED" |= ip("10.0.0.0/8") |= "zzz"
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, carrying both literal predicates.
+**SQL today** — one statement per page, `sql.rs:841`, carrying both literal predicates.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2491,7 +2543,7 @@ implementation treating a parse failure as a drop returns fewer than four.
 
 **No SQL is shown for either stage after this work, and that is the point of this entry.**
 
-**SQL today** — one statement **per page**, `sql.rs:827`, with no `body` term. `plan.rs:1705` names `json`; `plan.rs:1682` returns `true` at the label filter, so the read pages at `limit × reader.logql_pipeline_scan_factor` = 1,000 rows a page (`plan.rs:1644`).
+**SQL today** — one statement **per page**, `sql.rs:841`, with no `body` term. `plan.rs:1705` names `json`; `plan.rs:1682` returns `true` at the label filter, so the read pages at `limit × reader.logql_pipeline_scan_factor` = 1,000 rows a page (`plan.rs:1644`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2525,7 +2577,7 @@ One entry either way. Whoever fills those two cells must keep this answer identi
 {service_name="checkout"} | json | status >= 500
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, with no `body` term.
+**SQL today** — one statement per page, `sql.rs:841`, with no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2562,7 +2614,7 @@ fixes the answer, and the discriminating case is LogQL19.
 {service_name="checkout"} | json | dur_ms > 1e1
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`. **We answer `400` here and the reference answers `200`** — part 7, row 4.
+**SQL today** — one statement per page, `sql.rs:841`. **We answer `400` here and the reference answers `200`** — part 7, row 4.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2625,7 +2677,7 @@ return two entries in one stream. This is the clearest case that a parser is not
 {service_name="checkout"} | json | line_format "{{.msg}}" |= "pod-044"
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, with **no `body` term**. `compile_line_filters` ends its walk at `line_format` (`plan.rs:3067`), so the filter after it emits nothing; `has_unpushed_dropping_stage` returns `true` at that filter (`plan.rs:1666`), so the read pages.
+**SQL today** — one statement per page, `sql.rs:841`, with **no `body` term**. `compile_line_filters` ends its walk at `line_format` (`plan.rs:3067`), so the filter after it emits nothing; `has_unpushed_dropping_stage` returns `true` at that filter (`plan.rs:1666`), so the read pages.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2716,7 +2768,7 @@ One entry, with the escape sequences removed. The stored line is the 37 bytes
 
 **The reference returns zero entries, and this is the case part 7's last row is about.**
 
-**SQL today** — one statement per page, `sql.rs:827`, with **no `body` term**: the walk ends at `decolorize` (`plan.rs:3067`) and the filter after it is evaluated after the read.
+**SQL today** — one statement per page, `sql.rs:841`, with **no `body` term**: the walk ends at `decolorize` (`plan.rs:3067`) and the filter after it is evaluated after the read.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2748,7 +2800,7 @@ make it faster.
 {service_name="colors"} | decolorize |= "ok after"
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, with no `body` term.
+**SQL today** — one statement per page, `sql.rs:841`, with no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2778,7 +2830,7 @@ when the phrase straddles a code: it tests the raw line always.
 {service_name="colors"} | decolorize | line_format "{{.__line__}}" |= "upstream ok"
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, no `body` term.
+**SQL today** — one statement per page, `sql.rs:841`, no `body` term.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2904,7 +2956,7 @@ different label sets and fails here.
 {service_name="checkout"} | json | label_format lvl=level | lvl="warn"
 ```
 
-**SQL today** — one statement per page, `sql.rs:827`, no `body` term. `plan.rs:1711` names `label_format`; the label filter at `plan.rs:1682` makes the read page.
+**SQL today** — one statement per page, `sql.rs:841`, no `body` term. `plan.rs:1711` names `label_format`; the label filter at `plan.rs:1682` makes the read page.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -2941,7 +2993,7 @@ than copies.
 sum by (level) (count_over_time({service_name="checkout"} | json | __error__="" [1m]))
 ```
 
-**SQL today** — one statement, `sql.rs:996` — a scan of the whole window with **no aggregation and no `LIMIT`**. Every matching line crosses to `pulsus-server` and is counted there. Three separate reasons force this: `has_beyond_line_filter` (`json`), `grouping.is_some()`, and `is_range` (`plan.rs:1936-1941`).
+**SQL today** — one statement, `sql.rs:1010` — a scan of the whole window with **no aggregation and no `LIMIT`**. Every matching line crosses to `pulsus-server` and is counted there. Three separate reasons force this: `has_beyond_line_filter` (`json`), `grouping.is_some()`, and `is_range` (`plan.rs:1936-1941`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2985,7 +3037,7 @@ filter the same query is a `400` — LogQL32.
 sum by (level) (count_over_time({service_name="checkout"} | json [1m]))
 ```
 
-**SQL today** — one statement, `sql.rs:996`. The refusal happens in `pulsus-server`, after the read, when a line reaches the aggregation carrying a non-empty error label.
+**SQL today** — one statement, `sql.rs:1010`. The refusal happens in `pulsus-server`, after the read, when a line reaches the aggregation carrying a non-empty error label.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3020,7 +3072,7 @@ This entry exists to fix the bucketing rule part 2.7.2 settles. The
 corpus stream `bnd` holds one entry at grid point `G` = `1788256800000000000`, one at `G+30s` and one
 at `G+60s`, and the request runs `start=1788256740000000000`, `end=1788256920000000000`, `step=60`.
 
-**SQL today** — one statement, `sql.rs:996`, with **no bucket column at all** — the window widens by the range so the first grid point is covered, and every bucket is computed in `pulsus-server`.
+**SQL today** — one statement, `sql.rs:1010`, with **no bucket column at all** — the window widens by the range so the first grid point is covered, and every bucket is computed in `pulsus-server`.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3079,7 +3131,7 @@ bucket column can say which — that case is evaluated after the read, as today.
 count_over_time({service_name="checkout"}[1m])
 ```
 
-**SQL today** — one statement, `sql.rs:1042`, **aggregated in ClickHouse**. This is the one metric form that compiles today. `plan.rs:2009` routes an instant query to the raw table, and `metric_instant` groups by fingerprint and structured metadata.
+**SQL today** — one statement, `sql.rs:1056`, **aggregated in ClickHouse**. This is the one metric form that compiles today. `plan.rs:2009` routes an instant query to the raw table, and `metric_instant` groups by fingerprint and structured metadata.
 
 ```sql
 SELECT fingerprint, count() AS n, structured_metadata
@@ -3125,7 +3177,7 @@ Included here because it is the edge of what LogQL34's form accepts.
 bytes_over_time({service_name="edge"}[1m])
 ```
 
-**SQL today** — one statement, `sql.rs:1042`, with the byte aggregate from `sql.rs:111`.
+**SQL today** — one statement, `sql.rs:1056`, with the byte aggregate from `sql.rs:111`.
 
 ```sql
 SELECT fingerprint, sum(length(body)) AS n, structured_metadata
@@ -3153,7 +3205,7 @@ returns 67. This is the discriminating case for that column expression.
 sum_over_time({service_name="checkout"} | json | unwrap dur_ms [1m])
 ```
 
-**SQL today** — one statement, `sql.rs:996`, no aggregation. `has_unwrap` forces the client path (`plan.rs:1825`).
+**SQL today** — one statement, `sql.rs:1010`, no aggregation. `has_unwrap` forces the client path (`plan.rs:1825`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3184,7 +3236,7 @@ implementation formatting floats with a fixed number of places fails here.
 absent_over_time({service_name="nosuch"}[1m])
 ```
 
-**SQL today** — one statement, `sql.rs:996`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1147-1153`).
+**SQL today** — one statement, `sql.rs:1010`, with the lean projection — this is the only reducer that omits `structured_metadata` (`sql.rs:1161-1167`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body
@@ -3213,7 +3265,7 @@ omitting the label, fails here.
 topk(2, sum by (level) (count_over_time({service_name="checkout"} | json | __error__="" [1m])))
 ```
 
-**SQL today** — one statement, `sql.rs:996`. Both aggregation levels run in `pulsus-server`.
+**SQL today** — one statement, `sql.rs:1010`. Both aggregation levels run in `pulsus-server`.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
