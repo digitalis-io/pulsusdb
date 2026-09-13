@@ -5280,7 +5280,7 @@ An earlier version of this section said "no crate in this workspace has a compil
 and left the check to be run by hand. **That claim was false.** The workspace already has one, in
 the form this repository uses for exactly this purpose: rustdoc `compile_fail` fences, in
 `crates/pulsus-read/src/logql/predicate.rs` (`:257`, `:295`, `:332`, `:373`) and
-`crates/pulsus-read/src/logql/sql.rs` (`:181`, `:195`), with a module doc that sets the bar for them
+`crates/pulsus-read/src/logql/sql.rs` (`:453`, `:467`), with a module doc that sets the bar for them
 — *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:92`) — and a measured
 caveat that the annotated error code is not checked at all (`predicate.rs:87-91`, issue #286).
 Doctests are not run by `nextest`; CI runs them separately as `cargo test --workspace --doc`
