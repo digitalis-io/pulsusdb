@@ -117,6 +117,7 @@ pub mod predicate;
 pub mod rows;
 pub mod sql;
 pub mod template;
+mod unwrap_group;
 /// Test-only helpers shared by more than one region module's
 /// `#[cfg(test)] mod tests` (issue #299). A SUBDIRECTORY, never a flat
 /// `.rs`.

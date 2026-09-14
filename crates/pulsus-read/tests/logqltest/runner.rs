@@ -1338,7 +1338,7 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
             // lowers).
             fallback = match &mp.value {
                 pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
-                    unwrapped_fallback_client_agg(mp, &u.label)
+                    unwrapped_fallback_client_agg(mp, u)
                 }
                 pulsus_read::logql::sql::MetricValue::Shaped(_) => bucketed_fallback_client_agg(mp),
             };
