@@ -67,68 +67,55 @@ applied alone to a clean tree and restored with `git checkout -- <file>`.
   `explain_indexes` 74 run, 74 passed; `logs_detected_live` 7 run, 7 passed;
   the two-shard `the_undecided_rows_come_from_one_read` 1 run, 1 passed.
 
-## Measurements (set up, not run)
+## Measurements (done)
 
-- Two detached measurement worktrees, uncommitted harness files inside:
-  `agent-work/coder507gk-main-wt` (at `874b5619`) and
-  `agent-work/coder507gk-head-wt` (at `1c314e2f`). Each has
-  `crates/pulsus-read/tests/zz_arch507gk8_parser_cost.rs` (the plan's
-  per-line cost harness) and the plan's `zz_arch507gk_perf` appended to
-  `crates/pulsus-read/tests/query_log_gates.rs` (the head copy also labels
-  key and lane statements). Remove both worktrees after measuring
-  (`git worktree remove --force`).
-- Inputs regenerated from the plan's generators in
-  `agent-work/coder507gk-notes/cost/`: `logfmt_ordinary_lines.tsv` (SHA-256
-  prefix `a592611b02bc1110`), `unpack_ordinary_lines.hex`
-  (`f9dd6b1c39e90d46`); both equal the reviewer's.
-- Scripts: `cost/parser_cost.sh` (criteria 16, 28) and `cost/perf.sh`
-  (criterion 17), queries in `cost/perf_queries*.txt`. Not yet done: build
-  the release/test binaries into `cost/bins/` (`cost_main`, `cost_head`,
-  `qlg_main`, `qlg_head`), load the realistic corpus into
-  `c507gk2_perfsrc.ls_real` and `ls_realu` (the plan's SQL, revision 5
-  appendix 1), write `cost/base_ns.txt`, then run both scripts.
+Output and a summary in `agent-work/coder507gk-notes/cost/`
+(`parser_cost_out3.txt`, `perf_out.txt`, `measurements_summary.txt`).
+
+- Criterion 16 and 28: the plan's per-line cost harness, release, five
+  rounds with the base commit and the branch interleaved. On the ordinary
+  lines the branch's range lies below the base's for all five shapes. The
+  K ladder to 16,000 names: each step at most 6.87 times a quarter as many
+  names for `| logfmt` and `| unpack` (a quadratic cost would give 16).
+- Criterion 17: the plan's engine harness over the realistic corpus
+  (2,000,000 rows in one hour) and its undecided-heavy variant, three
+  repetitions per window, both builds interleaved.
+- The two measurement worktrees and their build subdirectories are removed,
+  and the three measurement databases are dropped.
 
 ## Containers
 
-Stopped (not removed) at the pause: `coder507gk-ch` (HTTP 58123, holds the
+Running again since the pause was lifted: `coder507gk-ch` (HTTP 58123, holds the
 `c507gk_*` and `c507gk2_*` test databases), `coder507gk-keeper`,
 `coder507gk-shard1` (58221), `coder507gk-shard2` (58222), and the reference
-containers `coder507gk-ref`, `coder507gk-ref463`. Start them again with
-`podman start <name>` (keeper before the shards). At the end: drop the
+containers `coder507gk-ref`, `coder507gk-ref463` (stopped; they are the
+reference build and are only needed when a capture has to be retaken). Start
+any of them with `podman start <name>` (the keeper before the shards). At the end: drop the
 `c507gk_*`/`c507gk2_*` databases, remove all six containers and the
 `coder507gk-net` network.
 
 ## Exact next step
 
-1. Run the measurements (criteria 16, 17, 28) and keep their output.
-2. Full gauntlet: `cargo nextest run --workspace`, `cargo test --workspace --doc`,
-   clippy with `-D warnings`, `cargo fmt --all -- --check`, the live suites.
-3. Stop and report to the task-manager (option A waits for the verdict).
+Option A (the ingest namer) is the only work left. Addendum 4 is with the
+reviewer; build nothing until the verdict arrives. Then: implement, re-run
+the gauntlet, push to the GitHub remote, open the pull request, and post the
+implementation notes.
 
-**No attribution lines anywhere** (owner): no session link and no tool name
-in a commit message, a pull request, an issue comment, `docs/` or code. The
-branch was rewritten once to remove the trailers it used to carry; nothing
-had been pushed.
+**No attribution lines and no tool names anywhere** (owner): not in a commit
+message, a pull request, an issue comment, `docs/` or code. The branch was
+rewritten once to remove the trailers it used to carry; nothing had been
+pushed.
 
-## Deviations to report
+## The gauntlet at `191a14af`
 
-- D1 crit 23 hermetic fixture; D2 criterion 3 instant rows run as one-point
-  range queries; D3 criterion 44 adds a decided row; D4 criterion 19
-  compares within the summation bound; D5 criterion 19 corpus 400,000 rows.
-- D6 defect numbering: the plan's #29 and #33 were withdrawn, so entries
-  are numbered 25–32 contiguously (29 renamed repeat, 30 quoted value,
-  31 replacement character) and the grouped `avg_over_time` entry 32 is
-  added because its mechanism is now located (the ledger row already said
-  "reference defect 32").
-- Criterion 24's `parser-extracted vector` grep still returns the main
-  sentence: revision 9 withdrew the rename that removed it.
-- Criterion 40's first grep returns nothing (plan said "only the quoted old
-  requirement"; the replacement text does not use those words).
-- The "unwrapped fold removes nothing" break (crit 20) has no target: the
-  shipped unwrapped fold is replaced by the key route's fold.
-- Criterion 23's two cap breaks are emulations: R1's 600 KB undecided line
-  was removed in revision 8, so "today's staging cap in L" is applied to the
-  key route's fold instead (L23a), and "retained window points on the
-  partials" counts folded samples (L23b). Both red.
-- Criterion 12's refused "filter after the unwrap" case is written under an
-  outer `sum` so that the filter is the only reason it is refused.
+- `cargo nextest run --workspace --no-fail-fast`: 7193 run, 7193 passed, 36
+  skipped.
+- `cargo test --workspace --doc`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
+- `cargo fmt --all -- --check`: exit 0.
+- `cargo nextest run -p pulsus-read --no-fail-fast`: 2277 run, 2277 passed.
+- Live: `query_log_gates` + `explain_indexes` 74 passed; `injected_settings`
+  3 passed; `logs_detected_live` 7 passed; the two-shard
+  `the_undecided_rows_come_from_one_read` 1 passed; and
+  `logql_line_filter_differential`, `query_text_cap_live`,
+  `series_stream_cap`, `patterns_explain` all passed.
