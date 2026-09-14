@@ -5134,3 +5134,170 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
         .await
         .expect("drop the run database");
 }
+
+/// A fresh run database with the schema, for one group key test.
+async fn group_key_db(stem: &str) -> (ChClient, ChClient, String) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_{stem}_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    (admin, client, db)
+}
+
+async fn drop_group_key_db(admin: &ChClient, db: &str) {
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// A one-stream case built in code, for the tests that do not read the
+/// fixture.
+fn group_key_case(id: &str, stream: &[(&str, &str)], entries: &[(&str, &str)]) -> GroupKeyCase {
+    GroupKeyCase {
+        id: id.to_string(),
+        stream: stream
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        entries: entries
+            .iter()
+            .map(|(b, sm)| (b.to_string(), sm.to_string()))
+            .collect(),
+        query: String::new(),
+        planned: String::new(),
+        observed: String::new(),
+        expected: String::new(),
+    }
+}
+
+/// **Criterion 44: the one read answers reserved-name rows under the query's
+/// rules** (issue #507, revision 10).
+///
+/// k3's and k4's rows and queries, with today's retained-label ceiling
+/// lowered so today's route refuses after S1 throws on the unconvertible
+/// value:
+///
+/// ```text
+/// S1 throws (395) ── today's route refuses (retained label bytes) ── L
+/// k3  {"latency":"abc"}, metadata __preserve_error__="true"   L: preserved, counts 0   {service_name="k3"} 0
+/// k4  {"latency":5}, then                                   L: decided, 5
+///     {"latency":"abc","__preserve_error__":"true"}           L: the hints skip the parsed name,
+///                                                                 so the error fails the query
+/// ```
+#[tokio::test]
+async fn the_lane_answers_reserved_name_rows_under_the_rules() {
+    skip_unless_live!();
+    const FP_BASE: u64 = 544_000;
+    let (admin, client, db) = group_key_db("gk_lane_rn").await;
+    let cases = [
+        group_key_case("k3", &[], &[(r#"{"latency":"abc"}"#, r#"{"__preserve_error__":"true"}"#)]),
+        // k4's row alone fails today's route with its pipeline error before
+        // any label set is retained, so today's route would answer rather than
+        // refuse. A decided row one nanosecond earlier is retained first, which
+        // trips the lowered ceiling and hands the query to L.
+        group_key_case(
+            "k4",
+            &[],
+            &[
+                (r#"{"latency":5}"#, ""),
+                (r#"{"latency":"abc","__preserve_error__":"true"}"#, ""),
+            ],
+        ),
+    ];
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    seed_group_key_cases(&admin, &client, &db, t, FP_BASE, &cases).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: Some(1),
+            key_statement_row_delay: None,
+        });
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 300_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    for (case, want) in [
+        ("k3", r#"{service_name="k3"} 0"#),
+        ("k4", "400 pipeline error: 'SampleExtractionErr'"),
+    ] {
+        let query = format!(
+            r#"sum by (service_name) (sum_over_time({{service_name="{case}"}} | json | unwrap latency [5m]))"#
+        );
+        let expr = parse(&query).expect("parse");
+        match plan(&expr, &params, &plan_ctx(&db)).expect("plan") {
+            Plan::Metric(mp) => assert!(
+                matches!(mp.value, sql::MetricValue::Unwrapped(_)),
+                "{query}: the plan is the group key read"
+            ),
+            _ => panic!("{query}: a metric plan"),
+        }
+        let got = match engine.query(&expr, &params).await {
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    let mut l = s.labels.clone();
+                    l.sort();
+                    format!(
+                        "{{{}}} {}",
+                        l.iter()
+                            .map(|(k, v)| format!("{k}={v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        s.points
+                            .iter()
+                            .map(|(_, v)| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => panic!("{query}: {other:?}"),
+            Err(ReadError::MetricPipelineError { error_type, series }) => {
+                assert!(
+                    !series.contains("__preserve_error__"),
+                    "{query}: the hints skip a parsed __preserve_error__ the query does not require: {series}"
+                );
+                format!("400 pipeline error: '{error_type}'")
+            }
+            Err(e) => panic!("{query}: {e}"),
+        };
+        assert_eq!(got, want, "{query}");
+    }
+    let statements = group_key_statements(&admin, &db, cases.len()).await;
+    for (i, case) in cases.iter().enumerate() {
+        let seen = group_key_observed(
+            statements
+                .get(&(FP_BASE + i as u64))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
+        assert_eq!(
+            seen, "lane",
+            "{}: S1 throws, today's route refuses, and L answers",
+            case.id
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
