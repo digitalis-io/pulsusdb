@@ -928,6 +928,29 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
     let run = run_file("inline/approx_exact.test", &ok).expect("parse");
     assert!(run.cases[0].passed, "{}", run.cases[0].detail);
 
+    // Criterion 12 (issue #507): the bare `| json` forms the extracted-field
+    // group key read serves lower, so the verb admits them. The four values
+    // sum to 57 and average to 14.25, both exact in binary.
+    for (what, query, value) in [
+        (
+            "a bare json under a sum",
+            r#"sum(sum_over_time({service_name="checkout"} | json | unwrap c [1m]))"#,
+            "57",
+        ),
+        (
+            "a bare json averaged by a label",
+            r#"avg_over_time({service_name="checkout"} | json | unwrap c [1m]) by (x)"#,
+            "14.25",
+        ),
+    ] {
+        let admitted = format!(
+            "{dataset}eval_approx 1e-9 range from 60s to 60s step 1m {query}\n\t{{}} 60s {value}\n"
+        );
+        let run = run_file("inline/approx_admitted.test", &admitted)
+            .unwrap_or_else(|e| panic!("{what}: must be admitted, got {e}"));
+        assert!(run.cases[0].passed, "{what}: {}", run.cases[0].detail);
+    }
+
     // **The control against sprinkling, over every way a query can fail to
     // lower** — not only the reducer name, which is what round 1 checked.
     // Each is a GRAMMAR error naming what it saw.
@@ -966,6 +989,16 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
             "a range that is not the step",
             "eval_approx 1e-9 range from 60s to 120s step 1m \
              sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap c [2m])",
+        ),
+        (
+            "a bare json averaged without a label, whose other keys name the series",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             avg_over_time({service_name=\"checkout\"} | json | unwrap c [1m]) without (x)",
+        ),
+        (
+            "a stage after the unwrap",
+            "eval_approx 1e-9 range from 60s to 60s step 1m \
+             sum(sum_over_time({service_name=\"checkout\"} | json | unwrap c | c > 1 [1m]))",
         ),
         (
             "a log selector, which has no aggregation",

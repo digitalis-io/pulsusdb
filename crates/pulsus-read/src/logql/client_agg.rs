@@ -3905,6 +3905,34 @@ mod tests {
                 .any(|(k, v)| k == "__error__" && v == "SampleExtractionErr"),
             "{v:?}"
         );
+        // The same line through the range state: one point at 60 s, the
+        // converter's zero, on the error series.
+        let step =
+            super::super::params::validate_duration_ns(60_000_000_000, "step").expect("step");
+        let range = super::super::params::validate_duration_ns(300_000_000_000, "range selector")
+            .expect("range");
+        let window = ClientWindow::Range {
+            grid_start_ns: 60_000_000_000,
+            end_ns: 60_000_000_000,
+            step_ns: step,
+            range_ns: range,
+            offset_ns: 0,
+        };
+        let QueryResult::Matrix(m) =
+            run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+                .expect("a preserved error answers on the range state")
+        else {
+            panic!("range");
+        };
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].points.len(), 1, "{m:?}");
+        assert_eq!(m[0].points[0].1.to_bits(), 0.0f64.to_bits(), "{m:?}");
+        assert!(
+            m[0].labels
+                .iter()
+                .any(|(k, v)| k == "__error__" && v == "SampleExtractionErr"),
+            "{m:?}"
+        );
     }
 
     use super::*;
