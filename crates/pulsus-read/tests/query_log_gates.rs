@@ -5641,3 +5641,301 @@ async fn the_key_route_falls_back_on_its_own_memory_error() {
     }
     drop_group_key_db(&admin, &db).await;
 }
+
+/// Seeds `rows` rows of the realistic corpus into `db`: 20 streams
+/// `{service_name="checkout", pod="checkout-<i>"}`, one row every 1.8 ms from
+/// `start`, 90% request bodies and 10% cache messages, each with its own
+/// `request_id` and `ts`. `undecided` writes every request body's `status`
+/// as a float (`200` becomes `0.200`), which the key statement cannot
+/// decide.
+async fn seed_realistic_corpus(admin: &ChClient, db: &str, start: i64, rows: u64, undecided: bool) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({start})))");
+    let status = if undecided { "0." } else { "" };
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+             SELECT {month}, 1000 + number, 'checkout', \
+             concat('{{\"pod\":\"checkout-', toString(number), '\",\"service_name\":\"checkout\"}}'), 0 \
+             FROM numbers(20)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+             SELECT {month}, k, v, 1000 + number FROM numbers(20) \
+             ARRAY JOIN ['service_name', 'pod'] AS k, ['checkout', concat('checkout-', toString(number))] AS v"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body, structured_metadata) \
+             SELECT 'checkout', 1000 + (number % 20), {start} + 1 + number * 1800000 AS ts, 0, \
+             if(number % 10 = 9, \
+               concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64(number))), lower(hex(cityHash64(number + 1))), \
+                 '\",\"service\":\"checkout\",\"level\":\"info\",\"msg\":\"cache refreshed\"}}'), \
+               concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64(number))), lower(hex(cityHash64(number + 1))), \
+                 '\",\"service\":\"checkout\",\"method\":\"', ['GET','POST','PUT','DELETE'][number % 4 + 1], \
+                 '\",\"status\":{status}', toString([200,201,204,400,404,500][number % 6 + 1]), \
+                 ',\"path\":\"/api/v1/items/', toString(number % 1000), \
+                 '\",\"latency\":', toString(round(((number * 7919) % 100000) / 100, 2)), '}}')), '' \
+             FROM numbers({rows})"
+        ),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("seed the realistic corpus");
+    }
+}
+
+/// A matrix answer, sorted, with each value's bits, or the error's text.
+fn matrix_bits(
+    res: Result<(QueryResult, pulsus_read::Warnings), ReadError>,
+) -> Result<Vec<(Vec<(String, String)>, Vec<(i64, u64)>)>, String> {
+    match res {
+        Ok((QueryResult::Matrix(m), _)) => {
+            let mut out: Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> = m
+                .into_iter()
+                .map(|s| {
+                    let mut l = s.labels;
+                    l.sort();
+                    (l, s.points.into_iter().map(|(t, v)| (t, v.to_bits())).collect())
+                })
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+        Ok((other, _)) => Err(format!("not a matrix: {other:?}")),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// **Criterion 19: the undecided rows come from one read** (issue #507, §4.1).
+///
+/// The realistic corpus with every request body's `status` a float, so the
+/// key statement cannot decide one of them, under
+/// `sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))`:
+///
+/// ```text
+/// 3 minutes, today's retained-label ceiling lowered
+///   S1 throws (395) -> today's raw scan refuses on the ceiling -> L, exactly one statement
+///   the query answers; no GROUP BY statement follows the raw scan
+/// 2 minutes
+///   without the lowered ceiling: S1 throws, today's route answers
+///   with it: L answers, and its answer equals today's, series by series
+/// ```
+///
+/// L folds each row under the grouping the range step uses (a parent `sum`
+/// by `status`), so 3 minutes of rows with a unique `request_id` each make
+/// six series, not one per row.
+#[tokio::test]
+async fn the_undecided_rows_come_from_one_read() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let (admin, _client, db) = group_key_db("gk_oneread").await;
+    let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    // Twelve minutes at the corpus's density; the queries read minutes 8–11.
+    seed_realistic_corpus(&admin, &db, start, 400_000, true).await;
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+    let expr = parse(query).expect("parse");
+    // `points` grid points ending at minute 11: 3 points read 3 minutes.
+    let range = |points: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start + (12 - points) * MIN,
+            end_ns: start + 11 * MIN,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lowered = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024))
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: Some(1),
+            key_statement_row_delay: None,
+        });
+    let plain = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024));
+
+    // 3 minutes: the query answers from L.
+    let from = server_micros(&admin).await;
+    let three = matrix_bits(lowered.query(&expr, &range(3)).await).expect("L answers at 3 minutes");
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(three.len(), 6, "one series per status: {:?}", three.iter().map(|s| &s.0).collect::<Vec<_>>());
+    assert!(three.iter().all(|(_, p)| p.len() == 3), "three points each");
+    let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
+    assert_eq!(
+        statements,
+        vec![
+            (GroupKeyStatement::Key, 395),
+            (GroupKeyStatement::Raw, 0),
+            (GroupKeyStatement::Lane, 0),
+        ],
+        "S1 throws, today's raw scan runs, and exactly one key-route statement follows it"
+    );
+    // Every statement of the query, in order: none after today's raw scan
+    // holds a GROUP BY.
+    let mut s = admin
+        .query_stream::<TimedStatementRow>(
+            &format!(
+                "SELECT query, exception_code FROM system.query_log WHERE has(databases, '{db}') \
+                 AND type != 'QueryStart' AND query NOT LIKE '%system.query_log%' \
+                 AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+                 AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+                 ORDER BY query_start_time_microseconds ASC"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the query's statements");
+    let mut all = Vec::new();
+    while let Some(row) = s.next().await {
+        all.push(row.expect("decode").query);
+    }
+    drop(s);
+    let raw_at = all
+        .iter()
+        .position(|q| q.starts_with("SELECT fingerprint, timestamp_ns, body"))
+        .expect("today's raw scan ran");
+    let grouped_after: Vec<&String> = all[raw_at + 1..]
+        .iter()
+        .filter(|q| q.contains("GROUP BY"))
+        .collect();
+    assert!(
+        grouped_after.is_empty(),
+        "no GROUP BY statement after today's raw scan: {grouped_after:?}"
+    );
+
+    // 2 minutes: L's answer is today's route's, series by series.
+    let from = server_micros(&admin).await;
+    let today = matrix_bits(plain.query(&expr, &range(2)).await).expect("today's route answers at 2 minutes");
+    let mid = server_micros(&admin).await + 1;
+    let lane = matrix_bits(lowered.query(&expr, &range(2)).await).expect("L answers at 2 minutes");
+    let to = server_micros(&admin).await + 1;
+    // Series by series and point by point, within the summation-order bound
+    // `2(n−1)·u·Σ|vᵢ|` of each point's rows: L adds its rows in the order
+    // they arrive and today's route in its own, and the owner accepted that
+    // the order is not fixed (docs/query-to-sql.md §8).
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct PointRow {
+        status: f64,
+        bucket: i64,
+        n: u64,
+        sum_abs: f64,
+    }
+    let mut s = admin
+        .query_stream::<PointRow>(
+            &format!(
+                "SELECT JSONExtractFloat(body, 'status') AS status, \
+                 {start} + intDiv(timestamp_ns - {start} + {MIN} - 1, {MIN}) * {MIN} AS bucket, \
+                 count() AS n, sum(abs(JSONExtractFloat(body, 'latency'))) AS sum_abs \
+                 FROM {db}.log_samples WHERE JSONHas(body, 'latency') \
+                 AND timestamp_ns > {} AND timestamp_ns <= {} GROUP BY status, bucket",
+                start + 8 * MIN,
+                start + 11 * MIN
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("each point's rows");
+    let mut points = std::collections::HashMap::new();
+    while let Some(row) = s.next().await {
+        let row = row.expect("decode");
+        points.insert((row.status.to_string(), row.bucket), (row.n, row.sum_abs));
+    }
+    drop(s);
+    assert_eq!(
+        lane.iter().map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>())).collect::<Vec<_>>(),
+        today.iter().map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>())).collect::<Vec<_>>(),
+        "at 2 minutes L answers the series and points today's route answers"
+    );
+    for ((labels, lp), (_, tp)) in lane.iter().zip(&today) {
+        let status = &labels.iter().find(|(k, _)| k == "status").expect("status").1;
+        for ((t, a), (_, b)) in lp.iter().zip(tp) {
+            let (n, sum_abs) = points[&(status.clone(), *t)];
+            let bound = 2.0 * ((n as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            assert!(
+                (a - b).abs() <= bound,
+                "status {status} at {t}: L {a:?}, today's route {b:?}, bound {bound:e} over {n} rows"
+            );
+        }
+    }
+    assert_eq!(
+        group_key_statements_between(&admin, &db, from, mid, 2).await,
+        vec![(GroupKeyStatement::Key, 395), (GroupKeyStatement::Raw, 0)],
+        "without the lowered ceiling today's route answers"
+    );
+    assert_eq!(
+        group_key_statements_between(&admin, &db, mid, to, 3).await,
+        vec![
+            (GroupKeyStatement::Key, 395),
+            (GroupKeyStatement::Raw, 0),
+            (GroupKeyStatement::Lane, 0),
+        ],
+        "with it, L answers"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// **Criterion 31: a timeout of the key statement is the timeout response**
+/// (issue #507, owner ruling: no race, no fallback).
+///
+/// The realistic corpus; `avg_over_time({service_name="checkout"} | json |
+/// path != "" | unwrap latency [1m]) by (service, method, status, level,
+/// msg)` over two minutes, with S1 slowed by a per-row delay past a
+/// one-second query timeout:
+///
+/// ```text
+/// S1 ── the timeout ── the timeout response (ChError::Timeout, the logs API's 504)
+///                      today's route does not run
+/// ```
+#[tokio::test]
+async fn the_key_statement_timeout_is_the_timeout_response() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let (admin, _client, db) = group_key_db("gk_timeout").await;
+    let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    seed_realistic_corpus(&admin, &db, start, 200_000, false).await;
+    let query = r#"avg_over_time({service_name="checkout"} | json | path != "" | unwrap latency [1m]) by (service, method, status, level, msg)"#;
+    let expr = parse(query).expect("parse");
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start + 3 * MIN,
+            end_ns: start + 4 * MIN,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    match plan(&expr, &params, &plan_ctx(&db)).expect("plan") {
+        Plan::Metric(mp) => assert!(
+            matches!(mp.value, sql::MetricValue::Unwrapped(_)),
+            "the plan is the group key read"
+        ),
+        _ => panic!("a metric plan"),
+    }
+    let mut cfg = test_config();
+    cfg.database = db.clone();
+    cfg.query_timeout = Duration::from_secs(1);
+    let slow = LogQlEngine::new(
+        ChClient::new(cfg).await.expect("connect"),
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    )
+    .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+        todays_route_group_bytes: None,
+        key_statement_row_delay: Some(sql::RowDelay { micros: 40 }),
+    });
+    let from = server_micros(&admin).await;
+    let res = slow.query(&expr, &params).await;
+    // S1 may still be running on the server after the client's deadline;
+    // its row is logged when the server stops it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let to = server_micros(&admin).await + 1;
+    match &res {
+        Err(ReadError::Clickhouse(pulsus_clickhouse::ChError::Timeout(_))) => {}
+        other => panic!("the key statement's timeout must be the timeout response, got {other:?}"),
+    }
+    let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
+    assert!(
+        matches!(statements.as_slice(), [(GroupKeyStatement::Key, code)] if *code != 0),
+        "S1 ended with its timeout and no raw scan followed it: {statements:?}"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
