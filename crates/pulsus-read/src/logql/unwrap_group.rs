@@ -594,3 +594,132 @@ fn merged_value(reducer: UnwrapReducer, p: Partial) -> f64 {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logql::params::{Direction, PlanCtx, QueryParams, QuerySpec};
+    use crate::logql::plan::{Plan, plan};
+    use crate::logql::sql::MetricValue;
+
+    /// The group key read a range query plans to, with a one-minute step.
+    fn value_of(query: &str) -> UnwrappedValue {
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let ctx = PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let expr = pulsus_logql::parse(query).expect("parse");
+        match plan(&expr, &params, &ctx).expect("plan") {
+            Plan::Metric(mp) => match mp.value {
+                MetricValue::Unwrapped(u) => *u,
+                other => panic!("{query}: expected the group key read, got {other:?}"),
+            },
+            _ => panic!("{query}: expected a metric plan"),
+        }
+    }
+
+    fn stream(fp: u64, labels: &str) -> (u64, StreamMetaRow) {
+        (
+            fp,
+            StreamMetaRow {
+                fingerprint: fp,
+                service: "s".to_string(),
+                labels: labels.to_string(),
+            },
+        )
+    }
+
+    /// Criterion 5: the group document holds each present key label's source
+    /// key with its text, then the unwrapped path's placeholder; an absent key
+    /// is omitted.
+    #[test]
+    fn the_group_document_holds_the_present_keys_and_the_placeholder() {
+        let v = value_of(
+            r#"sum_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m])"#,
+        );
+        let resolved = resolve(&v, &HashMap::from([stream(1, r#"{"a":"b"}"#)]));
+        let doc = group_document(
+            &v,
+            &resolved.columns.keys,
+            &[(1, "a".to_string()), (0, String::new())],
+        );
+        assert_eq!(doc, r#"{"code":"a","latency":0}"#);
+        // A nested unwrapped path nests the placeholder.
+        let p = value_of(r#"sum_over_time({a="b"} | json lat="req.latency" | unwrap lat [1m])"#);
+        assert_eq!(group_document(&p, &[], &[]), r#"{"req":{"latency":0}}"#);
+        // A key text is written as a JSON string, escapes included.
+        let doc = group_document(
+            &v,
+            &resolved.columns.keys,
+            &[(1, "a\"b".to_string()), (1, "z".to_string())],
+        );
+        assert_eq!(doc, r#"{"code":"a\"b","missing":"z","latency":0}"#);
+    }
+
+    /// Criterion 5: streams whose labels agree on the class names are one
+    /// class, whatever their other labels say.
+    #[test]
+    fn classes_split_streams_only_on_the_class_names() {
+        let v = value_of(r#"sum by (pod) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
+        let meta = HashMap::from([
+            stream(1, r#"{"a":"b","pod":"p1","zone":"z1"}"#),
+            stream(2, r#"{"a":"b","pod":"p1","zone":"z2"}"#),
+            stream(3, r#"{"a":"b","pod":"p2","zone":"z1"}"#),
+        ]);
+        let resolved = resolve(&v, &meta);
+        assert_eq!(resolved.columns.classes, Some(vec![vec![1, 2], vec![3]]));
+        assert_eq!(
+            resolved.class_labels[&0],
+            vec![("pod".to_string(), "p1".to_string())]
+        );
+        assert_eq!(
+            resolved.class_labels[&1],
+            vec![("pod".to_string(), "p2".to_string())]
+        );
+    }
+
+    /// Criterion 5: a bare key label some streams carry is read and blanked
+    /// on those streams; one every stream carries is not read at all; a
+    /// blanked key is omitted from the document.
+    #[test]
+    fn a_blank_key_is_omitted_from_the_document() {
+        let v = value_of(r#"sum by (code) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
+        let some = resolve(
+            &v,
+            &HashMap::from([
+                stream(1, r#"{"a":"b","code":"s"}"#),
+                stream(2, r#"{"a":"b"}"#),
+            ]),
+        );
+        assert_eq!(some.columns.keys.len(), 1);
+        assert_eq!(some.columns.keys[0].1, vec![1]);
+        assert_eq!(
+            group_document(&v, &some.columns.keys, &[(0, String::new())]),
+            r#"{"latency":0}"#
+        );
+        let all = resolve(
+            &v,
+            &HashMap::from([
+                stream(1, r#"{"a":"b","code":"s"}"#),
+                stream(2, r#"{"a":"b","code":"t"}"#),
+            ]),
+        );
+        assert!(all.columns.keys.is_empty(), "{:?}", all.columns.keys);
+    }
+}
