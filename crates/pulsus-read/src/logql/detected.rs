@@ -756,6 +756,27 @@ mod tests {
         assert!(pairs.is_empty(), "no clean fields, got {pairs:?}");
     }
 
+    /// Issue #507: a line is classified `json` exactly when `| json` reads
+    /// it. `{"a":1}trailing` is not one JSON text, so it is tried as logfmt,
+    /// which reads nothing from a token opened by `{"`.
+    #[test]
+    fn auto_parse_does_not_call_a_line_with_text_after_the_object_json() {
+        assert_eq!(
+            auto_parse(r#"{"a":1}trailing"#),
+            Some(("logfmt", Vec::new()))
+        );
+    }
+
+    /// Issue #507: `| json` skips one leading byte-order mark, so detection
+    /// calls such a line JSON too.
+    #[test]
+    fn auto_parse_calls_an_object_after_a_byte_order_mark_json() {
+        assert_eq!(
+            auto_parse("\u{feff}{\"a\":1}"),
+            Some(("json", vec![("a".to_string(), "1".to_string())]))
+        );
+    }
+
     // -- auto_parse keys on the error SLOT, not the label name (issue #238
     // review round 7, the ninth site). Expected values are literal captures
     // from the pinned reference container (grafana/loki:3.7.4,
