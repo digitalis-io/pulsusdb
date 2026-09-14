@@ -4734,57 +4734,18 @@ fn group_key_observed(statements: &[(GroupKeyStatement, i32)]) -> String {
     }
 }
 
-/// **Criterion 3: the group key read answers every case of the plan's
-/// tables as today's route does** (issue #507).
-///
-/// `tests/fixtures/group_key/cases.tsv` holds each case of the design's
-/// tables — the JSON text rules, nesting, text after a value, empty and
-/// absent values, lines that are not JSON, the q, g, e and k rows, the
-/// collision rows, the refused chains, the reserved-name rows at the
-/// reference's answers, the three rows of the unconvertible value under
-/// `__preserve_error__`, and a filter naming the unwrapped label — with its
-/// answer. For each, the test asserts:
-///
-/// ```text
-/// planned   the plan is the group key read, or it is not
-/// observed  system.query_log: S1 alone; S1 then today's raw scan (a fold
-///           fallback); S1 throwing (395) then the raw scan; that and L;
-///           or no key-route statement
-/// answer    the fixture's answer, value bits included
-/// ```
-///
-/// Each query runs as a range query at one grid point whose step is its
-/// range, which is what lets the planner choose the group key read; the
-/// design's tables give instant-query answers over the same rows.
-#[tokio::test]
-async fn the_group_key_read_agrees_with_the_client_path() {
-    skip_unless_live!();
-    const FP_BASE: u64 = 507_000;
-    let admin = ChClient::new(test_config()).await.expect("connect admin");
-    let db = pulsus_testkit::test_db(&format!(
-        "pulsus_read_it_qlg_gk_{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    for stmt in [
-        format!("DROP DATABASE IF EXISTS {db}"),
-        format!("CREATE DATABASE {db}"),
-    ] {
-        admin
-            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
-            .await
-            .expect("database");
-    }
-    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
-    let client = data_client(&db).await;
-    let cases = load_group_key_cases("tests/fixtures/group_key/cases.tsv");
+/// Seeds `cases` into a fresh database, runs each through the engine and
+/// `system.query_log`, and returns every way a case differs from its row.
+async fn check_group_key_cases(stem: &str, fp_base: u64, cases: &[GroupKeyCase]) -> Vec<String> {
+    let (admin, client, db) = group_key_db(stem).await;
     let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
-    seed_group_key_cases(&admin, &client, &db, t, FP_BASE, &cases).await;
+    seed_group_key_cases(&admin, &client, &db, t, fp_base, cases).await;
     let engine = LogQlEngine::new(
         data_client(&db).await,
         engine_config(&db, 50 * 1024 * 1024 * 1024),
     );
     let mut wrong = Vec::new();
-    for case in &cases {
+    for case in cases {
         let (query, params) = group_key_request(case, t);
         let planned = match parse(&query) {
             Err(_) => "none",
@@ -4813,7 +4774,7 @@ async fn the_group_key_read_agrees_with_the_client_path() {
     for (i, case) in cases.iter().enumerate() {
         let observed = group_key_observed(
             statements
-                .get(&(FP_BASE + i as u64))
+                .get(&(fp_base + i as u64))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
         );
@@ -4824,6 +4785,37 @@ async fn the_group_key_read_agrees_with_the_client_path() {
             ));
         }
     }
+    drop_group_key_db(&admin, &db).await;
+    wrong
+}
+
+/// **Criterion 3: the group key read answers every case of the plan's
+/// tables as today's route does** (issue #507).
+///
+/// `tests/fixtures/group_key/cases.tsv` holds each case of the design's
+/// tables — the JSON text rules, nesting, text after a value, empty and
+/// absent values, lines that are not JSON, the q, g, e and k rows, the
+/// collision rows, the refused chains, the reserved-name rows at the
+/// reference's answers, the three rows of the unconvertible value under
+/// `__preserve_error__`, and a filter naming the unwrapped label — with its
+/// answer. For each, the test asserts:
+///
+/// ```text
+/// planned   the plan is the group key read, or it is not
+/// observed  system.query_log: S1 alone; S1 then today's raw scan (a fold
+///           fallback); S1 throwing (395) then the raw scan; that and L;
+///           or no key-route statement
+/// answer    the fixture's answer, value bits included
+/// ```
+///
+/// Each query runs as a range query at one grid point whose step is its
+/// range, which is what lets the planner choose the group key read; the
+/// design's tables give instant-query answers over the same rows.
+#[tokio::test]
+async fn the_group_key_read_agrees_with_the_client_path() {
+    skip_unless_live!();
+    let cases = load_group_key_cases("tests/fixtures/group_key/cases.tsv");
+    let wrong = check_group_key_cases("gk", 507_000, &cases).await;
     assert!(
         wrong.is_empty(),
         "{} of {} cases differ:\n{}",
@@ -4831,14 +4823,30 @@ async fn the_group_key_read_agrees_with_the_client_path() {
         cases.len(),
         wrong.join("\n")
     );
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop the run database");
+}
+
+/// **Criterion 22: the group key read refuses where the flattened-key budget
+/// refuses** (issue #507, §3.1).
+///
+/// ```text
+/// k01  quadratic_line(32_761, 2_979) with "latency":5, 65,548 B   undecided: S1 throws, today's route: 422 budget
+/// k05  p 20, m 1,232, 13,590 B (the bound over, the charge under) undecided: S1 throws, today's route: {} 5
+/// k02  p 32,761, m 1,022, 44,021 B (the parser accepts it)        S1 throws, today's route refuses on its
+///                                                                  same-nanosecond staging, L: {} 5
+/// ```
+///
+/// The rows are the fixture's k01, k02 and k05, under
+/// `sum by (service_name) (sum_over_time({…} | json | unwrap latency [1m]))`.
+#[tokio::test]
+async fn the_group_key_read_refuses_where_the_key_budget_refuses() {
+    skip_unless_live!();
+    let cases: Vec<GroupKeyCase> = load_group_key_cases("tests/fixtures/group_key/cases.tsv")
+        .into_iter()
+        .filter(|c| ["k01", "k02", "k05"].contains(&c.id.as_str()))
+        .collect();
+    assert_eq!(cases.len(), 3, "the fixture holds k01, k02 and k05");
+    let wrong = check_group_key_cases("gk_budget", 522_000, &cases).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// **Criteria 29 and 42: reserved label names answer as the pinned reference
