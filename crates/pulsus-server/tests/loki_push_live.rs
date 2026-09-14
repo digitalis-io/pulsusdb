@@ -1091,7 +1091,12 @@ async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() 
         return;
     }
     let port = 31_166;
-    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_collision_it");
+    // Its own database: this suite's tests run concurrently, and
+    // `structured_metadata_colliding_with_a_stream_label_lands_under_extracted_suffix`
+    // used to share this name and drop the database out from under this test
+    // (measured: 7 of 8 rows visible inside the read-back poll, all 8 present
+    // afterwards).
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_name_collision_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
