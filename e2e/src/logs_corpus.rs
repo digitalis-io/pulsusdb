@@ -281,9 +281,12 @@ pub const SCOPE_WITNESS_ATTRS: &[(&str, &str)] = &[
     ("scope.name", "LOSE"),
 ];
 
-/// Sanitizes a label key the way `pulsus_model::canonicalize_label_key` /
-/// `LabelSet::from_normalized` does (`[^a-zA-Z0-9_]` -> `_`) — the corpus's
-/// own independent copy, never calling the crate under test.
+/// Renames a witness scope attribute key: each character outside
+/// `[a-zA-Z0-9_]` becomes `_`. The OTLP scope path stores
+/// `pulsus_model::log_label_name`'s result, which is the same for the three
+/// witness keys (`dup.key`, `dup_key`, `scope.name`); a key with a run of
+/// such characters, a leading digit or `__` affixes would need the log rule.
+/// The corpus's own independent copy, never calling the crate under test.
 fn sanitize_label_key(key: &str) -> String {
     key.chars()
         .map(|c| {

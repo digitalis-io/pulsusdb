@@ -219,81 +219,140 @@ pub enum MetricValue {
     Unwrapped(Box<UnwrappedValue>),
 }
 
-/// [`MetricValue::Unwrapped`]'s payload — a separate struct only so the
-/// variant can be one pointer wide.
+/// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
+/// read of a `| json … | unwrap` range query (issue #507), as the planner
+/// admits it — checked values, never statement text.
+///
+/// ```text
+/// targeted  | json <l>="<path>"[, <d>="<src>"…] | unwrap <l>      key labels: the declared labels but <l>
+/// bare      | json [| <label filter>…] | unwrap <l>                key labels: the grouping's names and the
+///                                                                  filter labels no selected stream carries
+/// ```
+///
+/// What depends on the selected streams — which fingerprints form one
+/// class, and which key labels a stream label or metadata entry blanks —
+/// is resolved after stream resolution into [`GroupKeyColumns`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnwrappedValue {
     pub reducer: UnwrapReducer,
-    /// The label as the query wrote it — what the READER compares a
-    /// row's structured-metadata keys against.
+    pub form: UnwrapForm,
+    /// The `| unwrap` label, as the query wrote it: what the reader compares
+    /// a row's structured-metadata keys and its class's stream labels against.
     pub label: String,
-    /// The same name, minted for the STATEMENT.
-    ///
-    /// Two fields for one name because they are read by two different
-    /// things: one is bytes this process compares, the other is bytes
-    /// ClickHouse parses. [`MetricValue::unwrapped`] is the only
-    /// constructor and mints both from one argument, so they cannot
-    /// drift; `the_unwrapped_value_mints_both_spellings_from_one_name`
-    /// is the test that fails if a second construction site appears.
-    pub name: CheckedLiteral,
+    /// The field segments to the unwrapped value; on the bare form, `[label]`.
+    pub path: Vec<String>,
+    /// The candidate key labels, before stream resolution.
+    pub keys: Vec<UnwrapKeyLabel>,
+    /// Which stream labels can reach the answer, which decides the classes.
+    pub classes: ClassNames,
+    /// What of a row's structured metadata the statement sends.
+    pub metadata: MetadataSent,
+    /// The range aggregation's own `by`/`without`.
+    pub grouping: Option<super::pipeline::RangeGrouping>,
+    /// The chain the group document and today's route run: the `| json`
+    /// stage, any label filters, and the `| unwrap` stage.
+    pub stages: Vec<pulsus_logql::Stage>,
+    /// The range step's rules the group document runs under (issue #507,
+    /// reserved names).
+    pub rules: super::pipeline::RangeStepRules,
 }
 
-impl MetricValue {
-    /// The ONE constructor of the unwrapped arm (issue #507, W4).
-    pub fn unwrapped(reducer: UnwrapReducer, label: &str) -> Self {
-        MetricValue::Unwrapped(Box::new(UnwrappedValue {
-            reducer,
-            label: label.to_string(),
-            name: super::predicate::literal(label),
-        }))
+/// Which `| json` form a group key read serves (issue #507).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapForm {
+    /// `| json` with no extractions: the line is flattened, so a label name
+    /// can have spellings `JSONExtractRaw` does not read.
+    Bare,
+    /// `| json <label>="<path>"…`: every path is exact.
+    Targeted,
+}
+
+/// One candidate key label of a group key read (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwrapKeyLabel {
+    /// The label name in the answer.
+    pub label: String,
+    /// The top-level source key; equal to `label` on the bare form.
+    pub source: String,
+}
+
+/// Which stream labels reach the answer, so which fingerprints one class
+/// holds (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassNames {
+    /// Every stream label reaches the answer: one class per fingerprint.
+    PerFingerprint,
+    /// Only these names do: streams whose labels agree on them are one class.
+    Projected(Vec<String>),
+    /// Every stream label but these.
+    Without(Vec<String>),
+}
+
+/// What of a row's structured metadata a group key read sends (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSent {
+    /// Every entry can reach the answer: the stored text is sent.
+    Text,
+    /// Entries named in `values` are sent with their values; entries named
+    /// in `presence` are sent with the value `'1'`, because only their
+    /// presence changes an answer (it sends the query to today's route).
+    Projected {
+        values: Vec<String>,
+        presence: Vec<String>,
+    },
+}
+
+/// A group key read's key columns and classes for one resolved stream set
+/// (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupKeyColumns {
+    /// The key labels the statement reads, each with the fingerprints whose
+    /// streams carry its name (the body's value is renamed out of the answer
+    /// there). Empty lists on the targeted form: a declared label is never
+    /// blanked.
+    pub keys: Vec<(UnwrapKeyLabel, Vec<u64>)>,
+    /// `None`: one class per fingerprint. Otherwise the fingerprints of each
+    /// class, by class id.
+    pub classes: Option<Vec<Vec<u64>>>,
+}
+
+/// What a group key statement does with a row the database cannot decide
+/// (issue #507).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecidedRows {
+    /// `throwIf`: the statement fails (code 395) and the query takes today's
+    /// route.
+    Throw,
+    /// The row is counted in `n_undecided` and nothing throws.
+    Count,
+}
+
+/// Why a group key statement cannot be rendered. Every one sends the query
+/// to today's route; none is a client error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatementRefusal {
+    Grid(super::predicate::BucketGridRefusal),
+    Reader(super::predicate::KeyReaderRefusal),
+}
+
+impl From<super::predicate::BucketGridRefusal> for KeyStatementRefusal {
+    fn from(r: super::predicate::BucketGridRefusal) -> Self {
+        KeyStatementRefusal::Grid(r)
     }
 }
 
-/// **The mantissa-has-a-digit test, and it asserts exactly one fact**
-/// (issue #507, W4).
-///
-/// `toFloat64OrNull` alone is not a sufficient guard, and the case it
-/// misses is the one that matters: `"E12"` — a rack name, an error code, a
-/// firmware revision — comes back as `0` rather than `NULL`, so a
-/// null-based check admits it and a zero joins the sum where the evaluator
-/// would have produced an error series. Measured on 26.3.29.7 across the
-/// family `"e3"`, `"E3"`, `"e+3"`, `"E12"`, `"."`, `"+."`, `".e3"`,
-/// `"+e3"`, and `"e999999"`, which returns a negative NaN.
-///
-/// **This is not a float grammar in SQL.** It asserts that the mantissa
-/// starts with a digit and leaves every other decision to
-/// `toFloat64OrNull`; it is anchored, so no suffix defeats it; and it
-/// rejects a structural family rather than an enumerated list, so a new
-/// member of that family is rejected too. **A second clause added here is
-/// a float grammar and stops being this.**
-///
-/// Its known over-rejections are the `inf`/`Inf`/`NaN` spellings, which
-/// our own parser accepts: those queries fall back rather than being
-/// answered wrongly.
-///
-/// **The `0`-rather-than-`NULL` reading above was measured under the
-/// default parser.** Under [`UNWRAP_PARSER_SETTING`], which the statement
-/// now carries, that whole family converts to NULL and `isNotNull` refuses
-/// it. This test is kept because it is the clause that refuses the
-/// `inf`/`NaN` spellings, which do convert under the setting — and because
-/// it refuses on the text rather than on what one parser happens to do with
-/// it.
-const UNWRAP_MANTISSA_HAS_A_DIGIT: &str = r"^[+-]?([0-9]|\.[0-9])";
-
-/// Rendered through the string escaper, so the regex's backslash reaches
-/// the matcher as one backslash rather than being eaten by ClickHouse's
-/// own string-literal unescaping — `\.` must stay a literal dot and not
-/// become "any character".
-fn unwrap_prefix_literal() -> CheckedLiteral {
-    super::predicate::literal(UNWRAP_MANTISSA_HAS_A_DIGIT)
+impl From<super::predicate::KeyReaderRefusal> for KeyStatementRefusal {
+    fn from(r: super::predicate::KeyReaderRefusal) -> Self {
+        KeyStatementRefusal::Reader(r)
+    }
 }
 
-/// **The parser the statement runs under** (issue #507, W4, review round 4).
+/// **The parser the group key statements run under** (issue #507, W4
+/// review round 4; kept by the group key read).
 ///
 /// `toFloat64OrNull` uses a fast approximate parser by default, and it is
-/// not correctly rounded. One row is enough for that to be a wrong answer,
-/// because the summation-order bound `2(n−1)·u·Σ|vᵢ|` this lowering is
-/// justified by is ZERO at `n = 1`. Measured on 26.3.29.7:
+/// not correctly rounded. One row is enough for that to be a wrong answer.
+/// Measured on 26.3.29.7:
 ///
 /// ```text
 ///   SELECT hex(reinterpretAsUInt64(assumeNotNull(
@@ -304,115 +363,20 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
 ///   "9367469347402735e292".parse::<f64>() ->  7FE0ACB5CADC2917
 /// ```
 ///
+/// Under the setting each text the W4 rounds measured either converts to
+/// the same bits as `f64::from_str` or converts to NULL: `"E12"`, `"e3"`,
+/// `"."` and `"1.7976931348623159e308"` convert to NULL, `"0e999999"` to
+/// `+0`, `"5e-324"` to bits `0x1`, and `"2e-324"` to NULL where Rust gives
+/// `0`. A NULL is an UNDECIDED row (`uw_q = 0`), which our parser reads;
+/// the `inf` and `NaN` spellings convert to a non-finite value on both
+/// sides, and a merged non-finite value sends the query to today's route.
+///
 /// **It is rendered into the statement text rather than sent as a
 /// connection setting**, so the EXPLAIN payload reports the query that
-/// executes.
-///
-/// **What it does to the rest of the guard.** Measured over every text this
-/// module's classes name — the class A spellings (`"E12"`, `"e3"`, `"."`,
-/// `"e999999"`), the overflow and underflow boundaries, the infinity and
-/// NaN spellings, and ordinary values — under the setting each text either
-/// converts to the same bits as `f64::from_str` or converts to NULL, and
-/// NULL is what `isNotNull` refuses. Class A converts to NULL (it was `0`);
-/// `"1.7976931348623159e308"` converts to NULL (it was `f64::MAX`);
-/// `"0e999999"` converts to `+0` (it was a negative NaN); `"5e-324"`
-/// converts to bits `0x1` (it was `0`); an underflow past the smallest
-/// subnormal, `"2e-324"` or `"1e-400"`, converts to NULL where Rust gives
-/// `0`.
-///
-/// So the four conjuncts beside `isNotNull` have no measured disagreement
-/// left to catch, and each is kept as an over-rejection — a fallback, never
-/// a wrong answer. See [`UNWRAP_OVERFLOW_CUTOFF`] and
-/// [`UNWRAP_TEXT_DENOTES_NON_ZERO`] for what each still refuses.
-/// **Widening the lowered set by dropping them is a change to make on its
-/// own evidence, not at the end of a wave.**
-///
-/// **The setting belongs to this one statement, and nothing carries it to
-/// the next.** Review round 5 enumerated every LogQL statement builder in
-/// this module and found that [`metric_range_unwrapped`] is the only one
-/// that converts text to a float in SQL: the raw scans send text for our
-/// own parser, and the rest read labels, counts or byte lengths. **A
-/// future builder that converts text to a float does not get this setting
-/// by being written here.** It has to append it itself, and it needs its
-/// own one-row test of the shape of `query_log_gates.rs`'s `one_ulp` case,
-/// because the byte-exact test that checks the suffix checks only this
-/// builder. Nothing in the type system enforces either half. The setting
-/// was measured on `toFloat64OrNull` only; whether it governs another
-/// conversion function (`JSONExtractFloat`, say) is not measured, so such a
-/// builder starts from its own measurement rather than from this one.
+/// executes. It belongs to [`metric_range_unwrapped`],
+/// [`metric_range_unwrapped_rows`] and [`metric_range_unwrapped_verdicts`]:
+/// no other builder converts text to a float in SQL.
 const UNWRAP_PARSER_SETTING: &str = "precise_float_parsing = 1";
-
-/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
-///
-/// Under the default parser `"1.7976931348623159e308"` converted to
-/// `f64::MAX` here and to `inf` in Rust, and no tolerance absorbs that: a
-/// sum holding `inf` is `inf`, a sum holding `f64::MAX` may be finite. One
-/// equality test closed it, over-rejecting a genuine `f64::MAX` with it.
-///
-/// **Under [`UNWRAP_PARSER_SETTING`] that text converts to NULL** and
-/// `isNotNull` refuses it, so what this clause still does is the
-/// over-rejection: a row whose value really is `f64::MAX` falls back. Kept
-/// (review round 4), because dropping it widens the lowered set.
-///
-/// `isFinite` is the same shape. It was the other half of the family —
-/// `"0e999999"` converted to a negative NaN here and to `+0` in Rust — and
-/// under the setting that text converts to `+0`. Of the texts measured, the
-/// only ones that still convert to a non-finite value are the `inf`,
-/// `Infinity` and `NaN` spellings, which the anchored prefix test refuses
-/// first and which our own parser accepts. Kept for the same reason.
-const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
-
-/// **A text that denotes a non-zero number** — the underflow clause
-/// (issue #507, W4, review rounds 1 to 4).
-///
-/// Under the default parser `toFloat64OrNull` returned `0` for a value
-/// whose exponent underflows, where our own parser keeps a subnormal.
-/// Measured on 26.3.29.7 against `f64::from_str`, with and without
-/// [`UNWRAP_PARSER_SETTING`]:
-///
-/// ```text
-///  text                      default   precise   ours (bits)
-///  "5e-324"                  0         0x1       0x1
-///  "7.5e-324"                0         0x2       0x2
-///  "9999999999999999e-324"   0         0x730d67819e8d2  0x730d67819e8d2
-///  "0.000…0005" (326 chars)  0         0x1       0x1
-/// ```
-///
-/// **The stated bound does not absorb these**, which is why the clause was
-/// written: `2(n−1)·u·Σ|vᵢ|` is ZERO at `n = 1`, and `Σ|vᵢ|` is the
-/// underflowing value itself when it is the only sample — so the difference
-/// is the whole answer.
-///
-/// **Under the setting the disagreement is gone**, and an underflow past
-/// the smallest subnormal (`"2e-324"`, `"1e-400"`) converts to NULL rather
-/// than to `0`, which `isNotNull` refuses. What this clause still does is
-/// refuse a text that converts to zero while carrying a non-zero digit —
-/// `"0e5"`, `"0.0e9"`, `"0e-1"` — where both parsers answer `+0` and the
-/// lowering would have been correct. Those fall back: a wasted statement,
-/// never a wrong answer. Kept (review round 4).
-///
-/// **The rule it expresses is about denotation, not spelling.** Review
-/// round 1 tested for an exponent, which is a rule about how a number is
-/// written: the 326-character fixed-point spelling of `5e-324` carries no
-/// `e`, converted to database zero, and parses to bits `0x1` in Rust — so
-/// it passed a guard built for exactly that case. What holds for every
-/// notation is that **a decimal literal denotes zero if and only if none of
-/// its digits is non-zero**, and that is one character class and one fact
-/// rather than a parse.
-///
-/// **One consequence a reader should not have to discover: the same value
-/// takes two routes depending on how it was STORED.** `JSONExtractRaw`
-/// returns a JSON *number* as the database normalised it and a JSON
-/// *string* as it was written, so
-///
-/// ```text
-///   {"latency":0e5}     -> raw text `0`     -> lowers
-///   {"latency":"0e5"}   -> raw text `0e5`   -> falls back
-/// ```
-///
-/// Same number, same query, two routes and the same answer. It is visible
-/// only as a statement that did or did not run.
-const UNWRAP_TEXT_DENOTES_NON_ZERO: &str = "[1-9]";
 
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
@@ -1377,98 +1341,373 @@ pub fn metric_range_bucketed(
     Ok(sql)
 }
 
-/// The bucketed range read over an UNWRAPPED value (issue #507, W4): one
-/// row per `(fingerprint, grid point, structured_metadata)`, whose
-/// aggregate is over the number a `| json | unwrap <name>` chain extracts
-/// rather than over a count of rows.
+/// Test-only knobs rendered into a group key statement (issue #507), so a
+/// live test can make the statement outlast a deadline and can choose WHICH
+/// deadline stops it.
+///
+/// - `row_delay_micros` renders `sleepEachRow` into the inner `WHERE`, which
+///   is what makes the statement slow.
+/// - `max_execution_s`, when set, renders that `max_execution_time` into the
+///   statement's own `SETTINGS`. A statement's own `SETTINGS` clause wins
+///   over the settings the client sends beside the request
+///   (`QuerySettings::apply_to_query`), so this puts the SERVER's limit
+///   below the client's stream deadline and the server's code 159 is what
+///   the reader sees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyStatementTestKnobs {
+    pub row_delay_micros: u32,
+    pub max_execution_s: Option<f64>,
+}
+
+/// The per-row reader columns of a group key statement (issue #507), in the
+/// order the statement lists them, ending in `decided`.
 ///
 /// ```text
-/// t   trim(BOTH '"' FROM JSONExtractRaw(body, '<name>'))   the raw value, unquoted
-/// q   t's mantissa starts with a digit
-///     AND toFloat64OrNull(t) is not null
-///     AND its magnitude is not the f64 overflow cutoff
-/// v   <reducer>If(ifNull(toFloat64OrNull(t), 0), q)        the aggregate, over qualifying rows
-/// n   count()                                              every row, qualifying or not
-/// all_numeric  countIf(NOT q) = 0                          whether the reader may use `v`
+/// uw_r uw_t uw_x uw_q      the unwrapped value: raw, unquoted, as Float64, not NULL
+/// uw_amb uw_missing        a spelling JSONExtractRaw does not read; no value at all
+/// l<i>_r _amb _str _int _absent   per key label: raw, spelling, string, integer, absent
+/// depth_ok keybudget_ok    the nesting bound; the bare flatten's key budget
+/// decided                  every reader decided the row
+/// ```
+fn unwrapped_reader_columns(
+    value: &UnwrappedValue,
+    keys: &[(UnwrapKeyLabel, Vec<u64>)],
+) -> Result<Vec<String>, KeyStatementRefusal> {
+    use super::predicate::{
+        ReaderColumns, json_depth_bound, json_flatten_key_budget_bound, literal,
+        unwrap_label_integer_text, unwrap_name_absence, unwrap_name_ambiguity,
+    };
+    let ambiguity = |name: &str| -> Result<String, KeyStatementRefusal> {
+        Ok(match value.form {
+            UnwrapForm::Targeted => "toUInt8(0)".to_string(),
+            UnwrapForm::Bare => unwrap_name_ambiguity(name)?.as_sql().to_string(),
+        })
+    };
+    let path: Vec<String> = value
+        .path
+        .iter()
+        .map(|seg| literal(seg).as_sql().to_string())
+        .collect();
+    let unwrap_name = value.path.last().map(String::as_str).unwrap_or("");
+    let mut w = vec![
+        format!("JSONExtractRaw(body, {}) AS uw_r", path.join(", ")),
+        "trim(BOTH '\"' FROM uw_r) AS uw_t".to_string(),
+        "toFloat64OrNull(uw_t) AS uw_x".to_string(),
+        "toUInt8(isNotNull(uw_x)) AS uw_q".to_string(),
+        format!("{} AS uw_amb", ambiguity(unwrap_name)?),
+        format!(
+            "{} AS uw_missing",
+            unwrap_name_absence(ReaderColumns::Unwrap, unwrap_name, value.form)?.as_sql()
+        ),
+    ];
+    let mut decided = vec!["uw_q".to_string(), "(1 - uw_amb)".to_string()];
+    let backslash = literal("\\");
+    for (i, (key, _)) in keys.iter().enumerate() {
+        let t = format!("l{i}");
+        let src = literal(&key.source);
+        let src = src.as_sql();
+        w.push(format!("JSONExtractRaw(body, {src}) AS {t}_r"));
+        w.push(format!("{} AS {t}_amb", ambiguity(&key.source)?));
+        w.push(format!(
+            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0) AS {t}_str",
+            backslash.as_sql()
+        ));
+        w.push(format!(
+            "toUInt8({t}_amb = 0 AND {} AND JSONType(body, {src}) IN ('Int64', 'UInt64')) AS {t}_int",
+            unwrap_label_integer_text(ReaderColumns::Key(i)).as_sql()
+        ));
+        w.push(format!(
+            "{} AS {t}_absent",
+            unwrap_name_absence(ReaderColumns::Key(i), &key.source, value.form)?.as_sql()
+        ));
+        decided.push(format!("toUInt8(({t}_str + {t}_int + {t}_absent) > 0)"));
+    }
+    w.push(format!(
+        "toUInt8({}) AS depth_ok",
+        json_depth_bound().as_sql()
+    ));
+    decided.push("depth_ok".to_string());
+    if value.form == UnwrapForm::Bare {
+        w.push(format!(
+            "toUInt8({}) AS keybudget_ok",
+            json_flatten_key_budget_bound().as_sql()
+        ));
+        decided.push("keybudget_ok".to_string());
+    }
+    w.push(format!("toUInt8({}) AS decided", decided.join(" * ")));
+    Ok(w)
+}
+
+/// `[(k0_present, k0_value), …] AS keys`: each key label's decided text,
+/// blank where a stream label or metadata entry of that name renames the
+/// body's value out of the answer (issue #507).
+fn unwrapped_keys_column(value: &UnwrappedValue, keys: &[(UnwrapKeyLabel, Vec<u64>)]) -> String {
+    if keys.is_empty() {
+        return "CAST([], 'Array(Tuple(UInt8, String))') AS keys".to_string();
+    }
+    let items: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, (key, blank_fps))| {
+            let t = format!("l{i}");
+            let mut present = format!("decided * ({t}_str + {t}_int)");
+            let mut text = format!(
+                "if(decided = 1, if({t}_str = 1, substring({t}_r, 2, length({t}_r) - 2), if({t}_int = 1, {t}_r, '')), '')"
+            );
+            if value.form == UnwrapForm::Bare {
+                let holds = super::predicate::metadata_holds_name(&key.source);
+                let blank = if blank_fps.is_empty() {
+                    format!("({})", holds.as_sql())
+                } else {
+                    format!(
+                        "(fingerprint IN ({}) OR {})",
+                        fp_list(blank_fps),
+                        holds.as_sql()
+                    )
+                };
+                present = format!("if({blank}, 0, {present})");
+                text = format!("if({blank}, '', {text})");
+            }
+            format!("(toUInt8({present}), {text})")
+        })
+        .collect();
+    format!("[{}] AS keys", items.join(", "))
+}
+
+fn unwrapped_class_expr(classes: &Option<Vec<Vec<u64>>>) -> String {
+    match classes {
+        None => "fingerprint".to_string(),
+        Some(classes) if classes.len() <= 1 => "toUInt64(0)".to_string(),
+        Some(classes) => {
+            let fps: Vec<u64> = classes.iter().flatten().copied().collect();
+            let ids: Vec<String> = classes
+                .iter()
+                .enumerate()
+                .flat_map(|(id, c)| std::iter::repeat_n(id.to_string(), c.len()))
+                .collect();
+            format!(
+                "transform(fingerprint, [{}], [{}], toUInt64(0))",
+                fp_list(&fps),
+                ids.join(", ")
+            )
+        }
+    }
+}
+
+/// The inner level both group key statements share: the stored columns
+/// each needs, then the reader columns, over the raw scan's own filter.
+#[allow(clippy::too_many_arguments)]
+fn unwrapped_inner_level(
+    stored: &[&str],
+    readers: &[String],
+    table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    window: TimeWindow,
+    lower: ScanLowerBound,
+    extra_predicates: &[CheckedFragment],
+    knobs: Option<KeyStatementTestKnobs>,
+) -> String {
+    let cols: Vec<String> = stored
+        .iter()
+        .map(|c| c.to_string())
+        .chain(readers.iter().cloned())
+        .collect();
+    let mut sql = format!("  SELECT {}\n  FROM {table}", cols.join(",\n    "));
+    if !services.is_empty() {
+        sql.push_str("\n  PREWHERE ");
+        sql.push_str(&service_predicate(services));
+    }
+    sql.push_str(&format!(
+        "\n  WHERE fingerprint IN ({}) AND timestamp_ns {} {} AND timestamp_ns <= {}",
+        fp_list(fingerprints),
+        lower.sql_op(),
+        window.start_ns,
+        window.end_ns
+    ));
+    for clause in extra_predicates {
+        sql.push_str(" AND ");
+        sql.push_str(clause.as_sql());
+    }
+    if let Some(k) = knobs.filter(|k| k.row_delay_micros > 0) {
+        sql.push_str(&format!(
+            " AND sleepEachRow({}) = 0",
+            f64::from(k.row_delay_micros) / 1_000_000.0
+        ));
+    }
+    sql
+}
+
+/// **S1, the extracted-field group key statement** (issue #507): one row
+/// per (class, grid point, key labels, projected metadata), holding the sum
+/// of the decided rows' unwrapped values and three counts.
 ///
-/// SETTINGS precise_float_parsing = 1                       every conversion above
+/// ```text
+/// decided    the database read the value and every key label as our parser would
+/// missing    no value at the path, no spelling of it, a valid document: dropped
+/// undecided  anything else: `UndecidedRows::Throw` fails the statement, and the
+///            query takes today's route, where our parser reads the line
 /// ```
 ///
-/// **The trailing `SETTINGS` is not decoration.** Without it
-/// `toFloat64OrNull` is not correctly rounded, and a single row is enough
-/// to answer one ulp away from the client path — see
-/// [`UNWRAP_PARSER_SETTING`], which also records what the setting does to
-/// the four remaining conjuncts of `q`.
-///
-/// **`trim` is what makes the common case reachable.** `JSONExtractRaw`
-/// returns `45.2` for a JSON number and `"45.2"` for a JSON string, and a
-/// logging agent wrapping a plain line writes the second. Trimming the
-/// quotes reads both; a type check on `JSONExtractFloat` read only the
-/// first.
-///
-/// **`all_numeric` is one column and it conflates two outcomes on
-/// purpose.** An absent key, a JSON `null` and an unparseable value are
-/// three different behaviours in the evaluator — no series, no series, and
-/// an error series — and this column says only "not all of them
-/// qualified". That is sound ONLY because the fallback is whole-query: the
-/// reader discards the result and re-runs on the client path, where the
-/// evaluator makes the distinction itself. **There is no version of this
-/// where the lowered path reproduces an error series.**
-///
-/// **Why the fallback cannot be per group.** A group that fails the guard
-/// needs its rows re-read and they were aggregated away; and the value's
-/// shape is a property of each row, so nothing at plan time can predict
-/// it. The price is one wasted statement, paid exactly on the corpora
-/// where the lowering does not help.
-///
-/// Raw source only, as [`metric_range_bucketed`] — the rollup table has no
-/// `body` column to extract from.
+/// The statement's group key holds only what can reach the answer, so a
+/// query over many distinct lines returns as many rows as it has answer
+/// points, not as many as it read. See docs/query-to-sql.md, the
+/// extracted-field group key.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_range_unwrapped(
     table: &str,
-    reducer: UnwrapReducer,
-    name: &CheckedLiteral,
+    value: &UnwrappedValue,
+    columns: &GroupKeyColumns,
     services: &[CheckedLiteral],
     fingerprints: &[u64],
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
-) -> Result<String, super::predicate::BucketGridRefusal> {
+    undecided: UndecidedRows,
+    knobs: Option<KeyStatementTestKnobs>,
+) -> Result<String, KeyStatementRefusal> {
     let BucketedScan {
         window,
         lower,
         lo_ns,
         step_ns,
     } = scan;
-    let TimeWindow { start_ns, end_ns } = window;
-    // The grid column is the raw table's own, as the counting form's: this
-    // builder is raw-only, so there is one column it can be.
-    let bucket = super::predicate::bucket_expr("timestamp_ns", lo_ns, step_ns, start_ns, end_ns)?;
-    let fp_list = fp_list(fingerprints);
-    let lower_op = lower.sql_op();
-    let prewhere = metric_prewhere(services);
-    let bucket_sql = bucket.as_sql();
-    let key = name.as_sql();
-    let prefix = unwrap_prefix_literal();
-    let prefix = prefix.as_sql();
-    let non_zero = super::predicate::literal(UNWRAP_TEXT_DENOTES_NON_ZERO);
-    let non_zero = non_zero.as_sql();
-    let t = format!("trim(BOTH '\"' FROM JSONExtractRaw(body, {key}))");
-    let raw = format!("toFloat64OrNull({t})");
-    let q = format!(
-        "(match({t}, {prefix}) AND isNotNull({raw}) AND isFinite({raw}) AND abs({raw}) != \
-         {UNWRAP_OVERFLOW_CUTOFF} AND ({raw} != 0 OR NOT match({t}, {non_zero})))"
+    let bucket = super::predicate::bucket_expr(
+        "timestamp_ns",
+        lo_ns,
+        step_ns,
+        window.start_ns,
+        window.end_ns,
+    )?;
+    let readers = unwrapped_reader_columns(value, &columns.keys)?;
+    let (sm_text, sm_kept) = unwrapped_metadata_columns(&value.metadata, false);
+    let inner = unwrapped_inner_level(
+        &["fingerprint", "timestamp_ns", "structured_metadata"],
+        &readers,
+        table,
+        services,
+        fingerprints,
+        window,
+        lower,
+        extra_predicates,
+        knobs,
     );
-    let f = reducer.function();
     let mut sql = format!(
-        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {f}If(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS all_numeric, structured_metadata\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT {} AS class, {} AS bucket_ns, {}, sumIf(ifNull(uw_x, 0), decided = 1) AS v, \
+         countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, \
+         countIf(decided = 0 AND uw_missing = 0) AS n_undecided, {sm_text}, {sm_kept}\nFROM (\n{inner}\n)",
+        unwrapped_class_expr(&columns.classes),
+        bucket.as_sql(),
+        unwrapped_keys_column(value, &columns.keys),
     );
-    for clause in extra_predicates {
-        sql.push_str("\n  AND ");
-        sql.push_str(clause.as_sql());
+    if undecided == UndecidedRows::Throw {
+        sql.push_str("\nWHERE throwIf(decided = 0 AND uw_missing = 0) = 0");
     }
-    sql.push_str("\nGROUP BY fingerprint, bucket_ns, structured_metadata");
-    sql.push_str("\nSETTINGS ");
+    sql.push_str("\nGROUP BY class, bucket_ns, keys, sm_text, sm_kept\nSETTINGS ");
+    sql.push_str(UNWRAP_PARSER_SETTING);
+    if let Some(limit) = knobs.and_then(|k| k.max_execution_s) {
+        sql.push_str(&format!(", max_execution_time = {limit}"));
+    }
+    Ok(sql)
+}
+
+/// **L, the one read** (issue #507): every row that is not missing, in one
+/// streaming statement. A decided row carries its key labels and value; an
+/// undecided row carries its body and stored metadata for our parser. It
+/// runs only after today's route refused on a buffer the key route does not
+/// allocate, and its rows are one snapshot of the parts, as the raw scan's
+/// are.
+#[allow(clippy::too_many_arguments)]
+pub fn metric_range_unwrapped_rows(
+    table: &str,
+    value: &UnwrappedValue,
+    columns: &GroupKeyColumns,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+) -> Result<String, KeyStatementRefusal> {
+    let BucketedScan {
+        window,
+        lower,
+        lo_ns,
+        step_ns,
+    } = scan;
+    let bucket = super::predicate::bucket_expr(
+        "timestamp_ns",
+        lo_ns,
+        step_ns,
+        window.start_ns,
+        window.end_ns,
+    )?;
+    let readers = unwrapped_reader_columns(value, &columns.keys)?;
+    let (sm_text, sm_kept) = unwrapped_metadata_columns(&value.metadata, true);
+    let inner = unwrapped_inner_level(
+        &["fingerprint", "timestamp_ns", "body", "structured_metadata"],
+        &readers,
+        table,
+        services,
+        fingerprints,
+        window,
+        lower,
+        extra_predicates,
+        None,
+    );
+    let mut sql = format!(
+        "SELECT {} AS class, {} AS bucket_ns, decided, {}, if(decided = 1, ifNull(uw_x, 0), 0) AS v, \
+         if(decided = 1, '', body) AS body, fingerprint, {sm_text}, {sm_kept}\nFROM (\n{inner}\n)",
+        unwrapped_class_expr(&columns.classes),
+        bucket.as_sql(),
+        unwrapped_keys_column(value, &columns.keys),
+    );
+    sql.push_str("\nWHERE NOT (decided = 0 AND uw_missing = 1)\nSETTINGS ");
     sql.push_str(UNWRAP_PARSER_SETTING);
     Ok(sql)
+}
+
+/// The per-body verdicts of the group key statement over a table of bodies
+/// (`c String, body String`), for the agreement measurement (issue #507):
+/// the same reader columns S1 carries, selected per body and ordered by
+/// `c`. No stream label or metadata entry blanks a key here.
+pub fn metric_range_unwrapped_verdicts(
+    corpus_table: &str,
+    value: &UnwrappedValue,
+    keys: &[UnwrapKeyLabel],
+) -> Result<String, KeyStatementRefusal> {
+    let keys: Vec<(UnwrapKeyLabel, Vec<u64>)> =
+        keys.iter().map(|k| (k.clone(), Vec::new())).collect();
+    let readers = unwrapped_reader_columns(value, &keys)?;
+    // A corpus row belongs to no stream and carries no metadata, so no key
+    // is blanked: the keys column is rendered as the targeted form renders it.
+    let mut unblanked = value.clone();
+    unblanked.form = UnwrapForm::Targeted;
+    let keys_col = unwrapped_keys_column(&unblanked, &keys);
+    Ok(format!(
+        "SELECT c, body, decided, uw_missing, uw_x, {keys_col}\nFROM (\n  SELECT c, body, structured_metadata,\n    {}\n  FROM (SELECT c, body, '' AS structured_metadata FROM {corpus_table})\n)\nORDER BY c\nSETTINGS {UNWRAP_PARSER_SETTING}",
+        readers.join(",\n    ")
+    ))
+}
+
+/// `(sm_text, sm_kept)` for a group key statement. In L an undecided row
+/// carries its whole stored metadata for our parser.
+fn unwrapped_metadata_columns(metadata: &MetadataSent, lane: bool) -> (String, String) {
+    let empty = "CAST([], 'Array(Tuple(String, String))') AS sm_kept".to_string();
+    match metadata {
+        MetadataSent::Text => ("structured_metadata AS sm_text".to_string(), empty),
+        MetadataSent::Projected { values, presence } => {
+            let text = if lane {
+                "if(decided = 1, '', structured_metadata) AS sm_text"
+            } else {
+                "'' AS sm_text"
+            };
+            (
+                text.to_string(),
+                format!(
+                    "{} AS sm_kept",
+                    super::predicate::metadata_names_projection(values, presence).as_sql()
+                ),
+            )
+        }
+    }
 }
 
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
@@ -3179,107 +3418,8 @@ mod tests {
         );
     }
 
-    /// Issue #507, W4 — the unwrapped statement, frozen, and the row type
-    /// named for its columns.
-    ///
-    /// The text is asserted whole rather than by parts, because every part
-    /// of it is load-bearing: the `trim` that reads a quoted number, the
-    /// anchored prefix test that rejects `"E12"`, the overflow equality
-    /// that excludes the one-ulp class, the `ifNull` that keeps the
-    /// aggregate's argument non-nullable, and the `all_numeric` column the
-    /// reader refuses on.
-    #[test]
-    fn the_unwrapped_statement_is_byte_exact_and_its_row_type_names_its_columns() {
-        use crate::logql::rows::MetricRangeUnwrappedRow;
-        use pulsus_clickhouse::Row;
-
-        let f = W0Fixtures::new();
-        let sql = metric_range_unwrapped(
-            "log_samples",
-            UnwrapReducer::Sum,
-            &crate::logql::predicate::literal("latency"),
-            &f.one_service,
-            &f.fingerprints,
-            BucketedScan {
-                window: TimeWindow {
-                    start_ns: 1_699_999_940_000_000_000,
-                    end_ns: 1_700_003_600_000_000_000,
-                },
-                lower: ScanLowerBound::Exclusive,
-                lo_ns: 1_699_999_940_000_000_000,
-                step_ns: 60_000_000_000,
-            },
-            &f.no_predicate,
-        )
-        .expect("an ordinary grid renders");
-
-        let t = "trim(BOTH '\"' FROM JSONExtractRaw(body, 'latency'))";
-        let raw = format!("toFloat64OrNull({t})");
-        let q = format!(
-            "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND isFinite({raw}) \
-             AND abs({raw}) != 1.7976931348623157e308 AND ({raw} != 0 OR NOT match({t}, '[1-9]')))"
-        );
-        let expected = format!(
-            "SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - \
-             1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, \
-             sumIf(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS \
-             all_numeric, structured_metadata\nFROM log_samples\nPREWHERE service = \
-             'checkout'\nWHERE fingerprint IN (18374, 99120)\n  AND timestamp_ns > \
-             1699999940000000000 AND timestamp_ns <= 1700003600000000000\nGROUP BY fingerprint, \
-             bucket_ns, structured_metadata\nSETTINGS precise_float_parsing = 1"
-        );
-        assert_eq!(sql, expected);
-
-        // The parser setting travels IN the statement, so the reported
-        // query is the executed one (review round 4). Without it
-        // `toFloat64OrNull('9367469347402735e292')` converts to
-        // `0x7fe0acb5cadc2918` where `f64::from_str` gives
-        // `0x7fe0acb5cadc2917`, and at `n = 1` the summation-order bound
-        // that justifies this lowering is zero.
-        assert!(
-            sql.ends_with("\nSETTINGS precise_float_parsing = 1"),
-            "{sql}"
-        );
-
-        // The regex reaches the matcher with ONE backslash — `\.` must
-        // stay a literal dot rather than becoming "any character".
-        assert!(sql.contains(r"'^[+-]?([0-9]|\\.[0-9])'"), "{sql}");
-
-        // The OTHER reducer renders its own function name and nothing else
-        // about the statement moves. There are two, and the loop this
-        // replaced was written when there were four (review round 3).
-        let other = metric_range_unwrapped(
-            "log_samples",
-            UnwrapReducer::Avg,
-            &crate::logql::predicate::literal("latency"),
-            &f.one_service,
-            &f.fingerprints,
-            BucketedScan {
-                window: TimeWindow {
-                    start_ns: 1_699_999_940_000_000_000,
-                    end_ns: 1_700_003_600_000_000_000,
-                },
-                lower: ScanLowerBound::Exclusive,
-                lo_ns: 1_699_999_940_000_000_000,
-                step_ns: 60_000_000_000,
-            },
-            &f.no_predicate,
-        )
-        .expect("renders");
-        assert_eq!(other, sql.replace("sumIf(", "avgIf("));
-        // And the enum has exactly the two: a third variant makes this
-        // match non-exhaustive and the test stops compiling, which is
-        // where the decision to add one has to be taken.
-        for r in [UnwrapReducer::Sum, UnwrapReducer::Avg] {
-            match r {
-                UnwrapReducer::Sum => assert_eq!(r.function(), "sum"),
-                UnwrapReducer::Avg => assert_eq!(r.function(), "avg"),
-            }
-        }
-
-        // The decode binds on the column NAME, so the aliases and the
-        // derive's names must agree in order — the `metric_range_bucketed`
-        // arrangement, for the row type that carries three more columns.
+    /// The column names a statement's outer projection declares, in order.
+    fn projected_names(sql: &str) -> Vec<String> {
         let select = sql
             .strip_prefix("SELECT ")
             .expect("the statement opens with its projection")
@@ -3287,24 +3427,238 @@ mod tests {
             .next()
             .expect("the projection is one line");
         let mut items: Vec<&str> = Vec::new();
-        let (mut depth, mut start) = (0usize, 0usize);
-        for (i, c) in select.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ',' if depth == 0 => {
+        let (mut depth, mut start, mut quoted) = (0i32, 0usize, false);
+        let bytes = select.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if quoted => i += 1,
+                b'\'' => quoted = !quoted,
+                b'(' | b'[' if !quoted => depth += 1,
+                b')' | b']' if !quoted => depth -= 1,
+                b',' if depth == 0 && !quoted => {
                     items.push(&select[start..i]);
                     start = i + 1;
                 }
                 _ => {}
             }
+            i += 1;
         }
         items.push(&select[start..]);
-        let names: Vec<&str> = items
+        items
             .iter()
-            .map(|item| item.trim().rsplit(" AS ").next().expect("a column name"))
+            .map(|item| {
+                item.trim()
+                    .rsplit(" AS ")
+                    .next()
+                    .expect("a name")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Issue #507, criterion 1 — **the two group key statements are byte
+    /// exact**, against fixtures rendered by an independent renderer (the
+    /// plan's Python renderer, with the key labels in one
+    /// `Array(Tuple(UInt8, String))` column), for S1 with and without the
+    /// throw, L, and the targeted, nested-path, no-key, several-class,
+    /// stored-text-metadata and `_`-name variants. The row types' field
+    /// names are the statements' aliases.
+    #[test]
+    fn the_unwrapped_statements_are_byte_exact() {
+        use crate::logql::pipeline::RangeStepRules;
+        use crate::logql::rows::{MetricRangeUnwrappedRow, UnwrappedLaneRow};
+        use pulsus_clickhouse::Row;
+
+        let fixtures = include_str!("../../tests/golden/unwrapped_statements.txt");
+        let expected: std::collections::BTreeMap<&str, &str> = fixtures
+            .split("=== ")
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                let (name, sql) = c.split_once('\n').expect("a name line");
+                (name, sql.trim_end_matches('\n'))
+            })
             .collect();
-        assert_eq!(names, <MetricRangeUnwrappedRow as Row>::COLUMN_NAMES);
+        assert_eq!(expected.len(), 10, "ten fixtures");
+
+        let f = W0Fixtures::new();
+        let scan = BucketedScan {
+            window: TimeWindow {
+                start_ns: 1_699_999_940_000_000_000,
+                end_ns: 1_700_003_600_000_000_000,
+            },
+            lower: ScanLowerBound::Exclusive,
+            lo_ns: 1_699_999_940_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let key = |label: &str, source: &str| UnwrapKeyLabel {
+            label: label.to_string(),
+            source: source.to_string(),
+        };
+        let value = |form: UnwrapForm, path: &[&str], metadata: MetadataSent| UnwrappedValue {
+            reducer: UnwrapReducer::Sum,
+            form,
+            label: path.last().expect("a path").to_string(),
+            path: path.iter().map(|s| s.to_string()).collect(),
+            keys: Vec::new(),
+            classes: ClassNames::PerFingerprint,
+            metadata,
+            grouping: None,
+            stages: Vec::new(),
+            rules: RangeStepRules::PLAIN,
+        };
+        let presence = |unwrap: &str| {
+            vec![
+                "__error__".to_string(),
+                "__error_details__".to_string(),
+                unwrap.to_string(),
+            ]
+        };
+        let by_status = value(
+            UnwrapForm::Bare,
+            &["latency"],
+            MetadataSent::Projected {
+                values: vec!["status".to_string()],
+                presence: presence("latency"),
+            },
+        );
+        let one_class = GroupKeyColumns {
+            keys: vec![(key("status", "status"), Vec::new())],
+            classes: Some(vec![vec![18374, 99120]]),
+        };
+        let targeted = value(UnwrapForm::Targeted, &["latency"], MetadataSent::Text);
+        let per_fp = GroupKeyColumns {
+            keys: Vec::new(),
+            classes: None,
+        };
+        let targeted_keys = GroupKeyColumns {
+            keys: vec![
+                (key("c", "code"), Vec::new()),
+                (key("m", "missing"), Vec::new()),
+            ],
+            classes: None,
+        };
+        let s1 = |v: &UnwrappedValue, c: &GroupKeyColumns, u: UndecidedRows| {
+            metric_range_unwrapped(
+                "log_samples",
+                v,
+                c,
+                &f.one_service,
+                &f.fingerprints,
+                scan,
+                &f.no_predicate,
+                u,
+                None,
+            )
+            .expect("renders")
+        };
+        let lane = |v: &UnwrappedValue, c: &GroupKeyColumns| {
+            metric_range_unwrapped_rows(
+                "log_samples",
+                v,
+                c,
+                &f.one_service,
+                &f.fingerprints,
+                scan,
+                &f.no_predicate,
+            )
+            .expect("renders")
+        };
+        let bare_no_key = value(
+            UnwrapForm::Bare,
+            &["latency"],
+            MetadataSent::Projected {
+                values: Vec::new(),
+                presence: presence("latency"),
+            },
+        );
+        let underscores = value(
+            UnwrapForm::Bare,
+            &["latency_ms"],
+            MetadataSent::Projected {
+                values: vec!["_".to_string(), "a_b".to_string()],
+                presence: presence("latency_ms"),
+            },
+        );
+        let rendered = [
+            (
+                "s1_bare_by_status",
+                s1(&by_status, &one_class, UndecidedRows::Throw),
+            ),
+            (
+                "s1_bare_by_status_counting_undecided",
+                s1(&by_status, &one_class, UndecidedRows::Count),
+            ),
+            ("l_bare_by_status", lane(&by_status, &one_class)),
+            (
+                "s1_targeted_no_key",
+                s1(&targeted, &per_fp, UndecidedRows::Throw),
+            ),
+            (
+                "s1_targeted_nested_path",
+                s1(
+                    &value(
+                        UnwrapForm::Targeted,
+                        &["req", "latency"],
+                        MetadataSent::Text,
+                    ),
+                    &per_fp,
+                    UndecidedRows::Throw,
+                ),
+            ),
+            (
+                "s1_targeted_keys_text_metadata",
+                s1(&targeted, &targeted_keys, UndecidedRows::Throw),
+            ),
+            (
+                "l_targeted_keys_text_metadata",
+                lane(&targeted, &targeted_keys),
+            ),
+            (
+                "s1_bare_no_key",
+                s1(
+                    &bare_no_key,
+                    &GroupKeyColumns {
+                        keys: Vec::new(),
+                        classes: Some(vec![vec![18374, 99120]]),
+                    },
+                    UndecidedRows::Throw,
+                ),
+            ),
+            (
+                "s1_bare_several_classes",
+                s1(
+                    &by_status,
+                    &GroupKeyColumns {
+                        keys: vec![(key("status", "status"), vec![99120])],
+                        classes: Some(vec![vec![18374], vec![99120]]),
+                    },
+                    UndecidedRows::Throw,
+                ),
+            ),
+            (
+                "s1_bare_underscore_names",
+                s1(
+                    &underscores,
+                    &GroupKeyColumns {
+                        keys: vec![(key("_", "_"), Vec::new()), (key("a_b", "a_b"), Vec::new())],
+                        classes: Some(vec![vec![18374, 99120]]),
+                    },
+                    UndecidedRows::Throw,
+                ),
+            ),
+        ];
+        for (name, sql) in &rendered {
+            assert_eq!(sql.as_str(), expected[name], "{name}");
+        }
+        assert_eq!(
+            projected_names(&rendered[0].1),
+            <MetricRangeUnwrappedRow as Row>::COLUMN_NAMES
+        );
+        assert_eq!(
+            projected_names(&rendered[2].1),
+            <UnwrappedLaneRow as Row>::COLUMN_NAMES
+        );
     }
 
     /// Issue #507, W2 — **the row type's field names ARE the statement's

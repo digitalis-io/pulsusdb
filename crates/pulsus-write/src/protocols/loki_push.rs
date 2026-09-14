@@ -1,13 +1,18 @@
 //! Loki push receiver parser (issue #77 architect plan, docs/api.md §8.2): a
 //! pure `bytes -> PushRequest -> ParsedLogs` pipeline with no I/O — the
 //! structural analog of [`crate::protocols::remote_write`], but feeding the
-//! **log** storage path. A pushed stream's label set flattens through the
-//! *identical* frozen canonical model the OTLP logs path uses
-//! (`pulsus_model::LabelSet::from_normalized` -> `stream_fingerprint`), so a
-//! stream pushed here fingerprints byte-for-byte the same as the same
-//! logical stream ingested via `otlp_logs::parse` — the load-bearing
-//! correctness gate (AC-3): pushed logs are queryable via LogQL (#72/#73)
-//! and appear in tail (#74) with no read-path change.
+//! **log** storage path. A pushed stream's label names are validated against
+//! the stream-label grammar and stored as sent
+//! (`pulsus_model::LabelSet::from_normalized` -> `stream_fingerprint`), while
+//! an OTLP resource attribute key is renamed to the reference's label name
+//! first (`LabelSet::from_log_attribute_pairs`, issue #507). The two paths
+//! meet at `stream_fingerprint` over the pairs each one STORES, so a stream
+//! pushed here fingerprints byte-for-byte the same as the same logical stream
+//! ingested via `otlp_logs::parse` wherever the pushed names equal the stored
+//! OTLP ones (`service.name` -> `service_name`, `env` unchanged) — the
+//! load-bearing correctness gate (AC-3), pinned by the push-fixture
+//! fingerprint test: pushed logs are queryable via LogQL (#72/#73) and appear
+//! in tail (#74) with no read-path change.
 //!
 //! ## Wire types: hand-rolled `logproto` prost structs
 //!
@@ -1350,7 +1355,8 @@ fn resolve_pb_timestamp(ts: &Timestamp) -> Result<i64, LogsIngestError> {
 
 /// Parses a Loki `StreamAdapter.labels` string — a Prometheus label-set
 /// literal `{key="value", key2="value2"}` — into a [`LabelSet`] via the
-/// same `LabelSet::from_normalized` seam every other path uses. See
+/// same `LabelSet::from_normalized` seam a pushed stream uses (the OTLP log
+/// path renames its attribute keys first, issue #507). See
 /// [`parse_label_pairs`] for the accepted grammar and the rejections; this
 /// wrapper only adds the canonicalizing collapse, so it is used where the
 /// **raw** pairs are not needed (the duplicate-name bound in
@@ -2169,8 +2175,8 @@ struct JsonEntry {
 /// per-entry cardinality bound — so raw pairs are counted instead, which is
 /// also how the reference accumulates them (`unmarshalHTTPToLogProtoEntry`
 /// appends every pair, `pkg/loghttp/query.go:181-196 @ v3.7.4`). Downstream
-/// dedup/canonicalization is left to [`canonical_structured_metadata`]'s
-/// `LabelSet::from_normalized`, exactly as the protobuf path does.
+/// dedup and renaming are left to [`canonical_structured_metadata`]'s
+/// `resolve_structured_metadata`, exactly as the protobuf path does.
 struct BoundedStructuredMetadata(Vec<(String, String)>);
 
 impl<'de> serde::Deserialize<'de> for BoundedStructuredMetadata {
@@ -2807,9 +2813,10 @@ mod tests {
     }
 
     #[test]
-    fn dotted_key_canonicalizes_like_every_other_path() {
-        // A Loki label name is normally already dot-free, but the canonical
-        // seam is the same one OTLP uses.
+    fn a_pushed_label_name_is_stored_as_sent() {
+        // A pushed label name is already dot-free — the grammar refuses a dot
+        // — and `from_normalized` leaves such a name unchanged. An OTLP
+        // attribute key takes the log name rule instead (issue #507).
         let (labels, _) = parse_label_set(r#"{service_name="checkout"}"#).unwrap();
         assert_eq!(labels.get("service_name"), Some("checkout"));
     }

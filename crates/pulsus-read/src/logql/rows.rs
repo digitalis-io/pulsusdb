@@ -213,27 +213,44 @@ pub struct MetricRangeBucketRow {
     pub structured_metadata: String,
 }
 
-/// A bucketed range partial over an UNWRAPPED value (issue #507, W4): one
-/// `(fingerprint, grid point, structured_metadata)` group from
-/// [`crate::logql::sql::metric_range_unwrapped`].
+/// One row of the extracted-field group key statement, S1 (issue #507,
+/// [`crate::logql::sql::metric_range_unwrapped`]): one (class, grid point,
+/// key labels, projected metadata) group.
 ///
-/// `v` is the reducer's aggregate over the rows whose value qualified;
-/// `n` is EVERY row in the group, qualifying or not; `all_numeric` says
-/// whether those two sets are the same. A `0` there sends the whole query
-/// to the client path — the statement cannot tell an absent key from an
-/// unparseable one, and the evaluator answers those two differently.
-///
-/// `structured_metadata` is LAST, the convention the other two metric row
-/// types keep. It is carried raw and is what the reader reads to find a
-/// key that shadows the unwrapped name.
+/// `keys` is `(present, text)` per key label, in the plan's key order;
+/// `present = 0` is an absent or blanked key. `v` sums the decided rows'
+/// values; `n_value` counts them, `n_missing` counts the rows dropped for
+/// having no value, and `n_undecided` the rows the database could not
+/// decide (zero whenever the statement throws on them).
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MetricRangeUnwrappedRow {
-    pub fingerprint: u64,
+    pub class: u64,
     pub bucket_ns: i64,
+    pub keys: Vec<(u8, String)>,
     pub v: f64,
-    pub n: u64,
-    pub all_numeric: u8,
-    pub structured_metadata: String,
+    pub n_value: u64,
+    pub n_missing: u64,
+    pub n_undecided: u64,
+    pub sm_text: String,
+    pub sm_kept: Vec<(String, String)>,
+}
+
+/// One row of the one read, L (issue #507,
+/// [`crate::logql::sql::metric_range_unwrapped_rows`]): a decided row with
+/// its key labels and value, or an undecided row with its `body`, its
+/// `fingerprint` and its stored metadata in `sm_text`. A missing row is
+/// never sent.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct UnwrappedLaneRow {
+    pub class: u64,
+    pub bucket_ns: i64,
+    pub decided: u8,
+    pub keys: Vec<(u8, String)>,
+    pub v: f64,
+    pub body: String,
+    pub fingerprint: u64,
+    pub sm_text: String,
+    pub sm_kept: Vec<(String, String)>,
 }
 
 #[cfg(test)]

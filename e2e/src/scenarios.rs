@@ -479,9 +479,12 @@ fn build_otlp_export_request(
     serde_json::json!({ "resourceLogs": resource_logs })
 }
 
-/// Normalizes a label key the same way the writer does
-/// (`pulsus_model::LabelSet::from_normalized`, docs/architecture.md §2.3):
-/// characters outside `[a-zA-Z0-9_]` become `_`.
+/// The label name an OTLP resource or scope attribute key is expected under:
+/// each character outside `[a-zA-Z0-9_]` becomes `_`. The writer stores
+/// `pulsus_model::log_label_name`'s result (docs/architecture.md §2.3), which
+/// is the same for every key the roundtrip fixture carries (`env`,
+/// `k8s.pod.name`, `team`); a key with a run of such characters, a leading
+/// digit or `__` affixes would need the log rule.
 fn normalize_label_key(key: &str) -> String {
     key.chars()
         .map(|c| {

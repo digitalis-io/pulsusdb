@@ -1,0 +1,801 @@
+# id	mode	labels the pinned reference returned, as a JSON object with sorted keys (stream labels and detected_level removed)
+L000	lenient	{}
+L000	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L001	lenient	{}
+L001	strict	{}
+L002	lenient	{}
+L002	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L003	lenient	{}
+L003	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '='"}
+L004	lenient	{}
+L004	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L005	lenient	{}
+L005	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L006	lenient	{}
+L006	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L007	lenient	{}
+L007	strict	{}
+L008	lenient	{"ba": "1{"}
+L008	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L009	lenient	{}
+L009	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L010	lenient	{}
+L010	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L011	lenient	{}
+L011	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L012	lenient	{"f": "2"}
+L012	strict	{"f": "2"}
+L013	lenient	{}
+L013	strict	{}
+L014	lenient	{}
+L014	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L015	lenient	{}
+L015	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L016	lenient	{"b": "q"}
+L016	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L017	lenient	{}
+L017	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unexpected '\"'"}
+L018	lenient	{}
+L018	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L019	lenient	{"_b": "q"}
+L019	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unexpected '='", "_b": "q"}
+L020	lenient	{}
+L020	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L021	lenient	{}
+L021	strict	{}
+L022	lenient	{}
+L022	strict	{}
+L023	lenient	{}
+L023	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unterminated quoted value"}
+L024	lenient	{}
+L024	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unterminated quoted value"}
+L025	lenient	{}
+L025	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '='"}
+L026	lenient	{}
+L026	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L027	lenient	{}
+L027	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L028	lenient	{}
+L028	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L029	lenient	{}
+L029	strict	{}
+L030	lenient	{}
+L030	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L031	lenient	{}
+L031	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L032	lenient	{}
+L032	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L033	lenient	{}
+L033	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L034	lenient	{}
+L034	strict	{}
+L035	lenient	{}
+L035	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L036	lenient	{}
+L036	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L037	lenient	{}
+L037	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L038	lenient	{"b": "q"}
+L038	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '='", "b": "q"}
+L039	lenient	{}
+L039	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L040	lenient	{}
+L040	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L041	lenient	{}
+L041	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '='"}
+L042	lenient	{"b": "q", "d": "u\"v"}
+L042	strict	{"b": "q", "d": "u\"v"}
+L043	lenient	{}
+L043	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'"}
+L044	lenient	{}
+L044	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L045	lenient	{"__b": "q"}
+L045	strict	{"__b": "q"}
+L046	lenient	{}
+L046	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L047	lenient	{}
+L047	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L048	lenient	{"_1_d": "u\"v", "a": "1:"}
+L048	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unexpected '='", "a": "1:"}
+L049	lenient	{}
+L049	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L050	lenient	{"g": "3"}
+L050	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L051	lenient	{}
+L051	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L052	lenient	{}
+L052	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unterminated quoted value"}
+L053	lenient	{}
+L053	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L054	lenient	{}
+L054	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L055	lenient	{}
+L055	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L056	lenient	{}
+L056	strict	{}
+L057	lenient	{}
+L057	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unterminated quoted value"}
+L058	lenient	{}
+L058	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L059	lenient	{"d": "u\"v"}
+L059	strict	{"d": "u\"v"}
+L060	lenient	{"g": "3"}
+L060	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '\"'"}
+L061	lenient	{}
+L061	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L062	lenient	{"d": "u\"v"}
+L062	strict	{"d": "u\"v"}
+L063	lenient	{}
+L063	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L064	lenient	{}
+L064	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L065	lenient	{}
+L065	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L066	lenient	{}
+L066	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L067	lenient	{}
+L067	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L068	lenient	{"xb": "q"}
+L068	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '='", "xb": "q"}
+L069	lenient	{}
+L069	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L070	lenient	{"a": "1"}
+L070	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L071	lenient	{"g": "3"}
+L071	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L072	lenient	{"ba": "1\\", "k1k1b": "q"}
+L072	strict	{"ba": "1\\", "k1k1b": "q"}
+L073	lenient	{}
+L073	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unterminated quoted value"}
+L074	lenient	{}
+L074	strict	{}
+L075	lenient	{"a": "1\u00e9"}
+L075	strict	{"a": "1\u00e9"}
+L076	lenient	{"g": "3"}
+L076	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unexpected '='", "g": "3"}
+L077	lenient	{}
+L077	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '='"}
+L078	lenient	{}
+L078	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L079	lenient	{"_1e": "openb="}
+L079	strict	{"_1e": "openb=", "__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 13 : unexpected '\"'"}
+L080	lenient	{}
+L080	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L081	lenient	{"e": "open\t\u00e9f=2\u00e9"}
+L081	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 20 : unexpected '\"'", "e": "open\t\u00e9f=2\u00e9"}
+L082	lenient	{"bc": "v w"}
+L082	strict	{"bc": "v w"}
+L083	lenient	{}
+L083	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unterminated quoted value"}
+L084	lenient	{}
+L084	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 16 : unterminated quoted value"}
+L085	lenient	{}
+L085	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L086	lenient	{}
+L086	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L087	lenient	{}
+L087	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L088	lenient	{}
+L088	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 26 : unterminated quoted value"}
+L089	lenient	{"d": "u\"v", "e": "openabe="}
+L089	strict	{"d": "u\"v", "e": "openabe="}
+L090	lenient	{}
+L090	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L091	lenient	{}
+L091	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L092	lenient	{}
+L092	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L093	lenient	{}
+L093	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L094	lenient	{"g": "3"}
+L094	strict	{"g": "3"}
+L095	lenient	{}
+L095	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L096	lenient	{}
+L096	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L097	lenient	{}
+L097	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L098	lenient	{}
+L098	strict	{}
+L099	lenient	{"e": "open", "g": "3b{"}
+L099	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '\"'", "e": "open"}
+L100	lenient	{}
+L100	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '\"'"}
+L101	lenient	{}
+L101	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '='"}
+L102	lenient	{}
+L102	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L103	lenient	{"f": "2"}
+L103	strict	{"f": "2"}
+L104	lenient	{}
+L104	strict	{}
+L105	lenient	{}
+L105	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L106	lenient	{}
+L106	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L107	lenient	{}
+L107	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L108	lenient	{}
+L108	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L109	lenient	{}
+L109	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L110	lenient	{}
+L110	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'"}
+L111	lenient	{}
+L111	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 14 : unterminated quoted value"}
+L112	lenient	{"_": "da"}
+L112	strict	{"_": "da", "__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unexpected '\"'"}
+L113	lenient	{}
+L113	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L114	lenient	{"a": "1"}
+L114	strict	{"a": "1"}
+L115	lenient	{}
+L115	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L116	lenient	{"b": "q"}
+L116	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'", "b": "q"}
+L117	lenient	{}
+L117	strict	{}
+L118	lenient	{"__e": "open: g=3{"}
+L118	strict	{"__e": "open: g=3{", "__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 19 : unexpected '\"'"}
+L119	lenient	{}
+L119	strict	{}
+L120	lenient	{}
+L120	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '='"}
+L121	lenient	{"b": "q"}
+L121	strict	{"b": "q"}
+L122	lenient	{"a": "11k1{"}
+L122	strict	{"a": "11k1{"}
+L123	lenient	{}
+L123	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 15 : unterminated quoted value"}
+L124	lenient	{}
+L124	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L125	lenient	{}
+L125	strict	{}
+L126	lenient	{"f": "2{a"}
+L126	strict	{"f": "2{a"}
+L127	lenient	{}
+L127	strict	{}
+L128	lenient	{}
+L128	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L129	lenient	{"h": "\u00e9"}
+L129	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L130	lenient	{"b": "q"}
+L130	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '\"'", "b": "q"}
+L131	lenient	{}
+L131	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L132	lenient	{"_d": "u\"v", "d": "u\"v"}
+L132	strict	{"_d": "u\"v", "d": "u\"v"}
+L133	lenient	{}
+L133	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L134	lenient	{"g": "3"}
+L134	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L135	lenient	{}
+L135	strict	{}
+L136	lenient	{"_": "d", "g": "3"}
+L136	strict	{"_": "d", "g": "3"}
+L137	lenient	{"_h": "\u00e9"}
+L137	strict	{"_h": "\u00e9"}
+L138	lenient	{}
+L138	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L139	lenient	{"bb": "q"}
+L139	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '='", "bb": "q"}
+L140	lenient	{"c": "1", "d": "u\"v"}
+L140	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L141	lenient	{"g": "3"}
+L141	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L142	lenient	{"g": "3\u00e9"}
+L142	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L143	lenient	{}
+L143	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L144	lenient	{}
+L144	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '='"}
+L145	lenient	{}
+L145	strict	{}
+L146	lenient	{}
+L146	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '='"}
+L147	lenient	{"f": "2:x"}
+L147	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L148	lenient	{}
+L148	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unterminated quoted value"}
+L149	lenient	{"d": "u\"v"}
+L149	strict	{"d": "u\"v"}
+L150	lenient	{}
+L150	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L151	lenient	{}
+L151	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L152	lenient	{}
+L152	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unterminated quoted value"}
+L153	lenient	{}
+L153	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L154	lenient	{}
+L154	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L155	lenient	{"b": "q"}
+L155	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '\"'", "b": "q"}
+L156	lenient	{"b": "q"}
+L156	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 16 : unexpected '='", "b": "q"}
+L157	lenient	{}
+L157	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L158	lenient	{}
+L158	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unterminated quoted value"}
+L159	lenient	{}
+L159	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 19 : unterminated quoted value"}
+L160	lenient	{}
+L160	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L161	lenient	{"h": "\u00e9"}
+L161	strict	{"h": "\u00e9"}
+L162	lenient	{"a": "1"}
+L162	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L163	lenient	{}
+L163	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L164	lenient	{}
+L164	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L165	lenient	{}
+L165	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L166	lenient	{}
+L166	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L167	lenient	{"a": "1"}
+L167	strict	{"a": "1"}
+L168	lenient	{}
+L168	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L169	lenient	{}
+L169	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L170	lenient	{}
+L170	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L171	lenient	{}
+L171	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L172	lenient	{"g": "3"}
+L172	strict	{"g": "3"}
+L173	lenient	{"b": "q", "c": "k1"}
+L173	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 20 : unterminated quoted value", "b": "q", "c": "k1"}
+L174	lenient	{}
+L174	strict	{}
+L175	lenient	{"h": "\u00e9,"}
+L175	strict	{"h": "\u00e9,"}
+L176	lenient	{"g": "3", "h": "\u00e9"}
+L176	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L177	lenient	{}
+L177	strict	{}
+L178	lenient	{}
+L178	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L179	lenient	{"b": "q"}
+L179	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'", "b": "q"}
+L180	lenient	{}
+L180	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L181	lenient	{"a": "1"}
+L181	strict	{"a": "1"}
+L182	lenient	{}
+L182	strict	{}
+L183	lenient	{}
+L183	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L184	lenient	{}
+L184	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L185	lenient	{"b": "q"}
+L185	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'", "b": "q"}
+L186	lenient	{}
+L186	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unterminated quoted value"}
+L187	lenient	{}
+L187	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L188	lenient	{}
+L188	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L189	lenient	{"g": "3"}
+L189	strict	{"g": "3"}
+L190	lenient	{}
+L190	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L191	lenient	{"f": "2"}
+L191	strict	{"f": "2"}
+L192	lenient	{}
+L192	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L193	lenient	{}
+L193	strict	{}
+L194	lenient	{}
+L194	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unterminated quoted value"}
+L195	lenient	{"g": "3"}
+L195	strict	{"g": "3"}
+L196	lenient	{"d": "u\"v"}
+L196	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L197	lenient	{}
+L197	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L198	lenient	{}
+L198	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L199	lenient	{}
+L199	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L200	lenient	{}
+L200	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L201	lenient	{}
+L201	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L202	lenient	{"e": "open{"}
+L202	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unexpected '\"'", "e": "open{"}
+L203	lenient	{}
+L203	strict	{}
+L204	lenient	{"e": "openc=e="}
+L204	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 23 : unexpected '\"'", "e": "openc=e="}
+L205	lenient	{}
+L205	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L206	lenient	{"_": "b"}
+L206	strict	{"_": "b"}
+L207	lenient	{"_b": "q", "k1d": "u\"v"}
+L207	strict	{"_b": "q", "k1d": "u\"v"}
+L208	lenient	{}
+L208	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L209	lenient	{"e": "openb="}
+L209	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L210	lenient	{"h": "\u00e9k1\u00e9"}
+L210	strict	{"h": "\u00e9k1\u00e9"}
+L211	lenient	{}
+L211	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L212	lenient	{}
+L212	strict	{}
+L213	lenient	{"c": ":"}
+L213	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'", "c": ":"}
+L214	lenient	{"_1h": "\u00e9"}
+L214	strict	{"_1h": "\u00e9", "__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L215	lenient	{}
+L215	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 21 : unterminated quoted value"}
+L216	lenient	{"af": "2", "f": "2a"}
+L216	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'", "f": "2a"}
+L217	lenient	{"b": "q"}
+L217	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unexpected '='", "b": "q"}
+L218	lenient	{}
+L218	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L219	lenient	{}
+L219	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L220	lenient	{}
+L220	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L221	lenient	{}
+L221	strict	{}
+L222	lenient	{}
+L222	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L223	lenient	{"g": "3\\:"}
+L223	strict	{"g": "3\\:"}
+L224	lenient	{}
+L224	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L225	lenient	{}
+L225	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L226	lenient	{"_h": "\u00e9"}
+L226	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unexpected '='", "_h": "\u00e9"}
+L227	lenient	{}
+L227	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L228	lenient	{}
+L228	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L229	lenient	{}
+L229	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L230	lenient	{"e": "openh=\u00e9b="}
+L230	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 16 : unexpected '\"'", "e": "openh=\u00e9b="}
+L231	lenient	{}
+L231	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L232	lenient	{"d": "u\"v"}
+L232	strict	{"d": "u\"v"}
+L233	lenient	{"g": "3a"}
+L233	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L234	lenient	{"_b": "q"}
+L234	strict	{"_b": "q"}
+L235	lenient	{"_a": "1"}
+L235	strict	{"_a": "1"}
+L236	lenient	{}
+L236	strict	{}
+L237	lenient	{"k1be": "open{\u00e9"}
+L237	strict	{"k1be": "open{\u00e9"}
+L238	lenient	{}
+L238	strict	{}
+L239	lenient	{}
+L239	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L240	lenient	{"b": "q"}
+L240	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'", "b": "q"}
+L241	lenient	{"_b": "q"}
+L241	strict	{"_b": "q"}
+L242	lenient	{"d": "u\"v", "h": "\u00e9"}
+L242	strict	{"d": "u\"v", "h": "\u00e9"}
+L243	lenient	{}
+L243	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L244	lenient	{}
+L244	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L245	lenient	{}
+L245	strict	{}
+L246	lenient	{"f": "2{"}
+L246	strict	{"f": "2{"}
+L247	lenient	{}
+L247	strict	{}
+L248	lenient	{"_d": "u\"v", "a": "1", "xd": "u\"v"}
+L248	strict	{"_d": "u\"v", "a": "1", "xd": "u\"v"}
+L249	lenient	{}
+L249	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L250	lenient	{}
+L250	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L251	lenient	{}
+L251	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L252	lenient	{"a": "1"}
+L252	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'", "a": "1"}
+L253	lenient	{}
+L253	strict	{}
+L254	lenient	{}
+L254	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L255	lenient	{}
+L255	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L256	lenient	{}
+L256	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L257	lenient	{}
+L257	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L258	lenient	{}
+L258	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 14 : unterminated quoted value"}
+L259	lenient	{}
+L259	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L260	lenient	{}
+L260	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L261	lenient	{}
+L261	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L262	lenient	{"g": "3"}
+L262	strict	{"g": "3"}
+L263	lenient	{"a": "1"}
+L263	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L264	lenient	{"a": "1ab"}
+L264	strict	{"a": "1ab"}
+L265	lenient	{}
+L265	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L266	lenient	{}
+L266	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L267	lenient	{}
+L267	strict	{}
+L268	lenient	{}
+L268	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unterminated quoted value"}
+L269	lenient	{}
+L269	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L270	lenient	{"_": "b", "g": "3:"}
+L270	strict	{"_": "b", "g": "3:"}
+L271	lenient	{"g": "3"}
+L271	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L272	lenient	{}
+L272	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L273	lenient	{}
+L273	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '\"'"}
+L274	lenient	{}
+L274	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L275	lenient	{}
+L275	strict	{}
+L276	lenient	{"d": "u\"v", "g": "3x"}
+L276	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L277	lenient	{}
+L277	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L278	lenient	{}
+L278	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L279	lenient	{}
+L279	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L280	lenient	{"a": "1"}
+L280	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'", "a": "1"}
+L281	lenient	{"a": "1{"}
+L281	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L282	lenient	{}
+L282	strict	{}
+L283	lenient	{}
+L283	strict	{}
+L284	lenient	{}
+L284	strict	{}
+L285	lenient	{}
+L285	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L286	lenient	{}
+L286	strict	{}
+L287	lenient	{}
+L287	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L288	lenient	{"_d": "u\"v"}
+L288	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 13 : unexpected '\"'", "_d": "u\"v"}
+L289	lenient	{}
+L289	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L290	lenient	{"h": "\u00e9}"}
+L290	strict	{"h": "\u00e9}"}
+L291	lenient	{}
+L291	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L292	lenient	{}
+L292	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L293	lenient	{"d": "u\"v"}
+L293	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 13 : unexpected '\"'", "d": "u\"v"}
+L294	lenient	{}
+L294	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '='"}
+L295	lenient	{"b": "q"}
+L295	strict	{"b": "q"}
+L296	lenient	{}
+L296	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L297	lenient	{"g": "3"}
+L297	strict	{"g": "3"}
+L298	lenient	{}
+L298	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '='"}
+L299	lenient	{}
+L299	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L300	lenient	{}
+L300	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L301	lenient	{}
+L301	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L302	lenient	{}
+L302	strict	{}
+L303	lenient	{}
+L303	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L304	lenient	{"d": "u\"v"}
+L304	strict	{"d": "u\"v"}
+L305	lenient	{}
+L305	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L306	lenient	{"g": "3"}
+L306	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L307	lenient	{"g": "3b"}
+L307	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unexpected '\"'", "g": "3b"}
+L308	lenient	{}
+L308	strict	{}
+L309	lenient	{}
+L309	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L310	lenient	{}
+L310	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L311	lenient	{}
+L311	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L312	lenient	{}
+L312	strict	{}
+L313	lenient	{"_h": "\u00e9"}
+L313	strict	{"_h": "\u00e9"}
+L314	lenient	{"b": "q", "k1h": "\u00e9\\"}
+L314	strict	{"b": "q", "k1h": "\u00e9\\"}
+L315	lenient	{"f": "2"}
+L315	strict	{"f": "2"}
+L316	lenient	{}
+L316	strict	{}
+L317	lenient	{}
+L317	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L318	lenient	{}
+L318	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L319	lenient	{}
+L319	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 16 : unterminated quoted value"}
+L320	lenient	{}
+L320	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L321	lenient	{}
+L321	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 10 : unexpected '='"}
+L322	lenient	{}
+L322	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L323	lenient	{}
+L323	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L324	lenient	{"k1e": "open==d="}
+L324	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 17 : unexpected '\"'", "k1e": "open==d="}
+L325	lenient	{}
+L325	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'"}
+L326	lenient	{}
+L326	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L327	lenient	{"_d": "u\"v"}
+L327	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 12 : unexpected '\"'", "_d": "u\"v"}
+L328	lenient	{}
+L328	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L329	lenient	{}
+L329	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L330	lenient	{}
+L330	strict	{}
+L331	lenient	{}
+L331	strict	{}
+L332	lenient	{}
+L332	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L333	lenient	{"_h": "\u00e9a"}
+L333	strict	{"_h": "\u00e9a"}
+L334	lenient	{}
+L334	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L335	lenient	{}
+L335	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L336	lenient	{"_k1_f": "2{"}
+L336	strict	{"_k1_f": "2{"}
+L337	lenient	{}
+L337	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 3 : unexpected '\"'"}
+L338	lenient	{}
+L338	strict	{}
+L339	lenient	{}
+L339	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L340	lenient	{}
+L340	strict	{}
+L341	lenient	{"g": "3"}
+L341	strict	{"g": "3"}
+L342	lenient	{}
+L342	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L343	lenient	{}
+L343	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '='"}
+L344	lenient	{}
+L344	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L345	lenient	{}
+L345	strict	{}
+L346	lenient	{}
+L346	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L347	lenient	{}
+L347	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 11 : unterminated quoted value"}
+L348	lenient	{}
+L348	strict	{}
+L349	lenient	{}
+L349	strict	{}
+L350	lenient	{"_h": "\u00e9", "d": "u\"v"}
+L350	strict	{"_h": "\u00e9", "d": "u\"v"}
+L351	lenient	{}
+L351	strict	{}
+L352	lenient	{}
+L352	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L353	lenient	{}
+L353	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 8 : unexpected '='"}
+L354	lenient	{"_d": "u\"v"}
+L354	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L355	lenient	{}
+L355	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L356	lenient	{}
+L356	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 5 : unexpected '\"'"}
+L357	lenient	{}
+L357	strict	{}
+L358	lenient	{"a": "1\\"}
+L358	strict	{"a": "1\\"}
+L359	lenient	{}
+L359	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 24 : unterminated quoted value"}
+L360	lenient	{}
+L360	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L361	lenient	{}
+L361	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L362	lenient	{}
+L362	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L363	lenient	{"g": "3x"}
+L363	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 9 : unexpected '='"}
+L364	lenient	{}
+L364	strict	{}
+L365	lenient	{}
+L365	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 14 : unexpected '='"}
+L366	lenient	{}
+L366	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L367	lenient	{}
+L367	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 20 : unterminated quoted value"}
+L368	lenient	{}
+L368	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L369	lenient	{}
+L369	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L370	lenient	{}
+L370	strict	{}
+L371	lenient	{}
+L371	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L372	lenient	{}
+L372	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}
+L373	lenient	{}
+L373	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 24 : unterminated quoted value"}
+L374	lenient	{}
+L374	strict	{}
+L375	lenient	{}
+L375	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L376	lenient	{"h": "\u00e9"}
+L376	strict	{"h": "\u00e9"}
+L377	lenient	{"b": "q"}
+L377	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 16 : unterminated quoted value", "b": "q"}
+L378	lenient	{"h": "\u00e9"}
+L378	strict	{"h": "\u00e9"}
+L379	lenient	{"k11b": "q"}
+L379	strict	{"k11b": "q"}
+L380	lenient	{}
+L380	strict	{}
+L381	lenient	{"b": "q"}
+L381	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '\"'", "b": "q"}
+L382	lenient	{"f": "2", "g": "3x"}
+L382	strict	{"f": "2", "g": "3x"}
+L383	lenient	{}
+L383	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '\"'"}
+L384	lenient	{}
+L384	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '\"'"}
+L385	lenient	{"xf": "2"}
+L385	strict	{"xf": "2"}
+L386	lenient	{}
+L386	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L387	lenient	{"_1b": "q"}
+L387	strict	{"_1b": "q"}
+L388	lenient	{}
+L388	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 4 : unexpected '='"}
+L389	lenient	{"af": "2", "g": "3"}
+L389	strict	{"af": "2", "g": "3"}
+L390	lenient	{}
+L390	strict	{}
+L391	lenient	{}
+L391	strict	{}
+L392	lenient	{"ba": "11"}
+L392	strict	{"ba": "11"}
+L393	lenient	{}
+L393	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 7 : unexpected '\"'"}
+L394	lenient	{"bd": "u\"v"}
+L394	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 13 : unexpected '\"'", "bd": "u\"v"}
+L395	lenient	{"_d": "u\"v"}
+L395	strict	{"_d": "u\"v"}
+L396	lenient	{}
+L396	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 6 : unexpected '='"}
+L397	lenient	{}
+L397	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 1 : unexpected '='"}
+L398	lenient	{"e": "open\"d="}
+L398	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 15 : unexpected '\"'", "e": "open\"d="}
+L399	lenient	{}
+L399	strict	{"__error__": "LogfmtParserErr", "__error_details__": "logfmt syntax error at pos 2 : unexpected '\"'"}

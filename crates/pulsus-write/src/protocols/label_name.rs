@@ -16,13 +16,14 @@
 //! (`pkg/chunkenc/symbols.go:120-135` calls it too, but that is a storage
 //! re-normalization of already-admitted names, not an ingest gate.)
 //!
-//! This module is the ingest-side counterpart of the REJECT half only. The
-//! NORMALIZE half — `sanitize` plus the `key_` prefix — is replicated here
-//! solely because condition (2) below is evaluated on the *sanitized* name,
-//! and is deliberately NOT used to rename anything: PulsusDB stores an
-//! admitted name under [`canonicalize_label_key`](pulsus_model::canonicalize_label_key),
-//! which differs from the reference's renaming for some admitted inputs (see
-//! the module test `sanitize_differs_from_our_storage_canonicalization`).
+//! This module is the REJECT half. The NORMALIZE half is
+//! [`log_label_name`](pulsus_model::log_label_name), which condition (2)
+//! below is evaluated on and which is also the name every admitted name is
+//! stored under (issue #507) — except a resource attribute other than
+//! `service.name` landing on `service_name`, which is stored as
+//! `service_name_extracted` (issue #379) — so the two halves cannot drift
+//! apart (the
+//! module test `the_rejection_rule_and_storage_name_alike`).
 //!
 //! Distinct from `loki_push::is_valid_label_name`, which is the STREAM-label
 //! grammar `[a-zA-Z_][a-zA-Z0-9_]*`: a stream label name is parsed, not
@@ -33,6 +34,8 @@
 //! the OTLP one, so this module exposes one entry point per seam —
 //! [`validate_label_names`] and [`validate_otlp_attribute_names`]. See the
 //! latter for the reference lines and the measurement.
+
+use pulsus_model::log_label_name;
 
 use crate::error::LogsIngestError;
 
@@ -127,7 +130,10 @@ fn inadmissible_reason(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("label name is empty".to_string());
     }
-    let normalized = sanitize(name);
+    // The REJECT half is evaluated on the stored name, which is
+    // `pulsus_model::log_label_name` (issue #507), so the two cannot drift
+    // apart.
+    let normalized = log_label_name(name);
     if normalized.bytes().all(|b| b == b'_') {
         return Some(format!(
             "normalization for label name {name:?} resulted in invalid name {normalized:?}"
@@ -189,63 +195,6 @@ pub(crate) fn validate_otlp_attribute_names<'a>(
         }
     }
     Ok(())
-}
-
-/// `LabelNamer.Build`'s normalization for the zero-valued `LabelNamer{}` both
-/// reference call sites construct — `UTF8Allowed`,
-/// `UnderscoreLabelSanitization` and `PreserveMultipleUnderscores` all false.
-/// That fixes the shape to `sanitizeLabelName(name, false)` plus the leading-
-/// digit `key_` prefix (`label_namer.go:73-85`, `strconv.go:30-70 @ v3.7.4`):
-///
-/// - a rune outside `[a-zA-Z0-9]` becomes `_`, and CONSECUTIVE such runes
-///   collapse to a single `_` — note `_` is itself not a "valid compliant
-///   char" (`strconv.go:73-75`), so `a__b` collapses to `a_b`;
-/// - a name that both starts and ends with `__` and is at least 4 bytes long
-///   is "reserved": the affixes are stripped, the middle sanitized, and the
-///   affixes restored (`strconv.go:81-89`), which is why `"____"` survives as
-///   `"____"` where `"__"` collapses to `"_"`;
-/// - a result starting with a digit is prefixed `key_`.
-///
-/// Used ONLY to evaluate the all-underscores rejection above. The result is
-/// never stored; see the module docs.
-fn sanitize(name: &str) -> String {
-    // `isReservedLabel`: len >= 4 AND starts and ends with `__`
-    // (`strconv.go:81-89 @ v3.7.4`). Byte-oriented on the reference (Go string
-    // slicing), and `_` is ASCII, so byte prefix/suffix tests are exact.
-    let reserved = name.len() >= 4 && name.starts_with("__") && name.ends_with("__");
-    let inner = if reserved {
-        &name[2..name.len() - 2]
-    } else {
-        name
-    };
-
-    let mut out = String::with_capacity(name.len() + if reserved { 4 } else { 0 });
-    if reserved {
-        out.push_str("__");
-    }
-    let mut prev_was_underscore = false;
-    for c in inner.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            prev_was_underscore = false;
-        } else if !prev_was_underscore {
-            out.push('_');
-            prev_was_underscore = true;
-        }
-    }
-    if reserved {
-        out.push_str("__");
-    }
-
-    // `unicode.IsDigit(rune(normalizedName[0]))` (`label_namer.go:80-81`).
-    // `out` is non-empty here for any non-empty `name` (a reserved name
-    // carries its affixes; any other name emits at least one char for its
-    // first rune), and every byte in it is ASCII, so the reference's
-    // byte-indexed first-rune test is exactly this one.
-    if out.starts_with(|c: char| c.is_ascii_digit()) {
-        out.insert_str(0, "key_");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -386,7 +335,7 @@ mod tests {
         );
         // Two adjacent invalid runes collapse to ONE `_`, which is why a
         // two-character CJK name reports `"_"` rather than `"__"`.
-        assert_eq!(sanitize("日本"), "_");
+        assert_eq!(log_label_name("日本"), "_");
     }
 
     /// The reserved-affix path over a multi-byte middle. `__é__` is 8 bytes,
@@ -408,7 +357,7 @@ mod tests {
             reject_message("__________"),
             r#"normalization for label name "__________" resulted in invalid name "_____""#
         );
-        assert_eq!(sanitize("__ab__"), "__ab__");
+        assert_eq!(log_label_name("__ab__"), "__ab__");
     }
 
     /// The one place our message is NOT the reference's, pinned so it cannot
@@ -519,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_matches_the_references_measured_renaming() {
+    fn the_stored_name_matches_the_references_measured_renaming() {
         // Read back from `grafana/loki:3.7.4` with `categorize-labels` after
         // pushing each name as structured metadata.
         for (input, expected) in [
@@ -533,25 +482,27 @@ mod tests {
             ("ok ", "ok_"),
             ("ok", "ok"),
         ] {
-            assert_eq!(sanitize(input), expected, "sanitize({input:?})");
+            assert_eq!(log_label_name(input), expected, "log_label_name({input:?})");
         }
     }
 
+    /// **The rejection rule and the stored name are one function** (issue
+    /// #507). This module evaluates its second condition on
+    /// `pulsus_model::log_label_name`'s result, and that same result is what
+    /// an admitted name is stored under, so a name cannot be admitted under
+    /// one rule and stored under another.
     #[test]
-    fn sanitize_differs_from_our_storage_canonicalization() {
-        // Pinned so the divergence stays visible: this module's `sanitize`
-        // exists to evaluate the REJECT rule only, and PulsusDB stores an
-        // admitted name under `canonicalize_label_key` instead. These three
-        // inputs are admitted by both and stored under different keys —
-        // flagged on issue #259, not fixed there.
-        for name in ["a..b", "a__b", "9bad"] {
-            assert_ne!(
-                sanitize(name),
-                canonicalize_label_key(name),
-                "{name:?} is expected to render differently"
+    fn the_rejection_rule_and_storage_name_alike() {
+        for (name, stored) in [("a..b", "a_b"), ("a__b", "a_b"), ("9bad", "key_9bad")] {
+            assert!(validate_label_name(name).is_ok(), "{name:?} is admitted");
+            assert_eq!(
+                log_label_name(name),
+                stored,
+                "{name:?} is stored as {stored:?}"
             );
         }
-        // …while the common case agrees, so the divergence is narrow.
-        assert_eq!(sanitize("a.b"), canonicalize_label_key("a.b"));
+        // The metrics namer is a different rule and stays one: it escapes
+        // each character on its own, so a run survives as a run.
+        assert_eq!(canonicalize_label_key("a..b"), "a__b");
     }
 }

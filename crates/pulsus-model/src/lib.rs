@@ -11,7 +11,10 @@ mod matcher;
 mod sample;
 mod time;
 
-pub use canonical::{METRIC_NAME_LABEL, SERVICE_NAME_LABEL, canonicalize_label_key};
+pub use canonical::{
+    METRIC_NAME_LABEL, SERVICE_NAME_LABEL, canonicalize_label_key, is_log_label_name,
+    log_label_name,
+};
 pub use fingerprint::{
     build_metric_buffer, build_stream_buffer, metric_fingerprint, raw_cityhash64,
     stream_fingerprint,

@@ -25,7 +25,7 @@ string	json	-	level	error	{"level":"info"}	0
 string	json	-	level	error	{"level":500}	0
 string	json	-	level	error	{"msg":"x"}	0
 string	json	-	level	error	plain text, not json at all	0
-string	json	-	level	error	{"level":"error"}junk	1
+string	json	-	level	error	{"level":"error"}junk	0
 string	json	-	level	error	{"level":{"a":1}}	0
 string	json	-	level	error	{"level":"\u0065rror"}	1
 string	json	-	level	error	{"level":"error"}	1
@@ -49,7 +49,7 @@ neq	json	-	level	error	{"level":"info"}	1
 neq	json	-	level	error	{"level":500}	1
 neq	json	-	level	error	{"level":{"a":1}}	1
 neq	json	-	level	error	{"level":["a"]}	1
-neq	json	-	level	error	{"level":"error"}junk	0
+neq	json	-	level	error	{"level":"error"}junk	1
 neq	json	-	level	error	{"level":"\u0065rror"}	0
 neq	json	-	level		{"msg":"x"}	0
 neq	logfmt	-	level	error	msg=x	1

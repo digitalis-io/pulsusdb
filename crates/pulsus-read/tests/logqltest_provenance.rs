@@ -1996,7 +1996,15 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// Issue #294 added `t6_errors_edges.test`'s raw-byte `duration` /
 /// `duration_seconds` failure rows, captured 2026-08-26 on the same
 /// pinned digest under that file's `captured` default.
-const CAPTURED: usize = 1_513;
+/// Issue #507 moved the `b23_json_raw_read.test` rows whose line is not a
+/// JSON text off that file's `captured` default (they now hold our answer,
+/// with the reference's captured answer in the comment above each), and
+/// added `b27_logfmt_token_scan.test` and `b28_reserved_names.test` under
+/// their files' `captured` defaults: the logfmt rows were captured on the
+/// pinned digest with the shared config, the reserved-name rows on the same
+/// digest with `ci/logql/config-463.yaml`, both at the query text committed
+/// in the file.
+const CAPTURED: usize = 1_665;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -2004,8 +2012,15 @@ const CAPTURED: usize = 1_513;
 /// on-axis control), same file default.
 const DERIVED: usize = 32;
 /// Issue #389's residual rows — the mid-line-malformed class, and its
-/// bound where both sides answer the empty string — all name
-/// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
+/// bound where both sides answered the empty string — named
+/// `json-nonvalidating-scan-residual` (issue #507 moved the bound row to
+/// `json-targeted-line-that-does-not-parse`). Issue #507's other
+/// `b23_json_raw_read.test` rows name `json-text-is-one-value` and
+/// `json-targeted-line-that-does-not-parse`, and its
+/// `b27_logfmt_token_scan.test` rows where the reference reads a label from
+/// inside a quoted value or replaces a value holding U+FFFD name
+/// `logfmt-quoted-value-ends-its-token` and
+/// `logfmt-replacement-character-value`. Issue #397's wrapped-variant rows
 /// on the reference's surviving-error surface name
 /// `variants-surviving-error-status`. Issue #393's rows where several
 /// logfmt extraction identifiers share a source key name
@@ -2014,13 +2029,14 @@ const DERIVED: usize = 32;
 /// file's `ported(...)` default onto `sort-tie-order`: their expected
 /// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
 /// ported reference order — the reference specifies none.
-const DIVERGENCE: usize = 30;
+const DIVERGENCE: usize = 90;
 const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
 /// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
-/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`.
-const TOTAL: usize = 1_605;
+/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`, and issue #507
+/// by `b27_logfmt_token_scan.test` and `b28_reserved_names.test`.
+const TOTAL: usize = 1_817;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------
@@ -2037,12 +2053,17 @@ const TOTAL: usize = 1_605;
 /// their own `mod tests` (one surviving pre-#286 expectation plus one
 /// `match(body, '(')` fixture proving `MetricShape`/`source_shape` refuse a
 /// foreign column pair).
+///
+/// Issue #507: `predicate.rs` gains the extracted-field group key read's
+/// spelling guards (8 -> 15), and `sql.rs` loses the unwrapped statement's
+/// two value-guard renderings and their byte-exact test (6 -> 2), so its
+/// production code renders no `match(` again.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
     ("pulsus-read/src/logql/plan.rs", 1),
-    ("pulsus-read/src/logql/predicate.rs", 8),
-    ("pulsus-read/src/logql/sql.rs", 6),
+    ("pulsus-read/src/logql/predicate.rs", 15),
+    ("pulsus-read/src/logql/sql.rs", 2),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     ("pulsus-read/src/metrics/series_where.rs", 10),
     ("pulsus-read/src/metrics/sql.rs", 14),
@@ -2059,7 +2080,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 63;
+const MATCH_RENDER_TOTAL: usize = 66;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2382,6 +2403,39 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
+    // Issue #507: the extracted-field group key read's per-row readers.
+    "const KEY_TRIM_CLASS: &str = r_",
+    "const JSON_WS: &str = r_",
+    "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",
+    "const MAX_JSON_NESTING: u32 = 127",
+    "const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ReaderColumns",
+    "pub enum ReaderColumns :: Unwrap,",
+    "pub enum ReaderColumns :: Key(usize),",
+    "impl ReaderColumns",
+    "impl ReaderColumns :: fn prefix(self) -> String",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum KeyReaderRefusal",
+    "pub enum KeyReaderRefusal :: NameNotRenderable,",
+    "pub enum KeyReaderRefusal :: PatternNotCompilable,",
+    "fn key_regex(pattern: &str) -> Result<String, KeyReaderRefusal>",
+    "fn parts_joined(name: &str) -> bool",
+    "fn only_underscores(name: &str) -> bool",
+    "fn parts_with_sep(parts: &[&str]) -> String",
+    "fn spelled_pattern(name: &str) -> String",
+    "fn prefix_parent_pattern(name: &str) -> String",
+    "fn spelled_otherwise_pattern(name: &str) -> String",
+    "fn unwrap_name_escaped(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_transparent_parent() -> Result<String, KeyReaderRefusal>",
+    "pub fn unwrap_name_ambiguity(name: &str) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn json_depth_bound() -> CheckedFragment",
+    "pub fn json_flatten_key_budget_bound() -> CheckedFragment",
+    "pub fn unwrap_name_absence(columns: ReaderColumns, name: &str, form: super::sql::UnwrapForm) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment",
+    "pub fn metadata_holds_name(name: &str) -> CheckedFragment",
+    "pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use super::*",
@@ -2449,8 +2503,11 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// a function outside an `impl` whose signature names [`CheckedFragment`]
 /// and can therefore produce one. `metadata_non_empty_guard` is private
 /// and still counts: the count is over what can MINT, not over what is
-/// reachable.
-const MINT_COUNT: usize = 11;
+/// reachable. **18 at issue #507's group key read**: `unwrap_name_ambiguity`,
+/// `json_depth_bound`, `json_flatten_key_budget_bound`, `unwrap_name_absence`,
+/// `unwrap_label_integer_text`, `metadata_holds_name` and
+/// `metadata_names_projection` join them.
+const MINT_COUNT: usize = 18;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
@@ -2471,6 +2528,9 @@ const PREDICATE_IMPLS: &[&str] = &[
     // no text at all. Its `impl` renders the column name from the one
     // private constant that holds it.
     "impl MetadataTerm",
+    // Issue #507: `ReaderColumns` carries no text either — it names which
+    // reader columns (`uw_` or `l<i>_`) a key-route fragment reads.
+    "impl ReaderColumns",
 ];
 
 const NEWTYPES: &[&str] = &["CheckedFragment", "CheckedLiteral", "MonthLiteral"];

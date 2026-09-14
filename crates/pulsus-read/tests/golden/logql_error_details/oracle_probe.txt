@@ -69,7 +69,7 @@ STREAMS PATH — the three error classes (issue #99 scope)
     (not an error site in our engine — our logfmt only errors on the
      unterminated quote.)
 
-  => pos = (rune length of the line) + 1 for the unterminated-quote-at-EOF
+  => pos = (byte length of the line) + 1 for the unterminated-quote-at-EOF
      class — reproduced byte-exact. LEDGERED: every other Loki logfmt
      syntax-error class (unexpected '=', unexpected '"', unterminated quoted value, ...) is not an error
      site in our parser.
@@ -234,11 +234,15 @@ The LABEL __error__="LogfmtParserErr" is set for all three malformed
 classes; the detail STRING is byte-exact for the unterminated quote and
 faithful-format (same structure, ledgered position) for the others.
 
-  INPUT `level="unterminated`  (19 runes)  =>
+  INPUT `level="unterminated`  (19 bytes)  =>
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 20 : unterminated quoted value  [byte-exact]
   INPUT `a=1=2`  =>
     a="1"  kept (pair completed before the error), then:
+    CORRECTION (issue #507, case f05s): this line came from a capture on an
+    earlier build. The pinned reference build keeps NOTHING from this token:
+    a malformed token contributes no pair, not even the `key=value` before
+    the byte that breaks it. PulsusDB answers the same.
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 4 : unexpected '='             [faithful-format]
   INPUT `"quoted=1`  (a `"` opens the key)  =>
@@ -246,6 +250,10 @@ faithful-format (same structure, ledgered position) for the others.
     __error_details__ = logfmt syntax error at pos 1 : unexpected '"'              [byte-exact, v3.7.3]
   INPUT `a=1"b"`  (a `"` follows an unquoted value)  =>
     a="1"  kept (pair completed before the error), then:
+    CORRECTION (issue #507, case f03s): this line came from a capture on an
+    earlier build. The pinned reference build keeps NOTHING from this token:
+    a malformed token contributes no pair, not even the `key=value` before
+    the byte that breaks it. PulsusDB answers the same.
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 4 : unexpected '"'              [byte-exact, v3.7.3]
   NOTE: the reference renders `unexpected '<char>'` naming the offending byte

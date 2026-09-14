@@ -32,7 +32,7 @@ model: `docs/schemas.md` §9's two-tier evidence model (added by this issue).
   splitmix64/xorshift64\* PRNG (never `rand`, so a committed baseline stays
   byte-reproducible across `rand` major-version bumps). Uses
   `pulsus-model`'s frozen `LabelSet::from_normalized`/`stream_fingerprint`
-  (the same canonicalization every writer — product or bulk — agrees with)
+  (its four label names — `service.name`, `env`, `region`, `stream_ordinal` — are stored alike by that constructor and by the OTLP receiver's `LabelSet::from_log_attribute_pairs`, so the bulk corpus and the product path agree on them)
   and `pulsus-schema::run_init` for DDL, so the generated corpus is
   schema-identical to a product-ingested one. Bulk-loads via direct
   RowBinary `INSERT` (`ChClient::insert_block`); in `--dist` mode this goes

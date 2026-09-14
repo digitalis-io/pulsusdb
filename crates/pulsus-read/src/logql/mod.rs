@@ -117,6 +117,11 @@ pub mod predicate;
 pub mod rows;
 pub mod sql;
 pub mod template;
+mod unwrap_group;
+/// Test-only (issue #507): the key route's resolution and fold, for the live
+/// agreement measurement.
+#[doc(hidden)]
+pub use unwrap_group::probe as group_key_probe;
 /// Test-only helpers shared by more than one region module's
 /// `#[cfg(test)] mod tests` (issue #299). A SUBDIRECTORY, never a flat
 /// `.rs`.

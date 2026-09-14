@@ -27,7 +27,10 @@ use super::error::{ReadError, TooBroadReason};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
-use super::pipeline::{CompiledPipeline, RangeGrouping};
+use super::pipeline::{
+    CompiledPipeline, ERROR_LABEL, PRESERVE_ERROR_LABEL, ParentSum, ParserHints, RangeGrouping,
+    RangeStepRules,
+};
 use super::predicate::{CheckedFragment, MonthLiteral};
 use super::sql::{self, ScanLowerBound};
 use super::window::{ClientWindow, GridWindow};
@@ -1732,86 +1735,462 @@ fn has_unwrap_conversion(pipeline: &[Stage]) -> bool {
         .any(|s| matches!(s, Stage::Unwrap(u) if u.conversion.is_some()))
 }
 
-/// Issue #507 (W4): the chain shape the unwrapped read serves, or `None`.
-///
-/// **Exactly** a run of pushable line filters, then a `| json` whose ONE
-/// targeted extraction names the unwrapped label, then `| unwrap <name>`,
-/// and nothing after it:
+/// The reserved label names (issue #507): a group key read never takes one
+/// as a by-label, a filter label or a targeted destination, with or without
+/// `_extracted`, because the reference gives each a meaning our range step
+/// reproduces only on today's route.
+const RESERVED_KEY_NAMES: [&str; 4] = [
+    super::pipeline::ERROR_LABEL,
+    super::pipeline::ERROR_DETAILS_LABEL,
+    PRESERVE_ERROR_LABEL,
+    super::variants::VARIANT_LABEL,
+];
+
+fn is_reserved_key_name(name: &str) -> bool {
+    let stem = name.strip_suffix("_extracted").unwrap_or(name);
+    RESERVED_KEY_NAMES.contains(&name) || RESERVED_KEY_NAMES.contains(&stem)
+}
+
+/// A JSON path segment a statement literal reads exactly as our parser does:
+/// no quote, no backslash, no control byte.
+fn plain_path_segment(seg: &str) -> bool {
+    !seg.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20)
+}
+
+/// Issue #507: the `| json … | unwrap` range queries the extracted-field
+/// group key read serves, as [`sql::UnwrappedValue`], or `None` for today's
+/// route. See docs/query-to-sql.md, the extracted-field group key.
 ///
 /// ```text
-///  {app="x"} |= "boom" | json latency="latency" | unwrap latency   lowers
-///  {app="x"} | json | unwrap latency                               NO — see below
-///  {app="x"} | logfmt | unwrap latency                             no — no logfmt extractor in SQL
-///  {app="x"} | json latency="latency" | unwrap latency | lvl="x"   no — a stage after the unwrap
-///  {app="x"} | json latency="lat" | unwrap latency                 no — the label and the key differ
+/// shape                                                      key labels          classes          metadata
+/// targeted, no range grouping                                declared but <u>    per fingerprint  stored text
+/// targeted, avg_over_time(…) by (L)                          declared but <u>    L+declared+<u>   L+declared, presence
+/// targeted, avg_over_time(…) without (L)                     declared but <u>    all but L        stored text
+/// bare, sum [by (L)] (sum_over_time(…)), label filters too   L+filter labels     L+<u>+filters    L+filters, presence
+/// bare, avg_over_time(…) by (L), label filters too           L+filter labels     L+<u>+filters    L+filters, presence
 /// ```
 ///
-/// **The BARE `| json` is the one that cannot be lowered, and this is the
-/// opposite of what it looks like.** A bare `| json` puts **every**
-/// top-level key of the document into the label set, so the output series
-/// are keyed by those values and a statement grouping by
-/// `(fingerprint, grid point, structured_metadata)` cannot express them.
-/// Measured, two lines differing only in a second key:
-///
-/// ```text
-///  {"latency":1,"code":"a"}    | json | unwrap latency
-///  {"latency":2,"code":"b"}
-///    ->  {code="a", env=…} 1   AND  {code="b", env=…} 2      two series
-///
-///  the same lines             | json latency="latency" | unwrap latency
-///    ->  {env=…} 3                                           one series
-/// ```
-///
-/// The targeted form extracts exactly one label and `| unwrap` then
-/// removes it, so the surviving label set is the stream labels plus the
-/// structured metadata — **which is precisely the statement's group key**.
-/// That is the whole reason this shape is lowerable and the bare one is
-/// not.
-///
-/// The name must be underscore-free, for the reason W3 established and
-/// measured: sanitisation and flattening both write `_`, so a name
-/// carrying one has more than one preimage and SQL cannot say which the
-/// evaluator took ([`super::predicate::name_is_unambiguous`]).
-fn unwrapped_chain(op: RangeAggOp, pipeline: &[Stage]) -> Option<(sql::UnwrapReducer, String)> {
+/// `presence` is the unwrapped label, `__error__` and `__error_details__`:
+/// a row carrying one takes today's route. Everything else is today's
+/// route: another reducer or stage, a conversion, a stage after the unwrap,
+/// a bare form with no outer `sum` or with `without`, a `by` naming the
+/// unwrapped label, a filter naming it, a bare by-label or filter label
+/// ending in `_extracted`, a targeted form with two destinations of one
+/// label, and any reserved by-label, filter label or destination.
+fn unwrapped_key_route(
+    op: RangeAggOp,
+    pipeline: &[Stage],
+    own: Option<&RangeGrouping>,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<sql::UnwrappedValue> {
     use pulsus_logql::ParserStage;
     let reducer = match op {
         RangeAggOp::SumOverTime => sql::UnwrapReducer::Sum,
         RangeAggOp::AvgOverTime => sql::UnwrapReducer::Avg,
         _ => return None,
     };
-    let mut stages = pipeline.iter();
-    let mut next = stages.next();
-    while let Some(Stage::LineFilter(lf)) = next {
+    let mut at = 0;
+    while let Some(Stage::LineFilter(lf)) = pipeline.get(at) {
         if !is_pushable_line_filter(lf) {
             return None;
         }
-        next = stages.next();
+        at += 1;
     }
-    let extracted = match next {
-        Some(Stage::Parser(ParserStage::Json { extractions })) if extractions.len() == 1 => {
-            &extractions[0]
+    let stages = &pipeline[at..];
+    let Some((Stage::Parser(ParserStage::Json { extractions }), rest)) = stages.split_first()
+    else {
+        return None;
+    };
+    let Some((Stage::Unwrap(unwrap), filters)) = rest.split_last() else {
+        return None;
+    };
+    if unwrap.conversion.is_some() {
+        return None;
+    }
+    let label = unwrap.label.as_str();
+    let mut filter_names: Vec<String> = Vec::new();
+    for stage in filters {
+        let Stage::LabelFilter(expr) = stage else {
+            return None;
+        };
+        pulsus_logql::for_each_label_filter(expr, |e| match e {
+            LabelFilterExpr::Match(m) => filter_names.push(m.name.clone()),
+            LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                filter_names.push(name.clone())
+            }
+            LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+        });
+    }
+    filter_names.sort_unstable();
+    filter_names.dedup();
+    if parent_sum_rules(op, own.is_some(), vector_aggs, Some(label))
+        .is_some_and(|p| p.keeps_unwrapped)
+    {
+        return None;
+    }
+    let presence = || {
+        let mut p = vec![
+            label.to_string(),
+            super::pipeline::ERROR_LABEL.to_string(),
+            super::pipeline::ERROR_DETAILS_LABEL.to_string(),
+        ];
+        p.sort_unstable();
+        p.dedup();
+        p
+    };
+    let union = |parts: &[&[String]]| -> Vec<String> {
+        let mut all: Vec<String> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    };
+    let rules = range_step_rules(op, pipeline, own, vector_aggs);
+    let stages = stages.to_vec();
+    if extractions.is_empty() {
+        // The bare form.
+        let by: Vec<String> = match (own, vector_aggs.last()) {
+            (Some(RangeGrouping::Singleton), _) => Vec::new(),
+            (Some(RangeGrouping::By(names)), _) => names.clone(),
+            (Some(RangeGrouping::Without(_)), _) => return None,
+            (None, Some((VectorAggOp::Sum, grouping, _))) if op == RangeAggOp::SumOverTime => {
+                match grouping {
+                    None => Vec::new(),
+                    Some(g) if g.kind == GroupingKind::By => g.labels.clone(),
+                    Some(_) => return None,
+                }
+            }
+            (None, _) => return None,
+        };
+        let names = union(&[&by, &filter_names]);
+        if names
+            .iter()
+            .any(|n| n == label || is_reserved_key_name(n) || n.ends_with("_extracted"))
+        {
+            return None;
         }
-        _ => return None,
+        return Some(sql::UnwrappedValue {
+            reducer,
+            form: sql::UnwrapForm::Bare,
+            label: label.to_string(),
+            path: vec![label.to_string()],
+            keys: names
+                .iter()
+                .map(|n| sql::UnwrapKeyLabel {
+                    label: n.clone(),
+                    source: n.clone(),
+                })
+                .collect(),
+            classes: sql::ClassNames::Projected(union(&[&names, &[label.to_string()]])),
+            metadata: sql::MetadataSent::Projected {
+                values: names.clone(),
+                presence: presence(),
+            },
+            grouping: own.cloned(),
+            stages,
+            rules,
+        });
+    }
+    // The targeted form.
+    if !filters.is_empty() {
+        return None;
+    }
+    let mut destinations: Vec<&str> = extractions.iter().map(|e| e.label.as_str()).collect();
+    if destinations.iter().any(|d| is_reserved_key_name(d)) {
+        return None;
+    }
+    destinations.sort_unstable();
+    for (i, d) in destinations.iter().enumerate() {
+        let renamed = format!("{d}_extracted");
+        if destinations[i + 1..].iter().any(|o| o == d) || destinations.contains(&renamed.as_str())
+        {
+            return None;
+        }
+    }
+    let field_path = |expression: &str| -> Option<Vec<String>> {
+        let segs = super::json_expr::parse_json_expr(expression).ok()?;
+        segs.into_iter()
+            .map(|seg| match seg {
+                super::pipeline::JsonPathSeg::Field(f) if plain_path_segment(&f) => Some(f),
+                _ => None,
+            })
+            .collect()
     };
-    let name = match stages.next() {
-        Some(Stage::Unwrap(u)) if u.conversion.is_none() => u.label.as_str(),
-        _ => return None,
+    let unwrapped = extractions.iter().find(|e| e.label == label)?;
+    let path = field_path(&unwrapped.expression)?;
+    if path.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::new();
+    for e in extractions.iter().filter(|e| e.label != label) {
+        let source = field_path(&e.expression)?;
+        let [source] = source.as_slice() else {
+            return None;
+        };
+        if path.len() == 1 && path[0] == *source {
+            return None;
+        }
+        keys.push(sql::UnwrapKeyLabel {
+            label: e.label.clone(),
+            source: source.clone(),
+        });
+    }
+    let declared: Vec<String> = keys.iter().map(|k| k.label.clone()).collect();
+    let (classes, metadata) = match own {
+        None => (sql::ClassNames::PerFingerprint, sql::MetadataSent::Text),
+        Some(RangeGrouping::Without(names)) => (
+            sql::ClassNames::Without(names.clone()),
+            sql::MetadataSent::Text,
+        ),
+        Some(RangeGrouping::Singleton) | Some(RangeGrouping::By(_)) => {
+            let by = match own {
+                Some(RangeGrouping::By(names)) => names.clone(),
+                _ => Vec::new(),
+            };
+            if by.iter().any(|n| n == label || is_reserved_key_name(n)) {
+                return None;
+            }
+            (
+                sql::ClassNames::Projected(union(&[&by, &declared, &[label.to_string()]])),
+                sql::MetadataSent::Projected {
+                    values: union(&[&by, &declared]),
+                    presence: presence(),
+                },
+            )
+        }
     };
-    if stages.next().is_some() {
-        return None;
+    Some(sql::UnwrappedValue {
+        reducer,
+        form: sql::UnwrapForm::Targeted,
+        label: label.to_string(),
+        path,
+        keys,
+        classes,
+        metadata,
+        grouping: own.cloned(),
+        stages,
+        rules,
+    })
+}
+
+/// The range step's rules for one range aggregation (issue #507): what the
+/// reference's sample extractor does to a line's labels beyond the range
+/// aggregation's own grouping. Derived from the plan's existing fields, so no
+/// plan shape changes.
+///
+/// ```text
+/// sum by (L) (count_over_time(...))      parent_sum = by (L)
+/// sum (rate(...))                        parent_sum = by ()   (a singleton)
+/// max by (L) (count_over_time(...))      parent_sum = none    (not a sum)
+/// sum by (L) (avg_over_time(...) by (M)) parent_sum = none    (own grouping)
+/// ```
+///
+/// `parent_sum` is the reference handing a parent `sum`'s grouping to the
+/// range step (`pkg/logql/syntax/ast.go:1612-1642 @ v3.7.4`); `hints` is the
+/// reference's parser hints over the grouping the sample extractor receives
+/// (`pkg/logql/log/parser_hints.go:145-189`, built at
+/// `pkg/logql/log/metrics_extraction.go:66-68` and `:162-168`), reduced to
+/// the two reserved names.
+pub(in crate::logql) fn range_step_rules(
+    op: RangeAggOp,
+    pipeline: &[Stage],
+    own: Option<&RangeGrouping>,
+    vector_aggs: &[VectorAggSpec],
+) -> RangeStepRules {
+    let unwrap_label = pipeline.iter().find_map(|s| match s {
+        Stage::Unwrap(u) => Some(u.label.as_str()),
+        _ => None,
+    });
+    let parent = parent_sum_grouping(op, own.is_some(), vector_aggs);
+    // The grouping the extractor receives: (names, without, needs no labels).
+    let (mut groups, mut without, mut no_labels): (Vec<&str>, bool, bool) = match (own, parent) {
+        (Some(RangeGrouping::Singleton), _) | (None, Some(None)) => (Vec::new(), false, true),
+        (Some(RangeGrouping::By(names)), _) => {
+            (names.iter().map(String::as_str).collect(), false, false)
+        }
+        (Some(RangeGrouping::Without(names)), _) => {
+            (names.iter().map(String::as_str).collect(), true, false)
+        }
+        (None, Some(Some(g))) => match g.kind {
+            GroupingKind::By if g.labels.is_empty() => (Vec::new(), false, true),
+            GroupingKind::By => (g.labels.iter().map(String::as_str).collect(), false, false),
+            GroupingKind::Without => (g.labels.iter().map(String::as_str).collect(), true, false),
+        },
+        (None, None) => (Vec::new(), false, false),
+    };
+    if matches!(op, RangeAggOp::AbsentOverTime) {
+        no_labels = true;
     }
-    // The label, the source key and the unwrapped name are one string, so
-    // the statement extracts the key the evaluator extracted and the
-    // label `| unwrap` removes is the one `| json` added. A differing
-    // source key would be sound too, but its expression is a grammar
-    // (`a.b`, `arr[0]`, quoted segments) and this build does not read one.
-    if extracted.label != name || extracted.expression != name {
-        return None;
+    if let Some(label) = unwrap_label
+        && (groups.is_empty() || without)
+    {
+        // The reference's unwrap extractor rewrites an empty or `without`
+        // grouping into a `without` naming the unwrapped label
+        // (`pkg/logql/log/metrics_extraction.go:162-166 @ v3.7.4`).
+        without = true;
+        groups.push(label);
     }
-    if !super::predicate::name_is_unambiguous(name) {
-        return None;
+    // A required name matches with or without `_extracted`
+    // (`pkg/logql/log/parser_hints.go:207-215 @ v3.7.4`).
+    let names_required = |name: &str| {
+        stages_require(op, pipeline, name)
+            || groups
+                .iter()
+                .chain(unwrap_label.iter())
+                .any(|g| hint_names(g, name))
+    };
+    let hint_list_empty =
+        groups.is_empty() && unwrap_label.is_none() && !stages_require_any(op, pipeline);
+    let active = if no_labels {
+        !hint_list_empty
+    } else {
+        !(without || groups.is_empty())
+    };
+    RangeStepRules {
+        parent_sum: parent_sum_rules(op, own.is_some(), vector_aggs, unwrap_label),
+        hints: ParserHints {
+            active,
+            requires_error: active && names_required(ERROR_LABEL),
+            requires_preserve: active && names_required(PRESERVE_ERROR_LABEL),
+        },
     }
-    Some((reducer, name.to_string()))
+}
+
+/// The grouping of a `sum` directly above the range aggregation, when the
+/// reference hands it to the range step (`canInjectVectorGrouping`,
+/// `pkg/logql/syntax/ast.go:1632-1642 @ v3.7.4`): `Some(None)` for a bare `sum`
+/// (whose empty grouping the reference treats as a singleton),
+/// `Some(Some(g))` for `sum by`/`sum without`, `None` when nothing is handed.
+fn parent_sum_grouping(
+    op: RangeAggOp,
+    has_own: bool,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<Option<&Grouping>> {
+    match vector_aggs.last() {
+        Some((VectorAggOp::Sum, grouping, _))
+            if !has_own
+                && matches!(
+                    op,
+                    RangeAggOp::CountOverTime
+                        | RangeAggOp::BytesOverTime
+                        | RangeAggOp::BytesRate
+                        | RangeAggOp::SumOverTime
+                        | RangeAggOp::Rate
+                ) =>
+        {
+            Some(grouping.as_ref())
+        }
+        _ => None,
+    }
+}
+
+/// [`ParentSum`] for a range aggregation, allocation-free (issue #507): the
+/// `variants(...)` sub-states call it per variant, where every allocation is
+/// charged.
+pub(in crate::logql) fn parent_sum_rules(
+    op: RangeAggOp,
+    has_own: bool,
+    vector_aggs: &[VectorAggSpec],
+    unwrap_label: Option<&str>,
+) -> Option<ParentSum> {
+    let grouping = parent_sum_grouping(op, has_own, vector_aggs)?;
+    let keeps = |name: &str| match grouping {
+        None => false,
+        Some(g) => match g.kind {
+            GroupingKind::By => g.labels.iter().any(|l| l == name),
+            GroupingKind::Without => !g.labels.iter().any(|l| l == name),
+        },
+    };
+    Some(ParentSum {
+        keeps_error: keeps(ERROR_LABEL),
+        keeps_preserve: keeps(PRESERVE_ERROR_LABEL),
+        keeps_unwrapped: unwrap_label.is_some_and(|label| {
+            grouping
+                .is_some_and(|g| g.kind == GroupingKind::By && g.labels.iter().any(|l| l == label))
+        }),
+    })
+}
+
+/// The reference's hint list: a required label ending `_extracted` also
+/// requires the name without the suffix.
+fn hint_names(required: &str, name: &str) -> bool {
+    required == name || required.strip_suffix("_extracted") == Some(name)
+}
+
+/// Whether any stage requires any label at all (the hint list's emptiness,
+/// which decides the hints for a query that needs no labels).
+fn stages_require_any(op: RangeAggOp, pipeline: &[Stage]) -> bool {
+    let mut any = false;
+    each_required_label(op, pipeline, &mut |_| any = true);
+    any
+}
+
+/// Whether the pipeline's stages require `name` (issue #507).
+fn stages_require(op: RangeAggOp, pipeline: &[Stage], name: &str) -> bool {
+    let mut found = false;
+    each_required_label(op, pipeline, &mut |label| found |= hint_names(label, name));
+    found
+}
+
+/// The labels the reference's stages require
+/// (`pkg/logql/log/pipeline.go:351-358 @ v3.7.4`), after its optimiser has
+/// removed the `line_format` stages a metric query does not need
+/// (`pkg/logql/optimize.go:53-110`): label filters (a `=~` whose pattern is
+/// the match-all `.*` or empty is a no-op filter and requires nothing,
+/// `pkg/logql/log/label_filter.go:360-368`), `label_format` sources and
+/// template fields (`pkg/logql/log/fmt.go:436-446`), `line_format` template
+/// fields (`pkg/logql/log/fmt.go:260-316`), and `ip()` filters
+/// (`pkg/logql/log/ip.go:113-115`). Templates are handed to
+/// `each` as their field names via [`super::template::names_field`], so
+/// `each` sees the reserved names only.
+fn each_required_label(op: RangeAggOp, pipeline: &[Stage], each: &mut dyn FnMut(&str)) {
+    use super::template::{TemplateKind, names_field};
+    let keeps_line_format = |at: usize| {
+        matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate)
+            || pipeline[at..]
+                .iter()
+                .any(|s| matches!(s, Stage::Parser(_) | Stage::Unpack | Stage::LineFilter(_)))
+    };
+    for (at, stage) in pipeline.iter().enumerate() {
+        match stage {
+            Stage::LabelFilter(expr) => {
+                pulsus_logql::for_each_label_filter(expr, |e| match e {
+                    LabelFilterExpr::Match(m) => {
+                        let match_all = m.op == MatchOp::Re
+                            && matches!(m.value.as_str(), "" | ".*" | "(.*)" | "(?:.*)");
+                        if !match_all {
+                            each(&m.name);
+                        }
+                    }
+                    LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                        each(name)
+                    }
+                    LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+                });
+            }
+            Stage::LabelFormat(fmts) => {
+                for f in fmts {
+                    match f {
+                        pulsus_logql::LabelFmt::Rename { src, .. } => each(src),
+                        pulsus_logql::LabelFmt::Template { tmpl, .. } => {
+                            for reserved in [ERROR_LABEL, PRESERVE_ERROR_LABEL] {
+                                if names_field(tmpl, TemplateKind::Label, reserved) {
+                                    each(reserved);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Stage::LineFormat(tmpl) if keeps_line_format(at) => {
+                for reserved in [ERROR_LABEL, PRESERVE_ERROR_LABEL] {
+                    if names_field(tmpl, TemplateKind::Line, reserved) {
+                        each(reserved);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `force_client` (issue #221): `true` ONLY for the `variants(...)` scan
@@ -2168,7 +2547,6 @@ fn metric_plan(
     let unwrapped_range = if is_range
         && !force_client
         && !has_unwrap_conversion(pipeline)
-        && client.as_ref().is_none_or(|c| c.grouping.is_none())
         && match step_ns {
             Some(step) => {
                 let step = step.get();
@@ -2176,7 +2554,12 @@ fn metric_plan(
             }
             None => false,
         } {
-        unwrapped_chain(*op, pipeline)
+        unwrapped_key_route(
+            *op,
+            pipeline,
+            client.as_ref().and_then(|c| c.grouping.as_deref()),
+            &vector_aggs,
+        )
     } else {
         None
     };
@@ -2229,15 +2612,15 @@ fn metric_plan(
             chosen: RouteChoice::Raw,
             reason,
         }
-    } else if let Some((reducer, _)) = &unwrapped_range {
-        // Issue #507 (W4). RAW for the same forced reason as the counting
+    } else if let Some(value) = &unwrapped_range {
+        // Issue #507. RAW for the same forced reason as the counting
         // shape, and named distinctly so `X-Pulsus-Explain` says which of
         // the two lowered reads ran.
         RoutingDecision {
             chosen: RouteChoice::Raw,
             reason: format!(
-                "raw: bucketed unwrapped range aggregation, {} (issue #507)",
-                reducer.function()
+                "raw: extracted-field group key, {} (issue #507)",
+                value.reducer.function()
             ),
         }
     } else if bucketed_range {
@@ -2311,7 +2694,7 @@ fn metric_plan(
         ctx.samples.to_string()
     };
     let value = match unwrapped_range {
-        Some((reducer, label)) => sql::MetricValue::unwrapped(reducer, &label),
+        Some(value) => sql::MetricValue::Unwrapped(Box::new(value)),
         None => sql::MetricValue::Shaped(shape),
     };
 
@@ -3588,6 +3971,254 @@ mod recursive_control;
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #507, criterion 23 (R9): a key statement over the query-text cap
+    /// is not sent, and the query takes today's route.
+    ///
+    /// 100,000 streams (the stream cap) each carry `zone` in one of three
+    /// values, and every stream but the first carries `a`, `b` and `c`. The
+    /// statement lists every fingerprint in its scan and in its class
+    /// mapping, and each of `a`, `b` and `c` lists the 99,999 streams that
+    /// blank it, in its presence column and in its text column. Rendered by
+    /// this test: 17,911,422 bytes. With `zone` alone (`sum by (zone, status)`,
+    /// no `a`, `b`, `c`) it is 4,706,315 bytes, under the cap.
+    #[test]
+    fn a_key_statement_over_the_text_cap_takes_todays_route() {
+        use crate::logql::predicate::literal;
+        use crate::logql::rows::StreamMetaRow;
+        let query = r#"sum by (zone, a, b, c) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+        let mp = metric_mp(
+            query,
+            QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .expect("plan");
+        let sql::MetricValue::Unwrapped(u) = &mp.value else {
+            panic!("{query}: expected the group key read");
+        };
+        let meta: HashMap<u64, StreamMetaRow> = (0..100_000u64)
+            .map(|i| {
+                let fp = 18_000_000_000_000_000_000 + i * 7_919;
+                (
+                    fp,
+                    StreamMetaRow {
+                        fingerprint: fp,
+                        service: "checkout".to_string(),
+                        labels: if i == 0 {
+                            format!(r#"{{"zone":"z{}"}}"#, i % 3)
+                        } else {
+                            format!(r#"{{"a":"1","b":"2","c":"3","zone":"z{}"}}"#, i % 3)
+                        },
+                    },
+                )
+            })
+            .collect();
+        let resolved = crate::logql::unwrap_group::resolve(u, &meta);
+        assert_eq!(
+            resolved.columns.classes.as_ref().map(Vec::len),
+            Some(4),
+            "the three zones, and the first stream's own class"
+        );
+        assert_eq!(
+            resolved
+                .columns
+                .keys
+                .iter()
+                .map(|(k, blank)| (k.label.as_str(), blank.len()))
+                .collect::<Vec<_>>(),
+            vec![("a", 99_999), ("b", 99_999), ("c", 99_999)],
+            "zone is on every stream, so it is not read; a, b and c are blanked where carried"
+        );
+        let step = mp.step_ns.expect("a range plan").get();
+        let text = sql::metric_range_unwrapped(
+            &mp.table,
+            u,
+            &resolved.columns,
+            &[literal("checkout")],
+            &resolved.fingerprints,
+            sql::BucketedScan {
+                window: sql::TimeWindow {
+                    start_ns: mp.start_ns,
+                    end_ns: mp.end_ns,
+                },
+                lower: mp.scan_lower,
+                lo_ns: mp.grid_start_ns - step as i64,
+                step_ns: step as i64,
+            },
+            &mp.extra_predicates,
+            sql::UndecidedRows::Throw,
+            None,
+        )
+        .expect("render");
+        let text = crate::logql::exec::escape_query_placeholders(&text);
+        assert!(
+            text.len() as u64 > crate::querytext::MAX_QUERY_TEXT_BYTES,
+            "the key statement is {} bytes, not over the cap",
+            text.len()
+        );
+        assert!(
+            !crate::logql::exec::key_statement_fits(&text),
+            "a key statement over the text cap must take today's route"
+        );
+    }
+
+    /// Issue #507: the range step's rules follow the reference's sample
+    /// extractor: which parent `sum` hands its grouping down, and the parser
+    /// hints over the grouping the extractor receives.
+    #[test]
+    fn range_step_rules_follow_the_reference_sample_extractor() {
+        use super::super::pipeline::{ParentSum, ParserHints};
+        let p = |keeps_error, keeps_preserve, keeps_unwrapped| {
+            Some(ParentSum {
+                keeps_error,
+                keeps_preserve,
+                keeps_unwrapped,
+            })
+        };
+        let h = |active, requires_error, requires_preserve| ParserHints {
+            active,
+            requires_error,
+            requires_preserve,
+        };
+        let cases = [
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum(count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(false, false, false),
+            ),
+            (
+                r#"sum without (__error__) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, true, false),
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (rate({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_rate({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"max by (service_name) (count_over_time({a="b"} | json [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (max_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (rate_counter({a="b"} | json | unwrap latency [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (__error__) (count_over_time({a="b"} | json [5m]))"#,
+                p(true, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (__error___extracted) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | json | __error__!="" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum(count_over_time({a="b"} | json | __error__!="" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (latency) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(false, false, true),
+                h(true, false, false),
+            ),
+            (
+                r#"sum without (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(true, true, false),
+                h(false, false, false),
+            ),
+            (
+                r#"avg_over_time({a="b"} | json | unwrap latency [5m]) by (x)"#,
+                None,
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | __preserve_error__="true" [5m]))"#,
+                p(false, false, false),
+                h(true, false, true),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | label_format x=__preserve_error__ [5m]))"#,
+                p(false, false, false),
+                h(true, false, true),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | line_format "{{.__error__}}" [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | line_format "{{.__error__}}" | logfmt [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_over_time({a="b"} | logfmt | line_format "{{.__error__}}" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | __error__=~".*" [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+        ];
+        for (query, parent, hints) in cases {
+            let mp = metric_mp(
+                query,
+                QuerySpec::Instant {
+                    at_ns: 600_000_000_000,
+                },
+            )
+            .expect(query);
+            let client = mp.client.as_ref().expect("client mode");
+            let got = range_step_rules(
+                client.range_op,
+                &client.pipeline,
+                client.grouping.as_deref(),
+                &mp.vector_aggs,
+            );
+            assert_eq!((got.parent_sum, got.hints), (parent, hints), "{query}");
+        }
+    }
+
     use pulsus_logql::{parse, parse_selector};
 
     use super::*;
@@ -7155,165 +7786,209 @@ mod tests {
         assert_eq!(mp.routing.reason, "raw: instant query");
     }
 
-    /// Issue #507, W4 — **the two reducers that lower, the eight that do
-    /// not, and the chain shape**, one clause at a time.
-    ///
-    /// `rate_counter` is in the "does not" list for a reason no check
-    /// enforces: `sql::UnwrapReducer` has no variant for it, so the match
-    /// in `unwrapped_chain` cannot produce one.
+    /// Issue #507, criterion 2 — **which `| json … | unwrap` range queries the
+    /// extracted-field group key read serves**, as literal queries: every
+    /// key-route shape of docs/query-to-sql.md's route table lowers, and every
+    /// refused chain keeps today's route.
     #[test]
-    fn an_unwrapped_chain_lowers_for_two_reducers_and_one_pipeline_shape() {
+    fn which_unwrapped_chains_lower() {
         const MIN: u64 = 60_000_000_000;
         let spec = QuerySpec::Range {
             start_ns: 600_000_000_000,
             end_ns: 1_200_000_000_000,
             step_ns: MIN,
         };
-        let value = |query: &str| {
-            metric_mp(query, spec)
-                .unwrap_or_else(|e| panic!("{query}: {e}"))
-                .value
-        };
-        let lowers = |query: &str, want: sql::UnwrapReducer| {
+        let lowers = |query: &str| -> sql::UnwrappedValue {
             let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
-            match &mp.value {
-                sql::MetricValue::Unwrapped(u) => {
-                    assert_eq!(u.reducer, want, "{query}");
-                    assert_eq!(u.label, "latency", "{query}");
-                    assert_eq!(u.name.as_sql(), "'latency'", "{query}");
-                }
-                other => panic!("{query} must lower, got {other:?}"),
-            }
-            assert!(mp.client.is_none(), "{query}");
+            assert!(mp.client.is_none(), "{query} must take the key route");
             assert!(
                 mp.routing
                     .reason
-                    .starts_with("raw: bucketed unwrapped range aggregation"),
+                    .starts_with("raw: extracted-field group key"),
                 "{query}: {}",
                 mp.routing.reason
             );
+            match mp.value {
+                sql::MetricValue::Unwrapped(u) => *u,
+                other => panic!("{query} must lower, got {other:?}"),
+            }
         };
-        let stays_client = |query: &str, why: &str| {
-            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
-            assert!(
-                matches!(mp.value, sql::MetricValue::Shaped(_)),
-                "{query} must not lower an unwrapped value: {why}"
-            );
-            assert!(
-                mp.client.is_some(),
-                "{query} must stay client-aggregated: {why}"
-            );
+        // A query the parser or planner refuses never reaches a route.
+        let today = |query: &str| {
+            if let Ok(mp) = metric_mp(query, spec) {
+                assert!(
+                    matches!(mp.value, sql::MetricValue::Shaped(_)) && mp.client.is_some(),
+                    "{query} must take today's route"
+                );
+            }
         };
 
-        // --- the two -------------------------------------------------
-        let pipe = r#"| json latency="latency" | unwrap latency"#;
+        // --- the key-route shapes -----------------------------------
+        let t = lowers(r#"sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m])"#);
+        assert_eq!(
+            (t.form, t.path.clone(), t.keys.len()),
+            (sql::UnwrapForm::Targeted, vec!["latency".to_string()], 0)
+        );
+        assert_eq!(
+            (t.classes, t.metadata),
+            (sql::ClassNames::PerFingerprint, sql::MetadataSent::Text)
+        );
+        let r = lowers(r#"sum_over_time({a="b"} | json lat="latency" | unwrap lat [1m])"#);
+        assert_eq!(
+            (r.label.as_str(), r.path.clone()),
+            ("lat", vec!["latency".to_string()])
+        );
+        let m = lowers(
+            r#"sum_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m])"#,
+        );
+        assert_eq!(
+            m.keys,
+            vec![
+                sql::UnwrapKeyLabel {
+                    label: "c".to_string(),
+                    source: "code".to_string()
+                },
+                sql::UnwrapKeyLabel {
+                    label: "m".to_string(),
+                    source: "missing".to_string()
+                },
+            ]
+        );
+        let p = lowers(r#"sum_over_time({a="b"} | json lat="req.latency" | unwrap lat [1m])"#);
+        assert_eq!(p.path, vec!["req".to_string(), "latency".to_string()]);
         lowers(
-            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
-            sql::UnwrapReducer::Sum,
+            r#"sum by (a) (sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m]))"#,
         );
         lowers(
-            &format!(r#"avg_over_time({{a="b"}} {pipe} [1m])"#),
-            sql::UnwrapReducer::Avg,
+            r#"sum_over_time({a="b"} |= "boom" | json latency="latency" | unwrap latency [1m])"#,
         );
-        // A pushable line filter is already in the statement.
+        let gtby = lowers(
+            r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) by (c)"#,
+        );
+        assert_eq!(
+            gtby.classes,
+            sql::ClassNames::Projected(vec!["c".to_string(), "lat".to_string(), "m".to_string()])
+        );
+        assert_eq!(
+            gtby.metadata,
+            sql::MetadataSent::Projected {
+                values: vec!["c".to_string(), "m".to_string()],
+                presence: vec![
+                    "__error__".to_string(),
+                    "__error_details__".to_string(),
+                    "lat".to_string()
+                ],
+            }
+        );
+        let gtwo = lowers(
+            r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) without (m)"#,
+        );
+        assert_eq!(
+            (gtwo.classes, gtwo.metadata),
+            (
+                sql::ClassNames::Without(vec!["m".to_string()]),
+                sql::MetadataSent::Text
+            )
+        );
+        let b = lowers(r#"sum(sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
+        assert_eq!((b.form, b.keys.len()), (sql::UnwrapForm::Bare, 0));
+        let bk = lowers(r#"sum by (status) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
+        assert_eq!(
+            bk.keys,
+            vec![sql::UnwrapKeyLabel {
+                label: "status".to_string(),
+                source: "status".to_string()
+            }]
+        );
+        assert_eq!(
+            bk.classes,
+            sql::ClassNames::Projected(vec!["latency".to_string(), "status".to_string()])
+        );
+        lowers(r#"topk(1, sum by (status) (sum_over_time({a="b"} | json | unwrap latency [1m])))"#);
+        lowers(r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (a)"#);
+        lowers(r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by ()"#);
         lowers(
-            &format!(r#"sum_over_time({{a="b"}} |= "boom" {pipe} [1m])"#),
-            sql::UnwrapReducer::Sum,
+            r#"sum by (method) (avg_over_time({a="b"} | json | unwrap latency [1m]) by (method, status))"#,
+        );
+        let bf = lowers(
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | a="x" | unwrap latency [1m]))"#,
+        );
+        assert_eq!(
+            bf.keys.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(),
+            vec!["a", "service_name"]
+        );
+        lowers(
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | code > 100 | unwrap latency [1m]))"#,
         );
 
-        // --- the eight that do not -----------------------------------
-        for (op, why) in [
-            ("min_over_time", "order-independent, and out of W4's scope"),
-            ("max_over_time", "the same"),
-            ("first_over_time", "selects rather than accumulates"),
-            ("last_over_time", "the same"),
-            (
-                "rate_counter",
-                "not an aggregate: a reset walk and an extrapolation",
-            ),
-            (
-                "stddev_over_time",
-                "withdrawn in review round 3: a partial-moment algorithm can lose the answer \
-                 and stay FINITE, so the reader's non-finite rule does not cover it",
-            ),
-            ("stdvar_over_time", "the same"),
-        ] {
-            stays_client(&format!(r#"{op}({{a="b"}} {pipe} [1m])"#), why);
-        }
-        stays_client(
-            &format!(r#"quantile_over_time(0.9, {{a="b"}} {pipe} [1m])"#),
-            "the exact quantile is not lowered either",
-        );
-
-        // --- the chain shape -----------------------------------------
-        stays_client(
-            r#"sum_over_time({a="b"} | json | unwrap latency [1m])"#,
-            "a BARE json puts every key of the document in the label set, so the output \
-             series are not the statement's group key",
-        );
-        stays_client(
+        // --- refused chains (§9 r61–r86, and the rows that follow; r60 is a
+        // parse error and never reaches a route) ---
+        for q in [
+            r#"sum_over_time({a="b"} | json lat="[\"la\\\\t\"]" | unwrap lat [1m])"#,
+            "sum_over_time({a=\"b\"} | json lat=\"[\\\"la\tt\\\"]\" | unwrap lat [1m])",
+            r#"sum_over_time({a="b"} | json lat="arr[0]" | unwrap lat [1m])"#,
+            r#"sum_over_time({a="b"} | json lat="latency", lat="l2" | unwrap lat [1m])"#,
+            r#"sum_over_time({a="b"} | json lat="latency", l2="latency" | unwrap lat [1m])"#,
             r#"sum_over_time({a="b"} | logfmt | unwrap latency [1m])"#,
-            "no logfmt extractor in the database",
-        );
-        stays_client(
-            r#"sum_over_time({a="b"} | json latency="lat" | unwrap latency [1m])"#,
-            "the label and the source key differ, and the expression is a grammar",
-        );
-        stays_client(
-            r#"sum_over_time({a="b"} | json latency="latency" | unwrap duration(latency) [1m])"#,
-            "a conversion is a grammar implemented in Rust",
-        );
-        stays_client(
-            r#"sum_over_time({a="b"} | json app_id="app_id" | unwrap app_id [1m])"#,
-            "an underscore-bearing name has more than one preimage",
-        );
-        stays_client(
-            &format!(r#"sum_over_time({{a="b"}} {pipe} | lvl="warn" [1m])"#),
-            "a stage after the unwrap",
-        );
-        stays_client(
-            &format!(r#"sum_over_time({{a="b"}} {pipe} [2m])"#),
-            "the range is not the step",
-        );
-        stays_client(
-            &format!(r#"sum_over_time({{a="b"}} |= ip("10.0.0.0/8") {pipe} [1m])"#),
-            "a line filter that cannot be pushed",
-        );
+            r#"sum_over_time({a="b"} | regexp "latency=(?P<latency>[0-9]+)" | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | pattern "latency=<latency>" | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | unpack | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | json | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | logfmt | json | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | code="a" | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | label_format x=code | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | line_format "{{.code}}" | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | drop code | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | keep code, latency | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | decolorize | json | unwrap latency [1m])"#,
+            r#"sum_over_time({a="b"} | json | unwrap latency | latency > 1 [1m])"#,
+            r#"sum_over_time({a="b"} | json | unwrap latency | __error__="" [1m])"#,
+            r#"sum_over_time({a="b"} | json | unwrap duration(latency) [1m])"#,
+            r#"avg_over_time({a="b"} | json | unwrap latency [1m]) without (r)"#,
+            r#"sum_over_time({a="b"} |= ip("10.0.0.0/8") | json | unwrap latency [1m])"#,
+            r#"max_over_time({a="b"} | json | unwrap latency [1m])"#,
+            r#"sum by (a) (sum_over_time({a="b"} | json | unwrap latency [2m]))"#,
+            r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (latency)"#,
+            r#"sum by (code_extracted) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            // g30 (g01 is a parse error; g07 and g08 are r85 and r81)
+            r#"max_over_time({a="b"} | json | unwrap latency [1m]) by (a)"#,
+            // q19, q50/q51, g18/g19
+            r#"sum by (code, code_extracted) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (code_extracted)"#,
+            // c34/c35, c36: two destinations of one label
+            r#"sum_over_time({a="b"} | json c="code", c="method", lat="latency" | unwrap lat [1m])"#,
+            r#"sum_over_time({a="b"} | json code="a", code_extracted="b", lat="latency" | unwrap lat [1m])"#,
+            r#"sum_over_time({a="b"} | json __error__="e", __error___extracted="f", lat="latency" | unwrap lat [1m])"#,
+            // the bare shapes today's route keeps
+            r#"sum_over_time({a="b"} | json | unwrap latency [1m])"#,
+            r#"avg by (a) (avg_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            r#"sum without (a) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            r#"sum by (a) (avg_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            // reserved names (issue #507, revision 9): by-labels, filter
+            // labels, destinations, and the `_extracted` spelling (n03)
+            r#"sum by (__error__) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            r#"sum by (__error___extracted) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | __error__="" | unwrap latency [1m]))"#,
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | __preserve_error__="true" | unwrap latency [1m]))"#,
+            r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (__variant__)"#,
+            r#"sum_over_time({a="b"} | json __error__="e", lat="latency" | unwrap lat [1m])"#,
+            r#"avg_over_time({a="b"} | json lat="latency" | unwrap lat [1m]) by (__error_details__)"#,
+            // g02: a parent `sum by` naming the unwrapped label
+            r#"sum by (latency) (sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m]))"#,
+            // a filter naming the unwrapped label (issue #507, this change)
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | latency > 1 | unwrap latency [1m]))"#,
+        ] {
+            today(q);
+        }
 
-        // An instant query has no grid and keeps its existing route.
-        assert!(matches!(
-            value(&format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#)),
-            sql::MetricValue::Unwrapped(_)
-        ));
+        // An instant query has no grid and keeps today's route.
         let mp = metric_mp(
-            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
+            r#"sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m])"#,
             QuerySpec::Instant {
                 at_ns: 600_000_000_000,
             },
         )
         .expect("plan");
         assert!(matches!(mp.value, sql::MetricValue::Shaped(_)));
-    }
-
-    /// Issue #507, W4 — the two spellings of the unwrapped name come from
-    /// ONE argument, so a statement and the reader's metadata comparison
-    /// cannot be about different strings.
-    #[test]
-    fn the_unwrapped_value_mints_both_spellings_from_one_name() {
-        let v = sql::MetricValue::unwrapped(sql::UnwrapReducer::Sum, "it's");
-        let sql::MetricValue::Unwrapped(u) = &v else {
-            panic!("the constructor builds the unwrapped arm");
-        };
-        assert_eq!(u.label, "it's");
-        assert_eq!(
-            u.name.as_sql(),
-            crate::logql::predicate::literal("it's").as_sql(),
-            "the statement's spelling is the escaper's, not the raw one"
-        );
-        assert_ne!(
-            u.name.as_sql(),
-            u.label,
-            "and the two are not the same bytes"
-        );
     }
 }

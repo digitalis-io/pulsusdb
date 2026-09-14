@@ -158,8 +158,10 @@ fn parse_of_the_real_capture_is_pure() {
 /// Loki stream `{service_name="checkout", env="prod"}` and the equivalent
 /// **scope-absent, resource-only** OTLP log payload produce the SAME
 /// `fingerprint` and `service`. With resource attributes whose
-/// `canonicalize_label_key` images equal the Loki label keys, both inputs feed
-/// `LabelSet::from_normalized` over an identical pair set — so
+/// stored names equal the pushed label keys, both inputs reach an identical
+/// stored pair set (`LabelSet::from_normalized` on the push side,
+/// `LabelSet::from_log_attribute_pairs` on the OTLP side, which name these
+/// keys alike) — so
 /// `stream_fingerprint` and `service()` are identical by construction. Since
 /// issue #109 the scope-PRESENT case also converges (scope is structured
 /// metadata, not a stream label — see the convergence test below); this test

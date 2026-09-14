@@ -352,6 +352,64 @@ pub fn compile(text: &str, kind: TemplateKind) -> Result<Template, TemplateCompi
     })))
 }
 
+/// Whether the template names the field `name` where the reference's
+/// template field listing finds a field (`listNodeFields`,
+/// `pkg/logql/log/fmt.go:264-316 @ v3.7.4`):
+/// in the arguments of an action, of a parenthesised pipeline, or of an
+/// `if`/`with`/`range` branch, in the template's root only. Issue #507 reads
+/// it for the parser hints' required labels. A template that does not parse
+/// names nothing: the pipeline refuses it with its own 400.
+pub fn names_field(text: &str, kind: TemplateKind, name: &str) -> bool {
+    let Ok(tree) = parse::parse(kind.parse_name(), text, funcs::all_callable_names()) else {
+        return false;
+    };
+    list_names_field(&tree.root, name)
+}
+
+fn list_names_field(list: &parse::List, name: &str) -> bool {
+    list.nodes.iter().any(|node| match node {
+        parse::Node::Action { pipe, .. } => pipe_names_field(pipe, name),
+        parse::Node::If {
+            pipe,
+            list,
+            else_list,
+            ..
+        }
+        | parse::Node::Range {
+            pipe,
+            list,
+            else_list,
+            ..
+        }
+        | parse::Node::With {
+            pipe,
+            list,
+            else_list,
+            ..
+        } => {
+            pipe_names_field(pipe, name)
+                || list_names_field(list, name)
+                || else_list
+                    .as_ref()
+                    .is_some_and(|el| list_names_field(el, name))
+        }
+        parse::Node::Text { .. }
+        | parse::Node::Template { .. }
+        | parse::Node::Break { .. }
+        | parse::Node::Continue { .. } => false,
+    })
+}
+
+fn pipe_names_field(pipe: &parse::Pipe, name: &str) -> bool {
+    pipe.cmds.iter().any(|cmd| {
+        cmd.args.iter().any(|arg| match arg {
+            parse::Arg::Field { idents, .. } => idents.iter().any(|i| i == name),
+            parse::Arg::Pipe { pipe, .. } => pipe_names_field(pipe, name),
+            _ => false,
+        })
+    })
+}
+
 // ---------------------------------------------------------------------
 // Fast-path derivation + flag scan
 // ---------------------------------------------------------------------

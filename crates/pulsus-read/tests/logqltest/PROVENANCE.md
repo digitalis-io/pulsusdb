@@ -1325,9 +1325,16 @@ Each reachable case now takes its own sample span plus a gap of
 one — costs `MIN_GAP_SECS` and nothing more, where the fixed slot billed
 it at the widest case's rate. Measured over the corpus: the cases' own
 spans sum to 885 s and their gaps to 4940 s, so the placement occupies
-5825 s of a 9400 s budget (`SERVED_HORIZON - RUN_MARGIN - MIN_GAP_SECS`).
-That is **5825/9400 s**, i.e. **62.0% occupied**, with 3575 s free —
-about **178 more zero-span rows** before anything has to be narrowed.
+5825 s of a 9400 s budget (`SERVED_HORIZON - RUN_MARGIN - MIN_GAP_SECS`),
+with 3575 s free at that merge.
+
+Issue #507 moved it: `b27_logfmt_token_scan.test` and
+`b28_reserved_names.test` add single-entry streams cases, and the
+`b23_json_raw_read.test` rows that became divergences left the slice. The
+placement now occupies **7365/9400 s**, i.e. **78.4% occupied**, with 2035 s
+free — about **101 more zero-span rows** before anything has to be
+narrowed (`cargo test -p pulsus-read --test logqltest_replay the_placement
+-- --nocapture` prints the line).
 
 Three things follow, and each is a check rather than a sentence:
 

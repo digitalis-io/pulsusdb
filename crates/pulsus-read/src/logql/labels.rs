@@ -380,10 +380,40 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
     sm_ctx.stream_label_count = Some(base_len);
     sm_buf.clear();
     parse_flat_labels_into(structured_metadata, sm_buf);
+    merge_metadata_pairs(base_len, sm_buf.drain(..), merge_buf, sm_ctx);
+}
+
+/// [`merge_labels_with_structured_metadata`] over pairs already decoded —
+/// the extracted-field group key read's projected metadata (issue #507),
+/// which arrives as `Array(Tuple(String, String))` rather than as stored
+/// text. The same loop body, so the two merges cannot disagree.
+pub(in crate::logql) fn merge_labels_with_structured_metadata_pairs(
+    base: &[(String, String)],
+    pairs: &[(String, String)],
+    merge_buf: &mut Vec<(String, String)>,
+    sm_ctx: &mut StructuredMetadataCtx,
+) {
+    sm_ctx.err.clear();
+    sm_ctx.details.clear();
+    sm_ctx.has_ordinary = false;
+    sm_ctx.sm_over_stream.clear();
+    merge_buf.clear();
+    merge_buf.extend(base.iter().cloned());
+    let base_len = merge_buf.len();
+    sm_ctx.stream_label_count = Some(base_len);
+    merge_metadata_pairs(base_len, pairs.iter().cloned(), merge_buf, sm_ctx);
+}
+
+fn merge_metadata_pairs(
+    base_len: usize,
+    pairs: impl Iterator<Item = (String, String)>,
+    merge_buf: &mut Vec<(String, String)>,
+    sm_ctx: &mut StructuredMetadataCtx,
+) {
     // `base_len` is small (a stream's label count), so these scans are bounded
-    // by the fixed label cardinality, not by row count. `drain` moves the owned
-    // key/value Strings out of the reused scratch without cloning.
-    for (mut key, value) in sm_buf.drain(..) {
+    // by the fixed label cardinality, not by row count. The pairs are owned,
+    // so a drained scratch moves its Strings in without cloning.
+    for (mut key, value) in pairs {
         if merge_buf[..base_len].iter().any(|(bk, _)| *bk == key) {
             key.push_str("_extracted");
         }

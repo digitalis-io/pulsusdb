@@ -1076,6 +1076,16 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
 
+      # Issue #507: `| logfmt` over 400 generated lines holding malformed
+      # tokens, under both modes. Pushes the lines to this container and
+      # asserts its labels equal the ones committed in
+      # tests/fixtures/logfmt_token_scan/reference_labels.tsv, which the
+      # hermetic half compares with ours.
+      - name: LogQL differential leg (logfmt token scan matrix, issue #507)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_logfmt_token_scan_matrix
+
       # Issue #388: the `| pattern "…"` argument sub-grammar
       # (pkg/logql/log/pattern/ @ v3.7.4) x every position the stage can
       # occupy. Put to this same container and compared against the
@@ -2110,6 +2120,18 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
+      # Issue #507, criterion 19: the extracted-field group key read's one
+      # read (L) over the `_dist` tables — L answers where today's route
+      # refuses, its 2-minute answer is today's within the summation bound,
+      # and the other shard's system.query_log holds exactly one part of L
+      # after its part of today's raw scan.
+      - name: LogQL group key read, one read on two shards (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "18123"
+          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
+        run: cargo test -p pulsus-read --test query_log_gates the_undecided_rows_come_from_one_read -- --exact
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),

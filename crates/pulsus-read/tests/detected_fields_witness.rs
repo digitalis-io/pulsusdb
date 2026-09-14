@@ -1541,8 +1541,11 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
     // region, which is the double-collision case the categorised `stream`
     // object has to drop. Same single scan, one more `.clear` (the new
     // `sm_over_stream` list) and one more `.push`.
+    // Issue #507: the per-pair loop moved into `merge_metadata_pairs`, which
+    // the pairs sibling the extracted-field group key read uses shares, so
+    // this frame now calls it once in place of the loop's own calls.
     (("labels.rs", None, "merge_labels_with_structured_metadata"),
-     ".anyx1 .clearx5 .clonedx1 .drainx1 .extendx1 .is_emptyx1 .iterx3 .lenx1 .positionx1 .pushx2 .push_strx1 Somex1 parse_flat_labels_intox1"),
+     ".clearx5 .clonedx1 .drainx1 .extendx1 .iterx1 .lenx1 Somex1 merge_metadata_pairsx1 parse_flat_labels_intox1"),
     (("labels.rs", None, "parse_flat_labels_into"),
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
     (("detected_probe.rs", None, "recycle_label_scratch"),
