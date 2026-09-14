@@ -1857,7 +1857,7 @@ impl LogQlEngine {
         if key_statement_failure_goes_to_todays_route(&e) {
             return KeyRouteOutcome::TodaysRoute("the key statement failed");
         }
-        KeyRouteOutcome::Refusal(map_read_error(
+        KeyRouteOutcome::Refusal(key_statement_refusal(
             e,
             self.config.scan_budget_bytes,
             self.config.read_max_memory_bytes,
@@ -5208,6 +5208,22 @@ fn key_statement_failure_goes_to_todays_route(e: &ChError) -> bool {
         | ChError::Config(_)
         | ChError::InsertUncertain(_) => false,
     }
+}
+
+/// The answer to a failure of the key statement that does not hand the
+/// query to today's route (issue #507). The server's `max_execution_time`
+/// (159) and the client's stream deadline are one deadline, and whichever
+/// arrives first is the timeout response, `ChError::Timeout` (the logs API's
+/// `504`); everything else is today's error mapping.
+fn key_statement_refusal(e: ChError, budget_bytes: u64, read_max_memory_bytes: u64) -> ReadError {
+    if let ChError::Server {
+        code: CODE_TIMEOUT_EXCEEDED,
+        ..
+    } = &e
+    {
+        return ReadError::Clickhouse(ChError::Timeout(e.to_string()));
+    }
+    map_read_error(e, budget_bytes, read_max_memory_bytes)
 }
 
 /// Whether a group key statement is sent (issue #507): a statement over the
@@ -9015,6 +9031,45 @@ mod tests {
             fold_groups(sum, &[undecided]),
             Err(super::super::unwrap_group::FoldStop::TodaysRoute(_))
         ));
+        // L's undecided rows add their parsed values one at a time, from 0.0.
+        let mp = key_route_plan(sum);
+        let u = key_value(&mp);
+        let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
+        let mut meta = HashMap::new();
+        meta.insert(
+            10,
+            StreamMetaRow {
+                fingerprint: 10,
+                service: "r".to_string(),
+                labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
+            },
+        );
+        let resolved = super::super::unwrap_group::resolve(u, &meta);
+        let mut fold = super::super::unwrap_group::KeyRouteFold::new(
+            u,
+            &compiled,
+            &resolved,
+            &mp.vector_aggs,
+            mp.grid_start_ns,
+            mp.end_ns,
+            AggCaps::DEFAULT,
+        );
+        for _ in 0..3 {
+            fold.push_lane_row(&UnwrappedLaneRow {
+                class: 0,
+                bucket_ns: 660_000_000_000,
+                decided: 0,
+                keys: vec![(0, String::new())],
+                v: 0.0,
+                body: r#"{"latency":0.1}"#.to_string(),
+                fingerprint: 10,
+                sm_text: String::new(),
+                sm_kept: Vec::new(),
+            })
+            .expect("folds");
+        }
+        let got = fold.finish().expect("answers");
+        assert_eq!(got[0].1, vec![(660_000_000_000, 0.30000000000000004)]);
     }
 
     /// Criterion 7: a group whose grid point lies outside `[grid start, end]`
@@ -9134,6 +9189,34 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    /// Criterion 7: a timeout of the key statement is the timeout response,
+    /// whether the server's `max_execution_time` (159) or the client's stream
+    /// deadline arrives first; the scan budget stays its `422`.
+    #[test]
+    fn a_key_statement_timeout_is_the_timeout_response() {
+        let server = |code: i32| ChError::Server {
+            code,
+            message: format!("Code: {code}. DB::Exception: x"),
+        };
+        for (what, e) in [
+            ("server 159", server(159)),
+            (
+                "the stream deadline",
+                ChError::Timeout("query_stream exceeded 1s".to_string()),
+            ),
+        ] {
+            let got = super::key_statement_refusal(e, 1024, TEST_READ_MEM);
+            assert!(
+                matches!(got, ReadError::Clickhouse(ChError::Timeout(_))),
+                "{what}: {got:?}"
+            );
+        }
+        assert!(matches!(
+            super::key_statement_refusal(server(307), 1024, TEST_READ_MEM),
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
+        ));
     }
 
     /// Criterion 7: code 241 in the key statement is today's route, while
