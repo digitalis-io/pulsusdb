@@ -237,9 +237,23 @@ mod tests {
             (r#"{"k":"a\nb"}"#, '\n', r"\n"),
             (r#"{"k":"a\rb"}"#, '\r', r"\r"),
             (r#"{"k":"a\tb"}"#, '\t', r"\t"),
-            (r#"{"k":"aAb"}"#, 'A', r"A"),
+            (r#"{"k":"a\u0041b"}"#, 'A', r"\u0041"),
         ];
         for (stored, want, name) in table {
+            // Each row must actually carry the escape it names. The ninth
+            // row shipped with a raw `A` where its name promised
+            // `\u0041`, so the one arm this row exists to exercise was
+            // never reached and the row asserted that the letter A decodes
+            // to itself. These two checks are what catch that class of
+            // mistake: a name is an escape, and the stored text contains it.
+            assert!(
+                name.starts_with('\\'),
+                "row {name:?} does not name an escape; an escape starts with a backslash"
+            );
+            assert!(
+                stored.contains(name),
+                "the row for {name} must STORE that escape, and {stored} does not"
+            );
             let pairs = parse_canonical_labels(stored);
             assert_eq!(
                 pairs,
@@ -262,7 +276,12 @@ mod tests {
     /// do not match themselves and report a deleted arm as present.
     #[test]
     fn the_escape_table_lists_all_eight_of_jsons_two_character_escapes() {
-        let src = include_str!("canonical_labels.rs");
+        // Scoped to the PARSER's own body, not the whole file: over the
+        // file, an arm deleted from the table and a look-alike written
+        // anywhere else — in a test, in a doc comment's code block — would
+        // keep the count at one and the test green. A code review asked
+        // for this scoping.
+        let src = parser_source();
         // The SOURCE spelling of each escape's match pattern: a backslash
         // is written `\\` in a Rust character literal.
         for pattern in ["\"", "\\\\", "/", "b", "f", "n", "r", "t"] {
@@ -276,15 +295,39 @@ mod tests {
         }
     }
 
+    /// The source text of `parse_json_string` alone — from its declaration
+    /// at column 0 to its closing brace at column 0 — so a check over the
+    /// escape table reads the table and nothing else.
+    ///
+    /// The declaration it looks for is assembled at run time, so this
+    /// function's own source does not contain it.
+    fn parser_source() -> &'static str {
+        let src = include_str!("canonical_labels.rs");
+        let decl = format!("{}fn parse_{}", '\n', "json_string");
+        let start = src.find(&decl).expect("this module declares the parser") + 1;
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("the parser's closing brace at column 0")
+            + 2;
+        let body = &rest[..end];
+        assert!(
+            body.len() > 200 && body.ends_with("\n}"),
+            "the parser slice is {} byte(s) and does not end at a closing brace in column 0",
+            body.len()
+        );
+        body
+    }
+
     /// The two code points issue #539 fixed, each between its immediate
     /// neighbours — which come back through a DIFFERENT mechanism, so a
     /// build that special-cased U+0008 alone still fails here:
     ///
     /// ```text
-    ///   U+0007      the \uXXXX arm
+    ///   U+0007   \u0007   the \uXXXX arm
     ///   U+0008   \b       the arm added by #539
     ///   U+0009   \t       an explicit arm
-    ///   U+000B      the \uXXXX arm
+    ///   U+000B   \u000b   the \uXXXX arm
     ///   U+000C   \f       the arm added by #539
     ///   U+000D   \r       an explicit arm
     /// ```
@@ -321,34 +364,70 @@ mod tests {
         }
     }
 
-    /// Issue #539's first item: ONE decoder. The three files that used to
-    /// carry a private copy are read here, so a fourth copy reappearing in
-    /// any of them reddens this rather than waiting for a reviewer.
+    /// Issue #539's first item: ONE decoder — checked by SEARCHING the
+    /// crate, not by reading a list of files.
+    ///
+    /// The first version of this test named the three files that used to
+    /// carry a private copy and read those three with `include_str!`. A
+    /// code review pointed out what that cannot see: a fourth copy in any
+    /// of the crate's other source files leaves it green. It now walks
+    /// every `.rs` file under this crate's `src/` and reports WHERE each
+    /// definition is, so a new copy anywhere fails with its own path.
     ///
     /// The needle is assembled at run time from two pieces, so that the
     /// literal it looks for does not occur in this test's own source and
     /// count itself.
     #[test]
-    fn the_three_readers_carry_no_private_json_string_parser() {
+    fn the_crate_defines_the_json_string_parser_exactly_once() {
         let needle = format!("fn parse_{}", "json_string");
-        let sources: [(&str, &str); 3] = [
-            ("logql/labels.rs", include_str!("logql/labels.rs")),
-            ("metrics/exec.rs", include_str!("metrics/exec.rs")),
-            ("metrics/refresh.rs", include_str!("metrics/refresh.rs")),
-        ];
-        for (name, src) in sources {
-            assert!(
-                !src.contains(&needle),
-                "{name} defines its own JSON string parser again; issue #539 collapsed the \
-                 three copies into crate::canonical_labels because the escape table in all \
-                 three had the same hole"
-            );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rust_sources(&root, &mut files);
+        files.sort();
+        // The walk is the instrument, so it is checked too: this crate had
+        // 86 source files when this was written, and a walk that found a
+        // handful would pass the census below while seeing almost nothing.
+        assert!(
+            files.len() > 50,
+            "the walk found {} source file(s) under {} — it is not walking the crate",
+            files.len(),
+            root.display()
+        );
+        let mut definers: Vec<String> = Vec::new();
+        for path in &files {
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            for _ in 0..src.matches(&needle).count() {
+                definers.push(
+                    path.strip_prefix(&root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string(),
+                );
+            }
         }
         assert_eq!(
-            include_str!("canonical_labels.rs").matches(&needle).count(),
-            1,
-            "this module defines the decoder exactly once"
+            definers,
+            vec!["canonical_labels.rs".to_string()],
+            "the crate must define the JSON string parser exactly once and here; issue #539 \
+             collapsed three private copies into this module because the escape table in all \
+             three had the same hole"
         );
+    }
+
+    /// Every `.rs` file under `dir`, recursively — the finder the census
+    /// above uses.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]
