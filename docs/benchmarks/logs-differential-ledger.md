@@ -6829,16 +6829,16 @@ gated by
   string, and every JSON client decodes them identically — the two
   responses below parse to byte-identical label values.
 
-- **Measured** 2026-09-11 on one machine, single node, against the pinned
+- **Measured** 2026-09-14 on one machine, single node, against the pinned
   oracle (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
   `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`) with
   the committed `ci/logql/config.yaml`, and against PulsusDB at
-  `5a73a2b6` over ClickHouse `26.3.29.7`. One stream was pushed to each,
+  `f9f5d082` over ClickHouse `26.3.29.7`. One stream was pushed to each,
   through each side's own `POST /loki/api/v1/push`, with the same body:
 
   ```
   {"streams":[{"stream":{"service_name":"s539","bs":"a\bb"},
-               "values":[["1789126940000000000","line with backspace label"]]}]}
+               "values":[["1789415775000000000","line with backspace label"]]}]}
   ```
 
   Both answered `204`. Both were then asked the same question —
@@ -6868,10 +6868,11 @@ gated by
   both.
 
 - **What this row is NOT.** It is not the defect issue #539 fixed. At
-  `d3a1f4c9` our reader's escape table had no `\b` arm and its catch-all
-  kept the letter, so the same request returned
+  `92536d7a`, this branch's base, our reader's escape table had no `\b`
+  arm and its catch-all kept the letter, so the same request returned
   `"stream":{"bs":"abb",…}` — a different string, one that belongs to a
-  different stream. That was ours being wrong and is fixed;
+  different stream (measured the same day, same corpus, the base build
+  and the fixed build side by side on one database each). That was ours being wrong and is fixed;
   `crates/pulsus-read/src/canonical_labels.rs` is the one decoder now.
   The escape FORM above is what remains, and it was already the case
   before that fix — the writer has always emitted `\b`.
