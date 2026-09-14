@@ -215,7 +215,7 @@ GROUP BY fingerprint, bucket_ns, structured_metadata
 ```
 
 **The extracted-field group key** (`metric_range_unwrapped` and `metric_range_unwrapped_rows`, routed by
-`unwrapped_key_route`, `plan.rs:1781`; run by `run_unwrapped_range`, `exec.rs:1727`; issue #507). A
+`unwrapped_key_route`, `plan.rs:1780`; run by `run_unwrapped_range`, `exec.rs:1727`; issue #507). A
 range `sum_over_time` or `avg_over_time` with no conversion and nothing after `| unwrap`, a range equal
 to the step, pushable line filters, then one of these chains:
 
@@ -386,7 +386,7 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3721`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1547`) and `metric_range_unwrapped_rows` (`sql.rs:1607`); the chain rule is `unwrapped_key_route` (`plan.rs:1781`) |
+| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1547`) and `metric_range_unwrapped_rows` (`sql.rs:1607`); the chain rule is `unwrapped_key_route` (`plan.rs:1780`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1710` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1711` |
 | `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1712` |

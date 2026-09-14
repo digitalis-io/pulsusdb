@@ -5439,18 +5439,18 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 621 |
-| of those, citing a bare basename | 490 |
-| `(document, token)` pairs the rule resolves | 345 |
-| occurrences those resolved pairs cover | 518 |
-| `(document, token)` pairs it cannot resolve | 76 |
-| occurrences those frozen pairs cover | 103 |
+| citation occurrences in the five artefacts | 624 |
+| of those, citing a bare basename | 493 |
+| `(document, token)` pairs the rule resolves | 344 |
+| occurrences those resolved pairs cover | 515 |
+| `(document, token)` pairs it cannot resolve | 77 |
+| occurrences those frozen pairs cover | 109 |
 | resolved rows anchored on a token the citing prose prints | 179 |
-| resolved rows anchored on a snapshot of the cited line | 166 |
+| resolved rows anchored on a snapshot of the cited line | 165 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 69 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 70 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 | `occurrences_disagree` | 1 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
@@ -5466,7 +5466,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 621 citation occurrences the five artefacts make, 490 name a bare basename. The rule resolves 345 `(document, token)` pairs covering 518 occurrences, and cannot resolve 76 covering 103. Of the resolved rows, 179 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
+Of the 624 citation occurrences the five artefacts make, 493 name a bare basename. The rule resolves 344 `(document, token)` pairs covering 515 occurrences, and cannot resolve 77 covering 109. Of the resolved rows, 179 are anchored on a token the citing prose prints and 165 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 8 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

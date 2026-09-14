@@ -1633,11 +1633,17 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
         "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs",
     ),
     (
-        "docs/query-to-sql.md",
-        "plan.rs:3319",
-        3,
+        "docs/query-lowering.md",
+        "plan.rs:2294",
+        0,
         ReviewedVerdict::FallbackRight,
-        "the citing prose says compile_line_filters ends its walk at line_format, which is          the break arm at crates/pulsus-read/src/logql/plan.rs:3319 — the fallback's answer.          The anchor rule picks crates/pulsus-promql/src/plan.rs:3319,          `experimental_functions: true,`, because the same sentence prints `true` for          has_unpushed_dropping_stage's return value",
+        "the citing row is LogQL's refusal of `quantile_over_time` with no quantile, whose \
+         construction starts at crates/pulsus-read/src/logql/plan.rs:2294 — the fallback's answer. \
+         The anchor rule picks crates/pulsus-promql/src/plan.rs:2294, \
+         `\"absent() over an unexpected selector plan shape\",`, because the same row prints the \
+         parser's `unexpected '{' …` message. Issue #507 moved this citation from plan.rs:1915; \
+         the entry it replaces, query-to-sql.md's plan.rs:3319, moved to plan.rs:3702 with the \
+         same code and no longer resolves to the other file",
     ),
 ];
 
