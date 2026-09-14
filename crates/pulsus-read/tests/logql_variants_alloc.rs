@@ -2908,12 +2908,20 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs ClientAggState::push_one_row 26 32 :: .add .as_deref .collect .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .iter .key .len .map .run_metric_into_with_sm .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
-        branches: 26,
+        // Issue #507: 26 -> 25 branches. The unwrap arm's `match` on the
+        // value became `.unwrap_or(0.0)` (a preserved failed conversion
+        // counts the converter's zero), `.run_metric_into_with_sm` became
+        // `.run_metric_step_into` (the range step's rules), and the inert
+        // shortcut gained `reserved_fps.is_empty()` / `.contains`. W-MEM
+        // disposition unchanged: **NOT-EXEC, row F-d** — both new calls read a
+        // set built once per query, and none allocates.
+        // FRAME client_agg.rs ClientAggState::push_one_row 25 34 :: .add .as_deref .collect .contains .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .is_empty .iter .key .len .map .run_metric_step_into .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
+        branches: 25,
         callees: &[
             ".add",
             ".as_deref",
             ".collect",
+            ".contains",
             ".contains_key",
             ".copied",
             ".entry",
@@ -2922,11 +2930,12 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".get_mut",
             ".insert",
             ".into_mut",
+            ".is_empty",
             ".iter",
             ".key",
             ".len",
             ".map",
-            ".run_metric_into_with_sm",
+            ".run_metric_step_into",
             ".sort_unstable",
             ".stage",
             ".to_string",
@@ -2960,12 +2969,19 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs RangeSlideState::push_one_row 8 9 :: .len .run_metric_into_with_sm .stage_member Ok check_surviving_error debug_assert_eq! matches! route_row_counted row_route
-        branches: 8,
+        // Issue #507: 8 -> 7 branches, for the instant twin's reasons term
+        // for term (`.unwrap_or` replaces the unwrap arm's `match`;
+        // `.run_metric_step_into`; `reserved_fps.is_empty()` / `.contains`).
+        // W-MEM disposition: **NOT-EXEC, row F-d**.
+        // FRAME client_agg.rs RangeSlideState::push_one_row 7 12 :: .contains .is_empty .len .run_metric_step_into .stage_member .unwrap_or Ok check_surviving_error debug_assert_eq! matches! route_row_counted row_route
+        branches: 7,
         callees: &[
+            ".contains",
+            ".is_empty",
             ".len",
-            ".run_metric_into_with_sm",
+            ".run_metric_step_into",
             ".stage_member",
+            ".unwrap_or",
             "Ok",
             "check_surviving_error",
             "debug_assert_eq!",
@@ -3490,8 +3506,10 @@ static BOUNDARY_CALLEES: [Boundary; 13] = [
         // Issue #249: the metric entrypoint became
         // `run_metric_into_with_sm`, which the metadata-FREE row reaches
         // through the same call with the shared empty context — one
-        // implementation, so the boundary is one name.
-        callee: ".run_metric_into_with_sm",
+        // implementation, so the boundary is one name. Issue #507: the
+        // two row bodies call its rules-taking form, `run_metric_step_into`,
+        // which the older form now delegates to.
+        callee: ".run_metric_step_into",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },
