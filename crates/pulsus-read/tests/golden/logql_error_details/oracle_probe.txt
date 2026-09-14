@@ -69,7 +69,7 @@ STREAMS PATH — the three error classes (issue #99 scope)
     (not an error site in our engine — our logfmt only errors on the
      unterminated quote.)
 
-  => pos = (rune length of the line) + 1 for the unterminated-quote-at-EOF
+  => pos = (byte length of the line) + 1 for the unterminated-quote-at-EOF
      class — reproduced byte-exact. LEDGERED: every other Loki logfmt
      syntax-error class (unexpected '=', unexpected '"', unterminated quoted value, ...) is not an error
      site in our parser.
@@ -234,7 +234,7 @@ The LABEL __error__="LogfmtParserErr" is set for all three malformed
 classes; the detail STRING is byte-exact for the unterminated quote and
 faithful-format (same structure, ledgered position) for the others.
 
-  INPUT `level="unterminated`  (19 runes)  =>
+  INPUT `level="unterminated`  (19 bytes)  =>
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 20 : unterminated quoted value  [byte-exact]
   INPUT `a=1=2`  =>
