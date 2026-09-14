@@ -215,6 +215,64 @@ the body: over roughly 2 MiB the request is rejected `413` (the reference's
 own form cap is 10 MiB and it answers `400` — a difference in a limit, not
 in the parameter surface).
 
+**How `| json`, `| unpack` and `| logfmt` read a line** (issue #507).
+A line is JSON only when it is one JSON text (RFC 8259 §2):
+
+```
+line  = [BOM] [ws*] value [ws*]        ws = 20 09 0A 0D     BOM = EF BB BF, at most one, first
+value = one JSON value, nested at most 127 levels (serde_json's limit, unchanged)
+bare | json, | unpack : the value must be an object
+| json l="path"       : any JSON value; a path that does not resolve gives l="" (as `[1,2]`)
+anything else         = not JSON -> __error__="JSONParserErr",
+                        __error_details__="Value looks like object, but can't find closing '}' symbol",
+                        nothing extracted
+      (empty line, whitespace only, a first byte no value starts with, a parse error,
+       128 levels or more, any byte after the value other than ws)
+```
+
+The depth limit is a protection and stays whatever the reference does:
+`sum_over_time({…} | json latency="latency" | unwrap latency [1m])` over
+`{"latency":5,"a":` + 126 × `[` + 126 × `]` + `}` (127 levels) answers `5`;
+over the same body with 127 × `[` and `]` (128 levels) it answers no series,
+and `count_over_time({…} | json latency="latency" [1m])` answers
+`400 pipeline error: 'JSONParserErr'`, the answer for `{garbage`. The
+reference answers `5` at 128 levels. The reference's first-byte tests and its
+reading past trailing text are recorded as entries 25–28 of
+docs/reference-defects-we-do-not-copy.md.
+
+A line with no readable value for the unwrapped label (absent, empty, or a
+line that is not JSON) contributes no sample and no error, for every range
+aggregation, grouped or not.
+
+A `sum` directly above `count_over_time`, `bytes_over_time`, `rate`,
+`bytes_rate` or `sum_over_time` groups at the range step, so a `__error__`
+label outside its grouping does not fail the query unless the line's own
+error set it; `__preserve_error__="true"` lets an error series through.
+
+`| logfmt` reads a line one token at a time. A token is `key`, `key=`,
+`key=value` or `key="quoted value"` in full, and a closing quote must be
+followed by a byte at or below a space or by the end of the line. Any other
+token contributes nothing, not even the `key=value` before the byte that
+breaks it, and the scan resumes at the next byte at or below a space outside
+a quoted value, so no label is read from inside a quoted value however the
+token is malformed; `--strict` reports `LogfmtParserErr` at the first such
+token, at its 1-based byte position. `level=info msg="user "bob" role=admin now" status=200`
+answers `{level="info", status="200"}`, where the reference also answers
+`msg="user "` and `role="admin"`. A value holding U+FFFD keeps that
+character, where the reference replaces it with a space. Both are recorded
+as entries 30 and 31 of docs/reference-defects-we-do-not-copy.md, with
+ledger rows `logfmt-quoted-value-ends-its-token` and
+`logfmt-replacement-character-value`.
+
+A `| json … | unwrap` range query that the extracted-field group key read
+serves is not limited by the raw-scan read's own buffers — the 8 MiB
+same-nanosecond staging buffer, the 4,000,000 retained window points, the
+12,000,000 result point-slots and the 256 MiB of retained inner label bytes
+— so it can answer where the raw-scan read refuses; both reads keep the
+500-series cap, the scan budget, the memory ceiling, the statement timeout
+and every per-line rule. A timeout of the extracted-field group key read is
+returned as a timeout, as for any read (docs/query-to-sql.md).
+
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |

@@ -6872,8 +6872,9 @@ fn run_logfmt<'a, 't>(
                 return;
             };
             // `parser.go:590-592` — the EXPRESSION parser empties such a
-            // value; the implicit parser maps it to a space (`:417-419`),
-            // which the bare arm above keeps doing (issue #200 ground).
+            // value; the implicit parser maps each U+FFFD to a space
+            // (`:419-421`), where the bare arm above keeps the character
+            // (`logfmt-replacement-character-value`).
             let val = if val.contains(char::REPLACEMENT_CHARACTER) {
                 Cow::Borrowed("")
             } else {
