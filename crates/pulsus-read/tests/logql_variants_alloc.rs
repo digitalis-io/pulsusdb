@@ -1964,6 +1964,12 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // disposition: **NIL** — a `match` on a `Copy` enum and an
         // `Option`; the `.to_string` is inside the refusal arm, which
         // is unreachable (a stepped window routes to `Range` above).
+        // Issue #507: each sub-state takes its variant's range-step rules
+        // (`variant_range_step`, then `.with_range_step`). W-MEM
+        // disposition: **NIL** — `variant_range_step` reads the variant's
+        // grouping in place through the allocation-free
+        // `plan::parent_sum_rules`, and `.with_range_step` moves a `Copy`
+        // value into the state. Branch count unchanged.
         branches: 12,
         callees: &[
             ".as_instant",
@@ -1982,6 +1988,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".rate_window_ns",
             ".to_string",
             ".window",
+            ".with_range_step",
             "Instant",
             "Ok",
             "Range",
@@ -1990,6 +1997,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "matches!",
             "new",
             "variant_meta_snapshot_bytes",
+            "variant_range_step",
             "variant_state_bytes",
             "with_capacity",
         ],

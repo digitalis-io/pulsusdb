@@ -7886,12 +7886,12 @@ mod tests {
     /// answers `__error__="LogfmtParserErr"` **and** `a=""`; `ec774ee`
     /// answered with the error alone.
     ///
-    /// The lenient half stays divergent and that is deliberate — the
-    /// reference's lenient decoder RESUMES after a recoverable error
-    /// (`parser.go:564-571`) and ours stops, which is issue #200's
-    /// ground, not this one's. So `| logfmt a="b"` over this line is
-    /// `a=""` here and `a="1"` there, and this test pins OUR answer
-    /// rather than pretending the gap is closed.
+    /// The lenient half: the reference's lenient decoder RESUMES after a
+    /// malformed token (`pkg/logql/log/parser.go:564-571 @ v3.7.4`), and
+    /// since issue #507 ours does too — a malformed token contributes
+    /// nothing and the scan goes on to the next one. So `| logfmt a="b"`
+    /// over this line reads `b=1` after the broken `=x` and answers
+    /// `a="1"`, the reference's answer.
     #[test]
     fn a_pre_seeded_identifier_survives_a_strict_decoder_error() {
         let got = logfmt_labels(r#"{s="m"} | logfmt --strict a="b""#, "=x b=1", &[]);
@@ -7905,8 +7905,8 @@ mod tests {
         );
         assert_eq!(
             logfmt_labels(r#"{s="m"} | logfmt a="b""#, "=x b=1", &[]),
-            sorted_pairs(&[("a", "")]),
-            "lenient recovery is issue #200's ground; the reference answers `a=\"1\"` here"
+            sorted_pairs(&[("a", "1")]),
+            "the lenient scan resumes after the malformed `=x` and reads `b=1`, as the reference does"
         );
     }
 

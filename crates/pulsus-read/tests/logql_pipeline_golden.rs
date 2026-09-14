@@ -166,42 +166,82 @@ fn json_extraction_landing_on_an_object_hands_back_its_bytes() {
     );
 }
 
-// --- issue #389 part A: the scan stops at the end of the first value ---
+// --- issue #507: a line is JSON only when it is ONE JSON text ---
 //
-// `serde_json::from_str` demands end-of-input after the value; the
-// reference's scanner simply stops (`jsonparser.ObjectEach` returns the
-// moment it reaches the closing brace,
-// `vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160 @
-// v3.7.4`). ONE call, THREE entrypoints — `| json`, `| json a="…"` and
-// `| unpack` — so each gets its own case.
+// RFC 8259 §2: a JSON text is one value with optional whitespace around
+// it. So text after the value is not JSON on any form, and the three
+// entrypoints — `| json`, `| json a="…"` and `| unpack` — report such a
+// line as `JSONParserErr` with the bare form's details and extract
+// nothing. The reference's scanner stops at the end of the first value
+// instead (`jsonparser.ObjectEach` returns the moment it reaches the
+// closing brace, `vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160
+// @ v3.7.4`) and reads `a="1"` out of `{"a":1}trailing`: extracting from
+// text that is not the format. Recorded as ledger row
+// `json-text-is-one-value`; each entrypoint gets its own case.
+
+/// The pair every line that is not one JSON text carries, on every form.
+fn not_json() -> [(&'static str, &'static str); 4] {
+    [
+        ("app", "checkout"),
+        ("env", "prod"),
+        ("__error__", "JSONParserErr"),
+        (
+            "__error_details__",
+            "Value looks like object, but can't find closing '}' symbol",
+        ),
+    ]
+}
 
 #[test]
-fn json_flatten_ignores_bytes_after_the_first_value() {
-    for (line, want) in [
-        (r#"{"a":1}trailing"#, vec![("a", "1")]),
-        // Only the FIRST value is read: `b` is never seen.
-        (r#"{"a":1}{"b":2}"#, vec![("a", "1")]),
-        (r#"{"a":1,"o":{"x":2}}junk"#, vec![("a", "1"), ("o_x", "2")]),
-        // Rules out a "truncate at the last/first `}`" hack: the brace
-        // here is INSIDE a string.
-        (r#"{"a":"}x"}trailing"#, vec![("a", "}x")]),
+fn json_flatten_refuses_bytes_after_the_value() {
+    for line in [
+        r#"{"a":1}trailing"#,
+        r#"{"a":1}{"b":2}"#,
+        r#"{"a":1,"o":{"x":2}}junk"#,
+        // The brace is INSIDE a string: nothing truncates at it.
+        r#"{"a":"}x"}trailing"#,
     ] {
         let (got, kept) = run(r#"{a="b"} | json"#, line).unwrap();
-        let mut want: Vec<(&str, &str)> = want;
-        want.extend([("app", "checkout"), ("env", "prod")]);
-        assert_eq!(got, labels(&want), "line {line:?}");
+        assert_eq!(got, labels(&not_json()), "line {line:?}");
         assert_eq!(kept, line, "parsers never rewrite the line");
     }
 }
 
 #[test]
-fn json_expression_ignores_bytes_after_the_first_value() {
+fn json_expression_refuses_bytes_after_the_value() {
     for line in [
         r#"{"a":1}trailing"#,
         r#"{"a":1}{"b":2}"#,
-        // The first occurrence wins, and the second value is not read.
         r#"{"a":1,"a":2}zz"#,
     ] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
+        assert_eq!(got, labels(&not_json()), "line {line:?}");
+    }
+}
+
+#[test]
+fn unpack_refuses_bytes_after_the_value() {
+    let body = r#"{"_entry":"hi","lbl":"v"}trailing"#;
+    let (got, line) = run(r#"{a="b"} | unpack"#, body).unwrap();
+    assert_eq!(got, labels(&not_json()));
+    assert_eq!(line, body, "a line that is not JSON is not unpacked");
+}
+
+/// The targeted form reads exactly the JSON texts the bare form reads
+/// (issue #507). The reference gates it on ONE raw byte with whitespace
+/// not skipped, reports no details, writes nothing for an empty line, and
+/// answers the missing-path fill for a line that does not parse
+/// (`pkg/logql/log/parser.go:671-682,724-731 @ v3.7.4`). Its bare form
+/// refuses `{garbage` while its targeted form fills `a=""`, so the two
+/// forms disagree with each other; the correct answer is the JSON
+/// standard's, on both. Recorded as ledger rows
+/// `json-leading-whitespace-and-byte-order-mark` and
+/// `json-targeted-line-that-does-not-parse`.
+#[test]
+fn json_expression_reads_one_json_text() {
+    // JSON whitespace (and one leading byte-order mark) before the value
+    // is part of the JSON text.
+    for line in [r#" {"a":1}"#, "\t{\"a\":1}", "\u{feff}{\"a\":1}"] {
         let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
         assert_eq!(
             got,
@@ -209,79 +249,40 @@ fn json_expression_ignores_bytes_after_the_first_value() {
             "line {line:?}"
         );
     }
-}
-
-#[test]
-fn unpack_ignores_bytes_after_the_first_value() {
-    let (got, line) = run(
-        r#"{a="b"} | unpack"#,
-        r#"{"_entry":"hi","lbl":"v"}trailing"#,
-    )
-    .unwrap();
+    // Not one JSON text: the bare form's error and details, no fill.
+    for line in [
+        r#"x{"a":1}"#,
+        "",
+        r#"[1,2]junk"#,
+        r#""hello"trailing"#,
+        "{garbage",
+        r#"{"a"}"#,
+    ] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
+        assert_eq!(got, labels(&not_json()), "line {line:?}");
+    }
+    // A JSON text whose path does not resolve is the fill, as before.
+    let (got, _) = run(r#"{a="b"} | json a="a""#, "[1,2]").unwrap();
     assert_eq!(
         got,
-        labels(&[("app", "checkout"), ("env", "prod"), ("lbl", "v")])
+        labels(&[("app", "checkout"), ("env", "prod"), ("a", "")])
     );
-    assert_eq!(line, "hi");
 }
 
-/// `JSONExpressionParser.Process` gates on `len(line) == 0` and then on
-/// `isValidJSONStart(line)` — ONE raw byte, whitespace NOT skipped
-/// (`pkg/logql/log/parser.go:664-670,726-732 @ v3.7.4`). Everything past
-/// that gate is a non-validating scan whose misses are the missing-path
-/// fill, so a line that does not parse still answers `a=""` with no
-/// error. We used to route this arm through the flatten arm's
-/// "must parse to an object" test, which is wrong in both directions.
+/// `| unpack` reads the same JSON texts (issue #507). The reference
+/// returns silently on an empty line and refuses any first byte other
+/// than `{` with whitespace not skipped (`pkg/logql/log/parser.go:753-762
+/// @ v3.7.4`); an empty line is not JSON, and whitespace before the
+/// object is part of the JSON text.
 #[test]
-fn json_expression_gates_on_the_first_byte_only() {
-    // `addErrLabel(errJSON, nil, lbs)`: the error, and NO details.
-    for line in [r#" {"a":1}"#, "\t{\"a\":1}", r#"x{"a":1}"#] {
-        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
-        assert_eq!(
-            got,
-            labels(&[
-                ("app", "checkout"),
-                ("env", "prod"),
-                ("__error__", "JSONParserErr"),
-            ]),
-            "line {line:?}"
-        );
-    }
-    // An empty line writes NOTHING — not the fill, not an error.
-    let (got, _) = run(r#"{a="b"} | json a="a""#, "").unwrap();
-    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
-    // Past the gate, a miss is the fill: `a=""` and no error.
-    for line in [r#"[1,2]junk"#, r#""hello"trailing"#, "{garbage", r#"{"a"}"#] {
-        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
-        assert_eq!(
-            got,
-            labels(&[("app", "checkout"), ("env", "prod"), ("a", "")]),
-            "line {line:?}"
-        );
-    }
-}
-
-/// `UnpackParser.Process`'s own gate (`parser.go:753-762 @ v3.7.4`): an
-/// empty line returns silently, and the object test is `line[0] != '{'`.
-#[test]
-fn unpack_gates_on_the_first_byte_only() {
+fn unpack_reads_one_json_text() {
     let (got, line) = run(r#"{a="b"} | unpack"#, "").unwrap();
-    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(got, labels(&not_json()));
     assert_eq!(line, "");
 
+    // Read, and with no `_entry` nothing is promoted and nothing errs.
     let (got, line) = run(r#"{a="b"} | unpack"#, r#" {"a":"1"}"#).unwrap();
-    assert_eq!(
-        got,
-        labels(&[
-            ("app", "checkout"),
-            ("env", "prod"),
-            ("__error__", "JSONParserErr"),
-            (
-                "__error_details__",
-                "Value looks like object, but can't find closing '}' symbol",
-            ),
-        ])
-    );
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
     assert_eq!(line, r#" {"a":"1"}"#);
 }
 
@@ -368,11 +369,10 @@ fn a_key_order_fix_alone_does_not_pass() {
         ])
     );
 
+    // Issue #507: text after the value makes the line not JSON, so no
+    // truncation of any kind can pass this row — nothing is extracted.
     let (got, _) = run(r#"{a="b"} | json a="a""#, r#"{"a":"}x"}trailing"#).unwrap();
-    assert_eq!(
-        got,
-        labels(&[("app", "checkout"), ("env", "prod"), ("a", "}x"),])
-    );
+    assert_eq!(got, labels(&not_json()));
 }
 
 /// The span search and [the walk] must resolve a duplicated key the same
@@ -400,18 +400,15 @@ fn json_extraction_backtracks_over_a_duplicated_key_like_the_walk() {
 
 /// Nothing on this path may recurse: a path is bounded only by the
 /// query-text cap and a document by nothing at all. The nested line is
-/// past `serde_json`'s own recursion limit, so the parse fails and the
-/// missing-path fill answers — without touching the stack, which is the
-/// point. The flat line resolves a container span across 50 000 sibling
-/// fields.
+/// past `serde_json`'s own recursion limit, so the parse fails — without
+/// touching the stack, which is the point — and since issue #507 a line
+/// that does not parse is `JSONParserErr` on the targeted form too. The
+/// flat line resolves a container span across 50 000 sibling fields.
 #[test]
 fn json_expression_resolves_a_span_without_recursing() {
     let deep = format!("{}1{}", "[".repeat(50_000), "]".repeat(50_000));
     let (got, _) = run(r#"{a="b"} | json a="a""#, &format!(r#"{{"a":{deep}}}"#)).unwrap();
-    assert_eq!(
-        got,
-        labels(&[("app", "checkout"), ("env", "prod"), ("a", "")])
-    );
+    assert_eq!(got, labels(&not_json()));
 
     let mut flat = String::from("{");
     for i in 0..50_000 {
@@ -611,11 +608,12 @@ fn logfmt_keep_empty_retains_empty_value_keys() {
 #[test]
 fn logfmt_strict_errors_per_malformed_class() {
     // `--strict` sets `__error__="LogfmtParserErr"` for every malformed
-    // class (issue #200). Detail is byte-exact for the unterminated-quote
-    // class (oracle_probe.txt [2]) and faithful-format for the others (the
-    // LABEL is always correct; only the detail STRING is ledgered).
+    // class (issue #200). A malformed token contributes nothing, not even
+    // the `key=value` before the byte that broke it (issue #507), and the
+    // position is the 1-based BYTE offset, the reference's numbering
+    // (`pkg/logql/log/logfmt/decode.go:209-221 @ v3.7.4`).
 
-    // (1) Unterminated quote — `level="unterminated` is 19 runes, pos 20.
+    // (1) Unterminated quote — `level="unterminated` is 19 bytes, pos 20.
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"level="unterminated"#).unwrap();
     assert_eq!(
         got,
@@ -630,13 +628,14 @@ fn logfmt_strict_errors_per_malformed_class() {
         ])
     );
 
-    // (2) Unexpected `=` — `a=1=2`: the completed `a="1"` pair is kept, the
-    // second `=` (rune pos 4) is unexpected.
+    // (2) Unexpected `=` — `a=1=2`: the second `=` (pos 4) breaks the
+    // token, so no `a` is emitted. The reference answers the same: its
+    // decoder records the error before it returns the pair
+    // (`pkg/logql/log/logfmt/decode.go:120-125,140-149 @ v3.7.4`).
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, "a=1=2").unwrap();
     assert_eq!(
         got,
         labels(&[
-            ("a", "1"),
             ("app", "checkout"),
             ("env", "prod"),
             ("__error__", "LogfmtParserErr"),
@@ -647,8 +646,7 @@ fn logfmt_strict_errors_per_malformed_class() {
         ])
     );
 
-    // (3) A `"` opening a key at rune pos 1 is unexpected. Expected values
-    // captured against the pinned reference (v3.7.3): the reference names
+    // (3) A `"` opening a key at pos 1 is unexpected: the reference names
     // the offending byte (`unexpected '"'`) and has no "invalid key" text.
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#""quoted=1"#).unwrap();
     assert_eq!(
@@ -664,14 +662,13 @@ fn logfmt_strict_errors_per_malformed_class() {
         ])
     );
 
-    // (4) A `"` following an UNQUOTED value is unexpected. Reference
-    // (v3.7.3): `a=1"b"` → pos 4 `unexpected '"'`; the completed `a="1"`
-    // pair before the fault is kept.
+    // (4) A `"` following an UNQUOTED value is unexpected: `a=1"b"` →
+    // pos 4 `unexpected '"'`, and the broken token emits nothing, as the
+    // reference answers.
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a=1"b""#).unwrap();
     assert_eq!(
         got,
         labels(&[
-            ("a", "1"),
             ("app", "checkout"),
             ("env", "prod"),
             ("__error__", "LogfmtParserErr"),
@@ -682,15 +679,26 @@ fn logfmt_strict_errors_per_malformed_class() {
         ])
     );
 
-    // (5) Parity lock: after a CLOSED quoted value the next token may start
-    // with no separating whitespace. Reference (v3.7.3): `a="b"c=1` is
-    // ACCEPTED as `{a="b", c="1"}` with NO `__error__` — the
-    // whitespace-after-close-quote strictness a code-review proposed would
-    // have wrongly diverged here.
+    // (5) A closing quote must be followed by a separator or the end of the
+    // line (issue #507): `a="b"c=1` is one malformed token, broken at the
+    // `c` right after the quote (pos 6), and it emits nothing. The
+    // reference returns the quoted pair and starts a new key at the next
+    // byte, accepting `{a="b", c="1"}`; a byte after the closing quote
+    // means the quote was inside the value or the line is not logfmt, so a
+    // missing pair is preferred to a value cut at an inner quote. Recorded
+    // as ledger row `logfmt-quoted-value-ends-its-token`.
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a="b"c=1"#).unwrap();
     assert_eq!(
         got,
-        labels(&[("a", "b"), ("app", "checkout"), ("c", "1"), ("env", "prod"),])
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                "logfmt syntax error at pos 6 : unexpected 'c'",
+            ),
+        ])
     );
 }
 
@@ -1409,10 +1417,17 @@ fn label_filter_number_family_detail_is_byte_exact_for_nonascii_values() {
         detail(r#"{a="b"} | logfmt | status > 100"#, "status=\"ab\\\"cd\"").as_deref(),
         Some(r#"strconv.ParseFloat: parsing "ab\"cd": invalid syntax"#),
     );
-    // (b) C0 control byte 0x01 -> `\x01`.
+    // (b) C0 control byte 0x01 -> `\x01`. Carried inside a quoted value:
+    // unquoted, a byte at or below a space separates tokens (issue #507,
+    // `pkg/logql/log/logfmt/decode.go:126-131 @ v3.7.4`), so the value
+    // ends at it and the detail names `ab` alone, as the reference's does.
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=\"ab\u{1}cd\"").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "ab\x01cd": invalid syntax"#),
+    );
     assert_eq!(
         detail(r#"{a="b"} | logfmt | status > 100"#, "status=ab\u{1}cd").as_deref(),
-        Some(r#"strconv.ParseFloat: parsing "ab\x01cd": invalid syntax"#),
+        Some(r#"strconv.ParseFloat: parsing "ab": invalid syntax"#),
     );
     // (c) multi-byte UTF-8 rune (printable -> passes through under
     // strconv.Quote's IsPrint).
@@ -1433,10 +1448,15 @@ fn label_filter_duration_family_detail_is_byte_exact_for_nonascii_values() {
         detail(r#"{a="b"} | logfmt | took > 5s"#, "took=\"ab\\\"cd\"").as_deref(),
         Some(r#"time: invalid duration "ab\"cd""#),
     );
-    // (b) C0 control byte 0x01 -> `\x01` (time.quote has NO named escapes).
+    // (b) C0 control byte 0x01 -> `\x01` (time.quote has NO named escapes),
+    // carried inside a quoted value; unquoted it ends the value (issue #507).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=\"ab\u{1}cd\"").as_deref(),
+        Some(r#"time: invalid duration "ab\x01cd""#),
+    );
     assert_eq!(
         detail(r#"{a="b"} | logfmt | took > 5s"#, "took=ab\u{1}cd").as_deref(),
-        Some(r#"time: invalid duration "ab\x01cd""#),
+        Some(r#"time: invalid duration "ab""#),
     );
     // (c) multi-byte UTF-8 rune -> unknown-unit branch; BOTH the unit and
     // the whole value are per-byte `\xNN` escaped (中 == e4 b8 ad).
