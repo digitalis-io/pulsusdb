@@ -3949,6 +3949,15 @@ impl<'a> ExtractionState<'a, '_> {
         (present && !self.collides_at(key, present)) || self.removed_parsed.iter().any(|k| k == key)
     }
 
+    /// [`Self::is_extracted_at`] for a caller that has ALREADY asked
+    /// [`Self::collides_at`] of this very key and presence and got `false`
+    /// — every parser's unrenamed path (issue #507 review round 1). The
+    /// collision test is the expensive half, and asking it twice per
+    /// extracted key is what this saves.
+    fn is_extracted_at_uncollided(&self, key: &str, present: bool) -> bool {
+        present || self.removed_parsed.iter().any(|k| k == key)
+    }
+
     /// [`Self::collides_at`] for a caller that has not looked the key up.
     fn collides(&self, labels: &[(Cow<'a, str>, Cow<'a, str>)], key: &str) -> bool {
         // `sm_has` is a handful of entries and short-circuits, so the
@@ -4078,7 +4087,12 @@ fn add_extracted<'a>(
         OnAlreadyExtracted::Overwrite => false,
         OnAlreadyExtracted::OverwriteUnlessRenamedRepeat => renamed_here,
     };
-    if skip_repeat && st.is_extracted_at(&resolved, at.is_some()) {
+    let extracted = if renamed_here {
+        st.is_extracted_at(&resolved, at.is_some())
+    } else {
+        st.is_extracted_at_uncollided(&resolved, at.is_some())
+    };
+    if skip_repeat && extracted {
         return;
     }
     if origin == KeyOrigin::Line && st.hint_skips(&resolved) {
@@ -4096,17 +4110,22 @@ fn add_extracted<'a>(
 /// lookup (issue #507).
 const LABEL_SCAN_LIMIT: usize = 64;
 
+#[inline]
 fn lazy_position(
     labels: &[(Cow<'_, str>, Cow<'_, str>)],
     index: &mut Option<LabelIndex>,
     name: &str,
 ) -> Option<usize> {
-    if index.is_none() && labels.len() > LABEL_SCAN_LIMIT {
-        *index = Some(LabelIndex::build(labels));
-    }
+    // The narrow line — every ordinary log line — takes the scan and never
+    // touches the index, so it pays one length test (issue #507 review
+    // round 1).
     match index {
+        None if labels.len() <= LABEL_SCAN_LIMIT => label_position(labels, name),
+        None => {
+            let ix = index.insert(LabelIndex::build(labels));
+            ix.position(labels, name)
+        }
         Some(ix) => ix.position(labels, name),
-        None => label_position(labels, name),
     }
 }
 
@@ -4114,6 +4133,7 @@ fn lazy_position(
 /// (the bare `| logfmt`; issue #507): the lookups go through `index`
 /// (O(1) each, as the `| json` flatten's since #447).
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn add_extracted_indexed<'a>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     st: &mut ExtractionState<'a, '_>,
@@ -4143,7 +4163,12 @@ fn add_extracted_indexed<'a>(
         OnAlreadyExtracted::Overwrite => false,
         OnAlreadyExtracted::OverwriteUnlessRenamedRepeat => renamed_here,
     };
-    if skip_repeat && st.is_extracted_at(&resolved, at.is_some()) {
+    let extracted = if renamed_here {
+        st.is_extracted_at(&resolved, at.is_some())
+    } else {
+        st.is_extracted_at_uncollided(&resolved, at.is_some())
+    };
+    if skip_repeat && extracted {
         return;
     }
     if origin == KeyOrigin::Line && st.hint_skips(&resolved) {
@@ -4191,10 +4216,22 @@ enum KeyOrigin {
     QueryIdentifier,
 }
 
+#[inline]
 fn key_needs_sanitizing(key: &str) -> bool {
-    key.is_empty()
-        || key.as_bytes()[0].is_ascii_digit()
-        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    // Byte-wise, not char-wise (issue #507 review round 1): a key is left
+    // alone exactly when every BYTE is `[A-Za-z0-9_]` and the first is not a
+    // digit. That is the same answer the character walk gives — every byte
+    // of a multi-byte character is >= 0x80, so it is neither ASCII
+    // alphanumeric nor `_` — and it costs no UTF-8 decoding on the line
+    // parsers' paths, which ask this of every extracted key.
+    let bytes = key.as_bytes();
+    match bytes.first() {
+        None => true,
+        Some(first) if first.is_ascii_digit() => true,
+        _ => !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_'),
+    }
 }
 
 /// Canonical label-key sanitization for parser-extracted keys: characters
@@ -6916,6 +6953,38 @@ fn run_logfmt<'a, 't>(
 /// `pkg/logql/log/parser.go:563-571`). Returns `Err` with the FIRST error
 /// and its 1-based byte position; the caller decides strict (error) vs
 /// lenient (swallow, keep the pairs).
+/// The resume point after a malformed logfmt token (issue #507): the next
+/// byte at or below `' '` outside a quoted value, or the end. Out of
+/// [`walk_logfmt`]'s body and never inlined, so the valid-line loop keeps
+/// its registers: a valid line never calls this.
+#[inline(never)]
+#[cold]
+fn skip_malformed_token(bytes: &[u8], from: usize, quoted: bool) -> usize {
+    let len = bytes.len();
+    let mut quoted = quoted;
+    let mut in_quote = false;
+    let mut i = from;
+    while i < len {
+        let b = bytes[i];
+        if in_quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_quote = false;
+            }
+        } else if b <= b' ' {
+            return i;
+        } else if b == b'"' && (quoted || (i > 0 && bytes[i - 1] == b'=')) {
+            in_quote = true;
+            quoted = true;
+        }
+        i += 1;
+    }
+    len
+}
+
 fn walk_logfmt<'t>(
     text: &'t str,
     stop_at_error: bool,
@@ -6940,30 +7009,7 @@ fn walk_logfmt<'t>(
     // `' '` even inside a quoted value (`pkg/logql/log/logfmt/decode.go:140-149
     // @ v3.7.4`), so it reads labels out of the value's text;
     // `docs/reference-defects-we-do-not-copy.md` records the difference.
-    let skip = |from: usize, quoted: bool| -> usize {
-        let mut quoted = quoted;
-        let mut in_quote = false;
-        let mut i = from;
-        while i < len {
-            let b = bytes[i];
-            if in_quote {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b == b'"' {
-                    in_quote = false;
-                }
-            } else if b <= b' ' {
-                return i;
-            } else if b == b'"' && (quoted || (i > 0 && bytes[i - 1] == b'=')) {
-                in_quote = true;
-                quoted = true;
-            }
-            i += 1;
-        }
-        len
-    };
+    let skip = |from: usize, quoted: bool| skip_malformed_token(bytes, from, quoted);
     let mut pos = 0usize;
     let mut first: Option<LogfmtErr> = None;
     loop {
@@ -6975,17 +7021,24 @@ fn walk_logfmt<'t>(
         }
         let key_start = pos;
         let mut key_end = key_start;
+        // `high` collects the top bit of every key byte, so the non-ASCII
+        // test below costs no second pass over the key (issue #507 review
+        // round 1: that pass was 10 of the ~65 ns a ten-pair line spent
+        // here).
+        let mut high = 0u8;
         while key_end < len {
             let b = bytes[key_end];
             if b == b'=' || b == b'"' || b <= b' ' {
                 break;
             }
+            high |= b;
             key_end += 1;
         }
         let key = &text[key_start..key_end];
         // U+FFFD in a key is the reference's "invalid key"; only a
-        // non-ASCII key can hold one, so an ASCII key pays one fast pass.
-        let bad_rune = !key.is_ascii() && key.contains(char::REPLACEMENT_CHARACTER);
+        // non-ASCII key can hold one, and `high` already says whether the
+        // key has a non-ASCII byte.
+        let bad_rune = high >= 0x80 && key.contains(char::REPLACEMENT_CHARACTER);
         // (emitted pair, error at, error kind, resume at)
         let mut err: Option<(usize, LogfmtErrKind)> = None;
         if key_end == len || bytes[key_end] <= b' ' {

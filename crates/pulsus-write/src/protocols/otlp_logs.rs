@@ -121,9 +121,10 @@ pub struct StreamRow {
 pub struct ParsedLogs {
     pub rows: Vec<LogRow>,
     pub streams: Vec<StreamRow>,
-    /// Sum of every `(resource, scope)` label set's normalized-key
-    /// collision count (`LabelSet::from_normalized`'s lossy-resolution
-    /// counter) across the whole request — never swallowed, surfaced for
+    /// Sum of every `(resource, scope)` label set's stored-name collision
+    /// count (the lossy-resolution counter of
+    /// `LabelSet::from_log_attribute_pairs`, the constructor the resource
+    /// path uses since issue #507) across the whole request — never swallowed, surfaced for
     /// the writer's collision metric.
     pub collisions: u64,
     /// Count of individual log *records* dropped during parsing (not
@@ -263,7 +264,7 @@ pub fn parse(
         let (labels, collisions) = build_stream_labels(&raw_attributes, &service_name);
         // `WithoutEmpty` + the four per-stream label bounds (issue #374).
         // `WithoutEmpty` is applied inside `build_stream_labels` above, before
-        // `from_normalized`, because the reference drops empty values before
+        // `from_log_attribute_pairs`, because the reference drops empty values before
         // hashing on this transport too — its OTLP translation renders a label
         // literal (`pkg/loghttp/push/otlp.go:244 @ v3.7.4`) which the
         // distributor re-parses through `syntax.ParseLabels`
@@ -471,11 +472,15 @@ pub fn parse(
 const SERVICE_NAME_EXTRACTED_LABEL: &str = "service_name_extracted";
 
 /// Flattens `resource.attributes` — and ONLY those — into the stream
-/// [`LabelSet`] via [`LabelSet::from_normalized`] (issue #109: scope name/
-/// version/attributes are structured metadata, not stream labels — Loki
-/// 3.4.2 parity). A collision between two resource attributes resolves by
-/// `from_normalized`'s frozen deterministic rule (issue #4) and is counted,
-/// never swapped. Because scope no longer enters this set, `stream_fingerprint`
+/// [`LabelSet`] via [`LabelSet::from_log_attribute_pairs`], which groups the
+/// keys by the name the reference stores them under
+/// (`pulsus_model::log_label_name`, issue #507) — NOT by
+/// [`LabelSet::from_normalized`]'s per-character rule, which is the metrics
+/// namer and stays where it is. Issue #109: scope name/version/attributes are
+/// structured metadata, not stream labels — Loki 3.4.2 parity. A collision
+/// between two resource attributes resolves by the same frozen deterministic
+/// rule (issue #4), now over the stored names, and is counted, never
+/// swapped. Because scope no longer enters this set, `stream_fingerprint`
 /// is a pure function of the resource labels — a stream pushed with vs.
 /// without scope fingerprints identically, exactly as Loki does.
 ///
@@ -505,10 +510,10 @@ const SERVICE_NAME_EXTRACTED_LABEL: &str = "service_name_extracted";
 /// attribute key the reference is order-dependent — it maps the promoted
 /// attributes last-write-wins before stripping (`otlp.go:193`), measured as
 /// `cloud.region=""` then `="eu"` -> `eu` kept, and `="eu"` then `=""` ->
-/// dropped. PulsusDB resolves a duplicate key by `from_normalized`'s frozen
-/// order-independent rule (issue #4) instead, which already diverges there and
-/// is unchanged by this strip: pair-wise leaves the non-empty twin for
-/// `from_normalized` to resolve exactly as it did before #259. By-name would
+/// dropped. PulsusDB resolves a duplicate key by `from_log_attribute_pairs`'s
+/// frozen order-independent rule (issue #4) instead, which already diverges
+/// there and is unchanged by this strip: pair-wise leaves the non-empty twin
+/// for `from_log_attribute_pairs` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
 fn build_stream_labels(
@@ -516,7 +521,7 @@ fn build_stream_labels(
     service_name: &str,
 ) -> (LabelSet, usize) {
     // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
-    // `from_normalized`: an empty-valued resource attribute is neither
+    // `from_log_attribute_pairs`: an empty-valued resource attribute is neither
     // validated nor stored, so it cannot change the stream's fingerprint and
     // cannot win a normalized-key collision. The reference drops it in
     // `parseStreamLabels`, which this transport reaches too — its OTLP
@@ -1816,7 +1821,7 @@ mod tests {
     }
 
     /// A literally duplicated resource-attribute key, one occurrence empty:
-    /// the pair-wise strip hands `from_normalized` the non-empty twin, so the
+    /// the pair-wise strip hands `from_log_attribute_pairs` the non-empty twin, so the
     /// stored label is what it was before #259 and the frozen issue-#4
     /// collision rule stays the only thing deciding duplicates. Pins the
     /// neutrality claim in `build_stream_labels`' doc — the by-name strip
