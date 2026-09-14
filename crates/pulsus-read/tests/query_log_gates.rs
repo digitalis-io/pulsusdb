@@ -5939,3 +5939,209 @@ async fn the_key_statement_timeout_is_the_timeout_response() {
     );
     drop_group_key_db(&admin, &db).await;
 }
+
+/// Inserts `sql`'s rows as one stream `{service_name="<service>"}` at `fp`,
+/// with `pod` as a second stream label when it is not empty.
+async fn seed_one_stream(admin: &ChClient, db: &str, t: i64, fp: u64, service: &str, pod: &str, rows_sql: &str) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let (labels, idx) = if pod.is_empty() {
+        (
+            format!("{{\"service_name\":\"{service}\"}}"),
+            format!("({month}, 'service_name', '{service}', {fp})"),
+        )
+    } else {
+        (
+            format!("{{\"pod\":\"{pod}\",\"service_name\":\"{service}\"}}"),
+            format!("({month}, 'service_name', '{service}', {fp}), ({month}, 'pod', '{pod}', {fp})"),
+        )
+    };
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+             ({month}, {fp}, '{service}', '{labels}', 0)"
+        ),
+        format!("INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES {idx}"),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT '{service}', {fp}, ts, 0, body FROM ({rows_sql})"
+        ),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed {service}: {e}"));
+    }
+}
+
+/// **Criterion 23: every refusal lands as the refusal table says** (issue
+/// #507, §5.5).
+///
+/// The key route reproduces every rule that decides one line's outcome and
+/// every ceiling on the answer, the scan or the statement; it does not
+/// reproduce the ceilings on buffers only today's route allocates. Each row
+/// runs the query on the key route and on today's route (the same query
+/// with `| zzz=""` after the unwrap, which keeps every line and takes
+/// today's route):
+///
+/// ```text
+/// row  data                                                 today's route               key route
+/// R1   6,213 {"latency":1} at one nanosecond                 {} 6213                     {} 6213
+/// R1   6,214 at one nanosecond                              422 same-nanosecond staging {} 6214
+/// R2   4,100,000 {"latency":1} within 50 s                  422 retained window points  {} 4100000
+/// R3   3,400 lines, each its own request_id, one per second 422 result point-slots      one series, 3,400 points of 1
+///      over an hour, step 1 s
+/// R4   the realistic corpus, 3 minutes                       422 retained label bytes    three points (the plan's figures)
+/// R5   501 values of r under by (r)                         422 series cap              422 series cap
+/// R6   the realistic corpus under a scan budget below it    422 scan budget             422 scan budget, no raw scan
+/// ```
+///
+/// R9 (the statement text cap) is the hermetic
+/// `plan::tests::a_key_statement_over_the_text_cap_takes_todays_route`, and
+/// R10 (the memory ceiling) is `the_key_route_falls_back_on_its_own_memory_error`.
+#[tokio::test]
+async fn every_refusal_lands_as_the_table_says() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let (admin, _client, db) = group_key_db("gk_refusals").await;
+    let base = ((now_ns() - 7_200_000_000_000) / MIN) * MIN;
+    // R1's two streams carry the labels the plan measured them under
+    // (`{pod="checkout-1000", service_name="checkout"}`), at the same
+    // lengths: the staging charge counts each line's rendered labels.
+    seed_one_stream(&admin, &db, base, 2301, "checkou1", "checkout-1000",
+        &format!("SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6213)", base + 90_000_000_000)).await;
+    seed_one_stream(&admin, &db, base, 2302, "checkou2", "checkout-1000",
+        &format!("SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6214)", base + 90_000_000_000)).await;
+    seed_one_stream(&admin, &db, base, 2303, "r2", "",
+        &format!("SELECT {} + intDiv(number * 50000000000, 4100000) AS ts, '{{\"latency\":1}}' AS body FROM numbers(4100000)", base + 1_000_000_000)).await;
+    seed_one_stream(&admin, &db, base, 2304, "r3", "",
+        &format!("SELECT {base} + (number + 1) * 1000000000 AS ts, concat('{{\"request_id\":\"', toString(number), '\",\"latency\":1}}') AS body FROM numbers(3400)")).await;
+    seed_one_stream(&admin, &db, base, 2305, "r5", "",
+        &format!("SELECT {} + number AS ts, concat('{{\"latency\":1,\"r\":\"', toString(number), '\"}}') AS body FROM numbers(501)", base + 30_000_000_000)).await;
+    // The realistic corpus's first 3 minutes and a little more.
+    seed_realistic_corpus(&admin, &db, base, 120_000, false).await;
+
+    let engine = |budget: u64| {
+        let db = db.clone();
+        async move { LogQlEngine::new(data_client(&db).await, engine_config(&db, budget)) }
+    };
+    let wide = engine(50 * 1024 * 1024 * 1024).await;
+    let range = |start_s: i64, end_s: i64, step: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + start_s * 1_000_000_000,
+            end_ns: base + end_s * 1_000_000_000,
+            step_ns: (step * 1_000_000_000) as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let is_key = |q: &str, p: &QueryParams| {
+        matches!(
+            plan(&parse(q).expect("parse"), p, &plan_ctx(&db)).expect("plan"),
+            Plan::Metric(mp) if matches!(mp.value, sql::MetricValue::Unwrapped(_))
+        )
+    };
+    let sum_by = |svc: &str, extra: &str, r: &str| {
+        format!(r#"sum by (service_name) (sum_over_time({{service_name="{svc}"}} | json | unwrap latency{extra} [{r}]))"#)
+    };
+    let short = |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>| -> String {
+        match res {
+            Err(ReadError::QueryTooBroad(reason)) => {
+                let name = format!("{reason:?}");
+                format!("422 {}", name.split([' ', '{', '(']).next().unwrap_or(""))
+            }
+            Err(e) => format!("error {e}"),
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    let vals: Vec<String> = s.points.iter().map(|(_, v)| format!("{v:?}")).collect();
+                    format!("{} {}", group_key_labels(&s.labels), vals.join(","))
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => format!("unexpected {other:?}"),
+        }
+    };
+
+    // R1 and R2: (key-route query, today's control, params, today's answer, key answer)
+    for (svc, params, today_want, key_want) in [
+        ("checkou1", range(60, 120, 60), "{} 6213.0", "{} 6213.0"),
+        ("checkou2", range(60, 120, 60), "422 TsCollisionGroup", "{} 6214.0"),
+        ("r2", range(60, 120, 60), "422 MetricRetention", "{} 4100000.0"),
+    ] {
+        let key_q = sum_by(svc, "", "1m");
+        let today_q = sum_by(svc, r#" | zzz="""#, "1m");
+        assert!(is_key(&key_q, &params), "{key_q}: the key route");
+        assert!(!is_key(&today_q, &params), "{today_q}: today's route");
+        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), today_want, "{svc}: today's route");
+        assert_eq!(short(wide.query(&parse(&key_q).expect("parse"), &params).await), key_want, "{svc}: the key route");
+    }
+
+    // R3: one series of 3,400 points, each 1, where today's route runs out of
+    // result point-slots.
+    {
+        let params = range(1, 3600, 1);
+        let key_q = sum_by("r3", "", "1s");
+        let today_q = sum_by("r3", r#" | zzz="""#, "1s");
+        assert!(is_key(&key_q, &params), "R3: the key route");
+        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), "422 MetricResultPoints", "R3: today's route");
+        match wide.query(&parse(&key_q).expect("parse"), &params).await {
+            Ok((QueryResult::Matrix(m), _)) => {
+                assert_eq!(m.len(), 1, "R3: one series");
+                assert_eq!(m[0].points.len(), 3400, "R3: 3,400 points");
+                assert!(m[0].points.iter().all(|(_, v)| *v == 1.0), "R3: each 1");
+            }
+            other => panic!("R3: the key route answers: {other:?}"),
+        }
+    }
+
+    // R4: the realistic corpus over 3 minutes.
+    {
+        let params = range(60, 180, 60);
+        let key_q = sum_by("checkout", "", "1m");
+        let today_q = sum_by("checkout", r#" | zzz="""#, "1m");
+        assert!(is_key(&key_q, &params), "R4: the key route");
+        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), "422 MetricGroupLabelBytes", "R4: today's route");
+        match wide.query(&parse(&key_q).expect("parse"), &params).await {
+            Ok((QueryResult::Matrix(m), _)) => {
+                assert_eq!(m.len(), 1, "R4: one series");
+                let got: Vec<f64> = m[0].points.iter().map(|(_, v)| *v).collect();
+                let want = [14_999_019.46, 14_998_940.27, 15_001_940.27];
+                assert_eq!(got.len(), 3, "R4: three points: {got:?}");
+                for (g, w) in got.iter().zip(want) {
+                    assert!((g - w).abs() < 0.005, "R4: {got:?} against the plan's {want:?}");
+                }
+            }
+            other => panic!("R4: the key route answers: {other:?}"),
+        }
+    }
+
+    // R5: the series cap on both routes.
+    {
+        let params = range(60, 60, 60);
+        let key_q = r#"avg_over_time({service_name="r5"} | json | unwrap latency [1m]) by (r)"#;
+        let today_q = r#"avg_over_time({service_name="r5"} | json | unwrap latency | zzz="" [1m]) by (r)"#;
+        assert!(is_key(key_q, &params), "R5: the key route");
+        assert_eq!(short(wide.query(&parse(today_q).expect("parse"), &params).await), "422 MetricSeries", "R5: today's route");
+        assert_eq!(short(wide.query(&parse(key_q).expect("parse"), &params).await), "422 MetricSeries", "R5: the key route");
+    }
+
+    // R6: the scan budget on both routes, and no raw scan after the key
+    // statement's 307.
+    {
+        let params = range(60, 180, 60);
+        let tight = engine(1_000_000).await;
+        let key_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency [1m]) by (service)"#;
+        let today_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency | zzz="" [1m]) by (service)"#;
+        assert!(is_key(key_q, &params), "R6: the key route");
+        assert_eq!(short(tight.query(&parse(today_q).expect("parse"), &params).await), "422 ScanBudgetBytes", "R6: today's route");
+        let from = server_micros(&admin).await;
+        assert_eq!(short(tight.query(&parse(key_q).expect("parse"), &params).await), "422 ScanBudgetBytes", "R6: the key route");
+        let to = server_micros(&admin).await + 1;
+        assert_eq!(
+            group_key_statements_between(&admin, &db, from, to, 1).await,
+            vec![(GroupKeyStatement::Key, 307)],
+            "R6: the key statement meets the budget and no second read runs"
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
