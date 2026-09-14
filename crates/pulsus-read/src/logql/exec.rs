@@ -1756,7 +1756,7 @@ impl LogQlEngine {
             )
             .await
         {
-            KeyRouteOutcome::Answer(series) => return Ok(folded_answer(mp, series)?),
+            KeyRouteOutcome::Answer(series) => return folded_answer(mp, series),
             KeyRouteOutcome::Refusal(e) => return Err(e),
             KeyRouteOutcome::TodaysRoute(_why) => {}
         }
@@ -8970,11 +8970,15 @@ mod tests {
         }
     }
 
+    /// One folded answer: each series' labels and its points as
+    /// `(grid point, the value's bits)`.
+    type FoldedBits = Vec<(LabelSet, Vec<(i64, u64)>)>;
+
     /// Folds S1 rows for `query` over one stream `{app="x", service_name="r"}`.
     fn fold_groups(
         query: &str,
         rows: &[MetricRangeUnwrappedRow],
-    ) -> Result<Vec<(LabelSet, Vec<(i64, u64)>)>, super::super::unwrap_group::FoldStop> {
+    ) -> Result<FoldedBits, super::super::unwrap_group::FoldStop> {
         let mp = key_route_plan(query);
         let u = key_value(&mp);
         let compiled = CompiledPipeline::compile(&u.stages).expect("compile");

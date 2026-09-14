@@ -624,11 +624,15 @@ pub mod probe {
         end_ns: i64,
     }
 
+    /// One folded answer: each series' sorted labels and its ascending
+    /// `(grid point, value)` points.
+    pub type ProbeSeries = Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>;
+
     /// What folding one or more rows gives.
     #[derive(Debug)]
     pub enum ProbeOutcome {
         /// The answer's series: sorted labels, ascending points.
-        Answer(Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>),
+        Answer(ProbeSeries),
         /// The fold sends the query to today's route.
         TodaysRoute(&'static str),
         /// A refusal that is the query's answer.

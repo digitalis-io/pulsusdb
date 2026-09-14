@@ -5631,7 +5631,7 @@ async fn the_key_route_falls_back_on_its_own_memory_error() {
     let matrix =
         |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>, what: &str| match res {
             Ok((QueryResult::Matrix(m), _)) => {
-                let mut out: Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> = m
+                let mut out: MatrixBits = m
                     .into_iter()
                     .map(|s| {
                         let mut l = s.labels;
@@ -5764,13 +5764,27 @@ async fn seed_realistic_corpus_into(
     }
 }
 
+/// A matrix answer: each series' sorted labels and its `(grid point, the
+/// value's bits)` points.
+type MatrixBits = Vec<(Vec<(String, String)>, Vec<(i64, u64)>)>;
+
+/// The same, with the grid points dropped: one series' values alone.
+type SeriesBits = Vec<(Vec<(String, String)>, Vec<u64>)>;
+
+/// One agreement group: its name, its corpus, and up to two label pairs to
+/// attach to the stream and to the metadata.
+type AgreementGroup = (String, &'static str, Option<Pair>, Option<Pair>);
+
+/// A label pair as the agreement groups carry it.
+type Pair = (&'static str, &'static str);
+
 /// A matrix answer, sorted, with each value's bits, or the error's text.
 fn matrix_bits(
     res: Result<(QueryResult, pulsus_read::Warnings), ReadError>,
-) -> Result<Vec<(Vec<(String, String)>, Vec<(i64, u64)>)>, String> {
+) -> Result<MatrixBits, String> {
     match res {
         Ok((QueryResult::Matrix(m), _)) => {
-            let mut out: Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> = m
+            let mut out: MatrixBits = m
                 .into_iter()
                 .map(|s| {
                     let mut l = s.labels;
@@ -6828,7 +6842,7 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
         ("__variant__", "v"),
         ("__error_details__", "d"),
     ];
-    let mut groups: Vec<(String, &str, Option<(&str, &str)>, Option<(&str, &str)>)> = Vec::new();
+    let mut groups: Vec<AgreementGroup> = Vec::new();
     for corpus in ["NAMED6", "H5B6", "H6"] {
         groups.push((format!("ag_{corpus}_none"), corpus, None, None));
         if corpus != "H5B6" {
@@ -7059,7 +7073,7 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let canon = |o: ProbeOutcome| -> Result<Vec<(Vec<(String, String)>, Vec<u64>)>, String> {
+    let canon = |o: ProbeOutcome| -> Result<SeriesBits, String> {
         match o {
             ProbeOutcome::Answer(series) => Ok(series
                 .into_iter()

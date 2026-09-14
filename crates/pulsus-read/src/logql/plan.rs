@@ -7813,14 +7813,13 @@ mod tests {
                 other => panic!("{query} must lower, got {other:?}"),
             }
         };
+        // A query the parser or planner refuses never reaches a route.
         let today = |query: &str| {
-            match metric_mp(query, spec) {
-                Ok(mp) => assert!(
+            if let Ok(mp) = metric_mp(query, spec) {
+                assert!(
                     matches!(mp.value, sql::MetricValue::Shaped(_)) && mp.client.is_some(),
                     "{query} must take today's route"
-                ),
-                // A query the parser or planner refuses never reaches a route.
-                Err(_) => {}
+                );
             }
         };
 
