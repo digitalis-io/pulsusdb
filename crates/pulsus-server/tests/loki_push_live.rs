@@ -3212,6 +3212,14 @@ fn label_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, Strin
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect()
 }
+/// One OTLP naming case: its id, then its resource, scope and record
+/// attribute pairs.
+type OtlpNameCase<'a> = (
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    &'a [(&'a str, &'a str)],
+    &'a [(&'a str, &'a str)],
+);
 
 /// **N9 (issue #507, criterion 46): every stored name answers as the
 /// reference's does**, end to end through the push and OTLP receivers and
@@ -3320,8 +3328,11 @@ async fn metadata_and_otlp_attribute_names_answer_as_the_reference() {
     // A filter and a `by` over the stored name find the line (am1.01,
     // am1.02, am2.01, am3.01): before this change the names were `a__b` and
     // `9bad`, so both missed.
-    for (case, filter) in [("am1", "a_b"), ("am2", "a_b"), ("am3", "key_9bad")] {
-        let value = if case == "am3" { "1" } else { "1" };
+    for (case, filter, value) in [
+        ("am1", "a_b", "1"),
+        ("am2", "a_b", "1"),
+        ("am3", "key_9bad", "1"),
+    ] {
         let streams = query_streams_raw(
             port,
             prefix,
@@ -3372,7 +3383,7 @@ async fn metadata_and_otlp_attribute_names_answer_as_the_reference() {
     );
 
     // ---- the OTLP receiver: resource, scope and record attribute keys.
-    let otlp_cases: &[(&str, &[(&str, &str)], &[(&str, &str)], &[(&str, &str)])] = &[
+    let otlp_cases: &[OtlpNameCase<'_>] = &[
         (
             "ao1",
             &[

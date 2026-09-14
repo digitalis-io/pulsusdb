@@ -13,6 +13,7 @@
 //!   it, and `LabelSet::from_normalized` groups by it (pushed stream labels,
 //!   remote-write labels, the bound check over the eighteen OTLP index
 //!   attributes, and the render of already-resolved metadata).
+//!
 //! The physical `service` column is filled from the resolved `service_name`
 //! slot, which both rules name alike (`service.name` -> `service_name`).
 
