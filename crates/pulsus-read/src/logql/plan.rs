@@ -7765,9 +7765,9 @@ mod tests {
         assert_eq!(bf.keys.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), vec!["a", "service_name"]);
         lowers(r#"sum by (service_name) (sum_over_time({a="b"} | json | code > 100 | unwrap latency [1m]))"#);
 
-        // --- refused chains (§9 r60–r86, and the rows that follow) ---
+        // --- refused chains (§9 r61–r86, and the rows that follow; r60 is a
+        // parse error and never reaches a route) ---
         for q in [
-            r#"sum_over_time({a="b"} | json lat="[\"la\\\"t\"]" | unwrap lat [1m])"#,
             r#"sum_over_time({a="b"} | json lat="[\"la\\\\t\"]" | unwrap lat [1m])"#,
             "sum_over_time({a=\"b\"} | json lat=\"[\\\"la\tt\\\"]\" | unwrap lat [1m])",
             r#"sum_over_time({a="b"} | json lat="arr[0]" | unwrap lat [1m])"#,
@@ -7794,8 +7794,7 @@ mod tests {
             r#"sum by (a) (sum_over_time({a="b"} | json | unwrap latency [2m]))"#,
             r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (latency)"#,
             r#"sum by (code_extracted) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,
-            // g01 (a parse error), g07, g08, g30
-            r#"sum_over_time({a="b"} | json | unwrap latency [1m]) by (service)"#,
+            // g30 (g01 is a parse error; g07 and g08 are r85 and r81)
             r#"max_over_time({a="b"} | json | unwrap latency [1m]) by (a)"#,
             // q19, q50/q51, g18/g19
             r#"sum by (code, code_extracted) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#,

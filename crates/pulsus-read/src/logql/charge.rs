@@ -2528,14 +2528,14 @@ mod tests {
             // `MetricAggState` arms and the variants path. So
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            // Issue #507 (W4): `PushdownUnwrappedGroups::charged`, the
-            // unwrapped bucketed path's re-grouping map (x2, the same two
-            // arms). A further XOR arm of the same cap for the same
-            // reason: it runs only when `client == None` AND the plan's
-            // value is `Unwrapped`, which excludes the counting bucketed
-            // arm beside it as well as the instant one and both
-            // `MetricAggState` arms. `LEAF_COUNTERS.group_bytes` stays 2.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 5),
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 3),
+            // Issue #507: `KeyRouteFold::charged`, the extracted-field group
+            // key read's partials (x2, the new-series and new-grid-point
+            // arms). A further XOR arm of the same cap: S1's fold is dropped
+            // before today's route starts, and L's fold starts only after
+            // today's route has refused and dropped its state, so no two of
+            // them are live at once. `LEAF_COUNTERS.group_bytes` stays 2.
+            ("unwrap_group.rs", "charge_group_bytes", "&mut self.charged", 2),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.
@@ -2671,9 +2671,14 @@ mod tests {
             (
                 "exec.rs",
                 "group_bytes",
-                5,
-                "PushdownInstantGroups::charged | PushdownRangeGroups::charged | \
-                 PushdownUnwrappedGroups::charged",
+                3,
+                "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
+            ),
+            (
+                "unwrap_group.rs",
+                "group_bytes",
+                2,
+                "KeyRouteFold::charged (issue #507)",
             ),
             // Issue #249 cost work: 2 -> 3. `fan_out_sample_base`'s HIT
             // path accumulates straight into the cached group and so
@@ -2923,6 +2928,7 @@ mod tests {
             ("template/retained.rs", include_str!("template/retained.rs")),
             ("template/timefns.rs", include_str!("template/timefns.rs")),
             ("template/value.rs", include_str!("template/value.rs")),
+            ("unwrap_group.rs", include_str!("unwrap_group.rs")),
         ];
         assert_source_set_matches_the_directory(SOURCES);
         SOURCES

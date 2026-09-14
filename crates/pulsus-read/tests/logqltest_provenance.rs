@@ -2037,12 +2037,17 @@ const TOTAL: usize = 1_605;
 /// their own `mod tests` (one surviving pre-#286 expectation plus one
 /// `match(body, '(')` fixture proving `MetricShape`/`source_shape` refuse a
 /// foreign column pair).
+///
+/// Issue #507: `predicate.rs` gains the extracted-field group key read's
+/// spelling guards (8 -> 15), and `sql.rs` loses the unwrapped statement's
+/// two value-guard renderings and their byte-exact test (6 -> 2), so its
+/// production code renders no `match(` again.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
     ("pulsus-read/src/logql/plan.rs", 1),
-    ("pulsus-read/src/logql/predicate.rs", 8),
-    ("pulsus-read/src/logql/sql.rs", 6),
+    ("pulsus-read/src/logql/predicate.rs", 15),
+    ("pulsus-read/src/logql/sql.rs", 2),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     ("pulsus-read/src/metrics/series_where.rs", 10),
     ("pulsus-read/src/metrics/sql.rs", 14),
@@ -2059,7 +2064,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 63;
+const MATCH_RENDER_TOTAL: usize = 66;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2382,6 +2387,39 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
+    // Issue #507: the extracted-field group key read's per-row readers.
+    "const KEY_TRIM_CLASS: &str = r_",
+    "const JSON_WS: &str = r_",
+    "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",
+    "const MAX_JSON_NESTING: u32 = 127",
+    "const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ReaderColumns",
+    "pub enum ReaderColumns :: Unwrap,",
+    "pub enum ReaderColumns :: Key(usize),",
+    "impl ReaderColumns",
+    "impl ReaderColumns :: fn prefix(self) -> String",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum KeyReaderRefusal",
+    "pub enum KeyReaderRefusal :: NameNotRenderable,",
+    "pub enum KeyReaderRefusal :: PatternNotCompilable,",
+    "fn key_regex(pattern: &str) -> Result<String, KeyReaderRefusal>",
+    "fn parts_joined(name: &str) -> bool",
+    "fn only_underscores(name: &str) -> bool",
+    "fn parts_with_sep(parts: &[&str]) -> String",
+    "fn spelled_pattern(name: &str) -> String",
+    "fn prefix_parent_pattern(name: &str) -> String",
+    "fn spelled_otherwise_pattern(name: &str) -> String",
+    "fn unwrap_name_escaped(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_transparent_parent() -> Result<String, KeyReaderRefusal>",
+    "pub fn unwrap_name_ambiguity(name: &str) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn json_depth_bound() -> CheckedFragment",
+    "pub fn json_flatten_key_budget_bound() -> CheckedFragment",
+    "pub fn unwrap_name_absence(columns: ReaderColumns, name: &str, form: super::sql::UnwrapForm) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment",
+    "pub fn metadata_holds_name(name: &str) -> CheckedFragment",
+    "pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use super::*",
@@ -2449,8 +2487,11 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// a function outside an `impl` whose signature names [`CheckedFragment`]
 /// and can therefore produce one. `metadata_non_empty_guard` is private
 /// and still counts: the count is over what can MINT, not over what is
-/// reachable.
-const MINT_COUNT: usize = 11;
+/// reachable. **18 at issue #507's group key read**: `unwrap_name_ambiguity`,
+/// `json_depth_bound`, `json_flatten_key_budget_bound`, `unwrap_name_absence`,
+/// `unwrap_label_integer_text`, `metadata_holds_name` and
+/// `metadata_names_projection` join them.
+const MINT_COUNT: usize = 18;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
@@ -2471,6 +2512,9 @@ const PREDICATE_IMPLS: &[&str] = &[
     // no text at all. Its `impl` renders the column name from the one
     // private constant that holds it.
     "impl MetadataTerm",
+    // Issue #507: `ReaderColumns` carries no text either — it names which
+    // reader columns (`uw_` or `l<i>_`) a key-route fragment reads.
+    "impl ReaderColumns",
 ];
 
 const NEWTYPES: &[&str] = &["CheckedFragment", "CheckedLiteral", "MonthLiteral"];

@@ -36,7 +36,8 @@ use super::client_agg::check_surviving_error;
 use super::error::ReadError;
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, merge_labels_with_structured_metadata,
-    merge_labels_with_structured_metadata_pairs, render_series_labels, series_labels,
+    merge_labels_with_structured_metadata_pairs, push_json_string, render_series_labels,
+    series_labels,
 };
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::rows::{MetricRangeUnwrappedRow, StreamMetaRow, UnwrappedLaneRow};
@@ -178,19 +179,6 @@ pub(in crate::logql) fn group_document(
     doc.push_str(&leaf);
     doc.push('}');
     doc
-}
-
-fn push_json_string(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 /// What one group document, or one undecided body, contributes (issue #507).

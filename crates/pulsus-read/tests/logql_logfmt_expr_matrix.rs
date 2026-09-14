@@ -1376,10 +1376,9 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             6,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
-             read's capability-join fallback :1669, the unwrapped range read's fallback \
-             :1705, detected_fields :3107, tail :3399 — \
-             line numbers current at issue #507 W4, which added the third and the fourth and \
-             found the rest stale by unrelated growth. `POSITIONS` reaches the first TWO and no more: \
+             read's capability-join fallback, the extracted-field group key read, \
+             detected_fields, tail — issue #507 W4 added the third and the key route took over \
+             the fourth. `POSITIONS` reaches the first TWO and no more: \
              every position is a `query_range`-shaped log or metric query, so nothing in \
              this file executes `detected_fields` or `tail`. Those two call sites are \
              therefore UNCOVERED by this file, and left visibly so — the sub-grammar RULE \
@@ -1387,10 +1386,9 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              sites themselves are not driven by anything here. The bucketed fallback is a \
              fifth site no position needs: it compiles `bucketed_fallback_client_agg`'s \
              pipeline, which is EMPTY by construction, so no user stage of any kind reaches \
-             that compiler. The unwrapped fallback compiles a pipeline this \
-             file's positions never write either: it is RECONSTRUCTED from the plan's \
-             closed shape, so its only stages are a targeted `json` extraction and an \
-             `unwrap`, and no logfmt expression can be in it",
+             that compiler. The extracted-field group key read compiles a pipeline this \
+             file's positions never write either: the planner admits only a `json` stage, \
+             label filters and an `unwrap` (issue #507), so no logfmt expression can be in it",
         ),
         (
             "plan.rs",

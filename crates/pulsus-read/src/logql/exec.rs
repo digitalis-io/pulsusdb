@@ -1733,13 +1733,14 @@ impl LogQlEngine {
         meta: &HashMap<u64, StreamMetaRow>,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
+        // One compile serves both routes: today's route runs exactly the
+        // chain the group documents run (`unwrapped_fallback_client_agg`).
         let client = unwrapped_fallback_client_agg(mp, u);
-        let compiled = CompiledPipeline::compile(&u.stages)?;
+        let compiled = CompiledPipeline::compile(&client.pipeline)?;
         let resolved = super::unwrap_group::resolve(u, meta);
         let Some(scan) = unwrapped_scan(mp) else {
-            let compiled_client = CompiledPipeline::compile(&client.pipeline)?;
             return self
-                .run_metric_client(mp, &client, &compiled_client, fingerprints, explain)
+                .run_metric_client(mp, &client, &compiled, fingerprints, explain)
                 .await;
         };
         match self
@@ -1750,12 +1751,11 @@ impl LogQlEngine {
             KeyRouteOutcome::Refusal(e) => return Err(e),
             KeyRouteOutcome::TodaysRoute(_why) => {}
         }
-        let compiled_client = CompiledPipeline::compile(&client.pipeline)?;
         let todays = self
             .run_metric_client(
                 mp,
                 &client,
-                &compiled_client,
+                &compiled,
                 fingerprints,
                 explain.as_deref_mut(),
             )
