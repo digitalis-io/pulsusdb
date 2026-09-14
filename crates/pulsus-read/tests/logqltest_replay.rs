@@ -212,14 +212,6 @@ const CONFIG_DELTA_FILES: &[(&str, &str)] = &[
         "b25_structured_metadata.test",
         "discover_log_levels: false (NOT in ci/logql/config.yaml)",
     ),
-    // Issue #507. With level discovery on, the injected `detected_level`
-    // is structured metadata that the range step groups by and the parser
-    // hints can require, so it changes the answers of the reserved-name
-    // rows rather than adding a label the replay strips.
-    (
-        "b28_reserved_names.test",
-        "discover_log_levels: false (NOT in ci/logql/config.yaml)",
-    ),
     // Issue #277: the per-variant series cap's skip-and-warn corpus.
     (
         "b21_variant_series_cap.test",
@@ -988,17 +980,18 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// relative-offset load set, so they move this figure,
 /// [`PROVENANCE_PERMITS`] and [`REACHABLE`] together, and its rows that
 /// record our answer instead of the reference's land under
-/// `pinned-divergence`. It adds `b28_reserved_names.test`, a CONFIG-DELTA
-/// file (`discover_log_levels: false`), whose `eval` rows enlarge the
-/// `config-delta file` exclusion and whose `eval_fail` rows land under
-/// `our-error-text`. And it moves the `b23_json_raw_read.test` rows whose
+/// `pinned-divergence`. It adds `b28_reserved_names.test`, captured with
+/// level discovery off: its streams rows are reachable (discovery adds only
+/// a stream label the replay strips), its metric rows are permitted and
+/// unreachable, and its `eval_fail` rows land under `our-error-text`. And
+/// it moves the `b23_json_raw_read.test` rows whose
 /// line is not a JSON text from permitted to `pinned-divergence`.
 const TOTAL_DIRECTIVES: usize = 1_817;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_261;
+const PROVENANCE_PERMITS: usize = 1_311;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -1045,7 +1038,7 @@ const PROVENANCE_PERMITS: usize = 1_261;
 /// states no quantity in prose, by
 /// `check_f_marked_regions_state_no_corpus_count` — and lives in
 /// `PROVENANCE.md`'s issue #388 section instead.
-const REACHABLE: usize = 322;
+const REACHABLE: usize = 324;
 
 /// Issue #406 moved `differential_metric_reducers.test`'s `eval_ordered`
 /// rows off that file's `ported(...)` default onto
@@ -1064,7 +1057,7 @@ const REACHABLE: usize = 322;
 /// `b25_pattern_expr_reject.test` and `b26_json_expr.test` (issue #388)
 /// need no config delta, so their `eval_fail` rows enlarge
 /// `our-error-text` alone and their `eval` rows are permitted.
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=234, not a capture claim (derived)=30, \
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=30, \
 not a capture claim (ported)=27, our-error-text (eval_fail)=175, pinned-divergence=90";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
@@ -1073,7 +1066,7 @@ not a capture claim (ported)=27, our-error-text (eval_fail)=175, pinned-divergen
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=689, \
-metric query (slice: streams only)=240, range/matrix eval (slice: instant only)=10";
+metric query (slice: streams only)=287, range/matrix eval (slice: instant only)=11";
 // corpus-counts: end (replay-coverage-constants)
 
 /// **How far back the reference will still SERVE a pushed entry** —
@@ -1162,16 +1155,14 @@ const MIN_GAP_SECS: u64 = 20;
 /// moves. Any corpus edit that moves a load span moves this, and it goes
 /// red on the PR with the new figure in the message.
 ///
-/// Measured on the merged tree by [`place`] over the reachable slice:
-/// the 247 cases' own spans sum to 885s and their gaps
-/// `max(MIN_GAP_SECS, span_i)` sum to 4940s. Against
-/// [`PLACEMENT_BUDGET_SECS`] that is 5825/9400 s, i.e. 62.0% occupied.
-///
-/// Issue #507 moved it to 7325 s: `b27_logfmt_token_scan.test` adds
-/// single-entry cases, each costing `MIN_GAP_SECS`. The test prints
-/// `replay placement: 7325/9400 s (77.9% occupied, 2075 s free ≈ 103 more
-/// zero-span rows)` (`cargo test -p pulsus-read --test logqltest_replay
-/// the_placement -- --nocapture`).
+/// Measured by [`place`] over the reachable slice at issue #388's merge:
+/// the 247 cases' own spans summed to 885s and their gaps
+/// `max(MIN_GAP_SECS, span_i)` to 4940s, 5825 s of the budget. Issue #507
+/// added `b27_logfmt_token_scan.test`'s and `b28_reserved_names.test`'s
+/// streams cases, single-entry cases each costing `MIN_GAP_SECS`, and
+/// removed the `b23_json_raw_read.test` rows that became divergences.
+/// Against [`PLACEMENT_BUDGET_SECS`] that is now 7365/9400 s, i.e.
+/// 78.4% occupied.
 ///
 /// **What it replaces, and why the unit changed.** The retired
 /// `MAX_REACHABLE_ROWS` was a ROW ceiling,
@@ -1180,7 +1171,7 @@ const MIN_GAP_SECS: u64 = 20;
 /// scarce resource: seconds were, and a fixed slot billed 146 zero-span
 /// cases at the widest case's rate. Counting the seconds directly is
 /// what turned thirteen rows over a ceiling into 38% of a budget free.
-const PLACED_SPAN_SECS: u64 = 7_325;
+const PLACED_SPAN_SECS: u64 = 7_365;
 
 /// What the measured horizon holds once the run's own wall clock and one
 /// trailing gap are set aside — the same shape as the retired
@@ -1212,7 +1203,7 @@ const REMAINING_SECS: u64 = PLACEMENT_BUDGET_SECS - PLACED_SPAN_SECS;
 /// The free budget expressed in the cheapest row there is, because that
 /// is the question a corpus author actually asks. A zero-span row costs
 /// [`MIN_GAP_SECS`] and nothing else, so the free budget buys
-/// 178 more zero-span rows; a wide row costs twice its own span
+/// 101 more zero-span rows; a wide row costs twice its own span
 /// and buys fewer.
 ///
 /// The retired `REMAINING_SLOTS` doc said, of the fixed-slot scheme:

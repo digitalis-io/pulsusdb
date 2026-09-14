@@ -4,8 +4,7 @@
 #
 # Reference of record: grafana/loki:3.7.4 (revision b318f282, digest
 # sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc)
-# on `ci/logql/config-463.yaml`, the shared config with level discovery off
-# (`discover_log_levels: false`),
+# on `ci/logql/config-463.yaml`, the shared config with level discovery off,
 # so no `detected_level` pair joins any label set. Captured 2026-09-14 by push
 # and query: each stream pushed with `service=<id>`, its entries at T0 (1 ms
 # apart), instant queries at T0 + 60 s, the range row from T0 to T0 + 180 s
