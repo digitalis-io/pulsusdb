@@ -35,7 +35,7 @@ docs/query-lowering.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-confi
 docs/query-lowering.md	crates/pulsus-logql/src/ast.rs:1002	crates/pulsus-logql/src/ast.rs	1002		line	LabelReplace {
 docs/query-lowering.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-lowering.md	crates/pulsus-re2/src/compile_budget.rs:343	crates/pulsus-re2/src/compile_budget.rs	343		line	pub fn compile_user_regex_anchored(pattern: &str) -> Result<regex::Regex, RegexCompileError> {
-docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
+docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:131-163	crates/pulsus-read/src/canonical_labels.rs	131	163	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-lowering.md	crates/pulsus-read/src/compile/fold.rs:623	crates/pulsus-read/src/compile/fold.rs	623		prose	Relation
 docs/query-lowering.md	crates/pulsus-read/src/compile/fold.rs:960-967	crates/pulsus-read/src/compile/fold.rs	960	967	line	Capability::No(reason) => { rel = lw.residual_effect(stage, rel); how.push(Disposition::Residual(ResidualReason::Blocked
 docs/query-lowering.md	crates/pulsus-read/src/compile/plan.rs:543	crates/pulsus-read/src/compile/plan.rs	543		line	Disposition::Residual(_) => {
@@ -156,7 +156,7 @@ docs/query-to-sql.md	ast.rs:151	crates/pulsus-logql/src/ast.rs	151		prose	Vec<Dr
 docs/query-to-sql.md	ast.rs:2301	crates/pulsus-logql/src/ast.rs	2301		prose	LogRange
 docs/query-to-sql.md	ast.rs:939	crates/pulsus-logql/src/ast.rs	939		prose	MetricExpr
 docs/query-to-sql.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
-docs/query-to-sql.md	canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
+docs/query-to-sql.md	canonical_labels.rs:131-163	crates/pulsus-read/src/canonical_labels.rs	131	163	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-to-sql.md	catalog.rs:244-257	crates/pulsus-schema/src/catalog.rs	244	257	prose	log_samples
 docs/query-to-sql.md	catalog.rs:340-384	crates/pulsus-schema/src/catalog.rs	340	384	prose	trace_attrs_idx
 docs/query-to-sql.md	catalog.rs:343	crates/pulsus-schema/src/catalog.rs	343		line	parent_id FixedString(8),\n\
@@ -173,7 +173,7 @@ docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57	
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-config/src/model.rs	518		line	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i
-docs/query-to-sql.md	crates/pulsus-read/src/canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
+docs/query-to-sql.md	crates/pulsus-read/src/canonical_labels.rs:131-163	crates/pulsus-read/src/canonical_labels.rs	131	163	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:682	crates/pulsus-read/src/compile/fold.rs	682		prose	NotPushable
 docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:688-712	crates/pulsus-read/src/compile/fold.rs	688	712	prose	NotASearchLink
 docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:337	crates/pulsus-read/src/logql/compile.rs	337		prose	BlockReason::NotPushable

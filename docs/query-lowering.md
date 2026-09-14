@@ -1022,7 +1022,7 @@ question 5 asks the same question of LogQL, where today it costs a page loop, an
 compiler answers it, not this trait (owner decision, #507). The distinction it draws is the same.
 A filter over a structured-metadata key compiles to `JSONExtractString(structured_metadata, 'k') = 'v'`
 over a stored column our own encoder writes and our own flat reader reads
-(`crates/pulsus-read/src/canonical_labels.rs:93-125`), with no guard and no ambiguity, so its SQL means
+(`crates/pulsus-read/src/canonical_labels.rs:131-163`), with no guard and no ambiguity, so its SQL means
 the filter and LogQL's compiler may put the request `LIMIT` in the statement. A filter over a
 **parser-produced** name carries guard terms that keep lines SQL cannot decide, so the loop stays.
 §7.1 records how the unwired LogQL model would carry the same property as `Fidelity`; that is
