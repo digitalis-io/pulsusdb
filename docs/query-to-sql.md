@@ -75,7 +75,7 @@ Defined once, at first use, and used in only that sense afterwards.
 | **selector** | the part in braces that chooses which streams or spans are read: `{service_name="checkout"}`, `{ .service.namespace = "prod" }` |
 | **compiles to SQL** | the stage becomes part of the statement we send to ClickHouse, so ClickHouse does that work |
 | **evaluated after the read** | the stage does not become SQL; `pulsus-server` does that work itself, over the rows ClickHouse sent back |
-| **the engine** | the code that decides, stage by stage, which of those two happens |
+| **the engine** | the code that decides, stage by stage, which of those two happens. There are two, one per language, and they are separate compilers: LogQL's is `crates/pulsus-read/src/logql/plan.rs`, and TraceQL's is built on the compile core in `crates/pulsus-read/src/compile/` (§3.7) |
 | **the walk** | the engine's single pass over the steps, left to right. It never stops early: a step that does not become SQL is skipped and the next one is asked anyway |
 | **candidate trace** | a trace whose id came back from the first statement and which may or may not satisfy the whole query. TraceQL reads candidates in groups of 32, and this document calls one group a **batch** |
 | **root span** | the span of a trace that has no parent; if a trace has none, the earliest span |
@@ -499,10 +499,15 @@ because it is the filter every metric query over a parser needs. The source for 
 the design record `docs/query-lowering.md`, which passed review at round 15, or this document — and
 the marking says which.
 
+**For LogQL, the rows below are what LogQL's own compiler, `crates/pulsus-read/src/logql/plan.rs`,
+sends or is to send.** A LogQL cell marked *from the design* cites `docs/query-lowering.md` for where
+its text was worked out — that document's §7 analysis of LogQL's stages — and not for the code that
+decides it: LogQL keeps its own compiler, separate from the core (owner decision, #507).
+
 **Where the design settles that a stage can become SQL but does not fix the text, this document
 fixes it and marks the cell *decided here*.** The design assigns every SQL fragment — predicates,
 column expressions, escaping, regular-expression handling, time-bucket expressions — to
-per-language work rather than to the shared core (`docs/query-lowering.md:829-830`). This part is
+each language's compiler (`docs/query-lowering.md:829-830`). This part is
 that work for the two languages. Each decision rests on three things and says which: the table
 schema in `crates/pulsus-schema/src/catalog.rs`, what the shipped builders already emit, and what
 ClickHouse 26.3 does when the expression is executed — the version floor is 26.3
@@ -817,7 +822,7 @@ after the read, `stage3_keyset` (`sql.rs:897`) when something does.
 | `\|~ "re"` | `match(body, 're')` | `WHERE`, third statement | *emitted today*. Whether a granule can be skipped depends on whether ClickHouse can pull a required substring out of the pattern and test it against the body indexes. **That was not measured here**, so no figure is claimed for it |
 | `!~ "re"` | `NOT (match(body, 're'))` | `WHERE`, third statement | *emitted today*. As `!=` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | `WHERE`, third statement | *emitted today*. A granule survives if it can hold either alternative, so the prune is the union |
-| `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3338`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes: `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
+| `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3338`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes. The unwired LogQL model records the same as `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
 | `\| json` | none of its own; it makes a name `k` resolve to `JSONExtractString(body, 'k')` | nothing until a later stage names `k` | **decided here.** A parser is not a filter and adds no predicate. `JSONExtractString` decodes `\uXXXX` escapes in both the key and the value, and so does our parser, so the two agree byte for byte whenever the value is a JSON string. On a repeated key both take the **first** occurrence (measured: `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; our parser renames the second to `a_extracted`, `pipeline.rs:5934`) |
 | `\| logfmt` | none of its own; `k` resolves to `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | as above | **decided here.** The delimiter set is `' \t\r\n'`, not a single space, because the reference's decoder ends a key or an unquoted value at any byte at or below `0x20` (`pkg/logql/log/logfmt/decode.go`, the `c <= ' '` arms @ `v3.7.4`). Measured over eleven awkward lines; one shape disagrees and the escape guard covers it |
 | `\| regexp "re"` | none of its own; the *n*-th capture group resolves to `extractGroups(body, '(?-s)re')[n]` | as above | **decided here.** The `(?-s)` prefix is load-bearing and was measured: ClickHouse compiles this pattern with RE2's dot-matches-newline option **on**, so `extractGroups('a\nb', '(?P<x>a.b)')` answers `['a\nb']` while `extractGroups('a\nb', '(?-s)(?P<x>a.b)')` answers `[]`. The reference leaves that option off. Our line-filter path already carries the same prefix for the same reason (`escape.rs:213-236`) |
@@ -826,7 +831,7 @@ after the read, `stage3_keyset` (`sql.rs:897`) when something does.
 | `\| k >= 500` after a parser | `(JSONType(body,'k') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body,'k') >= 500 OR structured_metadata != '')` | `WHERE`, third statement | **decided here.** `JSONExtractFloat` is used rather than a text comparison because the reference converts the label text to a float before comparing. It agrees across spellings: measured, `JSONExtractFloat('{"i":1e3}','i')` is `1000`. Restricted to JSON numbers because a numeric-looking **string** can hold text the two sides parse differently (`JSONExtractFloat('{"s":"12abc"}','s')` is `0`) |
 | `\| k="v"` where `k` is a structured-metadata key | `JSONExtractString(structured_metadata, 'k') = 'v'` | `WHERE`, third statement | **decided here.** No guard and no page loop: `structured_metadata` is a stored column holding a flat JSON object of text keys to text values, written by our own encoder and read by a flat reader that accepts nothing else (`labels.rs:157-189`), so the extraction is the label. The plan-time precondition still applies, and here it is decidable in full — a metadata key that collides with a stream label is renamed at merge time (`labels.rs:363`) and the stream label sets are already in hand |
 | `\| __error__=""` after `\| json` | `match(body, '^[ \t\r\n]*\{')` | `WHERE`, third statement | **decided here.** Reading `JSONType(body) = 'Object'` would be wrong: measured, `JSONType('{"a":1}trailing')` is `Null` while our parser accepts a JSON object followed by anything, because it parses a **prefix** (`pipeline.rs:4692-4694`). Every line our parser flattens begins, after optional whitespace, with `{`, so this term keeps all of them and drops the rest without parsing anything |
-| `\| line_format "…"` | | — | *evaluated after the read*. A Go text/template with conditionals, ranges and function calls. The stage marks the line as computed with no expression, so every later stage that needs the line is evaluated after the read too (`docs/query-lowering.md:1049`). **Our own source already calls this unfinished work rather than a boundary** — "A Go text/template has no SQL form here. `No`, not `Never`." (`crates/pulsus-read/src/logql/compile.rs:488`, answering `BlockReason::NotYetLowered` at `:490`). §5.1 gives the size of the surface and the measured disagreements |
+| `\| line_format "…"` | | — | *evaluated after the read*. A Go text/template with conditionals, ranges and function calls. The stage marks the line as computed with no expression, so every later stage that needs the line is evaluated after the read too (`docs/query-lowering.md:1049`). **The unwired LogQL model in our source already calls this unfinished work rather than a boundary** — "A Go text/template has no SQL form here. `No`, not `Never`." (`crates/pulsus-read/src/logql/compile.rs:488`, answering `BlockReason::NotYetLowered` at `:490`). §5.1 gives the size of the surface and the measured disagreements |
 | `\| label_format dst=src` | none; `dst` resolves to whatever `src` resolved to, and `src` stops resolving | nothing of its own | **decided here.** A rename moves an entry in the name table. §2.8's LogQL51 is the worked case |
 | `\| label_format dst="text"` | none; `dst` resolves to the literal `'text'` | nothing of its own | **decided here.** A later filter on `dst` becomes a comparison of two constants, which ClickHouse folds before reading a row |
 | `\| label_format dst="{{…}}"` | | — | *evaluated after the read*, the same template as `\| line_format` and the same reason — §5.1 |
@@ -855,7 +860,7 @@ after the read, `stage3_keyset` (`sql.rs:897`) when something does.
 | `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:835` |
-| `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it depends on the filter's `Fidelity`** (`docs/query-lowering.md` §2.7.7, and §10's answered open question 5). A filter over a **parser-produced** name is `Fidelity::Wider` — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter that is `Fidelity::Equivalent` — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement |
+| `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it is decided by LogQL's own compiler**, in `plan.rs`, where `has_unpushed_dropping_stage` sets `fetch_until_limit` today (§10's answered open question 5). A filter over a **parser-produced** name keeps lines SQL cannot decide — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter whose SQL means exactly the filter — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement. The TraceQL core calls the same property `Fidelity` (`docs/query-lowering.md` §2.7.7); LogQL's compiler does not use that type |
 | the response | none | — | *evaluated after the read* |
 
 #### 2.7.3 TraceQL — every stage kind, and the selector
@@ -1732,13 +1737,17 @@ nothing.
 
 ## 3. How it is built
 
+**Each diagram in this part shows the decision as both compilers make it. They are separate:**
+LogQL's is `crates/pulsus-read/src/logql/plan.rs`, and TraceQL's is built on the compile core in
+`crates/pulsus-read/src/compile/` (§3.7). Nothing here is one engine shared by the two.
+
 ### 3.1 Where the engine sits
 
 ```mermaid
 graph LR
   C["HTTP client<br/>Grafana, curl"] -->|"query text, time range, limit"| S
   subgraph S["pulsus-server + pulsus-read"]
-    P["parser<br/>pulsus-logql / pulsus-traceql"] --> L["the engine<br/>decides stage by stage"]
+    P["parser<br/>pulsus-logql / pulsus-traceql"] --> L["the engine: two separate compilers<br/>logql/plan.rs for LogQL, the compile core for TraceQL"]
     L --> R["SQL writer"]
     L --> E["evaluator<br/>runs the stages that did not compile"]
   end
@@ -1757,7 +1766,7 @@ sequenceDiagram
   participant H as logs_api::handlers::query_range
   participant PA as pulsus_logql::parse
   participant PL as logql::plan::plan
-  participant EN2 as the engine (to be built)
+  participant EN2 as LogQL's per-stage decision (logql/plan.rs)
   participant SQ as logql::sql
   participant CH as ClickHouse
   participant EV as logql::pipeline::CompiledPipeline
@@ -1781,8 +1790,9 @@ sequenceDiagram
 ```
 
 Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-59` and planned at
-`pulsus-read/src/logql/plan.rs:1038`. The three passes this engine replaces are `plan.rs:3304`,
-`plan.rs:1673` and `plan.rs:1698`. Evaluation after the read is `logql/pipeline.rs:1168`. The
+`pulsus-read/src/logql/plan.rs:1038`. The three passes that make this decision today are `plan.rs:3304`,
+`plan.rs:1673` and `plan.rs:1698`; LogQL's compiler keeps or replaces them itself, and does not move
+them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1168`. The
 TraceQL equivalents are `traces/search_plan.rs:1083`, `traces/search_sql.rs:153` and
 `traces/exec.rs:1747`.
 
@@ -1876,32 +1886,30 @@ requires it (`exec.rs:385`). **Two statements is the floor, not one.**
 ```mermaid
 graph TD
   subgraph CR["crates/pulsus-read"]
-    CORE["the shared core module<br/>crates/pulsus-read/src/compile/"]
-    LQ["src/logql/"]
-    TQ["src/traces/"]
+    CORE["TraceQL's compiler core<br/>crates/pulsus-read/src/compile/"]
+    TQ["src/traces/ — TraceQL"]
+    LQ["src/logql/ — LogQL's own compiler (plan.rs);<br/>does not use the core"]
     PQ["src/metrics/ — PromQL, not in scope"]
   end
-  LQ -->|"supplies its step set,<br/>tables and SQL text"| CORE
   TQ -->|"supplies its step set,<br/>tables and SQL text"| CORE
-  CORE -->|"knows neither language"| LQ
-  CORE -->|"knows neither language"| TQ
+  CORE -->|"generic over the language"| TQ
 ```
 
 **The directory name is settled: `crates/pulsus-read/src/compile/`.** The design record previously
 named it after the term this document avoids throughout; that name would have entered the tree as a
 path and as module identifiers, so it was raised as this document's open question 3 and answered by
 owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) — rename before anything
-is written into the directory, because afterwards it is expensive. The per-language pieces are
-`crates/pulsus-read/src/logql/compile.rs` and `crates/pulsus-read/src/traces/compile.rs`, and the
-design record now says the same (`docs/query-lowering.md`, §6 "Where the code lives").
+is written into the directory, because afterwards it is expensive. TraceQL's piece is `crates/pulsus-read/src/traces/compile.rs`. LogQL and TraceQL keep separate compilers, and the two are not to be merged (owner decision, [#507](https://github.com/digitalis-io/pulsusdb/issues/507)). LogQL's compiler is `crates/pulsus-read/src/logql/plan.rs`, and no LogQL read calls the core. `crates/pulsus-read/src/logql/compile.rs` implements the core's language interface for LogQL, and only tests call it.
 
 Both read paths are already modules of one crate, so the core is a sibling module and **adds no
 new dependency between crates**: `crates/pulsus-read/Cargo.toml` already depends on `pulsus-logql`
 and `pulsus-traceql`, and the core depends on neither (`docs/query-lowering.md:854-860`).
 
-### 3.8 What is shared and what is not
+### 3.8 What the TraceQL core fixes, and what TraceQL's compiler supplies
 
-| concern | fixed by the shared core — a language cannot vary it | supplied per language |
+The table describes the core in `src/compile/` and TraceQL's compiler. LogQL's compiler (`src/logql/plan.rs`) is separate and decides each of these concerns itself; nothing in this table binds it.
+
+| concern | fixed by the core — TraceQL's compiler cannot vary it | supplied by TraceQL's compiler |
 |---|---|---|
 | the sequence of steps | the steps read left to right, with the ordering, the limit and the response added as ordinary steps | the step type itself, and the code that builds the chain |
 | the decision | the three answers — yes, no, never — evaluated against the accumulated state | the rule each step answers with |
@@ -1911,21 +1919,17 @@ and `pulsus-traceql`, and the core depends on neither (`docs/query-lowering.md:8
 | predicates | rule A of §2.1, including `NOT` refusing unless exact | every SQL fragment: predicates, column expressions, escaping, regex handling, time-bucket expressions |
 | assembling the statement | which clause each part goes in, and ADR 0008's wrap rule; the parts of the writer that do not depend on the language | building the fragments |
 | the handover | the three kinds of output and where each one's ceiling goes | the handover type and the evaluator that reads it |
-| whether to compile at all | that a step which **can** compile always **does**. There is no per-language cost rule and no hook: the read is greedy for both languages, argued from the cost model and from two measurements that looked like counterexamples and are not | nothing |
+| whether to compile at all | that a step which **can** compile always **does**. There is no per-language cost rule and no hook: the read is greedy, argued from the cost model and from two measurements that looked like counterexamples and are not | nothing |
 | how many statements | the four reasons a plan gets a second statement, and the three shapes that must **not** open one — including the rule that a statement may never be seeded by a value we computed per row | which table a step would read; how big its key set can get; what that key set costs to write out |
 | whether a compiled step still runs after the read | that each step says which — the SQL **means** the step, or is **wider** than it — and that the width is what decides whether the request's `LIMIT` can enter the statement | which of the two each step returns. The default is *wider*, which is what ships today |
-| errors | that each language has an error type | the errors and their HTTP mapping |
+| errors | that the language supplies an error type | the errors and their HTTP mapping |
 
-Three things are deliberately **not** shared (`docs/query-lowering.md`, §6): the row kinds are a
-per-language type rather than one enumeration over both, because one enumeration would carry
-per-language invalid values and every match on it would acquire unreachable arms; the writer is
-shared only in the parts that do not depend on the language, because LogQL's escaping and
-time-bucket expressions have nothing to do with TraceQL's; and each language supplies the **facts**
-about its own tables and key sets, while every **rule** about how many statements a request becomes
-is shared. That last one used to be a per-language cost rule and is not one any more: the greedy
-question is answered once, for both languages, and the single place the two genuinely differ —
-LogQL's page loop — is handled by whether a step's SQL means the step or is wider than it, which is
-a property of the SQL rather than a policy.
+Three things are deliberately not in the core (`docs/query-lowering.md`, §6).
+- The row kinds are a type the language supplies, not one enumeration in the core. An enumeration spanning languages would carry invalid values, and every match on it would gain unreachable arms.
+- The core's writer holds only the parts that do not depend on the language.
+- TraceQL's compiler supplies the facts about its own tables and key sets. The core fixes every rule about how many statements a request becomes, and answers the greedy question once.
+
+LogQL's page loop, and every other plan-shape decision for LogQL, belongs to LogQL's own compiler.
 
 ---
 
@@ -2422,8 +2426,9 @@ ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC
 LIMIT 1000
 ```
 
-**SQL after this work** — unchanged. `docs/query-lowering.md:1043` keeps the stage out of the
-statement; §5.1's row 5 says why, and the reason is pruning rather than a boundary.
+**SQL after this work** — unchanged. `is_pushable_line_filter` keeps the stage out of the
+statement, as the LogQL analysis at `docs/query-lowering.md:1043` records; §5.1's row 5 says why,
+and the reason is pruning rather than a boundary.
 
 **The answer must be `200`**, with this body:
 
@@ -4363,7 +4368,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 2 | LogQL `\| label_format k="{{…}}"`, general form | the same template as row 1 | the same as row 1 | the same as row 1, and one thing row 1 does not have: a template that fails rendering produces a `__error__` label and a `400`, and an expression in a `SELECT` list produces a value |
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
-| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
+| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and the unwired LogQL model in our source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
 | 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
@@ -5487,8 +5492,8 @@ noticed and are not grounds for a new round.
    The design record had named it after the term this document was asked to remove, and that name
    would have entered the tree as a path and as module identifiers. Settled by owner ruling on
    [#492](https://github.com/digitalis-io/pulsusdb/issues/492): rename the directory before anything
-   is written into it. Both documents now say `compile/`, and the per-language pieces are
-   `logql/compile.rs` and `traces/compile.rs`. §3.7 carries it.
+   is written into it. Both documents now say `compile/`. TraceQL's piece is `traces/compile.rs`;
+   `logql/compile.rs` is unwired, and LogQL's compiler is separate (§3.7).
 
    **And one that is this document's own, and is still open.** The key/value extractor chosen for `| logfmt` was
    compared to the reference's decoder on eleven awkward lines and disagreed on one, which the
@@ -5535,20 +5540,22 @@ noticed and are not grounds for a new round.
    whole-request shape it was written for is the shape that refuses, and the shape that runs is one
    join per batch — which is one statement per batch, the same count the value read already costs.
 5. **~~A label filter clears exactness even when its SQL is provably equivalent.~~ ANSWERED,
-   2026-09-02: the link says which, and the mechanism is `Fidelity`.** The design's rule used to be
-   unconditional, so a compiled parsed-name filter kept today's over-fetch page loop and the request
-   `LIMIT` never entered the statement — including for the two forms decided here that are
-   equivalent rather than merely wider: `| regexp` with a capture-group comparison, and a filter on
-   a structured-metadata key, both over a name no selected stream carries.
+   2026-09-02, and re-homed by the owner decision that LogQL keeps its own compiler (#507): LogQL's
+   compiler says which.** The rule used to be unconditional, so a compiled parsed-name filter kept
+   today's over-fetch page loop and the request `LIMIT` never entered the statement — including for
+   the two forms decided here whose SQL means exactly the filter rather than something wider:
+   `| regexp` with a capture-group comparison, and a filter on a structured-metadata key, both over a
+   name no selected stream carries.
 
-   The design record now has `Lower::fidelity`, returning `Fidelity::Equivalent` (`orig <=> sql`,
-   the evaluator must **not** re-apply the link) or `Fidelity::Wider` (`orig => sql`, it must), and
-   the fold ANDs it into `exact` — `docs/query-lowering.md` §2.7.7, with the trait method at §2.2 and
-   the fold line at §2.5. So the two forms above are `Equivalent`, the `LIMIT` compiles, and the read
-   is **one statement** instead of a page loop; a filter over a parser-produced name is `Wider` by
-   construction, because its predicate carries the type, metadata and escape guards this document's
-   part 2.7 puts on it, and the loop stays. `Wider` is the default, so a link whose author has not
-   considered it degrades to today's behaviour rather than to a wrong answer.
+   The answer is a property of each filter's SQL, and LogQL's compiler decides it in
+   `crates/pulsus-read/src/logql/plan.rs`, where `has_unpushed_dropping_stage` sets
+   `fetch_until_limit` today. A filter whose SQL means exactly the filter lets the `LIMIT` into the
+   statement, and the read is **one statement** instead of a page loop; a filter over a
+   parser-produced name keeps lines SQL cannot decide, because its predicate carries the type,
+   metadata and escape guards this document's part 2.7 puts on it, so the loop stays. The TraceQL
+   core expresses the same property as `Fidelity` (`docs/query-lowering.md` §2.7.7); LogQL's
+   compiler does not use that type. A filter nobody has classified keeps today's page loop, so the
+   default degrades to today's behaviour rather than to a wrong answer.
 
    **What this document still owes, and it is not a question but a job.** Every SQL cell in part 2
    and part 4 that compiles a label filter must say which of the two it is, because the cell is what

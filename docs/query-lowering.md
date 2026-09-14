@@ -3,8 +3,7 @@
 A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
 be evaluated in `pulsus-server` over rows ClickHouse has already sent, and some can instead be
 compiled into the SQL we send, so ClickHouse does the work next to the data and returns less.
-This document describes the mechanism that decides which — the shared lowering core — and applies
-it to both languages.
+This document describes the mechanism that decides which — the lowering core TraceQL's compiler is built on — and reads LogQL's stages against the same questions. LogQL keeps its own compiler; the two are not to be merged (§6).
 
 The decision it deliberately leaves out is the SQL shape several lowered stages compose into.
 That is [ADR 0008](decisions/0008-sql-composition-for-lowered-pipelines.md).
@@ -13,17 +12,7 @@ Related: [architecture.md §5.3](architecture.md) (LogQL) and [§5.4](architectu
 the read paths this sits inside; [schemas.md §3.2 and §4.2](schemas.md) for the generated SQL;
 [api.md §2.1 and §4.2](api.md) for the response contracts a lowered query must still satisfy.
 
-**What this design is required to do.** The requirement is **one generic architecture with shared
-code patterns for both LogQL and TraceQL, designed together** — not two designs sequenced. It has
-to cover **multi-stage pipelines**, not a single stage at a time, and it has to carry **query
-optimisation**: which stages compile into the SQL, in what shape, and what that saves on the hop
-that is billed. The requirement is recorded on
-[#492](https://github.com/digitalis-io/pulsusdb/issues/492) and on
-[#507](https://github.com/digitalis-io/pulsusdb/issues/507); #492 carries the shared core and #507
-the LogQL stage inventory and its measurements. Three obligations follow and every section below is
-answerable against them: the core is exercised by **both** stage sets, a stage from each fits
-through the same interface **without changing it**, and where the sharing stops is stated with
-reasons rather than left as a gap (§6).
+**What this design was required to do, and the decision that replaced it.** The requirement recorded on #492 and #507 was one architecture with shared code for LogQL and TraceQL, designed together. The owner has since decided that LogQL and TraceQL each keep their own compiler, and that the two are not to be merged. The core below is TraceQL's compiler. §7 reads LogQL's stages against the same model as analysis; it is not a plan to move them. §6 says what the two compilers have in common and what they do not.
 
 **What the compiler emits.** Not one statement: a **plan** — an ordered list of parts, each part
 either one SQL statement or work in our own engine, with the value set that crosses between
@@ -31,9 +20,10 @@ parts named, typed and bounded. §2.7 is the plan object and the four **cuts** t
 a plan gets a second SQL part. That is not an ambition: §9.2's worked request already sends **1,128**
 statements, and an earlier form of this design had no field that could hold a number other than one.
 
-**Status.** The core and the TraceQL side are designed and measured. The LogQL side is
-**described but not measured here** — its inventory belongs to
-[#507](https://github.com/digitalis-io/pulsusdb/issues/507) and §7 is structured to receive it.
+**Status.** The core, which is TraceQL's compiler, is designed and measured. LogQL keeps its own
+compiler, separate from the core (owner decision, [#507](https://github.com/digitalis-io/pulsusdb/issues/507)):
+§7 reads LogQL's stages against the same questions as analysis, and #507's inventory and
+measurements belong to LogQL's compiler, not to this document.
 The stage-by-stage statement text for both languages, with the answer each query must return, is
 [query-to-sql.md](query-to-sql.md).
 §10 states exactly what is demonstrated, what a compiler has now disproved and repaired, and what
@@ -73,8 +63,7 @@ TraceQL computes the same thing a fourth time and shares none of it:
 choosing candidate generators, and
 [`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1083) walks the pipeline.
 
-So a shared core is not an abstraction invented for a hypothetical future. It is the fourth
-hand-written copy being replaced by the thing all four already are.
+The core replaces TraceQL's hand-written walks; LogQL's walks stay in LogQL's compiler by the decision above.
 
 **And the cost of not having it was measurable.** TraceQL's spanset aggregate had no SQL path at
 all when this record was written: `PlannedAggregate` was built at `search_plan.rs:1218` and read at
@@ -116,7 +105,8 @@ qualifies, so `k` is the request's `limit` of 20 and the count is 4.
 
 ![Bytes per hop, evaluated against lowered](diagrams/query-lowering-hops.svg)
 
-**What it is worth on LogQL, including the case that is worth least.** Measured by
+**What compiling stages is worth on LogQL, including the case that is worth least.** LogQL's own
+compiler delivers it, not the core. Measured by
 [#507](https://github.com/digitalis-io/pulsusdb/issues/507) on its own corpus, metered-hop bytes
 today against lowered:
 
@@ -139,13 +129,19 @@ it. 7.8× is still worth having, and it is **180× less** than the grouped-by-`l
 the wrong number.** The 24,800× row is real — it is a structured-metadata filter that today burns
 127 round trips and about 53 GiB of reads **to return an empty partial answer** — but it is the
 best case, not the expected one. Two consequences follow and both are load-bearing: a bound on the
-number of groups is not optional (§8), and the case for this work rests on the round-trip collapse
+number of groups is not optional (§8 for the core; LogQL's compiler places its own), and the case for this work rests on the round-trip collapse
 and the 7.8×–70× band, not on its maximum.
 
 
 ---
 
 ## 2. The model
+
+**§2 describes the core, which is TraceQL's compiler.** Where §2 names LogQL it describes the
+unwired LogQL model in `crates/pulsus-read/src/logql/compile.rs` (§7), kept as analysis and as the
+evidence behind §2.5's rule. LogQL's own compiler, `crates/pulsus-read/src/logql/plan.rs`, uses
+none of §2's types; LogQL's plan shape, its page loop and where its limit is decided belong to that
+compiler (owner decision, [#507](https://github.com/digitalis-io/pulsusdb/issues/507)).
 
 ### 2.1 The pipeline as data
 
@@ -181,9 +177,9 @@ and that is a precondition on accumulated state rather than a rule about `LIMIT`
 pub trait Lang {
     /// The language's CHAIN LINK, which is not the same type as its AST
     /// stage enum. TraceQL's is `pulsus_traceql::PipelineStage` plus the
-    /// three synthesised links; LogQL's is `LqlLink` (§7.1), of which
-    /// `pulsus_logql::Stage` is ONE arm — the window and the two
-    /// aggregation levels are not `Stage` variants.
+    /// three synthesised links. §7.1's LogQL model uses `LqlLink`, of which
+    /// `pulsus_logql::Stage` is ONE arm (unwired — LogQL's compiler is
+    /// `logql/plan.rs` and does not use this trait).
     type Stage;
     type Source;                // which table(s), and how the selector lowered
     type ColExpr: Clone;        // a SQL column expression fragment
@@ -578,7 +574,7 @@ separate rule: the residual link's state effect is what removes the later link's
 A residual `by()` leaves the shape ungrouped, so a following aggregate that lowered would compute
 per-trace instead of per-group; the shape it reads is the shape it gets, and it refuses.
 
-![Lowering as a per-link disposition over the whole chain, on four pipelines](diagrams/query-lowering-boundary.svg)
+![Lowering as a per-link disposition over the whole chain, on three TraceQL pipelines, with LogQL's separate compiler drawn for comparison](diagrams/query-lowering-boundary.svg)
 
 **Greedy is the default, and it is a stated consequence of the cost model rather than a hook.**
 Lowering one more stage always removes a round trip and never adds one. It can add rows read: the
@@ -589,12 +585,12 @@ scan — which is exactly what the phase-1 generator already costs — so there 
 greedy lowering costs more than one generator's read. §2.7.5 gives the argument in full, together
 with the two measurements that looked like counterexamples and are not, and what would falsify it.
 
-**The one real per-language cost regime is not a policy either.** LogQL's `fetch_until_limit`
+**LogQL's paging belongs to LogQL's own compiler, not to the core.** LogQL's `fetch_until_limit`
 keyset paging (`crates/pulsus-read/src/logql/plan.rs:1643`, field at `:80`) means compiling a
 dropping stage changes the *paging strategy*, not only the byte count — and what decides that is
-whether the compiled predicate is **equivalent** to the link or merely **wider** than it. That is a
-property of the SQL a link contributed, so §2.7.7 makes the link say it, as `Fidelity`, rather than
-leaving it to a boolean nobody can make return `false`.
+whether the compiled predicate is **equivalent** to the stage or merely **wider** than it. LogQL's
+compiler is separate and is not to be merged into the core (owner decision, #507); it decides this
+in `plan.rs`. §2.7.7's `Fidelity` is how the core carries the same property for its own links.
 
 ### 2.6 What crosses, and what the evaluator may assume
 
@@ -711,8 +707,8 @@ pub struct Seed<L: Lang + ?Sized> {
     /// across two tables opens with two statements and hydrates their
     /// merged candidate set, and one index would credit one of the two.
     pub from_parts: Vec<usize>,
-    /// The language's own handoff type — trace ids, fingerprints, a
-    /// keyset cursor. Unchanged: this is `L::Handoff` (§2.2).
+    /// The language's own handoff type — trace ids for TraceQL; the unwired
+    /// LogQL model's would be fingerprints. Unchanged: this is `L::Handoff` (§2.2).
     pub values: L::Handoff,
     /// The plan-time upper bound on how many values can be in it, and
     /// where that bound comes from. A seed with no such bound is not
@@ -736,7 +732,8 @@ pub enum Driver {
     /// The request's LIMIT could not enter the statement, so pages are
     /// drawn, each resuming from the previous page's last sort key,
     /// until the limit fills, the window is exhausted, or a byte budget
-    /// is spent. This is today's `stage3_keyset` loop, named.
+    /// is spent. It has the shape of LogQL's `stage3_keyset` loop, which LogQL's
+    /// own compiler runs; no plan the core builds issues it (§2.7.5).
     Keyset { page_rows: u32, over_fetch: u32 },
 }
 
@@ -828,12 +825,13 @@ they are not**: §2.7.9 records the measured shape none of the four explains.
 reachable by a key `rel` projects. ADR 0008 D3 forbids expressing that as a subquery, on
 measurement.
 
-**Two shipped instances, and they are the whole of today's multi-statement structure.**
+**One shipped instance on the core's route, and the same shape in LogQL's own compiler.**
 
-- LogQL resolves the selector to fingerprints over `log_streams_idx`
-  (`crates/pulsus-read/src/logql/sql.rs:518`), then reads `log_streams` and `log_samples` filtered
-  on `fingerprint IN (…)` (`sql.rs:761`, `sql.rs:810`). Three statements, two cuts. The seed is the
-  fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
+- LogQL's compiler, which is not built on the core, resolves the selector to fingerprints over
+  `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:518`), then reads `log_streams` and
+  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:761`, `sql.rs:810`). Three statements; in
+  the core's terms that is two source handoffs, but LogQL's compiler does not use `Cut`. Its seed is
+  the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
   `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:386`,
@@ -949,14 +947,17 @@ bounded by the request's own `LIMIT`**, in which case it sits DOWNSTREAM of the 
 being the loop that fills it, and no driver is attached (issue #492 part 3, D4). Every TraceQL
 search's last statement is that shape: the winners' root read, seeded by at most `limit` trace ids
 and issued once after the limit is satisfied. Measured over the 56 committed search goldens, no part
-carries `Issue::PerSeed(Driver::Keyset { .. })` and none carries `Cut::InexactLimit`; the shipped
-instance below is LogQL's, and it is the only one.
+carries `Issue::PerSeed(Driver::Keyset { .. })` and none carries `Cut::InexactLimit`. No plan the
+core builds carries either today.
 
-**Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
-set at `:1643` from `has_unpushed_dropping_stage`, `:1673`), and when it is set the read is one
-statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:897`) with
-`scan_limit = result_limit × reader.logql_pipeline_scan_factor`. §2.7.7 is what can turn this cut
-off.
+**The same decision in LogQL belongs to LogQL's compiler, not to this cut.** LogQL keeps its own
+compiler, separate from the core (owner decision, #507). Its page loop is
+`StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`, set at `:1643` from
+`has_unpushed_dropping_stage`, `:1673`); when it is set the read is one statement per page through
+`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:897`) with
+`scan_limit = result_limit × reader.logql_pipeline_scan_factor`. Whether a compiled LogQL filter
+lets the request's limit into the statement is decided in `plan.rs`; §2.7.7's `Fidelity` does not
+reach it. §7.1's `Limit` row reads that decision in the model's terms, as analysis.
 
 **And this is where the greedy question is answered — once, here, rather than by a hook.** Under the
 cost model of §9.1 — bytes counted per hop, the client hop and the `pulsus-server`↔database hop
@@ -987,21 +988,22 @@ decision point.
 
 1. **A residual link mid-pipeline does not cut.** The fold continues and a later link contributes to
    the *same* statement. Withdrawing this is the measured **20.6×** metered-byte regression of §9.6
-   and it stands untouched. The boundary diagram's pipeline D is the shape.
+   and it stands untouched. The boundary diagram's panel D is the comparison it was measured on.
 2. **A part may not be seeded by a value our own engine computed per row.** Under the cost model
    (§9.1) such a seed crosses the metered hop twice and its size grows with the rows read. **Every
-   admissible seed is bounded by a plan-time constant** — the request `limit`, `DEFAULT_MAX_STREAMS`,
-   `reader.traceql_max_candidates`, `BATCH_TRACES` — and `L::handoff_bound` returning `None` is what
+   admissible seed is bounded by a plan-time constant** — the request `limit`,
+   `reader.traceql_max_candidates`, `BATCH_TRACES`; LogQL's own compiler bounds its fingerprint seed
+   by `DEFAULT_MAX_STREAMS` in the same way, outside the core — and `L::handoff_bound` returning `None` is what
    refuses the cut. This is what stops a plan from shipping rewritten lines back to the database
    after a stage that rewrites the line.
 3. **A predicate that engages no index does not cut and is not declined.** §2.7.5 measures why.
 
 #### 2.7.7 `Fidelity` — what the compiled SQL means, relative to the link
 
-Whether LogQL's third part is one statement carrying the request `LIMIT` or an iterated keyset loop
-turns on whether the compiled predicate is **equivalent** to the link or merely **wider** than it.
-§7.1's rows state that as a table cell; it is a property of the SQL a link contributed, so the link
-is what says it (`Lower::fidelity`, §2.2):
+Whether a SQL part the core plans may carry the request `LIMIT`, rather than being issued once per
+page, turns on whether the compiled predicate is **equivalent** to the link or merely **wider** than
+it. It is a property of the SQL a link contributed, so the link is what says it
+(`Lower::fidelity`, §2.2):
 
 ```rust
 pub enum Fidelity {
@@ -1015,14 +1017,16 @@ pub enum Fidelity {
 The fold gains one line — `rel.exact &= matches!(f, Fidelity::Equivalent);` (§2.5) — and its
 traversal, its arms and its bijection with `ResidualReason` are otherwise untouched.
 
-**This settles [query-to-sql.md](query-to-sql.md)'s open question 5, which today costs a page loop.**
+**What this does not settle: LogQL's page loop.** [query-to-sql.md](query-to-sql.md)'s open
+question 5 asks the same question of LogQL, where today it costs a page loop, and LogQL's own
+compiler answers it, not this trait (owner decision, #507). The distinction it draws is the same.
 A filter over a structured-metadata key compiles to `JSONExtractString(structured_metadata, 'k') = 'v'`
 over a stored column our own encoder writes and our own flat reader reads
-(`crates/pulsus-read/src/logql/labels.rs:157-189`), with no guard and no ambiguity: that is
-`Equivalent`, so `Limit` may lower, so the read is one statement rather than `stage3_keyset`'s loop.
-A filter over a **parser-produced** name is `Wider` by construction — its predicate carries guard
-terms that keep lines SQL cannot decide — so the loop stays. One mechanism, two answers, and neither
-is a rule anyone has to remember.
+(`crates/pulsus-read/src/logql/labels.rs:157-189`), with no guard and no ambiguity, so its SQL means
+the filter and LogQL's compiler may put the request `LIMIT` in the statement. A filter over a
+**parser-produced** name carries guard terms that keep lines SQL cannot decide, so the loop stays.
+§7.1 records how the unwired LogQL model would carry the same property as `Fidelity`; that is
+analysis, not LogQL's mechanism.
 
 **Why `Wider` is the default and not `Equivalent`:** `Wider` is exactly today's behaviour on every
 link, so a link whose author has not thought about it cannot make the plan wrong — it can only make
@@ -1093,8 +1097,8 @@ to repair — it ships today, independently of anything here.
 The argument that the four were **closed** is that each is derived from one of exactly two things a
 single statement cannot do — read a second source keyed by its own result, or hold more than fits —
 plus the two forms of "more than fits": the seed's size (§2.7.3), and the answer's when the `LIMIT`
-cannot enter (§2.7.5). **What would falsify it:** a query in either language whose correct plan has
-two SQL parts and no cut in the list.
+cannot enter (§2.7.5). **What would falsify it:** a query the core plans — a TraceQL query — whose
+correct plan has two SQL parts and no cut in the list.
 
 **That witness exists, it is committed, and the closure claim is therefore withdrawn** (issue #492
 part 3). `crates/pulsus-read/tests/golden/traces_search/nested_boolean.sql` is
@@ -1465,10 +1469,11 @@ was answered by running each expression on a container rather than by reading:
 | `unpack` | `if(JSONHas(body,'_entry'), JSONExtractString(body,'_entry'), body)` — the line becomes the packed object's `_entry` when present, otherwise unchanged | **`No`**, not `Never`, for the line. Its label promotion is the open-column-set case and needs no new mechanism |
 | `line_format` | a Go text/template evaluated per line | still open; #507 treats it as producing `Computed` only when the chain is residual from there |
 
-So `decolorize` and `unpack` produce `Provenance::Computed(expr)` rather than blocking, and a
-following line filter lowers **against the rewritten expression**. That is a strictly larger
-lowerable set than this document's first version assumed, and it is only reachable because a
-residual link still applies its state effect (§2.5).
+So in the model `decolorize` and `unpack` produce `Provenance::Computed(expr)` rather than
+blocking, and a following line filter could lower **against the rewritten expression**. That is a
+strictly larger lowerable set than this document's first version assumed, and it is only reachable
+because a residual link still applies its state effect (§2.5). Whether LogQL's own compiler
+compiles either stage is decided in `crates/pulsus-read/src/logql/plan.rs`, not here.
 
 **One caveat #507 owns and this document must not pre-empt:** the reference matches a line filter
 after `decolorize` against the **raw** line, which our tree appears not to do. If that holds on
@@ -1480,18 +1485,18 @@ is ratified — not whichever is convenient. #507 is measuring our side.
 ## 6. Where the sharing stops, and why
 
 Forcing a common abstraction over things that genuinely differ is worse than two clean mechanisms.
-The boundary below is part of the design, not an admission.
+The boundary below is part of the design, not an admission. By owner decision the two languages do not share a compiler: the table below describes the TraceQL core and the shape LogQL's own compiler answers the same questions in; nothing in the right-hand column is to be moved into the core.
 
 **Two different claims are made below and they are not the same strength.** "Generic by
 construction" means the type system or the fold enforces it: a language cannot supply a variant of
-it, and getting it wrong is a build failure. "Per-language work" means each language writes its own
+it, and getting it wrong is a build failure. "Supplied by the compiler" means TraceQL's compiler writes its own
 and the core only fixes the shape of the obligation. Everything in the second column is **asserted**
 generic in the sense that it is expected to fit; only the first column is generic in the sense that
 it cannot fail to.
 
-| mechanism | generic **by construction** — what the core enforces | **per-language work** — what each language supplies |
+| mechanism | generic **by construction** — what the core enforces | **supplied by the compiler** — TraceQL's; LogQL's separate compiler decides each row itself |
 |---|---|---|
-| the chain | `&[L::Stage]` folded left, and `Order`/`Limit`/`Emit` synthesised as ordinary links | the link type itself (`PipelineStage` + 3, or `LqlLink`) and the chain builder that produces it |
+| the chain | `&[L::Stage]` folded left, and `Order`/`Limit`/`Emit` synthesised as ordinary links | the link type itself (`PipelineStage` + 3; the LogQL model's `LqlLink` is unwired analysis) and the chain builder that produces it |
 | capability | `Capability`'s three outcomes, evaluated against the **accumulated** `Relation`, and their bijection with `ResidualReason` | the rule each link answers with |
 | dispositions | the fold applies `apply` on `Lowered` and **`residual_effect` on every other outcome**, for every link, with no early return — compiled (§2.5) | what each link's `residual_effect` *does* |
 | shapes | `L::Shape: Eq`, and the requirement that a stage's input shape match the accumulated one | the shape lattice: `Spans`/`Traces`/`Groups` against `Lines`/`Samples`/`Series` |
@@ -1505,7 +1510,7 @@ it cannot fail to.
 **Nothing moved from the right column to the left by argument.** One row moved by compiling: the
 fold's guarantee that a residual link still gets `residual_effect` was previously asserted in prose
 and did not compile (§2.5); it now compiles, so it is in the left column. The rest of the right
-column stays there and is named as per-language work rather than described as shared.
+column stays there and is named as the compiler's work rather than described as shared.
 
 **Three things that are deliberately not shared:**
 
@@ -1516,12 +1521,7 @@ column stays there and is named as per-language work rather than described as sh
 2. **The renderer is shared only as a skeleton.** Clause slots and nesting are common; fragment
    construction is not, and must not be — LogQL's escaping, regex handling and time-bucket
    expressions have nothing to do with TraceQL's.
-3. **The plan-shape FACTS are per language; the plan-shape RULES are not.** There is no cost
-   policy hook: §2.7.5 answers the greedy question once, for both languages, as a consequence of
-   §9.1's cost model, and §2.7.7 handles the one place the two languages genuinely differ — LogQL's
-   keyset paging — through `Fidelity`, which is a property of a link's SQL rather than a policy.
-   What a language still supplies is what the core cannot know: which source a link would read, how
-   big its handoff can get, and what that handoff costs to render.
+3. **The plan-shape FACTS come from the language; the plan-shape RULES are the core's.** There is no cost policy hook. §2.7.5 answers the greedy question once for the compiler built on the core (TraceQL's), as a consequence of §9.1's cost model. What TraceQL's compiler still supplies is what the core cannot know: which source a link would read, how big its handoff can get, and what that handoff costs to render. LogQL's compiler is separate and is not to be merged into the core (owner decision, [#507](https://github.com/digitalis-io/pulsusdb/issues/507)). LogQL's plan shape, keyset paging included, is decided in `crates/pulsus-read/src/logql/plan.rs`. §2.7.7's `Fidelity` says how LogQL's links would be expressed against the core; that is analysis, not a plan to move them.
 
 **Where the code lives.** Both read paths are already modules of **one crate** —
 `crates/pulsus-read/src/logql/` and `crates/pulsus-read/src/traces/`, with
@@ -1530,7 +1530,7 @@ column stays there and is named as per-language work rather than described as sh
 [#492](https://github.com/digitalis-io/pulsusdb/issues/492) and recorded as
 [query-to-sql.md](query-to-sql.md)'s open question 3: that document avoids the term throughout, and
 a word kept out of the prose has no business entering the tree as a path and as module identifiers.
-The per-language impls are `crates/pulsus-read/src/logql/compile.rs` and
+The per-language impls are `crates/pulsus-read/src/logql/compile.rs` (an implementation of the core's language interface that no LogQL read uses; LogQL's compiler is `logql/plan.rs`) and
 `crates/pulsus-read/src/traces/compile.rs`. The core **introduces no new dependency edge**:
 `crates/pulsus-read/Cargo.toml` already depends on `pulsus-logql` and `pulsus-traceql`, and the
 core depends on neither, being generic over `Lang`. A separate crate would be the wrong call — it
@@ -1547,7 +1547,7 @@ or every future consumer inherits a direct dependency it did not ask for.
 
 **This section is read from source and carries no measurement. The inventory and its numbers are
 [#507](https://github.com/digitalis-io/pulsusdb/issues/507)'s** — measuring LogQL stages here
-would produce a second set of figures that disagreed with that work.
+would produce a second set of figures that disagreed with that work. LogQL's compiler is not moved into the core (owner decision).
 
 ### 7.1 The complete LogQL link set
 
@@ -1724,7 +1724,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 | `Parser(Logfmt { strict, keep_empty, extractions })` (`ast.rs:242`) | as above | as above | as above | conditional | *none* |
 | `Parser(Regexp(re))` (`ast.rs:248`) | as above, names = capture groups | as above, and the pattern expressible | as above | conditional | *none* |
 | `Parser(Pattern(p))` (`ast.rs:251`) | as above, names = `<name>` captures | as above | as above | conditional | *none* |
-| `LabelFilter(expr)` (`ast.rs:136`) | `Lines` → `Lines` | every referenced name resolves in `cols`, and the comparison is expressible | **clears `exact`** — it drops lines in the evaluator | conditional | *none*. **Fidelity `Wider`** over a parser-produced name (its predicate carries guard terms SQL cannot decide), **`Equivalent`** over a structured-metadata key — which is what decides whether the `Limit` link may lower (§2.7.7) |
+| `LabelFilter(expr)` (`ast.rs:136`) | `Lines` → `Lines` | every referenced name resolves in `cols`, and the comparison is expressible | **clears `exact`** — it drops lines in the evaluator | conditional | *none*. **Fidelity `Wider`** over a parser-produced name (its predicate carries guard terms SQL cannot decide), **`Equivalent`** over a structured-metadata key — which, in the model, is what decides whether the `Limit` link may lower; LogQL's compiler decides its own limit (§2.7.5) |
 | `LineFormat(tpl)` (`ast.rs:140`) | `Lines` → `Lines`, `body` → `Computed` | none today: a Go text/template has no SQL form here | sets `body` provenance `Computed` with **no resolvable expression**, so every later link needing the line goes residual. Does **not** clear `exact` — it removes no lines | **must go residual** today: `No(NotYetLowered)`, not `Never` (§5) | *none* |
 | `LabelFormat(fmts)` (`ast.rs:141`) | `Lines` → `Lines`, `cols` rewritten | every source name resolves and the template is a rename or a constant | `cols` rewritten with evaluator-only provenance for each rewritten name; `exact` untouched | conditional | *none* |
 | `Unwrap(u)` (`ast.rs:142`) | `Lines` → `Samples{value}` | `u.label` resolves in `cols` and `u.conversion` is expressible | **shape unchanged** — always `Lines` today, because the parser refuses a second `unwrap` (§11.2b), but stated as preservation like every other row, because a state rule that is only true by grace of a parser restriction breaks silently when the restriction moves — and the sample source becomes evaluator-owned — which is what makes a following `RangeAgg`, whose input shape is `Samples`, refuse | conditional | *none* |
@@ -1743,7 +1743,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 | `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:956`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
 | `LabelReplace` | `MetricExpr::LabelReplace` (`ast.rs:1002`) | `Series` → `Series` | none today — see below | retains series state; **clears `exact`**, because at range it can REMOVE series: colliding post-rewrite label sets merge (`post_agg.rs:3307`, `merge_matrix_collisions`) | must go residual today: `No(NotYetLowered)` | *none* |
 | `Order` | the request direction | `Lines`\|`Series` → same | the ordering columns are in the projection | leaves `ordering` unset | conditional | *none* |
-| `Limit(n)` | the request limit | `Lines`\|`Series` → same | `ordering.is_some()` **and `exact`** — a `LIMIT` over a superset loses rows a residual link would have kept | leaves `limit` unset, which is today's oversample path | conditional | **the same SQL part, issued once per page** when `!exact` — `Cut::InexactLimit` (§2.7.5), `Issue::PerSeed(Driver::Keyset)`, which is today's `fetch_until_limit` loop. `Issue::Once` with the `LIMIT` in the statement when every earlier link was `Fidelity::Equivalent` |
+| `Limit(n)` | the request limit | `Lines`\|`Series` → same | `ordering.is_some()` **and `exact`** — a `LIMIT` over a superset loses rows a residual link would have kept | leaves `limit` unset, which is today's oversample path | conditional | in the model: **the same SQL part, issued once per page** when `!exact` — `Issue::PerSeed(Driver::Keyset)`, which is how the model describes LogQL's `fetch_until_limit` loop — and `Issue::Once` with the `LIMIT` in the statement when every earlier link was `Fidelity::Equivalent`. LogQL's own compiler makes this decision in `plan.rs` (§2.7.5) |
 | `Emit` | the response builder | → answer | none | records the response build as the evaluator's | **must go residual** | *none* on the LogQL routes: the response is built from rows the last SQL part already returned |
 | `MetricExpr::Literal` (`ast.rs:967`), `VectorFn` (`:972`) | — | — | scalar leaves, not chain links | n/a | not in the chain | n/a |
 | `MetricExpr::Binary` (`ast.rs:977`), `Variants` (`:992`) | — | — | **trees, not chains.** A left fold cannot represent two operands | n/a | out of scope, named | n/a |
@@ -1797,7 +1797,8 @@ Each of the three is a test, not a claim — §11 nominates one per walk, so tha
   already enumerates as blocking — `json`, `logfmt`, `regexp`, `pattern`, label filter,
   `line_format`, `label_format`, `unwrap`, `unpack`, `decolorize`, `drop`, `keep`, and the `ip()`
   line filter. **Which of those are lowerable, in what SQL, and what each saves is #507's
-  inventory.** This section is where it lands.
+  inventory**, and it lands in LogQL's own compiler (`crates/pulsus-read/src/logql/plan.rs`) and in
+  [query-to-sql.md](query-to-sql.md), not in this section (owner decision, #507).
 - **Group 3 (lowered already, prunes nothing):** LogQL's line filters lower to `LIKE`/`match`
   predicates backed by the body skip indexes ([architecture.md §5.3](architecture.md)). Whether a
   given filter shape actually prunes granules is a measurement, and it is #507's.
@@ -1815,7 +1816,9 @@ own `yields` (§2.7.1), and a part whose `issue` is `PerSeed` applies that cap *
 a cumulative request-scoped budget — which is exactly what `HYDRATION_BYTE_BUDGET`
 (`crates/pulsus-read/src/traces/exec.rs:145`) and `reader.logql_scan_budget_bytes` already do across
 today's loops. A plan with three SQL parts therefore has three enforcement points, not one, and
-saying which is which is the whole reason the cap table is keyed this way.
+saying which is which is the whole reason the cap table is keyed this way. The table is the core's:
+LogQL's own compiler places its own caps — the scan budget and the limits in
+[query-to-sql.md](query-to-sql.md) §8 — and does not take them from here (owner decision, #507).
 
 | `SqlPart::yields` | what crosses | the cap that applies |
 |---|---|---|
@@ -4338,10 +4341,11 @@ per-disjunct append from `:1681` to `:2157-2158`, `search_eval.rs`'s `apply_post
 `:2464` to `:2498`, `exec.rs`'s `BATCH_TRACES` from `:114` to `:115`, and `search_sql.rs`'s root
 read from `:345` to `:361`. **Wave 1 owes a re-print of every citation at the commit it lands on.**
 
-**Still not established.** #507's crate is outside the tree and compiles against a transcription,
-not against `crates/pulsus-read/src/compile/`. The core does not exist yet, so nothing has compiled
-the repaired interface **and** a real language implementation in one build. That is what wave 1
-closes, and until it does this section stays as it is.
+**Settled since, by a decision rather than by this section.** The core exists in
+`crates/pulsus-read/src/compile/`, and the unwired LogQL model in
+`crates/pulsus-read/src/logql/compile.rs` compiles against it in the tree. LogQL keeps its own
+compiler, and the two are not to be merged (owner decision, #507), so no LogQL read is to move onto
+the core and nothing here is owed for LogQL.
 
 **Both diagrams carried the same false assertion, and both are redrawn.** A picture asserts a design
 without being read as a claim, which is why §11.3 gates them — and why a stale one is worse than a
@@ -4392,7 +4396,7 @@ well as the tables. Wave 1 should write it that way.
 **What the first implementation wave settles.** It delivers the core **with R1–R3b and R5 already
 applied** — they are not wave-1 discoveries — and the TraceQL aggregate as its first lowered link.
 It also lands the LogQL `Lang` impl and link set **compiled and unwired**: not called from
-`plan.rs`, no LogQL SQL emitted, no LogQL behaviour changed. The gates that make that worth having
+`plan.rs`, no LogQL SQL emitted, no LogQL behaviour changed. LogQL's compiler is not moved into the core (owner decision). The gates that make that worth having
 are §11, by name and by selector — four of them exist and the other twenty-one are **wave 1**.
 
 **That re-measurement has landed.** §9.2's phase-2 membership row used to state a total that was
