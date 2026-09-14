@@ -55,8 +55,8 @@ fall short"; `compile_line_filters` is "the predicate the fold accumulated".
 Underneath them, `is_pushable_line_filter` (`plan.rs:3721`) carries a doc comment that states the
 problem in the codebase's own words — *"the single source of truth for 'does this line filter push
 down to SQL, or must it run in the client pipeline?' … so the two paths never drift"* — and it has
-five call sites across three files: `plan.rs:1686`, `plan.rs:1704`, `plan.rs:3695`,
-`pipeline.rs:1117`, `exec.rs:2441`.
+five call sites across three files: `plan.rs:1689`, `plan.rs:1707`, `plan.rs:3695`,
+`pipeline.rs:1117`, `exec.rs:2650`.
 
 TraceQL computes the same thing a fourth time and shares none of it:
 [`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2327) walks a boolean tree
@@ -829,7 +829,7 @@ measurement.
 
 - LogQL's compiler, which is not built on the core, resolves the selector to fingerprints over
   `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:482`), then reads `log_streams` and
-  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:725`, `sql.rs:810`). Three statements; in
+  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:725`, `sql.rs:774`). Three statements; in
   the core's terms that is two source handoffs, but LogQL's compiler does not use `Cut`. Its seed is
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -1648,31 +1648,31 @@ property of that grep and not of anyone's reading. Each row's body **and its rea
 then produced by sending a query through `logql::plan::plan` on this tree at `2f78c53` — the probe
 is `492-r4-probe-logql-rejections.rs` in the architect's session scratchpad, and its printed output
 is the source of every cell. The previous table was built by reading the `format!` strings, and
-reading missed `plan.rs:1245` and `plan.rs:1410` entirely, cited two sites one and five lines off,
+reading missed `plan.rs:1248` and `plan.rs:1413` entirely, cited two sites one and five lines off,
 and folded a helper with four distinct message bodies into a single row.
 
 | link | rejected payload | reached by | `400` body, verbatim |
 |---|---|---|---|
-| `VectorAgg` | a bare scalar literal as the aggregated operand (`plan.rs:1245`) | `sum(1)` · `topk(2, 1)` · `sum by (x) (1)` | `a vector aggregation cannot aggregate a bare scalar literal` |
-| `VectorAgg` | `sort`/`sort_desc` carrying a grouping clause (`plan.rs:1508`) | `sort by (x) (count_over_time({service_name="checkout"}[5m]))` | `` `sort` does not accept a grouping clause `` |
-| `VectorAgg` | `approx_topk` on a range query (`plan.rs:1519`) | `approx_topk(3, count_over_time({service_name="checkout"}[5m]))` **as a range query** | `count min sketches are only supported on instant queries` |
-| `VectorAgg` | an op that takes `k`, given none (`plan.rs:1526`) | **nothing — parser-shadowed.** `topk(count_over_time({service_name="checkout"}[5m]))` is refused by the parser: `unexpected identifier "count_over_time" at byte 5: expected the k parameter (e.g. topk(5, ...))` | `` `<op>` requires a k parameter (e.g. <op>(5, ...)) `` — unreachable |
-| `VectorAgg` | an op that takes no parameter, given one (`plan.rs:1531`) | **nothing — parser-shadowed.** `sum(3, count_over_time({service_name="checkout"}[5m]))` is refused: `unexpected ',' at byte 5: expected ')'` | `` `<op>` takes no parameter `` — unreachable |
-| `VectorAgg` | a `k` that is not a finite number (`plan.rs:1484`, from `plan.rs:1524`) | **nothing — parser-shadowed.** `topk(<320 nines>, count_over_time({service_name="checkout"}[5m]))` is refused: `invalid parameter topk(…)` | `` invalid `<op>` parameter "…" `` — unreachable |
-| `RangeAgg` | a quantile that is not a finite number (`plan.rs:1484`, from `plan.rs:1910`) | `quantile_over_time(<320 nines>, {service_name="checkout"} \| unwrap latency [5m])` | `invalid quantile parameter "999…"` |
-| `RangeAgg` | an op that requires `unwrap`, without one (`plan.rs:1892`) | `sum_over_time({service_name="checkout"}[5m])` | `invalid aggregation sum_over_time without unwrap` |
-| `RangeAgg` | an op that forbids `unwrap`, with one (`plan.rs:1897`) | `count_over_time({service_name="checkout"} \| unwrap latency [5m])` | `invalid aggregation count_over_time with unwrap` |
-| `RangeAgg` | `quantile_over_time` with no quantile (`plan.rs:1915`) | **nothing — parser-shadowed.** `quantile_over_time({service_name="checkout"} \| unwrap latency [5m])` is refused: `unexpected '{' at byte 19: expected the quantile parameter (e.g. 0.95)` | `quantile_over_time requires a quantile parameter` — unreachable |
+| `VectorAgg` | a bare scalar literal as the aggregated operand (`plan.rs:1248`) | `sum(1)` · `topk(2, 1)` · `sum by (x) (1)` | `a vector aggregation cannot aggregate a bare scalar literal` |
+| `VectorAgg` | `sort`/`sort_desc` carrying a grouping clause (`plan.rs:1511`) | `sort by (x) (count_over_time({service_name="checkout"}[5m]))` | `` `sort` does not accept a grouping clause `` |
+| `VectorAgg` | `approx_topk` on a range query (`plan.rs:1522`) | `approx_topk(3, count_over_time({service_name="checkout"}[5m]))` **as a range query** | `count min sketches are only supported on instant queries` |
+| `VectorAgg` | an op that takes `k`, given none (`plan.rs:1529`) | **nothing — parser-shadowed.** `topk(count_over_time({service_name="checkout"}[5m]))` is refused by the parser: `unexpected identifier "count_over_time" at byte 5: expected the k parameter (e.g. topk(5, ...))` | `` `<op>` requires a k parameter (e.g. <op>(5, ...)) `` — unreachable |
+| `VectorAgg` | an op that takes no parameter, given one (`plan.rs:1534`) | **nothing — parser-shadowed.** `sum(3, count_over_time({service_name="checkout"}[5m]))` is refused: `unexpected ',' at byte 5: expected ')'` | `` `<op>` takes no parameter `` — unreachable |
+| `VectorAgg` | a `k` that is not a finite number (`plan.rs:1487`, from `plan.rs:1527`) | **nothing — parser-shadowed.** `topk(<320 nines>, count_over_time({service_name="checkout"}[5m]))` is refused: `invalid parameter topk(…)` | `` invalid `<op>` parameter "…" `` — unreachable |
+| `RangeAgg` | a quantile that is not a finite number (`plan.rs:1487`, from `plan.rs:2289`) | `quantile_over_time(<320 nines>, {service_name="checkout"} \| unwrap latency [5m])` | `invalid quantile parameter "999…"` |
+| `RangeAgg` | an op that requires `unwrap`, without one (`plan.rs:2271`) | `sum_over_time({service_name="checkout"}[5m])` | `invalid aggregation sum_over_time without unwrap` |
+| `RangeAgg` | an op that forbids `unwrap`, with one (`plan.rs:2276`) | `count_over_time({service_name="checkout"} \| unwrap latency [5m])` | `invalid aggregation count_over_time with unwrap` |
+| `RangeAgg` | `quantile_over_time` with no quantile (`plan.rs:2294`) | **nothing — parser-shadowed.** `quantile_over_time({service_name="checkout"} \| unwrap latency [5m])` is refused: `unexpected '{' at byte 19: expected the quantile parameter (e.g. 0.95)` | `quantile_over_time requires a quantile parameter` — unreachable |
 | `Pipe(Stage::Unwrap)` | an `unwrap` in a **log** query (`plan.rs:1637`) | `{service_name="checkout"} \| unwrap latency` | `` `unwrap` is only valid inside a range aggregation (e.g. sum_over_time({...} \| unwrap x [5m])) `` |
-| `LabelReplace` | a **scalar** operand (`plan.rs:1410`) | `label_replace(1, "d", "$1", "src", "(.*)")` · `label_replace(1 + 2, …)` · `sum(label_replace(1, …))` | `label_replace requires a vector operand, got a scalar expression` |
-| `LabelReplace` | a regex using a group flag RE2 does not have (`plan.rs:167`) | `label_replace(count_over_time({service_name="checkout"}[5m]), "d", "$1", "src", "(?x)a")` | ``invalid regex in label_replace: a `(?x`/`(?u`/`(?R` group flag RE2 does not have: `(?x)a` `` |
-| `LabelReplace` | a regex that does not compile (`plan.rs:176`) | `label_replace(count_over_time({service_name="checkout"}[5m]), "d", "$1", "src", "a(")` | `invalid regex in label_replace: regex parse error: … error: unclosed group` |
+| `LabelReplace` | a **scalar** operand (`plan.rs:1413`) | `label_replace(1, "d", "$1", "src", "(.*)")` · `label_replace(1 + 2, …)` · `sum(label_replace(1, …))` | `label_replace requires a vector operand, got a scalar expression` |
+| `LabelReplace` | a regex using a group flag RE2 does not have (`plan.rs:170`) | `label_replace(count_over_time({service_name="checkout"}[5m]), "d", "$1", "src", "(?x)a")` | ``invalid regex in label_replace: a `(?x`/`(?u`/`(?R` group flag RE2 does not have: `(?x)a` `` |
+| `LabelReplace` | a regex that does not compile (`plan.rs:179`) | `label_replace(count_over_time({service_name="checkout"}[5m]), "d", "$1", "src", "a(")` | `invalid regex in label_replace: regex parse error: … error: unclosed group` |
 
-**14 rows over 13 of the 25 construction sites.** `plan.rs:1484` is a shared helper with **four**
-call sites and therefore four distinct message bodies; two of them — `plan.rs:1524` and
-`plan.rs:1910` — are reached from a chain link and get a row each, which is why 13 sites give 14
-rows. The helper's other two call sites, `plan.rs:1272` (`invalid scalar literal "…"`) and
-`plan.rs:1281` (`invalid vector() value "…"`), belong to `MetricExpr::Literal` and `VectorFn`,
+**14 rows over 13 of the 25 construction sites.** `plan.rs:1487` is a shared helper with **four**
+call sites and therefore four distinct message bodies; two of them — `plan.rs:1527` and
+`plan.rs:2289` — are reached from a chain link and get a row each, which is why 13 sites give 14
+rows. The helper's other two call sites, `plan.rs:1275` (`invalid scalar literal "…"`) and
+`plan.rs:1284` (`invalid vector() value "…"`), belong to `MetricExpr::Literal` and `VectorFn`,
 which the synthesised-link table marks **not in the chain**; both were confirmed reachable by the
 probe, so they are excluded by that marking rather than by an assumption that nothing reaches them.
 
@@ -1688,12 +1688,12 @@ lists and none in neither.
   `plan.rs:2999`, `plan.rs:3177`, `plan.rs:3193` (`QueryTooBroad`) — **request parameters and
   resource guards, not a link payload.** They refuse the request before any chain exists.
 - `plan.rs:3236` — one `reject` closure returned from three conditions (`plan.rs:3244`,
-  `plan.rs:2870`, `plan.rs:2879`; those three are call sites, not constructions, so they are not
+  `plan.rs:3253`, `plan.rs:3262`; those three are call sites, not constructions, so they are not
   among the 25). It states the shape a `variants(…)` operand must have, and `Variants` is
   **out of scope, named** in the synthesised-link table above. Reachable, and checked:
   `variants(sum(topk(2, count_over_time({service_name="checkout"}[5m])))) of ({service_name="checkout"}[5m])`
   returns `variant 0 must be a range aggregation, optionally wrapped in one vector aggregation …`.
-- `plan.rs:2929`, `plan.rs:2934`, `plan.rs:2943` — the same three range-aggregation arity
+- `plan.rs:3312`, `plan.rs:3317`, `plan.rs:3326` — the same three range-aggregation arity
   rejections as the rows above, re-checked on the `variants(…)` path. Identical bodies, identical
   links, reached only through a construct that is not in the chain.
 - `plan.rs:3620` (`ContradictoryMatchers`) and `plan.rs:3650` (`EmptyMatcherSet`) — the
@@ -1773,14 +1773,14 @@ because the merge happens at range and not at instant.
   `break`s at `LineFormat | Decolorize | Unpack` (`plan.rs:3702`). The first is the
   `is_pushable_line_filter` precondition above. The second is not a special case here — it is
   `body`'s provenance turning `Computed`. The documented *exception* falls out too: a filter after a
-  **parser** still lowers, because *"parsers read but never rewrite the line"* (`plan.rs:3291`), so
+  **parser** still lowers, because *"parsers read but never rewrite the line"* (`plan.rs:3674`), so
   `body` stays `Stored`.
 - **`has_unpushed_dropping_stage` is `!exact` on a `Lines` shape.** That function
-  (`plan.rs:1673`) decides `fetch_until_limit` (`plan.rs:1646`), and it returns `true` for exactly
+  (`plan.rs:1676`) decides `fetch_until_limit` (`plan.rs:1646`), and it returns `true` for exactly
   the links this table clears `exact` on — a label filter, a line filter after a line rewrite, a
   non-pushable line filter — and `false` for parsers and `label_format`, which its own doc comment
   calls non-dropping because *"a parse failure keeps the line with an `__error__` label; fan-out
-  only regroups"* (`plan.rs:1666-1672`). The oversample is not a separate concept: it is what the
+  only regroups"* (`plan.rs:1669-1675`). The oversample is not a separate concept: it is what the
   `Limit` link does when `exact` is false.
 - **`metric_pipeline_construct`'s first refusal** (`plan.rs:1701`) is the index of the first
   `Pipe` link this table marks residual under the capability set that ships today, and its
@@ -4257,7 +4257,7 @@ and neither at base — and §11.5's "no compile-failure harness exists" was fal
    calling a transcription the shipped function — were each re-checked for a surviving assertion
    and none has one.
 3. **Two reachable LogQL rejections were missing, and the method that missed them is replaced.**
-   `plan.rs:1245` (a vector aggregation over a bare scalar literal) and `plan.rs:1410`
+   `plan.rs:1248` (a vector aggregation over a bare scalar literal) and `plan.rs:1413`
    (`label_replace` over a scalar operand) are both reachable today. §7.1's table is now derived
    from a literal scope — every `ReadError::` construction in `plan.rs` above `mod tests`, 25 sites
    — with each site either a row or an excluded site with its reason, and every body and every
@@ -4918,7 +4918,7 @@ line rewrites, parsers and `label_format` — every stage the 15-atom set does n
 **What these three gates will NOT establish once wave 1 has written them, because they share a
 helper — today they establish nothing, because they do not exist.** All three walks call
 `is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:3721`) — `plan.rs:3695`,
-`plan.rs:1686`, `plan.rs:1704` — and so does the model's `LineFilter::capability` (§7.1). The
+`plan.rs:1689`, `plan.rs:1707` — and so does the model's `LineFilter::capability` (§7.1). The
 sharing is deliberate and stays: that function's doc comment calls itself *"the single source of
 truth for 'does this line filter push down to SQL, or must it run in the client pipeline?' … so the
 two paths never drift"*, and a model that computed pushability itself would be the second producer
