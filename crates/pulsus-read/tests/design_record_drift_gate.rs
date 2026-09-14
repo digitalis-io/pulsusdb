@@ -1582,7 +1582,7 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below; the count of cases
 // is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 8] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 6] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1613,24 +1613,10 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the sentence describes the label ENCODER; the fallback answers          crates/pulsus-read/src/logql/labels.rs, which is not where it lives",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        1,
-        ReviewedVerdict::Ambiguous,
-        "this sentence describes both the writer and the flat reader; the fallback points at          the flat reader, so neither answer is wrong and the case is evidence for neither rule",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:363",
+        "labels.rs:318",
         0,
         ReviewedVerdict::FallbackRight,
-        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs",
+        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
     ),
     (
         "docs/query-lowering.md",
@@ -1663,15 +1649,15 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// one that was measured against itself.** It called `resolve_citation`
 /// the truth and counted how often the fallback differed from it, which
 /// measures disagreement between two rules rather than error in either.
-/// Read one at a time, two of the eight divergences are cases where the
+/// Read one at a time, two of the six divergences are cases where the
 /// **resolver** points at the wrong file.
 ///
 /// What this test asserts instead: the divergence set is exactly the
-/// eight reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
-/// cannot appear without a person reading it; and five of the eight are
+/// six reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
+/// cannot appear without a person reading it; and four of the six are
 /// citations where the fallback answers a file the citing prose does not
-/// describe. **Five wrong answers out of eight disagreements is why the
-/// fallback is not applied** — not a percentage, five cases anyone can
+/// describe. **Four wrong answers out of six disagreements is why the
+/// fallback is not applied** — not a percentage, four cases anyone can
 /// read.
 #[test]
 fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
@@ -1765,7 +1751,7 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     }
     assert_eq!(
         (wrong.len(), right, ambiguous),
-        (5, 2, 1),
+        (4, 2, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

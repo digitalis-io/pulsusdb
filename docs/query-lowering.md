@@ -1022,7 +1022,7 @@ question 5 asks the same question of LogQL, where today it costs a page loop, an
 compiler answers it, not this trait (owner decision, #507). The distinction it draws is the same.
 A filter over a structured-metadata key compiles to `JSONExtractString(structured_metadata, 'k') = 'v'`
 over a stored column our own encoder writes and our own flat reader reads
-(`crates/pulsus-read/src/logql/labels.rs:157-189`), with no guard and no ambiguity, so its SQL means
+(`crates/pulsus-read/src/canonical_labels.rs:93-125`), with no guard and no ambiguity, so its SQL means
 the filter and LogQL's compiler may put the request `LIMIT` in the statement. A filter over a
 **parser-produced** name carries guard terms that keep lines SQL cannot decide, so the loop stays.
 §7.1 records how the unwired LogQL model would carry the same property as `Fidelity`; that is
@@ -5439,42 +5439,42 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 624 |
-| of those, citing a bare basename | 493 |
+| citation occurrences in the five artefacts | 623 |
+| of those, citing a bare basename | 492 |
 | `(document, token)` pairs the rule resolves | 344 |
 | occurrences those resolved pairs cover | 515 |
-| `(document, token)` pairs it cannot resolve | 77 |
-| occurrences those frozen pairs cover | 109 |
-| resolved rows anchored on a token the citing prose prints | 179 |
-| resolved rows anchored on a snapshot of the cited line | 165 |
+| `(document, token)` pairs it cannot resolve | 76 |
+| occurrences those frozen pairs cover | 108 |
+| resolved rows anchored on a token the citing prose prints | 178 |
+| resolved rows anchored on a snapshot of the cited line | 166 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 70 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 69 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 | `occurrences_disagree` | 1 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
-| the fallback answers a file the citing prose does not describe | 5 |
+| the fallback answers a file the citing prose does not describe | 4 |
 | the fallback is right and the anchor rule points elsewhere | 2 |
-| the sentence describes both candidates, so neither answer is wrong | 1 |
+| the sentence describes both candidates, so neither answer is wrong | 0 |
 
 | anchor kind | what a row of that kind can show |
 |---|---|
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 624 citation occurrences the five artefacts make, 493 name a bare basename. The rule resolves 344 `(document, token)` pairs covering 515 occurrences, and cannot resolve 77 covering 109. Of the resolved rows, 179 are anchored on a token the citing prose prints and 165 on a snapshot of the cited line.
+Of the 623 citation occurrences the five artefacts make, 492 name a bare basename. The rule resolves 344 `(document, token)` pairs covering 515 occurrences, and cannot resolve 76 covering 108. Of the resolved rows, 178 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 8 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 6 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
 The citations pointing at an empty line are `crates/pulsus-read/src/traces/exec.rs:1968` (in `docs/query-lowering.md`), `search_plan.rs:1042` (in `docs/query-lowering.md`), `traces/exec.rs:114` (cited from 2 documents).
 
-The citations the rule answers differently for two occurrences of are `labels.rs:363` (in `docs/query-to-sql.md`).
+The citations the rule answers differently for two occurrences of are `labels.rs:318` (in `docs/query-to-sql.md`).
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2830-2836` in `docs/query-lowering.md`, `exec.rs:2869` in `docs/query-lowering.md`, `exec.rs:701` in `docs/query-lowering.md`, `labels.rs:157-189` in `docs/query-to-sql.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2830-2836` in `docs/query-lowering.md`, `exec.rs:2869` in `docs/query-lowering.md`, `exec.rs:701` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 
