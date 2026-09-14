@@ -468,6 +468,35 @@ mod tests {
         }
     }
 
+    /// This file discusses control characters, and twice it held one:
+    /// a BEL and a vertical tab sat in the diagram above
+    /// [`the_boundary_neighbours_of_the_two_added_escapes_round_trip`],
+    /// in the column that names each code point's escape. Both are
+    /// invisible in a diff and in a terminal, and the BEL rings the bell
+    /// when the file is printed; `cargo fmt` and `clippy` pass with them
+    /// present, and a code review is what found them.
+    ///
+    /// A control character in this file is always a mistake: every one it
+    /// needs is written as an escape, in source and in prose alike.
+    #[test]
+    fn this_modules_source_carries_no_raw_control_bytes() {
+        let src = include_str!("canonical_labels.rs");
+        let found: Vec<(usize, u32)> = src
+            .lines()
+            .enumerate()
+            .flat_map(|(i, line)| {
+                line.chars()
+                    .filter(|c| c.is_control())
+                    .map(move |c| (i + 1, c as u32))
+            })
+            .collect();
+        assert!(
+            found.is_empty(),
+            "raw control character(s) at (line, code point): {found:04X?} — write the escape \
+             instead; a control character in this file is invisible in a diff"
+        );
+    }
+
     #[test]
     fn parse_canonical_labels_reads_simple_pairs() {
         let pairs = parse_canonical_labels(r#"{"env":"prod","team":"checkout"}"#);
