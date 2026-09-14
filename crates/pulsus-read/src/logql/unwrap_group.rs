@@ -506,7 +506,13 @@ impl<'q> KeyRouteFold<'q> {
     }
 
     fn add(&mut self, mut labels: LabelSet, bucket_ns: i64, v: f64, n: u64) -> Result<(), FoldStop> {
-        if let Some(grouping) = &self.project {
+        // A row whose error slot is set keeps its ungrouped labels, as the
+        // range step keeps them (`RangeStepRules::parent_sum`); only a
+        // preserved error reaches here, and its series is today's route's.
+        let errored = labels
+            .iter()
+            .any(|(k, v)| k.as_str() == ERROR_LABEL && !v.is_empty());
+        if let Some(grouping) = self.project.as_ref().filter(|_| !errored) {
             match grouping {
                 None => labels.clear(),
                 Some(g) => match g.kind {
