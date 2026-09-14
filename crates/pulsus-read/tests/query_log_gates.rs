@@ -5649,22 +5649,35 @@ async fn the_key_route_falls_back_on_its_own_memory_error() {
 /// as a float (`200` becomes `0.200`), which the key statement cannot
 /// decide.
 async fn seed_realistic_corpus(admin: &ChClient, db: &str, start: i64, rows: u64, undecided: bool) {
+    seed_realistic_corpus_into(admin, db, "", start, rows, undecided).await;
+}
+
+/// [`seed_realistic_corpus`] into tables named with `suffix` (`_dist` on a
+/// cluster, where each insert waits for every shard).
+async fn seed_realistic_corpus_into(
+    admin: &ChClient,
+    db: &str,
+    suffix: &str,
+    start: i64,
+    rows: u64,
+    undecided: bool,
+) {
     let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({start})))");
     let status = if undecided { "0." } else { "" };
     for sql in [
         format!(
-            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+            "INSERT INTO {db}.log_streams{suffix} (month, fingerprint, service, labels, updated_ns) \
              SELECT {month}, 1000 + number, 'checkout', \
              concat('{{\"pod\":\"checkout-', toString(number), '\",\"service_name\":\"checkout\"}}'), 0 \
              FROM numbers(20)"
         ),
         format!(
-            "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+            "INSERT INTO {db}.log_streams_idx{suffix} (month, key, val, fingerprint) \
              SELECT {month}, k, v, 1000 + number FROM numbers(20) \
              ARRAY JOIN ['service_name', 'pod'] AS k, ['checkout', concat('checkout-', toString(number))] AS v"
         ),
         format!(
-            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body, structured_metadata) \
+            "INSERT INTO {db}.log_samples{suffix} (service, fingerprint, timestamp_ns, severity, body, structured_metadata) \
              SELECT 'checkout', 1000 + (number % 20), {start} + 1 + number * 1800000 AS ts, 0, \
              if(number % 10 = 9, \
                concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
@@ -5680,7 +5693,11 @@ async fn seed_realistic_corpus(admin: &ChClient, db: &str, start: i64, rows: u64
         ),
     ] {
         admin
-            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .execute(
+                &sql,
+                &QuerySettings::new().set("distributed_foreground_insert", 1),
+                Idempotency::Idempotent,
+            )
             .await
             .expect("seed the realistic corpus");
     }
@@ -5726,14 +5743,59 @@ fn matrix_bits(
 /// L folds each row under the grouping the range step uses (a parent `sum`
 /// by `status`), so 3 minutes of rows with a unique `request_id` each make
 /// six series, not one per row.
+///
+/// **On CI's two-shard leg** (`PULSUS_TEST_CH_CLUSTER` names the cluster) the
+/// same test runs against the `_dist` tables: the statements above are the
+/// initiator's, which run its own shard's part, and the other shard's own
+/// `system.query_log` holds exactly one part of L after its part of today's
+/// raw scan.
 #[tokio::test]
 async fn the_undecided_rows_come_from_one_read() {
     skip_unless_live!();
     const MIN: i64 = 60_000_000_000;
-    let (admin, _client, db) = group_key_db("gk_oneread").await;
+    let cluster = std::env::var("PULSUS_TEST_CH_CLUSTER").ok();
+    let suffix = if cluster.is_some() { "_dist" } else { "" };
+    let (admin, db) = match &cluster {
+        None => {
+            let (admin, _client, db) = group_key_db("gk_oneread").await;
+            (admin, db)
+        }
+        Some(name) => {
+            let admin = ChClient::new(test_config()).await.expect("connect admin");
+            let db = pulsus_testkit::test_db(&format!(
+                "pulsus_read_it_qlg_gk_oneread_{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            admin
+                .execute(
+                    &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{name}' SYNC"),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("drop");
+            let ctx = RenderCtx {
+                cluster: Some(name.clone()),
+                ..test_ctx(&db)
+            };
+            run_init(&admin, &ctx).await.expect("run_init (clustered)");
+            (admin, db)
+        }
+    };
     let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
     // Twelve minutes at the corpus's density; the queries read minutes 8–11.
-    seed_realistic_corpus(&admin, &db, start, 400_000, true).await;
+    seed_realistic_corpus_into(&admin, &db, suffix, start, 400_000, true).await;
+    let config = || {
+        let mut c = engine_config(&db, 50 * 1024 * 1024 * 1024);
+        if cluster.is_some() {
+            c.streams_idx = "log_streams_idx_dist".to_string();
+            c.streams = "log_streams_dist".to_string();
+            c.samples = "log_samples_dist".to_string();
+            c.rollup_table = "log_metrics_5s_dist".to_string();
+            c.distributed = true;
+        }
+        c
+    };
     let query = r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
     let expr = parse(query).expect("parse");
     // `points` grid points ending at minute 11: 3 points read 3 minutes.
@@ -5746,12 +5808,13 @@ async fn the_undecided_rows_come_from_one_read() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let lowered = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024))
-        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+    let lowered = LogQlEngine::new(data_client(&db).await, config()).with_key_route_test_hooks(
+        pulsus_read::logql::exec::KeyRouteTestHooks {
             todays_route_group_bytes: Some(1),
             key_statement_row_delay: None,
-        });
-    let plain = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024));
+        },
+    );
+    let plain = LogQlEngine::new(data_client(&db).await, config());
 
     // 3 minutes: the query answers from L.
     let from = server_micros(&admin).await;
@@ -5775,7 +5838,7 @@ async fn the_undecided_rows_come_from_one_read() {
         .query_stream::<TimedStatementRow>(
             &format!(
                 "SELECT query, exception_code FROM system.query_log WHERE has(databases, '{db}') \
-                 AND type != 'QueryStart' AND query NOT LIKE '%system.query_log%' \
+                 AND type != 'QueryStart' AND is_initial_query AND query NOT LIKE '%system.query_log%' \
                  AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
                  AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
                  ORDER BY query_start_time_microseconds ASC"
@@ -5801,6 +5864,23 @@ async fn the_undecided_rows_come_from_one_read() {
         grouped_after.is_empty(),
         "no GROUP BY statement after today's raw scan: {grouped_after:?}"
     );
+    if let Some(name) = &cluster {
+        // The initiator runs its own shard's part inside the statements
+        // above; the other shard logs its parts as its own queries.
+        let per_shard = group_key_shard_statements(&admin, name, &db, from, to).await;
+        assert_eq!(per_shard.len(), 1, "the other shard ran its parts: {per_shard:?}");
+        for (host, kinds) in &per_shard {
+            let raw_at = kinds
+                .iter()
+                .position(|k| *k == GroupKeyStatement::Raw)
+                .unwrap_or_else(|| panic!("{host}: its part of today's raw scan: {kinds:?}"));
+            assert_eq!(
+                kinds[raw_at + 1..].to_vec(),
+                vec![GroupKeyStatement::Lane],
+                "{host}: exactly one part of L after its part of today's raw scan: {kinds:?}"
+            );
+        }
+    }
 
     // 2 minutes: L's answer is today's route's, series by series.
     let from = server_micros(&admin).await;
@@ -5825,7 +5905,7 @@ async fn the_undecided_rows_come_from_one_read() {
                 "SELECT JSONExtractFloat(body, 'status') AS status, \
                  {start} + intDiv(timestamp_ns - {start} + {MIN} - 1, {MIN}) * {MIN} AS bucket, \
                  count() AS n, sum(abs(JSONExtractFloat(body, 'latency'))) AS sum_abs \
-                 FROM {db}.log_samples WHERE JSONHas(body, 'latency') \
+                 FROM {db}.log_samples{suffix} WHERE JSONHas(body, 'latency') \
                  AND timestamp_ns > {} AND timestamp_ns <= {} GROUP BY status, bucket",
                 start + 8 * MIN,
                 start + 11 * MIN
@@ -5871,7 +5951,80 @@ async fn the_undecided_rows_come_from_one_read() {
         ],
         "with it, L answers"
     );
-    drop_group_key_db(&admin, &db).await;
+    match &cluster {
+        None => drop_group_key_db(&admin, &db).await,
+        Some(name) => admin
+            .execute(
+                &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{name}' SYNC"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop the run database"),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ShardStatementRow {
+    host: String,
+    query: String,
+}
+
+/// Each shard's own parts of the group key read's statements over `db` in
+/// `[from, to)` initiator microseconds, per host, in the order they ran.
+async fn group_key_shard_statements(
+    admin: &ChClient,
+    cluster: &str,
+    db: &str,
+    from: u64,
+    to: u64,
+) -> std::collections::BTreeMap<String, Vec<GroupKeyStatement>> {
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                &format!("SYSTEM FLUSH LOGS ON CLUSTER '{cluster}'"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs on the cluster");
+        let sql = format!(
+            "SELECT hostName() AS host, query FROM clusterAllReplicas('{cluster}', system.query_log) \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' AND NOT is_initial_query \
+             AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+             AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+             ORDER BY host, query_start_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<ShardStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read each shard's system.query_log");
+        out.clear();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode");
+            // A shard's part is the initiator's statement rewritten over the
+            // local table, so the markers are what survives the rewrite: the
+            // key statement's throw, the per-row readers, or neither.
+            if !row.query.contains("`log_samples`") {
+                continue;
+            }
+            let kind = if row.query.contains("throwIf") {
+                GroupKeyStatement::Key
+            } else if row.query.contains("JSONExtractRaw") {
+                GroupKeyStatement::Lane
+            } else {
+                GroupKeyStatement::Raw
+            };
+            out.entry(row.host).or_insert_with(Vec::new).push(kind);
+        }
+        drop(stream);
+        if !out.is_empty() && out.values().all(|k| k.contains(&GroupKeyStatement::Lane)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
 }
 
 /// **Criterion 31: a timeout of the key statement is the timeout response**
