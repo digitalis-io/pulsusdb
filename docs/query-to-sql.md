@@ -115,10 +115,10 @@ are the request window bounds in nanoseconds, `<step>` is the request step in na
 
 ### 1.1 The statements a LogQL request produces
 
-Eleven builder functions produce every LogQL statement. All are in
-`crates/pulsus-read/src/logql/sql.rs`. Two of them, `metric_range_bucketed` and
-`metric_range_unwrapped`, are the range metric reads issue #507 lowered; until then this list was nine
-and every range metric query read raw lines.
+Twelve builder functions produce every LogQL statement. All are in
+`crates/pulsus-read/src/logql/sql.rs`. Three of them, `metric_range_bucketed`, `metric_range_unwrapped`
+and `metric_range_unwrapped_rows`, are the range metric reads issue #507 lowered; until then this list
+was nine and every range metric query read raw lines.
 
 | builder | line | what it reads | when it is used |
 |---|---|---|---|
@@ -131,7 +131,8 @@ and every range metric query read raw lines.
 | `metric_raw_samples` | `sql.rs:1184` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
 | `metric_raw_samples_sliding` | `sql.rs:1232` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
 | `metric_range_bucketed` | `sql.rs:1305` | `log_samples` | a range `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose range equals its step, with no stage beyond a line filter (issue #507 W2) |
-| `metric_range_unwrapped` | `sql.rs:1547` | `log_samples` | a range `sum_over_time` or `avg_over_time` over `\| json <n>="<n>" \| unwrap <n>`, whose range equals its step (issue #507 W4) |
+| `metric_range_unwrapped` | `sql.rs:1547` | `log_samples` | S1, the extracted-field group key statement: a range `sum_over_time` or `avg_over_time` over `\| json … \| unwrap <n>` in one of the chains below, whose range equals its step (issue #507) |
+| `metric_range_unwrapped_rows` | `sql.rs:1607` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
 | `probe` | `sql.rs:519` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
 The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:761` and `:810`;
@@ -363,7 +364,7 @@ client-aggregated path by `let client = if … || is_range` (`plan.rs:2319`), un
 that **is** one no longer takes that path in substance — it is served by a lowered statement — but it
 is routed by the `else if bucketed_range` arm (`plan.rs:2626`), which chooses `RouteChoice::Raw`
 unconditionally and sits **before** the rollup-eligibility test, and the statement it renders is
-`metric_range_bucketed`, not `metric_range`. The unwrapped shape's arm, `else if let Some(..) = &unwrapped_range` (`plan.rs:2232`), sits
+`metric_range_bucketed`, not `metric_range`. The extracted-field group key's arm, `else if let Some(value) = &unwrapped_range` (`plan.rs:2615`), sits
 before it and also chooses `RouteChoice::Raw` unconditionally. The function is kept and tested; no request reaches it.
 The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes` — `sum(count)` and
 `sum(bytes)`, `sql.rs:105`, `sql.rs:107` — unreachable text.
@@ -385,7 +386,7 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3721`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none, except in the unwrapped shape | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` whose chain is `\| json <n>="<n>" \| unwrap <n>`, the extraction becomes `trim(BOTH '"' FROM JSONExtractRaw(body, '<n>'))` inside `metric_range_unwrapped` (`sql.rs:1547`); the chain rule is `unwrapped_chain` (`plan.rs:1775`) |
+| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1547`) and `metric_range_unwrapped_rows` (`sql.rs:1607`); the chain rule is `unwrapped_key_route` (`plan.rs:1781`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1710` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1711` |
 | `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1709` |
@@ -399,8 +400,8 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `\| keep a` | none | *evaluated after the read*, `plan.rs:1717` |
 
 **Line filters compile to SQL on every route; two other stage kinds compile on one.** `\| json` and
-`\| unwrap` compile inside the unwrapped range read and nowhere else, and only in the exact chain §1.1
-gives. The other seven stage kinds are evaluated after the read on every LogQL route.
+`\| unwrap` compile inside the extracted-field group key reads and nowhere else, and only in the chains
+§1.1 gives. The other seven stage kinds are evaluated after the read on every LogQL route.
 
 ### 1.3 LogQL — the parts that are not stages
 
@@ -5139,8 +5140,8 @@ engine will read, and what it will return:
 
 **What is NOT bounded, because it is not a size**: the final digits of an unwrapped range
 aggregation. `sum_over_time` and `avg_over_time` are summed by
-the database **on the queries that lower** — a `json` extraction naming one label, an `unwrap` of that
-label with no conversion, and a range equal to the step — and the database chooses the summation
+the database **on the queries that lower** — the chains of §1.1's extracted-field group key, an
+`unwrap` with no conversion, and a range equal to the step — and the database chooses the summation
 order. Three things decide the result, and the second is the one a user meets:
 
 - **the accumulation order is the database's**, and it reorders *inside* a block of rows, so the order
@@ -5178,9 +5179,9 @@ converts to the same bits as `f64::from_str` or converts to NULL — an overflow
 smallest subnormal, or a text our parser rejects — and a NULL sends the query to the evaluator.
 
 **A query that does not lower is unaffected**, and that is most of them: anything with a conversion,
-an underscore in the name, a parser other than `json`, a bare `json`, a range that is not the step, one
-row whose structured metadata carries the unwrapped name, or one row whose value the two float parsers
-do not agree on. Those are evaluated here, in
+a parser other than `json`, a bare `json` with no outer `sum` and no `by`, a range that is not the
+step, one row whose structured metadata carries the unwrapped name, or one row the database does not
+decide, which includes a value the two float parsers do not agree on. Those are evaluated here, in
 one accumulation order, and answer the same bits every time. The other eight reducers are unaffected on
 every path: `count_over_time` and `bytes_over_time` sum integers, `min_over_time` and `max_over_time`
 are order-independent, `first_over_time` and `last_over_time` select rather than accumulate, and
