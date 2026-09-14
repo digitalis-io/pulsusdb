@@ -40,34 +40,70 @@ task-manager sends the verdict.**
   compile-site list gained the probe's site (last full run before that fix:
   2277 run, 1 failed, which that fix addresses).
 
-## In progress
+## Break campaign (done except the findings below)
 
-- The break campaign. Runner: `agent-work/coder507gk-notes/breaks/run.py`
-  with specs `breaks/hermetic.py` (55 hermetic breaks, run at `dcd5a4c8`)
-  and `breaks/live.py` (24 live breaks, written, not yet run). Each break
-  needs a clean tree; output per break in `breaks/out/<id>.txt`.
-- Hermetic result: 53 red, 2 green, both findings to fix before reporting:
-  - c12 green: `logqltest_corpus::eval_approx_is_admitted_only_where_the_aggregation_lowers`
-    lacks criterion 12's four cases (bare `sum(sum_over_time(… | json | unwrap c …))`
-    and bare `avg_over_time(…) by (x)` admitted; bare `without (x)` and a
-    filter after the unwrap refused). Add them, then re-run c12.
-  - bk13b green: the range state's failed-conversion zero is not covered by
-    `client_agg::tests::a_preserved_error_passes_the_check_and_a_failed_conversion_counts_zero`
-    (only the instant state is). Extend the test to the range state, then
-    re-run bk13b.
+Runner `agent-work/coder507gk-notes/breaks/run.py`; specs `breaks/hermetic.py`
+(55) and `breaks/live.py` (24); one output file per break in
+`breaks/out/<id>.txt` (head, command, exit, full output). Each break is
+applied alone to a clean tree and restored with `git checkout -- <file>`.
 
-## Next
+- Hermetic, run at `dcd5a4c8`: 53 red. The 2 that stayed green were fixed at
+  `1c314e2f` and re-run red: c12 (criterion 12's four cases added to
+  `logqltest_corpus::eval_approx_is_admitted_only_where_the_aggregation_lowers`)
+  and bk13b (the range state added to
+  `client_agg::tests::a_preserved_error_passes_the_check_and_a_failed_conversion_counts_zero`).
+- Live, run at `1c314e2f` against the local 26.3 server and the two-shard
+  cluster: 23 red, 1 green.
+  - **L31 green, a finding:** mapping server code 159 in S1 to today's route
+    leaves `query_log_gates::the_key_statement_timeout_is_the_timeout_response`
+    green, because the client's stream deadline arrives before the server's
+    159 in that test. The client-deadline variant (L31t) is red. Next step
+    for this: make the test also reach a server 159 (a `max_execution_time`
+    below the client deadline for S1), so both arms are exercised, then
+    re-run L31.
+- Control at `1c314e2f` before the live breaks: `query_log_gates` +
+  `explain_indexes` 74 run, 74 passed; `logs_detected_live` 7 run, 7 passed;
+  the two-shard `the_undecided_rows_come_from_one_read` 1 run, 1 passed.
 
-1. Live breaks: K1, q12 (crit 3); rules off, depth, key budget (crit 4);
-   window (8); 241 and ceiling (9); fingerprint IN (10); SETTINGS (11);
-   L as two statements, single node and two shards (19); detected fields
-   (21); key budget (22); staging cap and retained points in L (23); the
-   four rn1/rn2 breaks (29, 42); 159 (31); K2, K3 (44).
-2. Measurements: criterion 16 (per-line cost, release, interleaved with a
-   build of `874b5619`), 17 (live cost), 28 (K ladder to 16,000).
-3. Full gauntlet (nextest workspace + doc tests, clippy, fmt, live suites).
-4. Stop and report to the task-manager with deviations (D1–D6, see the
-   report draft), then wait for the option A verdict.
+## Measurements (set up, not run)
+
+- Two detached measurement worktrees, uncommitted harness files inside:
+  `agent-work/coder507gk-main-wt` (at `874b5619`) and
+  `agent-work/coder507gk-head-wt` (at `1c314e2f`). Each has
+  `crates/pulsus-read/tests/zz_arch507gk8_parser_cost.rs` (the plan's
+  per-line cost harness) and the plan's `zz_arch507gk_perf` appended to
+  `crates/pulsus-read/tests/query_log_gates.rs` (the head copy also labels
+  key and lane statements). Remove both worktrees after measuring
+  (`git worktree remove --force`).
+- Inputs regenerated from the plan's generators in
+  `agent-work/coder507gk-notes/cost/`: `logfmt_ordinary_lines.tsv` (SHA-256
+  prefix `a592611b02bc1110`), `unpack_ordinary_lines.hex`
+  (`f9dd6b1c39e90d46`); both equal the reviewer's.
+- Scripts: `cost/parser_cost.sh` (criteria 16, 28) and `cost/perf.sh`
+  (criterion 17), queries in `cost/perf_queries*.txt`. Not yet done: build
+  the release/test binaries into `cost/bins/` (`cost_main`, `cost_head`,
+  `qlg_main`, `qlg_head`), load the realistic corpus into
+  `c507gk2_perfsrc.ls_real` and `ls_realu` (the plan's SQL, revision 5
+  appendix 1), write `cost/base_ns.txt`, then run both scripts.
+
+## Containers
+
+Stopped (not removed) at the pause: `coder507gk-ch` (HTTP 58123, holds the
+`c507gk_*` and `c507gk2_*` test databases), `coder507gk-keeper`,
+`coder507gk-shard1` (58221), `coder507gk-shard2` (58222), and the reference
+containers `coder507gk-ref`, `coder507gk-ref463`. Start them again with
+`podman start <name>` (keeper before the shards). At the end: drop the
+`c507gk_*`/`c507gk2_*` databases, remove all six containers and the
+`coder507gk-net` network.
+
+## Exact next step
+
+1. `podman start coder507gk-ch coder507gk-keeper coder507gk-shard1 coder507gk-shard2`.
+2. Fix the L31 finding (above), commit, re-run `python3 run.py live.py L31 L31t`.
+3. Run the measurements (criteria 16, 17, 28) and keep their output.
+4. Full gauntlet: `cargo nextest run --workspace`, `cargo test --workspace --doc`,
+   clippy with `-D warnings`, `cargo fmt --all -- --check`, the live suites.
+5. Stop and report to the task-manager (option A waits for the verdict).
 
 ## Deviations to report
 
@@ -85,3 +121,9 @@ task-manager sends the verdict.**
   requirement"; the replacement text does not use those words).
 - The "unwrapped fold removes nothing" break (crit 20) has no target: the
   shipped unwrapped fold is replaced by the key route's fold.
+- Criterion 23's two cap breaks are emulations: R1's 600 KB undecided line
+  was removed in revision 8, so "today's staging cap in L" is applied to the
+  key route's fold instead (L23a), and "retained window points on the
+  partials" counts folded samples (L23b). Both red.
+- Criterion 12's refused "filter after the unwrap" case is written under an
+  outer `sum` so that the filter is the only reason it is refused.

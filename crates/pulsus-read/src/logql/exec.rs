@@ -333,14 +333,15 @@ pub struct LogQlEngine {
 /// Test-only settings for the extracted-field group key read (issue #507).
 /// The default changes nothing; production never sets them.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct KeyRouteTestHooks {
     /// Today's route's retained-label ceiling, lowered so a live test can make
     /// today's route refuse first and reach the one read, L.
     pub todays_route_group_bytes: Option<u64>,
-    /// A per-row delay in the key statement, S1, so a live test can make it
-    /// outlast the request's deadline.
-    pub key_statement_row_delay: Option<super::sql::RowDelay>,
+    /// The key statement's test-only knobs: a per-row delay, so a live test
+    /// can make S1 outlast a deadline, and the server-side time limit that
+    /// decides which deadline stops it.
+    pub key_statement_test_knobs: Option<super::sql::KeyStatementTestKnobs>,
 }
 
 impl LogQlEngine {
@@ -1798,7 +1799,7 @@ impl LogQlEngine {
             scan,
             &mp.extra_predicates,
             super::sql::UndecidedRows::Throw,
-            self.key_route_test.key_statement_row_delay,
+            self.key_route_test.key_statement_test_knobs,
         ) {
             Ok(sql) => sql,
             Err(_) => return KeyRouteOutcome::TodaysRoute("the key statement cannot be rendered"),

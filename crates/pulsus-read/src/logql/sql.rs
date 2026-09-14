@@ -1341,12 +1341,22 @@ pub fn metric_range_bucketed(
     Ok(sql)
 }
 
-/// A test-only per-row delay rendered into a group key statement's inner
-/// `WHERE` (issue #507): `sleepEachRow` for that many microseconds, so a
-/// live test can make the key statement outlast the request's deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowDelay {
-    pub micros: u32,
+/// Test-only knobs rendered into a group key statement (issue #507), so a
+/// live test can make the statement outlast a deadline and can choose WHICH
+/// deadline stops it.
+///
+/// - `row_delay_micros` renders `sleepEachRow` into the inner `WHERE`, which
+///   is what makes the statement slow.
+/// - `max_execution_s`, when set, renders that `max_execution_time` into the
+///   statement's own `SETTINGS`. A statement's own `SETTINGS` clause wins
+///   over the settings the client sends beside the request
+///   (`QuerySettings::apply_to_query`), so this puts the SERVER's limit
+///   below the client's stream deadline and the server's code 159 is what
+///   the reader sees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyStatementTestKnobs {
+    pub row_delay_micros: u32,
+    pub max_execution_s: Option<f64>,
 }
 
 /// The per-row reader columns of a group key statement (issue #507), in the
@@ -1496,7 +1506,7 @@ fn unwrapped_inner_level(
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
-    delay: Option<RowDelay>,
+    knobs: Option<KeyStatementTestKnobs>,
 ) -> String {
     let cols: Vec<String> = stored
         .iter()
@@ -1519,10 +1529,10 @@ fn unwrapped_inner_level(
         sql.push_str(" AND ");
         sql.push_str(clause.as_sql());
     }
-    if let Some(d) = delay {
+    if let Some(k) = knobs.filter(|k| k.row_delay_micros > 0) {
         sql.push_str(&format!(
             " AND sleepEachRow({}) = 0",
-            f64::from(d.micros) / 1_000_000.0
+            f64::from(k.row_delay_micros) / 1_000_000.0
         ));
     }
     sql
@@ -1553,7 +1563,7 @@ pub fn metric_range_unwrapped(
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
     undecided: UndecidedRows,
-    delay: Option<RowDelay>,
+    knobs: Option<KeyStatementTestKnobs>,
 ) -> Result<String, KeyStatementRefusal> {
     let BucketedScan {
         window,
@@ -1579,7 +1589,7 @@ pub fn metric_range_unwrapped(
         window,
         lower,
         extra_predicates,
-        delay,
+        knobs,
     );
     let mut sql = format!(
         "SELECT {} AS class, {} AS bucket_ns, {}, sumIf(ifNull(uw_x, 0), decided = 1) AS v, \
@@ -1594,6 +1604,9 @@ pub fn metric_range_unwrapped(
     }
     sql.push_str("\nGROUP BY class, bucket_ns, keys, sm_text, sm_kept\nSETTINGS ");
     sql.push_str(UNWRAP_PARSER_SETTING);
+    if let Some(limit) = knobs.and_then(|k| k.max_execution_s) {
+        sql.push_str(&format!(", max_execution_time = {limit}"));
+    }
     Ok(sql)
 }
 

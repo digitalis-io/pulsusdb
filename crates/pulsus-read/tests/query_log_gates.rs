@@ -5264,7 +5264,7 @@ async fn the_lane_answers_reserved_name_rows_under_the_rules() {
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
         .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
             todays_route_group_bytes: Some(1),
-            key_statement_row_delay: None,
+            key_statement_test_knobs: None,
         });
     let params = QueryParams {
         spec: QuerySpec::Range {
@@ -5878,7 +5878,7 @@ async fn the_undecided_rows_come_from_one_read() {
     let lowered = LogQlEngine::new(data_client(&db).await, config()).with_key_route_test_hooks(
         pulsus_read::logql::exec::KeyRouteTestHooks {
             todays_route_group_bytes: Some(1),
-            key_statement_row_delay: None,
+            key_statement_test_knobs: None,
         },
     );
     let plain = LogQlEngine::new(data_client(&db).await, config());
@@ -6119,12 +6119,21 @@ async fn group_key_shard_statements(
 /// The realistic corpus; `avg_over_time({service_name="checkout"} | json |
 /// path != "" | unwrap latency [1m]) by (service, method, status, level,
 /// msg)` over two minutes, with S1 slowed by a per-row delay past a
-/// one-second query timeout:
+/// deadline:
 ///
 /// ```text
 /// S1 ── the timeout ── the timeout response (ChError::Timeout, the logs API's 504)
 ///                      today's route does not run
 /// ```
+///
+/// **Both deadlines are exercised, because either can arrive first and they
+/// are two code paths.** A run with the server's own `max_execution_time`
+/// below the client's stream deadline ends in the server's code 159, which
+/// `key_statement_refusal` maps to the timeout response; a run with the
+/// client's deadline below the server's ends in `ChError::Timeout` from the
+/// stream itself. With only the second, mapping 159 to today's route stays
+/// green — measured: that break left this test passing until the first run
+/// was added.
 #[tokio::test]
 async fn the_key_statement_timeout_is_the_timeout_response() {
     skip_unless_live!();
@@ -6150,32 +6159,50 @@ async fn the_key_statement_timeout_is_the_timeout_response() {
         ),
         _ => panic!("a metric plan"),
     }
-    let mut cfg = test_config();
-    cfg.database = db.clone();
-    cfg.query_timeout = Duration::from_secs(1);
-    let slow = LogQlEngine::new(
-        ChClient::new(cfg).await.expect("connect"),
-        engine_config(&db, 50 * 1024 * 1024 * 1024),
-    )
-    .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
-        todays_route_group_bytes: None,
-        key_statement_row_delay: Some(sql::RowDelay { micros: 40 }),
-    });
-    let from = server_micros(&admin).await;
-    let res = slow.query(&expr, &params).await;
-    // S1 may still be running on the server after the client's deadline;
-    // its row is logged when the server stops it.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let to = server_micros(&admin).await + 1;
-    match &res {
-        Err(ReadError::Clickhouse(pulsus_clickhouse::ChError::Timeout(_))) => {}
-        other => panic!("the key statement's timeout must be the timeout response, got {other:?}"),
+    // (what, the client's stream deadline, the server's own limit on S1)
+    for (what, client_timeout, server_limit_s) in [
+        ("the server's own limit", Duration::from_secs(20), Some(0.3)),
+        ("the client's stream deadline", Duration::from_secs(1), None),
+    ] {
+        let mut cfg = test_config();
+        cfg.database = db.clone();
+        cfg.query_timeout = client_timeout;
+        let slow = LogQlEngine::new(
+            ChClient::new(cfg).await.expect("connect"),
+            engine_config(&db, 50 * 1024 * 1024 * 1024),
+        )
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: None,
+            key_statement_test_knobs: Some(sql::KeyStatementTestKnobs {
+                row_delay_micros: 40,
+                max_execution_s: server_limit_s,
+            }),
+        });
+        let from = server_micros(&admin).await;
+        let res = slow.query(&expr, &params).await;
+        // S1 may still be running on the server after the client's deadline;
+        // its row is logged when the server stops it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let to = server_micros(&admin).await + 1;
+        match &res {
+            Err(ReadError::Clickhouse(pulsus_clickhouse::ChError::Timeout(_))) => {}
+            other => panic!(
+                "{what}: the key statement's timeout must be the timeout response, got {other:?}"
+            ),
+        }
+        let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
+        assert!(
+            matches!(statements.as_slice(), [(GroupKeyStatement::Key, code)] if *code != 0),
+            "{what}: S1 ended with its timeout and no raw scan followed it: {statements:?}"
+        );
+        if server_limit_s.is_some() {
+            assert!(
+                matches!(statements.as_slice(), [(GroupKeyStatement::Key, 159)]),
+                "the server's limit ends S1 with code 159, the code the reader maps: \
+                 {statements:?}"
+            );
+        }
     }
-    let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
-    assert!(
-        matches!(statements.as_slice(), [(GroupKeyStatement::Key, code)] if *code != 0),
-        "S1 ended with its timeout and no raw scan followed it: {statements:?}"
-    );
     drop_group_key_db(&admin, &db).await;
 }
 
