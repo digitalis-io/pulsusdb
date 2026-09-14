@@ -595,6 +595,96 @@ fn merged_value(reducer: UnwrapReducer, p: Partial) -> f64 {
 }
 
 
+/// Test-only access to the key route's resolution and fold (issue #507),
+/// for the live agreement measurement: it folds rows the one read returned
+/// exactly as the reader does, one row at a time. Production never uses it.
+#[doc(hidden)]
+pub mod probe {
+    use std::collections::HashMap;
+
+    use super::{FoldStop, KeyRouteFold, ResolvedGroupKey, resolve};
+    use crate::logql::charge::AggCaps;
+    use crate::logql::error::ReadError;
+    use crate::logql::pipeline::CompiledPipeline;
+    use crate::logql::plan::{MetricPlan, VectorAggSpec};
+    use crate::logql::rows::{StreamMetaRow, UnwrappedLaneRow};
+    use crate::logql::sql::{GroupKeyColumns, MetricValue, UnwrappedValue};
+
+    /// A plan's group key read, resolved over a stream set.
+    pub struct GroupKeyProbe {
+        value: UnwrappedValue,
+        compiled: CompiledPipeline,
+        resolved: ResolvedGroupKey,
+        vector_aggs: Vec<VectorAggSpec>,
+        grid_start_ns: i64,
+        end_ns: i64,
+    }
+
+    /// What folding one or more rows gives.
+    #[derive(Debug)]
+    pub enum ProbeOutcome {
+        /// The answer's series: sorted labels, ascending points.
+        Answer(Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>),
+        /// The fold sends the query to today's route.
+        TodaysRoute(&'static str),
+        /// A refusal that is the query's answer.
+        Refusal(ReadError),
+    }
+
+    impl GroupKeyProbe {
+        /// `None` when the plan is not the group key read.
+        pub fn new(mp: &MetricPlan, meta: &HashMap<u64, StreamMetaRow>) -> Option<Self> {
+            let MetricValue::Unwrapped(u) = &mp.value else {
+                return None;
+            };
+            let compiled = CompiledPipeline::compile(&u.stages).ok()?;
+            Some(GroupKeyProbe {
+                resolved: resolve(u, meta),
+                value: (**u).clone(),
+                compiled,
+                vector_aggs: mp.vector_aggs.clone(),
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+            })
+        }
+
+        /// The key columns and classes the statements are rendered with.
+        pub fn columns(&self) -> &GroupKeyColumns {
+            &self.resolved.columns
+        }
+
+        /// The fingerprints the statements read, ascending.
+        pub fn fingerprints(&self) -> &[u64] {
+            &self.resolved.fingerprints
+        }
+
+        /// Folds `rows` of the one read, in order, as the reader does.
+        pub fn fold_lane_rows(&self, rows: &[UnwrappedLaneRow]) -> ProbeOutcome {
+            let mut fold = KeyRouteFold::new(
+                &self.value,
+                &self.compiled,
+                &self.resolved,
+                &self.vector_aggs,
+                self.grid_start_ns,
+                self.end_ns,
+                AggCaps::DEFAULT,
+            );
+            for row in rows {
+                match fold.push_lane_row(row) {
+                    Ok(()) => {}
+                    Err(FoldStop::TodaysRoute(why)) => return ProbeOutcome::TodaysRoute(why),
+                    Err(FoldStop::Refusal(e)) => return ProbeOutcome::Refusal(e),
+                }
+            }
+            match fold.finish() {
+                Ok(series) => ProbeOutcome::Answer(series),
+                Err(FoldStop::TodaysRoute(why)) => ProbeOutcome::TodaysRoute(why),
+                Err(FoldStop::Refusal(e)) => ProbeOutcome::Refusal(e),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

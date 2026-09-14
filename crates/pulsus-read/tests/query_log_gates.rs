@@ -6347,3 +6347,358 @@ async fn the_reduced_input_answers_as_the_full_input() {
     assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
     drop_group_key_db(&admin, &db).await;
 }
+
+/// `quad(p, m)` of the key-budget corpus: `lead`, one key of `p` `a`s, and
+/// an object of `m` members under it.
+fn quadratic_body(p: usize, m: usize, lead: &str) -> String {
+    let members: Vec<String> = (0..m).map(|i| format!("\"k{i:05}\":0")).collect();
+    format!("{lead}\"{}\":{{{}}}}}", "a".repeat(p), members.join(","))
+}
+
+/// **Criterion 4: the group key read agrees with our parser on every fixed
+/// body** (issue #507, §6).
+///
+/// Each body is its own stream. For every corpus, stream-label or metadata
+/// variant, and form, the one read (L, the key statement's per-row columns)
+/// returns the database's verdict per body, and the reader's fold answers
+/// each returned row. The body's own answer is the fold of the same body as
+/// an undecided row: our parser over the line, under the query's rules.
+///
+/// ```text
+/// decided   the fold of L's row answers what the body answers (labels, value bits after + 0.0),
+///           or sends the query to today's route
+/// missing   no L row; the body contributes nothing
+/// undecided our parser reads the body: nothing to compare
+/// ```
+///
+/// Corpora: H1–H5 and G (1,026 bodies), H5B less its two flat bodies (6,
+/// generated here), and H6 (26 bodies, each about a reserved name). Variants:
+/// none; a stream label or one metadata entry of `__error__="s"`,
+/// `__preserve_error__="true"`, `__variant__="v"`, `__error_details__="d"`
+/// (H1–H5 + G and H6). Twenty form-rule cells each. The decided / missing /
+/// undecided counts of H1–H5 + G and of H5B are the design's.
+#[tokio::test]
+async fn the_group_key_read_agrees_on_every_fixed_body() {
+    skip_unless_live!();
+    use pulsus_read::logql::group_key_probe::{GroupKeyProbe, ProbeOutcome};
+    use pulsus_read::logql::rows::{StreamMetaRow, UnwrappedLaneRow};
+    const MIN: i64 = 60_000_000_000;
+    let (admin, client, db) = group_key_db("gk_agree").await;
+    let t = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+
+    let mut corpora: std::collections::BTreeMap<&str, Vec<(String, String)>> = Default::default();
+    for line in std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/group_key/agreement_bodies.tsv"),
+    )
+    .expect("read the bodies")
+    .lines()
+    .filter(|l| !l.starts_with('#'))
+    {
+        let f: Vec<&str> = line.split('\t').collect();
+        let corpus = if f[0] == "NAMED6" { "NAMED6" } else { "H6" };
+        corpora
+            .entry(corpus)
+            .or_default()
+            .push((f[1].to_string(), unhex_utf8(f[2])));
+    }
+    corpora.insert(
+        "H5B6",
+        vec![
+            ("H5B-budget-quadratic-32761-2979".into(), quadratic_body(32_761, 2_979, "{\"latency\":5,")),
+            ("H5B-budget-quadratic-no-latency-32761-2979".into(), quadratic_body(32_761, 2_979, "{")),
+            ("H5B-budget-parser-accepts-32761-1022".into(), quadratic_body(32_761, 1_022, "{\"latency\":5,")),
+            ("H5B-budget-parser-refuses-32761-1023".into(), quadratic_body(32_761, 1_023, "{\"latency\":5,")),
+            ("H5B-budget-bound-within-20-1231".into(), quadratic_body(20, 1_231, "{\"latency\":5,")),
+            ("H5B-budget-bound-over-20-1232".into(), quadratic_body(20, 1_232, "{\"latency\":5,")),
+        ],
+    );
+    assert_eq!(
+        corpora.iter().map(|(k, v)| (*k, v.len())).collect::<Vec<_>>(),
+        vec![("H5B6", 6), ("H6", 26), ("NAMED6", 1026)]
+    );
+
+    // (group, corpus, extra stream label, extra metadata)
+    let kvs = [
+        ("__error__", "s"),
+        ("__preserve_error__", "true"),
+        ("__variant__", "v"),
+        ("__error_details__", "d"),
+    ];
+    let mut groups: Vec<(String, &str, Option<(&str, &str)>, Option<(&str, &str)>)> = Vec::new();
+    for corpus in ["NAMED6", "H5B6", "H6"] {
+        groups.push((format!("ag_{corpus}_none"), corpus, None, None));
+        if corpus != "H5B6" {
+            for (i, kv) in kvs.iter().enumerate() {
+                groups.push((format!("ag_{corpus}_s{i}"), corpus, Some(*kv), None));
+                groups.push((format!("ag_{corpus}_m{i}"), corpus, None, Some(*kv)));
+            }
+        }
+    }
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let mut fp = 900_000u64;
+    let mut group_meta: Vec<std::collections::HashMap<u64, StreamMetaRow>> = Vec::new();
+    let mut group_bodies: Vec<std::collections::HashMap<u64, (String, String, String)>> = Vec::new();
+    for (name, corpus, stream, sm) in &groups {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("service_name".to_string(), name.clone());
+        if let Some((k, v)) = stream {
+            labels.insert(k.to_string(), v.to_string());
+        }
+        let labels_json = serde_json::to_string(&labels).expect("json");
+        let sm_text = sm
+            .map(|(k, v)| format!("{{\"{k}\":\"{v}\"}}"))
+            .unwrap_or_default();
+        let mut meta = std::collections::HashMap::new();
+        let mut bodies = std::collections::HashMap::new();
+        let mut streams = Vec::new();
+        let mut idx = Vec::new();
+        let mut rows = Vec::new();
+        for (case, body) in &corpora[corpus] {
+            fp += 1;
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: name.clone(),
+                    labels: labels_json.clone(),
+                },
+            );
+            bodies.insert(fp, (case.clone(), body.clone(), sm_text.clone()));
+            streams.push(format!("({month}, {fp}, '{name}', {}, 0)", literal(&labels_json).as_sql()));
+            idx.push(format!("({month}, 'service_name', '{name}', {fp})"));
+            rows.push(BucketedSeedRow {
+                service: name.clone(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000,
+                severity: 0,
+                body: body.clone(),
+                structured_metadata: sm_text.clone(),
+            });
+        }
+        for chunk in streams.chunks(2000) {
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES {}",
+                        chunk.join(", ")
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("streams");
+        }
+        for chunk in idx.chunks(2000) {
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES {}",
+                        chunk.join(", ")
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("idx");
+        }
+        client.insert_block("log_samples", &rows).await.expect("rows");
+        group_meta.push(meta);
+        group_bodies.push(bodies);
+    }
+
+    // The twenty form-rule cells, as the queries the planner derives their
+    // rules from.
+    let targeted = r#"json c="code", lat="latency", m="missing""#;
+    let cells: [(&str, String); 20] = [
+        ("B", "sum(sum_over_time(SEL | json | unwrap latency [1m]))".into()),
+        ("BK", "sum by (a, a_b, code) (sum_over_time(SEL | json | unwrap latency [1m]))".into()),
+        ("BU", "sum by (_) (sum_over_time(SEL | json | unwrap latency [1m]))".into()),
+        ("BF", r#"sum(sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#.into()),
+        ("BN", "sum(sum_over_time(SEL | json | code > 100 | unwrap latency [1m]))".into()),
+        ("T plain", r#"sum_over_time(SEL | json latency="latency" | unwrap latency [1m])"#.into()),
+        ("T parent", r#"sum(sum_over_time(SEL | json latency="latency" | unwrap latency [1m]))"#.into()),
+        ("R plain", r#"sum_over_time(SEL | json lat="latency" | unwrap lat [1m])"#.into()),
+        ("R parent", r#"sum(sum_over_time(SEL | json lat="latency" | unwrap lat [1m]))"#.into()),
+        ("M plain", format!("sum_over_time(SEL | {targeted} | unwrap lat [1m])")),
+        ("M parent", format!("sum(sum_over_time(SEL | {targeted} | unwrap lat [1m]))")),
+        ("P plain", r#"sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m])"#.into()),
+        ("P parent", r#"sum(sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m]))"#.into()),
+        ("GBY1", "avg_over_time(SEL | json | unwrap latency [1m]) by (a)".into()),
+        ("GBY2", "avg_over_time(SEL | json | unwrap latency [1m]) by (a_b, code)".into()),
+        ("GBYS", "avg_over_time(SEL | json | unwrap latency [1m]) by (service_name)".into()),
+        ("GBYE", "avg_over_time(SEL | json | unwrap latency [1m]) by ()".into()),
+        ("GBU", "avg_over_time(SEL | json | unwrap latency [1m]) by (_)".into()),
+        ("GTBY", format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) by (c)")),
+        ("GTWO", format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) without (m)")),
+    ];
+    // The design's decided / missing / undecided counts (§6.2; H5B from
+    // revision 8, less its two flat bodies).
+    let design_counts = |corpus: &str, form: &str| -> Option<(u64, u64, u64)> {
+        let form = form.split(' ').next().unwrap_or(form);
+        let named = [
+            ("B", (819, 6, 201)), ("BK", (594, 6, 426)), ("BU", (0, 6, 1020)), ("BF", (738, 6, 282)),
+            ("BN", (788, 6, 232)), ("T", (909, 12, 105)), ("R", (909, 12, 105)), ("M", (879, 12, 135)),
+            ("P", (9, 943, 74)), ("GBY1", (738, 6, 282)), ("GBY2", (654, 6, 366)), ("GBYS", (819, 6, 201)),
+            ("GBYE", (819, 6, 201)), ("GBU", (0, 6, 1020)), ("GTBY", (879, 12, 135)), ("GTWO", (879, 12, 135)),
+        ];
+        let h5b = [
+            ("B", (1, 0, 5)), ("BK", (1, 0, 5)), ("BU", (0, 0, 6)), ("BF", (1, 0, 5)), ("BN", (1, 0, 5)),
+            ("T", (5, 1, 0)), ("R", (5, 1, 0)), ("M", (5, 1, 0)), ("P", (0, 6, 0)), ("GBY1", (1, 0, 5)),
+            ("GBY2", (1, 0, 5)), ("GBYS", (1, 0, 5)), ("GBYE", (1, 0, 5)), ("GBU", (0, 0, 6)),
+            ("GTBY", (5, 1, 0)), ("GTWO", (5, 1, 0)),
+        ];
+        let table: &[(&str, (u64, u64, u64))] = match corpus {
+            "NAMED6" => &named,
+            "H5B6" => &h5b,
+            _ => return None,
+        };
+        table.iter().find(|(f, _)| *f == form).map(|(_, c)| *c)
+    };
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let canon = |o: ProbeOutcome| -> Result<Vec<(Vec<(String, String)>, Vec<u64>)>, String> {
+        match o {
+            ProbeOutcome::Answer(series) => Ok(series
+                .into_iter()
+                .map(|(mut l, p)| {
+                    l.sort();
+                    (l, p.into_iter().map(|(_, v)| (v + 0.0).to_bits()).collect())
+                })
+                .collect()),
+            ProbeOutcome::TodaysRoute(why) => Err(format!("today's route: {why}")),
+            ProbeOutcome::Refusal(e) => Err(format!("refusal: {e}")),
+        }
+    };
+    let mut comparisons = 0u64;
+    let mut wrong = Vec::new();
+    let mut h6_erroring: std::collections::BTreeMap<String, u64> = Default::default();
+    for (gi, (name, corpus, _, _)) in groups.iter().enumerate() {
+        for (form, q) in &cells {
+            let query = q.replace("SEL", &format!("{{service_name={name:?}}}"));
+            let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db)).expect("plan") {
+                Plan::Metric(mp) => mp,
+                _ => panic!("{query}: a metric plan"),
+            };
+            let probe = GroupKeyProbe::new(&mp, &group_meta[gi])
+                .unwrap_or_else(|| panic!("{query}: the group key read"));
+            let sql::MetricValue::Unwrapped(u) = &mp.value else {
+                unreachable!("the probe exists")
+            };
+            let lane = sql::metric_range_unwrapped_rows(
+                "log_samples",
+                u,
+                probe.columns(),
+                &[literal(name)],
+                probe.fingerprints(),
+                sql::BucketedScan {
+                    window: TimeWindow {
+                        start_ns: mp.start_ns,
+                        end_ns: mp.end_ns,
+                    },
+                    lower: mp.scan_lower,
+                    lo_ns: mp.grid_start_ns - MIN,
+                    step_ns: MIN,
+                },
+                &mp.extra_predicates,
+            )
+            .expect("render L");
+            let mut stream = client
+                .query_stream::<UnwrappedLaneRow>(&lane.replace('?', "??"), &QuerySettings::new())
+                .await
+                .unwrap_or_else(|e| panic!("{query}: L: {e}"));
+            let mut returned = std::collections::HashMap::new();
+            while let Some(row) = stream.next().await {
+                let row = row.unwrap_or_else(|e| panic!("{query}: L row: {e}"));
+                returned.insert(row.fingerprint, row);
+            }
+            drop(stream);
+            let (mut decided, mut missing, mut undecided) = (0u64, 0u64, 0u64);
+            for (fp, (case, body, sm)) in &group_bodies[gi] {
+                comparisons += 1;
+                let as_body = UnwrappedLaneRow {
+                    class: 0,
+                    bucket_ns: t,
+                    decided: 0,
+                    keys: probe.columns().keys.iter().map(|_| (0, String::new())).collect(),
+                    v: 0.0,
+                    body: body.clone(),
+                    fingerprint: *fp,
+                    sm_text: sm.clone(),
+                    sm_kept: Vec::new(),
+                };
+                let body_answer = canon(probe.fold_lane_rows(std::slice::from_ref(&as_body)));
+                match returned.get(fp) {
+                    None => {
+                        missing += 1;
+                        if *corpus == "H6" && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json") {
+                            *h6_erroring.entry(format!("{case} missing")).or_default() += 1;
+                        }
+                        if body_answer != Ok(Vec::new()) {
+                            wrong.push(format!("{name} {form} {case}: missing, but the body answers {body_answer:?}"));
+                        }
+                    }
+                    Some(row) if row.decided == 0 => {
+                        undecided += 1;
+                        if *corpus == "H6" && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json") {
+                            *h6_erroring.entry(format!("{case} undecided")).or_default() += 1;
+                        }
+                    }
+                    Some(row) => {
+                        decided += 1;
+                        let key = canon(probe.fold_lane_rows(std::slice::from_ref(row)));
+                        match (&key, &body_answer) {
+                            (Err(why), _) if why.starts_with("today's route") => {}
+                            (k, b) if k == b => {}
+                            _ => wrong.push(format!(
+                                "{name} {form} {case}: the key route {key:?}, the body {body_answer:?}"
+                            )),
+                        }
+                    }
+                }
+            }
+            if stream_is_plain(name)
+                && let Some(want) = design_counts(corpus, form)
+            {
+                assert_eq!(
+                    (decided, missing, undecided),
+                    want,
+                    "{name} {form}: decided / missing / undecided"
+                );
+            }
+        }
+    }
+    assert_eq!(comparisons, 1026 * 180 + 26 * 180 + 6 * 20, "row–form comparisons");
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
+    // Over the 180 H6 cells, the two erroring bodies are never decided: an
+    // unconvertible latency is undecided except in the 18 P cells, whose path
+    // `req.latency` is absent from it (missing, so it contributes nothing on
+    // either route), and invalid JSON is always undecided. (The design's 166
+    // and 14 count the four P cells whose metadata carries a presence name as
+    // undecided: those rows take today's route whatever the verdict.)
+    assert_eq!(
+        h6_erroring,
+        [
+            ("H6-pe-bad-latency missing".to_string(), 18),
+            ("H6-pe-bad-latency undecided".to_string(), 162),
+            ("H6-pe-invalid-json undecided".to_string(), 180),
+        ]
+        .into_iter()
+        .collect(),
+        "the erroring H6 bodies' verdicts"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// Whether an agreement group carries no extra stream label or metadata.
+fn stream_is_plain(group: &str) -> bool {
+    group.ends_with("_none")
+}
