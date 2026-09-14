@@ -1391,3 +1391,93 @@ async fn detected_field_values_end_to_end() {
 
     drop_db(db).await;
 }
+
+/// **Criterion 21: detected fields call a line JSON exactly when `| json`
+/// reads it** (issue #507, through the HTTP endpoint).
+///
+/// ```text
+/// df01  {"a":1}trailing          not one JSON text; logfmt reads nothing from a token opened by {"
+/// df02  <mark>{"a":1}            one JSON text after a byte-order mark
+/// df04  {"a":1} x=2              not JSON; logfmt reads x after the malformed token
+/// df06  {"__error__":"mine","foo":"x"}   JSON; the field named __error__ is not listed, as the reference lists it
+/// df07  {"a":1}                  JSON
+/// ```
+///
+/// A line detection calls `json` must be one `| json` reads, or the query a
+/// client builds from the answer fails on it; a line `| json` reads must be
+/// called `json`, or its fields are hidden.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_fields_classify_a_line_as_json_exactly_when_json_reads_it() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_228;
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_json_text");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let client = data_client(db).await;
+    let now = now_ns();
+    let cases: [(&str, &str); 5] = [
+        ("df01", "{\"a\":1}trailing"),
+        ("df02", "\u{feff}{\"a\":1}"),
+        ("df04", "{\"a\":1} x=2"),
+        ("df06", "{\"__error__\":\"mine\",\"foo\":\"x\"}"),
+        ("df07", "{\"a\":1}"),
+    ];
+    let mut rows: Vec<SeedSampleRow> = Vec::new();
+    for (i, (svc, body)) in cases.iter().enumerate() {
+        let fp = 700 + i as u64;
+        seed_stream(
+            &client,
+            db,
+            now,
+            fp,
+            svc,
+            &format!(r#"{{"service_name":"{svc}"}}"#),
+        )
+        .await;
+        rows.push(SeedSampleRow {
+            service: svc.to_string(),
+            fingerprint: fp,
+            timestamp_ns: now - 2_000_000_000,
+            severity: 0,
+            body: body.to_string(),
+            structured_metadata: String::new(),
+        });
+    }
+    client.insert_block("log_samples", &rows).await.expect("seed");
+    let start = now - 3_600_000_000_000;
+    let end = now + 3_600_000_000_000;
+    let mut got = Vec::new();
+    for (svc, _) in cases {
+        let r = http_get(
+            port,
+            &format!(
+                "/api/logs/v1/detected_fields?query=%7Bservice_name%3D%22{svc}%22%7D&start={start}&end={end}"
+            ),
+            false,
+        );
+        assert_eq!(r.status, 200, "{svc}: {}", r.body);
+        let json: serde_json::Value = serde_json::from_str(&r.body).expect("json");
+        let mut f: Vec<String> = if json.get("fields").is_some() {
+            fields_of(&json)
+                .into_iter()
+                .map(|(l, t, c, p, _)| format!("{l}:{t}:{c}:{}", p.join("+")))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        f.sort();
+        got.push((svc, f));
+    }
+    let want: Vec<(&str, Vec<String>)> = vec![
+        ("df01", vec![]),
+        ("df02", vec!["a:int:1:json".into()]),
+        ("df04", vec!["x:int:1:logfmt".into()]),
+        ("df06", vec!["foo:string:1:json".into()]),
+        ("df07", vec!["a:int:1:json".into()]),
+    ];
+    assert_eq!(got, want);
+    drop_db(db).await;
+}
