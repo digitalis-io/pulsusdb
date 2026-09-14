@@ -239,6 +239,10 @@ faithful-format (same structure, ledgered position) for the others.
     __error_details__ = logfmt syntax error at pos 20 : unterminated quoted value  [byte-exact]
   INPUT `a=1=2`  =>
     a="1"  kept (pair completed before the error), then:
+    CORRECTION (issue #507, case f05s): this line came from a capture on an
+    earlier build. The pinned reference build keeps NOTHING from this token:
+    a malformed token contributes no pair, not even the `key=value` before
+    the byte that breaks it. PulsusDB answers the same.
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 4 : unexpected '='             [faithful-format]
   INPUT `"quoted=1`  (a `"` opens the key)  =>
@@ -246,6 +250,10 @@ faithful-format (same structure, ledgered position) for the others.
     __error_details__ = logfmt syntax error at pos 1 : unexpected '"'              [byte-exact, v3.7.3]
   INPUT `a=1"b"`  (a `"` follows an unquoted value)  =>
     a="1"  kept (pair completed before the error), then:
+    CORRECTION (issue #507, case f03s): this line came from a capture on an
+    earlier build. The pinned reference build keeps NOTHING from this token:
+    a malformed token contributes no pair, not even the `key=value` before
+    the byte that breaks it. PulsusDB answers the same.
     __error__         = LogfmtParserErr
     __error_details__ = logfmt syntax error at pos 4 : unexpected '"'              [byte-exact, v3.7.3]
   NOTE: the reference renders `unexpected '<char>'` naming the offending byte
