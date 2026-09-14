@@ -705,6 +705,18 @@ async fn data_client(db: &str) -> ChClient {
     ChClient::new(cfg).await.expect("connect data client")
 }
 
+/// [`data_client`] with a deadline the caller sets, for a test whose own
+/// corpus needs longer than this file's 60 s: the deadline has to outlast
+/// the scan the query makes, and how long that scan takes is a property of
+/// the machine, not of the behaviour under test. See
+/// `every_refusal_lands_as_the_table_says`, row R2.
+async fn data_client_with_deadline(db: &str, deadline: Duration) -> ChClient {
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    cfg.query_timeout = deadline;
+    ChClient::new(cfg).await.expect("connect data client")
+}
+
 /// One finalized `system.query_log` row per keyset PAGE query for this
 /// test's run database, in issue order.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -6568,9 +6580,24 @@ async fn every_refusal_lands_as_the_table_says() {
     // The realistic corpus's first 3 minutes and a little more.
     seed_realistic_corpus(&admin, &db, base, 120_000, false).await;
 
+    // R2's control is the slowest query in this file by a wide margin: the
+    // retention cap is 4,000,000 points (`charge::MAX_RETAINED_WINDOW_POINTS`)
+    // and the row's stream holds 4,100,000 samples, so today's route reads
+    // 4,000,001 of them before it can refuse. The deadline therefore has to
+    // outlast that scan wherever the suite runs. At this file's 60 s it was a
+    // race the machine decided: it passed here and CI answered
+    // `timeout: query_stream exceeded 60s` for that one row instead of
+    // `422 MetricRetention`. Measured here with a deliberately short deadline,
+    // the failure reproduces exactly, and at 300 s the row answers on both.
+    const REFUSAL_TABLE_DEADLINE: Duration = Duration::from_secs(300);
     let engine = |budget: u64| {
         let db = db.clone();
-        async move { LogQlEngine::new(data_client(&db).await, engine_config(&db, budget)) }
+        async move {
+            LogQlEngine::new(
+                data_client_with_deadline(&db, REFUSAL_TABLE_DEADLINE).await,
+                engine_config(&db, budget),
+            )
+        }
     };
     let wide = engine(50 * 1024 * 1024 * 1024).await;
     let range = |start_s: i64, end_s: i64, step: i64| QueryParams {
