@@ -39,28 +39,66 @@
 //! walks the whole domain rather than a hand list, because a hand list is
 //! what was incomplete.
 //!
-//! # What this decoder accepts that JSON does not
+//! # Where this decoder differs from the database, case by case
 //!
-//! Carried across from the three copies unchanged. None of it is reachable
-//! from the writer; it is recorded here so the next reader does not have to
-//! re-derive it, and it is the reason this is not `serde_json`:
+//! Every input below was put to this decoder and to ClickHouse 26.3.29.7
+//! side by side (measured 2026-09-14; the same list a code review measured
+//! independently). `SQL` is `JSONExtractString(text,'k')`, the metric label
+//! pushdown's expression; `INDEX` is `JSONExtractKeysAndValues(text,'String')`,
+//! the expression `log_streams_idx_mv` is built from. Nothing here is
+//! reachable from our writer — see the paragraph after the table — and the
+//! list is recorded so the next reader does not have to re-derive it.
 //!
-//! | input | here | `serde_json` | `JSONExtractString` |
-//! |---|---|---|---|
-//! | `""` (the structured-metadata default, `catalog.rs:441`) | zero pairs | `Err` at column 0 | `''` |
-//! | `{"k""v"}` — no colon | `[("k","v")]` | `Err: expected ':'` | `''` |
-//! | `{"a":1,"b":"z"}` — a non-string value | `[]`, it stops | both pairs | `'z'` for `b` |
-//! | `{"k":"a\qb"}` — an unknown escape | `[("k","aqb")]` | `Err: invalid escape` | `''` |
-//! | `{"k":"a\ud800b"}` — a lone surrogate | `[("k","ab")]` | `Err` | `''` |
+//! | input | here | `serde_json::Value` | `SQL` | `INDEX` |
+//! |---|---|---|---|---|
+//! | `""` (the structured-metadata default, `catalog.rs:441`) | zero pairs | `Err: EOF at column 0` | `''` | `[]` |
+//! | `{"k""v"}` — no colon | `[("k","v")]` | `Err: expected ':'` | `''` | `[]` |
+//! | `{"a":1,"b":"z"}` — a non-string value | `[]`, it stops | both pairs | `'z'` for `b` | `[('a','1'),('b','z')]` |
+//! | `{"k":"a\qb"}` — an unknown escape | `[("k","aqb")]` | `Err: invalid escape` | `''` | `[]` |
+//! | `{"k":"a\ud800b"}` — a lone surrogate | `[("k","ab")]` | `Err: unexpected end of hex escape` | `''` | `[]` |
+//! | `{"k":"a\ud83d\ude00b"}` — a valid surrogate PAIR | `[("k","ab")]`, the character is LOST | `a` + U+1F600 + `b` | `a` + U+1F600 + `b` | the same |
+//! | `{"k":{"n":"v"},"m":"w"}` — an object as a value | `[]`, it stops | both pairs | `{"n":"v"}` | both, the sub-object as its raw text |
+//! | `{"k":["v"],"m":"w"}` — an array as a value | `[]`, it stops | both pairs | `["v"]` | both, the array as its raw text |
+//! | `{"k":"v"} trailing` — text after the object | `[("k","v")]` | `Err: trailing characters` | `''` | `[]` |
+//! | `{"k":"first","k":"second"}` — a duplicate key | both, in document order | `"second"` | `'first'` | both |
 //!
-//! The first row is the one that decides it: our own writer produces the
-//! empty string for every log entry with no structured metadata
-//! (`crates/pulsus-write/src/protocols/loki_push.rs:788-790`), and
-//! `serde_json` rejects it. The rest are unreachable — the only two
-//! renderers that reach these columns are
-//! `pulsus_model::LabelSet::to_canonical_json` and
+//! **What each row would cost if it were reachable.** A metric selector is
+//! answered either from the label cache, which this decoder fills, or by
+//! the `SQL` expression, and which one serves a given query is a runtime
+//! decision (`crates/pulsus-read/src/metrics/labels.rs:9-14`). So on any
+//! row above, the same stored bytes would answer the same query two ways.
+//! Two rows are worth naming:
+//!
+//! * **the duplicate key.** Here both pairs are kept and
+//!   [`parse_canonical_label_set`] collapses them through
+//!   `LabelSet::from_verbatim`, whose winner within a key group is the
+//!   greatest `(key, value)` pair (`crates/pulsus-model/src/labels.rs:364`);
+//!   the key is the same twice here, so the greater value wins — `second`.
+//!   `JSONExtractString` returns the FIRST — `first`. The cache route and
+//!   the SQL route would disagree on the value, not merely on the spelling.
+//! * **the surrogate pair.** The `\uXXXX` arm decodes each escape on its
+//!   own and drops an unpaired surrogate, so a pair loses the astral
+//!   character it spells: `ab` here against `a` + U+1F600 + `b` from both
+//!   database expressions. **This is not a change made by issue #539** —
+//!   that issue's base decoder had a byte-identical `\u` arm — and it is
+//!   left as it is, recorded rather than fixed, because no writer of ours
+//!   can produce it (below).
+//!
+//! **Why none of it is reachable.** The only two renderers that reach these
+//! columns are `pulsus_model::LabelSet::to_canonical_json` and
 //! `pulsus_write::protocols::otlp_logs::push_json_string`, and both bottom
-//! out in `serde_json::to_string` over string keys and string values.
+//! out in `serde_json::to_string` over a container of sorted unique string
+//! keys with string values. That rules out every row but the first: there
+//! is always a colon, every value is a string, no escape is unknown, no
+//! surrogate escape of either kind is emitted (`serde_json` writes code
+//! points at or above U+0080 verbatim), no value is an object or an array,
+//! nothing follows the object, and no key occurs twice.
+//!
+//! **The first row is the one that decides `serde_json` is not an option**:
+//! our own writer produces the empty string for every log entry with no
+//! structured metadata
+//! (`crates/pulsus-write/src/protocols/loki_push.rs:788-790`), and
+//! `serde_json` rejects it.
 //!
 //! `serde_json` IS a dependency of this crate (`crates/pulsus-read/Cargo.toml:53`,
 //! for the `| json` pipeline stage). Three doc comments used to say the
