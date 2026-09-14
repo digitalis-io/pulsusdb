@@ -3754,13 +3754,15 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         // `"0e999999"` converts to `+0` rather than to a negative NaN, and
         // what refuses it now is the denotation clause — an over-rejection,
         // since our parser also gives `+0`.
+        // Issue #507, criterion 11: on the group key read the text is decided
+        // (the database's `+0` is our parser's), so it answers there.
         (
             "nan_exp",
             206,
             &["1", "\"0e999999\""],
             "",
             "sum_over_time",
-            true,
+            false,
         ),
         // Review round 4: the same move as `class_c` at a magnitude where
         // the old divergence was obvious — `0` against
