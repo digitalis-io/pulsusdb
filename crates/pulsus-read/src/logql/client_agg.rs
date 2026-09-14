@@ -894,7 +894,7 @@ impl<'q> ClientAggState<'q> {
                 // `__error__`: the check above failed the query unless
                 // `__preserve_error__="true"` let the series through (issue
                 // #507), and then the reference's sample is the converter's
-                // zero.
+                // zero (`pkg/logql/log/metrics_extraction.go:219-230 @ v3.7.4`).
                 ClientValue::Unwrap => value.unwrap_or(0.0),
             };
             let op = self.client.range_op;
@@ -3787,7 +3787,7 @@ where
     };
     // Issue #507: a series carrying `__preserve_error__` exactly `true`
     // passes, whatever put the label there, as the reference's error check
-    // does on every range step.
+    // does on every range step (`pkg/logql/evaluator.go:730` and `:762 @ v3.7.4`).
     if labels
         .iter()
         .any(|(k, v)| k.as_ref() == PRESERVE_ERROR_LABEL && v.as_ref() == "true")

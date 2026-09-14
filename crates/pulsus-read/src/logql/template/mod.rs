@@ -353,7 +353,8 @@ pub fn compile(text: &str, kind: TemplateKind) -> Result<Template, TemplateCompi
 }
 
 /// Whether the template names the field `name` where the reference's
-/// template field listing finds a field:
+/// template field listing finds a field (`listNodeFields`,
+/// `pkg/logql/log/fmt.go:264-316 @ v3.7.4`):
 /// in the arguments of an action, of a parenthesised pipeline, or of an
 /// `if`/`with`/`range` branch, in the template's root only. Issue #507 reads
 /// it for the parser hints' required labels. A template that does not parse

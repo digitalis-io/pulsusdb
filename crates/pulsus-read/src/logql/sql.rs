@@ -1412,7 +1412,10 @@ fn unwrapped_reader_columns(
         ));
         decided.push(format!("toUInt8(({t}_str + {t}_int + {t}_absent) > 0)"));
     }
-    w.push(format!("toUInt8({}) AS depth_ok", json_depth_bound().as_sql()));
+    w.push(format!(
+        "toUInt8({}) AS depth_ok",
+        json_depth_bound().as_sql()
+    ));
     decided.push("depth_ok".to_string());
     if value.form == UnwrapForm::Bare {
         w.push(format!(
@@ -3431,7 +3434,13 @@ mod tests {
         items.push(&select[start..]);
         items
             .iter()
-            .map(|item| item.trim().rsplit(" AS ").next().expect("a name").to_string())
+            .map(|item| {
+                item.trim()
+                    .rsplit(" AS ")
+                    .next()
+                    .expect("a name")
+                    .to_string()
+            })
             .collect()
     }
 
@@ -3559,17 +3568,27 @@ mod tests {
             },
         );
         let rendered = [
-            ("s1_bare_by_status", s1(&by_status, &one_class, UndecidedRows::Throw)),
+            (
+                "s1_bare_by_status",
+                s1(&by_status, &one_class, UndecidedRows::Throw),
+            ),
             (
                 "s1_bare_by_status_counting_undecided",
                 s1(&by_status, &one_class, UndecidedRows::Count),
             ),
             ("l_bare_by_status", lane(&by_status, &one_class)),
-            ("s1_targeted_no_key", s1(&targeted, &per_fp, UndecidedRows::Throw)),
+            (
+                "s1_targeted_no_key",
+                s1(&targeted, &per_fp, UndecidedRows::Throw),
+            ),
             (
                 "s1_targeted_nested_path",
                 s1(
-                    &value(UnwrapForm::Targeted, &["req", "latency"], MetadataSent::Text),
+                    &value(
+                        UnwrapForm::Targeted,
+                        &["req", "latency"],
+                        MetadataSent::Text,
+                    ),
                     &per_fp,
                     UndecidedRows::Throw,
                 ),
@@ -3578,7 +3597,10 @@ mod tests {
                 "s1_targeted_keys_text_metadata",
                 s1(&targeted, &targeted_keys, UndecidedRows::Throw),
             ),
-            ("l_targeted_keys_text_metadata", lane(&targeted, &targeted_keys)),
+            (
+                "l_targeted_keys_text_metadata",
+                lane(&targeted, &targeted_keys),
+            ),
             (
                 "s1_bare_no_key",
                 s1(

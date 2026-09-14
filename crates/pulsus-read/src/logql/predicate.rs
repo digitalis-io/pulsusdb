@@ -1118,7 +1118,10 @@ fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal>
         ));
     }
     let first = name.split('_').next().unwrap_or("");
-    let mut spelled = format!("match(body, {})", key_regex(&spelled_otherwise_pattern(name))?);
+    let mut spelled = format!(
+        "match(body, {})",
+        key_regex(&spelled_otherwise_pattern(name))?
+    );
     if parts_joined(name) {
         spelled = format!(
             "({spelled} OR match(body, {}))",
@@ -1204,9 +1207,7 @@ pub fn unwrap_name_absence(
     let depth = depth.as_sql();
     match form {
         super::sql::UnwrapForm::Targeted => Ok(CheckedFragment {
-            sql: format!(
-                "toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth})"
-            ),
+            sql: format!("toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth})"),
         }),
         super::sql::UnwrapForm::Bare => {
             if !name_is_renderable(name) {
@@ -1237,7 +1238,8 @@ pub fn unwrap_name_absence(
 /// is an integer our parser renders the same way (issue #507).
 pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment {
     // A constant pattern; the escaper cannot refuse it.
-    let pattern = ch_regex_unanchored_checked(INTEGER_TEXT).unwrap_or_else(|_| ch_string(INTEGER_TEXT));
+    let pattern =
+        ch_regex_unanchored_checked(INTEGER_TEXT).unwrap_or_else(|_| ch_string(INTEGER_TEXT));
     CheckedFragment {
         sql: format!("match({}_r, {pattern})", columns.prefix()),
     }

@@ -18,8 +18,8 @@ use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, St
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
-    MetricRangeBucketRow, MetricRangeUnwrappedRow, MetricScanRow, UnwrappedLaneRow, PatternFetchRow, SampleRow,
-    StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
+    MetricRangeBucketRow, MetricRangeUnwrappedRow, MetricScanRow, PatternFetchRow, SampleRow,
+    StreamMetaRow, StreamRow, TailSampleRow, UnwrappedLaneRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -1744,7 +1744,15 @@ impl LogQlEngine {
                 .await;
         };
         match self
-            .run_key_statement(mp, u, &compiled, &resolved, services, scan, explain.as_deref_mut())
+            .run_key_statement(
+                mp,
+                u,
+                &compiled,
+                &resolved,
+                services,
+                scan,
+                explain.as_deref_mut(),
+            )
             .await
         {
             KeyRouteOutcome::Answer(series) => return Ok(folded_answer(mp, series)?),
@@ -1752,13 +1760,7 @@ impl LogQlEngine {
             KeyRouteOutcome::TodaysRoute(_why) => {}
         }
         let todays = self
-            .run_metric_client(
-                mp,
-                &client,
-                &compiled,
-                fingerprints,
-                explain.as_deref_mut(),
-            )
+            .run_metric_client(mp, &client, &compiled, fingerprints, explain.as_deref_mut())
             .await;
         match todays {
             Err(ReadError::QueryTooBroad(reason)) if lane_may_answer(&reason) => {
@@ -1846,7 +1848,9 @@ impl LogQlEngine {
         }
         match fold.finish() {
             Ok(series) => KeyRouteOutcome::Answer(series),
-            Err(super::unwrap_group::FoldStop::TodaysRoute(why)) => KeyRouteOutcome::TodaysRoute(why),
+            Err(super::unwrap_group::FoldStop::TodaysRoute(why)) => {
+                KeyRouteOutcome::TodaysRoute(why)
+            }
             Err(super::unwrap_group::FoldStop::Refusal(e)) => KeyRouteOutcome::Refusal(e),
         }
     }
@@ -1930,7 +1934,9 @@ impl LogQlEngine {
         }
         match fold.finish() {
             Ok(series) => KeyRouteOutcome::Answer(series),
-            Err(super::unwrap_group::FoldStop::TodaysRoute(why)) => KeyRouteOutcome::TodaysRoute(why),
+            Err(super::unwrap_group::FoldStop::TodaysRoute(why)) => {
+                KeyRouteOutcome::TodaysRoute(why)
+            }
             Err(super::unwrap_group::FoldStop::Refusal(e)) => KeyRouteOutcome::Refusal(e),
         }
     }
@@ -5146,8 +5152,9 @@ impl CarriesMetadata for MetricRangeBucketRow {
 /// A lowered fold's half of `RangeStepRules::parent_sum` (issue #507): the
 /// reserved labels a parent `sum` does not keep are removed, unless this
 /// row's metadata filled the error slot, where the reference keeps the
-/// ungrouped labels. `sm_ctx` is only this row's when the row carries
-/// metadata, which is why the row is read first.
+/// ungrouped labels (`pkg/logql/log/labels.go:664-668 @ v3.7.4`). `sm_ctx`
+/// is only this row's when the row carries metadata, which is why the row is
+/// read first.
 fn remove_unkept_reserved<R: CarriesMetadata>(
     labels: &mut LabelSet,
     parent_sum: Option<ParentSum>,
@@ -8940,7 +8947,12 @@ mod tests {
         }
     }
 
-    fn group_row(bucket_ns: i64, v: f64, n_value: u64, sm_kept: &[(&str, &str)]) -> MetricRangeUnwrappedRow {
+    fn group_row(
+        bucket_ns: i64,
+        v: f64,
+        n_value: u64,
+        sm_kept: &[(&str, &str)],
+    ) -> MetricRangeUnwrappedRow {
         MetricRangeUnwrappedRow {
             class: 0,
             bucket_ns,
@@ -9150,20 +9162,32 @@ mod tests {
     #[test]
     fn a_shadowed_row_falls_back_rather_than_being_recomputed() {
         let q = r#"avg_over_time({app="x"} | json | unwrap latency [1m]) by (app)"#;
-        let e = fold_groups(q, &[group_row(660_000_000_000, 999.0, 10, &[("latency", "1")])])
-            .expect_err("a shadowed row must fall back");
+        let e = fold_groups(
+            q,
+            &[group_row(660_000_000_000, 999.0, 10, &[("latency", "1")])],
+        )
+        .expect_err("a shadowed row must fall back");
         assert!(
             matches!(e, super::super::unwrap_group::FoldStop::TodaysRoute(why) if why.contains("unwrapped name")),
             "{e:?}"
         );
         // The control: metadata that does not carry the name is ordinary.
-        let ok = fold_groups(q, &[group_row(660_000_000_000, 12.5, 1, &[("lvl", "info")])])
-            .expect("metadata that does not collide is ordinary");
+        let ok = fold_groups(
+            q,
+            &[group_row(660_000_000_000, 12.5, 1, &[("lvl", "info")])],
+        )
+        .expect("metadata that does not collide is ordinary");
         assert_eq!(ok[0].1, vec![(660_000_000_000, 12.5f64.to_bits())]);
         // And a presence name for the error pair is today's route too.
-        let e = fold_groups(q, &[group_row(660_000_000_000, 1.0, 1, &[("__error__", "1")])])
-            .expect_err("metadata __error__ falls back");
-        assert!(matches!(e, super::super::unwrap_group::FoldStop::TodaysRoute(_)), "{e:?}");
+        let e = fold_groups(
+            q,
+            &[group_row(660_000_000_000, 1.0, 1, &[("__error__", "1")])],
+        )
+        .expect_err("metadata __error__ falls back");
+        assert!(
+            matches!(e, super::super::unwrap_group::FoldStop::TodaysRoute(_)),
+            "{e:?}"
+        );
     }
 
     /// Criterion 7: which failures of the key statement hand the query to
@@ -9180,7 +9204,10 @@ mod tests {
             (server(241), true),
             (ChError::Decode("too big".to_string()), true),
             (server(159), false),
-            (ChError::Timeout("query_stream exceeded 3s".to_string()), false),
+            (
+                ChError::Timeout("query_stream exceeded 3s".to_string()),
+                false,
+            ),
             (server(307), false),
         ] {
             assert_eq!(

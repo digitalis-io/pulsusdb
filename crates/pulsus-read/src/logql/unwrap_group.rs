@@ -76,10 +76,8 @@ pub(in crate::logql) fn resolve(
 ) -> ResolvedGroupKey {
     let mut fingerprints: Vec<u64> = meta.keys().copied().collect();
     fingerprints.sort_unstable();
-    let stream_labels: HashMap<u64, LabelSet> = meta
-        .iter()
-        .map(|(fp, m)| (*fp, series_labels(m)))
-        .collect();
+    let stream_labels: HashMap<u64, LabelSet> =
+        meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect();
     let keys: Vec<(UnwrapKeyLabel, Vec<u64>)> = value
         .keys
         .iter()
@@ -230,9 +228,7 @@ pub(in crate::logql) fn run_group(
                     out.sort();
                     GroupOutcome::Keep(out, 0.0)
                 }
-                _ => GroupOutcome::TodaysRoute(
-                    "the group document's value is not its placeholder",
-                ),
+                _ => GroupOutcome::TodaysRoute("the group document's value is not its placeholder"),
             }
         }
     }
@@ -456,7 +452,10 @@ impl<'q> KeyRouteFold<'q> {
     }
 
     /// Folds one L row.
-    pub(in crate::logql) fn push_lane_row(&mut self, row: &UnwrappedLaneRow) -> Result<(), FoldStop> {
+    pub(in crate::logql) fn push_lane_row(
+        &mut self,
+        row: &UnwrappedLaneRow,
+    ) -> Result<(), FoldStop> {
         if !self.in_window(row.bucket_ns) {
             return Ok(());
         }
@@ -505,7 +504,13 @@ impl<'q> KeyRouteFold<'q> {
         }
     }
 
-    fn add(&mut self, mut labels: LabelSet, bucket_ns: i64, v: f64, n: u64) -> Result<(), FoldStop> {
+    fn add(
+        &mut self,
+        mut labels: LabelSet,
+        bucket_ns: i64,
+        v: f64,
+        n: u64,
+    ) -> Result<(), FoldStop> {
         // A row whose error slot is set keeps its ungrouped labels, as the
         // range step keeps them (`RangeStepRules::parent_sum`); only a
         // preserved error reaches here, and its series is today's route's.
@@ -593,7 +598,6 @@ fn merged_value(reducer: UnwrapReducer, p: Partial) -> f64 {
         UnwrapReducer::Avg => p.sum / p.n as f64,
     }
 }
-
 
 /// Test-only access to the key route's resolution and fold (issue #507),
 /// for the live agreement measurement: it folds rows the one read returned

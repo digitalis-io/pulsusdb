@@ -888,13 +888,16 @@ pub struct RangeStepRules {
     /// A `sum` directly above one of `count_over_time`, `bytes_over_time`,
     /// `rate`, `bytes_rate` or `sum_over_time` that has no grouping of its
     /// own. The reference hands that sum's grouping to the range step, so a
-    /// label outside it is gone before the error check reads the series.
-    /// (Citations: the reference at the pinned tag.)
+    /// label outside it is gone before the error check reads the series
+    /// (`pkg/logql/syntax/ast.go:1612-1642 @ v3.7.4`, the override at
+    /// `pkg/logql/syntax/extractor.go:21-42`; the error check at
+    /// `pkg/logql/evaluator.go:730` and `:762`). A line whose error slot is
+    /// set keeps its ungrouped labels (`pkg/logql/log/labels.go:664-668`).
     /// Here the grouping itself is applied later, by the vector aggregation;
     /// at the range step only its observable effects are applied.
     pub parent_sum: Option<ParentSum>,
     /// The reference's parser hints, reduced to the two reserved names they
-    /// change.
+    /// change (`pkg/logql/log/parser_hints.go:145-189 @ v3.7.4`).
     pub hints: ParserHints,
 }
 
@@ -934,7 +937,8 @@ pub struct ParserHints {
     /// that needs no labels but whose stages require some).
     pub active: bool,
     /// `__error__` is in that list: every parser error also sets the parsed
-    /// label `__preserve_error__="true"`.
+    /// label `__preserve_error__="true"` (`pkg/logql/log/parser_hints.go:191-198`
+    /// and `pkg/logql/log/parser.go:784-786 @ v3.7.4`).
     pub requires_error: bool,
     /// `__preserve_error__` is in that list. When the hints are active and it
     /// is not, no implicit parser extracts a line key of that name.
@@ -3343,24 +3347,27 @@ enum LogfmtErrKind {
     /// `=` immediately after a completed bare value (`a=1=2`).
     UnexpectedEquals,
     /// A byte the decoder rejects where a key or unquoted value is
-    /// expected — a `"` opening a key, a control byte `<0x20` mid-key, or a
-    /// `"` following an unquoted value. Carries the offending byte so the
-    /// message can name it (`unexpected '<char>'`), matching the reference
-    /// (v3.7.3), which has no static "invalid key" text.
+    /// expected — a `"` in a key, a `"` inside an unquoted value, or a
+    /// byte other than a separator right after a closing quote. A control
+    /// byte is a separator (every byte at or below `' '`), not this class.
+    /// Carries the offending byte so the message can name it
+    /// (`unexpected '<char>'`, `pkg/logql/log/logfmt/decode.go:216-221
+    /// @ v3.7.4`).
     InvalidKey(char),
-    /// A key holding U+FFFD (the reference's "invalid key").
+    /// A key holding U+FFFD (the reference's "invalid key",
+    /// `pkg/logql/log/logfmt/decode.go:59-100 @ v3.7.4`).
     InvalidKeyRune,
-    /// A quoted value holding an escape the reference's unquoting refuses.
+    /// A quoted value holding an escape the reference's unquoting refuses
+    /// (`pkg/logql/log/logfmt/decode.go:167-171 @ v3.7.4`).
     InvalidQuotedValue,
 }
 
 /// Streams-path `__error_details__` for a `--strict` `LogfmtParserErr`
-/// (issue #99 detail-string precedent, extended for #200). Byte-exact for
-/// the unterminated-quote class (`pos` = byte offset + 1, issue #507);
-/// faithful-format (same structure, ledgered position) for the
-/// `unexpected '='` class. The `InvalidKey` class renders
-/// `unexpected '<char>'` naming the offending byte, matching the reference
-/// (v3.7.3) — the `__error__` LABEL is always correct.
+/// (issue #99 detail-string precedent, extended for #200). The message is
+/// `logfmt syntax error at pos <p> : <reason>` with `p` the 1-based byte
+/// position ([`logfmt_byte_pos`]) and `reason` one of the decoder's texts
+/// (`pkg/logql/log/logfmt/decode.go:59`, `:153-154`, `:209-230 @ v3.7.4`);
+/// `InvalidKey` names the offending byte as `unexpected '<char>'`.
 fn logfmt_error_details(err: LogfmtErr) -> String {
     let reason = match err.kind {
         LogfmtErrKind::UnterminatedQuote => "unterminated quoted value".to_string(),
@@ -3373,7 +3380,8 @@ fn logfmt_error_details(err: LogfmtErr) -> String {
 }
 
 /// The 1-based position of the byte at `byte_off` — the reference's `pos`
-/// numbering (issue #507: a byte offset, not a character count, so a
+/// numbering (`dec.pos + 1`, `pkg/logql/log/logfmt/decode.go:209-221
+/// @ v3.7.4`; issue #507: a byte offset, not a character count, so a
 /// position names one place in the line however the text before it is
 /// read).
 fn logfmt_byte_pos(byte_off: usize) -> usize {
@@ -3882,8 +3890,11 @@ enum OnAlreadyExtracted {
     Overwrite,
     /// The logfmt expression parser: last write wins, except that a
     /// destination renamed to `<id>_extracted` is skipped when that name is
-    /// already extracted on this line (the reference skips it and then stops
-    /// reading the line; issue #507 skips it and reads on).
+    /// already extracted on this line. The reference skips it and then stops
+    /// reading the line (the `break` at `pkg/logql/log/parser.go:604-607
+    /// @ v3.7.4` leaves the scan loop), so a later pair for another
+    /// identifier is lost; issue #507 skips it and reads on, the difference
+    /// recorded in `docs/reference-defects-we-do-not-copy.md`.
     OverwriteUnlessRenamedRepeat,
 }
 
@@ -3928,7 +3939,8 @@ impl<'a> ExtractionState<'a, '_> {
     /// `__preserve_error__` not required, an implicit parser skips a line key
     /// of that name. Asked only by the implicit parsers (`| json`, `| logfmt`,
     /// `| regexp`, `| pattern`, `| unpack`), after the collision rename, as the
-    /// reference asks it.
+    /// reference asks it (`pkg/logql/log/parser.go:156`, `:190`, `:346`,
+    /// `:413`, `:485`, `:580`, `:604`, `:815 @ v3.7.4`).
     fn hint_skips(&self, key: &str) -> bool {
         self.hints.skips_parsed_preserve() && key == PRESERVE_ERROR_LABEL
     }
@@ -4920,33 +4932,35 @@ impl<'de> serde::Deserialize<'de> for WireJson {
     }
 }
 
-/// The FIRST JSON value in `line`, with whatever follows it ignored —
-/// issue #389 part A.
-///
-/// `serde_json::from_str` is `Deserializer::from_str` plus `end()`, and
-/// that `end()` is the whole difference: it demands end-of-input after
-/// the value, so `{"a":1}trailing` is a parse error here where the
-/// reference answers `a="1"`. The reference's scanner simply stops.
-/// `jsonparser.ObjectEach` returns `nil` the moment it reaches the
-/// object's closing `}` and never looks further
-/// (`vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160
-/// @ v3.7.4`), and `EachKey`'s dispatch has no default case, so a byte it
-/// does not recognise is skipped rather than refused (`:568-577`).
-/// Dropping `end()` reproduces that for a line whose trailing bytes come
-/// AFTER a complete value; a line malformed INSIDE the value is still
-/// refused here and is not (the residual ledgered as
-/// `json-nonvalidating-scan-residual`).
-///
-/// The recursion bound is unchanged: this is the same deserializer with
-/// the same limit, reached by a different spelling — see [`WireJson`] and
-/// `tests/recursion_census.rs`.
 /// Where a JSON text starts: after at most one leading byte-order mark,
 /// then JSON whitespace (RFC 8259 §2). Nothing else is skipped.
+///
+/// The reference's gates read the first raw byte instead: the targeted
+/// form's `isValidJSONStart` (`pkg/logql/log/parser.go:724-731 @ v3.7.4`)
+/// and `| unpack`'s `line[0] != '{'` (`:759`), so ` {"a":1}` is refused
+/// there. RFC 8259 allows whitespace before a value, so every `| json` and
+/// `| unpack` arm here skips it (issue #507; the difference is recorded in
+/// `docs/reference-defects-we-do-not-copy.md`).
 fn json_text_start(line: &str) -> &str {
     let s = line.strip_prefix('\u{feff}').unwrap_or(line);
     s.trim_start_matches([' ', '\t', '\n', '\r'])
 }
 
+/// ONE JSON text: a value, then nothing but JSON whitespace (issue #507).
+///
+/// `de.end()` demands end-of-input after the value, so `{"a":1}trailing`
+/// is a parse error here where the reference answers `a="1"`. The
+/// reference's scanner stops instead: `jsonparser.ObjectEach` returns `nil`
+/// the moment it reaches the object's closing `}` and never looks further
+/// (`vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160
+/// @ v3.7.4`), and `EachKey`'s dispatch has no default case, so a byte it
+/// does not recognise is skipped rather than refused (`:568-577`). A line
+/// with text after its value is not JSON (RFC 8259 §2), so it is refused
+/// here on every arm; the difference is recorded in
+/// `docs/reference-defects-we-do-not-copy.md`.
+///
+/// The recursion bound is unchanged: this is the same deserializer with
+/// the same limit — see [`WireJson`] and `tests/recursion_census.rs`.
 fn parse_wire_json_prefix(line: &str) -> Result<WireJson, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(line);
     let v: WireJson = serde::Deserialize::deserialize(&mut de)?;
@@ -5025,44 +5039,31 @@ fn run_json<'a>(
             capture.as_mut(),
         )?;
     } else {
-        // THE TARGETED FORM HAS ITS OWN VALIDITY GATE, and it is not the
-        // flatten arm's (issue #389 part A). `JSONExpressionParser.Process`
-        // (`pkg/logql/log/parser.go:664-670,726-732 @ v3.7.4`) tests
-        // exactly two things before scanning, and neither is "does the
-        // line parse":
+        // The targeted form's validity rule (issue #507): the line must be
+        // one JSON text, as `json_text_start` and `parse_wire_json_prefix`
+        // read it. An empty line, a first byte no JSON value starts with, a
+        // parse error and text after the value are each reported exactly as
+        // the bare form reports them, `JSONParserErr` with its details. Any
+        // JSON value is accepted: a path that does not resolve in it is the
+        // missing-path fill, `""`.
         //
-        // - an EMPTY line returns with no label written at all — not the
-        //   missing-path fill, not an error;
-        // - `isValidJSONStart` looks at ONE RAW BYTE, `line[0]`, and
-        //   whitespace is NOT skipped, so ` {"a":1}` is refused where
-        //   `{"a":1}trailing` is admitted.
+        // The reference tests two things only (`JSONExpressionParser.Process`,
+        // `pkg/logql/log/parser.go:671-682 @ v3.7.4`): an EMPTY line returns
+        // with no label written, and `isValidJSONStart` (`:724-731`) reads
+        // ONE RAW BYTE. Past that gate its scan does not validate, so
+        // `{garbage` and `"hello"trailing` answer `a=""` with no error there.
+        // A line that is not JSON reporting no error is the difference
+        // recorded in `docs/reference-defects-we-do-not-copy.md`.
         //
-        // Everything past that gate is the non-validating scan, whose
-        // misses are the missing-path fill: `{garbage`, `[1,2]junk` and
-        // `"hello"trailing` all answer `a=""` with NO error. Routing this
-        // arm through the flatten arm's "must parse to an object" test got
-        // all eight of those rows wrong in both directions.
+        // The targeted form needs the wire-order, duplicate-preserving
+        // shape (issue #334 review round 1): its winner is decided by
+        // DOCUMENT order, not by the order the expressions were written,
+        // and a repeated document key resolves to its FIRST occurrence.
         if line.is_empty() {
             malformed(errs);
             hint_preserve_error(labels, st, &mut errs.dirty);
             return Ok(());
         }
-        // `addErrLabel(errJSON, nil, lbs)` — a NIL error, so `SetErr` runs
-        // and `SetErrorDetails` does not (`parser.go:734-742`). The detail
-        // slot stays as the previous stage left it.
-        // The targeted form needs the wire-order, duplicate-preserving
-        // shape (issue #334 review round 1): its winner is decided by
-        // DOCUMENT order, not by the order the expressions were written,
-        // and a repeated document key resolves to its FIRST occurrence.
-        //
-        // A parse failure past the first-byte gate is NOT an error here:
-        // the reference's scan finds nothing and the fill writes `""`, so
-        // an empty document reproduces it exactly.
-        // A line that is not one JSON text (empty, a first byte no JSON
-        // value starts with, a parse error, text after the value) is
-        // reported exactly as the bare form reports it. Any JSON value is
-        // accepted: a path that does not resolve in it is the missing-path
-        // fill, as for `[1,2]` before this change.
         let text = json_text_start(line);
         let parsed = match parse_wire_json_prefix(text) {
             Ok(v) => v,
@@ -5326,7 +5327,8 @@ impl<'a> TargetWalk<'a, '_> {
     }
 }
 
-/// The last step of the reference's parser error helper (issue #507): when
+/// The last step of the reference's parser error helper
+/// (`pkg/logql/log/parser.go:777-787 @ v3.7.4`; issue #507): when
 /// the parser hints require `__error__`, a parser error
 /// also sets the parsed label `__preserve_error__="true"`, which the metric
 /// error check then honours. A `Set`, so it dirties the builder and takes
@@ -6904,11 +6906,15 @@ fn run_logfmt<'a, 't>(
 /// tokens, double-quoted values with `\"`/`\\` escapes, bare keys emitting
 /// an empty value. Values are borrowed slices of `text` except quoted
 /// values containing an escape (the only owned path). Pairs are emitted to
-/// `sink` as they decode (including any preceding a later error). Returns
-/// `Err` on the first malformed token — an unterminated quote, an
-/// unexpected `=`, an invalid key, or a quoted value not followed by a
-/// separator — carrying its 1-based byte position;
-/// the caller decides strict (error) vs lenient (swallow, keep the pairs).
+/// `sink` as they decode (including any preceding a later error). A
+/// malformed token — an unterminated quote, an unexpected `=`, an invalid
+/// key, an invalid quoted value, or a quoted value not followed by a
+/// separator — emits nothing, and the scan resumes after it unless
+/// `stop_at_error`, as the reference's decoder does
+/// (`pkg/logql/log/logfmt/decode.go:43-187 @ v3.7.4`; the resume at
+/// `pkg/logql/log/parser.go:563-571`). Returns `Err` with the FIRST error
+/// and its 1-based byte position; the caller decides strict (error) vs
+/// lenient (swallow, keep the pairs).
 fn walk_logfmt<'t>(
     text: &'t str,
     stop_at_error: bool,
@@ -6929,7 +6935,10 @@ fn walk_logfmt<'t>(
     // value's text runs on); inside one, `\` escapes the next byte. No label
     // is then read from inside a value, however the token broke. `quoted`
     // says whether the token has already opened a quoted value before
-    // `from`.
+    // `from`. The reference's skip stops at the first byte at or below
+    // `' '` even inside a quoted value (`pkg/logql/log/logfmt/decode.go:140-149
+    // @ v3.7.4`), so it reads labels out of the value's text;
+    // `docs/reference-defects-we-do-not-copy.md` records the difference.
     let skip = |from: usize, quoted: bool| -> usize {
         let mut quoted = quoted;
         let mut in_quote = false;

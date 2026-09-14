@@ -4441,10 +4441,8 @@ fn unhex_utf8(h: &str) -> String {
 }
 
 fn load_group_key_cases(path: &str) -> Vec<GroupKeyCase> {
-    let text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
-    )
-    .expect("read the fixture");
+    let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .expect("read the fixture");
     text.lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
         .map(|l| {
@@ -4528,7 +4526,10 @@ async fn seed_group_key_cases(
         for chunk in values.chunks(500) {
             admin
                 .execute(
-                    &format!("INSERT INTO {db}.{table} {cols} VALUES {}", chunk.join(", ")),
+                    &format!(
+                        "INSERT INTO {db}.{table} {cols} VALUES {}",
+                        chunk.join(", ")
+                    ),
                     &QuerySettings::new(),
                     Idempotency::Idempotent,
                 )
@@ -4676,7 +4677,11 @@ async fn group_key_statements(
     let mut out = std::collections::HashMap::new();
     for _ in 0..30 {
         admin
-            .execute("SYSTEM FLUSH LOGS", &QuerySettings::new(), Idempotency::Idempotent)
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
             .await
             .expect("flush logs");
         let sql = format!(
@@ -4692,11 +4697,20 @@ async fn group_key_statements(
         out = std::collections::HashMap::new();
         while let Some(row) = stream.next().await {
             let row = row.expect("decode query_log row");
-            let kind = if row.query.contains("throwIf(decided = 0 AND uw_missing = 0)") {
+            let kind = if row
+                .query
+                .contains("throwIf(decided = 0 AND uw_missing = 0)")
+            {
                 GroupKeyStatement::Key
-            } else if row.query.contains("WHERE NOT (decided = 0 AND uw_missing = 1)") {
+            } else if row
+                .query
+                .contains("WHERE NOT (decided = 0 AND uw_missing = 1)")
+            {
                 GroupKeyStatement::Lane
-            } else if row.query.starts_with("SELECT fingerprint, timestamp_ns, body") {
+            } else if row
+                .query
+                .starts_with("SELECT fingerprint, timestamp_ns, body")
+            {
                 GroupKeyStatement::Raw
             } else {
                 continue;
@@ -4756,7 +4770,10 @@ async fn check_group_key_cases(stem: &str, fp_base: u64, cases: &[GroupKeyCase])
             },
         };
         if planned != case.planned {
-            wrong.push(format!("{}: planned {planned}, want {}", case.id, case.planned));
+            wrong.push(format!(
+                "{}: planned {planned}, want {}",
+                case.id, case.planned
+            ));
         }
         let answer = match parse(&query) {
             Ok(expr) => group_key_answer(engine.query(&expr, &params).await),
@@ -4960,7 +4977,10 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             structured_metadata: sm.to_string(),
         });
     }
-    client.insert_block("log_samples", &rows).await.expect("insert");
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert");
 
     let instant = QueryParams {
         spec: QuerySpec::Instant { at_ns: t },
@@ -5123,7 +5143,10 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
     // of ({…} | json [5m])` over a line with a `__error__` field:
     // `{__variant__="0", service_name=…} 1`).
     let variants = r#"variants(sum by (service_name) (count_over_time({service_name="rn2"} [5m]))) of ({service_name="rn2"} | json [5m])"#;
-    let got = match engine.query(&parse(variants).expect("parse"), &instant).await {
+    let got = match engine
+        .query(&parse(variants).expect("parse"), &instant)
+        .await
+    {
         Ok((QueryResult::Vector(v), _)) => v
             .iter()
             .map(|s| format!("{} {}", render(&s.labels), s.value))
@@ -5132,7 +5155,10 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
         Ok((other, _)) => panic!("{variants}: {other:?}"),
         Err(e) => panic!("{variants}: {e}"),
     };
-    assert_eq!(got, r#"{__variant__="0", service_name="rn2"} 1"#, "{variants}");
+    assert_eq!(
+        got, r#"{__variant__="0", service_name="rn2"} 1"#,
+        "{variants}"
+    );
     admin
         .execute(
             &format!("DROP DATABASE IF EXISTS {db}"),
@@ -5215,7 +5241,11 @@ async fn the_lane_answers_reserved_name_rows_under_the_rules() {
     const FP_BASE: u64 = 544_000;
     let (admin, client, db) = group_key_db("gk_lane_rn").await;
     let cases = [
-        group_key_case("k3", &[], &[(r#"{"latency":"abc"}"#, r#"{"__preserve_error__":"true"}"#)]),
+        group_key_case(
+            "k3",
+            &[],
+            &[(r#"{"latency":"abc"}"#, r#"{"__preserve_error__":"true"}"#)],
+        ),
         // k4's row alone fails today's route with its pipeline error before
         // any label set is retained, so today's route would answer rather than
         // refuse. A decided row one nanosecond earlier is retained first, which
@@ -5344,7 +5374,11 @@ async fn group_key_statements_between(
     let mut out = Vec::new();
     for _ in 0..30 {
         admin
-            .execute("SYSTEM FLUSH LOGS", &QuerySettings::new(), Idempotency::Idempotent)
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
             .await
             .expect("flush logs");
         let sql = format!(
@@ -5362,11 +5396,20 @@ async fn group_key_statements_between(
         out.clear();
         while let Some(row) = stream.next().await {
             let row = row.expect("decode");
-            let kind = if row.query.contains("throwIf(decided = 0 AND uw_missing = 0)") {
+            let kind = if row
+                .query
+                .contains("throwIf(decided = 0 AND uw_missing = 0)")
+            {
                 GroupKeyStatement::Key
-            } else if row.query.contains("WHERE NOT (decided = 0 AND uw_missing = 1)") {
+            } else if row
+                .query
+                .contains("WHERE NOT (decided = 0 AND uw_missing = 1)")
+            {
                 GroupKeyStatement::Lane
-            } else if row.query.starts_with("SELECT fingerprint, timestamp_ns, body") {
+            } else if row
+                .query
+                .starts_with("SELECT fingerprint, timestamp_ns, body")
+            {
                 GroupKeyStatement::Raw
             } else {
                 continue;
@@ -5496,12 +5539,19 @@ async fn the_key_statement_does_not_throw_on_rows_outside_its_filter() {
         .unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}"));
     let mut rows = Vec::new();
     while let Some(row) = stream.next().await {
-        rows.push(row.unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}")));
+        rows.push(
+            row.unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}")),
+        );
     }
     drop(stream);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(
-        (rows[0].n_value, rows[0].n_missing, rows[0].n_undecided, rows[0].v),
+        (
+            rows[0].n_value,
+            rows[0].n_missing,
+            rows[0].n_undecided,
+            rows[0].v
+        ),
         (1001, 0, 0, 1001.0),
         "{rows:?}"
     );
@@ -5578,24 +5628,32 @@ async fn the_key_route_falls_back_on_its_own_memory_error() {
     };
     let query = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency [1s]))"#;
     let control = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency | latency >= 0 [1s]))"#;
-    let matrix = |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>, what: &str| {
-        match res {
+    let matrix =
+        |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>, what: &str| match res {
             Ok((QueryResult::Matrix(m), _)) => {
                 let mut out: Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> = m
                     .into_iter()
                     .map(|s| {
                         let mut l = s.labels;
                         l.sort();
-                        (l, s.points.into_iter().map(|(t, v)| (t, v.to_bits())).collect())
+                        (
+                            l,
+                            s.points
+                                .into_iter()
+                                .map(|(t, v)| (t, v.to_bits()))
+                                .collect(),
+                        )
                     })
                     .collect();
                 out.sort();
                 out
             }
             other => panic!("{what}: {other:?}"),
-        }
-    };
-    let today = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024));
+        };
+    let today = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
     let want = matrix(
         today.query(&parse(control).expect("parse"), &params).await,
         "the control",
@@ -5631,7 +5689,10 @@ async fn the_key_route_falls_back_on_its_own_memory_error() {
             &format!("the key route at a {ceiling}-byte ceiling"),
         );
         let to = server_micros(&admin).await + 1;
-        assert_eq!(got, want, "ceiling {ceiling}: the answer is the control's, bit for bit");
+        assert_eq!(
+            got, want,
+            "ceiling {ceiling}: the answer is the control's, bit for bit"
+        );
         let statements =
             group_key_statements_between(&admin, &db, from, to, statements_want.len()).await;
         assert_eq!(
@@ -5714,7 +5775,13 @@ fn matrix_bits(
                 .map(|s| {
                     let mut l = s.labels;
                     l.sort();
-                    (l, s.points.into_iter().map(|(t, v)| (t, v.to_bits())).collect())
+                    (
+                        l,
+                        s.points
+                            .into_iter()
+                            .map(|(t, v)| (t, v.to_bits()))
+                            .collect(),
+                    )
                 })
                 .collect();
             out.sort();
@@ -5820,7 +5887,12 @@ async fn the_undecided_rows_come_from_one_read() {
     let from = server_micros(&admin).await;
     let three = matrix_bits(lowered.query(&expr, &range(3)).await).expect("L answers at 3 minutes");
     let to = server_micros(&admin).await + 1;
-    assert_eq!(three.len(), 6, "one series per status: {:?}", three.iter().map(|s| &s.0).collect::<Vec<_>>());
+    assert_eq!(
+        three.len(),
+        6,
+        "one series per status: {:?}",
+        three.iter().map(|s| &s.0).collect::<Vec<_>>()
+    );
     assert!(three.iter().all(|(_, p)| p.len() == 3), "three points each");
     let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
     assert_eq!(
@@ -5868,7 +5940,11 @@ async fn the_undecided_rows_come_from_one_read() {
         // The initiator runs its own shard's part inside the statements
         // above; the other shard logs its parts as its own queries.
         let per_shard = group_key_shard_statements(&admin, name, &db, from, to).await;
-        assert_eq!(per_shard.len(), 1, "the other shard ran its parts: {per_shard:?}");
+        assert_eq!(
+            per_shard.len(),
+            1,
+            "the other shard ran its parts: {per_shard:?}"
+        );
         for (host, kinds) in &per_shard {
             let raw_at = kinds
                 .iter()
@@ -5884,7 +5960,8 @@ async fn the_undecided_rows_come_from_one_read() {
 
     // 2 minutes: L's answer is today's route's, series by series.
     let from = server_micros(&admin).await;
-    let today = matrix_bits(plain.query(&expr, &range(2)).await).expect("today's route answers at 2 minutes");
+    let today = matrix_bits(plain.query(&expr, &range(2)).await)
+        .expect("today's route answers at 2 minutes");
     let mid = server_micros(&admin).await + 1;
     let lane = matrix_bits(lowered.query(&expr, &range(2)).await).expect("L answers at 2 minutes");
     let to = server_micros(&admin).await + 1;
@@ -5921,12 +5998,21 @@ async fn the_undecided_rows_come_from_one_read() {
     }
     drop(s);
     assert_eq!(
-        lane.iter().map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>())).collect::<Vec<_>>(),
-        today.iter().map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>())).collect::<Vec<_>>(),
+        lane.iter()
+            .map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        today
+            .iter()
+            .map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
         "at 2 minutes L answers the series and points today's route answers"
     );
     for ((labels, lp), (_, tp)) in lane.iter().zip(&today) {
-        let status = &labels.iter().find(|(k, _)| k == "status").expect("status").1;
+        let status = &labels
+            .iter()
+            .find(|(k, _)| k == "status")
+            .expect("status")
+            .1;
         for ((t, a), (_, b)) in lp.iter().zip(tp) {
             let (n, sum_abs) = points[&(status.clone(), *t)];
             let bound = 2.0 * ((n as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
@@ -6095,7 +6181,15 @@ async fn the_key_statement_timeout_is_the_timeout_response() {
 
 /// Inserts `sql`'s rows as one stream `{service_name="<service>"}` at `fp`,
 /// with `pod` as a second stream label when it is not empty.
-async fn seed_one_stream(admin: &ChClient, db: &str, t: i64, fp: u64, service: &str, pod: &str, rows_sql: &str) {
+async fn seed_one_stream(
+    admin: &ChClient,
+    db: &str,
+    t: i64,
+    fp: u64,
+    service: &str,
+    pod: &str,
+    rows_sql: &str,
+) {
     let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
     let (labels, idx) = if pod.is_empty() {
         (
@@ -6105,7 +6199,9 @@ async fn seed_one_stream(admin: &ChClient, db: &str, t: i64, fp: u64, service: &
     } else {
         (
             format!("{{\"pod\":\"{pod}\",\"service_name\":\"{service}\"}}"),
-            format!("({month}, 'service_name', '{service}', {fp}), ({month}, 'pod', '{pod}', {fp})"),
+            format!(
+                "({month}, 'service_name', '{service}', {fp}), ({month}, 'pod', '{pod}', {fp})"
+            ),
         )
     };
     for sql in [
@@ -6160,10 +6256,32 @@ async fn every_refusal_lands_as_the_table_says() {
     // R1's two streams carry the labels the plan measured them under
     // (`{pod="checkout-1000", service_name="checkout"}`), at the same
     // lengths: the staging charge counts each line's rendered labels.
-    seed_one_stream(&admin, &db, base, 2301, "checkou1", "checkout-1000",
-        &format!("SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6213)", base + 90_000_000_000)).await;
-    seed_one_stream(&admin, &db, base, 2302, "checkou2", "checkout-1000",
-        &format!("SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6214)", base + 90_000_000_000)).await;
+    seed_one_stream(
+        &admin,
+        &db,
+        base,
+        2301,
+        "checkou1",
+        "checkout-1000",
+        &format!(
+            "SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6213)",
+            base + 90_000_000_000
+        ),
+    )
+    .await;
+    seed_one_stream(
+        &admin,
+        &db,
+        base,
+        2302,
+        "checkou2",
+        "checkout-1000",
+        &format!(
+            "SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6214)",
+            base + 90_000_000_000
+        ),
+    )
+    .await;
     seed_one_stream(&admin, &db, base, 2303, "r2", "",
         &format!("SELECT {} + intDiv(number * 50000000000, 4100000) AS ts, '{{\"latency\":1}}' AS body FROM numbers(4100000)", base + 1_000_000_000)).await;
     seed_one_stream(&admin, &db, base, 2304, "r3", "",
@@ -6194,7 +6312,9 @@ async fn every_refusal_lands_as_the_table_says() {
         )
     };
     let sum_by = |svc: &str, extra: &str, r: &str| {
-        format!(r#"sum by (service_name) (sum_over_time({{service_name="{svc}"}} | json | unwrap latency{extra} [{r}]))"#)
+        format!(
+            r#"sum by (service_name) (sum_over_time({{service_name="{svc}"}} | json | unwrap latency{extra} [{r}]))"#
+        )
     };
     let short = |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>| -> String {
         match res {
@@ -6206,7 +6326,8 @@ async fn every_refusal_lands_as_the_table_says() {
             Ok((QueryResult::Matrix(m), _)) => m
                 .iter()
                 .map(|s| {
-                    let vals: Vec<String> = s.points.iter().map(|(_, v)| format!("{v:?}")).collect();
+                    let vals: Vec<String> =
+                        s.points.iter().map(|(_, v)| format!("{v:?}")).collect();
                     format!("{} {}", group_key_labels(&s.labels), vals.join(","))
                 })
                 .collect::<Vec<_>>()
@@ -6218,15 +6339,33 @@ async fn every_refusal_lands_as_the_table_says() {
     // R1 and R2: (key-route query, today's control, params, today's answer, key answer)
     for (svc, params, today_want, key_want) in [
         ("checkou1", range(60, 120, 60), "{} 6213.0", "{} 6213.0"),
-        ("checkou2", range(60, 120, 60), "422 TsCollisionGroup", "{} 6214.0"),
-        ("r2", range(60, 120, 60), "422 MetricRetention", "{} 4100000.0"),
+        (
+            "checkou2",
+            range(60, 120, 60),
+            "422 TsCollisionGroup",
+            "{} 6214.0",
+        ),
+        (
+            "r2",
+            range(60, 120, 60),
+            "422 MetricRetention",
+            "{} 4100000.0",
+        ),
     ] {
         let key_q = sum_by(svc, "", "1m");
         let today_q = sum_by(svc, r#" | zzz="""#, "1m");
         assert!(is_key(&key_q, &params), "{key_q}: the key route");
         assert!(!is_key(&today_q, &params), "{today_q}: today's route");
-        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), today_want, "{svc}: today's route");
-        assert_eq!(short(wide.query(&parse(&key_q).expect("parse"), &params).await), key_want, "{svc}: the key route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            today_want,
+            "{svc}: today's route"
+        );
+        assert_eq!(
+            short(wide.query(&parse(&key_q).expect("parse"), &params).await),
+            key_want,
+            "{svc}: the key route"
+        );
     }
 
     // R3: one series of 3,400 points, each 1, where today's route runs out of
@@ -6236,7 +6375,11 @@ async fn every_refusal_lands_as_the_table_says() {
         let key_q = sum_by("r3", "", "1s");
         let today_q = sum_by("r3", r#" | zzz="""#, "1s");
         assert!(is_key(&key_q, &params), "R3: the key route");
-        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), "422 MetricResultPoints", "R3: today's route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            "422 MetricResultPoints",
+            "R3: today's route"
+        );
         match wide.query(&parse(&key_q).expect("parse"), &params).await {
             Ok((QueryResult::Matrix(m), _)) => {
                 assert_eq!(m.len(), 1, "R3: one series");
@@ -6253,7 +6396,11 @@ async fn every_refusal_lands_as_the_table_says() {
         let key_q = sum_by("checkout", "", "1m");
         let today_q = sum_by("checkout", r#" | zzz="""#, "1m");
         assert!(is_key(&key_q, &params), "R4: the key route");
-        assert_eq!(short(wide.query(&parse(&today_q).expect("parse"), &params).await), "422 MetricGroupLabelBytes", "R4: today's route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            "422 MetricGroupLabelBytes",
+            "R4: today's route"
+        );
         match wide.query(&parse(&key_q).expect("parse"), &params).await {
             Ok((QueryResult::Matrix(m), _)) => {
                 assert_eq!(m.len(), 1, "R4: one series");
@@ -6261,7 +6408,10 @@ async fn every_refusal_lands_as_the_table_says() {
                 let want = [14_999_019.46, 14_998_940.27, 15_001_940.27];
                 assert_eq!(got.len(), 3, "R4: three points: {got:?}");
                 for (g, w) in got.iter().zip(want) {
-                    assert!((g - w).abs() < 0.005, "R4: {got:?} against the plan's {want:?}");
+                    assert!(
+                        (g - w).abs() < 0.005,
+                        "R4: {got:?} against the plan's {want:?}"
+                    );
                 }
             }
             other => panic!("R4: the key route answers: {other:?}"),
@@ -6272,10 +6422,19 @@ async fn every_refusal_lands_as_the_table_says() {
     {
         let params = range(60, 60, 60);
         let key_q = r#"avg_over_time({service_name="r5"} | json | unwrap latency [1m]) by (r)"#;
-        let today_q = r#"avg_over_time({service_name="r5"} | json | unwrap latency | zzz="" [1m]) by (r)"#;
+        let today_q =
+            r#"avg_over_time({service_name="r5"} | json | unwrap latency | zzz="" [1m]) by (r)"#;
         assert!(is_key(key_q, &params), "R5: the key route");
-        assert_eq!(short(wide.query(&parse(today_q).expect("parse"), &params).await), "422 MetricSeries", "R5: today's route");
-        assert_eq!(short(wide.query(&parse(key_q).expect("parse"), &params).await), "422 MetricSeries", "R5: the key route");
+        assert_eq!(
+            short(wide.query(&parse(today_q).expect("parse"), &params).await),
+            "422 MetricSeries",
+            "R5: today's route"
+        );
+        assert_eq!(
+            short(wide.query(&parse(key_q).expect("parse"), &params).await),
+            "422 MetricSeries",
+            "R5: the key route"
+        );
     }
 
     // R6: the scan budget on both routes, and no raw scan after the key
@@ -6283,12 +6442,21 @@ async fn every_refusal_lands_as_the_table_says() {
     {
         let params = range(60, 180, 60);
         let tight = engine(1_000_000).await;
-        let key_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency [1m]) by (service)"#;
+        let key_q =
+            r#"avg_over_time({service_name="checkout"} | json | unwrap latency [1m]) by (service)"#;
         let today_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency | zzz="" [1m]) by (service)"#;
         assert!(is_key(key_q, &params), "R6: the key route");
-        assert_eq!(short(tight.query(&parse(today_q).expect("parse"), &params).await), "422 ScanBudgetBytes", "R6: today's route");
+        assert_eq!(
+            short(tight.query(&parse(today_q).expect("parse"), &params).await),
+            "422 ScanBudgetBytes",
+            "R6: today's route"
+        );
         let from = server_micros(&admin).await;
-        assert_eq!(short(tight.query(&parse(key_q).expect("parse"), &params).await), "422 ScanBudgetBytes", "R6: the key route");
+        assert_eq!(
+            short(tight.query(&parse(key_q).expect("parse"), &params).await),
+            "422 ScanBudgetBytes",
+            "R6: the key route"
+        );
         let to = server_micros(&admin).await + 1;
         assert_eq!(
             group_key_statements_between(&admin, &db, from, to, 1).await,
@@ -6327,13 +6495,31 @@ async fn the_reduced_input_answers_as_the_full_input() {
     skip_unless_live!();
     let (admin, client, db) = group_key_db("gk_reduced").await;
     let queries = [
-        ("qa", "sum by (code) (sum_over_time(SEL | json | unwrap latency [1m]))"),
-        ("qb", "avg_over_time(SEL | json | unwrap latency [1m]) by (code)"),
-        ("qc", r#"sum by (code) (sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#),
-        ("qd", "sum by (pod) (sum_over_time(SEL | json | unwrap latency [1m]))"),
+        (
+            "qa",
+            "sum by (code) (sum_over_time(SEL | json | unwrap latency [1m]))",
+        ),
+        (
+            "qb",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (code)",
+        ),
+        (
+            "qc",
+            r#"sum by (code) (sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#,
+        ),
+        (
+            "qd",
+            "sum by (pod) (sum_over_time(SEL | json | unwrap latency [1m]))",
+        ),
         ("qe", "sum(sum_over_time(SEL | json | unwrap latency [1m]))"),
-        ("qf", r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) by (c)"#),
-        ("qg", r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) without (pod)"#),
+        (
+            "qf",
+            r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) by (c)"#,
+        ),
+        (
+            "qg",
+            r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) without (pod)"#,
+        ),
     ];
     let bodies = [
         r#"{"latency":1,"code":"a","a":"x"}"#,
@@ -6355,7 +6541,12 @@ async fn the_reduced_input_answers_as_the_full_input() {
         &[r#"{"__error_details__":"d"}"#],
         &[r#"{"c":"k"}"#],
         &[r#"{"lat":"7"}"#],
-        &[r#"{"trace_id":"t1"}"#, r#"{"trace_id":"t2"}"#, r#"{"code":"m"}"#, ""],
+        &[
+            r#"{"trace_id":"t1"}"#,
+            r#"{"trace_id":"t2"}"#,
+            r#"{"code":"m"}"#,
+            "",
+        ],
     ];
     let stream = [("pod", "p1"), ("zone", "z1")];
     let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
@@ -6373,7 +6564,8 @@ async fn the_reduced_input_answers_as_the_full_input() {
     let mut to_today = 0;
     for (qn, q) in queries {
         let planned = q.replace("SEL", r#"{service_name="x"}"#);
-        let u = match plan(&parse(&planned).expect("parse"), &range, &plan_ctx(&db)).expect("plan") {
+        let u = match plan(&parse(&planned).expect("parse"), &range, &plan_ctx(&db)).expect("plan")
+        {
             Plan::Metric(mp) => match mp.value {
                 sql::MetricValue::Unwrapped(u) => *u,
                 other => panic!("{q}: the group key read, got {other:?}"),
@@ -6396,10 +6588,11 @@ async fn the_reduced_input_answers_as_the_full_input() {
                 sql::MetadataSent::Projected { presence, .. } => presence.clone(),
                 sql::MetadataSent::Text => vec![u.label.clone(), "__error__".to_string()],
             };
-            if sms
-                .iter()
-                .any(|sm| keys_of(sm).iter().any(|k| presence.contains(k) || *k == u.label))
-            {
+            if sms.iter().any(|sm| {
+                keys_of(sm)
+                    .iter()
+                    .any(|k| presence.contains(k) || *k == u.label)
+            }) {
                 to_today += 1;
                 continue;
             }
@@ -6438,7 +6631,9 @@ async fn the_reduced_input_answers_as_the_full_input() {
                 let rsm = match &u.metadata {
                     sql::MetadataSent::Text => sm.to_string(),
                     sql::MetadataSent::Projected { values, presence } => {
-                        let expr = pulsus_read::logql::predicate::metadata_names_projection(values, presence);
+                        let expr = pulsus_read::logql::predicate::metadata_names_projection(
+                            values, presence,
+                        );
                         let mut s = admin
                             .query_stream::<ProjectedMetadataRow>(
                                 &format!(
@@ -6486,7 +6681,9 @@ async fn the_reduced_input_answers_as_the_full_input() {
     };
     let mut answers = std::collections::HashMap::new();
     for case in &cases {
-        let query = case.query.replace("SEL", &format!("{{service_name={:?}}}", case.id));
+        let query = case
+            .query
+            .replace("SEL", &format!("{{service_name={:?}}}", case.id));
         answers.insert(
             case.id.clone(),
             group_key_answer(engine.query(&parse(&query).expect("parse"), &instant).await),
@@ -6497,7 +6694,12 @@ async fn the_reduced_input_answers_as_the_full_input() {
         .filter(|(f, r)| answers[f] != answers[r])
         .map(|(f, r)| format!("{f}: full {}, reduced {}", answers[f], answers[r]))
         .collect();
-    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
     drop_group_key_db(&admin, &db).await;
 }
 
@@ -6558,16 +6760,37 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
     corpora.insert(
         "H5B6",
         vec![
-            ("H5B-budget-quadratic-32761-2979".into(), quadratic_body(32_761, 2_979, "{\"latency\":5,")),
-            ("H5B-budget-quadratic-no-latency-32761-2979".into(), quadratic_body(32_761, 2_979, "{")),
-            ("H5B-budget-parser-accepts-32761-1022".into(), quadratic_body(32_761, 1_022, "{\"latency\":5,")),
-            ("H5B-budget-parser-refuses-32761-1023".into(), quadratic_body(32_761, 1_023, "{\"latency\":5,")),
-            ("H5B-budget-bound-within-20-1231".into(), quadratic_body(20, 1_231, "{\"latency\":5,")),
-            ("H5B-budget-bound-over-20-1232".into(), quadratic_body(20, 1_232, "{\"latency\":5,")),
+            (
+                "H5B-budget-quadratic-32761-2979".into(),
+                quadratic_body(32_761, 2_979, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-quadratic-no-latency-32761-2979".into(),
+                quadratic_body(32_761, 2_979, "{"),
+            ),
+            (
+                "H5B-budget-parser-accepts-32761-1022".into(),
+                quadratic_body(32_761, 1_022, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-parser-refuses-32761-1023".into(),
+                quadratic_body(32_761, 1_023, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-bound-within-20-1231".into(),
+                quadratic_body(20, 1_231, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-bound-over-20-1232".into(),
+                quadratic_body(20, 1_232, "{\"latency\":5,"),
+            ),
         ],
     );
     assert_eq!(
-        corpora.iter().map(|(k, v)| (*k, v.len())).collect::<Vec<_>>(),
+        corpora
+            .iter()
+            .map(|(k, v)| (*k, v.len()))
+            .collect::<Vec<_>>(),
         vec![("H5B6", 6), ("H6", 26), ("NAMED6", 1026)]
     );
 
@@ -6591,7 +6814,8 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
     let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
     let mut fp = 900_000u64;
     let mut group_meta: Vec<std::collections::HashMap<u64, StreamMetaRow>> = Vec::new();
-    let mut group_bodies: Vec<std::collections::HashMap<u64, (String, String, String)>> = Vec::new();
+    let mut group_bodies: Vec<std::collections::HashMap<u64, (String, String, String)>> =
+        Vec::new();
     for (name, corpus, stream, sm) in &groups {
         let mut labels = std::collections::BTreeMap::new();
         labels.insert("service_name".to_string(), name.clone());
@@ -6618,7 +6842,10 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                 },
             );
             bodies.insert(fp, (case.clone(), body.clone(), sm_text.clone()));
-            streams.push(format!("({month}, {fp}, '{name}', {}, 0)", literal(&labels_json).as_sql()));
+            streams.push(format!(
+                "({month}, {fp}, '{name}', {}, 0)",
+                literal(&labels_json).as_sql()
+            ));
             idx.push(format!("({month}, 'service_name', '{name}', {fp})"));
             rows.push(BucketedSeedRow {
                 service: name.clone(),
@@ -6655,7 +6882,10 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                 .await
                 .expect("idx");
         }
-        client.insert_block("log_samples", &rows).await.expect("rows");
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("rows");
         group_meta.push(meta);
         group_bodies.push(bodies);
     }
@@ -6664,42 +6894,126 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
     // rules from.
     let targeted = r#"json c="code", lat="latency", m="missing""#;
     let cells: [(&str, String); 20] = [
-        ("B", "sum(sum_over_time(SEL | json | unwrap latency [1m]))".into()),
-        ("BK", "sum by (a, a_b, code) (sum_over_time(SEL | json | unwrap latency [1m]))".into()),
-        ("BU", "sum by (_) (sum_over_time(SEL | json | unwrap latency [1m]))".into()),
-        ("BF", r#"sum(sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#.into()),
-        ("BN", "sum(sum_over_time(SEL | json | code > 100 | unwrap latency [1m]))".into()),
-        ("T plain", r#"sum_over_time(SEL | json latency="latency" | unwrap latency [1m])"#.into()),
-        ("T parent", r#"sum(sum_over_time(SEL | json latency="latency" | unwrap latency [1m]))"#.into()),
-        ("R plain", r#"sum_over_time(SEL | json lat="latency" | unwrap lat [1m])"#.into()),
-        ("R parent", r#"sum(sum_over_time(SEL | json lat="latency" | unwrap lat [1m]))"#.into()),
-        ("M plain", format!("sum_over_time(SEL | {targeted} | unwrap lat [1m])")),
-        ("M parent", format!("sum(sum_over_time(SEL | {targeted} | unwrap lat [1m]))")),
-        ("P plain", r#"sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m])"#.into()),
-        ("P parent", r#"sum(sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m]))"#.into()),
-        ("GBY1", "avg_over_time(SEL | json | unwrap latency [1m]) by (a)".into()),
-        ("GBY2", "avg_over_time(SEL | json | unwrap latency [1m]) by (a_b, code)".into()),
-        ("GBYS", "avg_over_time(SEL | json | unwrap latency [1m]) by (service_name)".into()),
-        ("GBYE", "avg_over_time(SEL | json | unwrap latency [1m]) by ()".into()),
-        ("GBU", "avg_over_time(SEL | json | unwrap latency [1m]) by (_)".into()),
-        ("GTBY", format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) by (c)")),
-        ("GTWO", format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) without (m)")),
+        (
+            "B",
+            "sum(sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BK",
+            "sum by (a, a_b, code) (sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BU",
+            "sum by (_) (sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BF",
+            r#"sum(sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#.into(),
+        ),
+        (
+            "BN",
+            "sum(sum_over_time(SEL | json | code > 100 | unwrap latency [1m]))".into(),
+        ),
+        (
+            "T plain",
+            r#"sum_over_time(SEL | json latency="latency" | unwrap latency [1m])"#.into(),
+        ),
+        (
+            "T parent",
+            r#"sum(sum_over_time(SEL | json latency="latency" | unwrap latency [1m]))"#.into(),
+        ),
+        (
+            "R plain",
+            r#"sum_over_time(SEL | json lat="latency" | unwrap lat [1m])"#.into(),
+        ),
+        (
+            "R parent",
+            r#"sum(sum_over_time(SEL | json lat="latency" | unwrap lat [1m]))"#.into(),
+        ),
+        (
+            "M plain",
+            format!("sum_over_time(SEL | {targeted} | unwrap lat [1m])"),
+        ),
+        (
+            "M parent",
+            format!("sum(sum_over_time(SEL | {targeted} | unwrap lat [1m]))"),
+        ),
+        (
+            "P plain",
+            r#"sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m])"#.into(),
+        ),
+        (
+            "P parent",
+            r#"sum(sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m]))"#.into(),
+        ),
+        (
+            "GBY1",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (a)".into(),
+        ),
+        (
+            "GBY2",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (a_b, code)".into(),
+        ),
+        (
+            "GBYS",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (service_name)".into(),
+        ),
+        (
+            "GBYE",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by ()".into(),
+        ),
+        (
+            "GBU",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (_)".into(),
+        ),
+        (
+            "GTBY",
+            format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) by (c)"),
+        ),
+        (
+            "GTWO",
+            format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) without (m)"),
+        ),
     ];
     // The design's decided / missing / undecided counts (§6.2; H5B from
     // revision 8, less its two flat bodies).
     let design_counts = |corpus: &str, form: &str| -> Option<(u64, u64, u64)> {
         let form = form.split(' ').next().unwrap_or(form);
         let named = [
-            ("B", (819, 6, 201)), ("BK", (594, 6, 426)), ("BU", (0, 6, 1020)), ("BF", (738, 6, 282)),
-            ("BN", (788, 6, 232)), ("T", (909, 12, 105)), ("R", (909, 12, 105)), ("M", (879, 12, 135)),
-            ("P", (9, 943, 74)), ("GBY1", (738, 6, 282)), ("GBY2", (654, 6, 366)), ("GBYS", (819, 6, 201)),
-            ("GBYE", (819, 6, 201)), ("GBU", (0, 6, 1020)), ("GTBY", (879, 12, 135)), ("GTWO", (879, 12, 135)),
+            ("B", (819, 6, 201)),
+            ("BK", (594, 6, 426)),
+            ("BU", (0, 6, 1020)),
+            ("BF", (738, 6, 282)),
+            ("BN", (788, 6, 232)),
+            ("T", (909, 12, 105)),
+            ("R", (909, 12, 105)),
+            ("M", (879, 12, 135)),
+            ("P", (9, 943, 74)),
+            ("GBY1", (738, 6, 282)),
+            ("GBY2", (654, 6, 366)),
+            ("GBYS", (819, 6, 201)),
+            ("GBYE", (819, 6, 201)),
+            ("GBU", (0, 6, 1020)),
+            ("GTBY", (879, 12, 135)),
+            ("GTWO", (879, 12, 135)),
         ];
         let h5b = [
-            ("B", (1, 0, 5)), ("BK", (1, 0, 5)), ("BU", (0, 0, 6)), ("BF", (1, 0, 5)), ("BN", (1, 0, 5)),
-            ("T", (5, 1, 0)), ("R", (5, 1, 0)), ("M", (5, 1, 0)), ("P", (0, 6, 0)), ("GBY1", (1, 0, 5)),
-            ("GBY2", (1, 0, 5)), ("GBYS", (1, 0, 5)), ("GBYE", (1, 0, 5)), ("GBU", (0, 0, 6)),
-            ("GTBY", (5, 1, 0)), ("GTWO", (5, 1, 0)),
+            ("B", (1, 0, 5)),
+            ("BK", (1, 0, 5)),
+            ("BU", (0, 0, 6)),
+            ("BF", (1, 0, 5)),
+            ("BN", (1, 0, 5)),
+            ("T", (5, 1, 0)),
+            ("R", (5, 1, 0)),
+            ("M", (5, 1, 0)),
+            ("P", (0, 6, 0)),
+            ("GBY1", (1, 0, 5)),
+            ("GBY2", (1, 0, 5)),
+            ("GBYS", (1, 0, 5)),
+            ("GBYE", (1, 0, 5)),
+            ("GBU", (0, 0, 6)),
+            ("GTBY", (5, 1, 0)),
+            ("GTWO", (5, 1, 0)),
         ];
         let table: &[(&str, (u64, u64, u64))] = match corpus {
             "NAMED6" => &named,
@@ -6737,7 +7051,9 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
     for (gi, (name, corpus, _, _)) in groups.iter().enumerate() {
         for (form, q) in &cells {
             let query = q.replace("SEL", &format!("{{service_name={name:?}}}"));
-            let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db)).expect("plan") {
+            let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db))
+                .expect("plan")
+            {
                 Plan::Metric(mp) => mp,
                 _ => panic!("{query}: a metric plan"),
             };
@@ -6781,7 +7097,12 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                     class: 0,
                     bucket_ns: t,
                     decided: 0,
-                    keys: probe.columns().keys.iter().map(|_| (0, String::new())).collect(),
+                    keys: probe
+                        .columns()
+                        .keys
+                        .iter()
+                        .map(|_| (0, String::new()))
+                        .collect(),
                     v: 0.0,
                     body: body.clone(),
                     fingerprint: *fp,
@@ -6792,7 +7113,9 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                 match returned.get(fp) {
                     None => {
                         missing += 1;
-                        if *corpus == "H6" && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json") {
+                        if *corpus == "H6"
+                            && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json")
+                        {
                             *h6_erroring.entry(format!("{case} missing")).or_default() += 1;
                         }
                         if body_answer != Ok(Vec::new()) {
@@ -6801,7 +7124,9 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                     }
                     Some(row) if row.decided == 0 => {
                         undecided += 1;
-                        if *corpus == "H6" && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json") {
+                        if *corpus == "H6"
+                            && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json")
+                        {
                             *h6_erroring.entry(format!("{case} undecided")).or_default() += 1;
                         }
                     }
@@ -6829,8 +7154,22 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
             }
         }
     }
-    assert_eq!(comparisons, 1026 * 180 + 26 * 180 + 6 * 20, "row–form comparisons");
-    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
+    assert_eq!(
+        comparisons,
+        1026 * 180 + 26 * 180 + 6 * 20,
+        "row–form comparisons"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     // Over the 180 H6 cells, the two erroring bodies are never decided: an
     // unconvertible latency is undecided except in the 18 P cells, whose path
     // `req.latency` is absent from it (missing, so it contributes nothing on

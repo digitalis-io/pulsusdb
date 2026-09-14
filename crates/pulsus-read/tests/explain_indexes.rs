@@ -2902,10 +2902,7 @@ async fn the_group_key_read_selects_the_raw_scans_granules() {
     for (what, sql) in [("S1", &s1), ("L", &lane)] {
         let got = primary_key_granules(&explain_raw(&client, sql).await)
             .unwrap_or_else(|| panic!("{what}: a PrimaryKey Granules line"));
-        assert_eq!(
-            got, raw_granules,
-            "{what} selects the raw scan's granules"
-        );
+        assert_eq!(got, raw_granules, "{what} selects the raw scan's granules");
     }
     drop_database(&client, db).await;
 }

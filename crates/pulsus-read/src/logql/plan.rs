@@ -1937,9 +1937,10 @@ fn unwrapped_key_route(
     let declared: Vec<String> = keys.iter().map(|k| k.label.clone()).collect();
     let (classes, metadata) = match own {
         None => (sql::ClassNames::PerFingerprint, sql::MetadataSent::Text),
-        Some(RangeGrouping::Without(names)) => {
-            (sql::ClassNames::Without(names.clone()), sql::MetadataSent::Text)
-        }
+        Some(RangeGrouping::Without(names)) => (
+            sql::ClassNames::Without(names.clone()),
+            sql::MetadataSent::Text,
+        ),
         Some(RangeGrouping::Singleton) | Some(RangeGrouping::By(_)) => {
             let by = match own {
                 Some(RangeGrouping::By(names)) => names.clone(),
@@ -1984,9 +1985,11 @@ fn unwrapped_key_route(
 /// ```
 ///
 /// `parent_sum` is the reference handing a parent `sum`'s grouping to the
-/// range step; `hints` is the reference's parser hints over the grouping the
-/// sample extractor receives, reduced to the two reserved names. (Citations:
-/// the reference at the pinned tag.)
+/// range step (`pkg/logql/syntax/ast.go:1612-1642 @ v3.7.4`); `hints` is the
+/// reference's parser hints over the grouping the sample extractor receives
+/// (`pkg/logql/log/parser_hints.go:145-189`, built at
+/// `pkg/logql/log/metrics_extraction.go:66-68` and `:162-168`), reduced to
+/// the two reserved names.
 pub(in crate::logql) fn range_step_rules(
     op: RangeAggOp,
     pipeline: &[Stage],
@@ -2021,10 +2024,13 @@ pub(in crate::logql) fn range_step_rules(
         && (groups.is_empty() || without)
     {
         // The reference's unwrap extractor rewrites an empty or `without`
-        // grouping into a `without` naming the unwrapped label.
+        // grouping into a `without` naming the unwrapped label
+        // (`pkg/logql/log/metrics_extraction.go:162-166 @ v3.7.4`).
         without = true;
         groups.push(label);
     }
+    // A required name matches with or without `_extracted`
+    // (`pkg/logql/log/parser_hints.go:207-215 @ v3.7.4`).
     let names_required = |name: &str| {
         stages_require(op, pipeline, name)
             || groups
@@ -2050,7 +2056,8 @@ pub(in crate::logql) fn range_step_rules(
 }
 
 /// The grouping of a `sum` directly above the range aggregation, when the
-/// reference hands it to the range step: `Some(None)` for a bare `sum`
+/// reference hands it to the range step (`canInjectVectorGrouping`,
+/// `pkg/logql/syntax/ast.go:1632-1642 @ v3.7.4`): `Some(None)` for a bare `sum`
 /// (whose empty grouping the reference treats as a singleton),
 /// `Some(Some(g))` for `sum by`/`sum without`, `None` when nothing is handed.
 fn parent_sum_grouping(
@@ -2124,11 +2131,15 @@ fn stages_require(op: RangeAggOp, pipeline: &[Stage], name: &str) -> bool {
     found
 }
 
-/// The labels the reference's stages require, after its optimiser has
-/// removed the `line_format` stages a metric query does not need: label
-/// filters (a `=~` whose pattern is the match-all `.*` or empty is a no-op
-/// filter and requires nothing), `label_format` sources and template fields,
-/// `line_format` template fields, and `ip()` filters. Templates are handed to
+/// The labels the reference's stages require
+/// (`pkg/logql/log/pipeline.go:351-358 @ v3.7.4`), after its optimiser has
+/// removed the `line_format` stages a metric query does not need
+/// (`pkg/logql/optimize.go:53-110`): label filters (a `=~` whose pattern is
+/// the match-all `.*` or empty is a no-op filter and requires nothing,
+/// `pkg/logql/log/label_filter.go:360-368`), `label_format` sources and
+/// template fields (`pkg/logql/log/fmt.go:436-446`), `line_format` template
+/// fields (`pkg/logql/log/fmt.go:260-316`), and `ip()` filters
+/// (`pkg/logql/log/ip.go:113-115`). Templates are handed to
 /// `each` as their field names via [`super::template::names_field`], so
 /// `each` sees the reserved names only.
 fn each_required_label(op: RangeAggOp, pipeline: &[Stage], each: &mut dyn FnMut(&str)) {
@@ -7815,23 +7826,46 @@ mod tests {
 
         // --- the key-route shapes -----------------------------------
         let t = lowers(r#"sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m])"#);
-        assert_eq!((t.form, t.path.clone(), t.keys.len()), (sql::UnwrapForm::Targeted, vec!["latency".to_string()], 0));
-        assert_eq!((t.classes, t.metadata), (sql::ClassNames::PerFingerprint, sql::MetadataSent::Text));
+        assert_eq!(
+            (t.form, t.path.clone(), t.keys.len()),
+            (sql::UnwrapForm::Targeted, vec!["latency".to_string()], 0)
+        );
+        assert_eq!(
+            (t.classes, t.metadata),
+            (sql::ClassNames::PerFingerprint, sql::MetadataSent::Text)
+        );
         let r = lowers(r#"sum_over_time({a="b"} | json lat="latency" | unwrap lat [1m])"#);
-        assert_eq!((r.label.as_str(), r.path.clone()), ("lat", vec!["latency".to_string()]));
-        let m = lowers(r#"sum_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m])"#);
+        assert_eq!(
+            (r.label.as_str(), r.path.clone()),
+            ("lat", vec!["latency".to_string()])
+        );
+        let m = lowers(
+            r#"sum_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m])"#,
+        );
         assert_eq!(
             m.keys,
             vec![
-                sql::UnwrapKeyLabel { label: "c".to_string(), source: "code".to_string() },
-                sql::UnwrapKeyLabel { label: "m".to_string(), source: "missing".to_string() },
+                sql::UnwrapKeyLabel {
+                    label: "c".to_string(),
+                    source: "code".to_string()
+                },
+                sql::UnwrapKeyLabel {
+                    label: "m".to_string(),
+                    source: "missing".to_string()
+                },
             ]
         );
         let p = lowers(r#"sum_over_time({a="b"} | json lat="req.latency" | unwrap lat [1m])"#);
         assert_eq!(p.path, vec!["req".to_string(), "latency".to_string()]);
-        lowers(r#"sum by (a) (sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m]))"#);
-        lowers(r#"sum_over_time({a="b"} |= "boom" | json latency="latency" | unwrap latency [1m])"#);
-        let gtby = lowers(r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) by (c)"#);
+        lowers(
+            r#"sum by (a) (sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m]))"#,
+        );
+        lowers(
+            r#"sum_over_time({a="b"} |= "boom" | json latency="latency" | unwrap latency [1m])"#,
+        );
+        let gtby = lowers(
+            r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) by (c)"#,
+        );
         assert_eq!(
             gtby.classes,
             sql::ClassNames::Projected(vec!["c".to_string(), "lat".to_string(), "m".to_string()])
@@ -7840,23 +7874,53 @@ mod tests {
             gtby.metadata,
             sql::MetadataSent::Projected {
                 values: vec!["c".to_string(), "m".to_string()],
-                presence: vec!["__error__".to_string(), "__error_details__".to_string(), "lat".to_string()],
+                presence: vec![
+                    "__error__".to_string(),
+                    "__error_details__".to_string(),
+                    "lat".to_string()
+                ],
             }
         );
-        let gtwo = lowers(r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) without (m)"#);
-        assert_eq!((gtwo.classes, gtwo.metadata), (sql::ClassNames::Without(vec!["m".to_string()]), sql::MetadataSent::Text));
+        let gtwo = lowers(
+            r#"avg_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m]) without (m)"#,
+        );
+        assert_eq!(
+            (gtwo.classes, gtwo.metadata),
+            (
+                sql::ClassNames::Without(vec!["m".to_string()]),
+                sql::MetadataSent::Text
+            )
+        );
         let b = lowers(r#"sum(sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
         assert_eq!((b.form, b.keys.len()), (sql::UnwrapForm::Bare, 0));
         let bk = lowers(r#"sum by (status) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
-        assert_eq!(bk.keys, vec![sql::UnwrapKeyLabel { label: "status".to_string(), source: "status".to_string() }]);
-        assert_eq!(bk.classes, sql::ClassNames::Projected(vec!["latency".to_string(), "status".to_string()]));
+        assert_eq!(
+            bk.keys,
+            vec![sql::UnwrapKeyLabel {
+                label: "status".to_string(),
+                source: "status".to_string()
+            }]
+        );
+        assert_eq!(
+            bk.classes,
+            sql::ClassNames::Projected(vec!["latency".to_string(), "status".to_string()])
+        );
         lowers(r#"topk(1, sum by (status) (sum_over_time({a="b"} | json | unwrap latency [1m])))"#);
         lowers(r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by (a)"#);
         lowers(r#"avg_over_time({a="b"} | json | unwrap latency [1m]) by ()"#);
-        lowers(r#"sum by (method) (avg_over_time({a="b"} | json | unwrap latency [1m]) by (method, status))"#);
-        let bf = lowers(r#"sum by (service_name) (sum_over_time({a="b"} | json | a="x" | unwrap latency [1m]))"#);
-        assert_eq!(bf.keys.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), vec!["a", "service_name"]);
-        lowers(r#"sum by (service_name) (sum_over_time({a="b"} | json | code > 100 | unwrap latency [1m]))"#);
+        lowers(
+            r#"sum by (method) (avg_over_time({a="b"} | json | unwrap latency [1m]) by (method, status))"#,
+        );
+        let bf = lowers(
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | a="x" | unwrap latency [1m]))"#,
+        );
+        assert_eq!(
+            bf.keys.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(),
+            vec!["a", "service_name"]
+        );
+        lowers(
+            r#"sum by (service_name) (sum_over_time({a="b"} | json | code > 100 | unwrap latency [1m]))"#,
+        );
 
         // --- refused chains (§9 r61–r86, and the rows that follow; r60 is a
         // parse error and never reaches a route) ---

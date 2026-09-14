@@ -2104,7 +2104,11 @@ fn logfmt_expression_skips_a_renamed_repeat_and_reads_on() {
         let (got, _) = run(q, line).expect("kept");
         assert_eq!(
             got,
-            labels(&[("app", "checkout"), ("env", "prod"), ("env_extracted", want)]),
+            labels(&[
+                ("app", "checkout"),
+                ("env", "prod"),
+                ("env_extracted", want)
+            ]),
             "{line}"
         );
     }

@@ -2535,7 +2535,12 @@ mod tests {
             // before today's route starts, and L's fold starts only after
             // today's route has refused and dropped its state, so no two of
             // them are live at once. `LEAF_COUNTERS.group_bytes` stays 2.
-            ("unwrap_group.rs", "charge_group_bytes", "&mut self.charged", 2),
+            (
+                "unwrap_group.rs",
+                "charge_group_bytes",
+                "&mut self.charged",
+                2,
+            ),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.

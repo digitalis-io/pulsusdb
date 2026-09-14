@@ -1446,7 +1446,10 @@ async fn detected_fields_classify_a_line_as_json_exactly_when_json_reads_it() {
             structured_metadata: String::new(),
         });
     }
-    client.insert_block("log_samples", &rows).await.expect("seed");
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("seed");
     let start = now - 3_600_000_000_000;
     let end = now + 3_600_000_000_000;
     let mut got = Vec::new();

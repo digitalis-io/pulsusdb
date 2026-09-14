@@ -221,9 +221,7 @@ fn live_the_committed_reference_labels_match_the_reference() {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset; skipping the live logfmt token-scan matrix");
         return;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
     let app = format!("lf507-{}", now.as_secs());
     let lines = lines();
     // One stream, one entry per line, 1 ms apart and ending a minute ago.
