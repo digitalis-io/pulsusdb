@@ -481,19 +481,19 @@ mod tests {
     #[test]
     fn this_modules_source_carries_no_raw_control_bytes() {
         let src = include_str!("canonical_labels.rs");
-        let found: Vec<(usize, u32)> = src
+        let found: Vec<String> = src
             .lines()
             .enumerate()
             .flat_map(|(i, line)| {
                 line.chars()
                     .filter(|c| c.is_control())
-                    .map(move |c| (i + 1, c as u32))
+                    .map(move |c| format!("line {} holds U+{:04X}", i + 1, c as u32))
             })
             .collect();
         assert!(
             found.is_empty(),
-            "raw control character(s) at (line, code point): {found:04X?} — write the escape \
-             instead; a control character in this file is invisible in a diff"
+            "raw control character(s): {found:?} — write the escape instead; a control \
+             character in this file is invisible in a diff and in a terminal"
         );
     }
 
