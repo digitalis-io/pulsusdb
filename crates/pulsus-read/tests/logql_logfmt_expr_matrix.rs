@@ -1400,6 +1400,15 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              it refuses here rather than at a pipeline compile",
         ),
         (
+            "unwrap_group.rs",
+            1,
+            0,
+            "the test-only group key probe (`group_key_probe`, issue #507) compiles the \
+             pipeline the planner admitted for the extracted-field group key read, for the \
+             agreement measurement; that pipeline is a `json` stage, label filters and an \
+             `unwrap`, so no logfmt expression can be in it, and no position here reaches it",
+        ),
+        (
             "variants.rs",
             1,
             1,
