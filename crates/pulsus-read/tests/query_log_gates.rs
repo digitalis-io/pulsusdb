@@ -4840,3 +4840,297 @@ async fn the_group_key_read_agrees_with_the_client_path() {
         .await
         .expect("drop the run database");
 }
+
+/// **Criteria 29 and 42: reserved label names answer as the pinned reference
+/// build answers, on every metric route** (issue #507).
+///
+/// One stream per source of a reserved name, one row each, an hour back:
+///
+/// ```text
+/// fp 901  {__error__="s", service_name="rn1"}   {"latency":5}                     stream label
+/// fp 902  {service_name="rn2"}                   {"latency":5,"__error__":"boom"}  a field in the line
+/// fp 903  {service_name="rn3"}                   {garbage}  metadata __preserve_error__=true
+/// fp 904  {service_name="rn4"}                   {garbage}
+/// fp 905  {service_name="k3"}                    {"latency":"abc"}  metadata __preserve_error__=true
+/// fp 906  {service_name="k4"}                    {"latency":"abc","__preserve_error__":"true"}
+/// ```
+///
+/// Each query's route is asserted from its plan before its answer, so a
+/// query that stopped reaching its fold would fail here rather than pass on
+/// another path. Every expected answer was captured from the pinned
+/// reference build (issue #507, the reserved-name tables, and revision 10's
+/// k rows).
+#[tokio::test]
+async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_rn_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("db");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let streams = [
+        (
+            901u64,
+            "rn1",
+            r#"{"__error__":"s","service_name":"rn1"}"#,
+            r#"{"latency":5}"#,
+            "",
+        ),
+        (
+            902u64,
+            "rn2",
+            r#"{"service_name":"rn2"}"#,
+            r#"{"latency":5,"__error__":"boom"}"#,
+            "",
+        ),
+        (
+            903u64,
+            "rn3",
+            r#"{"service_name":"rn3"}"#,
+            "{garbage",
+            r#"{"__preserve_error__":"true"}"#,
+        ),
+        (904u64, "rn4", r#"{"service_name":"rn4"}"#, "{garbage", ""),
+        (
+            905u64,
+            "k3",
+            r#"{"service_name":"k3"}"#,
+            r#"{"latency":"abc"}"#,
+            r#"{"__preserve_error__":"true"}"#,
+        ),
+        (
+            906u64,
+            "k4",
+            r#"{"service_name":"k4"}"#,
+            r#"{"latency":"abc","__preserve_error__":"true"}"#,
+            "",
+        ),
+    ];
+    let mut rows = Vec::new();
+    for (fp, service, labels, body, sm) in streams {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                     VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 'service_name', '{service}', {fp})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams_idx");
+        rows.push(BucketedSeedRow {
+            service: service.to_string(),
+            fingerprint: fp,
+            timestamp_ns: t - 10_000_000_000,
+            severity: 0,
+            body: body.to_string(),
+            structured_metadata: sm.to_string(),
+        });
+    }
+    client.insert_block("log_samples", &rows).await.expect("insert");
+
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: t },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    #[derive(Debug, PartialEq)]
+    enum Route {
+        Client,
+        Lowered,
+    }
+    let route = |query: &str, params: &QueryParams| match plan(
+        &parse(query).expect("parse"),
+        params,
+        &plan_ctx(&db),
+    )
+    .expect("plan")
+    {
+        Plan::Metric(mp) if mp.client.is_some() => Route::Client,
+        Plan::Metric(_) => Route::Lowered,
+        _ => panic!("{query}: a metric plan"),
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let render = |labels: &[(String, String)]| {
+        let mut l = labels.to_vec();
+        l.sort();
+        format!(
+            "{{{}}}",
+            l.iter()
+                .map(|(k, v)| format!("{k}={v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    // (query, params, route, the reference's answer)
+    let cases: [(&str, &QueryParams, Route, &str); 12] = [
+        (
+            r#"sum by (latency) (sum_over_time({service_name="rn1"} | json latency="latency" | unwrap latency [1m]))"#,
+            &range,
+            Route::Client,
+            r#"{latency="5"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn1"} [1m]))"#,
+            &instant,
+            Route::Lowered,
+            r#"{service_name="rn1"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn1"} [1m]))"#,
+            &range,
+            Route::Lowered,
+            r#"{service_name="rn1"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn1"} | json latency="latency" | unwrap latency [1m]))"#,
+            &range,
+            Route::Lowered,
+            r#"{service_name="rn1"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn2"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{service_name="rn2"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn2"} | json | unwrap latency [5m]))"#,
+            &range,
+            Route::Client,
+            r#"{service_name="rn2"} 5"#,
+        ),
+        (
+            r#"count_over_time({service_name="rn3"} | json [5m])"#,
+            &instant,
+            Route::Client,
+            r#"{__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", __preserve_error__="true", service_name="rn3"} 1"#,
+        ),
+        (
+            r#"sum by (__error__) (count_over_time({service_name="rn4"} | json [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{__error__="JSONParserErr"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn4"} | json | __error__!="" [5m]))"#,
+            &range,
+            Route::Client,
+            r#"{service_name="rn4"} 1"#,
+        ),
+        (
+            r#"count_over_time({service_name="rn1"} [1m])"#,
+            &instant,
+            Route::Lowered,
+            "400 pipeline error: 's'",
+        ),
+        // Revision 10's k3.00 and k4.00 on the client path: a preserved
+        // failed conversion counts zero (R2); a parsed `__preserve_error__`
+        // not required by the hints is skipped (R4), so k4's error fails the
+        // query.
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="k3"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{service_name="k3"} 0"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="k4"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            "400 pipeline error: 'SampleExtractionErr'",
+        ),
+    ];
+    for (query, params, want_route, want) in cases {
+        assert_eq!(route(query, params), want_route, "{query}: the route");
+        let got = match engine.query(&parse(query).expect("parse"), params).await {
+            Ok((QueryResult::Vector(v), _)) => v
+                .iter()
+                .map(|s| format!("{} {}", render(&s.labels), s.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {}",
+                        render(&s.labels),
+                        s.points
+                            .iter()
+                            .map(|(_, v)| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => panic!("{query}: {other:?}"),
+            Err(ReadError::MetricPipelineError { error_type, series }) => {
+                assert!(
+                    !series.contains("__preserve_error__"),
+                    "{query}: a parsed __preserve_error__ the hints do not require is skipped: {series}"
+                );
+                format!("400 pipeline error: '{error_type}'")
+            }
+            Err(e) => panic!("{query}: {e}"),
+        };
+        assert_eq!(got, want, "{query}");
+    }
+    // A `variants(...)` sub-state takes its variant's parent `sum` (the
+    // reference, `variants(sum by (service_name) (count_over_time({…} [5m])))
+    // of ({…} | json [5m])` over a line with a `__error__` field:
+    // `{__variant__="0", service_name=…} 1`).
+    let variants = r#"variants(sum by (service_name) (count_over_time({service_name="rn2"} [5m]))) of ({service_name="rn2"} | json [5m])"#;
+    let got = match engine.query(&parse(variants).expect("parse"), &instant).await {
+        Ok((QueryResult::Vector(v), _)) => v
+            .iter()
+            .map(|s| format!("{} {}", render(&s.labels), s.value))
+            .collect::<Vec<_>>()
+            .join("; "),
+        Ok((other, _)) => panic!("{variants}: {other:?}"),
+        Err(e) => panic!("{variants}: {e}"),
+    };
+    assert_eq!(got, r#"{__variant__="0", service_name="rn2"} 1"#, "{variants}");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
