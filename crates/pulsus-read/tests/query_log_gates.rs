@@ -6127,6 +6127,242 @@ async fn group_key_shard_statements(
     out
 }
 
+/// **Criterion 49: lane L keeps an error row's ungrouped labels** (issue
+/// #507 addendum 4 §D2).
+///
+/// A row whose `__error__` slot is set keeps the labels it had, exactly as
+/// the range step keeps them, so the query fails with that row's series —
+/// the same failure today's route reports, from the same data.
+///
+/// ```text
+/// T0        +60s        +120s        +177s +180s
+/// |-----------|------------|-------------xxx-|
+///   request lines on both pods, 20/s      x = the three error lines (pod 1002)
+/// W2 points:  *            *
+/// W3 points:  *            *                  *
+/// the lowered ceiling refuses inside the first 120 s, before any x
+/// ```
+///
+/// | run | ceiling | window | route | answer |
+/// |---|---|---|---|---|
+/// | (a) | shipped | W3 | S1 395, today's raw scan, no L | the pipeline error, series E177 |
+/// | (b) | lowered | W2 | S1 395, raw, then L | today's route's answer at the shipped ceiling |
+/// | (c) | lowered | W3 | S1 395, raw, then L | the pipeline error, series one of E177–E179 |
+/// | (c′) | — | — | — | (c)'s text with its series put back to (a)'s equals (a)'s |
+///
+/// `T0` and both window bounds are whole multiples of the step, asserted
+/// rather than assumed: an unaligned window is answered on a different grid
+/// by the reference (ledger `frontend-step-alignment`), which would compare
+/// two different grids.
+#[tokio::test]
+async fn the_lane_keeps_an_error_row_ungrouped() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    // The ceiling at which today's route refuses inside the first two
+    // minutes of this corpus, before any error line. Measured below by the
+    // test itself: both windows refuse.
+    const LOWERED_GROUP_BYTES: u64 = 1;
+    let (admin, _client, db) = group_key_db("gk_lane_err").await;
+    let t0 = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    assert_eq!(t0 % MIN, 0, "T0 is a whole multiple of the step");
+
+    // Two streams, 1,800 request lines each, one every 100 ms over
+    // (T0, T0+180 s]. Every `request_id` is different and every `status` is
+    // `0.200`, so every row is undecided on the key route.
+    for pod in [1001u64, 1002u64] {
+        seed_one_stream(
+            &admin,
+            &db,
+            t0,
+            pod,
+            "checkout",
+            &format!("checkout-{pod}"),
+            &format!(
+                "SELECT {t0} + number * 100000000 + 50000000 AS ts, \
+                 concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64({pod}, number))), \
+                 lower(hex(cityHash64(number, {pod}))), \
+                 '\",\"service\":\"checkout\",\"method\":\"', ['GET','POST'][number % 2 + 1], \
+                 '\",\"status\":0.200,\"path\":\"', ['/cart','/checkout','/items'][number % 3 + 1], \
+                 '\",\"latency\":', toString(5 + cityHash64(number, {pod}) % 496), '}}') AS body \
+                 FROM numbers(1800)"
+            ),
+        )
+        .await;
+    }
+    // Three error lines on pod 1002, at T0+177.075 s, +178.075 s and
+    // +179.075 s: a timed-out request, whose `latency` is the string `n/a`.
+    // Their `request_id`s are the ones the plan measured.
+    let err_ids = [
+        (177i64, "29bcab778732ded776228be2ccf48c4a"),
+        (178, "09a0625ad8dfcf64eaac7929d2030284"),
+        (179, "0e135bc3a9ca6dd103d7b196f18022bb"),
+    ];
+    for (second, id) in err_ids {
+        let ts = t0 + second * 1_000_000_000 + 75_000_000;
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                     SELECT 'checkout', 1002, {ts}, 0, \
+                     concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(toInt64({ts})), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                     '\",\"request_id\":\"{id}\",\"service\":\"checkout\",\"method\":\"POST\",\
+\"status\":0.200,\"path\":\"/checkout\",\"latency\":\"n/a\"}}')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed an error line");
+    }
+
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+    let expr = parse(query).expect("parse");
+    let window = |end_s: i64| {
+        assert_eq!(
+            (60 * 1_000_000_000i64) % MIN,
+            0,
+            "the window's start is a whole multiple of the step"
+        );
+        assert_eq!(
+            (end_s * 1_000_000_000) % MIN,
+            0,
+            "the window's end is a whole multiple of the step"
+        );
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t0 + 60 * 1_000_000_000,
+                end_ns: t0 + end_s * 1_000_000_000,
+                step_ns: MIN as u64,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        }
+    };
+    let w3 = window(180);
+    let w2 = window(120);
+    let shipped = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
+    let lowered = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    )
+    .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+        todays_route_group_bytes: Some(LOWERED_GROUP_BYTES),
+        key_statement_test_knobs: None,
+    });
+
+    // (a) the shipped ceiling at W3: the query fails on the first error line
+    // today's route reads, and no L runs.
+    let from = server_micros(&admin).await;
+    let a = shipped.query(&expr, &w3).await;
+    let to = server_micros(&admin).await + 1;
+    let (a_type, a_series) = match &a {
+        Err(ReadError::MetricPipelineError { error_type, series }) => {
+            (error_type.clone(), series.clone())
+        }
+        other => panic!("(a): the pipeline error, got {other:?}"),
+    };
+    assert_eq!(a_type, "SampleExtractionErr", "(a)");
+    assert!(
+        a_series.contains(&format!("request_id=\"{}\"", err_ids[0].1)),
+        "(a): the first error line's series, got {a_series}"
+    );
+    assert_eq!(
+        group_key_statements_between(&admin, &db, from, to, 2).await,
+        vec![(GroupKeyStatement::Key, 395), (GroupKeyStatement::Raw, 0),],
+        "(a): S1 throws and today's raw scan answers; no L"
+    );
+
+    // The lowered ceiling is what makes (b) and (c) reach L: today's route
+    // refuses on its retained-label ceiling inside the first two minutes,
+    // before any error line, and that refusal is the only way in. Each run
+    // below asserts it through `system.query_log`, where the refusal shows
+    // as today's raw scan followed by L.
+
+    // (b) the lowered ceiling at W2: L answers, and its answer is today's
+    // route's at the shipped ceiling.
+    let today_w2 = matrix_bits(shipped.query(&expr, &w2).await)
+        .expect("(b): today's route answers W2 at the shipped ceiling");
+    let from = server_micros(&admin).await;
+    let b = matrix_bits(lowered.query(&expr, &w2).await).expect("(b): L answers W2");
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(
+        b.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+        vec![vec![("status".to_string(), "0.2".to_string())]],
+        "(b): one series, `status=\"0.2\"`"
+    );
+    assert_eq!(
+        b, today_w2,
+        "(b): L's answer is today's route's, bit for bit"
+    );
+    assert_eq!(
+        group_key_statements_between(&admin, &db, from, to, 3).await,
+        vec![
+            (GroupKeyStatement::Key, 395),
+            (GroupKeyStatement::Raw, 0),
+            (GroupKeyStatement::Lane, 0),
+        ],
+        "(b): S1 throws, today's route refuses on its ceiling, and L answers"
+    );
+
+    // (c) the lowered ceiling at W3: L reaches an error row, and that row
+    // keeps its ungrouped labels, so the query fails with its series.
+    let from = server_micros(&admin).await;
+    let c = lowered.query(&expr, &w3).await;
+    let to = server_micros(&admin).await + 1;
+    let (c_type, c_series) = match &c {
+        Err(ReadError::MetricPipelineError { error_type, series }) => {
+            (error_type.clone(), series.clone())
+        }
+        other => panic!("(c): the pipeline error, got {other:?}"),
+    };
+    assert_eq!(c_type, "SampleExtractionErr", "(c)");
+    assert!(
+        err_ids
+            .iter()
+            .any(|(_, id)| c_series.contains(&format!("request_id=\"{id}\""))),
+        "(c): one of the three error lines' series, got {c_series}"
+    );
+    assert!(
+        c_series.contains("__error__=\"SampleExtractionErr\"")
+            && c_series.contains("latency=\"n/a\"")
+            && c_series.contains("pod=\"checkout-1002\""),
+        "(c): the row's ungrouped labels, got {c_series}"
+    );
+    let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
+    assert_eq!(
+        statements,
+        vec![
+            (GroupKeyStatement::Key, 395),
+            (GroupKeyStatement::Raw, 0),
+            (GroupKeyStatement::Lane, 0),
+        ],
+        "(c): the error came from L, not from today's route"
+    );
+
+    // (c′) the two failures are the same response: equal variants, and equal
+    // text once (c)'s series is put back to (a)'s. The logs API renders
+    // `to_string()` into the body, so equal text is an equal response.
+    let c_as_a = ReadError::MetricPipelineError {
+        error_type: c_type,
+        series: a_series.clone(),
+    };
+    assert_eq!(
+        c_as_a.to_string(),
+        ReadError::MetricPipelineError {
+            error_type: a_type,
+            series: a_series,
+        }
+        .to_string(),
+        "(c′): the same failure, reported from whichever error row the read reached first"
+    );
+
+    drop_group_key_db(&admin, &db).await;
+}
+
 /// **Criterion 31: a timeout of the key statement is the timeout response**
 /// (issue #507, owner ruling: no race, no fallback).
 ///
