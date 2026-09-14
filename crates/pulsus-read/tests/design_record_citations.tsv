@@ -204,7 +204,7 @@ docs/query-to-sql.md	escape.rs:83-92	crates/pulsus-read/src/logql/escape.rs	83	9
 docs/query-to-sql.md	escape.rs:93	crates/pulsus-read/src/logql/escape.rs	93		line	pub fn ch_like_contains(needle: &str) -> String {
 docs/query-to-sql.md	escape.rs:93-105	crates/pulsus-read/src/logql/escape.rs	93	105	line	pub fn ch_like_contains(needle: &str) -> String { let mut pattern = String::with_capacity(needle.len() + 2); pattern.pus
 docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		prose	\\%
-docs/query-to-sql.md	exec.rs:1727	crates/pulsus-read/src/logql/exec.rs	1727		prose	run_unwrapped_range
+docs/query-to-sql.md	exec.rs:1728	crates/pulsus-read/src/logql/exec.rs	1728		prose	run_unwrapped_range
 docs/query-to-sql.md	exec.rs:3421	crates/pulsus-read/src/traces/exec.rs	3421		prose	reduce
 docs/query-to-sql.md	filter.rs:76-79	crates/pulsus-read/src/traces/filter.rs	76	79	prose	unsupported field:
 docs/query-to-sql.md	filter.rs:817	crates/pulsus-read/src/traces/filter.rs	817		line	/// fragment. Fallible for the same reason as [`physical_sql`] (issue
@@ -323,8 +323,8 @@ docs/query-to-sql.md	sql.rs:1232	crates/pulsus-read/src/logql/sql.rs	1232		prose
 docs/query-to-sql.md	sql.rs:1247	crates/pulsus-read/src/logql/sql.rs	1247		prose	timestamp_ns
 docs/query-to-sql.md	sql.rs:1253	crates/pulsus-read/src/logql/sql.rs	1253		prose	ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 docs/query-to-sql.md	sql.rs:1305	crates/pulsus-read/src/logql/sql.rs	1305		prose	metric_range_bucketed
-docs/query-to-sql.md	sql.rs:1547	crates/pulsus-read/src/logql/sql.rs	1547		prose	metric_range_unwrapped
-docs/query-to-sql.md	sql.rs:1607	crates/pulsus-read/src/logql/sql.rs	1607		prose	metric_range_unwrapped_rows
+docs/query-to-sql.md	sql.rs:1557	crates/pulsus-read/src/logql/sql.rs	1557		prose	metric_range_unwrapped
+docs/query-to-sql.md	sql.rs:1620	crates/pulsus-read/src/logql/sql.rs	1620		prose	metric_range_unwrapped_rows
 docs/query-to-sql.md	sql.rs:482	crates/pulsus-read/src/logql/sql.rs	482		prose	stage1
 docs/query-to-sql.md	sql.rs:519	crates/pulsus-read/src/logql/sql.rs	519		prose	probe
 docs/query-to-sql.md	sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		prose	stage2

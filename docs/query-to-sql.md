@@ -131,8 +131,8 @@ was nine and every range metric query read raw lines.
 | `metric_raw_samples` | `sql.rs:1184` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
 | `metric_raw_samples_sliding` | `sql.rs:1232` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
 | `metric_range_bucketed` | `sql.rs:1305` | `log_samples` | a range `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose range equals its step, with no stage beyond a line filter (issue #507 W2) |
-| `metric_range_unwrapped` | `sql.rs:1547` | `log_samples` | S1, the extracted-field group key statement: a range `sum_over_time` or `avg_over_time` over `\| json … \| unwrap <n>` in one of the chains below, whose range equals its step (issue #507) |
-| `metric_range_unwrapped_rows` | `sql.rs:1607` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
+| `metric_range_unwrapped` | `sql.rs:1557` | `log_samples` | S1, the extracted-field group key statement: a range `sum_over_time` or `avg_over_time` over `\| json … \| unwrap <n>` in one of the chains below, whose range equals its step (issue #507) |
+| `metric_range_unwrapped_rows` | `sql.rs:1620` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
 | `probe` | `sql.rs:519` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
 The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:761` and `:810`;
@@ -215,7 +215,7 @@ GROUP BY fingerprint, bucket_ns, structured_metadata
 ```
 
 **The extracted-field group key** (`metric_range_unwrapped` and `metric_range_unwrapped_rows`, routed by
-`unwrapped_key_route`, `plan.rs:1780`; run by `run_unwrapped_range`, `exec.rs:1727`; issue #507). A
+`unwrapped_key_route`, `plan.rs:1780`; run by `run_unwrapped_range`, `exec.rs:1728`; issue #507). A
 range `sum_over_time` or `avg_over_time` with no conversion and nothing after `| unwrap`, a range equal
 to the step, pushable line filters, then one of these chains:
 
@@ -245,14 +245,14 @@ missing    no value at the path, no spelling of it, the document is valid: dropp
 undecided  anything else
 ```
 
-**S1, the key statement** (`sql.rs:1547`), for
+**S1, the key statement** (`sql.rs:1557`), for
 `sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))` over two
 streams in one class, one hour, step 1m. The inner level's reader columns are elided here; the full
 text of this statement and of L below is committed in
 `crates/pulsus-read/tests/golden/unwrapped_statements.txt`:
 
 ```sql
--- emitted today, sql.rs:1547
+-- emitted today, sql.rs:1557
 SELECT toUInt64(0) AS class, <lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step> AS bucket_ns,
        [(<status present>, <status value>)] AS keys,
        sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value,
@@ -317,13 +317,13 @@ S1 ─────────────┬── rows, folded ...............
                 └── 307 (the scan budget) .............................. 422, as today's route would answer
 ```
 
-**L, the one read** (`sql.rs:1607`). Its inner level is S1's with `body` added. It has no
+**L, the one read** (`sql.rs:1620`). Its inner level is S1's with `body` added. It has no
 `GROUP BY` and no throw: every row that is not missing is streamed, a decided row with its key labels
 and value and an undecided row with its body and stored metadata, which our parser reads as today's
 route would. Its outer level for the query above:
 
 ```sql
--- emitted today, sql.rs:1607
+-- emitted today, sql.rs:1620
 SELECT toUInt64(0) AS class, <bucket> AS bucket_ns, decided, [(<status present>, <status value>)] AS keys,
        if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint,
        if(decided = 1, '', structured_metadata) AS sm_text, <projected metadata> AS sm_kept
@@ -386,14 +386,14 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3721`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1547`) and `metric_range_unwrapped_rows` (`sql.rs:1607`); the chain rule is `unwrapped_key_route` (`plan.rs:1780`) |
+| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1709`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1557`) and `metric_range_unwrapped_rows` (`sql.rs:1620`); the chain rule is `unwrapped_key_route` (`plan.rs:1780`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1710` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1711` |
 | `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1712` |
 | `\| level="error"` | none | *evaluated after the read*, `plan.rs:1713`. Also makes `has_unpushed_dropping_stage` return `true` (`plan.rs:1685`), which turns the read into a page loop |
 | `\| line_format "…"` | none | *evaluated after the read*, `plan.rs:1714`. **Ends the line-filter walk** (`plan.rs:3702`), so every line filter after it is evaluated after the read too |
 | `\| label_format k="…"` | none | *evaluated after the read*, `plan.rs:1715` |
-| `\| unwrap x` | none, except in the extracted-field group key | *evaluated after the read*, `plan.rs:1716`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in those chains, it becomes the aggregate's argument `sumIf(ifNull(uw_x, 0), decided = 1)` over the rows the database decided (`sql.rs:1547`) |
+| `\| unwrap x` | none, except in the extracted-field group key | *evaluated after the read*, `plan.rs:1716`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in those chains, it becomes the aggregate's argument `sumIf(ifNull(uw_x, 0), decided = 1)` over the rows the database decided (`sql.rs:1557`) |
 | `\| unpack` | none | *evaluated after the read*, `plan.rs:1717`. Ends the line-filter walk, `plan.rs:3702` |
 | `\| decolorize` | none | *evaluated after the read*, `plan.rs:1718`. Ends the line-filter walk, `plan.rs:3702` |
 | `\| drop a, b` | none | *evaluated after the read*, `plan.rs:1719` |
@@ -415,7 +415,7 @@ come from the request.
 | `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1085`) |
 | `bytes_over_time`, instant | `sum(length(body))` | *emitted today*, `sql.rs:111` |
 | `count_over_time`, range | `count() AS n`, per grid point | *emitted today* when the range equals the step and no stage goes beyond a line filter — `metric_range_bucketed` (`sql.rs:1305`); `bytes_over_time`, `rate` and `bytes_rate` take the same statement. Otherwise *evaluated after the read* over the raw scan (`plan.rs:2319`) |
-| any `_over_time` with `\| unwrap` | `sumIf` over the converted value and `countIf` of the decided rows, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the extracted-field group key — `metric_range_unwrapped` (`sql.rs:1547`); the reader divides for the average. Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1716` |
+| any `_over_time` with `\| unwrap` | `sumIf` over the converted value and `countIf` of the decided rows, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the extracted-field group key — `metric_range_unwrapped` (`sql.rs:1557`); the reader divides for the average. Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1716` |
 | `absent_over_time` | none | *never becomes SQL*. The answer is a statement about rows that are **absent**, so there is no row to compute it from |
 | `sum by (level) (…)` | none | *evaluated after the read*. `grouping.is_some()` forces the client path (`plan.rs:2320`) |
 | `topk(3, …)` | none | *evaluated after the read* |
