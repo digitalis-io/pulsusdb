@@ -1076,6 +1076,16 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
 
+      # Issue #507: `| logfmt` over 400 generated lines holding malformed
+      # tokens, under both modes. Pushes the lines to this container and
+      # asserts its labels equal the ones committed in
+      # tests/fixtures/logfmt_token_scan/reference_labels.tsv, which the
+      # hermetic half compares with ours.
+      - name: LogQL differential leg (logfmt token scan matrix, issue #507)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_logfmt_token_scan_matrix
+
       # Issue #388: the `| pattern "…"` argument sub-grammar
       # (pkg/logql/log/pattern/ @ v3.7.4) x every position the stage can
       # occupy. Put to this same container and compared against the
