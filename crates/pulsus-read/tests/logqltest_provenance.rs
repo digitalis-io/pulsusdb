@@ -1996,11 +1996,15 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// Issue #294 added `t6_errors_edges.test`'s raw-byte `duration` /
 /// `duration_seconds` failure rows, captured 2026-08-26 on the same
 /// pinned digest under that file's `captured` default.
-/// Issue #507 moved fourteen `b23_json_raw_read.test` rows off that file's
-/// `captured` default: a line that is not one JSON text is `JSONParserErr`
-/// on every form, so those rows now hold our answer, with the reference's
-/// captured answer kept in the comment above each.
-const CAPTURED: usize = 1_499;
+/// Issue #507 moved the `b23_json_raw_read.test` rows whose line is not a
+/// JSON text off that file's `captured` default (they now hold our answer,
+/// with the reference's captured answer in the comment above each), and
+/// added `b27_logfmt_token_scan.test` and `b28_reserved_names.test` under
+/// their files' `captured` defaults: the logfmt rows were captured on the
+/// pinned digest with the shared config, the reserved-name rows on the same
+/// digest with `ci/logql/config-463.yaml`, both at the query text committed
+/// in the file.
+const CAPTURED: usize = 1_665;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -2012,7 +2016,11 @@ const DERIVED: usize = 32;
 /// `json-nonvalidating-scan-residual` (issue #507 moved the bound row to
 /// `json-targeted-line-that-does-not-parse`). Issue #507's other
 /// `b23_json_raw_read.test` rows name `json-text-is-one-value` and
-/// `json-targeted-line-that-does-not-parse`. Issue #397's wrapped-variant rows
+/// `json-targeted-line-that-does-not-parse`, and its
+/// `b27_logfmt_token_scan.test` rows where the reference reads a label from
+/// inside a quoted value or replaces a value holding U+FFFD name
+/// `logfmt-quoted-value-ends-its-token` and
+/// `logfmt-replacement-character-value`. Issue #397's wrapped-variant rows
 /// on the reference's surviving-error surface name
 /// `variants-surviving-error-status`. Issue #393's rows where several
 /// logfmt extraction identifiers share a source key name
@@ -2021,13 +2029,14 @@ const DERIVED: usize = 32;
 /// file's `ported(...)` default onto `sort-tie-order`: their expected
 /// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
 /// ported reference order — the reference specifies none.
-const DIVERGENCE: usize = 44;
+const DIVERGENCE: usize = 90;
 const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
 /// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
-/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`.
-const TOTAL: usize = 1_605;
+/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`, and issue #507
+/// by `b27_logfmt_token_scan.test` and `b28_reserved_names.test`.
+const TOTAL: usize = 1_817;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------

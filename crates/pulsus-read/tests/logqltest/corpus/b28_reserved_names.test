@@ -1,0 +1,821 @@
+# b28 — reserved label names at the range step (issue #507): `__error__`,
+# `__error_details__`, `__preserve_error__` and `__variant__`, from a field
+# in the line, structured metadata, a stream label or a query step.
+#
+# Reference of record: grafana/loki:3.7.4 (revision b318f282, digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc)
+# on `ci/logql/config-463.yaml`, the shared config with level discovery off
+# (`discover_log_levels: false`),
+# so no `detected_level` pair joins any label set. Captured 2026-09-14 by push
+# and query: each stream pushed with `service=<id>`, its entries at T0 (1 ms
+# apart), instant queries at T0 + 60 s, the range row from T0 to T0 + 180 s
+# step 60 s. The reference derives `service_name` from `service`; the load
+# blocks below carry both.
+#
+# THE MODEL, read at the pinned tag and then measured (ledger row
+# `reserved-names-at-the-range-step`, docs/api.md §2):
+#
+#   R1  A `sum` directly above `count_over_time`, `bytes_over_time`, `rate`,
+#       `bytes_rate` or `sum_over_time` with no grouping of its own hands its
+#       grouping to the range step, so a `__error__` label that is not the
+#       engine's error (a stream label, a parsed field) is gone before the
+#       check unless the grouping keeps it.
+#   R2  A series whose `__preserve_error__` is exactly `true` passes the
+#       check; a preserved failed conversion contributes 0.
+#   R3  With the parser hints in force and `__error__` required, a parser
+#       error also writes `__preserve_error__="true"`.
+#   R4  With the hints in force and `__preserve_error__` not required, the
+#       implicit parsers do not extract a line key of that name.
+#
+# Each section is one row of issue #507's revision 9 tables, named in the
+# comment above its `load`. `eval_fail` rows match the reference's status;
+# the message wording is never matched, only the error class.
+#
+# Not expressible here, and so not in this file: the kept table's label-
+# endpoint and series rows (c01.11, c01.13), `absent_over_time` over a
+# stream that does not exist (d03.02; this runner does not apply
+# selectors), and b08's log query (stream label `__error__="s"` with
+# metadata `__error__="m"`; streams evals are structured-metadata-blind in
+# this runner). The live test
+# `query_log_gates::reserved_names_answer_as_the_reference_on_every_metric_route`
+# carries the metric rows through the real engine.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+
+# c01.03
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="c01"} [5m]))
+  {service_name="c01"} 1
+
+clear
+
+# c01.04
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval instant at 60s sum(count_over_time({service="c01"} [5m]))
+  {} 1
+
+clear
+
+# q2w
+load
+  {__error__="s", service="q2w", service_name="q2w"}
+  0s  {"latency":5}
+
+eval instant at 60s sum by (service_name) (sum_over_time({service="q2w"} | json | unwrap latency [5m]))
+  {service_name="q2w"} 5
+
+clear
+
+# a01.03
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="a01"} | json [5m]))
+  {service_name="a01"} 1
+
+clear
+
+# a01.05
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (sum_over_time({service="a01"} | json | unwrap latency [5m]))
+  {service_name="a01"} 5
+
+clear
+
+# a01.07
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (rate({service="a01"} | json [5m]))
+  {service_name="a01"} 0.0033333333333333335
+
+clear
+
+# a01.08
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (bytes_over_time({service="a01"} | json [5m]))
+  {service_name="a01"} 32
+
+clear
+
+# a01.12
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum without (__error__) (count_over_time({service="a01"} | json [5m]))
+  {latency="5", service="a01", service_name="a01"} 1
+
+clear
+
+# a01.15
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s topk(1, sum by (service_name) (count_over_time({service="a01"} | json [5m])))
+  {service_name="a01"} 1
+
+clear
+
+# a01.16
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="a01"} | json [5m])) > 0
+  {service_name="a01"} 1
+
+clear
+
+# a01.20
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="a01"} | json | __error__="" [5m]))
+  {service_name="a01"} 1
+
+clear
+
+# a02.02
+load
+  {service="a02", service_name="a02"}
+  0s  latency=5 __error__=boom
+
+eval instant at 60s sum by (service_name) (sum_over_time({service="a02"} | logfmt | unwrap latency [5m]))
+  {service_name="a02"} 5
+
+clear
+
+# a03.01
+load
+  {service="a03", service_name="a03"}
+  0s  boom 5
+
+eval instant at 60s sum by (service_name) (sum_over_time({service="a03"} | regexp "(?P<__error__>\\w+) (?P<latency>\\d+)" | unwrap latency [5m]))
+  {service_name="a03"} 5
+
+clear
+
+# a03.02
+load
+  {service="a03", service_name="a03"}
+  0s  boom 5
+
+eval instant at 60s sum by (service_name) (count_over_time({service="a03"} | pattern "<__error__> <latency>" [5m]))
+  {service_name="a03"} 1
+
+clear
+
+# a05.02
+load
+  {service="a05", service_name="a05"}
+  0s  {"_entry":"x","__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="a05"} | unpack [5m]))
+  {service_name="a05"} 1
+
+clear
+
+# a09.01
+load
+  {service="a09", service_name="a09"}
+  0s  {"latency":5,"__error__":"boom","__error___extracted":"x"}
+
+eval instant at 60s sum by (__error___extracted) (count_over_time({service="a09"} | json [5m]))
+  {__error___extracted="x"} 1
+
+clear
+
+# f03b.01
+load
+  {__error__="boom", grp="f03", service="f03", service_name="f03"}
+  0s  {"latency":5}
+  {__error___extracted="boom", grp="f03", service="f03b", service_name="f03b"}
+  0s  {"latency":5}
+
+eval instant at 60s sum by (grp) (count_over_time({grp="f03"} [5m]))
+  {grp="f03"} 2
+
+clear
+
+# f06
+load
+  {service="f06", service_name="f06"}
+  0s  {"latency":5,"__error__":"boom"}
+  1ms  {"latency":3}
+  2ms  {garbage
+
+eval instant at 60s sum by (service_name) (sum_over_time({service="f06"} | json | __error__="" | unwrap latency [5m]))
+  {service_name="f06"} 8
+
+clear
+
+# f06.02
+load
+  {service="f06", service_name="f06"}
+  0s  {"latency":5,"__error__":"boom"}
+  1ms  {"latency":3}
+  2ms  {garbage
+
+eval instant at 60s sum by (latency) (count_over_time({service="f06"} | json | __error__="" [5m]))
+  {latency="3"} 1
+  {latency="5"} 1
+
+clear
+
+# h04.02
+load
+  {service="h04", service_name="h04"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s sum by (service_name) (count_over_time({service="h04"} | json | line_format "{{.__error__}}" [5m]))
+  {service_name="h04"} 1
+
+clear
+
+# e03
+load
+  {service="e03", service_name="e03"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval instant at 60s variants(sum by (service_name) (count_over_time({service="e03"} [5m]))) of ({service="e03"} | json [5m])
+  {__variant__="0", service_name="e03"} 1
+
+clear
+
+# g01
+load
+  {service="g01", service_name="g01"}
+  0s  {"latency":5}
+
+eval instant at 60s sum by (latency) (sum_over_time({service="g01"} | json | unwrap latency [5m]))
+  {latency="5"} 5
+
+clear
+
+# g02
+load
+  {service="g02", service_name="g02"}
+  0s  {"latency":5}
+
+eval range from 0s to 180s step 60s sum by (latency) (sum_over_time({service="g02"} | json latency="latency" | unwrap latency [1m]))
+  {latency="5"} 0s 5
+
+clear
+
+# a01.01
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval_fail instant at 60s count_over_time({service="a01"} | json [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# a01.09
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval_fail instant at 60s sum by (service_name) (max_over_time({service="a01"} | json | unwrap latency [5m]))
+  msg: pipeline error: 'boom'
+
+clear
+
+# a01.10
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval_fail instant at 60s avg by (service_name) (count_over_time({service="a01"} | json [5m]))
+  msg: pipeline error: 'boom'
+
+clear
+
+# a01.11
+load
+  {service="a01", service_name="a01"}
+  0s  {"latency":5,"__error__":"boom"}
+
+eval_fail instant at 60s sum by (__error__) (count_over_time({service="a01"} | json [5m]))
+  msg: pipeline error: 'boom'
+
+clear
+
+# b01.04
+load
+  {service="b01", service_name="b01"}
+  0s  sm{__error__="boom"} {"latency":5}
+
+eval_fail instant at 60s sum by (service_name) (sum_over_time({service="b01"} | json | unwrap latency [5m]))
+  msg: pipeline error: 'boom'
+
+clear
+
+# c01.01
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s count_over_time({service="c01"} [5m])
+  msg: pipeline error: 's'
+
+clear
+
+# c01.07
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s sum by (__error__) (count_over_time({service="c01"} [5m]))
+  msg: pipeline error: 's'
+
+clear
+
+# b03.01
+load
+  {service="b03", service_name="b03"}
+  0s  sm{__preserve_error__="true"} {garbage
+
+eval instant at 60s count_over_time({service="b03"} | json [5m])
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", __preserve_error__="true", service="b03", service_name="b03"} 1
+
+clear
+
+# b03.02
+load
+  {service="b03", service_name="b03"}
+  0s  sm{__preserve_error__="true"} {garbage
+
+eval instant at 60s sum by (service_name) (count_over_time({service="b03"} | json [5m]))
+  {service_name="b03"} 1
+
+clear
+
+# c03
+load
+  {__preserve_error__="true", service="c03", service_name="c03"}
+  0s  {garbage
+
+eval instant at 60s count_over_time({service="c03"} | json [5m])
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", __preserve_error__="true", service="c03", service_name="c03"} 1
+
+clear
+
+# d02
+load
+  {service="d02", service_name="d02"}
+  0s  {garbage
+
+eval instant at 60s count_over_time({service="d02"} | json | label_format __preserve_error__="true" [5m])
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", __preserve_error__="true", service="d02", service_name="d02"} 1
+
+clear
+
+# a07.01
+load
+  {service="a07", service_name="a07"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s count_over_time({service="a07"} | logfmt | latency > 1 [5m])
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax", __preserve_error__="true", latency="abc", service="a07", service_name="a07"} 1
+
+clear
+
+# a07.02
+load
+  {service="a07", service_name="a07"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s sum_over_time({service="a07"} | logfmt | unwrap latency [5m])
+  {__error__="SampleExtractionErr", __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax", __preserve_error__="true", latency="abc", service="a07", service_name="a07"} 0
+
+clear
+
+# q02.01
+load
+  {service="q02", service_name="q02"}
+  0s  {"__preserve_error__":"true","latency":"abc"}
+
+eval instant at 60s count_over_time({service="q02"} | json | latency > 1 [5m])
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax", __preserve_error__="true", latency="abc", service="q02", service_name="q02"} 1
+
+clear
+
+# p01
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum by (__error__) (count_over_time({service="p01"} | json [5m]))
+  {__error__="JSONParserErr"} 1
+
+clear
+
+# p01.01
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum by (service_name) (count_over_time({service="p01"} | json | __error__!="" [5m]))
+  {service_name="p01"} 1
+
+clear
+
+# p01.03
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum(count_over_time({service="p01"} | json | __error__!="" [5m]))
+  {} 1
+
+clear
+
+# p01.04
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum by (__error__) (count_over_time({service="p01"} | json | __error__="JSONParserErr" [5m]))
+  {__error__="JSONParserErr"} 1
+
+clear
+
+# p01.05
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum by (__error__) (count_over_time({service="p01"} | unpack [5m]))
+  {__error__="JSONParserErr"} 1
+
+clear
+
+# p01.09
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval instant at 60s sum by (service_name) (count_over_time({service="p01"} | json | __error__!="" | keep service_name [5m]))
+  {service_name="p01"} 1
+
+clear
+
+# p06
+load
+  {service="p06", service_name="p06"}
+  0s  a=1 "b
+
+eval instant at 60s sum by (__error__) (count_over_time({service="p06"} | logfmt --strict [5m]))
+  {__error__="LogfmtParserErr"} 1
+
+clear
+
+# p01.02
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval_fail instant at 60s count_over_time({service="p01"} | json | __error__!="" [5m])
+  msg: pipeline error: 'JSONParserErr'
+
+clear
+
+# p01.07
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval_fail instant at 60s sum without (service) (count_over_time({service="p01"} | json | __error__!="" [5m]))
+  msg: pipeline error: 'JSONParserErr'
+
+clear
+
+# p01.08
+load
+  {service="p01", service_name="p01"}
+  0s  {garbage
+
+eval_fail instant at 60s sum by (service_name) (count_over_time({service="p01"} | json | __error__!="" | drop __preserve_error__ [5m]))
+  msg: pipeline error: 'JSONParserErr'
+
+clear
+
+# p07
+load
+  {service="p07", service_name="p07"}
+  0s  latency=abc
+
+eval_fail instant at 60s sum by (__error__) (count_over_time({service="p07"} | logfmt | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# p07.01
+load
+  {service="p07", service_name="p07"}
+  0s  latency=abc
+
+eval_fail instant at 60s sum by (__error__) (sum_over_time({service="p07"} | logfmt | unwrap latency [5m]))
+  msg: pipeline error: 'SampleExtractionErr'
+
+clear
+
+# h03.01
+load
+  {service="h03", service_name="h03"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s sum by (__preserve_error__) (count_over_time({service="h03"} | logfmt | latency > 1 [5m]))
+  {__preserve_error__="true"} 1
+
+clear
+
+# h03.02
+load
+  {service="h03", service_name="h03"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s sum without (service) (count_over_time({service="h03"} | logfmt | latency > 1 [5m]))
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax", __preserve_error__="true", latency="abc", service_name="h03"} 1
+
+clear
+
+# h03.04
+load
+  {service="h03", service_name="h03"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s max by (service_name) (count_over_time({service="h03"} | logfmt | latency > 1 [5m]))
+  {service_name="h03"} 1
+
+clear
+
+# q01
+load
+  {service="q01", service_name="q01"}
+  0s  __preserve_error__=true latency=abc
+
+eval instant at 60s sum by (service_name) (count_over_time({service="q01"} | logfmt | __preserve_error__="true" | latency > 1 [5m]))
+  {service_name="q01"} 1
+
+clear
+
+# a07.03
+load
+  {service="a07", service_name="a07"}
+  0s  __preserve_error__=true latency=abc
+
+eval_fail instant at 60s sum by (service_name) (count_over_time({service="a07"} | logfmt | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# h03
+load
+  {service="h03", service_name="h03"}
+  0s  __preserve_error__=true latency=abc
+
+eval_fail instant at 60s sum by (latency) (count_over_time({service="h03"} | logfmt | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# h03.03
+load
+  {service="h03", service_name="h03"}
+  0s  __preserve_error__=true latency=abc
+
+eval_fail instant at 60s sum(count_over_time({service="h03"} | logfmt | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# q01.01
+load
+  {service="q01", service_name="q01"}
+  0s  __preserve_error__=true latency=abc
+
+eval_fail instant at 60s sum by (service_name) (count_over_time({service="q01"} | logfmt | line_format "{{.__preserve_error__}}" | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# q02
+load
+  {service="q02", service_name="q02"}
+  0s  {"__preserve_error__":"true","latency":"abc"}
+
+eval_fail instant at 60s sum by (service_name) (count_over_time({service="q02"} | json | latency > 1 [5m]))
+  msg: pipeline error: 'LabelFilterErr'
+
+clear
+
+# c01
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval instant at 60s {service="c01"}
+  {__error__="s", service="c01", service_name="c01"}  0s  {"latency":5}
+
+clear
+
+# c01.02
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s count_over_time({service="c01"} | __error__="" [5m])
+  msg: pipeline error: 's'
+
+clear
+
+# c01.08
+load
+  {__error__="s", service="c01", service_name="c01"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s count_over_time({__error__="s", service="c01"} [5m])
+  msg: pipeline error: 's'
+
+clear
+
+# b01.01
+load
+  {service="b01", service_name="b01"}
+  0s  sm{__error__="boom"} {"latency":5}
+
+eval_fail instant at 60s count_over_time({service="b01"} [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# b01.05
+load
+  {service="b01", service_name="b01"}
+  0s  sm{__error__="boom"} {"latency":5}
+
+eval instant at 60s count_over_time({service="b01"} | __error__="" [5m])
+
+clear
+
+# b01.08
+load
+  {service="b01", service_name="b01"}
+  0s  sm{__error__="boom"} {"latency":5}
+
+eval instant at 60s count_over_time({service="b01"} | drop __error__ [5m])
+  {service="b01", service_name="b01"} 1
+
+clear
+
+# b02.01
+load
+  {service="b02", service_name="b02"}
+  0s  sm{__error_details__="d"} {"latency":5}
+
+eval instant at 60s count_over_time({service="b02"} [5m])
+  {service="b02", service_name="b02"} 1
+
+clear
+
+# b08.01
+load
+  {__error__="s", service="b08", service_name="b08"}
+  0s  sm{__error__="m"} {"latency":5}
+
+eval_fail instant at 60s count_over_time({service="b08"} [5m])
+  msg: pipeline error: 's'
+
+clear
+
+# d01.01
+load
+  {service="d01", service_name="d01"}
+  0s  a=boom
+
+eval instant at 60s count_over_time({service="d01"} | logfmt | label_format __error_details__=a [5m])
+  {__error_details__="boom", service="d01", service_name="d01"} 1
+
+clear
+
+# d01.02
+load
+  {service="d01", service_name="d01"}
+  0s  a=boom
+
+eval instant at 60s {service="d01"} | logfmt | label_format __variant__=a
+  {__variant__="boom", service="d01", service_name="d01"}  0s  a=boom
+
+clear
+
+# d03
+load
+  {service="d03", service_name="d03"}
+  0s  {"latency":5}
+
+eval instant at 60s label_replace(count_over_time({service="d03"} [5m]), "__error__", "boom", "", "")
+  {__error__="boom", service="d03", service_name="d03"} 1
+
+clear
+
+# f02.02
+load
+  {__error__="a", __error___extracted="b", service="f02", service_name="f02"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s count_over_time({__error__="a", service="f02"} [5m])
+  msg: pipeline error: 'a'
+
+clear
+
+# f02.03
+load
+  {__error__="a", __error___extracted="b", service="f02", service_name="f02"}
+  0s  {"latency":5}
+
+eval_fail instant at 60s count_over_time({__error___extracted="b", service="f02"} [5m])
+  msg: pipeline error: 'a'
+
+clear
+
+# rr04M
+load
+  {service="rr04M", service_name="rr04M"}
+  0s  x
+
+eval_fail instant at 60s count_over_time({service="rr04M"} | line_format "{\"__error__\":\"boom\"}" | json [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# rr05M
+load
+  {service="rr05M", service_name="rr05M"}
+  0s  {"_":{"error__":"boom"}}
+
+eval_fail instant at 60s count_over_time({service="rr05M"} | json [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# rr06M
+load
+  {service="rr06M", service_name="rr06M"}
+  0s  {"--error--":"boom"}
+
+eval_fail instant at 60s count_over_time({service="rr06M"} | json [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# rr09M
+load
+  {service="rr09M", service_name="rr09M"}
+  0s  a=boom
+
+eval instant at 60s count_over_time({service="rr09M"} | logfmt | label_format __error_details__=a [5m])
+  {__error_details__="boom", service="rr09M", service_name="rr09M"} 1
+
+clear
+
+# rr11M
+load
+  {service="rr11M", service_name="rr11M"}
+  0s  --error--=boom
+
+eval_fail instant at 60s count_over_time({service="rr11M"} | logfmt [5m])
+  msg: pipeline error: 'boom'
+
+clear
+
+# rr13M
+load
+  {service="rr13M", service_name="rr13M"}
+  0s  {"latency":5}
+
+eval instant at 60s label_replace(count_over_time({service="rr13M"} [5m]), "__error__", "boom", "", "")
+  {__error__="boom", service="rr13M", service_name="rr13M"} 1
+
+clear
