@@ -3961,6 +3961,99 @@ mod recursive_control;
 #[cfg(test)]
 mod tests {
 
+    /// Issue #507, criterion 23 (R9): a key statement over the query-text cap
+    /// is not sent, and the query takes today's route.
+    ///
+    /// 100,000 streams (the stream cap) each carry `zone` in one of three
+    /// values, and every stream but the first carries `a`, `b` and `c`. The
+    /// statement lists every fingerprint in its scan and in its class
+    /// mapping, and each of `a`, `b` and `c` lists the 99,999 streams that
+    /// blank it, in its presence column and in its text column. Rendered by
+    /// this test: 17,911,422 bytes. With `zone` alone (`sum by (zone, status)`,
+    /// no `a`, `b`, `c`) it is 4,706,315 bytes, under the cap.
+    #[test]
+    fn a_key_statement_over_the_text_cap_takes_todays_route() {
+        use crate::logql::predicate::literal;
+        use crate::logql::rows::StreamMetaRow;
+        let query = r#"sum by (zone, a, b, c) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+        let mp = metric_mp(
+            query,
+            QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .expect("plan");
+        let sql::MetricValue::Unwrapped(u) = &mp.value else {
+            panic!("{query}: expected the group key read");
+        };
+        let meta: HashMap<u64, StreamMetaRow> = (0..100_000u64)
+            .map(|i| {
+                let fp = 18_000_000_000_000_000_000 + i * 7_919;
+                (
+                    fp,
+                    StreamMetaRow {
+                        fingerprint: fp,
+                        service: "checkout".to_string(),
+                        labels: if i == 0 {
+                            format!(r#"{{"zone":"z{}"}}"#, i % 3)
+                        } else {
+                            format!(r#"{{"a":"1","b":"2","c":"3","zone":"z{}"}}"#, i % 3)
+                        },
+                    },
+                )
+            })
+            .collect();
+        let resolved = crate::logql::unwrap_group::resolve(u, &meta);
+        assert_eq!(
+            resolved.columns.classes.as_ref().map(Vec::len),
+            Some(4),
+            "the three zones, and the first stream's own class"
+        );
+        assert_eq!(
+            resolved
+                .columns
+                .keys
+                .iter()
+                .map(|(k, blank)| (k.label.as_str(), blank.len()))
+                .collect::<Vec<_>>(),
+            vec![("a", 99_999), ("b", 99_999), ("c", 99_999)],
+            "zone is on every stream, so it is not read; a, b and c are blanked where carried"
+        );
+        let step = mp.step_ns.expect("a range plan").get();
+        let text = sql::metric_range_unwrapped(
+            &mp.table,
+            u,
+            &resolved.columns,
+            &[literal("checkout")],
+            &resolved.fingerprints,
+            sql::BucketedScan {
+                window: sql::TimeWindow {
+                    start_ns: mp.start_ns,
+                    end_ns: mp.end_ns,
+                },
+                lower: mp.scan_lower,
+                lo_ns: mp.grid_start_ns - step as i64,
+                step_ns: step as i64,
+            },
+            &mp.extra_predicates,
+            sql::UndecidedRows::Throw,
+            None,
+        )
+        .expect("render");
+        let text = crate::logql::exec::escape_query_placeholders(&text);
+        assert!(
+            text.len() as u64 > crate::querytext::MAX_QUERY_TEXT_BYTES,
+            "the key statement is {} bytes, not over the cap",
+            text.len()
+        );
+        assert!(
+            !crate::logql::exec::key_statement_fits(&text),
+            "a key statement over the text cap must take today's route"
+        );
+    }
+
     /// Issue #507: the range step's rules follow the reference's sample
     /// extractor: which parent `sum` hands its grouping down, and the parser
     /// hints over the grouping the extractor receives.

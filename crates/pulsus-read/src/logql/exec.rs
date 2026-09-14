@@ -1805,7 +1805,7 @@ impl LogQlEngine {
             e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
         }
         let sql = escape_query_placeholders(&sql);
-        if crate::querytext::ensure_query_text_fits(&sql).is_err() {
+        if !key_statement_fits(&sql) {
             return KeyRouteOutcome::TodaysRoute("the key statement's text is over the cap");
         }
         let mut fold = super::unwrap_group::KeyRouteFold::new(
@@ -1892,7 +1892,7 @@ impl LogQlEngine {
             e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
         }
         let sql = escape_query_placeholders(&sql);
-        if crate::querytext::ensure_query_text_fits(&sql).is_err() {
+        if !key_statement_fits(&sql) {
             return KeyRouteOutcome::TodaysRoute("the one read's text is over the cap");
         }
         let mut fold = super::unwrap_group::KeyRouteFold::new(
@@ -5208,6 +5208,14 @@ fn key_statement_failure_goes_to_todays_route(e: &ChError) -> bool {
         | ChError::Config(_)
         | ChError::InsertUncertain(_) => false,
     }
+}
+
+/// Whether a group key statement is sent (issue #507): a statement over the
+/// query-text cap (`querytext::MAX_QUERY_TEXT_BYTES`) is not, and the query
+/// takes today's route, whose own statement is far shorter, instead of
+/// answering the cap's `422`.
+pub(in crate::logql) fn key_statement_fits(sql: &str) -> bool {
+    crate::querytext::ensure_query_text_fits(sql).is_ok()
 }
 
 /// Today's-route refusals after which the one read, L, may answer (issue
