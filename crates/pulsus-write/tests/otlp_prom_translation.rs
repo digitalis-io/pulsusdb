@@ -2650,8 +2650,9 @@ fn api_md_documents_the_fault_model() {
 // AC12 — the scope predicates on the canonicalizer's reuse
 
 /// The workspace crates whose `src/` this gate walks, and the symbol it
-/// tracks: `pulsus_model::canonicalize_label_key`, the sole authority for
-/// turning an OTel attribute key into a Prometheus-style label name.
+/// tracks: `pulsus_model::canonicalize_label_key`, the character-escaping
+/// primitive the metrics namer builds on (log attribute keys use
+/// `pulsus_model::log_label_name` instead, issue #507).
 const CANONICALIZER: &str = "canonicalize_label_key";
 
 /// Every file under `crates/*/src/` with a **production** call to

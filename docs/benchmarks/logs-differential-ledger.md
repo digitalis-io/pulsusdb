@@ -3977,11 +3977,7 @@ unexplained.
 
 ### structured-metadata-collision-resolution (issue #381)
 
-- **Status: PARITY, with three named residuals.** The construct itself is
-  fixed, not exempted: PulsusDB now runs the reference's own builder at the
-  one shared structured-metadata seam, and reproduces its answer on every
-  measured row. What remains are the three residuals below, two of which are
-  cases where the reference has no stable answer of its own.
+- **Status: PARITY, with residuals A and B below.** The construct itself is fixed, not exempted: PulsusDB now runs the reference's own builder at the one shared structured-metadata seam, and reproduces its answer on every measured row. Residuals A and B are both cases where the reference has no stable answer of its own; residual C is closed by issue #507.
 - **Construct:** which of several structured-metadata pairs sharing a stored
   label name is the one stored, and what a value containing `utf8.RuneError`
   (U+FFFD) stores as.
@@ -4038,13 +4034,7 @@ unexplained.
   `structured_metadata_collisions.rs`'s
   `the_row_the_reference_cannot_serve_is_stored_by_us_as_the_last_pair`,
   which asserts the captured 500 alongside our stored value.
-- **Residual C — inherited, unchanged.** The builder groups by PulsusDB's
-  `canonicalize_label_key` rather than the reference's `LabelNamer.Build`, so
-  wherever the two renamings differ the collision GROUPS differ (`a..b` and
-  `a__b` are `a_b` there and `a__b` here; `9bad` gains a `key_` prefix
-  there). That is the renaming divergence already registered under issue #259
-  / docs/api.md §8.2, not a second rule, and it disappears when that one
-  does.
+- **Residual C — closed by issue #507.** The builder groups by the stored name, which is now the reference's label name.
 - **In scope deliberately: the U+FFFD branch is a value change.** It is not
   separable from the collision rule — the branch is a `Set`, and `Set` is
   what decides the tier, so omitting it resolves `{a.b="x", a_b="p\ufffd"}`
@@ -4055,10 +4045,7 @@ unexplained.
 - **Not in scope, and named rather than omitted:** stream-label collisions of
   any kind. Structured metadata is a per-entry column and never enters
   `stream_fingerprint`, so no stored stream identity moves here;
-  `LabelSet::from_normalized`'s frozen greatest-original-key rule (issue #4)
-  is untouched and still governs stream labels, including residual 4 of
-  `ingest-label-bounds` (a repeated OTLP index attribute) and the
-  `{service.name, service_name}` near-miss, which belong to issues #4/#109.
+  the frozen greatest-original-key rule (issue #4) is untouched and still governs stream labels (`LabelSet::from_normalized` for pushed stream labels, `LabelSet::from_log_attribute_pairs` for OTLP resource attributes), including residual 4 of `ingest-label-bounds` (a repeated OTLP index attribute) and the `{k8s.pod.name, k8s_pod_name}` near-miss, which belong to issues #4/#109. The `{service.name, service_name}` near-miss is stored as `service_name_extracted` (issue #507, `ingest-service-name-discovery`).
 - **Fixture status:** capture-backed parity in
   `crates/pulsus-write/tests/structured_metadata_collisions.rs`
   (`the_stored_string_reproduces_the_reference_capture`,
@@ -5189,10 +5176,7 @@ back up here.
   carries the same index attribute twice with different values is
   resolved last-write-wins upstream (`streamLabels` is a map,
   `otlp.go:191-193 @ v3.7.4`), so the bound is charged on whichever value
-  came last. PulsusDB collapses the repeat through
-  `LabelSet::from_normalized`, whose resolution is issue #4's frozen
-  greatest-`(key, value)` rule, so the bound is charged on the value that
-  would actually be stored. Measured: `[k8s.pod.name="ok",
+  came last. PulsusDB collapses the repeat by issue #4's frozen greatest-`(key, value)` rule — for the bound through `LabelSet::from_normalized`, in storage through `LabelSet::from_log_attribute_pairs`, which name the eighteen index attributes alike — so the bound is charged on the value that would actually be stored. Measured: `[k8s.pod.name="ok",
   k8s.pod.name="b"*2049]` is `400` upstream and `200` here; the reverse
   order agrees. Matching upstream's choice would mean validating a value
   we do not store — the defect this issue's first round was about — so
@@ -5628,17 +5612,7 @@ two.
   So a resource carrying `app=x` stores `{app="x", service_name="unknown_service"}`
   here and `{service_name="unknown_service"}` there: the `service_name` now
   agrees and the extra label does not. Two consequences of making the slot
-  authoritative, both of the same #109 mechanism: an attribute whose raw name
-  merely canonicalizes onto `service_name` (`service_name`, `service-name`,
-  `service name`) is now stored **nowhere** here, where the reference keeps it
-  as structured metadata; and that attribute no longer wins the
-  `from_normalized` collision (issue #4) it used to win, so
-  `{service.name: "ok", service_name: <2049 B>}` stores the validated `"ok"`
-  on both sides. The seventeen other index names still resolve that collision
-  the old way — `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` stores the
-  unvalidated value here — which is `ingest-label-bounds`' *What these bounds
-  do not cover*, unchanged. Issue #109 owns the placement rule and therefore
-  owns all of this.
+  authoritative, both of the same #109 mechanism: an attribute whose stored name would be `service_name` (`service_name`, `service-name`, `service..name`) is stored as `service_name_extracted` (issue #507), which is what the reference's query answers show for the same attribute: measured, `{service.name: "ao6", service_name: "v6"}` answers `{service_name="ao6", service_name_extracted="v6"}` on both. The seventeen other index names still resolve a near-miss collision by #4's frozen rule — `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` stores the unvalidated value here — which is `ingest-label-bounds`' *What these bounds do not cover*. Issue #109 owns the placement rule.
 
 - **Pinned by** `service_name`'s own unit tests (the thirteen defaults and
   their order, list order vs wire order asserted side by side so unifying the

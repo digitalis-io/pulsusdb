@@ -1301,11 +1301,11 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
     );
     assert_eq!(
         stored[ok_line].structured_metadata, r#"{"a_b":"v","detected_level":"unknown"}"#,
-        "an admissible dotted name is canonicalized, not rejected"
+        "an admissible dotted name is renamed, not rejected"
     );
     assert_eq!(
         stored[naive_line].structured_metadata, r#"{"detected_level":"unknown","na_ve":"v"}"#,
-        "an admissible non-ASCII name is canonicalized per character"
+        "an admissible non-ASCII name is renamed to its stored name"
     );
 }
 
@@ -2059,18 +2059,21 @@ async fn wait_for_count(db: &str, sql: &str, want: u64) -> u64 {
 /// spelling only (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes
 /// the underscored one to structured metadata, which no bound reaches.
 /// Storage does not agree: we index every resource attribute (#109), both
-/// spellings canonicalize onto `k8s_pod_name`, and `from_normalized`'s frozen
-/// rule (#4) keeps the greatest original key — `_` (0x5F) after `.` (0x2E) —
+/// spellings are stored under `k8s_pod_name`, and the frozen rule of issue #4
+/// (applied by `from_log_attribute_pairs`) keeps the greatest original key — `_` (0x5F) after `.` (0x2E) —
 /// so the **unvalidated** value is written under a label the validator passed
 /// at two bytes, and the stream's identity follows it.
 ///
-/// The same shape spelled `service.name`/`service_name` no longer behaves that
-/// way (issue #379): that slot is resolved from the raw attributes and written
-/// last, exactly as the reference's map assignment is, so the validated value
-/// wins and the near-miss is not stored at all. Measured on stock
-/// `grafana/loki@sha256:87f0a067…` via `/loki/api/v1/series`:
-/// `{service.name: "ok379", service_name: <2049 B>}` stores
-/// `{service_name="ok379"}`.
+/// The same shape spelled `service.name`/`service_name` behaves differently
+/// (issues #379, #507): that slot is resolved from the raw attributes and
+/// written last, exactly as the reference's map assignment is, so the
+/// validated value wins the slot and the near-miss is stored beside it under
+/// `service_name_extracted` — the name the reference's own read path gives
+/// that attribute, which it keeps as structured metadata (#109). Measured on
+/// the pinned reference build (the coder keeps the image citation) through
+/// its series route: `{service.name: "ok379", service_name: <2049 B>}` stores
+/// `{service_name="ok379"}` there and
+/// `{service_name="ok379", service_name_extracted=<2049 B>}` here.
 ///
 /// Four rounds of status-only oracle comparison could not see any of this.
 /// The hermetic twin is

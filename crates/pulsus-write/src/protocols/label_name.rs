@@ -16,13 +16,14 @@
 //! (`pkg/chunkenc/symbols.go:120-135` calls it too, but that is a storage
 //! re-normalization of already-admitted names, not an ingest gate.)
 //!
-//! This module is the ingest-side counterpart of the REJECT half only. The
-//! NORMALIZE half — `sanitize` plus the `key_` prefix — is replicated here
-//! solely because condition (2) below is evaluated on the *sanitized* name,
-//! and is deliberately NOT used to rename anything: PulsusDB stores an
-//! admitted name under [`canonicalize_label_key`](pulsus_model::canonicalize_label_key),
-//! which differs from the reference's renaming for some admitted inputs (see
-//! the module test `sanitize_differs_from_our_storage_canonicalization`).
+//! This module is the REJECT half. The NORMALIZE half is
+//! [`log_label_name`](pulsus_model::log_label_name), which condition (2)
+//! below is evaluated on and which is also the name every admitted name is
+//! stored under (issue #507) — except a resource attribute other than
+//! `service.name` landing on `service_name`, which is stored as
+//! `service_name_extracted` (issue #379) — so the two halves cannot drift
+//! apart (the
+//! module test `the_rejection_rule_and_storage_name_alike`).
 //!
 //! Distinct from `loki_push::is_valid_label_name`, which is the STREAM-label
 //! grammar `[a-zA-Z_][a-zA-Z0-9_]*`: a stream label name is parsed, not

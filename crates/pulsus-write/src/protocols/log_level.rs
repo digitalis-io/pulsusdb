@@ -310,8 +310,8 @@ impl MetadataView for PairsView<'_> {
 /// stops at the first hit, so an OTLP record's attributes are never rendered
 /// wholesale just to look for a level.
 pub trait AttributeLookup {
-    /// The value of the attribute whose key canonicalizes to
-    /// `canonical_name`, in wire order, or `None`.
+    /// The value of the attribute whose key is STORED as `canonical_name`
+    /// (`log_label_name`, issue #507), in wire order, or `None`.
     fn get(&self, canonical_name: &str) -> Option<Cow<'_, str>>;
 }
 

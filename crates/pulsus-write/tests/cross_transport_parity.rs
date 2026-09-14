@@ -411,7 +411,7 @@ fn otlp_scope_stored(sm: &[(&str, &str)]) -> String {
 /// The two log receivers run the SAME structured-metadata rule, stated as an
 /// equation rather than an exception (issue #381):
 ///
-/// > `OTLP(raw keys) == Loki-push(canonicalized keys)`
+/// > `OTLP(raw keys) == push(stored names)`
 ///
 /// Both call `pulsus_model::resolve_structured_metadata` through the one
 /// shared seam. What differs is only what each hands it: the push transport
@@ -423,7 +423,7 @@ fn otlp_scope_stored(sm: &[(&str, &str)]) -> String {
 /// from `:300-317`), whereas the push path hands the builder the wire names.
 ///
 /// So no row is exempted: every row is checked, and the rows whose names are
-/// already canonicalize fixed points — where the renaming is the identity and
+/// already `log_label_name` fixed points — where the renaming is the identity and
 /// the equation collapses to plain equality — are checked a second time and
 /// counted, because those are the rows that were CROSS-TRANSPORT DIVERGENT
 /// before this fix. Measured at `b872855`: `[a_b="2", a_b="1"]` stored

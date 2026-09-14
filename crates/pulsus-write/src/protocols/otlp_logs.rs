@@ -1,8 +1,14 @@
 //! OTLP logs parser (issue #8 architect plan, docs/architecture.md §4): a
 //! pure `bytes -> ExportLogsServiceRequest -> ParsedLogs` pipeline with no
-//! I/O. **Resource** attributes flatten through the frozen canonical label
-//! model (`pulsus_model::LabelSet::from_normalized` -> `stream_fingerprint`,
-//! issue #4) as stream labels; the log record's `InstrumentationScope`
+//! I/O. **Resource** attribute keys are stored under the reference's label
+//! name (issue #507), with one exception: a key other than `service.name`
+//! whose stored name would be `service_name` is stored as
+//! `service_name_extracted`, because that slot is resolved from the raw
+//! attributes and written last (issue #379). A collision between any two of
+//! the remaining keys is resolved by the frozen rule of issue #4, which the
+//! slot is therefore never asked to decide
+//! (`pulsus_model::LabelSet::from_log_attribute_pairs` ->
+//! `stream_fingerprint`), as stream labels; the log record's `InstrumentationScope`
 //! (name, version, and attributes) lands in per-entry **structured
 //! metadata**, never stream labels (issue #109 — Loki 3.4.2 parity), so
 //! scope leaves the stream fingerprint. Fingerprints and the `service`
@@ -510,21 +516,18 @@ fn build_stream_labels(
     // `pkg/distributor/distributor.go:1370 @ v3.7.4`).
     //
     // `service_name` is the resolved slot (issue #379) and it is
-    // AUTHORITATIVE: every raw attribute that canonicalizes onto that name is
-    // dropped first, then the slot is appended. Upstream that name is written
-    // by a plain map assignment (`otlp.go:193,201,219 @ v3.7.4`) which no
-    // other attribute can reach — a raw `service_name` or `service-name`
-    // attribute is not an index attribute there, so it becomes structured
-    // metadata and never touches the stream label. `from_normalized`'s frozen
-    // greatest-key/greatest-value rule (issue #4) is therefore never asked to
-    // decide `service_name` on this path; it still decides every other
-    // collision, unchanged.
-    //
-    // What this costs, stated plainly: PulsusDB stores a `service_name`
-    // near-miss attribute nowhere, where the reference stores it as structured
-    // metadata. That is the #109 attribute-placement difference showing
-    // through, and it is ledgered under this issue's residual rather than
-    // fixed here.
+    // AUTHORITATIVE: every raw attribute other than `service.name` whose
+    // stored name (`log_label_name`) is `service_name` is stored as
+    // `service_name_extracted` instead (issue #507), then the slot is appended.
+    // In the reference no other attribute can reach the slot either; such an
+    // attribute is structured metadata there, and its read path shows it as
+    // `service_name_extracted` beside the stream's `service_name` (measured,
+    // #507 addendum 3, ao5 and ao6). The frozen greatest-key/greatest-value
+    // rule (issue #4) is therefore never asked to decide `service_name` on
+    // this path; it still decides every other collision, unchanged, through
+    // `LabelSet::from_log_attribute_pairs`. We store that attribute as a
+    // stream label where the reference stores structured metadata: the #109
+    // placement difference.
     let mut pairs: Vec<(String, String)> = raw_attributes
         .iter()
         .filter(|(key, _)| canonicalize_label_key(key) != SERVICE_NAME_LABEL)
@@ -588,9 +591,10 @@ fn build_stream_labels(
 /// attributes from `:300-317`), so at the builder no OTLP pair is ever
 /// renamed, `add` stays empty but for the U+FFFD rewrites, and the builder
 /// degenerates to exactly the by-name delete + keep-last this function used to
-/// spell inline. [`canonicalize_label_key`] is the same primitive
-/// `LabelSet::from_normalized` uses, so the keys handed over are its fixed
-/// points and the seam only sorts + JSON-encodes them (byte-identical to the
+/// spell inline. The keys are renamed with `log_label_name`, the same
+/// renaming the builder applies, so the keys handed over are its fixed points
+/// (and fixed points of the grouping `render_structured_metadata` applies),
+/// and the seam only sorts + JSON-encodes them (byte-identical to the
 /// Loki-push representation). The surviving asymmetry — push hands the builder
 /// RAW names, this path hands it renamed ones — is the reference's own
 /// asymmetry, at the same place.
@@ -617,7 +621,7 @@ fn build_scope_metadata_pairs(
         .map(|(key, value)| (canonicalize_label_key(&key), value))
         .collect();
     if !scope.name.is_empty() {
-        // `scope_name`/`scope_version` are already canonicalize fixed points.
+        // `scope_name`/`scope_version` are already `log_label_name` fixed points.
         ordered.push(("scope_name".to_string(), scope.name.clone()));
     }
     if !scope.version.is_empty() {
@@ -756,16 +760,14 @@ impl AttributeLookup for RecordAttributes<'_> {
     }
 }
 
-/// `canonicalize_label_key(raw) == canonical`, without building the
-/// canonical form. The reference reaches record attributes through the same
-/// key sanitizer every other attribute goes through
-/// (`pkg/loghttp/push/otlp.go:488-499 @ v3.7.4`), so the comparison has to
-/// be on the canonical name — but the rule asks about at most fifteen names
-/// per record, and allocating a canonical key per attribute per name to
-/// answer them would be the whole cost of the feature.
+/// `log_label_name(raw) == canonical`, without building the stored name.
+/// The reference renames record attribute keys with the same label namer as
+/// every other attribute (the coder keeps the citation), so the comparison has
+/// to be on the stored name — but the rule asks about at most fifteen names
+/// per record, and allocating a stored name per attribute per name to answer
+/// them would be the whole cost of the feature.
 ///
-/// `canonical_key_eq_matches_canonicalize_label_key` pins the two against
-/// each other.
+/// `a_record_attribute_level_is_found_under_its_stored_name` pins it.
 fn canonical_key_eq(raw: &str, canonical: &str) -> bool {
     let mut want = canonical.chars();
     for c in raw.chars() {
@@ -3013,8 +3015,9 @@ mod tests {
     /// structured metadata, which no bound reaches.
     ///
     /// Storage still disagrees for seventeen of the eighteen: we index every
-    /// resource attribute (#109), both spellings canonicalize onto one label,
-    /// and `from_normalized`'s frozen collision rule (#4) keeps the greatest
+    /// resource attribute (#109), both spellings are stored under one label,
+    /// and the frozen collision rule (#4, applied by
+    /// `from_log_attribute_pairs`) keeps the greatest
     /// *original* key — `_` (0x5F) sorts after `.` (0x2E) — so the
     /// **unvalidated** near-miss wins and a 2049-byte value is stored under a
     /// label the validator passed at two bytes.
