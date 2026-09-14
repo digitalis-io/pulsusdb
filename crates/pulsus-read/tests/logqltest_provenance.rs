@@ -1996,7 +1996,11 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// Issue #294 added `t6_errors_edges.test`'s raw-byte `duration` /
 /// `duration_seconds` failure rows, captured 2026-08-26 on the same
 /// pinned digest under that file's `captured` default.
-const CAPTURED: usize = 1_513;
+/// Issue #507 moved fourteen `b23_json_raw_read.test` rows off that file's
+/// `captured` default: a line that is not one JSON text is `JSONParserErr`
+/// on every form, so those rows now hold our answer, with the reference's
+/// captured answer kept in the comment above each.
+const CAPTURED: usize = 1_499;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -2004,8 +2008,11 @@ const CAPTURED: usize = 1_513;
 /// on-axis control), same file default.
 const DERIVED: usize = 32;
 /// Issue #389's residual rows — the mid-line-malformed class, and its
-/// bound where both sides answer the empty string — all name
-/// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
+/// bound where both sides answered the empty string — named
+/// `json-nonvalidating-scan-residual` (issue #507 moved the bound row to
+/// `json-targeted-line-that-does-not-parse`). Issue #507's other
+/// `b23_json_raw_read.test` rows name `json-text-is-one-value` and
+/// `json-targeted-line-that-does-not-parse`. Issue #397's wrapped-variant rows
 /// on the reference's surviving-error surface name
 /// `variants-surviving-error-status`. Issue #393's rows where several
 /// logfmt extraction identifiers share a source key name
@@ -2014,7 +2021,7 @@ const DERIVED: usize = 32;
 /// file's `ported(...)` default onto `sort-tie-order`: their expected
 /// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
 /// ported reference order — the reference specifies none.
-const DIVERGENCE: usize = 30;
+const DIVERGENCE: usize = 44;
 const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by

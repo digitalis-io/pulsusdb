@@ -1994,3 +1994,118 @@ fn logfmt_a_malformed_token_contributes_nothing_and_the_scan_resumes() {
         assert_eq!(details, want_err, "{q} over {line}: error details");
     }
 }
+
+/// Runs one line through a range query's pipeline in metric mode:
+/// `(kept, unwrapped value, sorted labels)`.
+fn metric(query: &str, body: &str) -> (bool, Option<f64>, Vec<(String, String)>) {
+    let expr = pulsus_logql::parse(query).expect("parse");
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { ref range, .. }) = expr else {
+        panic!("expected a range query: {query}");
+    };
+    let pipeline = CompiledPipeline::compile(&range.selector.pipeline).expect("compile");
+    let base = base();
+    let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+    match pipeline
+        .run_metric_into(body, &base, 0, None, &mut labels)
+        .expect("no budget breach")
+    {
+        MetricRun::Dropped => (false, None, Vec::new()),
+        MetricRun::Kept { value, .. } => {
+            let mut l: Vec<(String, String)> = labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            l.sort();
+            (true, value, l)
+        }
+    }
+}
+
+/// Issue #507: a line with no readable value for the unwrapped label
+/// contributes no sample and no error — an absent path, an empty string and
+/// `null` alike, on the targeted and the bare form and under `duration()`.
+/// The targeted form's `""` fill for a path that does not resolve is not a
+/// value. A present value that is not a number is still an error.
+#[test]
+fn unwrap_over_an_absent_or_empty_value_contributes_no_sample() {
+    let t = r#"sum_over_time({a="b"} | json latency="latency" | unwrap latency [1m])"#;
+    let b = r#"sum_over_time({a="b"} | json | unwrap latency [1m])"#;
+    let d = r#"sum_over_time({a="b"} | json latency="latency" | unwrap duration(latency) [1m])"#;
+    let n = r#"sum_over_time({a="b"} | json lat="req.latency" | unwrap lat [1m])"#;
+    for (q, body) in [
+        (t, r#"{"other":1}"#),
+        (t, r#"{"latency":""}"#),
+        (t, r#"{"latency":null}"#),
+        (b, r#"{"latency":""}"#),
+        (d, r#"{"latency":""}"#),
+        (n, r#"{"req":{"other":4}}"#),
+    ] {
+        assert_eq!(
+            metric(q, body),
+            (false, None, Vec::new()),
+            "{q} over {body}"
+        );
+    }
+    let (kept, value, labels) = metric(t, r#"{"latency":"abc"}"#);
+    assert!(
+        kept && value.is_none()
+            && labels
+                .iter()
+                .any(|(k, v)| k == "__error__" && v == "SampleExtractionErr"),
+        "a value that is not a number is an error: {labels:?}"
+    );
+    assert_eq!(metric(t, r#"{"latency":5}"#).1, Some(5.0));
+}
+
+/// Issue #507: an empty line, or one holding only JSON whitespace, is not a
+/// JSON text, so the targeted form reports it exactly as the bare form does.
+#[test]
+fn targeted_empty_and_whitespace_lines_are_not_json() {
+    for line in ["", " ", "\t\n"] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).expect("kept");
+        assert_eq!(got, labels(&not_json()), "line {line:?}");
+    }
+}
+
+/// Two destinations that resolve to one label: the value kept is the one the
+/// DOCUMENT reaches last, which a group document built in declaration order
+/// cannot reproduce. This is why the planner sends such a query to today's
+/// route (`plan::tests::which_unwrapped_chains_lower`).
+#[test]
+fn two_destinations_of_one_label_follow_document_order() {
+    let q = r#"{a="b"} | json c="code", c="method", lat="latency""#;
+    let c_of = |line: &str| {
+        run(q, line)
+            .expect("kept")
+            .0
+            .into_iter()
+            .find(|(k, _)| k == "c")
+            .map(|(_, v)| v)
+    };
+    assert_eq!(
+        c_of(r#"{"method":"GET","code":"200","latency":1}"#).as_deref(),
+        Some("200")
+    );
+    assert_eq!(
+        c_of(r#"{"code":"200","method":"GET","latency":0}"#).as_deref(),
+        Some("GET")
+    );
+}
+
+/// Issue #507: in `| logfmt <id>="<key>"`, a destination renamed to
+/// `<id>_extracted` (the stream carries `<id>`) that is already written on
+/// the line is skipped and the scan reads on. The reference stops reading the
+/// line there (ledger `logfmt-expression-renamed-repeat`): over `a=x b=z` it
+/// answers `env_extracted=""`.
+#[test]
+fn logfmt_expression_skips_a_renamed_repeat_and_reads_on() {
+    let q = r#"{a="b"} | logfmt env="a", env_extracted="b""#;
+    for (line, want) in [("a=x b=z", "z"), ("b=z a=x", "z")] {
+        let (got, _) = run(q, line).expect("kept");
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("env_extracted", want)]),
+            "{line}"
+        );
+    }
+}
