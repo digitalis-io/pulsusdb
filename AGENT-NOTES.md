@@ -54,13 +54,15 @@ applied alone to a clean tree and restored with `git checkout -- <file>`.
   `client_agg::tests::a_preserved_error_passes_the_check_and_a_failed_conversion_counts_zero`).
 - Live, run at `1c314e2f` against the local 26.3 server and the two-shard
   cluster: 23 red, 1 green.
-  - **L31 green, a finding:** mapping server code 159 in S1 to today's route
-    leaves `query_log_gates::the_key_statement_timeout_is_the_timeout_response`
-    green, because the client's stream deadline arrives before the server's
-    159 in that test. The client-deadline variant (L31t) is red. Next step
-    for this: make the test also reach a server 159 (a `max_execution_time`
-    below the client deadline for S1), so both arms are exercised, then
-    re-run L31.
+  - **L31 was green, now fixed.** Mapping server code 159 in S1 to today's
+    route left `the_key_statement_timeout_is_the_timeout_response` green,
+    because the client's stream deadline always arrived first. The test now
+    runs both arms: the server's own `max_execution_time` (0.3 s) below a
+    20-second client deadline, and a 1-second client deadline with no server
+    limit. The test-only knobs carry the server limit into the statement's
+    own `SETTINGS`, which the server honours over the request's. Both breaks
+    are red at `84aa62c3`: L31 `Ok(Matrix(...))` where the timeout response
+    is required; L31t `[(Key, 159), (Raw, 0)]` where no raw scan may follow.
 - Control at `1c314e2f` before the live breaks: `query_log_gates` +
   `explain_indexes` 74 run, 74 passed; `logs_detected_live` 7 run, 7 passed;
   the two-shard `the_undecided_rows_come_from_one_read` 1 run, 1 passed.
@@ -98,12 +100,15 @@ containers `coder507gk-ref`, `coder507gk-ref463`. Start them again with
 
 ## Exact next step
 
-1. `podman start coder507gk-ch coder507gk-keeper coder507gk-shard1 coder507gk-shard2`.
-2. Fix the L31 finding (above), commit, re-run `python3 run.py live.py L31 L31t`.
-3. Run the measurements (criteria 16, 17, 28) and keep their output.
-4. Full gauntlet: `cargo nextest run --workspace`, `cargo test --workspace --doc`,
+1. Run the measurements (criteria 16, 17, 28) and keep their output.
+2. Full gauntlet: `cargo nextest run --workspace`, `cargo test --workspace --doc`,
    clippy with `-D warnings`, `cargo fmt --all -- --check`, the live suites.
-5. Stop and report to the task-manager (option A waits for the verdict).
+3. Stop and report to the task-manager (option A waits for the verdict).
+
+**No attribution lines anywhere** (owner): no session link and no tool name
+in a commit message, a pull request, an issue comment, `docs/` or code. The
+branch was rewritten once to remove the trailers it used to carry; nothing
+had been pushed.
 
 ## Deviations to report
 
