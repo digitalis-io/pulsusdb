@@ -27,7 +27,10 @@ use super::error::{ReadError, TooBroadReason};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
-use super::pipeline::{CompiledPipeline, RangeGrouping};
+use super::pipeline::{
+    CompiledPipeline, ERROR_LABEL, PRESERVE_ERROR_LABEL, ParentSum, ParserHints, RangeGrouping,
+    RangeStepRules,
+};
 use super::predicate::{CheckedFragment, MonthLiteral};
 use super::sql::{self, ScanLowerBound};
 use super::window::{ClientWindow, GridWindow};
@@ -1814,6 +1817,217 @@ fn unwrapped_chain(op: RangeAggOp, pipeline: &[Stage]) -> Option<(sql::UnwrapRed
     Some((reducer, name.to_string()))
 }
 
+/// The range step's rules for one range aggregation (issue #507): what the
+/// reference's sample extractor does to a line's labels beyond the range
+/// aggregation's own grouping. Derived from the plan's existing fields, so no
+/// plan shape changes.
+///
+/// ```text
+/// sum by (L) (count_over_time(...))      parent_sum = by (L)
+/// sum (rate(...))                        parent_sum = by ()   (a singleton)
+/// max by (L) (count_over_time(...))      parent_sum = none    (not a sum)
+/// sum by (L) (avg_over_time(...) by (M)) parent_sum = none    (own grouping)
+/// ```
+///
+/// `parent_sum` is the reference handing a parent `sum`'s grouping to the
+/// range step; `hints` is the reference's parser hints over the grouping the
+/// sample extractor receives, reduced to the two reserved names. (Citations:
+/// the reference at the pinned tag.)
+pub(in crate::logql) fn range_step_rules(
+    op: RangeAggOp,
+    pipeline: &[Stage],
+    own: Option<&RangeGrouping>,
+    vector_aggs: &[VectorAggSpec],
+) -> RangeStepRules {
+    let unwrap_label = pipeline.iter().find_map(|s| match s {
+        Stage::Unwrap(u) => Some(u.label.as_str()),
+        _ => None,
+    });
+    let parent = parent_sum_grouping(op, own.is_some(), vector_aggs);
+    // The grouping the extractor receives: (names, without, needs no labels).
+    let (mut groups, mut without, mut no_labels): (Vec<&str>, bool, bool) = match (own, parent) {
+        (Some(RangeGrouping::Singleton), _) | (None, Some(None)) => (Vec::new(), false, true),
+        (Some(RangeGrouping::By(names)), _) => {
+            (names.iter().map(String::as_str).collect(), false, false)
+        }
+        (Some(RangeGrouping::Without(names)), _) => {
+            (names.iter().map(String::as_str).collect(), true, false)
+        }
+        (None, Some(Some(g))) => match g.kind {
+            GroupingKind::By if g.labels.is_empty() => (Vec::new(), false, true),
+            GroupingKind::By => (g.labels.iter().map(String::as_str).collect(), false, false),
+            GroupingKind::Without => (g.labels.iter().map(String::as_str).collect(), true, false),
+        },
+        (None, None) => (Vec::new(), false, false),
+    };
+    if matches!(op, RangeAggOp::AbsentOverTime) {
+        no_labels = true;
+    }
+    if let Some(label) = unwrap_label
+        && (groups.is_empty() || without)
+    {
+        // The reference's unwrap extractor rewrites an empty or `without`
+        // grouping into a `without` naming the unwrapped label.
+        without = true;
+        groups.push(label);
+    }
+    let names_required = |name: &str| {
+        stages_require(op, pipeline, name)
+            || groups
+                .iter()
+                .chain(unwrap_label.iter())
+                .any(|g| hint_names(g, name))
+    };
+    let hint_list_empty =
+        groups.is_empty() && unwrap_label.is_none() && !stages_require_any(op, pipeline);
+    let active = if no_labels {
+        !hint_list_empty
+    } else {
+        !(without || groups.is_empty())
+    };
+    RangeStepRules {
+        parent_sum: parent_sum_rules(op, own.is_some(), vector_aggs, unwrap_label),
+        hints: ParserHints {
+            active,
+            requires_error: active && names_required(ERROR_LABEL),
+            requires_preserve: active && names_required(PRESERVE_ERROR_LABEL),
+        },
+    }
+}
+
+/// The grouping of a `sum` directly above the range aggregation, when the
+/// reference hands it to the range step: `Some(None)` for a bare `sum`
+/// (whose empty grouping the reference treats as a singleton),
+/// `Some(Some(g))` for `sum by`/`sum without`, `None` when nothing is handed.
+fn parent_sum_grouping(
+    op: RangeAggOp,
+    has_own: bool,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<Option<&Grouping>> {
+    match vector_aggs.last() {
+        Some((VectorAggOp::Sum, grouping, _))
+            if !has_own
+                && matches!(
+                    op,
+                    RangeAggOp::CountOverTime
+                        | RangeAggOp::BytesOverTime
+                        | RangeAggOp::BytesRate
+                        | RangeAggOp::SumOverTime
+                        | RangeAggOp::Rate
+                ) =>
+        {
+            Some(grouping.as_ref())
+        }
+        _ => None,
+    }
+}
+
+/// [`ParentSum`] for a range aggregation, allocation-free (issue #507): the
+/// `variants(...)` sub-states call it per variant, where every allocation is
+/// charged.
+pub(in crate::logql) fn parent_sum_rules(
+    op: RangeAggOp,
+    has_own: bool,
+    vector_aggs: &[VectorAggSpec],
+    unwrap_label: Option<&str>,
+) -> Option<ParentSum> {
+    let grouping = parent_sum_grouping(op, has_own, vector_aggs)?;
+    let keeps = |name: &str| match grouping {
+        None => false,
+        Some(g) => match g.kind {
+            GroupingKind::By => g.labels.iter().any(|l| l == name),
+            GroupingKind::Without => !g.labels.iter().any(|l| l == name),
+        },
+    };
+    Some(ParentSum {
+        keeps_error: keeps(ERROR_LABEL),
+        keeps_preserve: keeps(PRESERVE_ERROR_LABEL),
+        keeps_unwrapped: unwrap_label.is_some_and(|label| {
+            grouping
+                .is_some_and(|g| g.kind == GroupingKind::By && g.labels.iter().any(|l| l == label))
+        }),
+    })
+}
+
+/// The reference's hint list: a required label ending `_extracted` also
+/// requires the name without the suffix.
+fn hint_names(required: &str, name: &str) -> bool {
+    required == name || required.strip_suffix("_extracted") == Some(name)
+}
+
+/// Whether any stage requires any label at all (the hint list's emptiness,
+/// which decides the hints for a query that needs no labels).
+fn stages_require_any(op: RangeAggOp, pipeline: &[Stage]) -> bool {
+    let mut any = false;
+    each_required_label(op, pipeline, &mut |_| any = true);
+    any
+}
+
+/// Whether the pipeline's stages require `name` (issue #507).
+fn stages_require(op: RangeAggOp, pipeline: &[Stage], name: &str) -> bool {
+    let mut found = false;
+    each_required_label(op, pipeline, &mut |label| found |= hint_names(label, name));
+    found
+}
+
+/// The labels the reference's stages require, after its optimiser has
+/// removed the `line_format` stages a metric query does not need: label
+/// filters (a `=~` whose pattern is the match-all `.*` or empty is a no-op
+/// filter and requires nothing), `label_format` sources and template fields,
+/// `line_format` template fields, and `ip()` filters. Templates are handed to
+/// `each` as their field names via [`super::template::names_field`], so
+/// `each` sees the reserved names only.
+fn each_required_label(op: RangeAggOp, pipeline: &[Stage], each: &mut dyn FnMut(&str)) {
+    use super::template::{TemplateKind, names_field};
+    let keeps_line_format = |at: usize| {
+        matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate)
+            || pipeline[at..]
+                .iter()
+                .any(|s| matches!(s, Stage::Parser(_) | Stage::Unpack | Stage::LineFilter(_)))
+    };
+    for (at, stage) in pipeline.iter().enumerate() {
+        match stage {
+            Stage::LabelFilter(expr) => {
+                pulsus_logql::for_each_label_filter(expr, |e| match e {
+                    LabelFilterExpr::Match(m) => {
+                        let match_all = m.op == MatchOp::Re
+                            && matches!(m.value.as_str(), "" | ".*" | "(.*)" | "(?:.*)");
+                        if !match_all {
+                            each(&m.name);
+                        }
+                    }
+                    LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                        each(name)
+                    }
+                    LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+                });
+            }
+            Stage::LabelFormat(fmts) => {
+                for f in fmts {
+                    match f {
+                        pulsus_logql::LabelFmt::Rename { src, .. } => each(src),
+                        pulsus_logql::LabelFmt::Template { tmpl, .. } => {
+                            for reserved in [ERROR_LABEL, PRESERVE_ERROR_LABEL] {
+                                if names_field(tmpl, TemplateKind::Label, reserved) {
+                                    each(reserved);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Stage::LineFormat(tmpl) if keeps_line_format(at) => {
+                for reserved in [ERROR_LABEL, PRESERVE_ERROR_LABEL] {
+                    if names_field(tmpl, TemplateKind::Line, reserved) {
+                        each(reserved);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `force_client` (issue #221): `true` ONLY for the `variants(...)` scan
 /// plan — the routing decision becomes `Raw` with its own named reason and
 /// `client` is always `Some`, so the multi-extractor scan reads raw
@@ -2176,7 +2390,13 @@ fn metric_plan(
             }
             None => false,
         } {
-        unwrapped_chain(*op, pipeline)
+        unwrapped_chain(*op, pipeline).filter(|(_, name)| {
+            // Issue #507: a parent `sum by (…, <name>, …)` keeps the
+            // unwrapped label at the range step, and this statement cannot
+            // return it.
+            !parent_sum_rules(*op, false, &vector_aggs, Some(name))
+                .is_some_and(|p| p.keeps_unwrapped)
+        })
     } else {
         None
     };
@@ -3588,6 +3808,161 @@ mod recursive_control;
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #507: the range step's rules follow the reference's sample
+    /// extractor: which parent `sum` hands its grouping down, and the parser
+    /// hints over the grouping the extractor receives.
+    #[test]
+    fn range_step_rules_follow_the_reference_sample_extractor() {
+        use super::super::pipeline::{ParentSum, ParserHints};
+        let p = |keeps_error, keeps_preserve, keeps_unwrapped| {
+            Some(ParentSum {
+                keeps_error,
+                keeps_preserve,
+                keeps_unwrapped,
+            })
+        };
+        let h = |active, requires_error, requires_preserve| ParserHints {
+            active,
+            requires_error,
+            requires_preserve,
+        };
+        let cases = [
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum(count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(false, false, false),
+            ),
+            (
+                r#"sum without (__error__) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, true, false),
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (rate({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_rate({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"max by (service_name) (count_over_time({a="b"} | json [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (max_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (service_name) (rate_counter({a="b"} | json | unwrap latency [5m]))"#,
+                None,
+                h(false, false, false),
+            ),
+            (
+                r#"sum by (__error__) (count_over_time({a="b"} | json [5m]))"#,
+                p(true, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (__error___extracted) (count_over_time({a="b"} | json [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | json | __error__!="" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum(count_over_time({a="b"} | json | __error__!="" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (latency) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(false, false, true),
+                h(true, false, false),
+            ),
+            (
+                r#"sum without (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
+                p(true, true, false),
+                h(false, false, false),
+            ),
+            (
+                r#"avg_over_time({a="b"} | json | unwrap latency [5m]) by (x)"#,
+                None,
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | __preserve_error__="true" [5m]))"#,
+                p(false, false, false),
+                h(true, false, true),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | label_format x=__preserve_error__ [5m]))"#,
+                p(false, false, false),
+                h(true, false, true),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | line_format "{{.__error__}}" [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | line_format "{{.__error__}}" | logfmt [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (bytes_over_time({a="b"} | logfmt | line_format "{{.__error__}}" [5m]))"#,
+                p(false, false, false),
+                h(true, true, false),
+            ),
+            (
+                r#"sum by (service_name) (count_over_time({a="b"} | logfmt | __error__=~".*" [5m]))"#,
+                p(false, false, false),
+                h(true, false, false),
+            ),
+        ];
+        for (query, parent, hints) in cases {
+            let mp = metric_mp(
+                query,
+                QuerySpec::Instant {
+                    at_ns: 600_000_000_000,
+                },
+            )
+            .expect(query);
+            let client = mp.client.as_ref().expect("client mode");
+            let got = range_step_rules(
+                client.range_op,
+                &client.pipeline,
+                client.grouping.as_deref(),
+                &mp.vector_aggs,
+            );
+            assert_eq!((got.parent_sum, got.hints), (parent, hints), "{query}");
+        }
+    }
+
     use pulsus_logql::{parse, parse_selector};
 
     use super::*;

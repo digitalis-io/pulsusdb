@@ -1690,3 +1690,287 @@ fn ip_label_filter_invalid_value_is_a_non_match_without_error() {
         "the raw non-IP label value is carried unchanged: {kept:?}"
     );
 }
+
+/// Issue #507: `| unpack` reads the object in one pass and buffers, so the
+/// observable rules of the two-phase reading hold: no labels without a string
+/// `_entry`, a repeated name is last-wins, a non-string member is skipped, the
+/// nesting limit still applies inside skipped members, and a line that is not
+/// one JSON text is `JSONParserErr`.
+#[test]
+fn unpack_reads_the_object_in_one_pass_and_keeps_the_buffered_rules() {
+    let q = r#"{a="b"} | unpack"#;
+    let nest = |n: usize, open: char, close: char| {
+        format!(
+            "{{\"_entry\":\"x\",\"z\":{}1{},\"k\":\"v\"}}",
+            open.to_string().repeat(n),
+            close.to_string().repeat(n)
+        )
+    };
+    let nest_obj = |n: usize| {
+        format!(
+            "{{\"_entry\":\"x\",\"z\":{}1{},\"k\":\"v\"}}",
+            "{\"a\":".repeat(n),
+            "}".repeat(n)
+        )
+    };
+    let bodies: Vec<String> = vec![
+        r#"{"_entry":"hi","a":"1","b":2,"c":{"d":"e"},"a":"3"}"#.into(),
+        r#"{"a":"1"}"#.into(),
+        r#"{"_entry":"hi","env":"x","env_extracted":"y"}"#.into(),
+        r#"{"_entry":"hi","__error__":"boom","--error--":"b2"}"#.into(),
+        r#"{"_entry":"hi","key":"v\"q","a.b":"1","a_b":"2"}"#.into(),
+        r#"{"_entry":1,"a":"1"}"#.into(),
+        r#"{"_entry":"x","_entry":"y","a":"1"}"#.into(),
+        r#"[1,2]"#.into(),
+        r#"{"_entry":"x","a":tru}"#.into(),
+        r#"{"_entry":"x","a":"1"}junk"#.into(),
+        r#" {"_entry":"x","a":"1"} "#.into(),
+        "".into(),
+        r#""s""#.into(),
+        nest(126, '[', ']'),
+        nest(127, '[', ']'),
+        nest_obj(126),
+        nest_obj(127),
+        r#"{"_entry":"x","n":1e999}"#.into(),
+        r#"{"_entry":"x","a":"\ud800"}"#.into(),
+    ];
+    let expected: [&str; 19] = [
+        r##"Some(([("a", "3"), ("app", "checkout"), ("env", "prod")], "hi"))"##,
+        r##"Some(([("app", "checkout"), ("env", "prod")], "{\"a\":\"1\"}"))"##,
+        r##"Some(([("app", "checkout"), ("env", "prod"), ("env_extracted", "y")], "hi"))"##,
+        r##"Some(([("__error__", "b2"), ("app", "checkout"), ("env", "prod")], "hi"))"##,
+        r##"Some(([("a_b", "2"), ("app", "checkout"), ("env", "prod"), ("key", "v\"q")], "hi"))"##,
+        r##"Some(([("app", "checkout"), ("env", "prod")], "{\"_entry\":1,\"a\":\"1\"}"))"##,
+        r##"Some(([("a", "1"), ("app", "checkout"), ("env", "prod")], "y"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "[1,2]"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"a\":tru}"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"a\":\"1\"}junk"))"##,
+        r##"Some(([("a", "1"), ("app", "checkout"), ("env", "prod")], "x"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], ""))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "\"s\""))"##,
+        r##"Some(([("app", "checkout"), ("env", "prod"), ("k", "v")], "x"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"z\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\"k\":\"v\"}"))"##,
+        r##"Some(([("app", "checkout"), ("env", "prod"), ("k", "v")], "x"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"z\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":1}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"k\":\"v\"}"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"n\":1e999}"))"##,
+        r##"Some(([("__error__", "JSONParserErr"), ("__error_details__", "Value looks like object, but can't find closing '}' symbol"), ("app", "checkout"), ("env", "prod")], "{\"_entry\":\"x\",\"a\":\"\\ud800\"}"))"##,
+    ];
+    for (body, want) in bodies.iter().zip(expected) {
+        assert_eq!(format!("{:?}", run(q, body)), want, "{q} over {body}");
+    }
+}
+
+/// Issue #507: a `| logfmt` token is the bytes up to the next separator (a
+/// byte at or below `' '`, outside quotes). A malformed token contributes
+/// nothing — a quoted value that is not followed by a separator included —
+/// and the lenient scan resumes at the next token; the strict scan stops,
+/// keeping the pairs before it. Base labels `app`/`env` are the helper's.
+#[test]
+fn logfmt_a_malformed_token_contributes_nothing_and_the_scan_resumes() {
+    let base = [("app", "checkout"), ("env", "prod")];
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut v: Vec<(&str, &str)> = base.to_vec();
+        v.extend_from_slice(extra);
+        labels(&v)
+    };
+    let err = |pos: usize, what: &str| format!("logfmt syntax error at pos {pos} : {what}");
+    // (query, line, labels without the error pair, the strict error details or None)
+    type Case<'a> = (&'a str, &'a str, Vec<(String, String)>, Option<String>);
+    let cases: Vec<Case> = vec![
+        // a quoted value followed by `=`: nothing from that token
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a="x"=1 c=2"#,
+            with(&[("c", "2")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"a="x"=1 c=2"#,
+            with(&[]),
+            Some(err(6, "unexpected '='")),
+        ),
+        // a quoted value followed by a key byte: nothing from that token
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a="x"b c=1"#,
+            with(&[("c", "1")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"a="x"b c=1"#,
+            with(&[]),
+            Some(err(6, "unexpected 'b'")),
+        ),
+        // an unescaped quote inside a value: no truncated `msg`
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info msg="user "bob" logged in" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"level=info msg="user "bob" logged in" status=200"#,
+            with(&[("level", "info")]),
+            Some(err(23, "unexpected 'b'")),
+        ),
+        // a value holding an unescaped quote: the skip pairs quotes, so no label comes from inside it
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info msg="user "bob" role=admin now" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --keep-empty"#,
+            r#"level=info msg="user "bob" logged in" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"msg="a "b=c" d=e""#,
+            with(&[]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a="x""y" c=1"#,
+            with(&[("c", "1")]),
+            None,
+        ),
+        // a token already malformed before its quoted value: the skip still
+        // pairs a quote that follows `=`, so no label comes from inside it
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info filter=name="john x=1 smith" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --keep-empty"#,
+            r#"level=info filter=name="john x=1 smith" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"level=info filter=name="john x=1 smith" status=200"#,
+            with(&[("level", "info")]),
+            Some(err(23, "unexpected '='")),
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info q=a="b c=1" d=2"#,
+            with(&[("d", "2"), ("level", "info")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info url=http://x?a="b c=1" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info ke"y="b c=1" d=2"#,
+            with(&[("d", "2"), ("level", "info")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"k=x="a b=1 c"d e=2"#,
+            with(&[("e", "2")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#""f=2{"j":1}be="openx g=3"#,
+            with(&[]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a=1b="q"e="open d="u\"v" g=3x"#,
+            with(&[("g", "3x")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"é"v w"b="q"b="q"\c=" g=3"#,
+            with(&[]),
+            None,
+        ),
+        // a quote that does not follow `=` opens nothing
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"level=info "msg=user x=1" status=200"#,
+            with(&[("level", "info"), ("status", "200")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a=1"b c=2" d=3"#,
+            with(&[("d", "3")]),
+            None,
+        ),
+        // resumption after a malformed token
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"{"a":1} x=2"#,
+            with(&[("x", "2")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a=1"b" c=3"#,
+            with(&[("c", "3")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt"#,
+            r#"a=1 b"x c=3"#,
+            with(&[("a", "1"), ("c", "3")]),
+            None,
+        ),
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"a=1 b"x c=3"#,
+            with(&[("a", "1")]),
+            Some(err(6, "unexpected '\"'")),
+        ),
+        // an ordinary line
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            r#"level=info msg="user bob logged in" status=200"#,
+            with(&[
+                ("level", "info"),
+                ("msg", "user bob logged in"),
+                ("status", "200"),
+            ]),
+            None,
+        ),
+        // the position is a byte offset: `é` and the no-break space are two bytes each, so `=` is at byte 7
+        (
+            r#"{a="b"} | logfmt --strict"#,
+            "é=1\u{a0}c=2",
+            with(&[]),
+            Some(err(8, "unexpected '='")),
+        ),
+    ];
+    for (q, line, want, want_err) in cases {
+        let (got, _) = run(q, line).expect("logfmt keeps the line");
+        let details = got
+            .iter()
+            .find(|(k, _)| k == "__error_details__")
+            .map(|(_, v)| v.clone());
+        let got: Vec<(String, String)> = got
+            .into_iter()
+            .filter(|(k, _)| k != "__error__" && k != "__error_details__")
+            .collect();
+        assert_eq!(got, want, "{q} over {line}: labels");
+        assert_eq!(details, want_err, "{q} over {line}: error details");
+    }
+}

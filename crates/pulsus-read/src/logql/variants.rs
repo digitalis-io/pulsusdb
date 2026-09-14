@@ -631,14 +631,17 @@ impl<'q> VariantsAggState<'q> {
                 sub_charged.push(0);
             }
             let state = if is_range {
-                MetricAggState::Range(Box::new(RangeSlideState::new(
-                    compiled,
-                    meta,
-                    spec.client(),
-                    spec.window(),
-                    spec.rate_window_ns(),
-                    caps,
-                )?))
+                MetricAggState::Range(Box::new(
+                    RangeSlideState::new(
+                        compiled,
+                        meta,
+                        spec.client(),
+                        spec.window(),
+                        spec.rate_window_ns(),
+                        caps,
+                    )?
+                    .with_range_step(variant_range_step(spec)),
+                ))
             } else {
                 let instant =
                     spec.window()
@@ -648,14 +651,17 @@ impl<'q> VariantsAggState<'q> {
                                      aggregation state"
                                 .to_string(),
                         })?;
-                MetricAggState::Instant(Box::new(ClientAggState::new(
-                    compiled,
-                    meta,
-                    spec.client(),
-                    instant,
-                    spec.rate_window_ns(),
-                    caps,
-                )?))
+                MetricAggState::Instant(Box::new(
+                    ClientAggState::new(
+                        compiled,
+                        meta,
+                        spec.client(),
+                        instant,
+                        spec.rate_window_ns(),
+                        caps,
+                    )?
+                    .with_range_step(variant_range_step(spec)),
+                ))
             };
             if i == 0 {
                 // Sized from the FIRST sub-state's already-built maps —
@@ -913,6 +919,26 @@ pub fn run_variants_rows(
         state.push_rows(rows)?;
     }
     state.finish(warnings)
+}
+
+/// A variant's range-step rules (issue #507): its parent `sum` only. The
+/// parser hints are not applied inside `variants(...)`, whose reserved-name
+/// behaviour on the reference is recorded as an open question (issue #507,
+/// revision 9).
+fn variant_range_step(spec: &super::plan::VariantSpec) -> super::pipeline::RangeStepRules {
+    let unwrap_label = spec.client().pipeline.iter().find_map(|s| match s {
+        pulsus_logql::Stage::Unwrap(u) => Some(u.label.as_str()),
+        _ => None,
+    });
+    super::pipeline::RangeStepRules {
+        parent_sum: super::plan::parent_sum_rules(
+            spec.client().range_op,
+            spec.client().grouping.is_some(),
+            spec.vector_aggs(),
+            unwrap_label,
+        ),
+        hints: super::pipeline::ParserHints::default(),
+    }
 }
 
 #[cfg(test)]

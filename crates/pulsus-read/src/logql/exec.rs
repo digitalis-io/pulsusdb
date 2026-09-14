@@ -13,7 +13,7 @@ use super::detected::{
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
-use super::pipeline::CompiledPipeline;
+use super::pipeline::{CompiledPipeline, ParentSum};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
@@ -1552,7 +1552,8 @@ impl LogQlEngine {
             // set and RE-groups by the merged final set, summing `n` BEFORE
             // `apply_rate` — exact, because every op that can reach this
             // path is a linear sum (`count()` / `sum(length(body))`).
-            let mut groups = PushdownInstantGroups::new(&meta, AggCaps::DEFAULT);
+            let mut groups = PushdownInstantGroups::new(&meta, AggCaps::DEFAULT)
+                .with_parent_sum(parent_sum_of(mp));
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| {
                     map_read_error(
@@ -1636,7 +1637,8 @@ impl LogQlEngine {
                         AggCaps::DEFAULT,
                         mp.grid_start_ns,
                         mp.end_ns,
-                    );
+                    )
+                    .with_parent_sum(parent_sum_of(mp));
                     {
                         // Scoped: the row stream holds its pooled
                         // connection until dropped (the `ChRowStream`
@@ -1733,7 +1735,8 @@ impl LogQlEngine {
             label,
             mp.grid_start_ns,
             mp.end_ns,
-        );
+        )
+        .with_parent_sum(parent_sum_of(mp));
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped, and the fallback below issues a second query.
@@ -1815,6 +1818,13 @@ impl LogQlEngine {
         // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
         // without buffering-driven OOM risk.
         let window = metric_plan_window(mp);
+        // Issue #507: the range step's rules, derived from the plan.
+        let step = super::plan::range_step_rules(
+            client.range_op,
+            &client.pipeline,
+            client.grouping.as_deref(),
+            &mp.vector_aggs,
+        );
         // Issue #236 Part B: on a range query the INNERMOST vector
         // aggregation is folded at the leaf. `vector_aggs` is outer-first
         // (`unwrap_vector_aggs`) and collapses onto the leaf whenever the
@@ -1832,7 +1842,8 @@ impl LogQlEngine {
                 window,
                 mp.rate_window_ns,
                 AggCaps::DEFAULT,
-            )?;
+            )?
+            .with_range_step(step);
             if let Some(spec) = mp.vector_aggs.last() {
                 range.attach_fold(spec);
             }
@@ -1851,14 +1862,17 @@ impl LogQlEngine {
                         .to_string(),
                 })?;
             (
-                MetricAggState::Instant(Box::new(ClientAggState::new(
-                    compiled,
-                    &meta,
-                    client,
-                    instant,
-                    mp.rate_window_ns,
-                    AggCaps::DEFAULT,
-                )?)),
+                MetricAggState::Instant(Box::new(
+                    ClientAggState::new(
+                        compiled,
+                        &meta,
+                        client,
+                        instant,
+                        mp.rate_window_ns,
+                        AggCaps::DEFAULT,
+                    )?
+                    .with_range_step(step),
+                )),
                 0,
             )
         };
@@ -4570,6 +4584,8 @@ pub(in crate::logql) struct PushdownInstantGroups {
     merge_buf: Vec<(String, String)>,
     sm_buf: Vec<(String, String)>,
     sm_ctx: StructuredMetadataCtx,
+    /// A parent `sum`'s grouping (issue #507, `RangeStepRules::parent_sum`).
+    parent_sum: Option<ParentSum>,
 }
 
 impl PushdownInstantGroups {
@@ -4582,7 +4598,14 @@ impl PushdownInstantGroups {
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
             sm_ctx: StructuredMetadataCtx::default(),
+            parent_sum: None,
         }
+    }
+
+    /// Applies a parent `sum`'s grouping at the range step (issue #507).
+    pub(in crate::logql) fn with_parent_sum(mut self, parent_sum: Option<ParentSum>) -> Self {
+        self.parent_sum = parent_sum;
+        self
     }
 
     /// Folds one returned row. A row whose fingerprint did not hydrate is
@@ -4599,7 +4622,7 @@ impl PushdownInstantGroups {
         // a stage-free query merges. The out-of-band error slots are then
         // materialised by the same `visible()` rule the pipeline applies at
         // emit (issue #238).
-        let labels: LabelSet = if row.structured_metadata.is_empty() {
+        let mut labels: LabelSet = if row.structured_metadata.is_empty() {
             base.clone()
         } else {
             merge_labels_with_structured_metadata(
@@ -4614,6 +4637,7 @@ impl PushdownInstantGroups {
             merged.sort();
             merged
         };
+        remove_unkept_reserved(&mut labels, self.parent_sum, row, &self.sm_ctx);
         // A surviving `__error__` fails the whole query here too — measured
         // on the reference at v3.7.4: `count_over_time({…}[5m])` with NO
         // pipeline over an entry whose metadata carries `__error__` answers
@@ -4712,6 +4736,8 @@ pub(in crate::logql) struct PushdownRangeGroups {
     merge_buf: Vec<(String, String)>,
     sm_buf: Vec<(String, String)>,
     sm_ctx: StructuredMetadataCtx,
+    /// A parent `sum`'s grouping (issue #507, `RangeStepRules::parent_sum`).
+    parent_sum: Option<ParentSum>,
 }
 
 impl PushdownRangeGroups {
@@ -4731,7 +4757,14 @@ impl PushdownRangeGroups {
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
             sm_ctx: StructuredMetadataCtx::default(),
+            parent_sum: None,
         }
+    }
+
+    /// Applies a parent `sum`'s grouping at the range step (issue #507).
+    pub(in crate::logql) fn with_parent_sum(mut self, parent_sum: Option<ParentSum>) -> Self {
+        self.parent_sum = parent_sum;
+        self
     }
 
     /// Folds one returned row. A row whose fingerprint did not hydrate is
@@ -4767,7 +4800,7 @@ impl PushdownRangeGroups {
         // and every lowered stage is a pushed line filter), so the merge
         // IS the whole label computation — the instant path's derivation,
         // and the same `visible()` rule for the out-of-band error slots.
-        let labels: LabelSet = if row.structured_metadata.is_empty() {
+        let mut labels: LabelSet = if row.structured_metadata.is_empty() {
             base.clone()
         } else {
             merge_labels_with_structured_metadata(
@@ -4782,6 +4815,7 @@ impl PushdownRangeGroups {
             merged.sort();
             merged
         };
+        remove_unkept_reserved(&mut labels, self.parent_sum, row, &self.sm_ctx);
         // A surviving `__error__` fails the whole query, exactly as on the
         // instant pushdown path.
         check_surviving_error(&labels)?;
@@ -4910,6 +4944,8 @@ pub(in crate::logql) struct PushdownUnwrappedGroups<'a> {
     merge_buf: Vec<(String, String)>,
     sm_buf: Vec<(String, String)>,
     sm_ctx: StructuredMetadataCtx,
+    /// A parent `sum`'s grouping (issue #507, `RangeStepRules::parent_sum`).
+    parent_sum: Option<ParentSum>,
 }
 
 impl<'a> PushdownUnwrappedGroups<'a> {
@@ -4932,7 +4968,14 @@ impl<'a> PushdownUnwrappedGroups<'a> {
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
             sm_ctx: StructuredMetadataCtx::default(),
+            parent_sum: None,
         }
+    }
+
+    /// Applies a parent `sum`'s grouping at the range step (issue #507).
+    pub(in crate::logql) fn with_parent_sum(mut self, parent_sum: Option<ParentSum>) -> Self {
+        self.parent_sum = parent_sum;
+        self
     }
 
     pub(in crate::logql) fn push_row(
@@ -4970,7 +5013,7 @@ impl<'a> PushdownUnwrappedGroups<'a> {
         let Some(base) = self.base_labels.get(&row.fingerprint) else {
             return Ok(());
         };
-        let labels: LabelSet = if row.structured_metadata.is_empty() {
+        let mut labels: LabelSet = if row.structured_metadata.is_empty() {
             base.clone()
         } else {
             merge_labels_with_structured_metadata(
@@ -5000,6 +5043,7 @@ impl<'a> PushdownUnwrappedGroups<'a> {
             return Ok(());
         }
         let value = row.v;
+        remove_unkept_reserved(&mut labels, self.parent_sum, row, &self.sm_ctx);
         check_surviving_error(&labels)?;
         let key = render_series_labels(&labels);
         match self.groups.entry(key) {
@@ -5161,6 +5205,53 @@ fn unwrapped_range_sql(
 /// counting form's fallback does.
 /// `the_reconstructed_fallback_pipeline_is_the_planned_one` is the test
 /// that fails if the admitted shape ever widens.
+/// The grouping of a `sum` directly above a lowered range aggregation
+/// (issue #507). A lowered plan has no grouping of its own and no stage the
+/// parser hints read, so the parent sum is its whole rule.
+fn parent_sum_of(mp: &MetricPlan) -> Option<ParentSum> {
+    super::plan::parent_sum_rules(mp.op, false, &mp.vector_aggs, None)
+}
+
+/// A row with a structured-metadata row shape (issue #507).
+pub(in crate::logql) trait CarriesMetadata {
+    fn metadata_text(&self) -> &str;
+}
+impl CarriesMetadata for MetricInstantRow {
+    fn metadata_text(&self) -> &str {
+        &self.structured_metadata
+    }
+}
+impl CarriesMetadata for MetricRangeBucketRow {
+    fn metadata_text(&self) -> &str {
+        &self.structured_metadata
+    }
+}
+impl CarriesMetadata for MetricRangeUnwrappedRow {
+    fn metadata_text(&self) -> &str {
+        &self.structured_metadata
+    }
+}
+
+/// A lowered fold's half of `RangeStepRules::parent_sum` (issue #507): the
+/// reserved labels a parent `sum` does not keep are removed, unless this
+/// row's metadata filled the error slot, where the reference keeps the
+/// ungrouped labels. `sm_ctx` is only this row's when the row carries
+/// metadata, which is why the row is read first.
+fn remove_unkept_reserved<R: CarriesMetadata>(
+    labels: &mut LabelSet,
+    parent_sum: Option<ParentSum>,
+    row: &R,
+    sm_ctx: &StructuredMetadataCtx,
+) {
+    let Some(p) = parent_sum else {
+        return;
+    };
+    let slot_err = !row.metadata_text().is_empty() && !sm_ctx.err.is_empty();
+    if !slot_err {
+        p.remove_unkept_reserved(labels);
+    }
+}
+
 pub fn unwrapped_fallback_client_agg(mp: &MetricPlan, label: &str) -> ClientAgg {
     use pulsus_logql::{LabelExtraction, ParserStage, Unwrap};
     ClientAgg {
@@ -5656,6 +5747,109 @@ fn stage3_predicates(sp: &StreamsPlan, meta: &HashMap<u64, StreamMetaRow>) -> Ve
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #507: on the three lowered folds, a parent `sum` that does not
+    /// keep `__error__` removes a stream label of that name before the check;
+    /// an error slot filled by the row's metadata still fails the query.
+    #[test]
+    fn a_parent_sum_removes_a_stream_error_label_on_the_lowered_folds() {
+        use crate::logql::pipeline::ParentSum;
+        let mut meta = HashMap::new();
+        meta.insert(
+            1,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "s".to_string(),
+                labels: r#"{"__error__":"s","service_name":"s"}"#.to_string(),
+            },
+        );
+        // A stream with no `__error__` label, so a metadata `__error__` is not
+        // renamed `__error___extracted` and fills the slot.
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "s".to_string(),
+                labels: r#"{"service_name":"s"}"#.to_string(),
+            },
+        );
+        let by_service = Some(ParentSum {
+            keeps_error: false,
+            keeps_preserve: false,
+            keeps_unwrapped: false,
+        });
+        let instant = |sm: &str| MetricInstantRow {
+            fingerprint: 1,
+            n: 1,
+            structured_metadata: sm.to_string(),
+        };
+        let instant_fp2 = |sm: &str| MetricInstantRow {
+            fingerprint: 2,
+            n: 1,
+            structured_metadata: sm.to_string(),
+        };
+        assert!(
+            PushdownInstantGroups::new(&meta, AggCaps::DEFAULT)
+                .push_row(&instant(""))
+                .is_err()
+        );
+        PushdownInstantGroups::new(&meta, AggCaps::DEFAULT)
+            .with_parent_sum(by_service)
+            .push_row(&instant(""))
+            .expect("instant: removed by the parent sum");
+        assert!(
+            PushdownInstantGroups::new(&meta, AggCaps::DEFAULT)
+                .with_parent_sum(by_service)
+                .push_row(&instant_fp2(r#"{"__error__":"boom"}"#))
+                .is_err(),
+            "instant: a metadata error fills the slot"
+        );
+        let bucket = |sm: &str| MetricRangeBucketRow {
+            fingerprint: 1,
+            bucket_ns: 60_000_000_000,
+            n: 1,
+            structured_metadata: sm.to_string(),
+        };
+        assert!(
+            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, 60_000_000_000, 300_000_000_000)
+                .push_row(&bucket(""))
+                .is_err()
+        );
+        PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, 60_000_000_000, 300_000_000_000)
+            .with_parent_sum(by_service)
+            .push_row(&bucket(""))
+            .expect("range: removed by the parent sum");
+        let unwrapped = MetricRangeUnwrappedRow {
+            fingerprint: 1,
+            bucket_ns: 60_000_000_000,
+            v: 5.0,
+            n: 1,
+            all_numeric: 1,
+            structured_metadata: String::new(),
+        };
+        assert!(
+            PushdownUnwrappedGroups::new(
+                &meta,
+                AggCaps::DEFAULT,
+                "latency",
+                60_000_000_000,
+                300_000_000_000
+            )
+            .push_row(&unwrapped)
+            .is_err()
+        );
+        PushdownUnwrappedGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            "latency",
+            60_000_000_000,
+            300_000_000_000,
+        )
+        .with_parent_sum(by_service)
+        .push_row(&unwrapped)
+        .expect("unwrapped: removed by the parent sum");
+    }
+
     use super::super::charge::{AggCaps, PUSHDOWN_INSTANT_SLOT, group_entry_bytes};
     use super::super::labels::fnv1a64;
     use super::super::plan::{ClientAgg, ClientValue};
