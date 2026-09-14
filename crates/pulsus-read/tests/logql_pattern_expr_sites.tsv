@@ -49,7 +49,7 @@ Site	Literal	crates/pulsus-read/src/logql/charge.rs:549	-	-	, 	reject	reject	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1337	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1716	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3941	-	-	, 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7446	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7499	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:5870	-	-	<x> y	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:7123	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:7934	-	-	latency=<latency>	accept	accept	-	-	-

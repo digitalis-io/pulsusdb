@@ -181,7 +181,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:169	crates/pulsus-read/s
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:157-189	crates/pulsus-read/src/logql/labels.rs	157	189	line	pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:363	crates/pulsus-read/src/logql/labels.rs	363		prose	structured_metadata
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3041	crates/pulsus-read/src/logql/pipeline.rs	3041		prose	DURATION_UNITS
-docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6391	crates/pulsus-read/src/logql/pipeline.rs	6391		line	serde_json::Value::Number(n) => n.to_string(),
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		line	pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2869	crates/pulsus-read/src/traces/exec.rs	2869		prose	generator_settings
@@ -238,9 +238,9 @@ docs/query-to-sql.md	pipeline.rs:3027	crates/pulsus-read/src/logql/pipeline.rs	3
 docs/query-to-sql.md	pipeline.rs:3041	crates/pulsus-read/src/logql/pipeline.rs	3041		prose	DURATION_UNITS
 docs/query-to-sql.md	pipeline.rs:3153	crates/pulsus-read/src/logql/pipeline.rs	3153		line	const QUERY_BYTES_SUFFIXES: &[&str] = &[
 docs/query-to-sql.md	pipeline.rs:370	crates/pulsus-read/src/logql/pipeline.rs	370		prose	bad
-docs/query-to-sql.md	pipeline.rs:4999	crates/pulsus-read/src/logql/pipeline.rs	4999		line	// A non-object top level (or a parse failure) is the malformed class:
-docs/query-to-sql.md	pipeline.rs:6226	crates/pulsus-read/src/logql/pipeline.rs	6226		line	let renamed = st.collides_at(&key, at.is_some());
-docs/query-to-sql.md	pipeline.rs:6310-6330	crates/pulsus-read/src/logql/pipeline.rs	6310	6330	line	fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) { if prefix.is_empty() { if part.as_bytes().first().i
+docs/query-to-sql.md	pipeline.rs:5036	crates/pulsus-read/src/logql/pipeline.rs	5036		line	// A non-object top level (or a parse failure) is the malformed class:
+docs/query-to-sql.md	pipeline.rs:6263	crates/pulsus-read/src/logql/pipeline.rs	6263		line	let renamed = st.collides_at(&key, at.is_some());
+docs/query-to-sql.md	pipeline.rs:6347-6367	crates/pulsus-read/src/logql/pipeline.rs	6347	6367	line	fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) { if prefix.is_empty() { if part.as_bytes().first().i
 docs/query-to-sql.md	plan.rs:1647	crates/pulsus-read/src/logql/plan.rs	1647		prose	limit
 docs/query-to-sql.md	plan.rs:1676	crates/pulsus-read/src/logql/plan.rs	1676		prose	has_unpushed_dropping_stage
 docs/query-to-sql.md	plan.rs:1685	crates/pulsus-read/src/logql/plan.rs	1685		prose	true
