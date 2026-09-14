@@ -5309,3 +5309,335 @@ async fn the_lane_answers_reserved_name_rows_under_the_rules() {
     }
     drop_group_key_db(&admin, &db).await;
 }
+
+/// The server's clock, in microseconds: a marker between two queries'
+/// `system.query_log` rows.
+async fn server_micros(admin: &ChClient) -> u64 {
+    let mut s = admin
+        .query_stream::<PartCountRow>(
+            "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("now64");
+    let n = s.next().await.expect("one row").expect("decode").n;
+    drop(s);
+    n
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TimedStatementRow {
+    query: String,
+    exception_code: i32,
+}
+
+/// The group key read's statements over `db` that finished or failed in
+/// `[from, to)` server microseconds, in the order they ran. Waits until at
+/// least `want` of them are logged.
+async fn group_key_statements_between(
+    admin: &ChClient,
+    db: &str,
+    from: u64,
+    to: u64,
+    want: usize,
+) -> Vec<(GroupKeyStatement, i32)> {
+    let mut out = Vec::new();
+    for _ in 0..30 {
+        admin
+            .execute("SYSTEM FLUSH LOGS", &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, exception_code FROM system.query_log \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' \
+             AND query NOT LIKE '%system.query_log%' \
+             AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+             AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+             ORDER BY query_start_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<TimedStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        out.clear();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode");
+            let kind = if row.query.contains("throwIf(decided = 0 AND uw_missing = 0)") {
+                GroupKeyStatement::Key
+            } else if row.query.contains("WHERE NOT (decided = 0 AND uw_missing = 1)") {
+                GroupKeyStatement::Lane
+            } else if row.query.starts_with("SELECT fingerprint, timestamp_ns, body") {
+                GroupKeyStatement::Raw
+            } else {
+                continue;
+            };
+            out.push((kind, row.exception_code));
+        }
+        drop(stream);
+        if out.len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// **Criterion 8: the key statement does not throw on rows outside its
+/// filter** (issue #507, risk 2).
+///
+/// ```text
+/// fp 1009  5,000 rows, one per millisecond from T; rows 1,000..=2,000 {"latency":1,"status":1}  (decided)
+///          every other row {"latency":1,"status":1.5}                                        (undecided)
+/// fp 1010  5,000 undecided rows from T + 1 s
+/// S1 over fp 1009, (T + 999 ms, T + 2,000 ms]  ->  one group: n_value 1,001, no throw
+/// ```
+///
+/// The undecided rows share parts and granules with the decided ones, so a
+/// `throwIf` evaluated before the time and stream filters would throw. The
+/// same holds through the engine on a one-second grid.
+#[tokio::test]
+async fn the_key_statement_does_not_throw_on_rows_outside_its_filter() {
+    skip_unless_live!();
+    let (admin, client, db) = group_key_db("gk_tt").await;
+    let base = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base})))");
+    for (fp, pod) in [(1009u64, "a"), (1010u64, "b")] {
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+                     ({month}, {fp}, 'checkout', '{{\"pod\":\"{pod}\",\"service_name\":\"checkout\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("streams");
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES \
+                     ({month}, 'service_name', 'checkout', {fp}), ({month}, 'pod', '{pod}', {fp})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("idx");
+    }
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1009, {base} + number * 1000000, 0, \
+             if(number BETWEEN 1000 AND 2000, '{{\"latency\":1,\"status\":1}}', '{{\"latency\":1,\"status\":1.5}}') \
+             FROM numbers(5000)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1010, {base} + number * 1000000 + 1000000000, 0, \
+             '{{\"latency\":1,\"status\":1.5}}' FROM numbers(5000)"
+        ),
+        format!("OPTIMIZE TABLE {db}.log_samples FINAL"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("seed the throw layout");
+    }
+
+    // The statement itself, rendered by the reader's builder.
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout", pod="a"} | json | unwrap latency [1s]))"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + 2_000_000_000,
+            end_ns: base + 2_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db)).expect("plan") {
+        Plan::Metric(mp) => mp,
+        _ => panic!("a metric plan"),
+    };
+    let sql::MetricValue::Unwrapped(u) = &mp.value else {
+        panic!("{query}: the group key read");
+    };
+    let columns = sql::GroupKeyColumns {
+        keys: u.keys.iter().map(|k| (k.clone(), Vec::new())).collect(),
+        classes: Some(vec![vec![1009]]),
+    };
+    let s1 = sql::metric_range_unwrapped(
+        "log_samples",
+        u,
+        &columns,
+        &[literal("checkout")],
+        &[1009],
+        sql::BucketedScan {
+            window: TimeWindow {
+                start_ns: base + 999_000_000,
+                end_ns: base + 2_000_000_000,
+            },
+            lower: sql::ScanLowerBound::Exclusive,
+            lo_ns: base,
+            step_ns: 60_000_000_000,
+        },
+        &[],
+        sql::UndecidedRows::Throw,
+        None,
+    )
+    .expect("render S1");
+    let mut stream = client
+        .query_stream::<pulsus_read::logql::rows::MetricRangeUnwrappedRow>(
+            &s1.replace('?', "??"),
+            &QuerySettings::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}"));
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(row.unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}")));
+    }
+    drop(stream);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].n_value, rows[0].n_missing, rows[0].n_undecided, rows[0].v),
+        (1001, 0, 0, 1001.0),
+        "{rows:?}"
+    );
+
+    // And through the engine: the window (T + 1 s, T + 2 s] holds rows
+    // 1,001..=2,000.
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let from = server_micros(&admin).await;
+    let answer = group_key_answer(engine.query(&parse(query).expect("parse"), &params).await);
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(answer, r#"{status="1"} 1000.0"#);
+    let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
+    assert_eq!(
+        statements,
+        vec![(GroupKeyStatement::Key, 0)],
+        "the key statement answered, and nothing followed it"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// **Criterion 9: the key route falls back on its own memory error** (issue
+/// #507, code 241 end to end).
+///
+/// 20 streams `{service_name="checkout", pod="checkout-<fp>"}`, one hour,
+/// 360,000 lines `{"latency":1,"k":"k<n % 5>"}` (five per second per
+/// stream). `sum by (pod, k) (sum_over_time(… | json | unwrap latency [1s]))`
+/// over seconds 1–3,600 groups 20 × 5 × 3,600 keys:
+///
+/// ```text
+/// read ceiling 64 MiB   S1 fails (241) -> today's raw scan answers
+/// default ceiling       S1 answers, no raw scan
+/// both                  100 series, 359,980 points, each 1, bit-equal to the control
+/// ```
+///
+/// The control `… | unwrap latency | latency >= 0 [1s]` is today's route.
+#[tokio::test]
+async fn the_key_route_falls_back_on_its_own_memory_error() {
+    skip_unless_live!();
+    let (admin, _client, db) = group_key_db("gk_mem").await;
+    let base = ((now_ns() - 7_200_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base})))");
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+             SELECT {month}, 1000 + number, 'checkout', \
+             concat('{{\"pod\":\"checkout-', toString(1000 + number), '\",\"service_name\":\"checkout\"}}'), 0 \
+             FROM numbers(20)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+             SELECT {month}, k, v, 1000 + number FROM numbers(20) \
+             ARRAY JOIN ['service_name', 'pod'] AS k, ['checkout', concat('checkout-', toString(1000 + number))] AS v"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1000 + intDiv(number, 18000) % 20, \
+             {base} + intDiv(number % 18000, 5) * 1000000000 + (number % 5) * 1000, 0, \
+             concat('{{\"latency\":1,\"k\":\"k', toString(number % 5), '\"}}') FROM numbers(360000)"
+        ),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("seed the memory corpus");
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + 1_000_000_000,
+            end_ns: base + 3_600_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency [1s]))"#;
+    let control = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency | latency >= 0 [1s]))"#;
+    let matrix = |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>, what: &str| {
+        match res {
+            Ok((QueryResult::Matrix(m), _)) => {
+                let mut out: Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> = m
+                    .into_iter()
+                    .map(|s| {
+                        let mut l = s.labels;
+                        l.sort();
+                        (l, s.points.into_iter().map(|(t, v)| (t, v.to_bits())).collect())
+                    })
+                    .collect();
+                out.sort();
+                out
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+    };
+    let today = LogQlEngine::new(data_client(&db).await, engine_config(&db, 50 * 1024 * 1024 * 1024));
+    let want = matrix(
+        today.query(&parse(control).expect("parse"), &params).await,
+        "the control",
+    );
+    assert_eq!(want.len(), 100, "100 series");
+    assert_eq!(
+        want.iter().map(|(_, p)| p.len()).sum::<usize>(),
+        359_980,
+        "359,980 points"
+    );
+    assert!(
+        want.iter()
+            .all(|(_, p)| p.iter().all(|(_, v)| *v == 1f64.to_bits())),
+        "every point is 1"
+    );
+    for (ceiling, statements_want) in [
+        (
+            64 * 1024 * 1024u64,
+            vec![(GroupKeyStatement::Key, 241), (GroupKeyStatement::Raw, 0)],
+        ),
+        (8 * 1024 * 1024 * 1024u64, vec![(GroupKeyStatement::Key, 0)]),
+    ] {
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            EngineConfig {
+                read_max_memory_bytes: ceiling,
+                ..engine_config(&db, 50 * 1024 * 1024 * 1024)
+            },
+        );
+        let from = server_micros(&admin).await;
+        let got = matrix(
+            engine.query(&parse(query).expect("parse"), &params).await,
+            &format!("the key route at a {ceiling}-byte ceiling"),
+        );
+        let to = server_micros(&admin).await + 1;
+        assert_eq!(got, want, "ceiling {ceiling}: the answer is the control's, bit for bit");
+        let statements =
+            group_key_statements_between(&admin, &db, from, to, statements_want.len()).await;
+        assert_eq!(
+            statements, statements_want,
+            "ceiling {ceiling}: S1 failed with 241 and today's raw scan answered, or S1 answered alone"
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
