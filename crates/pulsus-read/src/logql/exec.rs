@@ -9159,6 +9159,97 @@ mod tests {
         assert_eq!(got[0].1, vec![(660_000_000_000, 4.5)]);
     }
 
+    /// **Criterion 49: a row L folds whose error slot is set keeps its
+    /// ungrouped labels** (issue #507). The range step keeps them
+    /// (`pkg/logql/log/labels.go:664-668 @ v3.7.4`: `GroupedLabels` returns
+    /// the builder's labels untouched whenever `HasErr()`), and the fold
+    /// keeps them too, so the series L hands the aggregation is the one
+    /// today's route hands it.
+    ///
+    /// Only a PRESERVED error reaches the fold — `check_surviving_error`
+    /// fails the whole query on any other, which is what the live
+    /// `the_lane_keeps_an_error_row_ungrouped` measures — so the row here
+    /// carries `__preserve_error__="true"` as its structured metadata, the
+    /// shape of fp 903/905 in the reserved-name corpus.
+    #[test]
+    fn the_fold_keeps_a_preserved_error_rows_ungrouped_labels() {
+        let mp = key_route_plan(
+            r#"sum by (app) (sum_over_time({app="x"} | json | unwrap latency [1m]))"#,
+        );
+        let u = key_value(&mp);
+        let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
+        let mut meta = HashMap::new();
+        meta.insert(
+            10,
+            StreamMetaRow {
+                fingerprint: 10,
+                service: "r".to_string(),
+                labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
+            },
+        );
+        let resolved = super::super::unwrap_group::resolve(u, &meta);
+        let mut fold = super::super::unwrap_group::KeyRouteFold::new(
+            u,
+            &compiled,
+            &resolved,
+            &mp.vector_aggs,
+            mp.grid_start_ns,
+            mp.end_ns,
+            AggCaps::DEFAULT,
+        );
+        let lane = |body: &str, sm_text: &str| UnwrappedLaneRow {
+            class: 0,
+            bucket_ns: 660_000_000_000,
+            decided: 0,
+            keys: vec![(1, "x".to_string())],
+            v: 0.0,
+            body: body.to_string(),
+            fingerprint: 10,
+            sm_text: sm_text.to_string(),
+            sm_kept: Vec::new(),
+        };
+        // An ordinary row, and one whose `latency` will not convert with the
+        // error preserved.
+        for row in [
+            lane(r#"{"latency":2}"#, ""),
+            lane(r#"{"latency":"abc"}"#, r#"{"__preserve_error__":"true"}"#),
+        ] {
+            fold.push_lane_row(&row).expect("folds");
+        }
+        let got = fold.finish().expect("answers");
+        assert_eq!(got.len(), 2, "two series, not one merged group: {got:?}");
+        let errored = got
+            .iter()
+            .find(|(l, _)| l.iter().any(|(k, _)| k == "__error__"))
+            .unwrap_or_else(|| panic!("the errored series is still there: {got:?}"));
+        assert_eq!(
+            errored.0,
+            vec![
+                ("__error__".to_string(), "SampleExtractionErr".to_string()),
+                (
+                    "__error_details__".to_string(),
+                    "strconv.ParseFloat: parsing \"abc\": invalid syntax".to_string()
+                ),
+                ("__preserve_error__".to_string(), "true".to_string()),
+                ("app".to_string(), "x".to_string()),
+                ("latency".to_string(), "abc".to_string()),
+                ("service_name".to_string(), "r".to_string()),
+            ],
+            "the errored row keeps every label it had, not the `by (app)` projection"
+        );
+        assert_eq!(errored.1, vec![(660_000_000_000, 0.0)], "{got:?}");
+        let ordinary = got
+            .iter()
+            .find(|(l, _)| !l.iter().any(|(k, _)| k == "__error__"))
+            .unwrap_or_else(|| panic!("the ordinary series: {got:?}"));
+        assert_eq!(
+            ordinary.0,
+            vec![("app".to_string(), "x".to_string())],
+            "an ordinary row is keyed by the aggregation's projection"
+        );
+        assert_eq!(ordinary.1, vec![(660_000_000_000, 2.0)], "{got:?}");
+    }
+
     /// **A shadowed row falls back rather than being recomputed** (issue
     /// #507 W4, kept by the group key read). The evaluator keeps the parsed
     /// value under `<name>_extracted`, so its series are keyed by a label
