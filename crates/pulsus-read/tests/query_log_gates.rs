@@ -4405,3 +4405,438 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
         .await
         .expect("drop the run database");
 }
+
+// ---------------------------------------------------------------------
+// Issue #507: the extracted-field group key read, end to end.
+// ---------------------------------------------------------------------
+
+/// One case of `tests/fixtures/group_key/cases.tsv`: one stream, its rows,
+/// one query, the route the planner must choose, what `system.query_log`
+/// must show, and the answer.
+#[derive(Debug, Clone)]
+struct GroupKeyCase {
+    id: String,
+    stream: std::collections::BTreeMap<String, String>,
+    /// `(body, structured metadata)` per row.
+    entries: Vec<(String, String)>,
+    query: String,
+    /// `key`: the plan is the group key read; `today`: it is not; `none`:
+    /// the query does not plan.
+    planned: String,
+    /// `s1`: the key statement answered and nothing followed; `s1+raw`: it
+    /// returned rows the fold sent to today's route; `throw`: it threw (395)
+    /// and today's raw scan followed; `lane`: it threw, today's route
+    /// refused, and the one read ran; `raw`: no key-route statement ran;
+    /// `none`: no statement ran.
+    observed: String,
+    expected: String,
+}
+
+fn unhex_utf8(h: &str) -> String {
+    let bytes: Vec<u8> = (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex"))
+        .collect();
+    String::from_utf8(bytes).expect("utf-8 fixture")
+}
+
+fn load_group_key_cases(path: &str) -> Vec<GroupKeyCase> {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+    )
+    .expect("read the fixture");
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert_eq!(f.len(), 7, "a fixture row has 7 fields: {l}");
+            let stream = if f[1].is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
+                serde_json::from_str(f[1]).expect("stream labels")
+            };
+            let entries = f[2]
+                .split(',')
+                .map(|e| {
+                    let (b, sm) = e.split_once(':').expect("body:metadata");
+                    (unhex_utf8(b), unhex_utf8(sm))
+                })
+                .collect();
+            GroupKeyCase {
+                id: f[0].to_string(),
+                stream,
+                entries,
+                query: f[3].to_string(),
+                planned: f[4].to_string(),
+                observed: f[5].to_string(),
+                expected: f[6].to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Seeds each case as its own stream `{service_name="<id>", …}` at
+/// fingerprint `fp_base + index`, its rows 50 s before `t`.
+async fn seed_group_key_cases(
+    admin: &ChClient,
+    client: &ChClient,
+    db: &str,
+    t: i64,
+    fp_base: u64,
+    cases: &[GroupKeyCase],
+) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let mut rows = Vec::new();
+    let mut streams = Vec::new();
+    let mut idx = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let fp = fp_base + i as u64;
+        let mut labels = case.stream.clone();
+        labels.insert("service_name".to_string(), case.id.clone());
+        let labels_json = serde_json::to_string(&labels).expect("labels json");
+        streams.push(format!(
+            "({month}, {fp}, {}, {}, 0)",
+            literal(&case.id).as_sql(),
+            literal(&labels_json).as_sql()
+        ));
+        for (k, v) in &labels {
+            idx.push(format!(
+                "({month}, {}, {}, {fp})",
+                literal(k).as_sql(),
+                literal(v).as_sql()
+            ));
+        }
+        for (j, (body, sm)) in case.entries.iter().enumerate() {
+            rows.push(BucketedSeedRow {
+                service: case.id.clone(),
+                fingerprint: fp,
+                timestamp_ns: t - 50_000_000_000 + j as i64,
+                severity: 0,
+                body: body.clone(),
+                structured_metadata: sm.clone(),
+            });
+        }
+    }
+    for (table, cols, values) in [
+        (
+            "log_streams",
+            "(month, fingerprint, service, labels, updated_ns)",
+            &streams,
+        ),
+        ("log_streams_idx", "(month, key, val, fingerprint)", &idx),
+    ] {
+        for chunk in values.chunks(500) {
+            admin
+                .execute(
+                    &format!("INSERT INTO {db}.{table} {cols} VALUES {}", chunk.join(", ")),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seed {table}: {e}"));
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the group key cases");
+}
+
+/// A case's query with its selector, and the request it runs as: a range
+/// query at one grid point `t` whose step is the query's range, so the
+/// planner can choose the group key read; `[2m]` keeps a one-minute step,
+/// which is the point of that case. A log query reads the five minutes
+/// before `t`.
+fn group_key_request(case: &GroupKeyCase, t: i64) -> (String, QueryParams) {
+    let query = case
+        .query
+        .replace("SEL", &format!("{{service_name={:?}}}", case.id));
+    let is_metric = query.contains("_over_time(") || query.contains("rate(");
+    let params = if is_metric {
+        let step: u64 = if query.contains("[5m]") {
+            300_000_000_000
+        } else {
+            60_000_000_000
+        };
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: t,
+                step_ns: step,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        }
+    } else {
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t - 300_000_000_000,
+                end_ns: t,
+                step_ns: 60_000_000_000,
+            },
+            limit: 10,
+            direction: Direction::Backward,
+        }
+    };
+    (query, params)
+}
+
+fn group_key_labels(labels: &[(String, String)]) -> String {
+    let mut l: Vec<&(String, String)> =
+        labels.iter().filter(|(k, _)| k != "service_name").collect();
+    l.sort();
+    format!(
+        "{{{}}}",
+        l.iter()
+            .map(|(k, v)| format!("{k}={v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The canonical text of an answer, as the fixture writes it: series sorted
+/// by label set, `service_name` left out, each value as Rust's `{:?}` of its
+/// `f64`.
+fn group_key_answer(res: Result<(QueryResult, pulsus_read::Warnings), ReadError>) -> String {
+    match res {
+        Ok((QueryResult::Vector(v), _)) if v.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Matrix(m), _)) if m.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Vector(v), _)) => {
+            let mut s: Vec<String> = v
+                .iter()
+                .map(|x| format!("{} {:?}", group_key_labels(&x.labels), x.value))
+                .collect();
+            s.sort();
+            s.join("; ")
+        }
+        Ok((QueryResult::Matrix(m), _)) => {
+            let mut s: Vec<String> = m
+                .iter()
+                .map(|x| {
+                    let pts: Vec<String> = x.points.iter().map(|(_, v)| format!("{v:?}")).collect();
+                    format!("{} {}", group_key_labels(&x.labels), pts.join(","))
+                })
+                .collect();
+            s.sort();
+            s.join("; ")
+        }
+        Ok((QueryResult::Streams { items, .. }, _)) if items.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Streams { items, .. }, _)) => {
+            let mut s: Vec<String> = items
+                .iter()
+                .map(|x| {
+                    let m: std::collections::BTreeMap<String, String> =
+                        serde_json::from_str(&x.labels_json).expect("stream labels json");
+                    group_key_labels(&m.into_iter().collect::<Vec<_>>())
+                })
+                .collect();
+            s.sort();
+            format!("streams {}", s.join("; "))
+        }
+        Ok((other, _)) => format!("unexpected {other:?}"),
+        Err(ReadError::MetricPipelineError { error_type, .. }) => {
+            format!("400 pipeline error: '{error_type}'")
+        }
+        Err(ReadError::QueryTooBroad(reason)) => {
+            let name = format!("{reason:?}");
+            let name = name.split([' ', '{', '(']).next().unwrap_or("").to_string();
+            format!("422 {name}")
+        }
+        Err(ReadError::Parse(_) | ReadError::PipelineInvalid { .. }) => "400 parse".to_string(),
+        Err(other) => format!("error {other}"),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct GroupKeyStatementRow {
+    query: String,
+    exception_code: i32,
+}
+
+/// Which statement a logged query is, for the group key read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKeyStatement {
+    /// S1, the key statement.
+    Key,
+    /// L, the one read.
+    Lane,
+    /// Today's raw scan.
+    Raw,
+}
+
+/// Every finished or failed statement over `db`'s samples, per fingerprint,
+/// in the order they ran. `SYSTEM FLUSH LOGS` does not guarantee the rows
+/// are there, so this waits until `want` fingerprints have one.
+async fn group_key_statements(
+    admin: &ChClient,
+    db: &str,
+    want: usize,
+) -> std::collections::HashMap<u64, Vec<(GroupKeyStatement, i32)>> {
+    let fp_re = regex::Regex::new(r"fingerprint IN \((\d+)\)").expect("regex");
+    let mut out = std::collections::HashMap::new();
+    for _ in 0..30 {
+        admin
+            .execute("SYSTEM FLUSH LOGS", &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, exception_code FROM system.query_log \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' \
+             AND query NOT LIKE '%system.query_log%' \
+             ORDER BY event_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<GroupKeyStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        out = std::collections::HashMap::new();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode query_log row");
+            let kind = if row.query.contains("throwIf(decided = 0 AND uw_missing = 0)") {
+                GroupKeyStatement::Key
+            } else if row.query.contains("WHERE NOT (decided = 0 AND uw_missing = 1)") {
+                GroupKeyStatement::Lane
+            } else if row.query.starts_with("SELECT fingerprint, timestamp_ns, body") {
+                GroupKeyStatement::Raw
+            } else {
+                continue;
+            };
+            let Some(fp) = fp_re
+                .captures(&row.query)
+                .and_then(|c| c[1].parse::<u64>().ok())
+            else {
+                continue;
+            };
+            out.entry(fp)
+                .or_insert_with(Vec::new)
+                .push((kind, row.exception_code));
+        }
+        drop(stream);
+        if out.len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// What `system.query_log` shows for one case, in the fixture's words.
+fn group_key_observed(statements: &[(GroupKeyStatement, i32)]) -> String {
+    use GroupKeyStatement::{Key, Lane, Raw};
+    match statements {
+        [] => "none".to_string(),
+        [(Key, 0)] => "s1".to_string(),
+        [(Key, 0), (Raw, _)] => "s1+raw".to_string(),
+        [(Key, 395), (Raw, _)] => "throw".to_string(),
+        [(Key, 395), (Raw, _), (Lane, 0)] => "lane".to_string(),
+        s if s.iter().all(|(k, _)| *k == Raw) => "raw".to_string(),
+        s => format!("{s:?}"),
+    }
+}
+
+/// **Criterion 3: the group key read answers every case of the plan's
+/// tables as today's route does** (issue #507).
+///
+/// `tests/fixtures/group_key/cases.tsv` holds each case of the design's
+/// tables — the JSON text rules, nesting, text after a value, empty and
+/// absent values, lines that are not JSON, the q, g, e and k rows, the
+/// collision rows, the refused chains, the reserved-name rows at the
+/// reference's answers, the three rows of the unconvertible value under
+/// `__preserve_error__`, and a filter naming the unwrapped label — with its
+/// answer. For each, the test asserts:
+///
+/// ```text
+/// planned   the plan is the group key read, or it is not
+/// observed  system.query_log: S1 alone; S1 then today's raw scan (a fold
+///           fallback); S1 throwing (395) then the raw scan; that and L;
+///           or no key-route statement
+/// answer    the fixture's answer, value bits included
+/// ```
+///
+/// Each query runs as a range query at one grid point whose step is its
+/// range, which is what lets the planner choose the group key read; the
+/// design's tables give instant-query answers over the same rows.
+#[tokio::test]
+async fn the_group_key_read_agrees_with_the_client_path() {
+    skip_unless_live!();
+    const FP_BASE: u64 = 507_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_gk_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let cases = load_group_key_cases("tests/fixtures/group_key/cases.tsv");
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    seed_group_key_cases(&admin, &client, &db, t, FP_BASE, &cases).await;
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
+    let mut wrong = Vec::new();
+    for case in &cases {
+        let (query, params) = group_key_request(case, t);
+        let planned = match parse(&query) {
+            Err(_) => "none",
+            Ok(expr) => match plan(&expr, &params, &plan_ctx(&db)) {
+                Ok(Plan::Metric(mp)) if matches!(mp.value, sql::MetricValue::Unwrapped(_)) => "key",
+                Ok(_) => "today",
+                Err(_) => "none",
+            },
+        };
+        if planned != case.planned {
+            wrong.push(format!("{}: planned {planned}, want {}", case.id, case.planned));
+        }
+        let answer = match parse(&query) {
+            Ok(expr) => group_key_answer(engine.query(&expr, &params).await),
+            Err(_) => "400 parse".to_string(),
+        };
+        if answer != case.expected {
+            wrong.push(format!(
+                "{}: {query}\n    got  {answer}\n    want {}",
+                case.id, case.expected
+            ));
+        }
+    }
+    let want = cases.iter().filter(|c| c.observed != "none").count();
+    let statements = group_key_statements(&admin, &db, want).await;
+    for (i, case) in cases.iter().enumerate() {
+        let observed = group_key_observed(
+            statements
+                .get(&(FP_BASE + i as u64))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
+        if observed != case.observed {
+            wrong.push(format!(
+                "{}: observed {observed}, want {}",
+                case.id, case.observed
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases differ:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
