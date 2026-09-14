@@ -436,19 +436,19 @@ load
 eval instant at 60s {service_name="jr-mid-obj"} | json
   {env="prod", service_name="jr-mid-obj", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":{"z":1}x,"a":2}
 
-# The reference reads past the malformed part and answers `a="2"`.
-# Issue #507: the reference answers `env="prod", service_name="jr-mid-obj", v=""` here (captured above). This line is
-# not one JSON text our parser reads, and the targeted form reports that
-# exactly as the bare form does.
-# provenance: divergence(json-targeted-line-that-does-not-parse)
+# The reference reads past the malformed part and answers `v="2"`.
+# Before issue #507 PulsusDB answered `v=""` here. The line is not one JSON
+# text, so the targeted form now reports it exactly as the bare form does;
+# the difference from the reference is still this residual.
+# provenance: divergence(json-nonvalidating-scan-residual)
 eval instant at 60s {service_name="jr-mid-obj"} | json v="a"
   {env="prod", service_name="jr-mid-obj", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":{"z":1}x,"a":2}
 
 # The reference answers `{"z":1}` — the span BEFORE the malformed byte.
-# Issue #507: the reference answers `env="prod", service_name="jr-mid-obj", o=""` here (captured above). This line is
-# not one JSON text our parser reads, and the targeted form reports that
-# exactly as the bare form does.
-# provenance: divergence(json-targeted-line-that-does-not-parse)
+# Before issue #507 PulsusDB answered `o=""` here. The line is not one JSON
+# text, so the targeted form now reports it exactly as the bare form does;
+# the difference from the reference is still this residual.
+# provenance: divergence(json-nonvalidating-scan-residual)
 eval instant at 60s {service_name="jr-mid-obj"} | json o="o"
   {env="prod", service_name="jr-mid-obj", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":{"z":1}x,"a":2}
 
@@ -460,10 +460,10 @@ load
 
 # An invalid escape is the same class: the reference reads straight
 # past it and answers `v="2"`.
-# Issue #507: the reference answers `env="prod", service_name="jr-mid-esc", v=""` here (captured above). This line is
-# not one JSON text our parser reads, and the targeted form reports that
-# exactly as the bare form does.
-# provenance: divergence(json-targeted-line-that-does-not-parse)
+# Before issue #507 PulsusDB answered `v=""` here. The line is not one JSON
+# text, so the targeted form now reports it exactly as the bare form does;
+# the difference from the reference is still this residual.
+# provenance: divergence(json-nonvalidating-scan-residual)
 eval instant at 60s {service_name="jr-mid-esc"} | json v="a"
   {env="prod", service_name="jr-mid-esc", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":["a\qb"],"a":2}
 
@@ -474,12 +474,10 @@ eval instant at 60s {service_name="jr-mid-esc"} | json
   {env="prod", service_name="jr-mid-esc", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":["a\qb"],"a":2}
 
 # The bound on the residual: where the invalid escape is INSIDE the span
-# the expression selects, both sides answer the empty string — the
-# reference because `unescapeJSONString` fails, we because the parse
-# does.
-# Issue #507: the reference answers `env="prod", service_name="jr-mid-esc", o=""` here (captured above). This line is
-# not one JSON text our parser reads, and the targeted form reports that
-# exactly as the bare form does.
+# the expression selects, the reference answers the empty string, because
+# `unescapeJSONString` fails; before issue #507 PulsusDB answered the same.
+# Issue #507: this line is not one JSON text our parser reads, and the
+# targeted form reports that exactly as the bare form does.
 # provenance: divergence(json-targeted-line-that-does-not-parse)
 eval instant at 60s {service_name="jr-mid-esc"} | json o="o"
   {env="prod", service_name="jr-mid-esc", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":["a\qb"],"a":2}
