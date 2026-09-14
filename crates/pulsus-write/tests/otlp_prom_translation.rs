@@ -2738,8 +2738,13 @@ fn collect_rs_under_src(dir: &Path, root: &Path, out: &mut Vec<String>) {
 /// a caller added or removed anywhere in the workspace has to be looked at,
 /// not silently absorbed.
 const CANONICALIZER_CALLERS: &[&str] = &[
+    // Issue #507 took `otlp_logs.rs` off this list: every log attribute key
+    // there is now named by `pulsus_model::log_label_name` instead, so the
+    // metrics canonicalizer has three production callers — the metadata
+    // render and bound path in `labels.rs`, the metrics namer, and the
+    // service-name discovery over the eighteen OTLP index attributes, where
+    // both rules name alike.
     "crates/pulsus-model/src/labels.rs",
-    "crates/pulsus-write/src/protocols/otlp_logs.rs",
     "crates/pulsus-write/src/protocols/prom_metric_name.rs",
     "crates/pulsus-write/src/protocols/service_name.rs",
 ];

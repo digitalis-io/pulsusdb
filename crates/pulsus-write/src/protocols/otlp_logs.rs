@@ -22,8 +22,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, canonicalize_label_key,
-    stream_fingerprint,
+    Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, log_label_name, stream_fingerprint,
 };
 
 use crate::error::LogsIngestError;
@@ -461,6 +460,16 @@ pub fn parse(
     Ok(out)
 }
 
+/// The name a resource attribute other than `service.name` is stored under
+/// when its own stored name would be `service_name` (issue #507): the
+/// `service_name` slot is resolved from the raw attributes and written last
+/// (issue #379), so such an attribute is stored beside it instead of being
+/// dropped. It is the name the reference's read path gives the same
+/// attribute, which it keeps as structured metadata: its read path renames a
+/// metadata name the stream already carries by appending `_extracted`
+/// (`LabelsBuilder::Add`, `pkg/logql/log/labels.go:391-397 @ v3.7.4`).
+const SERVICE_NAME_EXTRACTED_LABEL: &str = "service_name_extracted";
+
 /// Flattens `resource.attributes` — and ONLY those — into the stream
 /// [`LabelSet`] via [`LabelSet::from_normalized`] (issue #109: scope name/
 /// version/attributes are structured metadata, not stream labels — Loki
@@ -530,11 +539,21 @@ fn build_stream_labels(
     // placement difference.
     let mut pairs: Vec<(String, String)> = raw_attributes
         .iter()
-        .filter(|(key, _)| canonicalize_label_key(key) != SERVICE_NAME_LABEL)
-        .cloned()
+        .filter_map(|(key, value)| {
+            if log_label_name(key) != SERVICE_NAME_LABEL {
+                return Some((key.clone(), value.clone()));
+            }
+            if key == "service.name" {
+                // The slot below carries this attribute's value.
+                return None;
+            }
+            Some((SERVICE_NAME_EXTRACTED_LABEL.to_string(), value.clone()))
+        })
         .collect();
     pairs.push((SERVICE_NAME_LABEL.to_string(), service_name.to_string()));
-    LabelSet::from_normalized(log_label_limits::StreamLabels::from_pairs(pairs).into_pairs())
+    LabelSet::from_log_attribute_pairs(
+        log_label_limits::StreamLabels::from_pairs(pairs).into_pairs(),
+    )
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -618,7 +637,7 @@ fn build_scope_metadata_pairs(
     // identity field empty-suppressed (#108).
     let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)?
         .into_iter()
-        .map(|(key, value)| (canonicalize_label_key(&key), value))
+        .map(|(key, value)| (log_label_name(&key), value))
         .collect();
     if !scope.name.is_empty() {
         // `scope_name`/`scope_version` are already `log_label_name` fixed points.
@@ -769,14 +788,41 @@ impl AttributeLookup for RecordAttributes<'_> {
 ///
 /// `a_record_attribute_level_is_found_under_its_stored_name` pins it.
 fn canonical_key_eq(raw: &str, canonical: &str) -> bool {
-    let mut want = canonical.chars();
-    for c in raw.chars() {
-        let mapped = if c.is_ascii_alphanumeric() || c == '_' {
-            c
-        } else {
-            '_'
+    // The reserved-affix case: the affixes are kept around the collapsed
+    // middle, so strip them from both sides and compare the middles.
+    let reserved = raw.len() >= 4 && raw.starts_with("__") && raw.ends_with("__");
+    let inner = if reserved {
+        &raw[2..raw.len() - 2]
+    } else {
+        raw
+    };
+    let mut want = canonical;
+    if reserved {
+        let Some(rest) = want.strip_prefix("__").and_then(|w| w.strip_suffix("__")) else {
+            return false;
         };
-        if want.next() != Some(mapped) {
+        want = rest;
+    } else if inner.starts_with(|c: char| c.is_ascii_digit()) {
+        // A stored name starting with a digit gains `key_`; a reserved name
+        // starts with `_`, so it never does.
+        let Some(rest) = want.strip_prefix("key_") else {
+            return false;
+        };
+        want = rest;
+    }
+    let mut want = want.chars();
+    let mut prev_was_underscore = false;
+    for c in inner.chars() {
+        let emitted = if c.is_ascii_alphanumeric() {
+            prev_was_underscore = false;
+            c
+        } else if !prev_was_underscore {
+            prev_was_underscore = true;
+            '_'
+        } else {
+            continue;
+        };
+        if want.next() != Some(emitted) {
             return false;
         }
     }
@@ -3076,21 +3122,23 @@ mod tests {
         .unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         let stored = &out.streams[0].labels;
-        assert_eq!(stored.len(), 1, "the near-miss is not stored at all");
+        assert_eq!(stored.len(), 2, "the near-miss is stored beside the slot");
         assert_eq!(stored.get("service_name"), Some("ok"));
+        assert_eq!(stored.get("service_name_extracted"), Some(wide.as_str()));
 
         let validated = parse_off(
             &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
             0,
         )
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             out.streams[0].fingerprint, validated.streams[0].fingerprint,
-            "the validated value fixes the identity now"
+            "the near-miss is a stored label of its own, so the two resources \
+             are two streams (issue #507)"
         );
         // ...and NOT the stream a bare over-wide `service_name` produces,
-        // which is the assertion that discriminates: were `from_normalized`
-        // still deciding this name, these two would be one stream.
+        // which is the assertion that discriminates: were the near-miss
+        // deciding the slot, these two would be one stream.
         let near_miss_alone = parse_off(
             &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
             0,
@@ -3101,9 +3149,16 @@ mod tests {
             "the unvalidated near-miss no longer decides `service_name`"
         );
         assert_eq!(
-            near_miss_alone.streams[0].labels.to_canonical_json(),
-            r#"{"service_name":"unknown_service"}"#,
+            near_miss_alone.streams[0].labels.get("service_name"),
+            Some("unknown_service"),
             "a near-miss alone leaves the slot at its fallback"
+        );
+        assert_eq!(
+            near_miss_alone.streams[0]
+                .labels
+                .get("service_name_extracted"),
+            Some(wide.as_str()),
+            "and is stored beside it, where it used to be stored nowhere"
         );
     }
 
