@@ -6833,7 +6833,7 @@ gated by
   oracle (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
   `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`) with
   the committed `ci/logql/config.yaml`, and against PulsusDB at
-  `f9f5d082` over ClickHouse `26.3.29.7`. One stream was pushed to each,
+  `32253727` over ClickHouse `26.3.29.7`. One stream was pushed to each,
   through each side's own `POST /loki/api/v1/push`, with the same body:
 
   ```
