@@ -219,81 +219,140 @@ pub enum MetricValue {
     Unwrapped(Box<UnwrappedValue>),
 }
 
-/// [`MetricValue::Unwrapped`]'s payload — a separate struct only so the
-/// variant can be one pointer wide.
+/// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
+/// read of a `| json … | unwrap` range query (issue #507), as the planner
+/// admits it — checked values, never statement text.
+///
+/// ```text
+/// targeted  | json <l>="<path>"[, <d>="<src>"…] | unwrap <l>      key labels: the declared labels but <l>
+/// bare      | json [| <label filter>…] | unwrap <l>                key labels: the grouping's names and the
+///                                                                  filter labels no selected stream carries
+/// ```
+///
+/// What depends on the selected streams — which fingerprints form one
+/// class, and which key labels a stream label or metadata entry blanks —
+/// is resolved after stream resolution into [`GroupKeyColumns`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnwrappedValue {
     pub reducer: UnwrapReducer,
-    /// The label as the query wrote it — what the READER compares a
-    /// row's structured-metadata keys against.
+    pub form: UnwrapForm,
+    /// The `| unwrap` label, as the query wrote it: what the reader compares
+    /// a row's structured-metadata keys and its class's stream labels against.
     pub label: String,
-    /// The same name, minted for the STATEMENT.
-    ///
-    /// Two fields for one name because they are read by two different
-    /// things: one is bytes this process compares, the other is bytes
-    /// ClickHouse parses. [`MetricValue::unwrapped`] is the only
-    /// constructor and mints both from one argument, so they cannot
-    /// drift; `the_unwrapped_value_mints_both_spellings_from_one_name`
-    /// is the test that fails if a second construction site appears.
-    pub name: CheckedLiteral,
+    /// The field segments to the unwrapped value; on the bare form, `[label]`.
+    pub path: Vec<String>,
+    /// The candidate key labels, before stream resolution.
+    pub keys: Vec<UnwrapKeyLabel>,
+    /// Which stream labels can reach the answer, which decides the classes.
+    pub classes: ClassNames,
+    /// What of a row's structured metadata the statement sends.
+    pub metadata: MetadataSent,
+    /// The range aggregation's own `by`/`without`.
+    pub grouping: Option<super::pipeline::RangeGrouping>,
+    /// The chain the group document and today's route run: the `| json`
+    /// stage, any label filters, and the `| unwrap` stage.
+    pub stages: Vec<pulsus_logql::Stage>,
+    /// The range step's rules the group document runs under (issue #507,
+    /// reserved names).
+    pub rules: super::pipeline::RangeStepRules,
 }
 
-impl MetricValue {
-    /// The ONE constructor of the unwrapped arm (issue #507, W4).
-    pub fn unwrapped(reducer: UnwrapReducer, label: &str) -> Self {
-        MetricValue::Unwrapped(Box::new(UnwrappedValue {
-            reducer,
-            label: label.to_string(),
-            name: super::predicate::literal(label),
-        }))
+/// Which `| json` form a group key read serves (issue #507).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapForm {
+    /// `| json` with no extractions: the line is flattened, so a label name
+    /// can have spellings `JSONExtractRaw` does not read.
+    Bare,
+    /// `| json <label>="<path>"…`: every path is exact.
+    Targeted,
+}
+
+/// One candidate key label of a group key read (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwrapKeyLabel {
+    /// The label name in the answer.
+    pub label: String,
+    /// The top-level source key; equal to `label` on the bare form.
+    pub source: String,
+}
+
+/// Which stream labels reach the answer, so which fingerprints one class
+/// holds (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassNames {
+    /// Every stream label reaches the answer: one class per fingerprint.
+    PerFingerprint,
+    /// Only these names do: streams whose labels agree on them are one class.
+    Projected(Vec<String>),
+    /// Every stream label but these.
+    Without(Vec<String>),
+}
+
+/// What of a row's structured metadata a group key read sends (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSent {
+    /// Every entry can reach the answer: the stored text is sent.
+    Text,
+    /// Entries named in `values` are sent with their values; entries named
+    /// in `presence` are sent with the value `'1'`, because only their
+    /// presence changes an answer (it sends the query to today's route).
+    Projected {
+        values: Vec<String>,
+        presence: Vec<String>,
+    },
+}
+
+/// A group key read's key columns and classes for one resolved stream set
+/// (issue #507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupKeyColumns {
+    /// The key labels the statement reads, each with the fingerprints whose
+    /// streams carry its name (the body's value is renamed out of the answer
+    /// there). Empty lists on the targeted form: a declared label is never
+    /// blanked.
+    pub keys: Vec<(UnwrapKeyLabel, Vec<u64>)>,
+    /// `None`: one class per fingerprint. Otherwise the fingerprints of each
+    /// class, by class id.
+    pub classes: Option<Vec<Vec<u64>>>,
+}
+
+/// What a group key statement does with a row the database cannot decide
+/// (issue #507).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecidedRows {
+    /// `throwIf`: the statement fails (code 395) and the query takes today's
+    /// route.
+    Throw,
+    /// The row is counted in `n_undecided` and nothing throws.
+    Count,
+}
+
+/// Why a group key statement cannot be rendered. Every one sends the query
+/// to today's route; none is a client error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatementRefusal {
+    Grid(super::predicate::BucketGridRefusal),
+    Reader(super::predicate::KeyReaderRefusal),
+}
+
+impl From<super::predicate::BucketGridRefusal> for KeyStatementRefusal {
+    fn from(r: super::predicate::BucketGridRefusal) -> Self {
+        KeyStatementRefusal::Grid(r)
     }
 }
 
-/// **The mantissa-has-a-digit test, and it asserts exactly one fact**
-/// (issue #507, W4).
-///
-/// `toFloat64OrNull` alone is not a sufficient guard, and the case it
-/// misses is the one that matters: `"E12"` — a rack name, an error code, a
-/// firmware revision — comes back as `0` rather than `NULL`, so a
-/// null-based check admits it and a zero joins the sum where the evaluator
-/// would have produced an error series. Measured on 26.3.29.7 across the
-/// family `"e3"`, `"E3"`, `"e+3"`, `"E12"`, `"."`, `"+."`, `".e3"`,
-/// `"+e3"`, and `"e999999"`, which returns a negative NaN.
-///
-/// **This is not a float grammar in SQL.** It asserts that the mantissa
-/// starts with a digit and leaves every other decision to
-/// `toFloat64OrNull`; it is anchored, so no suffix defeats it; and it
-/// rejects a structural family rather than an enumerated list, so a new
-/// member of that family is rejected too. **A second clause added here is
-/// a float grammar and stops being this.**
-///
-/// Its known over-rejections are the `inf`/`Inf`/`NaN` spellings, which
-/// our own parser accepts: those queries fall back rather than being
-/// answered wrongly.
-///
-/// **The `0`-rather-than-`NULL` reading above was measured under the
-/// default parser.** Under [`UNWRAP_PARSER_SETTING`], which the statement
-/// now carries, that whole family converts to NULL and `isNotNull` refuses
-/// it. This test is kept because it is the clause that refuses the
-/// `inf`/`NaN` spellings, which do convert under the setting — and because
-/// it refuses on the text rather than on what one parser happens to do with
-/// it.
-const UNWRAP_MANTISSA_HAS_A_DIGIT: &str = r"^[+-]?([0-9]|\.[0-9])";
-
-/// Rendered through the string escaper, so the regex's backslash reaches
-/// the matcher as one backslash rather than being eaten by ClickHouse's
-/// own string-literal unescaping — `\.` must stay a literal dot and not
-/// become "any character".
-fn unwrap_prefix_literal() -> CheckedLiteral {
-    super::predicate::literal(UNWRAP_MANTISSA_HAS_A_DIGIT)
+impl From<super::predicate::KeyReaderRefusal> for KeyStatementRefusal {
+    fn from(r: super::predicate::KeyReaderRefusal) -> Self {
+        KeyStatementRefusal::Reader(r)
+    }
 }
 
-/// **The parser the statement runs under** (issue #507, W4, review round 4).
+/// **The parser the group key statements run under** (issue #507, W4
+/// review round 4; kept by the group key read).
 ///
 /// `toFloat64OrNull` uses a fast approximate parser by default, and it is
-/// not correctly rounded. One row is enough for that to be a wrong answer,
-/// because the summation-order bound `2(n−1)·u·Σ|vᵢ|` this lowering is
-/// justified by is ZERO at `n = 1`. Measured on 26.3.29.7:
+/// not correctly rounded. One row is enough for that to be a wrong answer.
+/// Measured on 26.3.29.7:
 ///
 /// ```text
 ///   SELECT hex(reinterpretAsUInt64(assumeNotNull(
@@ -304,115 +363,20 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
 ///   "9367469347402735e292".parse::<f64>() ->  7FE0ACB5CADC2917
 /// ```
 ///
+/// Under the setting each text the W4 rounds measured either converts to
+/// the same bits as `f64::from_str` or converts to NULL: `"E12"`, `"e3"`,
+/// `"."` and `"1.7976931348623159e308"` convert to NULL, `"0e999999"` to
+/// `+0`, `"5e-324"` to bits `0x1`, and `"2e-324"` to NULL where Rust gives
+/// `0`. A NULL is an UNDECIDED row (`uw_q = 0`), which our parser reads;
+/// the `inf` and `NaN` spellings convert to a non-finite value on both
+/// sides, and a merged non-finite value sends the query to today's route.
+///
 /// **It is rendered into the statement text rather than sent as a
 /// connection setting**, so the EXPLAIN payload reports the query that
-/// executes.
-///
-/// **What it does to the rest of the guard.** Measured over every text this
-/// module's classes name — the class A spellings (`"E12"`, `"e3"`, `"."`,
-/// `"e999999"`), the overflow and underflow boundaries, the infinity and
-/// NaN spellings, and ordinary values — under the setting each text either
-/// converts to the same bits as `f64::from_str` or converts to NULL, and
-/// NULL is what `isNotNull` refuses. Class A converts to NULL (it was `0`);
-/// `"1.7976931348623159e308"` converts to NULL (it was `f64::MAX`);
-/// `"0e999999"` converts to `+0` (it was a negative NaN); `"5e-324"`
-/// converts to bits `0x1` (it was `0`); an underflow past the smallest
-/// subnormal, `"2e-324"` or `"1e-400"`, converts to NULL where Rust gives
-/// `0`.
-///
-/// So the four conjuncts beside `isNotNull` have no measured disagreement
-/// left to catch, and each is kept as an over-rejection — a fallback, never
-/// a wrong answer. See [`UNWRAP_OVERFLOW_CUTOFF`] and
-/// [`UNWRAP_TEXT_DENOTES_NON_ZERO`] for what each still refuses.
-/// **Widening the lowered set by dropping them is a change to make on its
-/// own evidence, not at the end of a wave.**
-///
-/// **The setting belongs to this one statement, and nothing carries it to
-/// the next.** Review round 5 enumerated every LogQL statement builder in
-/// this module and found that [`metric_range_unwrapped`] is the only one
-/// that converts text to a float in SQL: the raw scans send text for our
-/// own parser, and the rest read labels, counts or byte lengths. **A
-/// future builder that converts text to a float does not get this setting
-/// by being written here.** It has to append it itself, and it needs its
-/// own one-row test of the shape of `query_log_gates.rs`'s `one_ulp` case,
-/// because the byte-exact test that checks the suffix checks only this
-/// builder. Nothing in the type system enforces either half. The setting
-/// was measured on `toFloat64OrNull` only; whether it governs another
-/// conversion function (`JSONExtractFloat`, say) is not measured, so such a
-/// builder starts from its own measurement rather than from this one.
+/// executes. It belongs to [`metric_range_unwrapped`],
+/// [`metric_range_unwrapped_rows`] and [`metric_range_unwrapped_verdicts`]:
+/// no other builder converts text to a float in SQL.
 const UNWRAP_PARSER_SETTING: &str = "precise_float_parsing = 1";
-
-/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
-///
-/// Under the default parser `"1.7976931348623159e308"` converted to
-/// `f64::MAX` here and to `inf` in Rust, and no tolerance absorbs that: a
-/// sum holding `inf` is `inf`, a sum holding `f64::MAX` may be finite. One
-/// equality test closed it, over-rejecting a genuine `f64::MAX` with it.
-///
-/// **Under [`UNWRAP_PARSER_SETTING`] that text converts to NULL** and
-/// `isNotNull` refuses it, so what this clause still does is the
-/// over-rejection: a row whose value really is `f64::MAX` falls back. Kept
-/// (review round 4), because dropping it widens the lowered set.
-///
-/// `isFinite` is the same shape. It was the other half of the family —
-/// `"0e999999"` converted to a negative NaN here and to `+0` in Rust — and
-/// under the setting that text converts to `+0`. Of the texts measured, the
-/// only ones that still convert to a non-finite value are the `inf`,
-/// `Infinity` and `NaN` spellings, which the anchored prefix test refuses
-/// first and which our own parser accepts. Kept for the same reason.
-const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
-
-/// **A text that denotes a non-zero number** — the underflow clause
-/// (issue #507, W4, review rounds 1 to 4).
-///
-/// Under the default parser `toFloat64OrNull` returned `0` for a value
-/// whose exponent underflows, where our own parser keeps a subnormal.
-/// Measured on 26.3.29.7 against `f64::from_str`, with and without
-/// [`UNWRAP_PARSER_SETTING`]:
-///
-/// ```text
-///  text                      default   precise   ours (bits)
-///  "5e-324"                  0         0x1       0x1
-///  "7.5e-324"                0         0x2       0x2
-///  "9999999999999999e-324"   0         0x730d67819e8d2  0x730d67819e8d2
-///  "0.000…0005" (326 chars)  0         0x1       0x1
-/// ```
-///
-/// **The stated bound does not absorb these**, which is why the clause was
-/// written: `2(n−1)·u·Σ|vᵢ|` is ZERO at `n = 1`, and `Σ|vᵢ|` is the
-/// underflowing value itself when it is the only sample — so the difference
-/// is the whole answer.
-///
-/// **Under the setting the disagreement is gone**, and an underflow past
-/// the smallest subnormal (`"2e-324"`, `"1e-400"`) converts to NULL rather
-/// than to `0`, which `isNotNull` refuses. What this clause still does is
-/// refuse a text that converts to zero while carrying a non-zero digit —
-/// `"0e5"`, `"0.0e9"`, `"0e-1"` — where both parsers answer `+0` and the
-/// lowering would have been correct. Those fall back: a wasted statement,
-/// never a wrong answer. Kept (review round 4).
-///
-/// **The rule it expresses is about denotation, not spelling.** Review
-/// round 1 tested for an exponent, which is a rule about how a number is
-/// written: the 326-character fixed-point spelling of `5e-324` carries no
-/// `e`, converted to database zero, and parses to bits `0x1` in Rust — so
-/// it passed a guard built for exactly that case. What holds for every
-/// notation is that **a decimal literal denotes zero if and only if none of
-/// its digits is non-zero**, and that is one character class and one fact
-/// rather than a parse.
-///
-/// **One consequence a reader should not have to discover: the same value
-/// takes two routes depending on how it was STORED.** `JSONExtractRaw`
-/// returns a JSON *number* as the database normalised it and a JSON
-/// *string* as it was written, so
-///
-/// ```text
-///   {"latency":0e5}     -> raw text `0`     -> lowers
-///   {"latency":"0e5"}   -> raw text `0e5`   -> falls back
-/// ```
-///
-/// Same number, same query, two routes and the same answer. It is visible
-/// only as a statement that did or did not run.
-const UNWRAP_TEXT_DENOTES_NON_ZERO: &str = "[1-9]";
 
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision

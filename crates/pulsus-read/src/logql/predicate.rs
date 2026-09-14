@@ -954,6 +954,348 @@ fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
     ))
 }
 
+// ---------------------------------------------------------------------
+// Issue #507: the per-row readers of the extracted-field group key read.
+// ---------------------------------------------------------------------
+//
+// Every `match(` and `countMatches(` below is the database deciding
+// whether a body holds a spelling of a name that OUR flatten maps to that
+// name and `JSONExtractRaw` does not read. A row where one does is
+// UNDECIDED: the statement throws on it and our parser reads the line
+// (docs/query-to-sql.md, the extracted-field group key). The spellings
+// over-approximate; a wrong guess costs the throw, never an answer.
+
+/// JSON whitespace, and every whitespace escape and character our flatten
+/// trims from a key.
+const KEY_TRIM_CLASS: &str = r"(?:[ \t\n\r]|\\[tnrf]|\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\x{00A0}|\x{0085}|\x{1680}|[\x{2000}-\x{200A}]|\x{2028}|\x{2029}|\x{202F}|\x{205F}|\x{3000})";
+
+/// JSON whitespace between a key's closing quote and its colon.
+const JSON_WS: &str = r"[ \t\n\r]*";
+
+/// One or more key bytes that are not a quote, or an escaped byte: what
+/// a flatten join or a sanitised separator can stand for.
+const KEY_SEP: &str = r#"(?:[^"\\]|\\.)+"#;
+
+/// A key label's raw text is an integer our parser renders identically.
+const INTEGER_TEXT: &str = "^-?[1-9][0-9]{0,18}$";
+
+/// The deepest nesting our parser reads (`serde_json`'s limit, unchanged).
+const MAX_JSON_NESTING: u32 = 127;
+
+/// The bare flatten's per-line key budget (`pipeline.rs`'s
+/// `MAX_JSON_FLATTEN_KEY_BYTES`).
+const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Which reader columns a fragment names: the unwrapped value's (`uw_`) or
+/// the `i`-th key label's (`l<i>_`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderColumns {
+    Unwrap,
+    Key(usize),
+}
+
+impl ReaderColumns {
+    fn prefix(self) -> String {
+        match self {
+            ReaderColumns::Unwrap => "uw".to_string(),
+            ReaderColumns::Key(i) => format!("l{i}"),
+        }
+    }
+}
+
+/// Why a name cannot be read by the group key statement. A refusal sends
+/// the query to today's route; it is never a client error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyReaderRefusal {
+    /// The name is not a label name, so no spelling guard is written for it.
+    NameNotRenderable,
+    /// A spelling guard does not compile as a pattern. Unreachable for a
+    /// label name; kept so the mint has no panic path.
+    PatternNotCompilable,
+}
+
+fn key_regex(pattern: &str) -> Result<String, KeyReaderRefusal> {
+    ch_regex_unanchored_checked(pattern).map_err(|_| KeyReaderRefusal::PatternNotCompilable)
+}
+
+/// `a_b`: every `_`-separated part is non-empty.
+fn parts_joined(name: &str) -> bool {
+    name.contains('_') && name.split('_').all(|p| !p.is_empty())
+}
+
+/// `_`, `__`: nothing but underscores.
+fn only_underscores(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c == '_')
+}
+
+fn parts_with_sep(parts: &[&str]) -> String {
+    parts.join(KEY_SEP)
+}
+
+/// A quoted key our flatten maps to `name`, spelled with any trimmed
+/// whitespace and, for a joined name, any separator between its parts.
+fn spelled_pattern(name: &str) -> String {
+    let body = if parts_joined(name) {
+        parts_with_sep(&name.split('_').collect::<Vec<_>>())
+    } else {
+        name.to_string()
+    };
+    format!("\"{KEY_TRIM_CLASS}*{body}{KEY_TRIM_CLASS}*\"{JSON_WS}:")
+}
+
+/// A key naming a PREFIX of a joined name that holds an object: our
+/// flatten joins its members onto the prefix.
+fn prefix_parent_pattern(name: &str) -> String {
+    let parts: Vec<&str> = name.split('_').collect();
+    let alts: Vec<String> = (1..parts.len())
+        .map(|j| parts_with_sep(&parts[..j]))
+        .collect();
+    format!(
+        "\"{KEY_TRIM_CLASS}*(?:{}){KEY_TRIM_CLASS}*\"{JSON_WS}:{JSON_WS}\\{{",
+        alts.join("|")
+    )
+}
+
+/// A key that is not exactly `"name"` and still maps to it.
+fn spelled_otherwise_pattern(name: &str) -> String {
+    if !parts_joined(name) {
+        return format!(
+            "\"(?:{KEY_TRIM_CLASS}+{name}{KEY_TRIM_CLASS}*|{name}{KEY_TRIM_CLASS}+)\"{JSON_WS}:"
+        );
+    }
+    let parts: Vec<&str> = name.split('_').collect();
+    let any_sep = parts_with_sep(&parts);
+    let odd_sep = r#"(?:(?:[^"\\_]|\\.)(?:[^"\\]|\\.)*|_(?:[^"\\]|\\.)+)"#;
+    let odd: Vec<String> = (1..parts.len())
+        .map(|i| {
+            format!(
+                "{}{odd_sep}{}",
+                parts_with_sep(&parts[..i]),
+                parts_with_sep(&parts[i..])
+            )
+        })
+        .collect();
+    format!(
+        "\"(?:{KEY_TRIM_CLASS}+{any_sep}{KEY_TRIM_CLASS}*|{any_sep}{KEY_TRIM_CLASS}+|{})\"{JSON_WS}:",
+        odd.join("|")
+    )
+}
+
+/// `(position(body, '\u') > 0 AND match(body, '\\u00(?i:..)'))`: an
+/// escaped byte of the name.
+fn unwrap_name_escaped(name: &str) -> Result<String, KeyReaderRefusal> {
+    let esc = ch_string("\\u");
+    if !name.is_ascii() {
+        return Ok(format!("position(body, {esc}) > 0"));
+    }
+    let hex: std::collections::BTreeSet<String> =
+        name.bytes().map(|b| format!("{b:02x}")).collect();
+    let pattern = format!(
+        "\\\\u00(?i:{})",
+        hex.into_iter().collect::<Vec<_>>().join("|")
+    );
+    Ok(format!(
+        "(position(body, {esc}) > 0 AND match(body, {}))",
+        key_regex(&pattern)?
+    ))
+}
+
+/// A spelling our flatten maps to `name` that is not the exact key.
+fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal> {
+    let exact = format!("\"{name}\"");
+    if name.contains('_') && !parts_joined(name) {
+        let parts: Vec<&str> = name.split('_').filter(|p| !p.is_empty()).collect();
+        let counts: Vec<String> = parts
+            .iter()
+            .map(|p| format!("countSubstrings(body, {}) > 1", ch_string(p)))
+            .collect();
+        let any_named = format!("\"[^\"]*(?:{})[^\"]*\"{JSON_WS}:", parts.join("|"));
+        return Ok(format!(
+            "(({}) AND countMatches(body, {}) > countMatches(body, {}))",
+            counts.join(" OR "),
+            key_regex(&any_named)?,
+            key_regex(&format!("{exact}{JSON_WS}:"))?
+        ));
+    }
+    let first = name.split('_').next().unwrap_or("");
+    let mut spelled = format!("match(body, {})", key_regex(&spelled_otherwise_pattern(name))?);
+    if parts_joined(name) {
+        spelled = format!(
+            "({spelled} OR match(body, {}))",
+            key_regex(&prefix_parent_pattern(name))?
+        );
+    }
+    Ok(format!(
+        "(countSubstrings(body, {}) > countSubstrings(body, {}) AND {spelled})",
+        ch_string(first),
+        ch_string(&exact)
+    ))
+}
+
+/// A whitespace-only key holding an object: our flatten joins its members
+/// onto the empty prefix, so they reach the top level.
+fn unwrap_transparent_parent() -> Result<String, KeyReaderRefusal> {
+    let pattern = format!("\"{KEY_TRIM_CLASS}*\"{JSON_WS}:{JSON_WS}\\{{");
+    Ok(format!(
+        "(countSubstrings(body, '{{') > 1 AND match(body, {}))",
+        key_regex(&pattern)?
+    ))
+}
+
+/// `toUInt8(…)`: whether a bare `| json` over this body can read `name`
+/// from a spelling `JSONExtractRaw(body, 'name')` does not read (issue
+/// #507). `_`-only names are always ambiguous.
+pub fn unwrap_name_ambiguity(name: &str) -> Result<CheckedFragment, KeyReaderRefusal> {
+    if !name_is_renderable(name) {
+        return Err(KeyReaderRefusal::NameNotRenderable);
+    }
+    if only_underscores(name) {
+        return Ok(CheckedFragment {
+            sql: "toUInt8(1)".to_string(),
+        });
+    }
+    Ok(CheckedFragment {
+        sql: format!(
+            "toUInt8({} OR {} OR {})",
+            unwrap_name_escaped(name)?,
+            unwrap_name_spelled_otherwise(name)?,
+            unwrap_transparent_parent()?
+        ),
+    })
+}
+
+/// `countSubstrings(body, '{') + countSubstrings(body, '[') <= 127` — a
+/// body that passes nests at most 127 levels, so our parser reads it
+/// (issue #507). Brackets inside strings are counted too, which only
+/// moves such a row to our parser.
+pub fn json_depth_bound() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "countSubstrings(body, '{{') + countSubstrings(body, '[') <= {MAX_JSON_NESTING}"
+        ),
+    }
+}
+
+/// An upper bound on the bare flatten's key-budget charge for this body,
+/// within the budget (issue #507). A body of at most 4,050 bytes has at
+/// most 4,050 colons, so its bound is at most 66,031,200 bytes and the
+/// counts are not computed.
+pub fn json_flatten_key_budget_bound() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "(length(body) <= 4050 OR if(countSubstrings(body, '{{') <= 1, 88 * \
+             countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * \
+             length(body) + 104)) <= {JSON_FLATTEN_KEY_BUDGET})"
+        ),
+    }
+}
+
+/// `toUInt8(…)`: no value at `name`, no spelling of it, a valid document
+/// within the nesting bound and, on the bare form, within the key budget
+/// (issue #507). `bare` is the bare `| json` flatten; otherwise the path is
+/// exact and only validity and depth are asked.
+pub fn unwrap_name_absence(
+    columns: ReaderColumns,
+    name: &str,
+    form: super::sql::UnwrapForm,
+) -> Result<CheckedFragment, KeyReaderRefusal> {
+    let t = columns.prefix();
+    let depth = json_depth_bound();
+    let depth = depth.as_sql();
+    match form {
+        super::sql::UnwrapForm::Targeted => Ok(CheckedFragment {
+            sql: format!(
+                "toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth})"
+            ),
+        }),
+        super::sql::UnwrapForm::Bare => {
+            if !name_is_renderable(name) {
+                return Err(KeyReaderRefusal::NameNotRenderable);
+            }
+            let budget = json_flatten_key_budget_bound();
+            let mut spelled = format!("NOT match(body, {})", key_regex(&spelled_pattern(name))?);
+            if parts_joined(name) {
+                spelled = format!(
+                    "{spelled} AND NOT (countSubstrings(body, '{{') > 1 AND match(body, {}))",
+                    key_regex(&prefix_parent_pattern(name))?
+                );
+            }
+            let first = name.split('_').next().unwrap_or("");
+            Ok(CheckedFragment {
+                sql: format!(
+                    "toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth} AND \
+                     {} AND (position(body, {}) = 0 OR ({spelled})))",
+                    budget.as_sql(),
+                    ch_string(first)
+                ),
+            })
+        }
+    }
+}
+
+/// `match(l<i>_r, '^-?[1-9][0-9]{0,18}$')` — the raw text of a key label
+/// is an integer our parser renders the same way (issue #507).
+pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment {
+    // A constant pattern; the escaper cannot refuse it.
+    let pattern = ch_regex_unanchored_checked(INTEGER_TEXT).unwrap_or_else(|_| ch_string(INTEGER_TEXT));
+    CheckedFragment {
+        sql: format!("match({}_r, {pattern})", columns.prefix()),
+    }
+}
+
+/// Whether a row's structured metadata holds an entry named `name`
+/// (issue #507): the substring test first, and the key list only on a row
+/// that passes it.
+pub fn metadata_holds_name(name: &str) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "(position({METADATA_COLUMN}, {}) > 0 AND has(JSONExtractKeys({METADATA_COLUMN}), {}))",
+            ch_string(&format!("\"{name}\":")),
+            ch_string(name)
+        ),
+    }
+}
+
+/// The structured metadata a group needs (issue #507): the entries named
+/// in `values`, with their values, and the entries named in `presence`
+/// with the value `'1'` — only their presence changes an answer. A row
+/// holding none of the names projects nothing and parses nothing.
+pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment {
+    let mut names: Vec<&str> = values
+        .iter()
+        .chain(presence.iter())
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let needles: Vec<String> = names
+        .iter()
+        .map(|n| ch_string(&format!("\"{n}\":")))
+        .collect();
+    let in_list: Vec<String> = names.iter().map(|n| ch_string(n)).collect();
+    let mut kept = format!(
+        "arrayFilter(x -> x.1 IN ({}), JSONExtractKeysAndValues({METADATA_COLUMN}, 'String'))",
+        in_list.join(", ")
+    );
+    if !presence.is_empty() {
+        let mut pres: Vec<&str> = presence.iter().map(String::as_str).collect();
+        pres.sort_unstable();
+        pres.dedup();
+        let pres: Vec<String> = pres.iter().map(|n| ch_string(n)).collect();
+        kept = format!(
+            "arrayMap(x -> (x.1, if(x.1 IN ({}), '1', x.2)), {kept})",
+            pres.join(", ")
+        );
+    }
+    CheckedFragment {
+        sql: format!(
+            "if(multiSearchAny({METADATA_COLUMN}, [{}]), {kept}, CAST([], 'Array(Tuple(String, \
+             String))'))",
+            needles.join(", ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
