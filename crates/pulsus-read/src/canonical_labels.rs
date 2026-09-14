@@ -55,7 +55,7 @@
 //!
 //! The first row is the one that decides it: our own writer produces the
 //! empty string for every log entry with no structured metadata
-//! (`crates/pulsus-write/src/protocols/loki_push.rs:783-785`), and
+//! (`crates/pulsus-write/src/protocols/loki_push.rs:788-790`), and
 //! `serde_json` rejects it. The rest are unreachable — the only two
 //! renderers that reach these columns are
 //! `pulsus_model::LabelSet::to_canonical_json` and

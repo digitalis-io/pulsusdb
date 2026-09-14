@@ -93,9 +93,9 @@ where
 /// else verbatim).
 ///
 /// Its inverse is [`crate::canonical_labels::parse_canonical_labels`].
-/// The two were not compared until issue #539, and the escape table 320
-/// lines below this one was missing the `\b` and `\f` this function has
-/// always emitted.
+/// The two were not compared until issue #539, when the reader's escape
+/// table — until then a private copy further down this same file — turned
+/// out to be missing the `\b` and `\f` this function has always emitted.
 pub(in crate::logql) fn push_json_string(out: &mut String, s: &str) {
     use std::fmt::Write as _;
     out.push('"');
