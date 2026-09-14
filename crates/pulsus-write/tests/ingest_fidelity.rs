@@ -99,7 +99,7 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet, canonicalize_label_key};
+use pulsus_model::{Date, LabelSet, log_label_name};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 use pulsus_write::writer::{LogSampleRow, LogStreamRow};
 use pulsus_write::{LogWriter, WriterTables};
@@ -482,7 +482,7 @@ fn path_b_scope_structured_metadata(f: &Fixture) -> String {
         .file
         .scope_attributes
         .iter()
-        .map(|(k, v)| (canonicalize_label_key(k), v.clone()))
+        .map(|(k, v)| (log_label_name(k), v.clone()))
         .collect();
     if !f.file.scope_name.is_empty() {
         ordered.push(("scope_name".to_string(), f.file.scope_name.clone()));

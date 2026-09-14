@@ -473,10 +473,10 @@ fn artifact_probe_set_is_exactly_the_source_probe_set() {
 fn no_probe_name_collides_with_an_elided_ingest_label() {
     for sp in source_probes() {
         for (name, _) in sp.sm {
-            let canonical = pulsus_model::canonicalize_label_key(name);
+            let canonical = pulsus_model::log_label_name(name);
             assert!(
                 !ELIDED_SM_NAMES.contains(&canonical.as_str()),
-                "{}: probe name {name:?} canonicalizes onto an elided name",
+                "{}: probe name {name:?} is stored under an elided name",
                 sp.id
             );
         }

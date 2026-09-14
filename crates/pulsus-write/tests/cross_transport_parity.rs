@@ -434,7 +434,7 @@ fn both_log_receivers_resolve_structured_metadata_with_one_rule() {
     for row in SM_COLLISION_ROWS {
         let canonicalized: Vec<(String, String)> = row
             .iter()
-            .map(|(k, v)| (pulsus_model::canonicalize_label_key(k), (*v).to_string()))
+            .map(|(k, v)| (pulsus_model::log_label_name(k), (*v).to_string()))
             .collect();
         let as_refs: Vec<(&str, &str)> = canonicalized
             .iter()

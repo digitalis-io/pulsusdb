@@ -3381,4 +3381,157 @@ mod tests {
         assert_eq!(out.stream_errors.len(), 1);
         assert!(out.rows.is_empty());
     }
+
+    // ---- issue #507: attribute names are stored as the reference stores
+    // them (option A). Each expectation below is a measured cell of the
+    // plan's OTLP table, taken from the pinned reference build.
+
+    /// **N4: a scope attribute key is stored under the reference's label
+    /// name.** `s..x` is stored as `s_x` and `9s` as `key_9s`, and two keys
+    /// that land on one stored name resolve by wire order — which is what
+    /// distinguishes renaming the keys here from repairing the names later:
+    /// the later pair wins in both orders only if the collision is decided on
+    /// the stored name.
+    #[test]
+    fn scope_attribute_names_are_stored_as_the_reference_names_them() {
+        let sm = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("s..x", "1"), attr("9s", "2")],
+        )));
+        assert_eq!(sm, r#"{"key_9s":"2","s_x":"1"}"#);
+
+        // ao7 and ao8 of the plan's table: `a..b` and `a_b` are one stored
+        // name, and the LAST pair in wire order wins.
+        let ao7 = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("a..b", "x"), attr("a_b", "y")],
+        )));
+        assert_eq!(ao7, r#"{"a_b":"y"}"#, "ao7");
+        let ao8 = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("a_b", "y"), attr("a..b", "x")],
+        )));
+        assert_eq!(ao8, r#"{"a_b":"x"}"#, "ao8");
+    }
+
+    /// **N5: a promoted resource attribute is stored under the reference's
+    /// label name**, and the stream's fingerprint is the one those stored
+    /// names give. The attributes are the plan's ao4 resource.
+    #[test]
+    fn resource_attribute_stream_labels_are_named_as_the_reference_names_them() {
+        let (labels, _) = stream_labels(vec![
+            attr("service.name", "ao4"),
+            attr("k8s..pod", "p"),
+            attr("9zone", "z"),
+            attr("--error--", "boom"),
+        ]);
+        assert_eq!(
+            labels.to_canonical_json(),
+            r#"{"_error_":"boom","k8s_pod":"p","key_9zone":"z","service_name":"ao4"}"#
+        );
+        // `--error--` is stored as `_error_`, so it is an ordinary label and
+        // a metric query over the stream answers instead of failing on a
+        // pipeline error named `boom` (the plan's ao4.01).
+        assert!(labels.get("__error__").is_none());
+        let expected = pulsus_model::LabelSet::from_log_attribute_pairs(vec![
+            ("service_name".to_string(), "ao4".to_string()),
+            ("k8s_pod".to_string(), "p".to_string()),
+            ("key_9zone".to_string(), "z".to_string()),
+            ("_error_".to_string(), "boom".to_string()),
+        ])
+        .0;
+        assert_eq!(
+            pulsus_model::stream_fingerprint(&labels),
+            pulsus_model::stream_fingerprint(&expected),
+            "the fingerprint is the stored names'"
+        );
+    }
+
+    /// **N6: a `service_name` spelling other than the slot's is stored as
+    /// `service_name_extracted`**, where it used to be stored nowhere. Both
+    /// rows are the plan's ao5 and ao6, whose answers were measured on the
+    /// reference through its read path.
+    #[test]
+    fn a_service_name_spelling_other_than_the_slot_is_stored_as_service_name_extracted() {
+        let (ao6, _) = stream_labels(vec![
+            attr("service.name", "ao6"),
+            attr("service_name", "v6"),
+        ]);
+        assert_eq!(
+            ao6.to_canonical_json(),
+            r#"{"service_name":"ao6","service_name_extracted":"v6"}"#
+        );
+        let (ao5, _) = stream_labels(vec![
+            attr("container.name", "ao5"),
+            attr("service..name", "x"),
+        ]);
+        assert_eq!(
+            ao5.to_canonical_json(),
+            r#"{"container_name":"ao5","service_name":"ao5","service_name_extracted":"x"}"#,
+            "the slot is discovered from `container.name` and the near-miss is stored beside it"
+        );
+        // The slot's own attribute is not stored twice.
+        let (plain, _) = stream_labels(vec![attr("service.name", "only")]);
+        assert_eq!(plain.to_canonical_json(), r#"{"service_name":"only"}"#);
+    }
+
+    /// **N7: the level is read from a record attribute under its stored
+    /// name.** The reference renames record attribute keys with the same
+    /// namer before it looks for `severity_text`, so `severity..text=warn`
+    /// is the level there — and now here (the plan's ao1.04).
+    #[test]
+    fn a_record_attribute_level_is_found_under_its_stored_name() {
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "ao1")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                attributes: vec![attr("severity..text", "warn")],
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(
+            &req,
+            0,
+            LogIngestSettings {
+                discover_log_levels: true,
+            },
+        )
+        .expect("within the depth cap");
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"detected_level":"warn","scope_name":"my-scope","scope_version":"1.0.0"}"#,
+            "the record attribute is found under its stored name"
+        );
+    }
+
+    /// **N8: the eighteen index attributes are named alike by both rules.**
+    /// The bound check and the discovery comparison run over the raw index
+    /// names with the metrics canonicalizer; storage uses the log namer. The
+    /// two agree on every one of those names, which is what lets those call
+    /// sites stay as they are.
+    #[test]
+    fn the_eighteen_index_attributes_are_named_alike_by_both_rules() {
+        for raw in log_label_limits::otlp_index_attributes() {
+            assert_eq!(
+                pulsus_model::log_label_name(raw),
+                pulsus_model::canonicalize_label_key(raw),
+                "{raw:?}"
+            );
+        }
+        // And the two rules do differ in general, so the agreement above is
+        // a property of those names rather than of the rules.
+        assert_ne!(
+            pulsus_model::log_label_name("a..b"),
+            pulsus_model::canonicalize_label_key("a..b")
+        );
+    }
 }
