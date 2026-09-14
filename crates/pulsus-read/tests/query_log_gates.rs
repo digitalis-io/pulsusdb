@@ -6145,3 +6145,205 @@ async fn every_refusal_lands_as_the_table_says() {
     }
     drop_group_key_db(&admin, &db).await;
 }
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ProjectedMetadataRow {
+    pairs: Vec<(String, String)>,
+}
+
+/// **Criterion 5: the key route's reduced input answers as the full input**
+/// (issue #507, §6.3).
+///
+/// The fold never sees a row as it was stored. It sees:
+///
+/// ```text
+/// metadata      only the entries the plan names, projected by the key statement's own SQL
+/// bare keys     a key label's body value removed where a stream label or metadata entry holds the name
+/// stream labels only the class names
+/// ```
+///
+/// Each case is stored twice, as it is and reduced, and today's route (an
+/// instant query) answers both; the answers must be equal. 7 queries × 14
+/// metadata variants over the same four bodies on a stream
+/// `{pod="p1", zone="z1"}`: 98 cases, of which 20 carry a name that sends the
+/// key route to today's route (the unwrapped label, `__error__` or
+/// `__error_details__`), so they have no reduced input and are not compared.
+/// The names come from the plan the key route runs.
+#[tokio::test]
+async fn the_reduced_input_answers_as_the_full_input() {
+    skip_unless_live!();
+    let (admin, client, db) = group_key_db("gk_reduced").await;
+    let queries = [
+        ("qa", "sum by (code) (sum_over_time(SEL | json | unwrap latency [1m]))"),
+        ("qb", "avg_over_time(SEL | json | unwrap latency [1m]) by (code)"),
+        ("qc", r#"sum by (code) (sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#),
+        ("qd", "sum by (pod) (sum_over_time(SEL | json | unwrap latency [1m]))"),
+        ("qe", "sum(sum_over_time(SEL | json | unwrap latency [1m]))"),
+        ("qf", r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) by (c)"#),
+        ("qg", r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) without (pod)"#),
+    ];
+    let bodies = [
+        r#"{"latency":1,"code":"a","a":"x"}"#,
+        r#"{"latency":2,"code":"b","a":"x","pod":"body-pod"}"#,
+        r#"{"latency":4,"code":"a","a":"y","c":"bc"}"#,
+        r#"{"latency":8}"#,
+    ];
+    let metadata: [&[&str]; 14] = [
+        &[""],
+        &[r#"{"code":"m"}"#],
+        &[r#"{"a":"x"}"#],
+        &[r#"{"a":"q"}"#],
+        &[r#"{"pod":"sm-pod"}"#],
+        &[r#"{"trace_id":"t1"}"#],
+        &[r#"{"zone":"sz"}"#],
+        &[r#"{"code":"m","trace_id":"t"}"#],
+        &[r#"{"latency":"9"}"#],
+        &[r#"{"__error__":"boom"}"#],
+        &[r#"{"__error_details__":"d"}"#],
+        &[r#"{"c":"k"}"#],
+        &[r#"{"lat":"7"}"#],
+        &[r#"{"trace_id":"t1"}"#, r#"{"trace_id":"t2"}"#, r#"{"code":"m"}"#, ""],
+    ];
+    let stream = [("pod", "p1"), ("zone", "z1")];
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut cases: Vec<GroupKeyCase> = Vec::new();
+    let mut compared: Vec<(String, String)> = Vec::new();
+    let mut to_today = 0;
+    for (qn, q) in queries {
+        let planned = q.replace("SEL", r#"{service_name="x"}"#);
+        let u = match plan(&parse(&planned).expect("parse"), &range, &plan_ctx(&db)).expect("plan") {
+            Plan::Metric(mp) => match mp.value {
+                sql::MetricValue::Unwrapped(u) => *u,
+                other => panic!("{q}: the group key read, got {other:?}"),
+            },
+            _ => panic!("{q}: a metric plan"),
+        };
+        for (si, sms) in metadata.iter().enumerate() {
+            let id = format!("sm_{qn}_{si:02}");
+            let keys_of = |sm: &str| -> Vec<String> {
+                if sm.is_empty() {
+                    return Vec::new();
+                }
+                let m: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(sm).expect("metadata json");
+                m.keys().cloned().collect()
+            };
+            // A row naming the unwrapped label or a presence name sends the
+            // key route to today's route: it has no reduced input.
+            let presence: Vec<String> = match &u.metadata {
+                sql::MetadataSent::Projected { presence, .. } => presence.clone(),
+                sql::MetadataSent::Text => vec![u.label.clone(), "__error__".to_string()],
+            };
+            if sms
+                .iter()
+                .any(|sm| keys_of(sm).iter().any(|k| presence.contains(k) || *k == u.label))
+            {
+                to_today += 1;
+                continue;
+            }
+            let mut full = group_key_case(&format!("{id}_f"), &stream, &[]);
+            let mut reduced_stream: Vec<(&str, &str)> = match &u.classes {
+                sql::ClassNames::Projected(names) => stream
+                    .iter()
+                    .copied()
+                    .filter(|(k, _)| names.iter().any(|n| n == k))
+                    .collect(),
+                _ => stream.to_vec(),
+            };
+            reduced_stream.sort();
+            let mut reduced = group_key_case(&format!("{id}_r"), &reduced_stream, &[]);
+            for (j, body) in bodies.iter().enumerate() {
+                let sm = sms[j % sms.len()];
+                full.entries.push((body.to_string(), sm.to_string()));
+                // The bare form's blank rule.
+                let rbody = if u.form == sql::UnwrapForm::Bare {
+                    let doc: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_str(body).expect("body json");
+                    let sm_keys = keys_of(sm);
+                    let kept: serde_json::Map<String, serde_json::Value> = doc
+                        .into_iter()
+                        .filter(|(k, _)| {
+                            let is_key = u.keys.iter().any(|key| key.source == *k);
+                            let held = stream.iter().any(|(s, _)| s == k) || sm_keys.contains(k);
+                            !(is_key && held)
+                        })
+                        .collect();
+                    serde_json::to_string(&kept).expect("json")
+                } else {
+                    body.to_string()
+                };
+                // The metadata the key statement sends, computed by its SQL.
+                let rsm = match &u.metadata {
+                    sql::MetadataSent::Text => sm.to_string(),
+                    sql::MetadataSent::Projected { values, presence } => {
+                        let expr = pulsus_read::logql::predicate::metadata_names_projection(values, presence);
+                        let mut s = admin
+                            .query_stream::<ProjectedMetadataRow>(
+                                &format!(
+                                    "SELECT {} AS pairs FROM (SELECT {} AS structured_metadata)",
+                                    expr.as_sql(),
+                                    literal(sm).as_sql()
+                                ),
+                                &QuerySettings::new(),
+                            )
+                            .await
+                            .expect("project the metadata");
+                        let pairs = s.next().await.expect("one row").expect("decode").pairs;
+                        drop(s);
+                        if pairs.is_empty() {
+                            String::new()
+                        } else {
+                            let m: serde_json::Map<String, serde_json::Value> = pairs
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect();
+                            serde_json::to_string(&m).expect("json")
+                        }
+                    }
+                };
+                reduced.entries.push((rbody, rsm));
+            }
+            full.query = q.to_string();
+            reduced.query = q.to_string();
+            compared.push((full.id.clone(), reduced.id.clone()));
+            cases.push(full);
+            cases.push(reduced);
+        }
+    }
+    assert_eq!(
+        (compared.len(), to_today),
+        (78, 20),
+        "78 compared, 20 on today's route"
+    );
+    seed_group_key_cases(&admin, &client, &db, t, 588_000, &cases).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: t },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut answers = std::collections::HashMap::new();
+    for case in &cases {
+        let query = case.query.replace("SEL", &format!("{{service_name={:?}}}", case.id));
+        answers.insert(
+            case.id.clone(),
+            group_key_answer(engine.query(&parse(&query).expect("parse"), &instant).await),
+        );
+    }
+    let differ: Vec<String> = compared
+        .iter()
+        .filter(|(f, r)| answers[f] != answers[r])
+        .map(|(f, r)| format!("{f}: full {}, reduced {}", answers[f], answers[r]))
+        .collect();
+    assert!(differ.is_empty(), "{} differ:\n{}", differ.len(), differ.join("\n"));
+    drop_group_key_db(&admin, &db).await;
+}
