@@ -572,6 +572,24 @@ fn regenerate_the_count_site_lines() {
 // an identifier the cited line carries — the same rule the resolved ones
 // already satisfy. That is a per-site reading of each cited line against
 // the claim beside it, and it is recorded as work rather than promised.
+//
+// **A CONTINUATION citation is read too** (issue #545). The record
+// writes a second line of the same file as a bare `` `:825` ``, and
+// until this was added the reader saw only the `<file>.rs:<line>` form,
+// so a continuation could be moved to any number and every check here
+// stayed green. That is how `docs/query-to-sql.md`'s TraceQL row came to
+// cite two call sites that did not exist. The rule is narrow and stated
+// in full: a `` `:<line>` `` or `` `:<line>-<line>` `` is a citation when
+// it sits **on the same line as, and after**, a `<file>.rs:<line>`
+// occurrence, and it is attributed to the nearest such occurrence before
+// it. Its token is synthesised as `<that file>:<its line>`, so it
+// resolves, is frozen and is checked by exactly the same rules as a
+// written-out citation.
+//
+// **What it still does not read**, named rather than left to be found: a
+// continuation on a LATER line than the citation it continues, and a
+// continuation of a citation into a file that is not a `.rs` file.
+// Neither is scanned, so neither is checked.
 // ---------------------------------------------------------------------
 
 const CITATIONS_TSV: &str = "crates/pulsus-read/tests/design_record_citations.tsv";
@@ -704,7 +722,11 @@ struct Occurrence {
     citing_line: String,
 }
 
-/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts.
+/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts,
+/// and every continuation citation that follows one on the same line.
+///
+/// See the section comment above [`CITATIONS_TSV`] for the continuation
+/// rule and for the two forms it deliberately does not read.
 fn citation_occurrences() -> Vec<Occurrence> {
     let mut out = Vec::new();
     for doc in DESIGN_ARTEFACTS {
@@ -712,6 +734,10 @@ fn citation_occurrences() -> Vec<Occurrence> {
         for (doc_line, line) in text.lines().enumerate() {
             let doc_line = doc_line as u32 + 1;
             let bytes = line.as_bytes();
+            // `(byte offset of the citation, the file part of its
+            // token)`, in the order they occur, so a continuation can be
+            // attributed to the nearest one before it.
+            let mut written_out: Vec<(usize, String)> = Vec::new();
             let mut i = 0usize;
             while let Some(at) = line[i..].find(".rs:") {
                 let dot = i + at;
@@ -741,6 +767,7 @@ fn citation_occurrences() -> Vec<Occurrence> {
                     }
                 }
                 if !first.is_empty() && start < dot {
+                    written_out.push((start, line[start..dot + 3].to_string()));
                     out.push(Occurrence {
                         doc: doc.to_string(),
                         doc_line,
@@ -752,7 +779,66 @@ fn citation_occurrences() -> Vec<Occurrence> {
                 }
                 i = (dot + 4).max(j);
             }
+            // The continuations on this line. `written_out` is in
+            // increasing offset order, so the nearest citation before a
+            // continuation is the last entry whose offset is smaller.
+            for (at, first, last) in continuations(line) {
+                let Some((_, path)) = written_out.iter().rev().find(|(o, _)| *o < at) else {
+                    continue;
+                };
+                let token = if first == last {
+                    format!("{path}:{first}")
+                } else {
+                    format!("{path}:{first}-{last}")
+                };
+                out.push(Occurrence {
+                    doc: doc.to_string(),
+                    doc_line,
+                    token,
+                    first,
+                    last,
+                    citing_line: line.to_string(),
+                });
+            }
         }
+    }
+    out
+}
+
+/// Every `` `:<line>` ``/`` `:<line>-<line>` `` on one line, as
+/// `(byte offset of the opening backtick, first, last)`.
+///
+/// The backticks are part of the form: a bare `:825` in prose is an
+/// ordinary colon before a number, and reading it as a citation would
+/// make the resolver answer for text nobody wrote as a citation.
+fn continuations(line: &str) -> Vec<(usize, u32, u32)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = line[at..].find("`:") {
+        let open = at + rel;
+        let mut j = open + 2;
+        let first: String = line[j..].chars().take_while(char::is_ascii_digit).collect();
+        j += first.len();
+        let mut last = first.clone();
+        if line[j..].starts_with('-') {
+            let second: String = line[j + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !second.is_empty() {
+                last = second.clone();
+                j += 1 + second.len();
+            }
+        }
+        if !first.is_empty() && bytes.get(j) == Some(&b'`') {
+            out.push((
+                open,
+                first.parse().expect("digits"),
+                last.parse().expect("digits"),
+            ));
+        }
+        at = open + 2;
     }
     out
 }

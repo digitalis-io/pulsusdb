@@ -135,7 +135,7 @@ was nine and every range metric query read raw lines.
 | `metric_range_unwrapped_rows` | `sql.rs:1620` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
 | `probe` | `sql.rs:519` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
-The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:761` and `:810`;
+The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:725` and `:774`;
 the values are those of part 4's corpus.
 
 ```sql
@@ -372,7 +372,7 @@ The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes
 ### 1.2 LogQL — the ten stage kinds
 
 `Stage` has exactly ten variants (`crates/pulsus-logql/src/ast.rs:133`); `Parser` has four of its
-own (`ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
+own (`crates/pulsus-logql/src/ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
 
 Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3763`) walks the
 stages and collects the ones that become predicates on `body`. `has_unpushed_dropping_stage`

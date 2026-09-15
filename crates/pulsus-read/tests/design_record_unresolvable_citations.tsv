@@ -8,6 +8,7 @@ docs/query-lowering.md	ast.rs:242	ambiguous_basename
 docs/query-lowering.md	ast.rs:248	ambiguous_basename
 docs/query-lowering.md	ast.rs:251	ambiguous_basename
 docs/query-lowering.md	ast.rs:939	ambiguous_basename
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1655	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1968	blank_target_line
 docs/query-lowering.md	exec.rs:121	ambiguous_basename
 docs/query-lowering.md	exec.rs:145	ambiguous_basename
@@ -48,13 +49,14 @@ docs/query-lowering.md	plan.rs:3750	ambiguous_basename
 docs/query-lowering.md	search_plan.rs:1042	blank_target_line
 docs/query-lowering.md	sql.rs:774	ambiguous_basename
 docs/query-lowering.md	traces/exec.rs:114	blank_target_line
-docs/query-to-sql.md	ast.rs:237	ambiguous_basename
 docs/query-to-sql.md	exec.rs:116	ambiguous_basename
 docs/query-to-sql.md	exec.rs:119	ambiguous_basename
 docs/query-to-sql.md	exec.rs:121	ambiguous_basename
 docs/query-to-sql.md	exec.rs:410	ambiguous_basename
 docs/query-to-sql.md	exec.rs:726	ambiguous_basename
+docs/query-to-sql.md	fold.rs:543	ambiguous_basename
 docs/query-to-sql.md	labels.rs:318	occurrences_disagree
+docs/query-to-sql.md	plan.rs:1534	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1649	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1650-1652	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1681-1687	ambiguous_basename
