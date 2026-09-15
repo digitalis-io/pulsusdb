@@ -7606,7 +7606,13 @@ const PINNED_SELECTION_STATEMENTS: &str =
 const SEL_AT_NS: i64 = 1_893_456_000_000_000_000;
 const SEL_STEP_NS: i64 = 60_000_000_000;
 
-/// The six streams, and how many samples each has in the one bucket.
+/// The six streams, their second grouping label, and how many samples
+/// each has in the one bucket.
+///
+/// `pod` exists so that a wrapping can group by something other than
+/// `service_name` between two aggregations — the middle-selection shape
+/// below. It changes no statement: the selector reads `env`, and
+/// `PREWHERE`/`fingerprint IN` are built from the resolved streams.
 ///
 /// Six rather than three, with a deliberate tie at 3, so that `topk(2, …)`
 /// drops four series and `bottomk(1, …)` drops five: a row-limiting drift
@@ -7614,13 +7620,13 @@ const SEL_STEP_NS: i64 = 60_000_000_000;
 /// not close that class — an attacker picks a larger literal, which is
 /// what red run 4's `<= 10` does — and B3 against the committed
 /// statements is what closes it.
-const SEL_STREAMS: [(u64, &str, u32); 6] = [
-    (545_001, "c545a", 6),
-    (545_002, "c545b", 5),
-    (545_003, "c545c", 4),
-    (545_004, "c545d", 3),
-    (545_005, "c545e", 3),
-    (545_006, "c545f", 1),
+const SEL_STREAMS: [(u64, &str, &str, u32); 6] = [
+    (545_001, "c545a", "p1", 6),
+    (545_002, "c545b", "p2", 5),
+    (545_003, "c545c", "p3", 4),
+    (545_004, "c545d", "p4", 3),
+    (545_005, "c545e", "p5", 3),
+    (545_006, "c545f", "p6", 1),
 ];
 
 /// One route's committed block.
@@ -7642,7 +7648,7 @@ struct SelectionBlock {
 /// reasons differ, so a change that quietly sent both down one path fails
 /// rather than passing twice over the same statements.
 ///
-/// **Four wrappings put the selection OUTERMOST and two put it inside.**
+/// **Four wrappings put the selection OUTERMOST and three put it inside.**
 /// The chain is stored outer-first and walked with `aggs.iter().rev()`
 /// (`post_agg.rs:3018`), so an outermost-only matrix leaves
 /// `vector_aggs.last()` — the innermost spec — never a selection, and a
@@ -7651,7 +7657,12 @@ struct SelectionBlock {
 ///
 ///     sum by (service_name) (topk(2, count_over_time(SEL[1m])))
 ///     topk(2, sum by (service_name) (bottomk(5, count_over_time(SEL[1m]))))
-fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 6])> {
+///     sum by (service_name) (topk(2, sum by (pod) (count_over_time(SEL[1m]))))
+///
+/// The third has a selection that is neither the first spec nor the last,
+/// so a condition indexed at EITHER end misses it. What the check rests on
+/// is therefore membership of the chain, not a position in it.
+fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 7])> {
     let range = QueryParams {
         spec: QuerySpec::Range {
             start_ns: SEL_AT_NS,
@@ -7688,6 +7699,12 @@ fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 6])> {
             format!("sum by (service_name) (topk(2, count_over_time({sel}[1m])))"),
             // A selection at both ends of one chain.
             format!("topk(2, sum by (service_name) (bottomk(5, count_over_time({sel}[1m]))))"),
+            // The selection is NEITHER the first spec NOR the last, so a
+            // condition indexed at either end misses it in both
+            // directions. `sum by (pod)` groups on the corpus's second
+            // label, so the middle stage is a real grouping rather than a
+            // repeat of the outer one.
+            format!("sum by (service_name) (topk(2, sum by (pod) (count_over_time({sel}[1m]))))"),
         ]
     };
     vec![
@@ -7712,6 +7729,52 @@ fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 6])> {
             six(plain, "approx_topk(2"),
         ),
     ]
+}
+
+/// The five operators section 1.3's row names.
+fn is_selection_op(op: &pulsus_logql::VectorAggOp) -> bool {
+    matches!(
+        op,
+        pulsus_logql::VectorAggOp::Topk
+            | pulsus_logql::VectorAggOp::Bottomk
+            | pulsus_logql::VectorAggOp::ApproxTopk
+            | pulsus_logql::VectorAggOp::Sort
+            | pulsus_logql::VectorAggOp::SortDesc
+    )
+}
+
+/// **What red run 2's rationale rests on, asserted rather than assumed.**
+///
+/// That run conditions a mutation on the plan carrying a selection, and
+/// its evidence is that the route's BASE statement does not move. That
+/// holds only while no route's base carries a selection ANYWHERE in its
+/// chain — a property of these query strings, not of the code. A base
+/// changed to `sum by (pod) (topk(2, count_over_time(…)))` is a valid
+/// query on the same route and would silently make that run prove
+/// nothing, so it fails here instead, naming the operator it found.
+///
+/// **Membership, not position.** The seven wrappings put a selection
+/// first, last and in the middle, so nothing here may be indexed at an
+/// end: this walks the whole chain.
+fn every_base_query_carries_no_selection(db: &str) {
+    for (route, base, params, _) in selection_routes() {
+        let expr = parse(&base).unwrap_or_else(|e| panic!("parse {base}: {e:?}"));
+        let Plan::Metric(mp) = plan(&expr, &params, &plan_ctx(db)).expect("plan") else {
+            panic!("{route}: the base query must be a metric plan");
+        };
+        let found: Vec<String> = mp
+            .vector_aggs
+            .iter()
+            .filter(|(op, _, _)| is_selection_op(op))
+            .map(|(op, _, _)| format!("{op:?}"))
+            .collect();
+        assert!(
+            found.is_empty(),
+            "{route}: the base query {base} carries {found:?} in its chain. Red run 2's \
+             evidence is that the base statement does not move under a selection-conditioned \
+             mutation, and a base that carries a selection makes that run prove nothing"
+        );
+    }
 }
 
 fn selection_request_line(params: &QueryParams) -> String {
@@ -7989,11 +8052,29 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         .await
         .expect("create");
     run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    // **The retention TTL comes off this table before anything is
+    // seeded.** `test_ctx` renders `TTL toDateTime(fromUnixTimestamp64Nano(
+    // timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and this
+    // fixture's timestamps are a FIXED constant, so the fixture would
+    // start expiring once the wall clock passed it — a check that goes red
+    // on a date rather than on a change. Measured on 26.3.29.7 over two
+    // tables with this DDL and one row 14 days old: 0 rows with the TTL,
+    // 1 row with it removed. `log_streams` (`catalog.rs:209`) and
+    // `log_streams_idx` (`catalog.rs:227`) carry no TTL, so this one
+    // statement covers the fixture.
+    admin
+        .execute(
+            &format!("ALTER TABLE {db}.log_samples REMOVE TTL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("remove the retention TTL from the fixture table");
     let client = data_client(&db).await;
 
     let mut rows = Vec::new();
-    for (fp, service, count) in SEL_STREAMS {
-        let labels = format!(r#"{{"env":"prod","service_name":"{service}"}}"#);
+    for (fp, service, pod, count) in SEL_STREAMS {
+        let labels = format!(r#"{{"env":"prod","pod":"{pod}","service_name":"{service}"}}"#);
         client
             .execute(
                 &format!(
@@ -8101,16 +8182,37 @@ async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<Selecti
 /// The labels of a matrix or vector answer, in the order the engine
 /// returned them.
 fn answer_labels(result: &QueryResult) -> Vec<String> {
+    // A series named by its `service_name`, or — when a wrapping grouped
+    // on something else and dropped it — by its whole label set, so that
+    // `{}` is a readable name for the one unlabelled series the
+    // middle-selection wrapping answers.
     let name = |labels: &[(String, String)]| {
         labels
             .iter()
             .find(|(k, _)| k == "service_name")
             .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| format!("{labels:?}"))
+            .unwrap_or_else(|| {
+                let mut kv: Vec<String> =
+                    labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+                kv.sort();
+                format!("{{{}}}", kv.join(", "))
+            })
     };
     match result {
         QueryResult::Matrix(series) => series.iter().map(|s| name(&s.labels)).collect(),
         QueryResult::Vector(samples) => samples.iter().map(|s| name(&s.labels)).collect(),
+        other => panic!("a selection answer is a matrix or a vector, not {other:?}"),
+    }
+}
+
+/// Every value in an answer, in the order the engine returned them.
+fn answer_values(result: &QueryResult) -> Vec<f64> {
+    match result {
+        QueryResult::Matrix(series) => series
+            .iter()
+            .flat_map(|s| s.points.iter().map(|(_, v)| *v))
+            .collect(),
+        QueryResult::Vector(samples) => samples.iter().map(|s| s.value).collect(),
         other => panic!("a selection answer is a matrix or a vector, not {other:?}"),
     }
 }
@@ -8178,6 +8280,7 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
 
     // ---- B3 and C: the live engine ---------------------------------
     let (admin, db) = seed_selection_corpus().await;
+    every_base_query_carries_no_selection(&db);
     let observed = observed_selection_blocks(&db).await;
 
     for (block, runs) in &observed {
@@ -8241,7 +8344,10 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
     );
 
     // ---- C: the answers ---------------------------------------------
-    let all: Vec<String> = SEL_STREAMS.iter().map(|(_, s, _)| s.to_string()).collect();
+    let all: Vec<String> = SEL_STREAMS
+        .iter()
+        .map(|(_, s, _, _)| s.to_string())
+        .collect();
     for (block, runs) in &observed {
         for run in runs {
             let (query, result) = (&run.query, &run.result);
@@ -8255,17 +8361,39 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
             // them; an inner `bottomk(5, …)` drops only the 6, and the
             // outer `topk(2, …)` then takes 5 and 4. No tie decides
             // either answer.
-            let want: Vec<String> = if query.starts_with("sum by (service_name) (topk(2,") {
-                vec!["c545a".to_string(), "c545b".to_string()]
-            } else if query.starts_with("topk(2, sum by (service_name) (bottomk(5,") {
-                vec!["c545b".to_string(), "c545c".to_string()]
-            } else if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
-                vec!["c545a".to_string(), "c545b".to_string()]
-            } else if query.starts_with("bottomk(1,") {
-                vec!["c545f".to_string()]
-            } else {
-                all.clone()
-            };
+            // The middle-selection wrapping groups by `pod` INSIDE, so
+            // its series carry no `service_name`, and the outer
+            // `sum by (service_name)` folds all of them into one
+            // unlabelled series. Its value is the only thing that says
+            // which two pods the selection kept, so it is asserted: 6 + 5.
+            let want_values: Option<Vec<f64>> =
+                if query.starts_with("sum by (service_name) (topk(2, sum by (pod)") {
+                    Some(vec![11.0])
+                } else {
+                    None
+                };
+            if let Some(want_values) = want_values {
+                assert_eq!(
+                    answer_values(result),
+                    want_values,
+                    "{}: {query} answered the wrong value",
+                    block.route
+                );
+            }
+            let want: Vec<String> =
+                if query.starts_with("sum by (service_name) (topk(2, sum by (pod)") {
+                    vec!["{}".to_string()]
+                } else if query.starts_with("sum by (service_name) (topk(2,") {
+                    vec!["c545a".to_string(), "c545b".to_string()]
+                } else if query.starts_with("topk(2, sum by (service_name) (bottomk(5,") {
+                    vec!["c545b".to_string(), "c545c".to_string()]
+                } else if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
+                    vec!["c545a".to_string(), "c545b".to_string()]
+                } else if query.starts_with("bottomk(1,") {
+                    vec!["c545f".to_string()]
+                } else {
+                    all.clone()
+                };
             assert_eq!(
                 sorted(labels.clone()),
                 sorted(want.clone()),
