@@ -8070,6 +8070,40 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         )
         .await
         .expect("remove the retention TTL from the fixture table");
+    // **Asserted, not assumed.** The statement above is the only thing
+    // standing between this fixture and a check that reddens on a date;
+    // taking it away reddens here instead, at once and on any machine.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct DdlRow {
+        ddl: String,
+    }
+    let mut ddl = String::new();
+    {
+        let mut stream = admin
+            .query_stream::<DdlRow>(
+                &format!(
+                    "SELECT create_table_query AS ddl FROM system.tables WHERE database = \
+                     '{db}' AND name = 'log_samples'"
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("read the fixture table's DDL");
+        while let Some(row) = stream.next().await {
+            ddl = row.expect("decode the DDL row").ddl;
+        }
+    }
+    assert!(
+        !ddl.is_empty(),
+        "the fixture's log_samples has no DDL to read"
+    );
+    // Upper case, so the `ttl_only_drop_parts` setting in the same text is
+    // not mistaken for a TTL clause.
+    assert!(
+        !ddl.contains("TTL "),
+        "the fixture's log_samples still carries a TTL clause: {ddl}. Its timestamps are a \
+         fixed constant, so the fixture would expire once the wall clock passed it"
+    );
     let client = data_client(&db).await;
 
     let mut rows = Vec::new();
