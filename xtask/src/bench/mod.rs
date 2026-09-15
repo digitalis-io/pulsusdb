@@ -53,6 +53,7 @@
 pub mod dataset;
 pub mod logs_hydration;
 pub mod match_flag_head;
+pub mod metadata_filter;
 pub mod metrics_labels;
 pub mod queries;
 mod query_log;
@@ -187,6 +188,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         "traces-read" => traces_read::run(args).await,
         "traces-lowering" => traces_lowering::run(args).await,
         "match-flag-head" => match_flag_head::run(args).await,
+        "logql-metadata-filter" => metadata_filter::run(args).await,
         other => anyhow::bail!(
             "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", \
              \"logs-hydration\", \"traces-read\", \"traces-lowering\", or \

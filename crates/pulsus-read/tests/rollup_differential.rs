@@ -673,11 +673,20 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
         },
     );
 
-    // The base-label filter `env = "prod"` is a beyond-line-filter stage:
+    // The base-label filter `env =~ "prod"` is a beyond-line-filter stage:
     // it forces the client-aggregated mode (asserted below) without
     // changing which rows survive — so the in-engine count must equal
     // the SQL-aggregated truth exactly.
-    let query = r#"count_over_time({env="prod"} |= "longer" | env = "prod" [1m])"#;
+    //
+    // **Why the regular-expression operator and not `=`** (issue #544):
+    // an equality or inequality over a name the merged label set resolves
+    // now compiles into the statement, so `| env = "prod"` leaves this
+    // plan with no client stage at all and there is no client-aggregated
+    // count to compare. The regular-expression form is refused by that
+    // cell — the reference's own regex label matcher disagrees with the
+    // pattern it says it compiles — so it still evaluates in-engine, and
+    // it still keeps every row, which is what this comparison needs.
+    let query = r#"count_over_time({env="prod"} |= "longer" | env =~ "prod" [1m])"#;
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: w.start_ns,

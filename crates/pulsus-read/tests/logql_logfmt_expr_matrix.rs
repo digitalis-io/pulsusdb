@@ -1373,12 +1373,16 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            6,
+            7,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
              read's capability-join fallback, the extracted-field group key read, \
-             detected_fields, tail — issue #507 W4 added the third and the key route took over \
-             the fourth. `POSITIONS` reaches the first TWO and no more: \
+             detected_fields, tail, and — since issue #544 — the restored client stage a \
+             metric read swaps in when its structured-metadata fragment exceeds its budget. \
+             That seventh site compiles `MetadataLowering::client_without_lowering`, which \
+             is the pipeline the planner would have carried, so any logfmt expression in it \
+             is one the metric site at :1444 already compiles for the same query. \
+             `POSITIONS` reaches the first TWO and no more: \
              every position is a `query_range`-shaped log or metric query, so nothing in \
              this file executes `detected_fields` or `tail`. Those two call sites are \
              therefore UNCOVERED by this file, and left visibly so — the sub-grammar RULE \

@@ -39,3 +39,6 @@ pulsus-schema = { path = "../pulsus-schema" }
 # #134 backfill tests (5s-cadence ticks without wall-clock waits).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { workspace = true, features = ["util"] }
+# Issue #544: the digest over the metadata ingest function's body, which is
+# what makes a constraint added inside it impossible to add silently.
+sha2.workspace = true

@@ -4666,6 +4666,64 @@ struct GroupKeyStatementRow {
     exception_code: i32,
 }
 
+/// The exception codes `system.query_log` may record for **today's raw scan
+/// when the retained-label ceiling refuses it**.
+///
+/// The refusal is client-side: our engine stops folding and drops the row
+/// stream, which drops its connection. Whether the server had finished
+/// writing the result by then decides what it records — a clean finish, or
+/// its own failure to write to a socket nobody is reading.
+///
+/// **Measured, one build, one corpus, only the read window widened**
+/// (`the_undecided_rows_come_from_one_read`, its assertion replaced by a
+/// print):
+///
+/// ```text
+///   3 grid points    [(Key, 395), (Raw,   0), (Lane, 0)]
+///  12 grid points    [(Key, 395), (Raw, 210), (Lane, 0)]
+/// ```
+///
+/// The answer is the same either way — six series, from the lane statement.
+/// CI records 210 on the three-point window where this machine records 0,
+/// which is the same race decided by a slower server. Any OTHER code is a
+/// real failure and still fails these tests.
+const RAW_SCAN_REFUSED_ON_THE_CEILING: &[i32] = &[0, 210];
+
+/// `[(Key, 395), (Raw, 0 or 210), (Lane, 0)]` — the three statements a
+/// refused ceiling produces, asserted as the claim rather than as one
+/// literal triple. See [`RAW_SCAN_REFUSED_ON_THE_CEILING`] for the one
+/// code that is a race and for what it was measured on.
+fn assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+    statements: &[(GroupKeyStatement, i32)],
+    what: &str,
+) {
+    let kinds: Vec<GroupKeyStatement> = statements.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            GroupKeyStatement::Key,
+            GroupKeyStatement::Raw,
+            GroupKeyStatement::Lane,
+        ],
+        "{what}: the three statements, in that order — got {statements:?}"
+    );
+    assert_eq!(
+        statements[0].1, 395,
+        "{what}: S1 must THROW on an undecided row"
+    );
+    assert!(
+        RAW_SCAN_REFUSED_ON_THE_CEILING.contains(&statements[1].1),
+        "{what}: today's raw scan recorded exception {}, which is neither a clean finish (0) \
+         nor our own disconnect after the ceiling refused it (210, NETWORK_ERROR). Another \
+         code is a real failure of that read — {statements:?}",
+        statements[1].1
+    );
+    assert_eq!(
+        statements[2].1, 0,
+        "{what}: the lane statement is the one that answers, so it must succeed"
+    );
+}
+
 /// Which statement a logged query is, for the group key read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupKeyStatement {
@@ -5921,14 +5979,9 @@ async fn the_undecided_rows_come_from_one_read() {
     );
     assert!(three.iter().all(|(_, p)| p.len() == 3), "three points each");
     let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
-    assert_eq!(
-        statements,
-        vec![
-            (GroupKeyStatement::Key, 395),
-            (GroupKeyStatement::Raw, 0),
-            (GroupKeyStatement::Lane, 0),
-        ],
-        "S1 throws, today's raw scan runs, and exactly one key-route statement follows it"
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &statements,
+        "S1 throws, today's raw scan runs, and exactly one key-route statement follows it",
     );
     // Every statement of the query, in order: none after today's raw scan
     // holds a GROUP BY.
@@ -6054,14 +6107,9 @@ async fn the_undecided_rows_come_from_one_read() {
         vec![(GroupKeyStatement::Key, 395), (GroupKeyStatement::Raw, 0)],
         "without the lowered ceiling today's route answers"
     );
-    assert_eq!(
-        group_key_statements_between(&admin, &db, mid, to, 3).await,
-        vec![
-            (GroupKeyStatement::Key, 395),
-            (GroupKeyStatement::Raw, 0),
-            (GroupKeyStatement::Lane, 0),
-        ],
-        "with it, L answers"
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &group_key_statements_between(&admin, &db, mid, to, 3).await,
+        "with it, L answers",
     );
     match &cluster {
         None => drop_group_key_db(&admin, &db).await,
@@ -6310,14 +6358,9 @@ async fn the_lane_keeps_an_error_row_ungrouped() {
         b, today_w2,
         "(b): L's answer is today's route's, bit for bit"
     );
-    assert_eq!(
-        group_key_statements_between(&admin, &db, from, to, 3).await,
-        vec![
-            (GroupKeyStatement::Key, 395),
-            (GroupKeyStatement::Raw, 0),
-            (GroupKeyStatement::Lane, 0),
-        ],
-        "(b): S1 throws, today's route refuses on its ceiling, and L answers"
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &group_key_statements_between(&admin, &db, from, to, 3).await,
+        "(b): S1 throws, today's route refuses on its ceiling, and L answers",
     );
 
     // (c) the lowered ceiling at W3: L reaches an error row, and that row
@@ -6345,14 +6388,9 @@ async fn the_lane_keeps_an_error_row_ungrouped() {
         "(c): the row's ungrouped labels, got {c_series}"
     );
     let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
-    assert_eq!(
-        statements,
-        vec![
-            (GroupKeyStatement::Key, 395),
-            (GroupKeyStatement::Raw, 0),
-            (GroupKeyStatement::Lane, 0),
-        ],
-        "(c): the error came from L, not from today's route"
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &statements,
+        "(c): the error came from L, not from today's route",
     );
 
     // (c′) the two failures are the same response: equal variants, and equal

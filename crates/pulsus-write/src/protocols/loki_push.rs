@@ -784,7 +784,16 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// [`canonical_structured_metadata`] (charge-before-allocate, before this is
 /// reached), and the OTLP path is intentionally uncapped (matching OTLP
 /// `parse`'s existing unbounded-label, infallible behaviour).
-pub(crate) fn render_structured_metadata(resolved: Vec<(String, String)>) -> String {
+/// **`pub` since issue #544**: this is the writer named for the
+/// `log_samples.structured_metadata` column, and the round-trip identity
+/// `T == render_structured_metadata(what the database reads out of T)` is
+/// checked against it by
+/// `crates/pulsus-write/tests/metadata_text_identity_live.rs`. Naming a
+/// different function there is what made an earlier version of that check
+/// false on the commonest input of all — an entry with no metadata, whose
+/// stored text is the empty string where `LabelSet::to_canonical_json`
+/// answers `{}`.
+pub fn render_structured_metadata(resolved: Vec<(String, String)>) -> String {
     if resolved.is_empty() {
         return String::new();
     }

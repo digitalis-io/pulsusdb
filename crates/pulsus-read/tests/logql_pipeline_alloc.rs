@@ -612,11 +612,20 @@ fn per_row_allocation_bounds_hold() {
         limit: 100,
         direction: Direction::Backward,
     };
-    // A string label filter over a BASE label: non-mutating (fingerprint
-    // grouping) and in-engine — the client-mode trigger. The dropped-row
-    // filter path's zero-alloc bound is pinned by the `run_into` cases
-    // above; here every row survives so the accumulate path is measured.
-    let expr = pulsus_logql::parse(r#"count_over_time({a="b"} |= "info" | env = "prod" [5s])"#)
+    // A regular-expression label filter over a BASE label: non-mutating
+    // (fingerprint grouping) and in-engine — the client-mode trigger. The
+    // dropped-row filter path's zero-alloc bound is pinned by the
+    // `run_into` cases above; here every row survives so the accumulate
+    // path is measured.
+    //
+    // **Why `=~` and not `=`** (issue #544): an equality or inequality
+    // over a structured-metadata name now compiles into the statement, so
+    // `| env = "prod"` leaves this plan with no client stage at all and
+    // the accumulate path would not be measured. The regular-expression
+    // operator is refused by that cell, so it still evaluates in-engine.
+    // The pattern is compiled once, at pipeline compile time, above the
+    // measured region.
+    let expr = pulsus_logql::parse(r#"count_over_time({a="b"} |= "info" | env =~ "prod" [5s])"#)
         .expect("parse");
     let Plan::Metric(mp) = plan(&expr, &params, &plan_ctx).expect("plan") else {
         panic!("expected a Metric plan");

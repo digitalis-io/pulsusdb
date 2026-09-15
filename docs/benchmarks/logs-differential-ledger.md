@@ -157,9 +157,24 @@ Out of this ledger's scope by design:
   the physical stream identity is not black-box-observable, and Loki exposes
   no comparable fingerprint. #97 pins that storage semantics hermetically
   (`protocols/loki_push.rs`, `writer/rows.rs`); this lane does not fabricate a
-  cross-store fingerprint assertion. There is **no SM predicate pushdown** —
-  SM label filters are evaluated client-side (the #97 baseline), so this lane
-  adds no read-path SQL and cannot regress the Tier-1 SQL/alloc goldens.
+  cross-store fingerprint assertion. **SM predicate pushdown exists for the equality
+  and inequality forms since issue #544**: `| trace_id="…"` and
+  `| trace_id!="…"` compile into the sample statement, and the request
+  `LIMIT` compiles with them. The regular-expression and numeric forms are
+  still evaluated client-side, and so are the two fallbacks, each of
+  which takes the route it takes today with the same answer: a filter
+  whose rendered fragments exceed `MAX_METADATA_FRAGMENT_BYTES`, and a
+  filter over a stream carrying both the name and that name without its
+  `_extracted` suffix as labels, where the renamed pair overwrites the
+  stream label of that name. The second half of the withdrawn
+  sentence goes with the first: this lane no longer "adds no read-path SQL
+  and cannot regress the Tier-1 SQL/alloc goldens" by construction. What
+  holds it to them instead is stated rather than assumed —
+  `crates/pulsus-read/tests/golden_sql_freeze.rs` and the Tier-1 gates in
+  `crates/pulsus-read/tests/query_log_gates.rs` carry no SM label filter,
+  so the predicate this lane can now emit appears in none of their frozen
+  statements, and a corpus entry that grew one would move those goldens
+  and redden them.
   **Cross-store duplicate-on-retry semantics are a permanent carve-out
   (issue #102 un-defer).** `grafana/loki:3.4.2`'s native `/loki/api/v1/push`
   has no idempotency-key or request-dedup contract, so whether a live

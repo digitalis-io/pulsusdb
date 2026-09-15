@@ -369,6 +369,18 @@ pub struct MetricPlan {
     /// (rollup-or-raw) path, byte-identical to pre-M6-10 plans.
     pub client: Option<ClientAgg>,
     pub probes: Vec<ProbePlan>,
+    /// The structured-metadata label filters this plan compiled into its
+    /// statement, and the client stage it would have carried if it had
+    /// not (issue #544). `None` when no metadata filter lowered, which is
+    /// every plan that existed before this issue.
+    ///
+    /// **Boxed.** `MetricPlan` is the largest `Plan` variant, and an
+    /// inline `MetadataLowering` widens every `Plan`-sized move past
+    /// `clippy::large_enum_variant`'s threshold for a field that is
+    /// `None` on almost every plan. The box is allocated once per query
+    /// at plan time; `Debug` prints `None` either way, so the frozen
+    /// planner record is unmoved by the indirection.
+    pub metadata_lowering: Option<Box<MetadataLowering>>,
 }
 
 impl MetricPlan {
@@ -1674,14 +1686,23 @@ fn streams_plan(
 /// label; fan-out only regroups), so they alone never trigger the
 /// oversample and parser-only pipelines keep byte-identical SQL.
 fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
+    let lowered = metadata_filter_flags(pipeline);
     let mut seen_line_format = false;
-    for stage in pipeline {
+    for (i, stage) in pipeline.iter().enumerate() {
         match stage {
             Stage::LineFormat(_) => seen_line_format = true,
             // `decolorize`/`unpack` rewrite the line, so a following line
             // filter references the rewritten line and cannot push down (it
             // becomes an in-engine dropping stage — issue #200).
             Stage::Decolorize | Stage::Unpack => seen_line_format = true,
+            // Issue #544: a structured-metadata label filter whose whole
+            // tree compiles into the statement drops nothing in-engine —
+            // the database has already dropped those rows, and the client
+            // pipeline re-running an `Equivalent` filter over what comes
+            // back removes none of it. So it does not oversample, which is
+            // what lets the request `LIMIT` compile and turns the sample
+            // read from a page loop into one statement.
+            Stage::LabelFilter(_) if lowered[i] => {}
             Stage::LabelFilter(_) => return true,
             Stage::LineFilter(_) if seen_line_format => return true,
             // A non-pushable line filter (`ip(…)`/mixed-`or`) drops lines
@@ -1700,25 +1721,34 @@ fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
 /// pipeline evaluates in-engine over the raw scan.
 fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     use pulsus_logql::ParserStage;
-    pipeline.iter().find_map(|stage| match stage {
-        // A pushable line filter is served by the columnar `sp.line_filters`
-        // predicate; a non-pushable one (`ip(…)`/mixed-`or`) must force
-        // in-engine client aggregation over the raw scan.
-        Stage::LineFilter(lf) if is_pushable_line_filter(lf) => None,
-        Stage::LineFilter(_) => Some("ip line filter"),
-        Stage::Parser(ParserStage::Json { .. }) => Some("json"),
-        Stage::Parser(ParserStage::Logfmt { .. }) => Some("logfmt"),
-        Stage::Parser(ParserStage::Regexp(_)) => Some("regexp"),
-        Stage::Parser(ParserStage::Pattern(_)) => Some("pattern"),
-        Stage::LabelFilter(_) => Some("label filter"),
-        Stage::LineFormat(_) => Some("line_format"),
-        Stage::LabelFormat(_) => Some("label_format"),
-        Stage::Unwrap(_) => Some("unwrap"),
-        Stage::Unpack => Some("unpack"),
-        Stage::Decolorize => Some("decolorize"),
-        Stage::Drop(_) => Some("drop"),
-        Stage::Keep(_) => Some("keep"),
-    })
+    let lowered = metadata_filter_flags(pipeline);
+    pipeline
+        .iter()
+        .enumerate()
+        .find_map(|(i, stage)| match stage {
+            // A pushable line filter is served by the columnar `sp.line_filters`
+            // predicate; a non-pushable one (`ip(…)`/mixed-`or`) must force
+            // in-engine client aggregation over the raw scan.
+            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => None,
+            Stage::LineFilter(_) => Some("ip line filter"),
+            Stage::Parser(ParserStage::Json { .. }) => Some("json"),
+            Stage::Parser(ParserStage::Logfmt { .. }) => Some("logfmt"),
+            Stage::Parser(ParserStage::Regexp(_)) => Some("regexp"),
+            Stage::Parser(ParserStage::Pattern(_)) => Some("pattern"),
+            // Issue #544: a lowered structured-metadata label filter is served
+            // by the statement's own predicate, exactly as a pushable line
+            // filter is, so it names no beyond-line-filter construct and the
+            // aggregation stays with the database.
+            Stage::LabelFilter(_) if lowered[i] => None,
+            Stage::LabelFilter(_) => Some("label filter"),
+            Stage::LineFormat(_) => Some("line_format"),
+            Stage::LabelFormat(_) => Some("label_format"),
+            Stage::Unwrap(_) => Some("unwrap"),
+            Stage::Unpack => Some("unpack"),
+            Stage::Decolorize => Some("decolorize"),
+            Stage::Drop(_) => Some("drop"),
+            Stage::Keep(_) => Some("keep"),
+        })
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
@@ -1746,7 +1776,7 @@ const RESERVED_KEY_NAMES: [&str; 4] = [
     super::variants::VARIANT_LABEL,
 ];
 
-fn is_reserved_key_name(name: &str) -> bool {
+pub(in crate::logql) fn is_reserved_key_name(name: &str) -> bool {
     let stem = name.strip_suffix("_extracted").unwrap_or(name);
     RESERVED_KEY_NAMES.contains(&name) || RESERVED_KEY_NAMES.contains(&stem)
 }
@@ -2242,6 +2272,13 @@ fn metric_plan(
     // over-time ops — full-window raw scan, complete-or-error).
     let pipeline = &range.selector.pipeline;
     let has_beyond_line_filter = metric_pipeline_construct(pipeline).is_some();
+    // Issue #544: what `metric_pipeline_construct` would have answered
+    // before a structured-metadata label filter could compile into the
+    // statement. The two differ exactly when the lowering is what removed
+    // the client stage, which is the condition the restored stage is
+    // stored under.
+    let metadata_filters = compile_metadata_label_filters(pipeline);
+    let has_beyond_line_filter_unlowered = metadata_filters.is_some() || has_beyond_line_filter;
     let has_unwrap = pipeline.iter().any(|s| matches!(s, Stage::Unwrap(_))) ||
         // Defense in depth: the parser only emits the pipeline
         // `Stage::Unwrap` form and always leaves `LogRange::unwrap`
@@ -2312,12 +2349,17 @@ fn metric_plan(
     // the SQL-aggregated path would silently drop the clause and return
     // the ungrouped answer. Naming it here makes that unrepresentable
     // instead of incidental.
-    let client = if force_client
-        || has_beyond_line_filter
+    let has_grouping = grouping.is_some();
+    // Issue #544: built under the UNLOWERED condition, then taken only
+    // when the lowered one also holds. The unlowered condition is the
+    // weaker of the two, so one construction serves both answers and the
+    // restored stage is the same object the plan would have carried.
+    let client_full = if force_client
+        || has_beyond_line_filter_unlowered
         || has_unwrap
         || client_only_op
         || is_range
-        || grouping.is_some()
+        || has_grouping
     {
         let value = if has_unwrap {
             ClientValue::Unwrap
@@ -2346,6 +2388,17 @@ fn metric_plan(
             absent_labels,
             grouping,
         })
+    } else {
+        None
+    };
+    let client = if force_client
+        || has_beyond_line_filter
+        || has_unwrap
+        || client_only_op
+        || is_range
+        || has_grouping
+    {
+        client_full.clone()
     } else {
         None
     };
@@ -2697,6 +2750,13 @@ fn metric_plan(
         Some(value) => sql::MetricValue::Unwrapped(Box::new(value)),
         None => sql::MetricValue::Shaped(shape),
     };
+    // Issue #544: the lowering removed the client stage exactly when the
+    // unlowered answer would have kept one and this plan has none. The
+    // `has_unwrap`/`unwrapped_range` routes cannot reach it — a metadata
+    // filter after a parser does not lower at all, so the two
+    // `has_beyond_line_filter` answers agree there.
+    let lowering_removed_the_client_stage =
+        has_beyond_line_filter_unlowered && !has_beyond_line_filter && client.is_none();
 
     Ok(MetricPlan {
         stage1_sql,
@@ -2725,6 +2785,22 @@ fn metric_plan(
         vector_aggs,
         client,
         probes,
+        // Issue #544. The restored stage is `Some` exactly when the
+        // lowering is what removed `client` — the instant
+        // database-aggregated route and the bucketed range route — which
+        // is the pair on which omitting a fragment would change the
+        // ANSWER rather than the bytes. On the raw range route `client`
+        // is still `Some` and re-filters, so there is nothing to restore.
+        metadata_lowering: metadata_filters.map(|f| {
+            Box::new(MetadataLowering {
+                stages: f.stages,
+                client_without_lowering: if lowering_removed_the_client_stage {
+                    client_full
+                } else {
+                    None
+                },
+            })
+        }),
     })
 }
 
@@ -3833,6 +3909,200 @@ pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
 // module is above this point, so declaring the three items here moves
 // none of them.
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Issue #544: the structured-metadata label filter's compilation.
+//
+// Declared here for the reason the block above gives — a line added
+// anywhere earlier moves every design-record citation below it, and a
+// citation naming a bare `plan.rs:<line>` cannot be repaired when the
+// file shifts. The walk itself is read from `has_unpushed_dropping_stage`
+// and `metric_pipeline_construct`, which sit beside `compile_line_filters`
+// where they belong.
+// ---------------------------------------------------------------------
+
+/// What a metric plan carries because a structured-metadata label filter
+/// compiled into its statement (issue #544).
+///
+/// # Why the restored stage has to be STORED
+///
+/// A metric plan chooses its execution shape before hydration, and on two
+/// of its routes the aggregate is computed by the database with no client
+/// stage to re-filter: an instant count/bytes query with no unwrap and no
+/// grouping, and a range query whose `[range]` equals its `step`. On
+/// those two, omitting an oversized fragment does not cost bytes — it
+/// returns a **wrong number**. Measured on the design record's
+/// twelve-entry corpus, for
+/// `count_over_time({service_name="checkout"} | trace_id="740e…c7d8" [5m])`:
+///
+/// ```text
+/// with the fragment       1 group    n = 1       <- the reference's answer
+/// without the fragment   11 groups   12 entries  <- what an unguarded omission returns
+/// ```
+///
+/// So `exec` swaps [`MetadataLowering::client_without_lowering`] into
+/// `client` when the render exceeds the budget. It cannot be rebuilt
+/// there: the stage needs the pipeline, and the pipeline lives on
+/// [`ClientAgg`], which is absent from the plan exactly when the restored
+/// stage is needed.
+///
+/// **`bucketed_fallback_client_agg` is NOT this object.** That one builds
+/// an empty pipeline, and its own doc says why that is sound for the case
+/// it serves: the fragment IS in the statement there, so the rows coming
+/// back are already filtered. Here the fragment is not in the statement,
+/// and an empty pipeline filters nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataLowering {
+    /// One `Stage::LabelFilter` per lowered label-filter stage, in
+    /// pipeline order — [`MetadataFilterPlan::stages`]. The metric routes
+    /// that need them have no `client` to read the pipeline off.
+    ///
+    /// **`Vec<Stage>`, not `Vec<LabelFilterExpr>`** (issue #272's census):
+    /// a `Vec` of an SCC member re-opens a derivable recursive walk over
+    /// that member, and the census in
+    /// `crates/pulsus-read/tests/recursion_census.rs` refuses one. A
+    /// `Stage` holds its `LabelFilterExpr` by value, which is the same
+    /// arrangement `ClientAgg::pipeline` already has.
+    pub stages: Vec<Stage>,
+    /// The client-aggregation stage this plan WOULD have carried if the
+    /// metadata filter had not compiled into the statement. `Some` only
+    /// when the lowering is what removed `client`.
+    pub client_without_lowering: Option<ClientAgg>,
+}
+
+/// The structured-metadata label filters of a pipeline that compile into
+/// the statement (issue #544).
+///
+/// One entry per label-filter STAGE that lowers, in pipeline order; each
+/// is the whole stage's boolean tree, because `and`/`or` are rendered
+/// rather than split. A stage lowers **all of its leaves or none of
+/// them**: dropping one arm of an `or` narrows the predicate, which drops
+/// rows the evaluator keeps, and dropping one arm of an `and` widens it,
+/// which forfeits the request `LIMIT`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MetadataFilterPlan {
+    /// **`Vec<Stage>`, not `Vec<LabelFilterExpr>`** — see
+    /// [`MetadataLowering::stages`] for why the census refuses the
+    /// second.
+    pub stages: Vec<Stage>,
+}
+
+/// Does this label-filter stage compile into the statement, given the
+/// stages BEFORE it (issue #544)?
+///
+/// # Why the prefix and not the whole pipeline
+///
+/// The shared fold model decides link by link over the relation
+/// accumulated from the links before it
+/// ([`crate::compile::fold::lower_chain`]), so a per-filter rule that
+/// reads a LATER stage is one the model cannot express — and
+/// `plan.rs`'s two walk-agreement gates assert that the model and the
+/// shipped walks agree exactly, over all 3,375 chains of the atom corpus.
+/// The conditions that ARE about the whole pipeline — every line filter
+/// pushable, every later stage non-dropping — are not lost: they are what
+/// [`has_unpushed_dropping_stage`] already answers, and that answer is
+/// what decides whether the request `LIMIT` compiles. A filter whose
+/// fragment is in the statement while some other stage still drops lines
+/// in-engine costs nothing and reads fewer rows; it simply keeps paging.
+///
+/// # The rule
+///
+/// | a preceding stage | blocks when |
+/// |---|---|
+/// | a parser, `\| unpack` | always — either invents names, so the filter's name may no longer be the metadata one |
+/// | `\| label_format` | it writes one of this filter's names |
+/// | `\| drop` | it removes one of this filter's names |
+/// | `\| keep` | it does not keep one of this filter's names |
+/// | a line filter, `\| line_format`, `\| decolorize`, another label filter, `\| unwrap` | never — none of them touches the label namespace this filter reads |
+///
+/// Each row is the shipped half of a model condition: the two parsers and
+/// `unpack` widen the model's column set with an evaluator-only open
+/// source, and `label_format`, `drop` and `keep` rewrite or remove the
+/// column the model would resolve the name through.
+fn metadata_filter_lowers(prefix: &[Stage], expr: &LabelFilterExpr) -> bool {
+    let mut names: Vec<&str> = Vec::new();
+    let mut servable = true;
+    pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| match node {
+        LabelFilterExpr::Match(m) => {
+            if super::predicate::metadata_leaf_is_servable(&m.name, m.op).is_err() {
+                servable = false;
+            } else {
+                names.push(m.name.as_str());
+            }
+        }
+        // A numeric comparison is a comparison OR a conversion failure
+        // that also sets the error label, and an `ip()` form is an
+        // address match. Neither has an `Equivalent` predicate.
+        LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => servable = false,
+        LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {}
+    });
+    if !servable || names.is_empty() {
+        return false;
+    }
+    for stage in prefix {
+        match stage {
+            Stage::Parser(_) | Stage::Unpack => return false,
+            Stage::LabelFormat(fmts) => {
+                if fmts
+                    .iter()
+                    .any(|f| names.contains(&super::compile::label_fmt_dst(f)))
+                {
+                    return false;
+                }
+            }
+            Stage::Drop(elems) => {
+                if elems.iter().any(|e| names.contains(&e.label.as_str())) {
+                    return false;
+                }
+            }
+            Stage::Keep(elems) => {
+                if names
+                    .iter()
+                    .any(|n| !elems.iter().any(|e| e.label.as_str() == *n))
+                {
+                    return false;
+                }
+            }
+            Stage::LineFilter(_)
+            | Stage::LabelFilter(_)
+            | Stage::LineFormat(_)
+            | Stage::Decolorize
+            | Stage::Unwrap(_) => {}
+        }
+    }
+    true
+}
+
+/// One flag per pipeline stage: `true` exactly for a label-filter stage
+/// that compiles into the statement (issue #544).
+fn metadata_filter_flags(pipeline: &[Stage]) -> Vec<bool> {
+    pipeline
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| match stage {
+            Stage::LabelFilter(expr) => metadata_filter_lowers(&pipeline[..i], expr),
+            _ => false,
+        })
+        .collect()
+}
+
+/// The lowered structured-metadata label filters of `pipeline`, or `None`
+/// when no label-filter stage lowers and nothing changes (issue #544).
+pub(crate) fn compile_metadata_label_filters(pipeline: &[Stage]) -> Option<MetadataFilterPlan> {
+    let flags = metadata_filter_flags(pipeline);
+    let stages: Vec<Stage> = pipeline
+        .iter()
+        .zip(flags)
+        .filter_map(|(stage, lowered)| match stage {
+            Stage::LabelFilter(_) if lowered => Some(stage.clone()),
+            _ => None,
+        })
+        .collect();
+    if stages.is_empty() {
+        return None;
+    }
+    Some(MetadataFilterPlan { stages })
+}
 
 /// A pushed-down predicate whose soundness is conditional on state the
 /// planner cannot see (issue #507, W3).
@@ -5656,6 +5926,280 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Issue #544: which chains compile a structured-metadata filter.
+    // -----------------------------------------------------------------
+
+    fn metadata_trees(query: &str) -> Option<Vec<String>> {
+        let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let pipeline = match &expr {
+            Expr::Log(l) => l.pipeline.clone(),
+            Expr::Metric(_) => panic!("{query}: a log query"),
+        };
+        compile_metadata_label_filters(&pipeline).map(|p| {
+            p.stages
+                .iter()
+                .map(|st| match st {
+                    Stage::LabelFilter(e) => e.to_string(),
+                    other => panic!("a non-filter stage in the plan: {other}"),
+                })
+                .collect()
+        })
+    }
+
+    /// Issue #544 — **every row of the capability table refuses, and each
+    /// one refuses for its own reason.**
+    ///
+    /// The `Some` rows are the control: without them a renderer that
+    /// refused everything would satisfy every negative here.
+    #[test]
+    fn compile_metadata_label_filters_refuses_every_row_of_the_capability_table() {
+        // (query, the trees it lowers, why the refusals refuse)
+        let rows: &[(&str, Option<&[&str]>, &str)] = &[
+            // The served class.
+            (
+                r#"{a="b"} | trace_id="x""#,
+                Some(&[r#"trace_id="x""#]),
+                "an equality over a metadata name",
+            ),
+            (
+                r#"{a="b"} | trace_id!="x""#,
+                Some(&[r#"trace_id!="x""#]),
+                "an inequality",
+            ),
+            (
+                r#"{a="b"} |= "tok" | line_format "{{.m}}" | decolorize | trace_id="x""#,
+                Some(&[r#"trace_id="x""#]),
+                "a line filter, line_format and decolorize touch no label name",
+            ),
+            (
+                r#"{a="b"} | trace_id="x" and pod="y""#,
+                Some(&[r#"trace_id="x" and pod="y""#]),
+                "every leaf of an `and` is served",
+            ),
+            (
+                r#"{a="b"} | trace_id="x" | pod="y""#,
+                Some(&[r#"trace_id="x""#, r#"pod="y""#]),
+                "two stages, each its own tree",
+            ),
+            // The refusals, one per row of the table.
+            (
+                r#"{a="b"} | trace_id=~"x.*""#,
+                None,
+                "a regular-expression operator",
+            ),
+            (r#"{a="b"} | trace_id!~"x.*""#, None, "the negated one"),
+            (r#"{a="b"} | dur > 500"#, None, "a numeric comparison"),
+            (
+                r#"{a="b"} | addr = ip("10.0.0.0/8")"#,
+                None,
+                "an address match",
+            ),
+            (r#"{a="b"} | __error__="x""#, None, "a reserved error name"),
+            (
+                r#"{a="b"} | __error___extracted="x""#,
+                None,
+                "its `_extracted` spelling",
+            ),
+            (
+                r#"{a="b"} | json | trace_id="x""#,
+                None,
+                "a preceding parser",
+            ),
+            (r#"{a="b"} | logfmt | trace_id="x""#, None, "another parser"),
+            (
+                r#"{a="b"} | unpack | trace_id="x""#,
+                None,
+                "`| unpack` invents names",
+            ),
+            (
+                r#"{a="b"} | label_format trace_id=other | trace_id="x""#,
+                None,
+                "`label_format` writes this very name",
+            ),
+            (
+                r#"{a="b"} | drop trace_id | trace_id="x""#,
+                None,
+                "`drop` removes this very name",
+            ),
+            (
+                r#"{a="b"} | keep pod | trace_id="x""#,
+                None,
+                "`keep` does not keep it",
+            ),
+            (
+                r#"{a="b"} | trace_id="x" or dur > 500"#,
+                None,
+                "one leaf of an `or` is a numeric comparison — all or nothing",
+            ),
+            (
+                r#"{a="b"} | trace_id="x" and pod=~"y.*""#,
+                None,
+                "one leaf of an `and` is a regular expression",
+            ),
+        ];
+        for (query, want, why) in rows {
+            let got = metadata_trees(query);
+            match want {
+                Some(trees) => {
+                    let got = got.unwrap_or_else(|| panic!("{query} must lower ({why})"));
+                    let got: Vec<&str> = got.iter().map(String::as_str).collect();
+                    assert_eq!(got, *trees, "{query} ({why})");
+                }
+                None => assert!(got.is_none(), "{query} must NOT lower ({why}): {got:?}"),
+            }
+        }
+        // …and a stage that names a DIFFERENT label does not block it,
+        // which is what makes the three rows above about the NAME rather
+        // than about the stage kind.
+        for query in [
+            r#"{a="b"} | label_format other=src | trace_id="x""#,
+            r#"{a="b"} | drop other | trace_id="x""#,
+            r#"{a="b"} | keep trace_id, other | trace_id="x""#,
+        ] {
+            assert!(
+                metadata_trees(query).is_some(),
+                "{query}: the stage names another label, so it blocks nothing"
+            );
+        }
+    }
+
+    /// Issue #544 — the served class removes the page loop and the
+    /// refused class keeps it, on the plan the engine takes.
+    #[test]
+    fn a_lowered_metadata_filter_removes_the_page_loop() {
+        assert!(!streams_sp(r#"{service_name="checkout"} | trace_id="x""#).fetch_until_limit);
+        assert!(streams_sp(r#"{service_name="checkout"} | trace_id=~"x.*""#).fetch_until_limit);
+        assert!(streams_sp(r#"{service_name="checkout"} | dur > 500"#).fetch_until_limit);
+        // A pipeline whose OTHER stage still drops lines in-engine keeps
+        // paging, even though the metadata filter itself lowers: the two
+        // questions are different, and `has_unpushed_dropping_stage`
+        // answers the second.
+        assert!(
+            streams_sp(r#"{service_name="checkout"} | trace_id="x" |= ip("10.0.0.0/8")"#)
+                .fetch_until_limit
+        );
+    }
+
+    /// Issue #544 AC14 — **no metadata filter reaches the rollup table.**
+    ///
+    /// The rollup table has no `structured_metadata` column, so a plan
+    /// that lowered a metadata fragment onto it would name a column that
+    /// does not exist. An instant query answers `Raw` unconditionally and
+    /// a range query with a lowered filter is caught by the bucketed or
+    /// client branch above the rollup test; this asserts it over the plan
+    /// corpus rather than from the branch order.
+    #[test]
+    fn a_metadata_filter_never_routes_to_the_rollup() {
+        let specs = [
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 600_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            // range == step, the bucketed shape
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 600_000_000_000,
+                step_ns: 300_000_000_000,
+            },
+        ];
+        let queries = [
+            r#"count_over_time({service_name="sm"} | trace_id="x" [5m])"#,
+            r#"bytes_over_time({service_name="sm"} | trace_id="x" [5m])"#,
+            r#"rate({service_name="sm"} | trace_id="x" [5m])"#,
+            r#"bytes_rate({service_name="sm"} | trace_id="x" [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace_id="x" and pod!="y" [5m])"#,
+            r#"sum(count_over_time({service_name="sm"} | trace_id="x" [5m]))"#,
+        ];
+        let mut lowered = 0usize;
+        for query in queries {
+            for spec in specs {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+                if mp.metadata_lowering.is_some() {
+                    lowered += 1;
+                    assert!(
+                        !mp.rollup,
+                        "{query}: a lowered metadata filter routed to the rollup table \
+                         ({})",
+                        mp.routing.reason
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            lowered,
+            queries.len() * specs.len(),
+            "every case must carry a lowered filter, else the assertion is vacuous"
+        );
+        // The control: the same queries with the filter removed DO reach
+        // the rollup on the divisible-step range spec, so "never rollup"
+        // above is a consequence of the filter.
+        let bare = metric_mp(
+            r#"count_over_time({service_name="sm"}[5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 600_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .expect("plans");
+        assert!(bare.metadata_lowering.is_none());
+    }
+
+    /// Issue #544 — the restored client stage is stored exactly on the
+    /// two routes where the aggregate is the database's, and nowhere
+    /// else.
+    #[test]
+    fn the_restored_client_stage_is_stored_on_the_database_aggregated_routes() {
+        let instant = QuerySpec::Instant {
+            at_ns: 600_000_000_000,
+        };
+        let bucketed = QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 600_000_000_000,
+            step_ns: 300_000_000_000,
+        };
+        let raw_range = QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 600_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let q = r#"count_over_time({service_name="sm"} | trace_id="x" [5m])"#;
+        for (spec, want_client, want_restored, what) in [
+            (instant, false, true, "instant, database-aggregated"),
+            (bucketed, false, true, "range, bucketed"),
+            (raw_range, true, false, "range, raw — the client re-filters"),
+        ] {
+            let mp = metric_mp(q, spec).expect("plans");
+            assert_eq!(mp.client.is_some(), want_client, "{what}: client");
+            let restored = mp
+                .metadata_lowering
+                .as_ref()
+                .expect("the filter lowered")
+                .client_without_lowering
+                .is_some();
+            assert_eq!(restored, want_restored, "{what}: restored stage");
+            if want_restored {
+                let c = mp
+                    .metadata_lowering
+                    .as_ref()
+                    .unwrap()
+                    .client_without_lowering
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    c.pipeline.len(),
+                    1,
+                    "{what}: the restored stage carries the WHOLE pipeline, filter included"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Issue #507, W3, arm 3: which chains compile a parsed-name filter.
     // -----------------------------------------------------------------
 
@@ -5882,10 +6426,18 @@ mod tests {
                 .as_ref()
                 .unwrap_or_else(|| panic!("expected {query:?} to carry a client-aggregation spec"));
             assert!(!mp.rollup, "client mode always routes raw: {query}");
-            assert_eq!(
-                mp.routing.reason, "raw: client-side pipeline/unwrap aggregation",
-                "{query}"
-            );
+            // Issue #544: a structured-metadata equality filter no longer
+            // names a beyond-line-filter construct, so this range query is
+            // client-aggregated for the reason EVERY range query is —
+            // Loki's sliding window (issue #227) — and its filter is in
+            // the statement. It still plans in client mode, which is what
+            // this test is about.
+            let want = if query.contains("| level = \"error\"") {
+                "raw: sliding-window range aggregation (issue #227)"
+            } else {
+                "raw: client-side pipeline/unwrap aggregation"
+            };
+            assert_eq!(mp.routing.reason, want, "{query}");
             assert_eq!(
                 client.pipeline.len(),
                 mp.client.as_ref().unwrap().pipeline.len()
@@ -7033,35 +7585,66 @@ mod tests {
         }
     }
 
-    /// Issue #249 AC-17 — the routing consequence, pinned. An instant query
-    /// carrying a structured-metadata label filter plans `client.is_some()`,
-    /// so it can never reach the SQL-pushdown consumer at all.
+    /// Issue #249 AC-17, as issue #544 leaves it — the routing
+    /// consequence, pinned in BOTH directions.
+    ///
+    /// An instant query carrying a structured-metadata label filter used
+    /// to plan `client.is_some()`, so it could never reach the
+    /// SQL-pushdown consumer. Since issue #544 the equality and
+    /// inequality forms compile into the statement, so
+    /// `metric_pipeline_construct` names no construct, `client` is `None`,
+    /// and the aggregate is the database's — which is the whole point,
+    /// and is measured on the design record's corpus as one series with
+    /// value `1` against eleven series and twelve entries.
+    ///
+    /// The forms #544 refuses keep the old answer, and they are in the
+    /// table below so the first two rows are a consequence of the
+    /// OPERATOR rather than of the query shape.
     #[test]
-    fn an_instant_metadata_filter_can_never_reach_the_pushdown_path() {
-        let mp = metric_mp(
-            r#"count_over_time({service_name="sm"} | trace="a" [5m])"#,
-            QuerySpec::Instant {
-                at_ns: 600_000_000_000,
-            },
-        )
-        .expect("plans");
-        assert!(
-            mp.client.is_some(),
-            "a label filter makes `metric_pipeline_construct` report a beyond-line-filter \
-             construct, which forces the client path"
-        );
-        // The reason is the CLIENT one, not "raw: instant query": the
-        // `client.is_some()` arm is tested BEFORE the `match p.spec`
-        // (`metric_plan`'s routing decision), so a client-forced instant
-        // query reports why it is client-side rather than merely that it
-        // is instant. Asserted as measured.
-        assert_eq!(
-            mp.routing.reason,
-            "raw: client-side pipeline/unwrap aggregation"
-        );
-        // The negative control: WITHOUT the filter, the same instant query
-        // does reach the pushdown path — so `client.is_some()` above is a
-        // consequence of the filter, not of the query shape.
+    fn an_instant_metadata_filter_reaches_the_pushdown_path_on_the_served_operators() {
+        // (query, client is Some, routing reason)
+        let rows: [(&str, bool, &str); 5] = [
+            (
+                r#"count_over_time({service_name="sm"} | trace="a" [5m])"#,
+                false,
+                "raw: instant query",
+            ),
+            (
+                r#"count_over_time({service_name="sm"} | trace!="a" [5m])"#,
+                false,
+                "raw: instant query",
+            ),
+            (
+                r#"count_over_time({service_name="sm"} | trace=~"a.*" [5m])"#,
+                true,
+                "raw: client-side pipeline/unwrap aggregation",
+            ),
+            (
+                r#"count_over_time({service_name="sm"} | n > 15 [5m])"#,
+                true,
+                "raw: client-side pipeline/unwrap aggregation",
+            ),
+            (
+                r#"count_over_time({service_name="sm"} | trace = ip("10.0.0.1") [5m])"#,
+                true,
+                "raw: client-side pipeline/unwrap aggregation",
+            ),
+        ];
+        for (query, client_some, reason) in rows {
+            let mp = metric_mp(
+                query,
+                QuerySpec::Instant {
+                    at_ns: 600_000_000_000,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            assert_eq!(mp.client.is_some(), client_some, "{query}: client");
+            assert_eq!(mp.routing.reason, reason, "{query}: routing reason");
+        }
+        // The negative control: WITHOUT any filter, the same instant query
+        // reaches the pushdown path too — so the `false` rows above are
+        // about the filter lowering, not about a shape that never had a
+        // client stage.
         let bare = metric_mp(
             r#"count_over_time({service_name="sm"}[5m])"#,
             QuerySpec::Instant {
@@ -7605,8 +8188,31 @@ mod tests {
                 line_filters: 1,
                 probes: 1,
             },
+            // Issue #544: the structured-metadata equality filter
+            // compiles into the statement, so nothing drops lines
+            // in-engine and the request `LIMIT` goes with it — one
+            // statement, `scan_limit == result_limit`.
             Row {
                 query: r#"{service_name="checkout"} | trace_id="740eda9f12aec8e8""#,
+                limit: 100,
+                fetch_until_limit: false,
+                scan_limit: 100,
+                line_filters: 0,
+                probes: 0,
+            },
+            // …and the forms issue #544 refuses keep the page loop, so
+            // the row above is a consequence of the operator rather than
+            // of the shape.
+            Row {
+                query: r#"{service_name="checkout"} | trace_id=~"740.*""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 0,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="checkout"} | dur > 500"#,
                 limit: 100,
                 fetch_until_limit: true,
                 scan_limit: 1000,
