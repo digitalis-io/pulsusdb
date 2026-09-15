@@ -706,6 +706,18 @@ fn ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How a citation was written. The census counts by this, so the figure
+/// comes from the reader that produces the occurrences rather than from a
+/// second implementation of the same rule beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CitationForm {
+    /// `<file>.rs:<line>[-<line>]`, the path written out.
+    WrittenOut,
+    /// `` `:<line>[-<line>]` ``, continuing the file a citation earlier on
+    /// the same line names.
+    Continuation,
+}
+
 /// One `<file>.rs:<line>[-<line>]` occurrence.
 #[derive(Debug, Clone)]
 struct Occurrence {
@@ -720,6 +732,7 @@ struct Occurrence {
     /// which of several `plan.rs` files a bare citation means is decided
     /// by whether the cited line carries an identifier this line prints.
     citing_line: String,
+    form: CitationForm,
 }
 
 /// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts,
@@ -775,6 +788,7 @@ fn citation_occurrences() -> Vec<Occurrence> {
                         first: first.parse().expect("digits"),
                         last: last.parse().expect("digits"),
                         citing_line: line.to_string(),
+                        form: CitationForm::WrittenOut,
                     });
                 }
                 i = (dot + 4).max(j);
@@ -798,6 +812,7 @@ fn citation_occurrences() -> Vec<Occurrence> {
                     first,
                     last,
                     citing_line: line.to_string(),
+                    form: CitationForm::Continuation,
                 });
             }
         }
@@ -1861,6 +1876,10 @@ fn census_block() -> String {
         .iter()
         .filter(|o| !o.token.split(':').next().unwrap_or("").contains('/'))
         .count();
+    let continuations = occurrences
+        .iter()
+        .filter(|o| o.form == CitationForm::Continuation)
+        .count();
     let covered = |keys: &BTreeSet<(String, String)>| {
         occurrences
             .iter()
@@ -1880,6 +1899,10 @@ fn census_block() -> String {
             occurrences.len(),
         ),
         ("of those, citing a bare basename", bare),
+        (
+            "of those, written as a continuation of a citation earlier on the line",
+            continuations,
+        ),
         (
             "`(document, token)` pairs the rule resolves",
             resolved_keys.len(),
@@ -1931,8 +1954,10 @@ fn census_block() -> String {
     ));
 
     out.push_str(&format!(
-        "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename. \
-         The rule resolves {} `(document, token)` pairs covering {resolved_occ} occurrences, and \
+        "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename \
+         and {continuations} are written as a continuation of a citation earlier on the same \
+         line. The rule resolves {} `(document, token)` pairs covering {resolved_occ} \
+         occurrences, and \
          cannot resolve {} covering {frozen_occ}. Of the resolved rows, {prose} are anchored on a \
          token the citing prose prints and {line} on a snapshot of the cited line.\n\n",
         occurrences.len(),

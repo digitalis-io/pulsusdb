@@ -7633,7 +7633,7 @@ struct SelectionBlock {
     statements: Vec<(String, String)>,
 }
 
-/// What each route drives: its base query, its request, and the four
+/// What each route drives: its base query, its request, and the six
 /// wrappings of that base.
 ///
 /// The two range routes differ in the ONE stage that decides the route —
@@ -7641,7 +7641,17 @@ struct SelectionBlock {
 /// aggregation level cannot lower — and the test asserts their routing
 /// reasons differ, so a change that quietly sent both down one path fails
 /// rather than passing twice over the same statements.
-fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 4])> {
+///
+/// **Four wrappings put the selection OUTERMOST and two put it inside.**
+/// The chain is stored outer-first and walked with `aggs.iter().rev()`
+/// (`post_agg.rs:3018`), so an outermost-only matrix leaves
+/// `vector_aggs.last()` — the innermost spec — never a selection, and a
+/// change that lowered only an innermost selection would pass. Both
+/// nested shapes are ordinary queries that answer `200`:
+///
+///     sum by (service_name) (topk(2, count_over_time(SEL[1m])))
+///     topk(2, sum by (service_name) (bottomk(5, count_over_time(SEL[1m]))))
+fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 6])> {
     let range = QueryParams {
         spec: QuerySpec::Range {
             start_ns: SEL_AT_NS,
@@ -7656,16 +7666,28 @@ fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 4])> {
         limit: 100,
         direction: Direction::Backward,
     };
-    let bucketed = r#"sum by (service_name) (count_over_time({env="prod"}[1m]))"#.to_string();
-    let client =
-        r#"sum by (service_name) (count_over_time({env="prod"} | json | __error__="" [1m]))"#
-            .to_string();
-    let four = |base: &str, third: &str| {
+    // The selector each route reads, and the base query over it. The
+    // nested wrappings are built from the SELECTOR rather than by
+    // wrapping the base, because their selection sits inside the `sum by`.
+    let plain = r#"{env="prod"}"#;
+    // The trailing space is deliberate: `__error__=""[1m]` does not parse
+    // as a range selector.
+    let parsed = r#"{env="prod"} | json | __error__=""#.to_string() + "\" ";
+    let base_of = |sel: &str| format!("sum by (service_name) (count_over_time({sel}[1m]))");
+    let bucketed = base_of(plain);
+    let client = base_of(&parsed);
+    // `second` is the operator and its parameter, e.g. `bottomk(1`.
+    let six = |sel: &str, second: &str| {
+        let base = base_of(sel);
         [
             format!("topk(2, {base})"),
-            format!("bottomk(1, {base})"),
-            format!("{third}({base})"),
+            format!("{second}, {base})"),
+            format!("sort({base})"),
             format!("sort_desc({base})"),
+            // The selection is the INNERMOST spec: `vector_aggs.last()`.
+            format!("sum by (service_name) (topk(2, count_over_time({sel}[1m])))"),
+            // A selection at both ends of one chain.
+            format!("topk(2, sum by (service_name) (bottomk(5, count_over_time({sel}[1m]))))"),
         ]
     };
     vec![
@@ -7673,24 +7695,21 @@ fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 4])> {
             "range, bucketed read",
             bucketed.clone(),
             range,
-            four(&bucketed, "sort"),
+            six(plain, "bottomk(1"),
         ),
         (
             "range, client-aggregated read",
-            client.clone(),
+            client,
             range,
-            four(&client, "sort"),
+            six(&parsed, "bottomk(1"),
         ),
+        // `approx_topk` replaces `bottomk` here: it is refused on a range
+        // query and this is the only route that can carry it.
         (
             "instant read",
-            bucketed.clone(),
+            bucketed,
             instant,
-            [
-                format!("topk(2, {bucketed})"),
-                format!("approx_topk(2, {bucketed})"),
-                format!("sort({bucketed})"),
-                format!("sort_desc({bucketed})"),
-            ],
+            six(plain, "approx_topk(2"),
         ),
     ]
 }
@@ -7996,7 +8015,15 @@ async fn seed_selection_corpus() -> (ChClient, String) {
                 // two range routes count the same rows.
                 timestamp_ns: SEL_AT_NS - 30_000_000_000 + i64::from(i) * 1_000_000_000,
                 severity: 0,
-                body: format!(r#"{{"i":{i}}}"#),
+                // **Every body is the same JSON**, so `| json` adds the
+                // same label to every line and the client-aggregated
+                // route's series are one per stream, as the bucketed
+                // route's are. A body that varied would split each
+                // stream's lines into one series per value, and the two
+                // routes would answer differently for a selection applied
+                // BEFORE the `sum by` — which is what the nested
+                // wrappings drive.
+                body: r#"{"ok":1}"#.to_string(),
                 structured_metadata: String::new(),
             });
         }
@@ -8221,14 +8248,23 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
             // `topk(2, …)` and `approx_topk(2, …)` must answer the same
             // two series on this corpus: the sketch is exact well under
             // its own error bound at six series.
-            let want: Vec<String> =
-                if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
-                    vec!["c545a".to_string(), "c545b".to_string()]
-                } else if query.starts_with("bottomk(1,") {
-                    vec!["c545f".to_string()]
-                } else {
-                    all.clone()
-                };
+            //
+            // The two nested forms, over counts 6, 5, 4, 3, 3 and 1: an
+            // inner `topk(2, …)` keeps 6 and 5 before the `sum by` groups
+            // them; an inner `bottomk(5, …)` drops only the 6, and the
+            // outer `topk(2, …)` then takes 5 and 4. No tie decides
+            // either answer.
+            let want: Vec<String> = if query.starts_with("sum by (service_name) (topk(2,") {
+                vec!["c545a".to_string(), "c545b".to_string()]
+            } else if query.starts_with("topk(2, sum by (service_name) (bottomk(5,") {
+                vec!["c545b".to_string(), "c545c".to_string()]
+            } else if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
+                vec!["c545a".to_string(), "c545b".to_string()]
+            } else if query.starts_with("bottomk(1,") {
+                vec!["c545f".to_string()]
+            } else {
+                all.clone()
+            };
             assert_eq!(
                 sorted(labels.clone()),
                 sorted(want.clone()),
