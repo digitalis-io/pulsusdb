@@ -8008,12 +8008,26 @@ async fn seed_selection_corpus() -> (ChClient, String) {
     (admin, db)
 }
 
-/// Every query's statements, per route, from a live engine.
-async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<(String, QueryResult)>)> {
+/// What one query issued and answered.
+struct SelectionRun {
+    query: String,
+    statements: Vec<(String, String)>,
+    result: QueryResult,
+}
+
+/// Every query's statements and answer, per route, from a live engine.
+///
+/// **The base query gets no special treatment here.** Its statements are
+/// what the regenerator commits, and the test compares every query —
+/// base and wrappings alike — against the COMMITTED file, never against
+/// the base's live statements. Comparing a wrapping with the base would
+/// take its expected value from the engine under test, and a drift
+/// applied to both moves them together.
+async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<SelectionRun>)> {
     let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024));
     let mut out = Vec::new();
     for (route, base, params, wrappings) in selection_routes() {
-        let mut answers = Vec::new();
+        let mut runs: Vec<SelectionRun> = Vec::new();
         let mut block = SelectionBlock {
             route: route.to_string(),
             query: base.clone(),
@@ -8045,15 +8059,14 @@ async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<(String
                         .map(|r| r.reason.clone())
                         .unwrap_or_else(|| "none".to_string())
                 );
-            } else {
-                assert_eq!(
-                    statements, block.statements,
-                    "{route}: {query} issued statements the base query did not"
-                );
             }
-            answers.push((query, result));
+            runs.push(SelectionRun {
+                query,
+                statements,
+                result,
+            });
         }
-        out.push((block, answers));
+        out.push((block, runs));
     }
     out
 }
@@ -8140,7 +8153,7 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
     let (admin, db) = seed_selection_corpus().await;
     let observed = observed_selection_blocks(&db).await;
 
-    for (block, _) in &observed {
+    for (block, runs) in &observed {
         let want = golden
             .iter()
             .find(|g| g.route == block.route)
@@ -8155,25 +8168,32 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
             "{}: the committed request is not the one this test makes",
             block.route
         );
-        assert_eq!(
-            block.statements.len(),
-            want.statements.len(),
-            "{}: issued {} statements, {SELECTION_GOLDEN} holds {}",
-            block.route,
-            block.statements.len(),
-            want.statements.len()
-        );
-        for ((got_name, got_sql), (want_name, want_sql)) in
-            block.statements.iter().zip(want.statements.iter())
-        {
-            assert_eq!(got_name, want_name, "{}: a stage changed name", block.route);
+        for run in runs {
             assert_eq!(
-                got_sql, want_sql,
-                "{}: the {got_name} statement is not the committed one. §1.3's row says the \
-                 selection becomes no SQL; every query on this route — the base and all four \
-                 wrappings — must issue these bytes",
-                block.route
+                run.statements.len(),
+                want.statements.len(),
+                "{}: {} issued {} statements, {SELECTION_GOLDEN} holds {}",
+                block.route,
+                run.query,
+                run.statements.len(),
+                want.statements.len()
             );
+            for ((got_name, got_sql), (want_name, want_sql)) in
+                run.statements.iter().zip(want.statements.iter())
+            {
+                assert_eq!(
+                    got_name, want_name,
+                    "{}: {} moved a stage name",
+                    block.route, run.query
+                );
+                assert_eq!(
+                    got_sql, want_sql,
+                    "{}: {}'s {got_name} statement is not the committed one. §1.3's row says \
+                     the selection becomes no SQL; every query on this route — the base and \
+                     all four wrappings — must issue these bytes",
+                    block.route, run.query
+                );
+            }
         }
     }
 
@@ -8194,8 +8214,9 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
 
     // ---- C: the answers ---------------------------------------------
     let all: Vec<String> = SEL_STREAMS.iter().map(|(_, s, _)| s.to_string()).collect();
-    for (block, answers) in &observed {
-        for (query, result) in answers {
+    for (block, runs) in &observed {
+        for run in runs {
+            let (query, result) = (&run.query, &run.result);
             let labels = answer_labels(result);
             // `topk(2, …)` and `approx_topk(2, …)` must answer the same
             // two series on this corpus: the sketch is exact well under
