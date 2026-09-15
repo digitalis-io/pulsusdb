@@ -7536,3 +7536,767 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
 fn stream_is_plain(group: &str) -> bool {
     group.ends_with("_none")
 }
+
+// ---------------------------------------------------------------------
+// Issue #545 — `docs/query-to-sql.md` §1.3: the selection operators
+// contribute no SQL on any route
+//
+// §1.3's row says `topk`, `bottomk`, `approx_topk`, `sort` and
+// `sort_desc` become no SQL and are evaluated after the read. Before this
+// issue nothing checked that sentence: the row was rewritten to claim a
+// `LIMIT 3 BY bucket_ns` and the three suites that read the document —
+// 34 tests — stayed green.
+//
+// **Five assertions, and no assertion takes its expected value from the
+// engine under test.**
+//
+//     A   §1.3's row, "SQL emitted today" column, is the literal `none`
+//         <- docs/query-to-sql.md, read from disk at run time
+//     B1  the committed statements carry no selection clause
+//         <- a closed vocabulary written as literals below
+//     B2  the committed statements hash to PINNED_SELECTION_STATEMENTS
+//         <- that constant, in this source file
+//     B3  every query — the base and all four wrappings — issues exactly
+//         its route's committed statements, byte for byte
+//         <- crates/pulsus-read/tests/golden/logql_selection_statements.txt
+//     C   the answers differ as the corpus requires
+//         <- the seeded corpus
+//
+// A, B1 and B2 are hermetic and run before the live gate, so a developer
+// with no container still cannot regenerate the committed statements past
+// their digest. B3 and C need the container.
+//
+// **Two of the five call sites §1.3's row names are read, not run**: the
+// binary/`variants` tree (`exec.rs:2455`) and the extracted-field
+// group-key read (`exec.rs:5534`). Neither is reachable from the three
+// routes below, so the row carries them on the source alone and this
+// test does not close them.
+//
+// **What no test can close**, stated rather than left to be found: a
+// drift outside B1's vocabulary, regenerated with the digest deliberately
+// updated in the same change. The digest is this test's expected value,
+// so a change to both is indistinguishable, to any test, from a change
+// the author meant. It is caught by a person reading a diff that must
+// contain the changed SQL and the changed constant together.
+// ---------------------------------------------------------------------
+
+/// The committed statements, relative to the repository root.
+const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_statements.txt";
+
+/// `sha256sum crates/pulsus-read/tests/golden/logql_selection_statements.txt`
+///
+/// Pinned HERE, in the test source, and deliberately not beside the data
+/// — the posture `crates/pulsus-read/tests/golden_sql_freeze.rs` takes
+/// for its own corpus. Running `regenerate_the_logql_selection_statements`
+/// alone leaves this constant standing and B2 fails, so the author has to
+/// move a source line in the same change and the diff carries both.
+const PINNED_SELECTION_STATEMENTS: &str =
+    "6d0365da22a957554ed1eb6bfacad59601b85875d82c59bbbb6b190e896c7855";
+
+/// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
+///
+/// **Fixed, not `now_ns()`**, because a committed statement carries its
+/// window bounds and has to be reproducible. It is in the FUTURE, which
+/// `now_ns()`'s doc comment does not cover and the retention TTL forces:
+/// `log_samples` carries `TTL toDateTime(fromUnixTimestamp64Nano(
+/// timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and a
+/// fixed constant in the past is already expired. Measured on 26.3.29.7:
+/// 22 rows inserted at a timestamp 14 days old left
+/// `SELECT count() FROM log_samples` answering 0.
+const SEL_AT_NS: i64 = 1_893_456_000_000_000_000;
+const SEL_STEP_NS: i64 = 60_000_000_000;
+
+/// The six streams, and how many samples each has in the one bucket.
+///
+/// Six rather than three, with a deliberate tie at 3, so that `topk(2, …)`
+/// drops four series and `bottomk(1, …)` drops five: a row-limiting drift
+/// with a small literal changes an answer as well as a statement. It does
+/// not close that class — an attacker picks a larger literal, which is
+/// what red run 4's `<= 10` does — and B3 against the committed
+/// statements is what closes it.
+const SEL_STREAMS: [(u64, &str, u32); 6] = [
+    (545_001, "c545a", 6),
+    (545_002, "c545b", 5),
+    (545_003, "c545c", 4),
+    (545_004, "c545d", 3),
+    (545_005, "c545e", 3),
+    (545_006, "c545f", 1),
+];
+
+/// One route's committed block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionBlock {
+    route: String,
+    query: String,
+    request: String,
+    /// `(explain stage name, statement text)`, in issue order.
+    statements: Vec<(String, String)>,
+}
+
+/// What each route drives: its base query, its request, and the four
+/// wrappings of that base.
+///
+/// The two range routes differ in the ONE stage that decides the route —
+/// `| json | __error__=""` goes beyond a line filter, so the first
+/// aggregation level cannot lower — and the test asserts their routing
+/// reasons differ, so a change that quietly sent both down one path fails
+/// rather than passing twice over the same statements.
+fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 4])> {
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: SEL_AT_NS,
+            end_ns: SEL_AT_NS,
+            step_ns: SEL_STEP_NS as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: SEL_AT_NS },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let bucketed = r#"sum by (service_name) (count_over_time({env="prod"}[1m]))"#.to_string();
+    let client =
+        r#"sum by (service_name) (count_over_time({env="prod"} | json | __error__="" [1m]))"#
+            .to_string();
+    let four = |base: &str, third: &str| {
+        [
+            format!("topk(2, {base})"),
+            format!("bottomk(1, {base})"),
+            format!("{third}({base})"),
+            format!("sort_desc({base})"),
+        ]
+    };
+    vec![
+        (
+            "range, bucketed read",
+            bucketed.clone(),
+            range,
+            four(&bucketed, "sort"),
+        ),
+        (
+            "range, client-aggregated read",
+            client.clone(),
+            range,
+            four(&client, "sort"),
+        ),
+        (
+            "instant read",
+            bucketed.clone(),
+            instant,
+            [
+                format!("topk(2, {bucketed})"),
+                format!("approx_topk(2, {bucketed})"),
+                format!("sort({bucketed})"),
+                format!("sort_desc({bucketed})"),
+            ],
+        ),
+    ]
+}
+
+fn selection_request_line(params: &QueryParams) -> String {
+    match params.spec {
+        QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        } => format!("range start={start_ns} end={end_ns} step={step_ns}"),
+        QuerySpec::Instant { at_ns } => format!("instant time={at_ns}"),
+    }
+}
+
+/// The one normalisation applied to a live statement before it is
+/// compared with the committed one.
+///
+/// The integers inside `fingerprint IN (...)` arrive in the order the
+/// database's `GROUP BY fingerprint` returned them —
+/// `resolve_fingerprints` (`exec.rs:969`) pushes rows as they stream and
+/// does not sort, where `all_active_fingerprints` sorts for exactly this
+/// reason. That order is an execution artefact, not a property of the
+/// corpus: measured on 26.3.29.7, one selector over four streams answers
+/// `99120 18374 30001 40001` at `max_block_size=1` and
+/// `30001 40001 99120 18374` at the default. Sorting pins the SET, which
+/// is what the statement means, and leaves nowhere for a selection clause
+/// to hide — a clause is not an integer.
+fn sort_fingerprint_lists(sql: &str) -> String {
+    let needle = "fingerprint IN (";
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(needle) {
+        let (head, tail) = rest.split_at(at + needle.len());
+        out.push_str(head);
+        match tail.find(')') {
+            None => {
+                rest = tail;
+                break;
+            }
+            Some(close) => {
+                let mut ids: Vec<u64> = tail[..close]
+                    .split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .collect();
+                ids.sort_unstable();
+                out.push_str(
+                    &ids.iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                rest = &tail[close..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// B1's vocabulary: the two clause shapes §2.3 and §2.7.2 name as the
+/// designed lowering of a selection, written here as literals.
+///
+/// - a `LIMIT` with a ` BY ` after it — ClickHouse's per-group row limit;
+/// - an `ORDER BY` whose first token in any item is the aggregate alias
+///   `n` or the group alias `g0` — the ordering that limit needs in front
+///   of it.
+///
+/// The `ORDER BY` test compares whole tokens, never substrings: every
+/// statement here orders by `fingerprint`, and `fingerprint` contains an
+/// `n`. The clause is read to the end of the statement or to a following
+/// `LIMIT`/`SETTINGS`, whichever comes first.
+fn selection_clause(sql: &str) -> Option<String> {
+    let upper = sql.to_ascii_uppercase();
+    if let Some(at) = upper.find("LIMIT ")
+        && upper[at..].contains(" BY ")
+    {
+        return Some(format!(
+            "a per-group limit: {:?}",
+            sql[at..].lines().next().unwrap_or("")
+        ));
+    }
+    let mut from = 0usize;
+    while let Some(rel) = upper[from..].find("ORDER BY ") {
+        let at = from + rel + "ORDER BY ".len();
+        let tail = &sql[at..];
+        let end = ["\nLIMIT", "\nSETTINGS"]
+            .iter()
+            .filter_map(|k| tail.find(k))
+            .min()
+            .unwrap_or(tail.len());
+        for item in tail[..end].split(',') {
+            let token = item.split_whitespace().next().unwrap_or("");
+            if token == "n" || token == "g0" {
+                return Some(format!(
+                    "an ordering on the selection's alias {token:?}: {:?}",
+                    tail[..end].lines().next().unwrap_or("")
+                ));
+            }
+        }
+        from = at;
+    }
+    None
+}
+
+fn render_selection_golden(blocks: &[SelectionBlock]) -> String {
+    let mut out = String::new();
+    out.push_str(SELECTION_GOLDEN_HEADER);
+    for b in blocks {
+        out.push_str(&format!("\n=== route: {}\n", b.route));
+        out.push_str(&format!("--- query\n{}\n", b.query));
+        out.push_str(&format!("--- request\n{}\n", b.request));
+        for (i, (name, sql)) in b.statements.iter().enumerate() {
+            out.push_str(&format!("--- statement {} {name}\n{sql}\n", i + 1));
+        }
+    }
+    out
+}
+
+const SELECTION_GOLDEN_HEADER: &str = "\
+# The statements the three LogQL routes issue for `docs/query-to-sql.md` §1.3's
+# selection row, committed so that the check compares live SQL with bytes this
+# engine did not produce at test time.
+#
+# GENERATED by the ignored `regenerate_the_logql_selection_statements` in
+# crates/pulsus-read/tests/query_log_gates.rs. Not hand-written: the digest
+# pinned there as PINNED_SELECTION_STATEMENTS has to move in the same change,
+# and that pairing in one diff is the review.
+#
+# ONE normalisation is applied to a live statement before it is compared: the
+# integers inside `fingerprint IN (...)` are sorted ascending. Their order is
+# the database's grouping order and moves with settings; the SET is what the
+# statement means and it is still pinned. `sort_fingerprint_lists` carries the
+# measurement.
+";
+
+fn parse_selection_golden(text: &str) -> Vec<SelectionBlock> {
+    let mut blocks: Vec<SelectionBlock> = Vec::new();
+    let mut section: Option<(String, String)> = None;
+    let mut body: Vec<&str> = Vec::new();
+    let flush = |blocks: &mut Vec<SelectionBlock>,
+                 section: &Option<(String, String)>,
+                 body: &mut Vec<&str>| {
+        // The blank line the renderer puts between two blocks belongs to
+        // neither of them.
+        while body.last() == Some(&"") {
+            body.pop();
+        }
+        let text = body.join("\n");
+        body.clear();
+        let Some((kind, arg)) = section else { return };
+        let b = blocks.last_mut().expect("a section before any route");
+        match kind.as_str() {
+            "query" => b.query = text,
+            "request" => b.request = text,
+            "statement" => b.statements.push((arg.clone(), text)),
+            other => panic!("{SELECTION_GOLDEN}: unknown section {other:?}"),
+        }
+    };
+    for line in text.lines() {
+        if let Some(route) = line.strip_prefix("=== route: ") {
+            flush(&mut blocks, &section, &mut body);
+            section = None;
+            blocks.push(SelectionBlock {
+                route: route.to_string(),
+                query: String::new(),
+                request: String::new(),
+                statements: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(marker) = line.strip_prefix("--- ")
+            && (marker == "query" || marker == "request" || marker.starts_with("statement "))
+        {
+            flush(&mut blocks, &section, &mut body);
+            section = Some(if let Some(rest) = marker.strip_prefix("statement ") {
+                let name = rest
+                    .split_once(' ')
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_else(|| panic!("{SELECTION_GOLDEN}: statement marker {marker:?}"));
+                ("statement".to_string(), name)
+            } else {
+                (marker.to_string(), String::new())
+            });
+            continue;
+        }
+        if section.is_none() {
+            // The header, before the first route.
+            continue;
+        }
+        body.push(line);
+    }
+    flush(&mut blocks, &section, &mut body);
+    blocks
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn repo_file(rel: &str) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// The cells of one markdown table row, respecting `\|` inside a cell.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells = vec![String::new()];
+    let mut escaped = false;
+    for c in line.chars() {
+        match c {
+            '\\' if !escaped => {
+                escaped = true;
+                cells.last_mut().expect("a cell").push(c);
+            }
+            '|' if !escaped => cells.push(String::new()),
+            _ => {
+                escaped = false;
+                cells.last_mut().expect("a cell").push(c);
+            }
+        }
+    }
+    cells
+}
+
+/// §1.3's selection row, located rather than restated.
+///
+/// Finding it is part of the contract: a moved section, a reworded
+/// heading or a second matching row each yield a row count that is not
+/// one, and that is a failure with its own message rather than a check
+/// that quietly stops checking anything.
+fn selection_row_cells(doc: &str) -> Vec<Vec<String>> {
+    const HEADING: &str = "### 1.3 LogQL — the parts that are not stages";
+    let mut inside = false;
+    let mut rows = Vec::new();
+    for line in doc.lines() {
+        if line.starts_with("### ") {
+            inside = line == HEADING;
+            continue;
+        }
+        if inside && line.starts_with('|') {
+            let cells = table_cells(line);
+            if cells.len() >= 4 && cells[1].contains("`topk(k, …)`") {
+                rows.push(cells);
+            }
+        }
+    }
+    rows
+}
+
+async fn seed_selection_corpus() -> (ChClient, String) {
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_sel_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let mut rows = Vec::new();
+    for (fp, service, count) in SEL_STREAMS {
+        let labels = format!(r#"{{"env":"prod","service_name":"{service}"}}"#);
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({\
+                     SEL_AT_NS}))), {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        for i in 0..count {
+            rows.push(BucketedSeedRow {
+                service: service.to_string(),
+                fingerprint: fp,
+                // Inside the one window `(T - 60s, T]`, and every body is
+                // JSON so `| json | __error__=""` keeps every line and the
+                // two range routes count the same rows.
+                timestamp_ns: SEL_AT_NS - 30_000_000_000 + i64::from(i) * 1_000_000_000,
+                severity: 0,
+                body: format!(r#"{{"i":{i}}}"#),
+                structured_metadata: String::new(),
+            });
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the selection fixture");
+    (admin, db)
+}
+
+/// Every query's statements, per route, from a live engine.
+async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<(String, QueryResult)>)> {
+    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024));
+    let mut out = Vec::new();
+    for (route, base, params, wrappings) in selection_routes() {
+        let mut answers = Vec::new();
+        let mut block = SelectionBlock {
+            route: route.to_string(),
+            query: base.clone(),
+            request: selection_request_line(&params),
+            statements: Vec::new(),
+        };
+        for (n, query) in std::iter::once(base.clone())
+            .chain(wrappings.iter().cloned())
+            .enumerate()
+        {
+            let expr = parse(&query).unwrap_or_else(|e| panic!("parse {query}: {e:?}"));
+            let (result, _warnings, explain) = engine
+                .query_explained(&expr, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{route}: {query}: {e:?}"));
+            let statements: Vec<(String, String)> = explain
+                .stages
+                .iter()
+                .map(|s| (s.name.to_string(), sort_fingerprint_lists(&s.sql)))
+                .collect();
+            if n == 0 {
+                block.statements = statements.clone();
+                block.request = format!(
+                    "{} routing={}",
+                    block.request,
+                    explain
+                        .routing
+                        .as_ref()
+                        .map(|r| r.reason.clone())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            } else {
+                assert_eq!(
+                    statements, block.statements,
+                    "{route}: {query} issued statements the base query did not"
+                );
+            }
+            answers.push((query, result));
+        }
+        out.push((block, answers));
+    }
+    out
+}
+
+/// The labels of a matrix or vector answer, in the order the engine
+/// returned them.
+fn answer_labels(result: &QueryResult) -> Vec<String> {
+    let name = |labels: &[(String, String)]| {
+        labels
+            .iter()
+            .find(|(k, _)| k == "service_name")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| format!("{labels:?}"))
+    };
+    match result {
+        QueryResult::Matrix(series) => series.iter().map(|s| name(&s.labels)).collect(),
+        QueryResult::Vector(samples) => samples.iter().map(|s| name(&s.labels)).collect(),
+        other => panic!("a selection answer is a matrix or a vector, not {other:?}"),
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// **`docs/query-to-sql.md` §1.3's selection row, checked against the
+/// code** (issue #545). See this section's comment for the five
+/// assertions and where each one's expected value comes from.
+#[tokio::test]
+async fn the_selection_operators_add_no_clause_to_any_statement() {
+    // ---- A: the document's own cell -------------------------------
+    let doc = repo_file("docs/query-to-sql.md");
+    let rows = selection_row_cells(&doc);
+    assert_eq!(
+        rows.len(),
+        1,
+        "docs/query-to-sql.md §1.3 must carry exactly ONE row whose first cell names \
+         `topk(k, …)`; found {}. A moved row, a reworded heading or a second such row all \
+         land here rather than silently checking nothing",
+        rows.len()
+    );
+    assert_eq!(
+        rows[0][2].trim(),
+        "none",
+        "docs/query-to-sql.md §1.3's selection row says the SQL emitted today is {:?}. \
+         This test asserts the statements carry no selection clause, so the row and the \
+         code disagree: one of them is wrong",
+        rows[0][2].trim()
+    );
+
+    // ---- B1: the committed statements, against the vocabulary -----
+    let golden_text = repo_file(SELECTION_GOLDEN);
+    let golden = parse_selection_golden(&golden_text);
+    assert_eq!(
+        golden.len(),
+        3,
+        "{SELECTION_GOLDEN} holds one block per route"
+    );
+    for block in &golden {
+        for (name, sql) in &block.statements {
+            assert!(
+                selection_clause(sql).is_none(),
+                "{SELECTION_GOLDEN}: {}'s {name} statement carries {}. §1.3's row says the \
+                 selection becomes no SQL, so a regeneration that absorbed one fails here",
+                block.route,
+                selection_clause(sql).expect("just checked"),
+            );
+        }
+    }
+
+    // ---- B2: the committed bytes, against the pinned digest --------
+    assert_eq!(
+        sha256_hex(golden_text.as_bytes()),
+        PINNED_SELECTION_STATEMENTS,
+        "{SELECTION_GOLDEN} is not the file PINNED_SELECTION_STATEMENTS names. Regenerating \
+         it is not a way to make this green: move the constant in the same change and the \
+         diff carries both the statements and the pin"
+    );
+
+    skip_unless_live!();
+
+    // ---- B3 and C: the live engine ---------------------------------
+    let (admin, db) = seed_selection_corpus().await;
+    let observed = observed_selection_blocks(&db).await;
+
+    for (block, _) in &observed {
+        let want = golden
+            .iter()
+            .find(|g| g.route == block.route)
+            .unwrap_or_else(|| panic!("{SELECTION_GOLDEN} has no block for {}", block.route));
+        assert_eq!(
+            block.query, want.query,
+            "{}: the committed base query is not the one this test drives",
+            block.route
+        );
+        assert_eq!(
+            block.request, want.request,
+            "{}: the committed request is not the one this test makes",
+            block.route
+        );
+        assert_eq!(
+            block.statements.len(),
+            want.statements.len(),
+            "{}: issued {} statements, {SELECTION_GOLDEN} holds {}",
+            block.route,
+            block.statements.len(),
+            want.statements.len()
+        );
+        for ((got_name, got_sql), (want_name, want_sql)) in
+            block.statements.iter().zip(want.statements.iter())
+        {
+            assert_eq!(got_name, want_name, "{}: a stage changed name", block.route);
+            assert_eq!(
+                got_sql, want_sql,
+                "{}: the {got_name} statement is not the committed one. §1.3's row says the \
+                 selection becomes no SQL; every query on this route — the base and all four \
+                 wrappings — must issue these bytes",
+                block.route
+            );
+        }
+    }
+
+    // The two range routes must be two routes.
+    let reason = |route: &str| {
+        observed
+            .iter()
+            .find(|(b, _)| b.route == route)
+            .map(|(b, _)| b.request.clone())
+            .unwrap_or_else(|| panic!("no observed block for {route}"))
+    };
+    assert_ne!(
+        reason("range, bucketed read"),
+        reason("range, client-aggregated read"),
+        "both range routes reported the same routing reason, so this compares one path with \
+         itself"
+    );
+
+    // ---- C: the answers ---------------------------------------------
+    let all: Vec<String> = SEL_STREAMS.iter().map(|(_, s, _)| s.to_string()).collect();
+    for (block, answers) in &observed {
+        for (query, result) in answers {
+            let labels = answer_labels(result);
+            // `topk(2, …)` and `approx_topk(2, …)` must answer the same
+            // two series on this corpus: the sketch is exact well under
+            // its own error bound at six series.
+            let want: Vec<String> =
+                if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
+                    vec!["c545a".to_string(), "c545b".to_string()]
+                } else if query.starts_with("bottomk(1,") {
+                    vec!["c545f".to_string()]
+                } else {
+                    all.clone()
+                };
+            assert_eq!(
+                sorted(labels.clone()),
+                sorted(want.clone()),
+                "{}: {query} answered {labels:?}; the corpus requires {want:?}",
+                block.route
+            );
+        }
+    }
+
+    // The one refusal in the family: `approx_topk` on a RANGE query,
+    // before any statement is issued.
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: SEL_AT_NS,
+            end_ns: SEL_AT_NS,
+            step_ns: SEL_STEP_NS as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let refused = engine
+        .query_explained(
+            &parse(r#"approx_topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))"#)
+                .expect("parse"),
+            &range,
+        )
+        .await;
+    match refused {
+        Err(ReadError::PipelineInvalid { reason }) => assert_eq!(
+            reason, "count min sketches are only supported on instant queries",
+            "the range `approx_topk` refusal §1.3's row names"
+        ),
+        other => panic!("`approx_topk` on a range query must be refused, not {other:?}"),
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// Rewrites `crates/pulsus-read/tests/golden/logql_selection_statements.txt`
+/// from a live engine. Ignored, so it never runs in CI.
+///
+/// **Running it is not a way to make a red check green.** The committed
+/// statements are this test's oracle: rewriting them to match whatever
+/// the engine has started emitting is the defect the file exists to
+/// catch. `PINNED_SELECTION_STATEMENTS` stays where it is until a person
+/// has read the diff.
+///
+/// ```text
+/// PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test query_log_gates \
+///   -- --ignored regenerate_the_logql_selection_statements
+/// ```
+#[tokio::test]
+#[ignore = "writes crates/pulsus-read/tests/golden/logql_selection_statements.txt"]
+async fn regenerate_the_logql_selection_statements() {
+    assert!(
+        should_run(),
+        "the regenerator needs a live ClickHouse: set PULSUS_TEST_CLICKHOUSE=1"
+    );
+    let (admin, db) = seed_selection_corpus().await;
+    let blocks: Vec<SelectionBlock> = observed_selection_blocks(&db)
+        .await
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let text = render_selection_golden(&blocks);
+    std::fs::write(root.join(SELECTION_GOLDEN), &text).expect("write the committed statements");
+    eprintln!(
+        "wrote {SELECTION_GOLDEN} ({} bytes), sha256 {}",
+        text.len(),
+        sha256_hex(text.as_bytes())
+    );
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
