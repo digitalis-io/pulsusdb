@@ -612,6 +612,28 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test explain_indexes
 
+      # Issue #544: the structured-metadata label filter's live behaviour —
+      # the 32 lowered queries' answers, the four refusals' answers and
+      # route, exactly one sample statement per lowered request counted in
+      # `system.query_log`, the metric routes' answers with the fragment in
+      # the statement, and the budget fallback on all three routes that can
+      # meet it.
+      - name: LogQL structured-metadata filter gate
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test logql_metadata_filter_live
+
+      # Issue #544: the writer-side half — every stored metadata text is
+      # its own render under the writer named for its column, with the
+      # database in the loop, and every ingest constraint the render does
+      # not re-apply has a row whose witness and closure both run.
+      - name: Stored metadata text identity gate
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test metadata_text_identity_live
+
       # Issue #171 (M7-C3): the `/api/logs/v1/patterns` Tier-1 gate — the
       # `(fingerprint, bucket_ns, pattern)` PK prefix time-key pruning (narrow
       # window selects fewer granules than the fingerprint's total) and daily

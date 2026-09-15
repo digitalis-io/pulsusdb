@@ -432,16 +432,27 @@ distinct metadata combination.
 Three consequences worth stating, because none is visible from the query
 text:
 
-- **`structured_metadata` is projected, never predicated.** The client-
-  aggregated raw scans add it to the `SELECT` list and to nothing else — no
-  `WHERE`, no `PREWHERE`, no `ORDER BY`, no skip index. A filter on a
-  metadata label is evaluated client-side over the merged set. That matches
-  the reference (its syntax layer has no notion of pushing metadata into the
-  store) and it is also the only correct choice here: the column is an
-  opaque canonical-JSON `String` with `DEFAULT ''` and no index, so a
-  JSON-extract predicate could prune no granule, and the merge renames a
-  colliding key to `<k>_extracted` before any filter would see it. The
-  `ORDER BY` clauses are unchanged, so `optimize_read_in_order` is intact.
+- **`structured_metadata` is predicated for an equality or inequality over
+  a metadata name, and projected for everything else** (issue #544). The
+  raw scans add it to the `SELECT` list; `| trace_id="…"` and
+  `| trace_id!="…"` additionally compile into the statement's `WHERE`, and
+  the request `LIMIT` compiles with them, which is what turns the sample
+  read from a page loop into one statement. **When the rendered fragments
+  exceed `MAX_METADATA_FRAGMENT_BYTES` (2 MiB) the filter does not lower
+  and the query takes the route it takes today, with the same answer.**
+  The regular-expression and numeric forms stay client-side, each for a
+  reason docs/query-to-sql.md states.
+  Two of the three reasons the earlier rule gave survive and are still
+  true: the column is an opaque canonical-JSON `String` with `DEFAULT ''`
+  and no index, so the predicate prunes no granule — `EXPLAIN indexes=1`
+  over 3,000,000 rows lists `MinMax`, `Partition`, `PrimaryKey` and no
+  `Skip` section at all — and the merge does rename a colliding key to
+  `<k>_extracted` before any filter would see it. What does not survive is
+  the conclusion drawn from them: the value was never pruning. It is the
+  statement count and the bytes on the metered hop, and the rename is
+  reproduced by the predicate's three name-resolution arms rather than
+  being a reason it cannot exist. The `ORDER BY` clauses are unchanged, so
+  `optimize_read_in_order` is intact.
 - **`absent_over_time` does not read the column at all.** It is the one
   reducer whose label set is provably metadata-independent
   (`syntax/extractor.go:46-47` forces `noLabels = true`, and

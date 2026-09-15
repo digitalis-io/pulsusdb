@@ -1582,7 +1582,7 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below; the count of cases
 // is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 6] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1617,19 +1617,6 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
         0,
         ReviewedVerdict::FallbackRight,
         "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
-    ),
-    (
-        "docs/query-lowering.md",
-        "plan.rs:2294",
-        0,
-        ReviewedVerdict::FallbackRight,
-        "the citing row is LogQL's refusal of `quantile_over_time` with no quantile, whose \
-         construction starts at crates/pulsus-read/src/logql/plan.rs:2294 — the fallback's answer. \
-         The anchor rule picks crates/pulsus-promql/src/plan.rs:2294, \
-         `\"absent() over an unexpected selector plan shape\",`, because the same row prints the \
-         parser's `unexpected '{' …` message. Issue #507 moved this citation from plan.rs:1915; \
-         the entry it replaces, query-to-sql.md's plan.rs:3319, moved to plan.rs:3702 with the \
-         same code and no longer resolves to the other file",
     ),
 ];
 
@@ -1751,7 +1738,11 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     }
     assert_eq!(
         (wrong.len(), right, ambiguous),
-        (4, 2, 0),
+        // Issue #544 removed one `FallbackRight` row: the citation it
+        // judged — `quantile_over_time` with no quantile — moved with the
+        // declaration it names, and at its new line the two rules agree,
+        // so there is no divergence left to hold a judgement about.
+        (4, 1, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

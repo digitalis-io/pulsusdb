@@ -427,19 +427,33 @@ impl crate::compile::fold::OpenSource for EvaluatorOnlyLabels {
 }
 
 impl Lower<Lql> for LabelFilterLower {
-    /// Every referenced name must resolve in `cols`.
+    /// Every referenced name must resolve in `cols`, and — since issue
+    /// #544 — a filter whose every leaf is an equality or inequality over
+    /// a **structured-metadata** name lowers.
     ///
-    /// **Wave 1 lowers no label filter at all**, and that is a deliberate
-    /// stopping point rather than an oversight. The design record's
-    /// fidelity section makes a filter over a structured-metadata key
-    /// `Equivalent`, which would let the `Limit` link lower and turn the
-    /// sample read from a page loop into one statement — a real
-    /// improvement, and one that makes the model disagree with the
-    /// shipped `has_unpushed_dropping_stage`, whose answer for *any*
-    /// label filter is "drops lines in-engine". The three walk-agreement
-    /// gates in [`super::plan`]'s test module assert that the model and
-    /// the shipped walks agree exactly, so the two cannot both hold until
-    /// the wave that moves the shipped planner with it.
+    /// # What makes the metadata class lowerable and every other one not
+    ///
+    /// Three conditions, and each is the model's half of a shipped rule
+    /// ([`super::plan::compile_metadata_label_filters`] is the other
+    /// half; the two walk-agreement gates in [`super::plan`]'s test module
+    /// assert they agree over all 3,375 chains of the atom corpus):
+    ///
+    /// * **the column set is CLOSED.** A parser or `| unpack` widens it
+    ///   with an evaluator-only open source, and a name that could have
+    ///   come from one is no longer provably the metadata key;
+    /// * **every leaf's name resolves to the metadata extraction for that
+    ///   name**, which is what `| label_format`, `| drop` and `| keep`
+    ///   take away — each rewrites or removes the very column the name
+    ///   would resolve through;
+    /// * **every leaf is served** by the metadata cell
+    ///   ([`super::predicate::metadata_leaf_is_servable`]): an equality or
+    ///   inequality, a renderable name, not a reserved error name. The two
+    ///   regular-expression operators, a numeric comparison and an `ip()`
+    ///   form are refused there, each for a reason that cell states.
+    ///
+    /// **All leaves or none.** Dropping one arm of an `or` narrows the
+    /// predicate, which drops rows the evaluator keeps; dropping one arm
+    /// of an `and` widens it, which forfeits the request `LIMIT`.
     fn capability(&self, s: &LqlLink, rel: &Relation<Lql>) -> Capability {
         if let LqlLink::Pipe(Stage::LabelFilter(expr)) = s {
             let mut resolvable = true;
@@ -460,15 +474,37 @@ impl Lower<Lql> for LabelFilterLower {
             if !resolvable {
                 return Capability::No(BlockReason::NameNotResolvable);
             }
+            if metadata_filter_lowers_here(expr, rel) {
+                return Capability::Yes;
+            }
         }
         Capability::No(BlockReason::NotYetLowered)
     }
+    /// Conjoins the filter's tree over the expressions the relation
+    /// resolves each name through.
+    ///
+    /// **The text is the model's, not the statement's.** The shipped
+    /// renderer ([`super::predicate::metadata_string_filter`]) partitions
+    /// the SELECTED fingerprints by which name-resolution rule the name
+    /// takes on each stream, which needs the stream label sets stage 2
+    /// resolves and this method cannot see. Where no selected stream
+    /// carries the name — the ordinary case, and every query in the
+    /// design record's corpus — that renderer collapses to exactly the
+    /// text below.
     fn apply(
         &self,
-        _s: &LqlLink,
-        rel: Relation<Lql>,
+        s: &LqlLink,
+        mut rel: Relation<Lql>,
         _cx: &LowerCx<'_, Lql>,
     ) -> Result<Relation<Lql>, super::ReadError> {
+        let LqlLink::Pipe(Stage::LabelFilter(expr)) = s else {
+            return Ok(rel);
+        };
+        let Some(sql) = metadata_filter_sql(expr, &rel) else {
+            return Ok(rel);
+        };
+        let source = rel.source_ref();
+        rel.predicate = rel.predicate.clone().and(Pred::leaf(sql, source));
         Ok(rel)
     }
     /// It drops lines in the evaluator, and a NUMERIC comparison in it can
@@ -481,6 +517,110 @@ impl Lower<Lql> for LabelFilterLower {
             return mark_error_raisable(rel);
         }
         rel
+    }
+    /// **`Equivalent`, and that is the whole point of issue #544.** The
+    /// three arms of [`super::predicate::metadata_string_filter`]
+    /// reproduce the merge's own name resolution exactly, and our decoder
+    /// and the database read the same value out of every byte string a
+    /// field source can write, so the statement's rows are the evaluator's
+    /// rows — not a superset. `exact` therefore survives the link, the
+    /// `Limit` link lowers, and the request `LIMIT` enters the statement.
+    ///
+    /// A `Wider` answer here would be silent: the fragment would still be
+    /// emitted, the answer would still be right, and the page loop would
+    /// still run. That is why
+    /// `the_first_residual_pipe_link_agrees_with_metric_pipeline_construct`
+    /// and `exact_after_the_fold_agrees_with_has_unpushed_dropping_stage`
+    /// are two gates and not one: the first sees `capability`, the second
+    /// sees this.
+    fn fidelity(&self, _s: &LqlLink, _rel: &Relation<Lql>) -> Fidelity {
+        Fidelity::Equivalent
+    }
+}
+
+/// The structured-metadata class the fold lowers (issue #544). See
+/// [`LabelFilterLower::capability`] for what each condition is the model's
+/// half of.
+fn metadata_filter_lowers_here(expr: &LabelFilterExpr, rel: &Relation<Lql>) -> bool {
+    if !matches!(rel.cols, ColSet::Closed(_)) {
+        return false;
+    }
+    let mut leaves = 0usize;
+    let mut ok = true;
+    pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| match node {
+        LabelFilterExpr::Match(m) => {
+            leaves += 1;
+            if super::predicate::metadata_leaf_is_servable(&m.name, m.op).is_err() {
+                ok = false;
+                return;
+            }
+            let want = metadata_expr(&m.name);
+            if rel.cols.resolve(&Name::from(m.name.as_str())).map(|e| e.0) != Some(want) {
+                ok = false;
+            }
+        }
+        // A numeric comparison is a comparison OR a conversion failure
+        // that also sets the error label, and an `ip()` form is an
+        // address match. Neither has an `Equivalent` predicate.
+        LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => ok = false,
+        LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {}
+    });
+    ok && leaves > 0
+}
+
+/// The expression one structured-metadata name resolves to — the one
+/// spelling, which [`LEVEL_EXPR`] is an instance of.
+fn metadata_expr(name: &str) -> String {
+    format!(
+        "JSONExtractString({STRUCTURED_METADATA}, {})",
+        super::escape::ch_string(name)
+    )
+}
+
+/// The filter tree as one boolean expression over the resolved names.
+///
+/// **Iterative** (issue #272): a flat `a or b or c …` chain parses into a
+/// LEFT-DEEP tree of unbounded depth, so the fold walks a post-order node
+/// list with an explicit operand stack rather than recursing.
+fn metadata_filter_sql(expr: &LabelFilterExpr, rel: &Relation<Lql>) -> Option<String> {
+    let mut nodes: Vec<&LabelFilterExpr> = Vec::new();
+    if matches!(expr, LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _)) {
+        pulsus_logql::walk::postorder_into::<pulsus_logql::LabelFilterScc>(expr, &mut nodes);
+    } else {
+        nodes.push(expr);
+    }
+    let mut stack: Vec<String> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        match n {
+            LabelFilterExpr::Match(m) => {
+                let cmp = match m.op {
+                    pulsus_logql::MatchOp::Eq => "=",
+                    pulsus_logql::MatchOp::Neq => "!=",
+                    pulsus_logql::MatchOp::Re | pulsus_logql::MatchOp::Nre => return None,
+                };
+                let lhs = rel.cols.resolve(&Name::from(m.name.as_str()))?;
+                stack.push(format!(
+                    "{} {cmp} {}",
+                    lhs.as_str(),
+                    super::escape::ch_string(&m.value)
+                ));
+            }
+            LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => return None,
+            LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {
+                let rhs = stack.pop()?;
+                let lhs = stack.pop()?;
+                let joiner = if matches!(n, LabelFilterExpr::And(_, _)) {
+                    "AND"
+                } else {
+                    "OR"
+                };
+                stack.push(format!("({lhs} {joiner} {rhs})"));
+            }
+        }
+    }
+    match stack.len() {
+        1 => stack.pop(),
+        _ => None,
     }
 }
 
@@ -525,8 +665,10 @@ impl Lower<Lql> for LabelFormatLower {
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         if let LqlLink::Pipe(Stage::LabelFormat(fmts)) = s {
             for f in fmts {
-                rel.cols
-                    .set_provenance(&Name::new(label_fmt_dst(f)), Provenance::EvaluatorOnly);
+                rel.cols.set_provenance(
+                    &Name::new(label_fmt_dst(f).to_string()),
+                    Provenance::EvaluatorOnly,
+                );
             }
         }
         mark_error_raisable(rel)
@@ -534,9 +676,13 @@ impl Lower<Lql> for LabelFormatLower {
 }
 
 /// The destination label one `| label_format` element writes.
-fn label_fmt_dst(f: &LabelFmt) -> String {
+///
+/// `pub(in crate::logql)` and borrowing since issue #544: the shipped
+/// walk in [`super::plan`] asks the same question, and two spellings of
+/// one rule are free to drift.
+pub(in crate::logql) fn label_fmt_dst(f: &LabelFmt) -> &str {
     match f {
-        LabelFmt::Rename { dst, .. } | LabelFmt::Template { dst, .. } => dst.clone(),
+        LabelFmt::Rename { dst, .. } | LabelFmt::Template { dst, .. } => dst.as_str(),
     }
 }
 

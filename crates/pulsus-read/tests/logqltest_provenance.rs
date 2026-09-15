@@ -2364,10 +2364,6 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
-    // Issue #507 (W3): the metadata column's two named routes, the one
-    // private constant that holds its name, and the private whole-value
-    // guard. No item here renders an extraction over the column, which is
-    // the property the typed boundary exists for.
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum MetadataTerm",
     "pub enum MetadataTerm :: Project,",
@@ -2376,8 +2372,6 @@ const PREDICATE_ITEMS: &[&str] = &[
     "impl MetadataTerm",
     "impl MetadataTerm :: pub fn as_sql(self) -> &'static str",
     "fn metadata_non_empty_guard() -> CheckedFragment",
-    // Issue #507 (W3): the parsed-name filter, its refusals, and the two
-    // predicates that decide which route a name takes.
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum ParsedFilterRefusal",
     "pub enum ParsedFilterRefusal :: OperatorNotServed,",
@@ -2390,10 +2384,6 @@ const PREDICATE_ITEMS: &[&str] = &[
     "fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String>",
     "pub fn parsed_string_filter(name: &str, op: MatchOp, value: &str, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
     "pub fn parsed_numeric_filter(name: &str, op: CompareOp, threshold: f64, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
-    // Issue #507 (W2): the anchored bucket grid and the three ways it
-    // refuses. `BucketGridRefusal` is deliberately not a `PipelineError` —
-    // every one of its reasons leaves the link residual rather than
-    // answering the request 400.
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum BucketGridRefusal",
     "pub enum BucketGridRefusal :: StepNotPositive,",
@@ -2403,7 +2393,6 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
-    // Issue #507: the extracted-field group key read's per-row readers.
     "const KEY_TRIM_CLASS: &str = r_",
     "const JSON_WS: &str = r_",
     "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",
@@ -2436,6 +2425,36 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment",
     "pub fn metadata_holds_name(name: &str) -> CheckedFragment",
     "pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment",
+    "pub const MAX_METADATA_FRAGMENT_BYTES: usize = 2 * 1024 * 1024",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub struct MetadataNameClasses<'a>",
+    "pub struct MetadataNameClasses<'a> :: pub selected: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub stream_label: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub stream_label_true: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub unsuffixed: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub direct: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub base_name: Option<&'a str>,",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ComplementClass",
+    "pub enum ComplementClass :: StreamLabel,",
+    "pub enum ComplementClass :: Unsuffixed,",
+    "pub enum ComplementClass :: Direct,",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum MetadataFilterRefusal",
+    "pub enum MetadataFilterRefusal :: OperatorNotServed,",
+    "pub enum MetadataFilterRefusal :: ReservedName,",
+    "pub enum MetadataFilterRefusal :: NameNotRenderable,",
+    "pub enum MetadataFilterRefusal :: FragmentTooLarge,",
+    "pub enum MetadataFilterRefusal :: ClassesDoNotPartition,",
+    "pub fn metadata_leaf_is_servable(name: &str, op: MatchOp) -> Result<(), MetadataFilterRefusal>",
+    "fn class_expression(class: ComplementClass, name: &str, cmp: &str, value: &str, base_name: Option<&str>) -> Option<String>",
+    "fn fingerprint_test(fps: &[u64], negated: bool) -> String",
+    "pub fn metadata_string_filter(name: &str, op: MatchOp, value: &str, classes: MetadataNameClasses<'_>, budget_remaining: usize) -> Result<(CheckedFragment, Option<ComplementClass>), MetadataFilterRefusal>",
+    "fn class_list<'a>(classes: &MetadataNameClasses<'a>, which: ComplementClass) -> &'a [u64]",
+    "fn render_encoding(name: &str, cmp: &str, value: &str, classes: &MetadataNameClasses<'_>, complement: Option<ComplementClass>, a_all: bool) -> String",
+    "pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
+    "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
+    "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use super::*",
@@ -2464,9 +2483,6 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle() :: const SHAPED: &[&str] = &[ _, _, _, _, _, _, _, _, _, _, _, ]",
     "mod tests :: #[test]",
     "mod tests :: fn a_contains_line_filter_renders_an_escaped_like_pattern()",
-    // Issue #507 (W3): the witness table and the four cells it governs.
-    // `Witness` and its two readers are `pub(crate)` because the live half
-    // of the rule reads the same file from an integration target.
     "mod tests :: pub(crate) struct Witness",
     "mod tests :: pub(crate) struct Witness :: pub(crate) form: String,",
     "mod tests :: pub(crate) struct Witness :: pub(crate) parser: String,",
@@ -2489,6 +2505,24 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn a_parsed_name_filter_refuses_with_the_stated_reason()",
     "mod tests :: #[test]",
     "mod tests :: fn the_metadata_column_is_named_in_one_place()",
+    "mod tests :: fn fps(n: usize) -> Vec<u64>",
+    "mod tests :: fn classes<'a>(selected: &'a [u64], stream_label: &'a [u64], stream_label_true: &'a [u64], unsuffixed: &'a [u64], direct: &'a [u64], base_name: Option<&'a str>) -> MetadataNameClasses<'a>",
+    "mod tests :: const TRACE_ID: &str = _",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_collapsed_metadata_fragments_are_87_and_1_bytes()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_three_classes_partition_the_selected_fingerprints()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_encoding_is_the_shortest_admissible_render()",
+    "mod tests :: fn the_encoding_is_the_shortest_admissible_render() :: type Case = (&'static str, &'static [usize], &'static [usize], &'static [usize], &'static [usize], Option<ComplementClass>)",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_complement_excludes_every_other_class_not_only_the_rendered_arms()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_bare_metadata_fragment_matches_the_design_record()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_render_past_the_budget_is_refused_rather_than_truncated()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_metadata_cell_refuses_what_it_says_it_refuses()",
 ];
 
 /// The number of MINT-shaped entries: an `fn` whose OWN signature (the last
@@ -2506,8 +2540,13 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// reachable. **18 at issue #507's group key read**: `unwrap_name_ambiguity`,
 /// `json_depth_bound`, `json_flatten_key_budget_bound`, `unwrap_name_absence`,
 /// `unwrap_label_integer_text`, `metadata_holds_name` and
-/// `metadata_names_projection` join them.
-const MINT_COUNT: usize = 18;
+/// `metadata_names_projection` join them. **21 at issue #544**:
+/// `metadata_string_filter`, which renders the structured-metadata label
+/// filter, and the two combiners `metadata_filter_and` and
+/// `metadata_filter_or`, which join one stage's leaves — a fragment can
+/// only be minted in this module, so an `and`/`or` tree has to be
+/// combined here rather than at the caller.
+const MINT_COUNT: usize = 21;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

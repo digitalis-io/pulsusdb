@@ -1336,11 +1336,28 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
             // measured at three where the answer is `0.6000000000000001`
             // (review round 2, found by the first corpus entry that
             // lowers).
-            fallback = match &mp.value {
-                pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
-                    unwrapped_fallback_client_agg(mp, u)
-                }
-                pulsus_read::logql::sql::MetricValue::Shaped(_) => bucketed_fallback_client_agg(mp),
+            //
+            // **Issue #544: a plan whose metadata filter compiled into
+            // the statement carries the stage it would have had**, and
+            // that stage is the one to take — it holds the filter. The
+            // empty-pipeline counting fallback would filter nothing and
+            // answer the whole window: measured on the corpus's
+            // `count_over_time({service_name="sm"} | trace="a" [5m])`,
+            // four series where the answer is two.
+            fallback = match mp
+                .metadata_lowering
+                .as_ref()
+                .and_then(|m| m.client_without_lowering.clone())
+            {
+                Some(restored) => restored,
+                None => match &mp.value {
+                    pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
+                        unwrapped_fallback_client_agg(mp, u)
+                    }
+                    pulsus_read::logql::sql::MetricValue::Shaped(_) => {
+                        bucketed_fallback_client_agg(mp)
+                    }
+                },
             };
             &fallback
         }

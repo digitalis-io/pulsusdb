@@ -24,7 +24,9 @@ use super::rows::{
 use futures::Stream;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
-use pulsus_logql::{Expr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector};
+use pulsus_logql::{
+    Expr, LabelFilterExpr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector,
+};
 
 use super::charge::{
     MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_POINT_SLOT,
@@ -328,6 +330,12 @@ pub struct LogQlEngine {
     client: ChClient,
     config: EngineConfig,
     key_route_test: KeyRouteTestHooks,
+    /// Test-only: the statement's structured-metadata fragment budget
+    /// (issue #544), lowered so a live test can reach the fallback on
+    /// three streams instead of the ~48,000 it takes to spend
+    /// [`super::predicate::MAX_METADATA_FRAGMENT_BYTES`]. `None` is the
+    /// shipped constant; production never sets it.
+    metadata_fragment_budget: Option<usize>,
 }
 
 /// Test-only settings for the extracted-field group key read (issue #507).
@@ -350,7 +358,24 @@ impl LogQlEngine {
             client,
             config,
             key_route_test: KeyRouteTestHooks::default(),
+            metadata_fragment_budget: None,
         }
+    }
+
+    /// Lowers the statement's structured-metadata fragment budget (issue
+    /// #544). Test-only: it makes the budget fallback reachable on a
+    /// three-stream corpus, where the shipped constant needs about 48,000
+    /// selected streams.
+    #[doc(hidden)]
+    pub fn with_metadata_fragment_budget(mut self, bytes: usize) -> Self {
+        self.metadata_fragment_budget = Some(bytes);
+        self
+    }
+
+    /// The budget this read renders under.
+    fn metadata_budget(&self) -> usize {
+        self.metadata_fragment_budget
+            .unwrap_or(super::predicate::MAX_METADATA_FRAGMENT_BYTES)
     }
 
     /// Applies [`KeyRouteTestHooks`] (issue #507). Test-only.
@@ -1182,6 +1207,24 @@ impl LogQlEngine {
     ///   regroup by final label set, one `StreamResult` per set with a
     ///   canonically re-rendered `labels_json`.
     ///
+    /// The stage-3 row bound for THIS read (issue #544).
+    ///
+    /// [`StreamsPlan::scan_limit`] is the plan's, taken from the plan's
+    /// own `fetch_until_limit`. When a metadata fragment does not fit its
+    /// budget the read pages after all, and the first page's size is the
+    /// oversample the plan would have carried.
+    fn effective_scan_limit(&self, sp: &StreamsPlan, fetch_until_limit: bool) -> u32 {
+        if fetch_until_limit == sp.fetch_until_limit {
+            return sp.scan_limit;
+        }
+        if fetch_until_limit {
+            sp.result_limit
+                .saturating_mul(self.config.pipeline_scan_factor)
+        } else {
+            sp.result_limit
+        }
+    }
+
     /// Returns `(streams, partial)`: `partial` is set only on the
     /// fetch-until-limit dropping path when the byte scan budget is
     /// exhausted mid-paging (issue #90's signaled partial — surfaced as
@@ -1221,6 +1264,14 @@ impl LogQlEngine {
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
 
+        // Issue #544: the metadata fragments are rendered here, where the
+        // stream label sets exist, and the paging decision is re-taken on
+        // the result. `sp.fetch_until_limit` is the PLAN's answer, which
+        // assumed the fragments would fit; `fetch_until_limit` below is
+        // the read's.
+        let lowered = stage3_predicates(sp, &fingerprints, &meta, self.metadata_budget());
+        let fetch_until_limit = sp.fetch_until_limit || !lowered.metadata_lowered;
+        let scan_limit = self.effective_scan_limit(sp, fetch_until_limit);
         let sql = super::sql::stage3(
             &sp.samples_table,
             &services,
@@ -1229,9 +1280,9 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &stage3_predicates(sp, &meta),
+            &lowered.predicates,
             sp.direction,
-            sp.scan_limit,
+            scan_limit,
         );
         if let Some(e) = explain.as_mut() {
             e.push("stage3_samples", sql.clone(), None);
@@ -1274,9 +1325,17 @@ impl LogQlEngine {
         // after `line_format`, drops lines in-engine — a single oversampled
         // `LIMIT` scan could under-return. Keyset-page until the limit
         // fills, the window exhausts, or the budget is spent.
-        if sp.fetch_until_limit {
+        if fetch_until_limit {
             return self
-                .run_streams_paged(sp, &compiled, &meta, &services, &fingerprints, opts)
+                .run_streams_paged(
+                    sp,
+                    &compiled,
+                    &meta,
+                    &services,
+                    &fingerprints,
+                    scan_limit,
+                    opts,
+                )
                 .await;
         }
 
@@ -1373,6 +1432,7 @@ impl LogQlEngine {
     /// but complete-or-error wins where the ledger trips: a
     /// [`TooBroadReason::StreamsResultBytes`] refusal is never downgraded
     /// to a partial.
+    #[allow(clippy::too_many_arguments)]
     async fn run_streams_paged(
         &self,
         sp: &StreamsPlan,
@@ -1380,6 +1440,7 @@ impl LogQlEngine {
         meta: &HashMap<u64, StreamMetaRow>,
         services: &[CheckedLiteral],
         fingerprints: &[u64],
+        scan_limit: u32,
         opts: ResponseOptions,
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         let budget = self.config.scan_budget_bytes;
@@ -1393,9 +1454,12 @@ impl LogQlEngine {
             spent: 0,
             // First-page size = the oversample hint; subsequent pages
             // reuse it.
-            page_size: sp.scan_limit.max(1),
+            page_size: scan_limit.max(1),
             budget,
         };
+        // Issue #544: rendered once for the whole loop, not per page — the
+        // fingerprints and the label sets do not move between pages.
+        let lowered = stage3_predicates(sp, fingerprints, meta, self.metadata_budget());
 
         loop {
             // Terminate before issuing: `max_bytes_to_read = 0` is
@@ -1422,7 +1486,7 @@ impl LogQlEngine {
                 window,
                 ks_lower,
                 sp.direction,
-                &stage3_predicates(sp, meta),
+                &lowered.predicates,
                 st.page_size,
             );
 
@@ -1556,6 +1620,26 @@ impl LogQlEngine {
             distinct_escaped_services(&meta)
         };
 
+        // Issue #544: the structured-metadata fragments, rendered from the
+        // stream label sets stage 2 has just resolved. Both routes below
+        // let the DATABASE compute the aggregate, so a fragment that does
+        // not fit its budget cannot simply be omitted — the answer would
+        // move. The plan carries the client stage it would have had, and
+        // this is where it is swapped back in.
+        let lowered = metric_predicates(mp, &fingerprints, &meta, self.metadata_budget());
+        if !lowered.metadata_lowered {
+            let restored = mp
+                .metadata_lowering
+                .as_ref()
+                .and_then(|m| m.client_without_lowering.as_ref());
+            if let Some(client) = restored {
+                let compiled = CompiledPipeline::compile(&client.pipeline)?;
+                return self
+                    .run_metric_client(mp, client, &compiled, &fingerprints, explain)
+                    .await;
+            }
+        }
+
         if is_instant {
             // Issue #507 W4: the shape is read INSIDE the arms that need
             // one. An unwrapped plan has no sealed column pair, so
@@ -1570,7 +1654,7 @@ impl LogQlEngine {
                     end_ns: mp.end_ns,
                 },
                 mp.scan_lower,
-                &mp.extra_predicates,
+                &lowered.predicates,
                 // Issue #249: this arm runs only when `is_instant`, and an
                 // instant plan is always `RouteChoice::Raw` over
                 // `log_samples` (the rollup decision requires
@@ -1656,7 +1740,7 @@ impl LogQlEngine {
                     .run_unwrapped_range(mp, u, &services, &fingerprints, &meta, explain)
                     .await;
             }
-            match bucketed_range_sql(mp, &services, &fingerprints) {
+            match bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates) {
                 Ok(sql) => {
                     if let Some(e) = explain.as_mut() {
                         e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
@@ -2296,6 +2380,8 @@ impl LogQlEngine {
         explain.push("stage2_hydration", stage2_sql.clone(), None);
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
+        let lowered = stage3_predicates(sp, &fingerprints, &meta, self.metadata_budget());
+        let fetch_until_limit = sp.fetch_until_limit || !lowered.metadata_lowered;
         let stage3_sql = super::sql::stage3(
             &sp.samples_table,
             &services,
@@ -2304,9 +2390,9 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &stage3_predicates(sp, &meta),
+            &lowered.predicates,
             sp.direction,
-            sp.scan_limit,
+            self.effective_scan_limit(sp, fetch_until_limit),
         );
         explain.push("stage3_samples", stage3_sql, None);
         Ok(explain)
@@ -2360,7 +2446,17 @@ impl LogQlEngine {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         };
-        let metric_sql = if mp.client.is_some() {
+        // Issue #544: the EXPLAIN twin renders the same fragments the
+        // execution site does, from the same function, so the reported
+        // statement is the statement that runs.
+        let lowered = metric_predicates(mp, &fingerprints, &meta, self.metadata_budget());
+        let metric_sql = if mp.client.is_some()
+            || (!lowered.metadata_lowered
+                && mp
+                    .metadata_lowering
+                    .as_ref()
+                    .is_some_and(|m| m.client_without_lowering.is_some()))
+        {
             // Client-aggregated (issue M6-10): the raw full-window fetch,
             // not a SQL aggregate. Issue #227 review round 5, finding 3:
             // EXPLAIN must report the query that ACTUALLY executes — a range
@@ -2406,7 +2502,7 @@ impl LogQlEngine {
                             }
                         }
                         super::sql::MetricValue::Shaped(_) => {
-                            bucketed_range_sql(mp, &services, &fingerprints)
+                            bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates)
                         }
                     };
                     match rendered {
@@ -2426,7 +2522,7 @@ impl LogQlEngine {
                     &fingerprints,
                     window,
                     mp.scan_lower,
-                    &mp.extra_predicates,
+                    &lowered.predicates,
                     // The EXPLAIN twin of the execution site above, and
                     // reached under the same `step_ns.is_none()` instant
                     // condition — so it reports the query that runs.
@@ -5096,6 +5192,7 @@ fn bucketed_range_sql(
     mp: &MetricPlan,
     services: &[CheckedLiteral],
     fingerprints: &[u64],
+    predicates: &[CheckedFragment],
 ) -> Result<String, BucketGridRefusal> {
     // A plan with no step has no grid at all. Expressed as a refusal
     // rather than an assertion so the statement cannot be built for one.
@@ -5120,7 +5217,7 @@ fn bucketed_range_sql(
             lo_ns,
             step_ns,
         },
-        &mp.extra_predicates,
+        predicates,
         // `Lean` drops the metadata column and its only caller is
         // `absent_over_time`, which never lowers onto this path
         // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
@@ -5747,24 +5844,300 @@ fn pop_value(vals: &mut Vec<QueryResult>) -> QueryResult {
 /// those citations point at and no rule could repair them. The text is
 /// still produced by one function — `plan::compile_parsed_label_filters`,
 /// over the plan's own pipeline — so there is no second renderer.
-fn stage3_predicates(sp: &StreamsPlan, meta: &HashMap<u64, StreamMetaRow>) -> Vec<CheckedFragment> {
+fn stage3_predicates(
+    sp: &StreamsPlan,
+    fingerprints: &[u64],
+    meta: &HashMap<u64, StreamMetaRow>,
+    budget: usize,
+) -> LoweredPredicates {
     let mut out = sp.line_filters.clone();
     let candidates = super::plan::compile_parsed_label_filters(&sp.pipeline);
-    if candidates.is_empty() {
-        return out;
-    }
-    let mut stream_label_names: BTreeSet<String> = BTreeSet::new();
-    for m in meta.values() {
-        for (k, _) in series_labels(m) {
-            stream_label_names.insert(k);
+    if !candidates.is_empty() {
+        let mut stream_label_names: BTreeSet<String> = BTreeSet::new();
+        for m in meta.values() {
+            for (k, _) in series_labels(m) {
+                stream_label_names.insert(k);
+            }
+        }
+        for pred in candidates {
+            if !stream_label_names.contains(&pred.name) {
+                out.push(pred.fragment);
+            }
         }
     }
-    for pred in candidates {
-        if !stream_label_names.contains(&pred.name) {
-            out.push(pred.fragment);
+    // Issue #544: the structured-metadata filters, rendered from the
+    // stream label sets stage 2 has just resolved. `None` is the budget
+    // fallback — the query takes today's route with today's answer.
+    match metadata_predicates(&sp.pipeline, fingerprints, meta, budget) {
+        Some(fragments) => {
+            out.extend(fragments);
+            LoweredPredicates {
+                predicates: out,
+                metadata_lowered: true,
+            }
+        }
+        None => LoweredPredicates {
+            predicates: out,
+            metadata_lowered: !plans_a_metadata_filter(&sp.pipeline),
+        },
+    }
+}
+/// The stage-3 predicate vector, and whether the structured-metadata
+/// filters the plan counted on are in it (issue #544).
+///
+/// `metadata_lowered` is `false` only when the plan lowered a metadata
+/// filter and the render did not fit
+/// [`super::predicate::MAX_METADATA_FRAGMENT_BYTES`]. The caller then
+/// takes the route it takes today: the answer is the same and the cost is
+/// the one it has now. **Never a rejection** — a request that is legal
+/// today stays legal.
+struct LoweredPredicates {
+    predicates: Vec<CheckedFragment>,
+    metadata_lowered: bool,
+}
+
+/// One stream's exposed label set, by fingerprint — parsed once per read
+/// rather than once per filter leaf.
+fn label_sets(
+    fingerprints: &[u64],
+    meta: &HashMap<u64, StreamMetaRow>,
+) -> Option<HashMap<u64, Vec<(String, String)>>> {
+    let mut out = HashMap::with_capacity(fingerprints.len());
+    for fp in fingerprints {
+        // A selected fingerprint stage 2 did not hydrate has no label set,
+        // so no class can be decided for it. The read then takes today's
+        // route, where its rows are dropped by the client as they are
+        // today.
+        let m = meta.get(fp)?;
+        out.insert(*fp, series_labels(m));
+    }
+    Some(out)
+}
+
+/// Which name-resolution class each selected fingerprint falls in, for one
+/// filter leaf (issue #544). See
+/// [`super::predicate::MetadataNameClasses`] for the rule.
+struct NameClasses {
+    stream_label: Vec<u64>,
+    stream_label_true: Vec<u64>,
+    unsuffixed: Vec<u64>,
+    direct: Vec<u64>,
+    base_name: Option<String>,
+}
+
+fn classify_metadata_name(
+    name: &str,
+    op: MatchOp,
+    value: &str,
+    fingerprints: &[u64],
+    labels: &HashMap<u64, Vec<(String, String)>>,
+) -> Option<NameClasses> {
+    let base = name.strip_suffix("_extracted");
+    let mut classes = NameClasses {
+        stream_label: Vec::new(),
+        stream_label_true: Vec::new(),
+        unsuffixed: Vec::new(),
+        direct: Vec::new(),
+        base_name: None,
+    };
+    for fp in fingerprints {
+        let Some(set) = labels.get(fp) else {
+            // `label_sets` refuses a missing fingerprint before this runs.
+            continue;
+        };
+        let carries_name = set.iter().any(|(k, _)| k == name);
+        let carries_base = base.is_some_and(|m| set.iter().any(|(k, _)| k == m));
+        if carries_name && carries_base {
+            // **The DOUBLE collision, which the three classes do not
+            // cover** — measured, `crates/pulsus-server/tests/loki_push_live.rs`'s
+            // `structured_metadata_double_collision_overwrites_the_extracted_slot_once`.
+            //
+            // The stream carries BOTH `k` and `k` without its
+            // `_extracted` suffix as labels. A metadata pair named by the
+            // un-suffixed one is renamed to `k` and then **overwrites the
+            // stream label of that name** — `merge_metadata_pairs`
+            // (`crates/pulsus-read/src/logql/labels.rs`) assigns into the
+            // slot it finds, base region included. So on such a stream the
+            // stream label does NOT win, which is what the stream-label
+            // class is for, and the value depends per row on whether the
+            // metadata carries the un-suffixed name.
+            //
+            // Rendering it needs a fourth arm — a per-fingerprint constant
+            // under a `JSONHas` — and this work states three. The filter
+            // therefore does not lower and the query takes the route it
+            // takes today, with today's answer: the same fallback an
+            // oversized fragment takes.
+            return None;
+        }
+        if carries_name {
+            classes.stream_label.push(*fp);
+            let verdict = match op {
+                MatchOp::Eq => set.iter().any(|(k, v)| k == name && v == value),
+                MatchOp::Neq => set.iter().any(|(k, v)| k == name && v != value),
+                // Refused at the plan-time servability check.
+                MatchOp::Re | MatchOp::Nre => false,
+            };
+            if verdict {
+                classes.stream_label_true.push(*fp);
+            }
+        } else if carries_base {
+            classes.unsuffixed.push(*fp);
+        } else {
+            classes.direct.push(*fp);
         }
     }
-    out
+    if !classes.unsuffixed.is_empty() {
+        classes.base_name = base.map(str::to_string);
+    }
+    Some(classes)
+}
+
+/// One label-filter stage's whole tree as one fragment (issue #544).
+///
+/// **Iterative** (issue #272): a flat `a or b or c …` chain parses into a
+/// LEFT-DEEP tree of unbounded depth, so this walks a post-order node list
+/// with an explicit operand stack. `remaining` is the statement's whole
+/// metadata budget and is spent leaf by leaf, so three filters cannot each
+/// claim the budget in full.
+fn render_metadata_tree(
+    expr: &LabelFilterExpr,
+    fingerprints: &[u64],
+    labels: &HashMap<u64, Vec<(String, String)>>,
+    remaining: &mut usize,
+) -> Option<CheckedFragment> {
+    let mut nodes: Vec<&LabelFilterExpr> = Vec::new();
+    if matches!(expr, LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _)) {
+        pulsus_logql::walk::postorder_into::<pulsus_logql::LabelFilterScc>(expr, &mut nodes);
+    } else {
+        nodes.push(expr);
+    }
+    let mut stack: Vec<CheckedFragment> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        match n {
+            LabelFilterExpr::Match(m) => {
+                let c = classify_metadata_name(&m.name, m.op, &m.value, fingerprints, labels)?;
+                let (fragment, _complement) = super::predicate::metadata_string_filter(
+                    &m.name,
+                    m.op,
+                    &m.value,
+                    super::predicate::MetadataNameClasses {
+                        selected: fingerprints,
+                        stream_label: &c.stream_label,
+                        stream_label_true: &c.stream_label_true,
+                        unsuffixed: &c.unsuffixed,
+                        direct: &c.direct,
+                        base_name: c.base_name.as_deref(),
+                    },
+                    *remaining,
+                )
+                .ok()?;
+                *remaining = remaining.checked_sub(fragment.as_sql().len())?;
+                stack.push(fragment);
+            }
+            // Refused at the plan-time servability check, so the stage
+            // would not be in the plan at all.
+            LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => return None,
+            LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {
+                let rhs = stack.pop()?;
+                let lhs = stack.pop()?;
+                let joined = if matches!(n, LabelFilterExpr::And(_, _)) {
+                    super::predicate::metadata_filter_and(&lhs, &rhs)
+                } else {
+                    super::predicate::metadata_filter_or(&lhs, &rhs)
+                };
+                // The two operands are already charged; only the four
+                // bytes of parentheses and the operator are new.
+                let added = joined.as_sql().len() - lhs.as_sql().len() - rhs.as_sql().len();
+                *remaining = remaining.checked_sub(added)?;
+                stack.push(joined);
+            }
+        }
+    }
+    match stack.len() {
+        1 => stack.pop(),
+        _ => None,
+    }
+}
+
+/// Every lowered structured-metadata fragment for one read, or `None`
+/// when the render does not fit the budget (issue #544).
+fn metadata_predicates(
+    pipeline: &[Stage],
+    fingerprints: &[u64],
+    meta: &HashMap<u64, StreamMetaRow>,
+    budget: usize,
+) -> Option<Vec<CheckedFragment>> {
+    let plan = super::plan::compile_metadata_label_filters(pipeline)?;
+    metadata_predicates_of(&plan.stages, fingerprints, meta, budget)
+}
+
+/// The same, for a plan that carries the trees rather than the pipeline —
+/// the two metric routes on which the aggregate is the database's and no
+/// client stage holds a pipeline to read them off.
+fn metadata_predicates_of(
+    stages: &[Stage],
+    fingerprints: &[u64],
+    meta: &HashMap<u64, StreamMetaRow>,
+    budget: usize,
+) -> Option<Vec<CheckedFragment>> {
+    let labels = label_sets(fingerprints, meta)?;
+    let mut remaining = budget;
+    let mut out = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let Stage::LabelFilter(tree) = stage else {
+            // `compile_metadata_label_filters` puts nothing else here.
+            return None;
+        };
+        out.push(render_metadata_tree(
+            tree,
+            fingerprints,
+            &labels,
+            &mut remaining,
+        )?);
+    }
+    Some(out)
+}
+
+/// Whether this pipeline has a metadata filter the PLAN lowered — the
+/// question `metadata_lowered == false` answers against.
+fn plans_a_metadata_filter(pipeline: &[Stage]) -> bool {
+    super::plan::compile_metadata_label_filters(pipeline).is_some()
+}
+
+/// The metric read's predicate vector, and whether the structured-metadata
+/// filters the plan counted on are in it (issue #544).
+///
+/// Called on the two routes where the aggregate is the DATABASE's: an
+/// instant count/bytes query with no unwrap and no grouping, and a range
+/// query whose `[range]` equals its `step`. On those two a missing
+/// fragment is a wrong number, not a wider scan, so `metadata_lowered ==
+/// false` is what makes the caller swap the restored client stage in.
+fn metric_predicates(
+    mp: &MetricPlan,
+    fingerprints: &[u64],
+    meta: &HashMap<u64, StreamMetaRow>,
+    budget: usize,
+) -> LoweredPredicates {
+    let mut out = mp.extra_predicates.clone();
+    let Some(lowering) = &mp.metadata_lowering else {
+        return LoweredPredicates {
+            predicates: out,
+            metadata_lowered: true,
+        };
+    };
+    match metadata_predicates_of(&lowering.stages, fingerprints, meta, budget) {
+        Some(fragments) => {
+            out.extend(fragments);
+            LoweredPredicates {
+                predicates: out,
+                metadata_lowered: true,
+            }
+        }
+        None => LoweredPredicates {
+            predicates: out,
+            metadata_lowered: false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -8509,7 +8882,15 @@ mod tests {
         );
 
         // No resolved stream carries `lvl`, so the proviso holds.
-        let without = stage3_predicates(&sp, &sm_meta());
+        let meta0 = sm_meta();
+        let fps0: Vec<u64> = meta0.keys().copied().collect();
+        let without = stage3_predicates(
+            &sp,
+            &fps0,
+            &meta0,
+            super::super::predicate::MAX_METADATA_FRAGMENT_BYTES,
+        )
+        .predicates;
         assert_eq!(
             without.len(),
             sp.line_filters.len() + 1,
@@ -8533,7 +8914,14 @@ mod tests {
                 labels: r#"{"lvl":"warn","service_name":"sm"}"#.to_string(),
             },
         );
-        let with = stage3_predicates(&sp, &meta);
+        let fps: Vec<u64> = meta.keys().copied().collect();
+        let with = stage3_predicates(
+            &sp,
+            &fps,
+            &meta,
+            super::super::predicate::MAX_METADATA_FRAGMENT_BYTES,
+        )
+        .predicates;
         assert_eq!(
             with.len(),
             sp.line_filters.len(),
@@ -8844,13 +9232,13 @@ mod tests {
         // The control: the planned shape renders.
         let base = planned(r#"count_over_time({a="b"}[1m])"#);
         assert!(base.client.is_none(), "the fixture must be a lowered plan");
-        assert!(bucketed_range_sql(&base, &services, &fingerprints).is_ok());
+        assert!(bucketed_range_sql(&base, &services, &fingerprints, &[]).is_ok());
 
         // No step at all: no grid.
         let mut mp = base.clone();
         mp.step_ns = None;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints),
+            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
             Err(BucketGridRefusal::StepNotPositive)
         );
 
@@ -8859,7 +9247,7 @@ mod tests {
         let mut mp = base.clone();
         mp.start_ns = base.grid_start_ns - base.step_ns.expect("a step").get() - 1;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints),
+            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
             Err(BucketGridRefusal::AnchorAboveScanStart)
         );
 
@@ -8870,7 +9258,7 @@ mod tests {
         mp.start_ns = i64::MIN;
         mp.end_ns = i64::MAX;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints),
+            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
             Err(BucketGridRefusal::WouldOverflow)
         );
 
@@ -8883,7 +9271,7 @@ mod tests {
         mp.grid_start_ns = i64::MIN;
         mp.start_ns = i64::MIN;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints),
+            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
             Err(BucketGridRefusal::WouldOverflow)
         );
 
