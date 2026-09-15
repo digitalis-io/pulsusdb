@@ -100,7 +100,7 @@ no SQL, carries one of these markings.
 |---|---|
 | *emitted today* | our shipped code produces this text now. Cited to the function that produces it |
 | *from the design* | worked out from the design record `docs/query-lowering.md`. No code produces it |
-| *decided here* | the design settles that the stage can compile to SQL and does not fix the text, so **this document fixes it**. Every such cell names what the decision rests on, and every SQL text so marked was executed against ClickHouse 26.3 — see part 2.7 |
+| *decided here* | the design settles that the stage can compile to SQL and does not fix the text, so **this document fixes it**. Every such cell names what the decision rests on, and every SQL text so marked was executed against ClickHouse 26.3 — see part 2.7. **No code produces the text**, exactly as for *from the design*: part 1's row for the same construct is what ships, and the two are read together |
 | *cannot become SQL* | no correct SQL exists for it, and the reason is given in the cell. Distinct from *never becomes SQL* only in that part 5 collects the latter; the two mean the same thing. **The bar is information, not effort.** A cell may carry this marking only when it names a value that is not stored, state that is unbounded, or something only the query process can know. How long the work would take, how large it would be, and a composition rule of ours are none of those — §5.1 lists six constructs that carried this marking on one of those grounds until 2026-09-09 |
 | *evaluated after the read* | the stage runs in `pulsus-server` on every request. It says where the work happens today, not that it must happen there — the six constructs of §5.1 carry this marking, and each cell says what would move it |
 | *never becomes SQL* | SQL cannot have the information. Part 5 gives the reason for each, and §5.1 gives the six that were listed there on a reason that was not about information |
@@ -135,7 +135,7 @@ was nine and every range metric query read raw lines.
 | `metric_range_unwrapped_rows` | `sql.rs:1620` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
 | `probe` | `sql.rs:519` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
-The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:761` and `:810`;
+The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:725` and `:774`;
 the values are those of part 4's corpus.
 
 ```sql
@@ -372,7 +372,7 @@ The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes
 ### 1.2 LogQL — the ten stage kinds
 
 `Stage` has exactly ten variants (`crates/pulsus-logql/src/ast.rs:133`); `Parser` has four of its
-own (`ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
+own (`crates/pulsus-logql/src/ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
 
 Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3763`) walks the
 stages and collects the ones that become predicates on `body`. `has_unpushed_dropping_stage`
@@ -418,7 +418,7 @@ come from the request.
 | any `_over_time` with `\| unwrap` | `sumIf` over the converted value and `countIf` of the decided rows, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the extracted-field group key — `metric_range_unwrapped` (`sql.rs:1557`); the reader divides for the average. Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1746` |
 | `absent_over_time` | none | *never becomes SQL*. The answer is a statement about rows that are **absent**, so there is no row to compute it from |
 | `sum by (level) (…)` | none | *evaluated after the read*. `has_grouping` forces the client path (`plan.rs:2399`) |
-| `topk(3, …)` | none | *evaluated after the read* |
+| `topk(k, …)`, `bottomk(k, …)`, `approx_topk(k, …)`, `sort(…)`, `sort_desc(…)` | none | *evaluated after the read*. The planner records the chain on `MetricPlan::vector_aggs` (`plan.rs:365`) and nothing reads it when deciding what to lower — `bucketed_range` (`plan.rs:2545`) does not consult it — so no statement on any route carries the selection. `pulsus-server` applies it to the result the read produced: `post_agg.rs:1041` sends a matrix to `select_k_range` (`:807`), `post_agg.rs:1109` sends a vector to `select_k_instant` (`:858`), and `approx_topk` goes to `approx_topk_instant` (`post_agg.rs:983`). Applied at `exec.rs:1858` (the bucketed range read), `exec.rs:2285` (the client-aggregated range read, where the INNERMOST selection is folded at the leaf over the same rows instead — `client_agg.rs:2168`, `fold.rs:543`), `exec.rs:1770` (instant), `exec.rs:5534` (the extracted-field group-key read) and `exec.rs:2455` (a binary or `variants` tree). **One refusal:** `approx_topk` on a range query is a `400` at plan time, `count min sketches are only supported on instant queries` (`plan.rs:1534`). §2.8's LogQL56 carries the statement the range form issues |
 | `label_replace(…)` | none | *evaluated after the read* |
 | ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:799`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
 | ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` on the raw read; none on the two lowered reads | *emitted today*, `sql.rs:1253`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing. The lowered reads return groups, which the reader folds without an order |
@@ -489,7 +489,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:384`. On the **search** route they are refused with `400` (`search_plan.rs:1854`, `:1861`, `:1867`) |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:948` records it as the plan's `reduce` and `exec.rs:3421` applies it to the framed series (called at `:850` for range, `:1574` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:1861`) |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:948` records it as the plan's `reduce` and `exec.rs:3421` applies it to the framed series (called at `:825` for range, `:1510` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:1861`) |
 | ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:218`. The final ordering across statements is done in `pulsus-server` |
 | `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:219`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
@@ -695,7 +695,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `sum by (env) (…)`, `env` a stream label | `transform(fingerprint, [<fps>], [<env's value for each>], '') AS g0`, added to the `GROUP BY` | **decided here**, §2.7.2. The values come from the second statement, which has already read every selected stream's label set (`sql.rs:725`), so the group key is a lookup in a literal array — no extra read, no per-row parsing. Worked in §2.8's LogQL55 |
 | `sum by (k) (…)`, `k` a structured-metadata key | `JSONExtractString(structured_metadata, 'k') AS g0` | **decided here**, §2.7.2 |
 | `sum by (level) (…)`, `level` a parsed label | none | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The number-rendering reason this cell used to give is false** — `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, the reference's own bytes (measured, 26.3.29.7). What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
-| `topk(3, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT 3 BY bucket_ns`, over the first level wrapped in a subquery | **decided here**, §2.7.2. `LIMIT n BY` is ClickHouse's own "n rows per group", so the second level is one more statement layer rather than a second read — ADR 0008 D1's wrap. Worked in §2.8's LogQL56, which has a genuine tie the reference breaks the same way |
+| `topk(3, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT 3 BY bucket_ns`, over the first level wrapped in a subquery | **decided here**, §2.7.2. `LIMIT n BY` is ClickHouse's own "n rows per group", so the second level is one more statement layer rather than a second read — ADR 0008 D1's wrap. Worked in §2.8's LogQL56, which has a genuine tie the reference breaks the same way. **No code produces this text.** Today the second level is *evaluated after the read*: the planner records it on `MetricPlan::vector_aggs` (`plan.rs:365`) and `pulsus-server` applies it to the result — `post_agg.rs:1041` sends a matrix to `select_k_range` (`:807`) and `post_agg.rs:1109` sends a vector to `select_k_instant` (`:858`). §1.3's row carries the five call sites and the one refusal. |
 | `label_replace(…)` | none | *evaluated after the read*, `docs/query-lowering.md:1064` and `:1064-1079`. Not for want of a SQL spelling of the rewrite: at range, label sets that collide after the rewrite merge into **one** series whose points repeat per grid timestamp, and a `GROUP BY` on the rewritten key gives one point per timestamp instead. Measured on the reference: the operand alone returns four series, the rewritten form returns one with four points at each of two timestamps (`crates/pulsus-read/tests/logqltest/corpus/b16_label_replace.test:252-262`). Because it removes series the SQL returned, it makes the predicate wider than the query |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | *emitted today*, unchanged. Conditional on the ordering columns being in the projection |
 | `limit=100` | `LIMIT 100` | *emitted today*. Conditional on an ordering being set **and** on the predicate meaning exactly what the query means. Over a wider-than-needed set the engine keeps today's behaviour and over-fetches instead |
@@ -1139,7 +1139,7 @@ nothing and reads fewer rows; it simply keeps paging.
 | `sum by (k) (…)`, `k` a stream label | `transform(fingerprint, [<fps>], [<the value of k for each>], '') AS g0`, added to the `GROUP BY` | `SELECT` and `GROUP BY` | **decided here.** The values come from the second statement, which has already read every selected stream's label set (`sql.rs:725`), so the group key costs no extra read and no per-row parsing — it is a lookup in a literal array. Exact, because a structured-metadata key that collides with a stream label is renamed and can never overwrite it (`labels.rs:318`). Requires `k` to be a label of **every** selected stream |
 | `sum by (k) (…)`, `k` a structured-metadata key | `JSONExtractString(structured_metadata, 'k') AS g0` | `SELECT` and `GROUP BY` | **decided here.** Same reasoning as the structured-metadata label filter above: a stored column, our own encoding, an exact extraction |
 | `sum by (k) (…)`, `k` a parsed label | | — | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The reason this cell used to give is false.** `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, but `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0` — the reference's own bytes (measured, 26.3.29.7). The claim was about all ClickHouse expressions and was checked against two. What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
-| `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
+| `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled. **No code produces this text.** Today the second level is *evaluated after the read*: the planner records it on `MetricPlan::vector_aggs` (`plan.rs:365`) and `pulsus-server` applies it to the result — `post_agg.rs:1041` sends a matrix to `select_k_range` (`:807`) and `post_agg.rs:1109` sends a vector to `select_k_instant` (`:858`). §1.3's row carries the five call sites and the one refusal. |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:799` |
 | `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it is decided by LogQL's own compiler**, in `plan.rs`, where `has_unpushed_dropping_stage` sets `fetch_until_limit` today (§10's answered open question 5). A filter over a **parser-produced** name keeps lines SQL cannot decide — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter whose SQL means exactly the filter — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement. **The structured-metadata half is emitted since issue #544** (§2.7.4): measured on 3,000,000 rows for a single-row `trace_id` lookup, 3,001 statements and 460,676,744 bytes on the metered hop become 1 and 1,536, and the rows read in the database fall from 4,541,308,032 to 3,000,000 — §2.7.4 carries the command and the settings. It reverts to the page loop, with the same answer, on the two fallbacks §2.7.4 states: rendered fragments over `MAX_METADATA_FRAGMENT_BYTES`, and a selected stream carrying both `k` and `k` without its `_extracted` suffix as labels — the double collision, where the renamed pair overwrites the stream label of that name. The TraceQL core calls the same property `Fidelity` (`docs/query-lowering.md` §2.7.7); LogQL's compiler does not use that type |
@@ -1619,6 +1619,30 @@ query.
 **What it avoids.** The second level is a clause on the outer statement, not a second read.
 `LIMIT n BY` is ClickHouse's own "n rows per group", so at most two rows per bucket cross the
 network however many series there are.
+
+**What the query issues today.** Our code does not send the statement above. Measured on ClickHouse
+26.3.29.7 over part 4.1's corpus, with `start=1788256200000000000`, `end=1788256835000000000`,
+`step=60`, the query sends exactly one statement of its own — this part's first and second
+statements are unchanged and are not repeated here — and the bare
+`sum by (service_name) (count_over_time({env="prod"}[1m]))`, the `bottomk(2, …)` form and
+`sort_desc(…)` send the same bytes, which is the whole claim of §1.3's row:
+
+```sql
+-- emitted today, sql.rs:1305; fingerprints elided as <fps> and the SELECT list
+-- wrapped over three lines. No other edit
+SELECT fingerprint,
+       1788256140000000000 + intDiv(timestamp_ns - 1788256140000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns,
+       count() AS n, structured_metadata
+FROM log_samples
+PREWHERE service IN ('checkout', 'colors', 'edge', 'ipcase')
+WHERE fingerprint IN (<fps>)
+  AND timestamp_ns > 1788256140000000000 AND timestamp_ns <= 1788256835000000000
+GROUP BY fingerprint, bucket_ns, structured_metadata
+```
+
+No `ORDER BY`, no `LIMIT … BY`, no `g0`: the grouping key and the selection both run in
+`pulsus-server`. The answer is the body above — the tie at 3 between `edge` and `ipcase` is broken
+toward `edge` there too.
 
 #### LogQL57 — an unwrapped value, where the aggregation still cannot compile
 
@@ -3564,6 +3588,12 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 ```
 
 **SQL after this work** — the second level wraps the first and becomes `ORDER BY bucket_ns ASC, n DESC, g0 ASC` with `LIMIT 2 BY bucket_ns` (§2.7.2, **decided here**): `LIMIT n BY` is ClickHouse's own "n rows per group", so it is one more statement layer rather than a second read. **This query cannot reach it**, because its group key `level` is a parsed label and a parsed label cannot be a group key — see LogQL31. §2.8's LogQL56 is the reachable form, with a genuine tie the reference and this expression break the same way.
+
+**The request.** `start=1788256200000000000`, `end=1788256835000000000`, `step=60` — a `start` on
+a step boundary. Our grid is anchored on the request `start` (docs/api.md §2.1, recorded as
+`range-step-grid-start-anchored`), so §4.1's default `start=1788256175000000000` is not on a
+boundary and puts the same two series at `1788256835` instead. Values, series and tie-break are
+identical either way.
 
 **The answer must be `200`**, with this body:
 
