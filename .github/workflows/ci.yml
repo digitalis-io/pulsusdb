@@ -613,7 +613,7 @@ jobs:
         run: cargo test -p pulsus-read --test explain_indexes
 
       # Issue #544: the structured-metadata label filter's live behaviour —
-      # the 32 lowered queries' answers, the four refusals' answers and
+      # the 36 lowered queries' answers, the four refusals' answers and
       # route, exactly one sample statement per lowered request counted in
       # `system.query_log`, the metric routes' answers with the fragment in
       # the statement, and the budget fallback on all three routes that can
