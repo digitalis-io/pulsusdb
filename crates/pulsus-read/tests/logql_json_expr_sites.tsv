@@ -418,48 +418,48 @@ Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	
 Site	Literal	docs/api.md:225	-	-	path	accept	accept	-	-	
 Site	Literal	docs/api.md:234	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/api.md:237	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2686	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2687	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2689	-	-	a	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2690	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2708	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2821	-	-	a.b	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3838	-	-	code	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3838	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:4183	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:4184	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:4185	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:4205	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6370	-	-	["b]"]	reject	reject	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6370	-	-	["b]"]	reject	reject	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6498	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6502	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6503	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6504	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2692	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2693	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2711	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2824	-	-	a.b	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3841	-	-	code	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3841	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:4186	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:4187	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:4188	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:4208	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6372	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6372	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6373	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6373	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6501	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6505	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6533	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6535	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6537	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6539	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6541	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6541	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6506	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6507	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6508	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6536	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6538	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6540	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6542	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6545	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6546	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6571	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6572	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6573	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6574	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6576	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6544	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6544	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6545	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6548	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6549	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6574	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6575	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6576	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6577	-	-	level	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6578	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6583	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6603	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6605	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6607	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:6608	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6579	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6580	-	-	level	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6581	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6586	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6606	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6608	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6610	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:6611	-	-	o	accept	accept	-	-	
 Site	Literal	docs/reference-defects-we-do-not-copy.md:1720	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/reference-defects-we-do-not-copy.md:1737	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/reference-defects-we-do-not-copy.md:1810	-	-	latency	accept	accept	-	-	

@@ -161,9 +161,12 @@ Out of this ledger's scope by design:
   and inequality forms since issue #544**: `| trace_id="…"` and
   `| trace_id!="…"` compile into the sample statement, and the request
   `LIMIT` compiles with them. The regular-expression and numeric forms are
-  still evaluated client-side, and so is any filter whose rendered
-  fragments exceed `MAX_METADATA_FRAGMENT_BYTES`, which takes the route it
-  takes today with the same answer. The second half of the withdrawn
+  still evaluated client-side, and so are the two fallbacks, each of
+  which takes the route it takes today with the same answer: a filter
+  whose rendered fragments exceed `MAX_METADATA_FRAGMENT_BYTES`, and a
+  filter over a stream carrying both the name and that name without its
+  `_extracted` suffix as labels, where the renamed pair overwrites the
+  stream label of that name. The second half of the withdrawn
   sentence goes with the first: this lane no longer "adds no read-path SQL
   and cannot regress the Tier-1 SQL/alloc goldens" by construction. What
   holds it to them instead is stated rather than assumed —

@@ -13,9 +13,38 @@
 //!
 //! So every measured statement here is issued **once**, under a
 //! `log_comment` no earlier statement used, **against a predicate literal
-//! no earlier statement used**, and the uncached read is asserted to have
-//! examined more than a million rows. A second execution fails that check
-//! rather than entering a document.
+//! no earlier statement used**, with the condition cache dropped before
+//! each route runs, and **the route's FIRST statement required to be
+//! cold**: zero `ProfileEvents['QueryConditionCacheHits']` and at least
+//! `ROWS` rows examined. A re-run fails that, because on a re-run the
+//! first statement is the one that hits.
+//!
+//! **A row count cannot make that check, measured rather than argued.**
+//! The earlier form required the route's summed `read_rows` to exceed a
+//! million. Run twice on the same literal, once with the cache dropped and
+//! once against the cache the first run left:
+//!
+//! ```text
+//!                             read_rows       first statement    route
+//!                             (route total)   hits / rows        hits / misses
+//!   page loop, cache dropped   4,541,308,032    0 / 3,001,696    3,327 / 3,349
+//!   page loop, cache warm      4,541,308,032   10 / 3,001,696    3,351 / 3,353
+//!   one statement, cache warm          8,192   20 /     8,192       20 /     0
+//! ```
+//!
+//! On the page loop the row count is **the same number** cold and warm, so
+//! no threshold over it can tell the two apart; the hit counter moves from
+//! 0 to 10 on the statement that decides. On the lowered route a repeat
+//! collapses to 8,192 rows, which is where the 8,192 figure comes from.
+//!
+//! **And a zero-hit rule over the whole route would be wrong**, which the
+//! same table shows: on a first execution with the cache dropped
+//! immediately before it, the page loop still records 3,327 hits across
+//! its 3,001 statements. Every one is on the cache the route's OWN earlier
+//! statements filled — those statements share one predicate and differ
+//! only by the keyset cursor. That is the route's behaviour under the
+//! server defaults this script reports, not a stale figure, so the totals
+//! below include it and the per-route counters are printed beside them.
 //!
 //! # The seven settings every figure carries
 //!
@@ -64,6 +93,12 @@ struct RouteTotals {
     read_bytes: u64,
     result_bytes: u64,
     query_duration_ms: u64,
+    /// `ProfileEvents['QueryConditionCacheHits']`, summed over the
+    /// route's statements. **The cache check** — see the assertion below.
+    cache_hits: u64,
+    /// Its companion, printed so a zero-hit route is visibly a route that
+    /// USED the cache and missed, not one the cache never saw.
+    cache_misses: u64,
 }
 
 /// One server default in force, read off `system.settings`.
@@ -209,6 +244,15 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
 
     let mut measured: Vec<(&str, RouteTotals, SentSettings)> = Vec::new();
     for (name, query, tag, budget) in &routes {
+        // Dropped before each route, so the cache-hit counter below reads
+        // zero for a reason and not by luck of what ran before.
+        admin
+            .execute(
+                "SYSTEM DROP QUERY CONDITION CACHE",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await?;
         let engine = route_engine(&data_cfg, &args.database, tag, *budget).await?;
         let expr = parse(query)?;
         let started = now_micros(&admin).await?;
@@ -225,6 +269,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         // recorded, it is unique to the route, and no other statement can
         // carry it.
         let totals = route_totals(&admin, &args.database, started, tag).await?;
+        let first = first_statement(&admin, &args.database, started, tag).await?;
         let sent = sent_settings(&admin, &args.database, started, tag).await?;
         println!("\n=== {name} — {query} ===");
         println!("  attributed by       log_comment = {tag}");
@@ -233,6 +278,11 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         println!("  read_bytes          {}", totals.read_bytes);
         println!("  result_bytes        {}", totals.result_bytes);
         println!("  query_duration_ms   {}", totals.query_duration_ms);
+        println!(
+            "  condition cache     {} hit(s), {} miss(es) over the route; its FIRST \
+             statement {} hit(s), {} rows",
+            totals.cache_hits, totals.cache_misses, first.cache_hits, first.read_rows
+        );
         println!(
             "  settings THESE {} statements recorded (sent by the reader):",
             totals.statements
@@ -250,14 +300,39 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             "{name}: no statement carried log_comment = {tag} — the figures below would be \
              about nothing"
         );
-        // The check that stops a condition-cache hit entering a document:
-        // a first execution of either route examines the whole window.
+        // **The cache check: the route's FIRST statement has to be cold**
+        // (code review round 2). Two forms were measured and rejected
+        // before this one, and both failures are worth keeping:
+        //
+        //   - the route's SUMMED `read_rows` over a threshold. Measured,
+        //     the page loop reads 4,541,308,032 rows whether its cache was
+        //     dropped first or left warm by an identical earlier run — the
+        //     same number, because the read orders the window either way.
+        //     No threshold over that number separates the two.
+        //   - the route's SUMMED cache hits being zero. Measured, a page
+        //     loop whose cache was dropped immediately before it still
+        //     records 3,327 hits: its 3,001 statements share one predicate
+        //     and differ only by the cursor, so each fills the cache the
+        //     next one reads. A zero-sum rule forbids a first execution.
+        //
+        // What separates a first execution from a re-run is the FIRST
+        // statement: cold, it misses and examines the whole window; on a
+        // re-run it hits at once. The cache is dropped before each route,
+        // so the only cache a first statement could hit is another run's.
         anyhow::ensure!(
-            totals.read_rows > 1_000_000,
-            "{name}: read_rows is {}, which is not a first execution over a {ROWS}-row corpus \
-             — a repeated statement served from the query-condition cache reports about 8,192. \
-             Re-run against a fresh predicate literal.",
-            totals.read_rows
+            first.cache_hits == 0,
+            "{name}: the route's FIRST statement records {} query-condition-cache hit(s), so \
+             the figures are a re-run's, not a first execution's. The cache is dropped before \
+             each route and each route uses a predicate literal no earlier statement used — \
+             a hit here means neither held.",
+            first.cache_hits
+        );
+        anyhow::ensure!(
+            first.read_rows >= ROWS,
+            "{name}: the route's FIRST statement examined {} rows, fewer than the {ROWS} \
+             seeded — a cold first statement reads the whole window, so this is either a \
+             cached read or a corpus that is not what this script assumes.",
+            first.read_rows
         );
         measured.push((*name, totals, sent));
     }
@@ -303,7 +378,10 @@ async fn route_totals(
     let sql = format!(
         "SELECT count() AS statements, sum(read_rows) AS read_rows, sum(read_bytes) AS \
          read_bytes, sum(result_bytes) AS result_bytes, sum(query_duration_ms) AS \
-         query_duration_ms FROM system.query_log \
+         query_duration_ms, \
+         sum(ProfileEvents['QueryConditionCacheHits']) AS cache_hits, \
+         sum(ProfileEvents['QueryConditionCacheMisses']) AS cache_misses \
+         FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
            AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
            AND has(tables, '{db}.log_samples') \
@@ -312,6 +390,37 @@ async fn route_totals(
     );
     let mut stream = admin
         .query_stream::<RouteTotals>(&sql, &QuerySettings::new())
+        .await?;
+    Ok(stream.next().await.transpose()?.unwrap_or_default())
+}
+
+/// The route's FIRST statement in event order — the one that decides
+/// whether the figures are a first execution's or a re-run's.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+struct FirstStatement {
+    cache_hits: u64,
+    read_rows: u64,
+}
+
+async fn first_statement(
+    admin: &ChClient,
+    db: &str,
+    since_us: u64,
+    tag: &str,
+) -> anyhow::Result<FirstStatement> {
+    let sql = format!(
+        "SELECT ProfileEvents['QueryConditionCacheHits'] AS cache_hits, read_rows \
+         FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
+           AND has(tables, '{db}.log_samples') \
+           AND NOT has(tables, 'system.query_log') \
+           AND log_comment = '{tag}' \
+         ORDER BY query_start_time_microseconds ASC, event_time_microseconds ASC \
+         LIMIT 1"
+    );
+    let mut stream = admin
+        .query_stream::<FirstStatement>(&sql, &QuerySettings::new())
         .await?;
     Ok(stream.next().await.transpose()?.unwrap_or_default())
 }

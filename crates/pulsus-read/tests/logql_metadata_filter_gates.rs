@@ -419,15 +419,35 @@ const MOVED_PASSAGES: &[(&str, &str, &str)] = &[
         "**SM predicate pushdown exists for the equality\n  and inequality forms since issue \
          #544**",
     ),
+    // The ninth, added in code review round 2: the row a reader reaches
+    // when asking what decides whether the request `LIMIT` compiles.
+    (
+        "docs/query-to-sql.md",
+        "lets the `LIMIT` compile, and the read is one statement. The TraceQL core calls",
+        "**The structured-metadata half is emitted since issue #544**",
+    ),
 ];
 
-/// The budget caveat every replacement must carry: the rule is true
-/// *unless* the rendered fragments exceed the budget, and a document that
-/// states the first half without the second is false on the fallback
-/// path.
+/// The two caveats every replacement must carry, because the rule is
+/// true *unless* one of them applies and a document that states the first
+/// half without the second is false on the fallback path. There are two
+/// fallbacks, not one: the rendered fragments over the byte budget, and a
+/// selected stream carrying both the filter's name and that name without
+/// its `_extracted` suffix as labels.
+///
+/// **The collision caveat was missing from six passages** that carried
+/// the budget one (code review round 2), which is why it is checked here
+/// rather than read for.
 const BUDGET_CAVEAT: &str = "MAX_METADATA_FRAGMENT_BYTES";
+const COLLISION_CAVEAT: &str = "`_extracted` suffix as labels";
 
-/// Issue #544 AC13 — **eight passages, three assertions each.**
+/// One paragraph with every run of whitespace collapsed to a single
+/// space, so a caveat that a line wrap splits still reads as one phrase.
+fn one_line(paragraph: &str) -> String {
+    paragraph.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Issue #544 AC13 — **nine passages, four assertions each.**
 #[test]
 fn the_design_documents_state_the_metadata_predicate() {
     let mut problems: Vec<String> = Vec::new();
@@ -453,10 +473,18 @@ fn the_design_documents_state_the_metadata_predicate() {
             .find("\n\n")
             .map(|i| at + i)
             .unwrap_or(text.len());
-        if !text[para_start..para_end].contains(BUDGET_CAVEAT) {
+        let paragraph = one_line(&text[para_start..para_end]);
+        if !paragraph.contains(BUDGET_CAVEAT) {
             problems.push(format!(
                 "{file}: the replacement states the new rule absolutely — its paragraph does \
                  not name {BUDGET_CAVEAT}, so it is false on the fallback path"
+            ));
+        }
+        if !paragraph.contains(COLLISION_CAVEAT) {
+            problems.push(format!(
+                "{file}: the replacement's paragraph names the byte budget but not the other \
+                 fallback — it does not say {COLLISION_CAVEAT:?}, so it is false on a stream \
+                 that carries both names"
             ));
         }
     }
