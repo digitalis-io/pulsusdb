@@ -215,7 +215,7 @@ GROUP BY fingerprint, bucket_ns, structured_metadata
 ```
 
 **The extracted-field group key** (`metric_range_unwrapped` and `metric_range_unwrapped_rows`, routed by
-`unwrapped_key_route`, `plan.rs:1810`; run by `run_unwrapped_range`, `exec.rs:1812`; issue #507). A
+`unwrapped_key_route`, `plan.rs:1810`; run by `run_unwrapped_range`, `exec.rs:1820`; issue #507). A
 range `sum_over_time` or `avg_over_time` with no conversion and nothing after `| unwrap`, a range equal
 to the step, pushable line filters, then one of these chains:
 
@@ -958,13 +958,20 @@ exposed label set — its canonical labels plus `service_name` from the
 `service` column — and `sm` is the row's stored metadata:
 
 ```text
-value_of(k, fp) =
-   k in S(fp)                          ->  S(fp)[k]   (A) the stream label always wins
+value_of(k, fp) =                                     PROVIDED the stream does not carry BOTH
+                                                      k and k-minus-its-_extracted-suffix
+   k in S(fp)                          ->  S(fp)[k]   (A) the stream label wins
    else k in keys(sm)                  ->  sm[k]      (C) the ordinary case
    else k = m ++ "_extracted"
         and m in S(fp)                 ->  sm[m]      (B) the renamed one
    else                                ->  ""         absent
 ```
+
+**The proviso is not decoration, and the case it excludes is below.** Where
+a stream carries both names, a metadata pair named by the un-suffixed one
+is renamed to `k` and then *overwrites* the stream label of that name, so
+(A) is false there. The filter does not lower on such a stream — see the
+double collision at the end of this section.
 
 A metadata pair whose name collides with a stream label is renamed
 `<name>_extracted`, so a filter on `k_extracted` reads the renamed pair —
@@ -1037,17 +1044,36 @@ partition space admits renders at 4,400,299 bytes, at `A = 99,998`,
 against the cap, whatever the partition.
 
 **What it is worth.** A single-row `trace_id` lookup over 3,000,000 rows,
-one stream selector:
+one stream selector. **The same query on both rows** — what differs is
+whether the fragment lowers, which the fragment budget decides — each
+issued once against a predicate literal no earlier statement used, each
+attributed by its own `log_comment`, on ClickHouse 26.3.29.7:
 
-| | statements | bytes on the metered hop | rows read in the database |
-|---|---|---|---|
-| the page loop | 3,003 | 511,597,595 | 4,541,310,754 |
-| one statement | 1 | 1,536 | 3,000,001 |
+| | statements | `result_bytes`, the metered hop | `read_rows` | `read_bytes` |
+|---|---|---|---|---|
+| the page loop | 3,001 | 460,676,744 | 4,541,308,032 | 291,618,114,410 |
+| one statement | 1 | 1,536 | 3,000,000 | 319,888,890 |
+
+```text
+cargo run -p xtask -- bench logql-metadata-filter \
+    --http-url http://<host>:<port> --database <db> --user default --password ""
+```
+
+Settings the statements recorded, read back per route from the statement
+log: `max_query_size = 8388608`, `max_execution_time = 1800`,
+`max_memory_usage = 8589934592` on both, and `max_bytes_to_read`
+`536870912000` on the single statement against **3,001 distinct values,
+245,253,304,384 … 536,870,912,000** on the page loop — one per page,
+because each carries the budget the pages before it have not spent.
+Server defaults in force, which no statement records and which a reader
+reproducing these figures has to read off the server:
+`max_block_size = 65409`, `max_threads = auto(16)`,
+`use_query_condition_cache = 1`.
 
 The page loop's in-database cost is `N²/(2P)` — page *k* still has to
 order the `N - kP` rows below its cursor — where `N` is the rows in the
 window and `P` the page row bound. It was derived before it was measured:
-predicted 4.50e9 rows, measured 4.54e9.
+predicted 4.50e9 rows, measured 4.5413e9.
 
 **What it does not buy: pruning.** No skip index covers this column.
 `EXPLAIN indexes=1` over 3,000,000 rows lists `MinMax`, `Partition`,
@@ -1116,7 +1142,7 @@ nothing and reads fewer rows; it simply keeps paging.
 | `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:799` |
-| `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it is decided by LogQL's own compiler**, in `plan.rs`, where `has_unpushed_dropping_stage` sets `fetch_until_limit` today (§10's answered open question 5). A filter over a **parser-produced** name keeps lines SQL cannot decide — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter whose SQL means exactly the filter — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement. **The structured-metadata half is emitted since issue #544** (§2.7.4): measured on 3,000,000 rows for a single-row `trace_id` lookup, 3,003 statements and 511,597,595 bytes on the metered hop become 1 and 1,536, and the rows read in the database fall from 4,541,310,754 to 3,000,001. It reverts to the page loop, with the same answer, when the rendered fragments exceed `MAX_METADATA_FRAGMENT_BYTES`. The TraceQL core calls the same property `Fidelity` (`docs/query-lowering.md` §2.7.7); LogQL's compiler does not use that type |
+| `limit=100` | `LIMIT 100` | `LIMIT` | *emitted today*. **Whether a compiled filter brings the limit with it is decided by LogQL's own compiler**, in `plan.rs`, where `has_unpushed_dropping_stage` sets `fetch_until_limit` today (§10's answered open question 5). A filter over a **parser-produced** name keeps lines SQL cannot decide — its predicate carries the guards part 2.7 puts on it — so rule B refuses a `LIMIT` over a set wider than the query and the read stays the over-fetch page loop it is today, with a denser page. A filter whose SQL means exactly the filter — a structured-metadata key, or a `\| regexp` capture-group comparison over a name no selected stream carries — lets the `LIMIT` compile, and the read is one statement. **The structured-metadata half is emitted since issue #544** (§2.7.4): measured on 3,000,000 rows for a single-row `trace_id` lookup, 3,001 statements and 460,676,744 bytes on the metered hop become 1 and 1,536, and the rows read in the database fall from 4,541,308,032 to 3,000,000 — §2.7.4 carries the command and the settings. It reverts to the page loop, with the same answer, when the rendered fragments exceed `MAX_METADATA_FRAGMENT_BYTES`. The TraceQL core calls the same property `Fidelity` (`docs/query-lowering.md` §2.7.7); LogQL's compiler does not use that type |
 | the response | none | — | *evaluated after the read* |
 
 #### 2.7.3 TraceQL — every stage kind, and the selector
@@ -5392,7 +5418,7 @@ cheaper than having the next reader find them.
   arm: `plan.rs:2398` puts a range query that is not a clean bucketed chain on the client-aggregated
   path, and `plan.rs:2679` routes a clean bucketed chain to `RouteChoice::Raw` before the rollup test
   is reached, rendering `metric_range_bucketed`. **The original falsification condition — removing
-  `|| is_range` from `plan.rs:2398` — was met in substance by issue #507 W2 and did not falsify the
+  `|| is_range` from `plan.rs:2398` — was met in substance by the bucketed range read and did not falsify the
   claim**, because the lowered path was given its own gate, its own routing arm and its own renderer
   rather than being let through the old one. **What would falsify it now:** pointing the bucketed
   path at `metric_range`; removing the `else if bucketed_range` arm so a bucketed plan reaches the

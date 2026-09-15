@@ -66,16 +66,6 @@ struct RouteTotals {
     query_duration_ms: u64,
 }
 
-/// The four settings our reader sends, as `system.query_log` recorded
-/// them for one statement.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
-struct SentSettings {
-    max_query_size: String,
-    max_bytes_to_read: String,
-    max_execution_time: String,
-    max_memory_usage: String,
-}
-
 /// One server default in force, read off `system.settings`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 struct ServerSetting {
@@ -175,23 +165,6 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         println!("  {:<26} {:<12} changed={}", s.name, s.value, s.changed);
     }
 
-    let engine = LogQlEngine::new(
-        ChClient::new(data_cfg).await?,
-        EngineConfig {
-            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-            db: args.database.clone(),
-            streams_idx: "log_streams_idx".to_string(),
-            streams: "log_streams".to_string(),
-            samples: "log_samples".to_string(),
-            rollup_table: "log_metrics_5s".to_string(),
-            patterns_table: "log_patterns".to_string(),
-            rollup_res_ns: 5_000_000_000,
-            scan_budget_bytes: 500 * 1024 * 1024 * 1024,
-            max_streams: 100_000,
-            pipeline_scan_factor: 10,
-            distributed: false,
-        },
-    );
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: ts - 1_000_000_000,
@@ -202,49 +175,81 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         direction: Direction::Backward,
     };
 
-    // **Each route gets its own predicate literal.** The equality route
-    // looks for the row at index 7; the page-loop route looks for the row
-    // at index 11 under an operator the metadata cell refuses. No literal
-    // is issued twice, so no figure below can be a condition-cache hit.
+    // **The two routes run the SAME query**, and differ in one thing:
+    // whether the fragment lowers. The budget knob decides that, which is
+    // what makes this a comparison of routes rather than of queries — an
+    // earlier version put a regular-expression operator on the second
+    // route, so the two differed in the filter as well as in the route.
+    //
+    // **Each route gets its own predicate literal** — the row at index 7
+    // and the row at index 11 — so no literal is issued twice and no
+    // figure below can be a query-condition-cache hit.
+    //
+    // **And its own `log_comment`, which is SENT.** Attribution is by that
+    // tag, not by matching the statement text: the fallback route's
+    // statements carry no predicate literal at all, because the fragment
+    // is exactly what they lack.
     let lowered_value = trace_id(7);
     let paged_value = trace_id(11);
+    let run = trace_id(99);
     let routes = [
         (
             "one statement",
             format!(r#"{{service_name="{SERVICE}"}} | trace_id="{lowered_value}""#),
+            format!("issue544-one-statement-{run}"),
+            None,
         ),
         (
             "the page loop",
-            format!(r#"{{service_name="{SERVICE}"}} | trace_id=~"{paged_value}""#),
+            format!(r#"{{service_name="{SERVICE}"}} | trace_id="{paged_value}""#),
+            format!("issue544-page-loop-{run}"),
+            Some(1usize),
         ),
     ];
 
     let mut measured: Vec<(&str, RouteTotals, SentSettings)> = Vec::new();
-    for (name, query) in &routes {
-        let tag = format!("issue544-{}-{}", name.replace(' ', "-"), trace_id(99));
+    for (name, query, tag, budget) in &routes {
+        let engine = route_engine(&data_cfg, &args.database, tag, *budget).await?;
         let expr = parse(query)?;
         let started = now_micros(&admin).await?;
         let (_result, _warnings) = engine.query(&expr, &params).await?;
         super::query_log::flush_logs(&admin).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         super::query_log::flush_logs(&admin).await?;
-        let totals = route_totals(&admin, &args.database, started).await?;
-        let sent = sent_settings(&admin, &args.database, started).await?;
-        println!("\n=== {name} — {query}  (log_comment tag {tag}) ===");
+        // **Attributed by something TRANSMITTED** (code review round 1).
+        // An earlier version printed a `log_comment` tag it never sent and
+        // then attributed every sample statement since a timestamp, which
+        // is not attribution at all — a second route running in the same
+        // second would land in the first one's figures. The route's own
+        // predicate literal IS in the statement the server received and
+        // recorded, it is unique to the route, and no other statement can
+        // carry it.
+        let totals = route_totals(&admin, &args.database, started, tag).await?;
+        let sent = sent_settings(&admin, &args.database, started, tag).await?;
+        println!("\n=== {name} — {query} ===");
+        println!("  attributed by       log_comment = {tag}");
         println!("  statements          {}", totals.statements);
         println!("  read_rows           {}", totals.read_rows);
         println!("  read_bytes          {}", totals.read_bytes);
         println!("  result_bytes        {}", totals.result_bytes);
         println!("  query_duration_ms   {}", totals.query_duration_ms);
-        println!("  settings this statement RECORDED (sent by the reader):");
-        println!("    max_query_size      {}", sent.max_query_size);
-        println!("    max_bytes_to_read   {}", sent.max_bytes_to_read);
-        println!("    max_execution_time  {}", sent.max_execution_time);
-        println!("    max_memory_usage    {}", sent.max_memory_usage);
+        println!(
+            "  settings THESE {} statements recorded (sent by the reader):",
+            totals.statements
+        );
+        println!("    max_query_size      {}", sent.max_query_size());
+        println!("    max_bytes_to_read   {}", sent.max_bytes_to_read());
+        println!("    max_execution_time  {}", sent.max_execution_time());
+        println!("    max_memory_usage    {}", sent.max_memory_usage());
         println!("  settings in force but NOT recorded (server defaults):");
         for s in &defaults {
             println!("    {:<18} {}", s.name, s.value);
         }
+        anyhow::ensure!(
+            totals.statements >= 1,
+            "{name}: no statement carried log_comment = {tag} — the figures below would be \
+             about nothing"
+        );
         // The check that stops a condition-cache hit entering a document:
         // a first execution of either route examines the whole window.
         anyhow::ensure!(
@@ -283,8 +288,18 @@ async fn now_micros(admin: &ChClient) -> anyhow::Result<u64> {
     Ok(stream.next().await.transpose()?.map(|r| r.n).unwrap_or(0))
 }
 
-/// Every sample statement one request issued, summed.
-async fn route_totals(admin: &ChClient, db: &str, since_us: u64) -> anyhow::Result<RouteTotals> {
+/// Every sample statement one request issued, summed — the ones the
+/// server recorded under that route's own `log_comment`, and no others.
+///
+/// The tag is compared against the recorded `log_comment` COLUMN, not
+/// searched for in the statement text, so this counting statement cannot
+/// match itself however it spells the tag.
+async fn route_totals(
+    admin: &ChClient,
+    db: &str,
+    since_us: u64,
+    tag: &str,
+) -> anyhow::Result<RouteTotals> {
     let sql = format!(
         "SELECT count() AS statements, sum(read_rows) AS read_rows, sum(read_bytes) AS \
          read_bytes, sum(result_bytes) AS result_bytes, sum(query_duration_ms) AS \
@@ -292,7 +307,8 @@ async fn route_totals(admin: &ChClient, db: &str, since_us: u64) -> anyhow::Resu
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
            AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
            AND has(tables, '{db}.log_samples') \
-           AND NOT has(tables, 'system.query_log')"
+           AND NOT has(tables, 'system.query_log') \
+           AND log_comment = '{tag}'"
     );
     let mut stream = admin
         .query_stream::<RouteTotals>(&sql, &QuerySettings::new())
@@ -300,19 +316,98 @@ async fn route_totals(admin: &ChClient, db: &str, since_us: u64) -> anyhow::Resu
     Ok(stream.next().await.transpose()?.unwrap_or_default())
 }
 
-/// The four settings the reader sent, off the newest sample statement.
-async fn sent_settings(admin: &ChClient, db: &str, since_us: u64) -> anyhow::Result<SentSettings> {
+/// The four settings the reader sent, over the statements THIS route
+/// issued.
+///
+/// **Reported as a distinct count with its range, not as one row's
+/// value.** A route that issues one statement has one value per setting; a
+/// page loop has 3,001, and `max_bytes_to_read` is DIFFERENT on each
+/// because it carries the budget the pages before it have not spent. An
+/// earlier version read the newest row and printed its value as though it
+/// were the route's, which is a figure that is true of one statement and
+/// false of the other three thousand.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+struct SentSettings {
+    qs_n: u64,
+    qs_lo: String,
+    qs_hi: String,
+    br_n: u64,
+    br_lo: String,
+    br_hi: String,
+    et_n: u64,
+    et_lo: String,
+    et_hi: String,
+    mm_n: u64,
+    mm_lo: String,
+    mm_hi: String,
+}
+
+impl SentSettings {
+    fn max_query_size(&self) -> SettingSpread {
+        SettingSpread::new(self.qs_n, &self.qs_lo, &self.qs_hi)
+    }
+    fn max_bytes_to_read(&self) -> SettingSpread {
+        SettingSpread::new(self.br_n, &self.br_lo, &self.br_hi)
+    }
+    fn max_execution_time(&self) -> SettingSpread {
+        SettingSpread::new(self.et_n, &self.et_lo, &self.et_hi)
+    }
+    fn max_memory_usage(&self) -> SettingSpread {
+        SettingSpread::new(self.mm_n, &self.mm_lo, &self.mm_hi)
+    }
+}
+
+/// One setting over a route's statements: how many distinct values, and
+/// the lowest and highest.
+struct SettingSpread {
+    distinct: u64,
+    low: String,
+    high: String,
+}
+
+impl SettingSpread {
+    fn new(distinct: u64, low: &str, high: &str) -> Self {
+        Self {
+            distinct,
+            low: low.to_string(),
+            high: high.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for SettingSpread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.distinct {
+            0 => f.write_str("(no statement)"),
+            1 => f.write_str(&self.low),
+            n => write!(f, "{n} distinct, {} … {}", self.low, self.high),
+        }
+    }
+}
+
+async fn sent_settings(
+    admin: &ChClient,
+    db: &str,
+    since_us: u64,
+    tag: &str,
+) -> anyhow::Result<SentSettings> {
+    let spread = |name: &str, short: &str| {
+        format!(
+            "uniqExact(Settings['{name}']) AS {short}_n, min(Settings['{name}']) AS {short}_lo, \
+             max(Settings['{name}']) AS {short}_hi"
+        )
+    };
     let sql = format!(
-        "SELECT Settings['max_query_size'] AS max_query_size, \
-                Settings['max_bytes_to_read'] AS max_bytes_to_read, \
-                Settings['max_execution_time'] AS max_execution_time, \
-                Settings['max_memory_usage'] AS max_memory_usage \
-         FROM system.query_log \
+        "SELECT {}, {}, {}, {} FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
            AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
            AND has(tables, '{db}.log_samples') \
            AND NOT has(tables, 'system.query_log') \
-         ORDER BY event_time_microseconds DESC LIMIT 1"
+           AND log_comment = '{tag}'",
+        spread("max_query_size", "qs"),
+        spread("max_bytes_to_read", "br"),
+        spread("max_execution_time", "et"),
+        spread("max_memory_usage", "mm"),
     );
     let mut stream = admin
         .query_stream::<SentSettings>(&sql, &QuerySettings::new())
@@ -333,4 +428,37 @@ async fn server_defaults(admin: &ChClient) -> anyhow::Result<Vec<ServerSetting>>
         out.push(row?);
     }
     Ok(out)
+}
+
+/// One engine per route: its own `log_comment`, and — for the fallback
+/// route — a metadata fragment budget of one byte, which is what puts the
+/// same query on today's route.
+async fn route_engine(
+    data_cfg: &ChConnConfig,
+    db: &str,
+    tag: &str,
+    budget: Option<usize>,
+) -> anyhow::Result<LogQlEngine> {
+    let engine = LogQlEngine::new(
+        ChClient::new(data_cfg.clone()).await?,
+        EngineConfig {
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            db: db.to_string(),
+            streams_idx: "log_streams_idx".to_string(),
+            streams: "log_streams".to_string(),
+            samples: "log_samples".to_string(),
+            rollup_table: "log_metrics_5s".to_string(),
+            patterns_table: "log_patterns".to_string(),
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 500 * 1024 * 1024 * 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+            distributed: false,
+        },
+    )
+    .with_query_log_comment(tag);
+    Ok(match budget {
+        Some(bytes) => engine.with_metadata_fragment_budget(bytes),
+        None => engine,
+    })
 }

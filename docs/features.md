@@ -68,9 +68,10 @@ reference makes it so (`syntax/extractor.go:46-47`). A filter on a metadata
 label is evaluated in the compiled pipeline, except that an **equality or
 inequality** over a metadata name pushes into SQL exactly (issue #544),
 which is what lets the request `LIMIT` compile and turns the sample read
-from a page loop into one statement; past
-`MAX_METADATA_FRAGMENT_BYTES` the filter does not lower and the query
-takes the route it takes today, with the same answer. The
+from a page loop into one statement. Two things put it back on today's
+route with the same answer: rendered fragments past
+`MAX_METADATA_FRAGMENT_BYTES`, and a selected stream carrying both the
+filter's name and that name without its `_extracted` suffix as labels. The
 regular-expression forms do not push, because the reference's own regex
 label matcher disagrees with the pattern it says it compiles, and a
 numeric comparison does not, because a value that does not convert keeps

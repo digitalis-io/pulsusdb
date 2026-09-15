@@ -378,7 +378,7 @@ struct Fixture {
 const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "count_nonmutating",
-        query: r#"count_over_time({app="a"} | env = ip("10.0.0.0/8") [5m])"#,
+        query: r#"count_over_time({app="a"} | env =~ "pro.+" [5m])"#,
         streams: 64,
         pairs: 6,
         value_bytes: 24,
@@ -398,7 +398,7 @@ const FIXTURES: &[Fixture] = &[
     // shape, 8x the label value width.
     Fixture {
         name: "count_nonmutating_wide_labels",
-        query: r#"count_over_time({app="a"} | env = ip("10.0.0.0/8") [5m])"#,
+        query: r#"count_over_time({app="a"} | env =~ "pro.+" [5m])"#,
         streams: 64,
         pairs: 6,
         value_bytes: 192,
@@ -409,7 +409,7 @@ const FIXTURES: &[Fixture] = &[
     // 8x the stream count.
     Fixture {
         name: "count_nonmutating_many_streams",
-        query: r#"count_over_time({app="a"} | env = ip("10.0.0.0/8") [5m])"#,
+        query: r#"count_over_time({app="a"} | env =~ "pro.+" [5m])"#,
         streams: 512,
         pairs: 6,
         value_bytes: 24,
@@ -418,7 +418,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "bytes_nonmutating",
-        query: r#"bytes_over_time({app="a"} | env = ip("10.0.0.0/8") [5m])"#,
+        query: r#"bytes_over_time({app="a"} | env =~ "pro.+" [5m])"#,
         streams: 64,
         pairs: 6,
         value_bytes: 24,
@@ -427,7 +427,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "rate_nonmutating",
-        query: r#"rate({app="a"} | env = ip("10.0.0.0/8") [5m])"#,
+        query: r#"rate({app="a"} | env =~ "pro.+" [5m])"#,
         streams: 64,
         pairs: 6,
         value_bytes: 24,
@@ -716,13 +716,31 @@ fn every_fixture_releases_everything_it_allocates() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for fx in FIXTURES {
         let d = drive(fx);
-        let (_charged, w) = d.measured();
-        assert!(!w.overflow, "{}: cohort table overflowed: {w:?}", fx.name);
-        assert_eq!(
-            w.retained, 0,
-            "{}: the instant leaf retained {} B past the drop of its own result: {w:?}",
-            fx.name, w.retained
-        );
+        // **Warm the pipeline outside every window.** The first match a
+        // regular-expression label filter performs builds the matcher's
+        // lazy cache, which the `CompiledPipeline` owns and which
+        // therefore outlives the leaf: measured 4,510 B on
+        // `count_nonmutating`'s first run and 0 B on every run after it.
+        // That is a one-time allocation of the fixture's own apparatus,
+        // not a leaf that failed to free. Both cells below are measured
+        // after it, and both must be zero — a leaf that leaks leaks on
+        // every run, so warming cannot hide one.
+        let (warm, _charged) = d.run();
+        drop(warm);
+        for cell in 0..2u32 {
+            let (_charged, w) = d.measured();
+            assert!(
+                !w.overflow,
+                "{} cell {cell}: cohort table overflowed: {w:?}",
+                fx.name
+            );
+            assert_eq!(
+                w.retained, 0,
+                "{} cell {cell}: the instant leaf retained {} B past the drop of its own \
+                 result: {w:?}",
+                fx.name, w.retained
+            );
+        }
     }
 }
 
@@ -817,12 +835,36 @@ fn every_fixture_returns_a_vector() {
     for fx in FIXTURES {
         let d = drive(fx);
         let (result, _charged) = d.run();
+        let QueryResult::Vector(series) = &result else {
+            panic!(
+                "{}: the instant leaf returned {result:?}, not a Vector — B5's domain is no \
+                 longer the seam's",
+                fx.name
+            );
+        };
+        println!("VECTOR {:<32} series={}", fx.name, series.len());
+        // **The filter has to KEEP rows.** A fixture whose label filter
+        // matches nothing runs the same code with an empty fold, so every
+        // measurement above it is taken over no data and the seam it
+        // claims to exercise never fills. `absent_over_time` is the one
+        // fixture that is meant to see no rows, and it emits one
+        // synthetic series for exactly that reason.
         assert!(
-            matches!(result, QueryResult::Vector(_)),
-            "{}: the instant leaf returned {result:?}, not a Vector — B5's domain is no \
-             longer the seam's",
+            !series.is_empty(),
+            "{}: the instant leaf returned an empty vector — its filter kept no row, so \
+             every cell measured over this fixture is measured over nothing",
             fx.name
         );
+        // The non-mutating fixtures rename nothing, so the output series
+        // are the streams themselves, one each.
+        if fx.name.contains("nonmutating") {
+            assert_eq!(
+                series.len(),
+                fx.streams,
+                "{}: a non-mutating pipeline must emit one series per stream",
+                fx.name
+            );
+        }
     }
 }
 

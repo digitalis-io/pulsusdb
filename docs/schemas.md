@@ -437,9 +437,12 @@ text:
   raw scans add it to the `SELECT` list; `| trace_id="…"` and
   `| trace_id!="…"` additionally compile into the statement's `WHERE`, and
   the request `LIMIT` compiles with them, which is what turns the sample
-  read from a page loop into one statement. **When the rendered fragments
-  exceed `MAX_METADATA_FRAGMENT_BYTES` (2 MiB) the filter does not lower
-  and the query takes the route it takes today, with the same answer.**
+  read from a page loop into one statement. **Two things put it back on the
+  route it takes today, with the same answer: rendered fragments over
+  `MAX_METADATA_FRAGMENT_BYTES` (2 MiB), and a selected stream carrying
+  both `k` and `k` without its `_extracted` suffix as labels** — the double
+  collision, where a renamed metadata pair overwrites the stream label of
+  that name, so the three name-resolution arms do not describe it.
   The regular-expression and numeric forms stay client-side, each for a
   reason docs/query-to-sql.md states.
   Two of the three reasons the earlier rule gave survive and are still
@@ -450,8 +453,9 @@ text:
   `<k>_extracted` before any filter would see it. What does not survive is
   the conclusion drawn from them: the value was never pruning. It is the
   statement count and the bytes on the metered hop, and the rename is
-  reproduced by the predicate's three name-resolution arms rather than
-  being a reason it cannot exist. The `ORDER BY` clauses are unchanged, so
+  reproduced by the predicate's three name-resolution arms — except in the
+  double collision above, which those three arms do not cover and which
+  therefore does not lower — rather than being a reason it cannot exist. The `ORDER BY` clauses are unchanged, so
   `optimize_read_in_order` is intact.
 - **`absent_over_time` does not read the column at all.** It is the one
   reducer whose label set is provably metadata-independent

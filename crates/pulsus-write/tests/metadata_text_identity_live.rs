@@ -467,31 +467,73 @@ const BLIND_SPOTS: &[BlindSpot] = &[
     },
 ];
 
-/// The ingest function whose constraints the table above is derived from.
-const INGEST_FILE: &str = "src/protocols/loki_push.rs";
-const INGEST_FN: &str = "fn canonical_structured_metadata<'a>(";
-
-/// The digest of that function's body, from its `fn` line to its closing
-/// brace.
+/// **Every function the inventory's rows actually rest on**, not the
+/// outer one alone (issue #544 code review round 1).
 ///
-/// **A tripwire, not a classifier.** It fires on ANY edit to the body — a
-/// rename and a comment included — so it names the function and not the
-/// constraint. That is the price of detecting something that is, by
-/// definition, not yet described: a constraint ADDED inside the function
-/// changes neither the table nor any set built from it, so nothing
-/// narrower than "this function changed, re-derive the table" can see it.
-/// Anything narrower would have to parse the body, and a parser that
-/// decides what a "constraint" is would be a second place for this
-/// question to be answered wrongly.
-const INGEST_BODY_SHA256: &str = "523f7488cb27d7fb520c4bf646fc63f8a4158ea84c2b28b3f8d6cfe993f0030a";
+/// The first version hashed `canonical_structured_metadata` and nothing
+/// else — and three of the six rows name transformations that live in a
+/// CALLEE. `resolve_structured_metadata` is where the empty-value strip,
+/// the replacement-character rewrite and the name normalisation are; a
+/// constraint added there changed no digest at all, which is exactly the
+/// direction the digest exists to cover.
+///
+/// One entry per function, each pinned separately, so a failure names the
+/// function that moved rather than the set.
+///
+/// | function | which rows rest on it |
+/// |---|---|
+/// | the metadata ingest function | the two caps, and which checks run at all |
+/// | `validate_label_names` | the empty name and the underscore-only family |
+/// | `resolve_structured_metadata` | the empty-value strip, the replacement-character rewrite, the namer's application |
+/// | `log_label_name` | what the ingest namer does, which row 6 is the remainder of |
+///
+/// **A tripwire, not a classifier.** It fires on ANY edit to any of those
+/// bodies — a rename and a comment included — so it names the function and
+/// not the constraint. That is the price of detecting something that is,
+/// by definition, not yet described: a constraint ADDED changes neither
+/// the table nor any set built from it, so nothing narrower than "this
+/// function changed, re-derive the table" can see it. Anything narrower
+/// would have to parse the body, and a parser that decides what a
+/// "constraint" is would be a second place for this question to be
+/// answered wrongly.
+///
+/// **What it still does not reach:** a constraint applied somewhere else
+/// on the way to the column — a layer above the receiver, or the writer's
+/// batch path. `every_stored_metadata_field_source_uses_a_pinned_escaper`
+/// is what bounds where writers can be; nothing bounds where a refusal
+/// can be.
+const INGEST_BODIES: &[(&str, &str, &str)] = &[
+    (
+        "crates/pulsus-write/src/protocols/loki_push.rs",
+        "fn canonical_structured_metadata<'a>(",
+        "523f7488cb27d7fb520c4bf646fc63f8a4158ea84c2b28b3f8d6cfe993f0030a",
+    ),
+    (
+        "crates/pulsus-write/src/protocols/label_name.rs",
+        "pub(crate) fn validate_label_names<'a>(",
+        "cf51b760cf658e8a762b027a1751bc4b287ae13ea84e6e6b13241075b120bf17",
+    ),
+    (
+        "crates/pulsus-model/src/labels.rs",
+        "pub fn resolve_structured_metadata(pairs: Vec<(String, String)>)",
+        "03768afa04451e59d8eebd9383048db690b323da4991bfbe0cc6559e261f78f3",
+    ),
+    (
+        "crates/pulsus-model/src/canonical.rs",
+        "pub fn log_label_name(name: &str) -> String {",
+        "8255c217b9eec6b99b8c8b0d19f87469ab0119a066081578e3830c7456a29ea2",
+    ),
+];
 
-fn ingest_function_body() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(INGEST_FILE);
+/// One function body, from its `fn` line to the closing brace at column
+/// zero.
+fn function_body(rel: &str, signature: &str) -> String {
+    let path = repo_root().join(rel);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut out = String::new();
     let mut inside = false;
     for line in text.lines() {
-        if line.starts_with(INGEST_FN) {
+        if line.starts_with(signature) {
             inside = true;
         }
         if inside {
@@ -502,7 +544,21 @@ fn ingest_function_body() -> String {
             }
         }
     }
-    panic!("{INGEST_FN} not found in {INGEST_FILE}");
+    panic!("{signature} not found in {rel}");
+}
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repository root")
+}
+
+fn digest_of(body: &str) -> String {
+    format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes())
+    )
 }
 
 /// Issue #544 AC19, the inventory — **every ingest constraint has a row,
@@ -521,19 +577,24 @@ async fn the_blind_spot_rows_match_the_ingest_sites() {
     skip_unless_live!();
     let ch = client().await;
 
-    // The tripwire.
-    let body = ingest_function_body();
-    let digest = format!(
-        "{:x}",
-        <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes())
-    );
-    assert_eq!(
-        digest,
-        INGEST_BODY_SHA256,
-        "the metadata ingest function changed. Re-derive the blind-spot table in this file — \
-         of each constraint in that body, ask whether the render re-applies it, and on WHICH \
-         inputs — then update `INGEST_BODY_SHA256`. The body is {} lines.",
-        body.lines().count()
+    // The tripwire, over every function the rows rest on.
+    let mut moved: Vec<String> = Vec::new();
+    for (rel, signature, pinned) in INGEST_BODIES {
+        let body = function_body(rel, signature);
+        let digest = digest_of(&body);
+        if &digest != pinned {
+            moved.push(format!(
+                "{rel} :: {signature} — {} lines, digest {digest}, pinned {pinned}",
+                body.lines().count()
+            ));
+        }
+    }
+    assert!(
+        moved.is_empty(),
+        "a function the blind-spot table rests on changed. Re-derive the table — of each \
+         constraint in that body, ask whether the render re-applies it, and on WHICH inputs — \
+         then update its row in `INGEST_BODIES`:\n  {}",
+        moved.join("\n  ")
     );
 
     for row in BLIND_SPOTS {

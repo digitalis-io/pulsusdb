@@ -336,6 +336,11 @@ pub struct LogQlEngine {
     /// [`super::predicate::MAX_METADATA_FRAGMENT_BYTES`]. `None` is the
     /// shipped constant; production never sets it.
     metadata_fragment_budget: Option<usize>,
+    /// Measurement-only: a `log_comment` every read this engine issues
+    /// carries, so `system.query_log` can attribute a statement to the
+    /// request that made it (issue #544 code review round 1). `None` is
+    /// production, and then nothing is sent.
+    query_log_comment: Option<String>,
 }
 
 /// Test-only settings for the extracted-field group key read (issue #507).
@@ -359,7 +364,22 @@ impl LogQlEngine {
             config,
             key_route_test: KeyRouteTestHooks::default(),
             metadata_fragment_budget: None,
+            query_log_comment: None,
         }
+    }
+
+    /// Tags every read this engine issues with `comment`, recorded by the
+    /// database as `log_comment` (issue #544 code review round 1).
+    ///
+    /// **For measurement, not for production.** The benchmark needs to
+    /// attribute each statement to the request that made it, and the
+    /// alternative — matching the statement TEXT for a predicate literal —
+    /// attributes nothing on a route whose predicate never reaches SQL,
+    /// which is precisely the route being compared.
+    #[doc(hidden)]
+    pub fn with_query_log_comment(mut self, comment: impl Into<String>) -> Self {
+        self.query_log_comment = Some(comment.into());
+        self
     }
 
     /// Lowers the statement's structured-metadata fragment budget (issue
@@ -1048,10 +1068,25 @@ impl LogQlEngine {
     }
 
     fn budget_settings(&self) -> QuerySettings {
-        read_query_settings(
+        self.tagged(read_query_settings(
             self.config.scan_budget_bytes,
             self.config.read_max_memory_bytes,
-        )
+        ))
+    }
+
+    /// Applies the measurement tag, when one is set (issue #544 code
+    /// review round 1).
+    ///
+    /// **The one place it is applied**, so no read path can be measured
+    /// and no read path can be missed. Production never sets the tag and
+    /// this is then the identity — `system.query_log` records a setting
+    /// only when the client sent it, so an untagged read's `log_comment`
+    /// stays empty and nothing about the shipped statements moves.
+    fn tagged(&self, settings: QuerySettings) -> QuerySettings {
+        match &self.query_log_comment {
+            Some(tag) => settings.set("log_comment", tag.as_str()),
+            None => settings,
+        }
     }
 
     /// The request's own bounds, as the activity semi-join's window
@@ -1186,8 +1221,10 @@ impl LogQlEngine {
     /// never decremented — every page carries the same
     /// `reader.logql_read_max_memory_bytes`.
     pub fn paging_settings(&self, remaining: u64) -> QuerySettings {
-        read_query_settings(remaining, self.config.read_max_memory_bytes)
-            .set("wait_end_of_query", 1)
+        self.tagged(
+            read_query_settings(remaining, self.config.read_max_memory_bytes)
+                .set("wait_end_of_query", 1),
+        )
     }
 
     /// Executes a [`StreamsPlan`] end to end. When `explain` is `Some`,
@@ -1597,11 +1634,26 @@ impl LogQlEngine {
                 QueryResult::Matrix(Vec::new())
             });
         }
-        if let (Some(client), Some(compiled)) = (&mp.client, &compiled) {
-            return self
-                .run_metric_client(mp, client, compiled, &fingerprints, explain)
-                .await;
-        }
+        // **Hydration happens BEFORE the client branch** (issue #544 code
+        // review round 1). It used to sit below it, and
+        // `run_metric_client` hydrated again for itself — which meant the
+        // client-aggregated route returned before any metadata fragment
+        // could be rendered, because rendering one needs the stream label
+        // sets stage 2 resolves. Two things followed, and the second is a
+        // wrong answer rather than a wide scan:
+        //
+        // * a client-aggregated range carried no fragment at all, against
+        //   what `docs/features.md` §2 and `docs/schemas.md` §3.2 state.
+        //   Its client pipeline re-filters, so the ANSWER was right and
+        //   the bytes were not;
+        // * the bucketed grid's capability fallback builds an EMPTY
+        //   pipeline, whose own doc says that is sound because the
+        //   fragment is already in the scan. With the fragment omitted
+        //   there is nothing to re-filter, so that route would have
+        //   counted every row in the window.
+        //
+        // One hydration, one render, one predicate vector, passed to every
+        // route below.
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
@@ -1621,12 +1673,28 @@ impl LogQlEngine {
         };
 
         // Issue #544: the structured-metadata fragments, rendered from the
-        // stream label sets stage 2 has just resolved. Both routes below
-        // let the DATABASE compute the aggregate, so a fragment that does
-        // not fit its budget cannot simply be omitted — the answer would
-        // move. The plan carries the client stage it would have had, and
-        // this is where it is swapped back in.
+        // stream label sets stage 2 has just resolved. The two routes that
+        // let the DATABASE compute the aggregate cannot simply omit a
+        // fragment that does not fit its budget — the answer would move —
+        // so the plan carries the client stage it would have had and this
+        // is where it is swapped back in. On the client-aggregated route
+        // an omission costs bytes and not the answer, because the client
+        // pipeline re-runs the filter.
         let lowered = metric_predicates(mp, &fingerprints, &meta, self.metadata_budget());
+        if let (Some(client), Some(compiled)) = (&mp.client, &compiled) {
+            return self
+                .run_metric_client(
+                    mp,
+                    client,
+                    compiled,
+                    &fingerprints,
+                    &meta,
+                    &services,
+                    &lowered.predicates,
+                    explain,
+                )
+                .await;
+        }
         if !lowered.metadata_lowered {
             let restored = mp
                 .metadata_lowering
@@ -1635,7 +1703,19 @@ impl LogQlEngine {
             if let Some(client) = restored {
                 let compiled = CompiledPipeline::compile(&client.pipeline)?;
                 return self
-                    .run_metric_client(mp, client, &compiled, &fingerprints, explain)
+                    .run_metric_client(
+                        mp,
+                        client,
+                        &compiled,
+                        &fingerprints,
+                        &meta,
+                        &services,
+                        // `lowered.predicates` carries no metadata
+                        // fragment here: this arm runs exactly because the
+                        // render did not fit its budget.
+                        &lowered.predicates,
+                        explain,
+                    )
                     .await;
             }
         }
@@ -1787,8 +1867,25 @@ impl LogQlEngine {
                     // nobody chose for it.
                     let client = bucketed_fallback_client_agg(mp);
                     let compiled = CompiledPipeline::compile(&client.pipeline)?;
-                    self.run_metric_client(mp, &client, &compiled, &fingerprints, explain)
-                        .await
+                    // **`lowered.predicates`, and the metadata fragment in
+                    // it is load-bearing** (issue #544 code review round
+                    // 1). This fallback's pipeline is EMPTY, and its own
+                    // doc says that is sound because the predicates are
+                    // already in the scan. Passing `mp.extra_predicates`
+                    // here would leave nothing to apply the metadata
+                    // filter at all, and the aggregate would count every
+                    // row in the window.
+                    self.run_metric_client(
+                        mp,
+                        &client,
+                        &compiled,
+                        &fingerprints,
+                        &meta,
+                        &services,
+                        &lowered.predicates,
+                        explain,
+                    )
+                    .await
                 }
             }
         }
@@ -1825,7 +1922,20 @@ impl LogQlEngine {
         let resolved = super::unwrap_group::resolve(u, meta);
         let Some(scan) = unwrapped_scan(mp) else {
             return self
-                .run_metric_client(mp, &client, &compiled, fingerprints, explain)
+                .run_metric_client(
+                    mp,
+                    &client,
+                    &compiled,
+                    fingerprints,
+                    meta,
+                    services,
+                    // The extracted-field group key read is reached only
+                    // through a `| json` parser, and a metadata filter
+                    // after one does not lower, so this plan carries no
+                    // metadata fragment to add.
+                    &mp.extra_predicates,
+                    explain,
+                )
                 .await;
         };
         match self
@@ -1845,7 +1955,16 @@ impl LogQlEngine {
             KeyRouteOutcome::TodaysRoute(_why) => {}
         }
         let todays = self
-            .run_metric_client(mp, &client, &compiled, fingerprints, explain.as_deref_mut())
+            .run_metric_client(
+                mp,
+                &client,
+                &compiled,
+                fingerprints,
+                meta,
+                services,
+                &mp.extra_predicates,
+                explain.as_deref_mut(),
+            )
             .await;
         match todays {
             Err(ReadError::QueryTooBroad(reason)) if lane_may_answer(&reason) => {
@@ -2032,23 +2151,24 @@ impl LogQlEngine {
     /// (`QueryTooBroad`), never silently truncated — then run the
     /// compiled pipeline per line, bucket by step in-engine, reduce per
     /// `(final-label-set, bucket)`, and finish the vector aggregations.
+    #[allow(clippy::too_many_arguments)]
     async fn run_metric_client(
         &self,
         mp: &MetricPlan,
         client: &ClientAgg,
         compiled: &CompiledPipeline,
         fingerprints: &[u64],
+        meta: &HashMap<u64, StreamMetaRow>,
+        services: &[CheckedLiteral],
+        predicates: &[CheckedFragment],
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
-        if let Some(e) = explain.as_mut() {
-            e.push(
-                "stage2_hydration",
-                super::sql::stage2(&mp.streams_table, fingerprints),
-                None,
-            );
-        }
-        let meta = self.hydrate(&mp.streams_table, fingerprints).await?;
-        let services = distinct_escaped_services(&meta);
+        // **The hydrated state is passed in, not fetched here** (issue
+        // #544 code review round 1): the metadata fragments are rendered
+        // from the stream label sets, so a route that hydrated for itself
+        // was a route that could not carry one. `run_metric_inner` does
+        // the one hydration and the one render, and every route below it
+        // takes the same `predicates`.
         let is_range = mp.step_ns.is_some();
         let time_window = super::sql::TimeWindow {
             start_ns: mp.start_ns,
@@ -2057,7 +2177,7 @@ impl LogQlEngine {
         // Issue #227: a range query reads in physical-key order
         // (`optimize_read_in_order`, no server sort) for the streaming slide;
         // an instant query keeps the total-timestamp order its reducers pin.
-        let sql = client_metric_read_sql(mp, &services, fingerprints, time_window);
+        let sql = client_metric_read_sql(mp, services, fingerprints, time_window, predicates);
         // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
         // that used to sit here is gone — every
         // LogQL read now carries the ceiling from
@@ -2101,7 +2221,7 @@ impl LogQlEngine {
         let (mut state, folded) = if is_range {
             let mut range = RangeSlideState::new(
                 compiled,
-                &meta,
+                meta,
                 client,
                 window,
                 mp.rate_window_ns,
@@ -2129,7 +2249,7 @@ impl LogQlEngine {
                 MetricAggState::Instant(Box::new(
                     ClientAggState::new(
                         compiled,
-                        &meta,
+                        meta,
                         client,
                         instant,
                         mp.rate_window_ns,
@@ -2236,7 +2356,19 @@ impl LogQlEngine {
             start_ns: scan.start_ns,
             end_ns: scan.end_ns,
         };
-        let sql = client_metric_read_sql(scan, &services, &fingerprints, time_window);
+        // Issue #544: the variants scan hydrates for itself, so it
+        // renders its own fragments from the same function. A variants
+        // chain is `force_client`, so its metadata filter — if the common
+        // pipeline carries one — is re-applied per variant by the arena;
+        // the fragment narrows the scan and cannot change the answer.
+        let lowered = metric_predicates(scan, &fingerprints, &meta, self.metadata_budget());
+        let sql = client_metric_read_sql(
+            scan,
+            &services,
+            &fingerprints,
+            time_window,
+            &lowered.predicates,
+        );
         // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
         // that used to sit here is gone — every
         // LogQL read now carries the ceiling from
@@ -2463,10 +2595,11 @@ impl LogQlEngine {
             // query runs the PK-ordered sliding scan (`run_metric_client`),
             // so reporting `metric_raw_samples` here made the
             // `explain_indexes` gates validate a query we never issue.
-            client_metric_read_sql(mp, &services, &fingerprints, window)
+            client_metric_read_sql(mp, &services, &fingerprints, window, &lowered.predicates)
         } else {
             match mp.step_ns {
-                // The execution twin's range arm (issue #507, W2). It
+                // The execution twin's range arm (issue #507, the
+                // bucketed range read). It
                 // refused with the engine while the state was unreachable;
                 // now that the engine serves it, an EXPLAIN that still
                 // refused would be a wrong answer on a route a user can
@@ -2475,7 +2608,8 @@ impl LogQlEngine {
                 // the query that runs — including the capability join,
                 // whose three refusals report the client path's scan
                 // because that is what would execute.
-                // Issue #507 W4: the unwrapped shape has its own
+                // Issue #507, the extracted-field group key: the
+                // unwrapped shape has its own
                 // statement, so the twin matches the plan's `value` here
                 // exactly as the reader does. The fallback text is the
                 // client scan in both arms, because that is what would
@@ -2511,7 +2645,13 @@ impl LogQlEngine {
                             BucketGridRefusal::StepNotPositive
                             | BucketGridRefusal::AnchorAboveScanStart
                             | BucketGridRefusal::WouldOverflow,
-                        ) => client_metric_read_sql(mp, &services, &fingerprints, window),
+                        ) => client_metric_read_sql(
+                            mp,
+                            &services,
+                            &fingerprints,
+                            window,
+                            &lowered.predicates,
+                        ),
                     }
                 }
                 // The shape is read here rather than above the match,
@@ -5443,6 +5583,7 @@ fn client_metric_read_sql(
     services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: super::sql::TimeWindow,
+    predicates: &[CheckedFragment],
 ) -> String {
     // `absent_over_time` is the ONLY reducer whose label set is provably
     // metadata-independent (`syntax/extractor.go:46-47` forces
@@ -5461,7 +5602,7 @@ fn client_metric_read_sql(
             fingerprints,
             window,
             mp.scan_lower,
-            &mp.extra_predicates,
+            predicates,
             projection,
         )
     } else {
@@ -5471,7 +5612,7 @@ fn client_metric_read_sql(
             fingerprints,
             window,
             mp.scan_lower,
-            &mp.extra_predicates,
+            predicates,
             projection,
         )
     }
@@ -6274,7 +6415,7 @@ mod tests {
             end_ns: 60_000_000_000,
             step_ns: 15_000_000_000,
         });
-        let range_sql = client_metric_read_sql(&range_mp, &svc, &[1], window);
+        let range_sql = client_metric_read_sql(&range_mp, &svc, &[1], window, &[]);
         assert!(
             range_sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
             "range EXPLAIN/exec must report the sliding scan: {range_sql}"
@@ -6283,7 +6424,7 @@ mod tests {
         let instant_mp = mk(QuerySpec::Instant {
             at_ns: 60_000_000_000,
         });
-        let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window);
+        let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window, &[]);
         assert!(
             instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
             "instant must keep its total order: {instant_sql}"

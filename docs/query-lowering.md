@@ -1804,10 +1804,13 @@ Each of the three is a test, not a claim — §11 nominates one per walk, so tha
   given filter shape actually prunes granules is a measurement, and it is #507's.
   **The structured-metadata label filter moved here from group 2 in issue #544**: an equality or
   inequality over a metadata name compiles into the sample statement, and the request `LIMIT`
-  compiles with it. It prunes nothing — no skip index covers that column, and `EXPLAIN indexes=1`
+  compiles with it — unless the fragments exceed `MAX_METADATA_FRAGMENT_BYTES`, or a selected
+  stream carries both the name and that name without its `_extracted` suffix as labels. It prunes nothing — no skip index covers that column, and `EXPLAIN indexes=1`
   over 3,000,000 rows reports `Granules: 367/367` with no `Skip` section — so what it saves is the
-  statement count and the bytes on the metered hop rather than the scan: 3,003 statements and
-  511,597,595 bytes become 1 and 1,536. The regular-expression and numeric forms stay in group 2,
+  statement count and the bytes on the metered hop rather than the scan: 3,001 statements and
+  460,676,744 bytes become 1 and 1,536, measured by
+  `cargo run -p xtask -- bench logql-metadata-filter` and stated with its settings in
+  [query-to-sql.md](query-to-sql.md) §2.7.4. The regular-expression and numeric forms stay in group 2,
   each for a reason [query-to-sql.md](query-to-sql.md) §2.7.4 states.
 
 ---

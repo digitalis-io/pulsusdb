@@ -221,6 +221,12 @@ fn window(ts_ns: i64) -> QueryParams {
     }
 }
 
+/// An engine at the shipped metadata budget, for a control beside a
+/// starved one.
+async fn full_engine(db: &str) -> LogQlEngine {
+    LogQlEngine::new(data_client(db).await, engine_config(db))
+}
+
 /// The number of entries a log query returns.
 async fn entries(engine: &LogQlEngine, query: &str, params: &QueryParams) -> usize {
     let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
@@ -1118,6 +1124,128 @@ async fn a_metric_query_over_a_metadata_filter_answers_the_same_from_one_stateme
     drop_db(&db).await;
 }
 
+/// Issue #544 code review round 1 — **every metric route carries the
+/// fragment in its statement, including the client-aggregated one.**
+///
+/// A client-aggregated range used to return before the fragment could be
+/// rendered: `run_metric_client` hydrated for itself, below the branch
+/// that chose it, so the stream label sets a fragment is built from did
+/// not exist yet. The answer was right — that route's client pipeline
+/// re-runs the filter — and the bytes were not, against what
+/// `docs/features.md` §2 and `docs/schemas.md` §3.2 state.
+///
+/// Asserted by reading the statement the database executed, not by
+/// counting statements: on a corpus this small a page loop finishes in
+/// one page, so a count of 1 does not separate the routes.
+#[tokio::test]
+async fn every_metric_route_carries_the_fragment_in_its_statement() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("logql_md_filter_metric_routes");
+    let client = create_schema(&db).await;
+    let admin = admin_client().await;
+    let ts = now_ns();
+    seed(&client, &db, ts, STREAMS, &all_rows()).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+
+    // `[5m]` against a 60s step: the range is not the step, so this is the
+    // client-aggregated route — the one that carried no fragment.
+    let ranged =
+        format!(r#"count_over_time({{service_name="checkout"}} | trace_id="{TRACE_1}" [5m])"#);
+    let range_params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: ts,
+            end_ns: ts + 300_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Forward,
+    };
+    let since = now_micros(&admin).await;
+    let got = matrix(&engine, &ranged, &range_params).await;
+    assert_eq!(got.len(), 1, "one series: {got:?}");
+    assert!(
+        got[0].1.iter().all(|v| (*v - 1.0).abs() < f64::EPSILON),
+        "every point counts the one matching row: {got:?}"
+    );
+
+    flush_logs(&admin).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    flush_logs(&admin).await;
+    let sql = format!(
+        "SELECT count() AS n FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since} \
+           AND has(tables, '{db}.log_samples') \
+           AND NOT has(tables, 'system.query_log') \
+           AND position(query, concat('JSONExtractString(structured_metadata', \
+                                      ', ''trace_id'')')) > 0"
+    );
+    let mut stream = admin
+        .query_stream::<CountRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("count statements");
+    let with_fragment = stream.next().await.expect("a row").expect("decode").n;
+    assert_eq!(
+        with_fragment, 1,
+        "the client-aggregated range's own statement must carry the metadata fragment"
+    );
+    drop_db(&db).await;
+}
+
+/// Issue #544 AC16 — **the bucketed range route restores the same stage**,
+/// asserted against literal labels and literal point values.
+///
+/// The consolidated test below compares the starved engine against the
+/// same engine at the shipped budget, which is production against
+/// production: a control that moved would move the expectation with it.
+/// This one writes the answer out.
+///
+/// The shape: `[1m]` against a 60s step is the bucketed range route, the
+/// one where the database computes the aggregate and there is no client
+/// stage to re-filter. Under the budget the plan restores the client stage
+/// it would have had. Taking `bucketed_fallback_client_agg` instead —
+/// whose pipeline is EMPTY — filters nothing and counts every row in the
+/// window.
+#[tokio::test]
+async fn an_oversized_fragment_restores_the_client_stage_on_a_bucketed_range_query() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("logql_md_filter_bucketed_restore");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed(&client, &db, ts, STREAMS, &all_rows()).await;
+    let starved = LogQlEngine::new(data_client(&db).await, engine_config(&db))
+        .with_metadata_fragment_budget(1);
+
+    let ranged =
+        format!(r#"count_over_time({{service_name="checkout"}} | trace_id="{TRACE_1}" [1m])"#);
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: ts,
+            end_ns: ts + 60_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Forward,
+    };
+    // **The literal answer.** One series, carrying the matching row's
+    // metadata in its identity (issue #249's merge), and one point. The
+    // matching row is the first of corpus A, at `ts` exactly: the window
+    // `(g - 1m, g]` contains it at the first grid point and not at the
+    // second, and an empty bucket is not emitted — so the series carries
+    // the single value `1`.
+    assert_eq!(
+        matrix(&starved, &ranged, &params).await,
+        vec![(
+            "{env=prod,pod=checkout-7d9f6c5b4-xk2pq,service_name=checkout,\
+             trace_id=740e2a1b9c3d4f5061728394a5b6c7d8}"
+                .to_string(),
+            vec![1.0],
+        )],
+        "the bucketed range route must restore the client stage that holds the filter"
+    );
+    drop_db(&db).await;
+}
+
 /// Issue #544 AC12, AC15 and AC16 — **a fragment past the budget falls
 /// back, on all three routes that can meet it.**
 ///
@@ -1148,7 +1276,16 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
     let starved = LogQlEngine::new(data_client(&db).await, engine_config(&db))
         .with_metadata_fragment_budget(1);
 
-    // AC12 — the streams route. The same answer, and never a rejection.
+    // AC12 — the streams route. The same answer, never a rejection, and
+    // **the route proved rather than inferred** (code review round 1).
+    //
+    // The answers alone do not separate the two routes: the lowered SQL
+    // is exact, so ignoring the budget override entirely leaves every
+    // answer identical and the test green. What separates them is the
+    // statement the database executed — the fallback route carries no
+    // extraction over the metadata column at all.
+    let admin = admin_client().await;
+    let since = now_micros(&admin).await;
     for (query, want) in LOWERED {
         let got = entries(&starved, query, &window(ts)).await;
         assert_eq!(
@@ -1156,6 +1293,48 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
             "{query}: the budget fallback must answer exactly what the lowered route answers"
         );
     }
+    flush_logs(&admin).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    flush_logs(&admin).await;
+    let with_fragment = format!(
+        "SELECT count() AS n FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since} \
+           AND has(tables, '{db}.log_samples') \
+           AND NOT has(tables, 'system.query_log') \
+           AND position(query, concat('JSONExtractString(structured_', 'metadata')) > 0"
+    );
+    let mut stream = admin
+        .query_stream::<CountRow>(&with_fragment, &QuerySettings::new())
+        .await
+        .expect("count statements");
+    let lowered_statements = stream.next().await.expect("a row").expect("decode").n;
+    assert_eq!(
+        lowered_statements,
+        0,
+        "a starved budget must put every one of the {} lowered queries on the fallback route, \
+         whose statements carry no extraction over the metadata column; {lowered_statements} \
+         carried one",
+        LOWERED.len()
+    );
+    // The control, so the zero above is the BUDGET's doing and not a
+    // counting query that matches nothing: the same corpus at the shipped
+    // budget puts the fragment in a statement.
+    let since_full = now_micros(&admin).await;
+    let _ = entries(&full_engine(&db).await, LOWERED[0].0, &window(ts)).await;
+    flush_logs(&admin).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    flush_logs(&admin).await;
+    let control_sql = with_fragment.replace(&since.to_string(), &since_full.to_string());
+    let mut stream = admin
+        .query_stream::<CountRow>(&control_sql, &QuerySettings::new())
+        .await
+        .expect("count statements");
+    let at_the_shipped_budget = stream.next().await.expect("a row").expect("decode").n;
+    assert!(
+        at_the_shipped_budget >= 1,
+        "the control: at the shipped budget the same query DOES carry the fragment"
+    );
 
     // AC15 — the instant, database-aggregated route. Omitting the
     // fragment with no client stage counts every row the window admits,
