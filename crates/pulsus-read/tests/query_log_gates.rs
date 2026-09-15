@@ -7556,7 +7556,7 @@ fn stream_is_plain(group: &str) -> bool {
 //         <- a closed vocabulary written as literals below
 //     B2  the committed statements hash to PINNED_SELECTION_STATEMENTS
 //         <- that constant, in this source file
-//     B3  every query — the base and all four wrappings — issues exactly
+//     B3  every query — the base and all six wrappings — issues exactly
 //         its route's committed statements, byte for byte
 //         <- crates/pulsus-read/tests/golden/logql_selection_statements.txt
 //     C   the answers differ as the corpus requires
@@ -8217,7 +8217,8 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
                     got_sql, want_sql,
                     "{}: {}'s {got_name} statement is not the committed one. §1.3's row says \
                      the selection becomes no SQL; every query on this route — the base and \
-                     all four wrappings — must issue these bytes",
+                     all six wrappings, four with the selection outermost and two with it \
+                     inside — must issue these bytes",
                     block.route, run.query
                 );
             }
