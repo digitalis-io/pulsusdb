@@ -643,22 +643,32 @@ impl MetricsEngine {
                     // driver is not represented and the module doc says
                     // so. Sorted here the way `build_chunk_sqls` sorts,
                     // so the leaf and the statement carry one list.
+                    //
+                    // **A read is recorded only where a chunk exists, and
+                    // that is the same condition as a statement being
+                    // sent**: `build_chunk_sqls` renders one statement per
+                    // chunk of this same list. An empty fingerprint set —
+                    // a concrete metric name the cache does not know —
+                    // yields ZERO chunks and zero statements, and a read
+                    // recorded there would put a plan naming two
+                    // statements on the explain surface for a read the
+                    // database never performed (code review round 2).
                     if explain.is_some() {
                         let mut sorted = fps.clone();
                         sorted.sort_unstable();
-                        let first_chunk =
+                        if let Some(first_chunk) =
                             sample_sql::chunk_fingerprints(&sorted, sample_sql::CHUNK_THRESHOLD)
                                 .first()
-                                .copied()
-                                .unwrap_or(&[]);
-                        reads.push(compile::SelectorRead {
-                            selector: selector_id,
-                            pred: compile::selector_pred(
-                                &sample_sql::name_predicate(metric_name),
-                                &sample_sql::window_predicate(lower_excl, upper_incl),
-                                &sample_sql::fingerprints_predicate(first_chunk),
-                            ),
-                        });
+                        {
+                            reads.push(compile::SelectorRead {
+                                selector: selector_id,
+                                pred: compile::selector_pred(
+                                    &sample_sql::name_predicate(metric_name),
+                                    &sample_sql::window_predicate(lower_excl, upper_incl),
+                                    &sample_sql::fingerprints_predicate(first_chunk),
+                                ),
+                            });
+                        }
                     }
                     let hist_sqls = build_hist_chunk_sqls(
                         &self.config.hist_samples_table,

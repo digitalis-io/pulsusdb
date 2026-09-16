@@ -95,6 +95,13 @@ const LOOKBACK_MS: i64 = 300_000;
 /// The `[5m]` range of the two-chain query, written out.
 const RANGE_MS: i64 = 300_000;
 
+/// A concrete metric name the cache does not know. It resolves to an
+/// empty fingerprint set, which renders ZERO chunks and therefore zero
+/// statements — so it must contribute no plan either (code review round
+/// 2). It is a different arm from [`EXCLUDED_NAME`] below: this one
+/// reaches the cache and comes back empty, that one never reaches it.
+const MISSING_METRIC: &str = "metric_that_does_not_exist";
+
 /// A selector whose name matchers exclude its own concrete metric name,
 /// in the one spelling the parser accepts (issue #85's duplicate
 /// `__name__` matcher). One selector, no read, no plan.
@@ -589,6 +596,24 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
         "an excluded concrete name sends no statement; the log holds {rows:?}"
     );
     assert!(explain.plans.is_empty(), "and it carries no plan");
+
+    // 6 — a concrete metric the cache does not know. The name reaches the
+    // resolver, which answers with an empty fingerprint set; the chunker
+    // then yields no chunk and the engine sends nothing. An explain
+    // object naming two statements here would describe a read the
+    // database never performed (code review round 2).
+    let mark = now_micros(&h.admin).await;
+    let explain = h.explained(MISSING_METRIC).await;
+    let rows = settled_statements(&h.admin, &h.db, mark).await;
+    assert!(
+        rows.is_empty(),
+        "a metric the cache does not know sends no statement; the log holds {rows:?}"
+    );
+    assert!(
+        explain.plans.is_empty(),
+        "and it carries no plan; it carried {}",
+        explain.plans.len()
+    );
 }
 
 /// Criterion 10, half two: **the plan's SQL parts are the statements the
@@ -602,7 +627,7 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
     skip_unless_live!();
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_plan_parts_names")).await;
 
-    let cases: [(String, usize); 5] = [
+    let cases: [(String, usize); 6] = [
         (format!("max by (status) ({METRIC}{{status=\"500\"}})"), 1),
         (format!("{METRIC}{{status=\"500\"}}"), 1),
         (
@@ -614,6 +639,9 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
         ),
         ("time()".to_string(), 0),
         (EXCLUDED_NAME.to_string(), 0),
+        // One selector, one resolver answer, an empty fingerprint set —
+        // zero statements, so zero plans (code review round 2).
+        (MISSING_METRIC.to_string(), 0),
     ];
 
     for (query, plans) in cases {

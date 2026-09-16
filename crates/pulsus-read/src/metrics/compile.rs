@@ -415,6 +415,40 @@ pub struct Chain {
     pub links: Vec<PqlLink>,
 }
 
+/// How many selector-list entries' rows reach a node.
+///
+/// **Three cases and not a set**, because the rule asks exactly one
+/// question — *is `i` the only entry whose rows this node consumes?* —
+/// and that question is answered by `One(i)` alone. Carrying the whole
+/// set instead made the union O(entries) per edge and made the chain
+/// builder scan every node once per entry: a 4,096-selector query, which
+/// the accept surface admits at 43,940 bytes, did 33,550,336 node-filter
+/// checks (code review round 2). The merge below is O(1) and the
+/// information dropped — WHICH several entries reach a `Many` node — is
+/// information no rule here reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// No entry's rows reach this node: a scalar leaf, `time()`.
+    None,
+    /// Exactly one, so the node is on that entry's chain.
+    One(SelectorId),
+    /// Two or more, so the node is on no chain — and, because the merge
+    /// is monotonic, neither is any ancestor of it.
+    Many,
+}
+
+impl Owner {
+    /// The union, as the rule reads it. `None` is the identity; two
+    /// different `One`s are `Many`; `Many` absorbs.
+    fn merge(self, other: Owner) -> Owner {
+        match (self, other) {
+            (Owner::None, o) | (o, Owner::None) => o,
+            (Owner::One(a), Owner::One(b)) if a == b => Owner::One(a),
+            _ => Owner::Many,
+        }
+    }
+}
+
 /// Every chain of a planned query, one per selector-list entry, in the
 /// planner's own order.
 ///
@@ -423,44 +457,63 @@ pub struct Chain {
 /// for every walk over an accepted tree, whose depth may be
 /// [`pulsus_promql::MAX_EXPR_DEPTH`] = 250.
 ///
-/// The walk is three passes over a flattened pre-order of the tree:
-/// collect the nodes with their parents and depths; propagate each node's
-/// entry set into its parent, in reverse pre-order, so a node is
-/// processed after every descendant; then take, for each entry, the nodes
-/// whose set is exactly that entry, innermost first.
+/// **Linear in the tree, not quadratic in the selector list.** Four
+/// passes, each over the nodes or over the entries and never over both:
+///
+/// ```text
+///   flatten          nodes, their parents and their depths      O(nodes)
+///   own              each node's Owner, folded into its parent  O(nodes)
+///   bucket           each One node filed under its entry        O(nodes)
+///   build            one chain per entry, from its bucket only  O(entries + nodes)
+/// ```
+///
+/// The third pass is what removes the per-entry scan: **every node is
+/// placed at most once**, so the buckets hold no more than `nodes`
+/// entries between them however many selectors the query has.
+/// `the_explain_walk_is_linear_in_the_tree` bounds the counted work and
+/// reddens if a pass over all nodes is put back inside the per-entry
+/// loop.
 pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     let flat = flatten(&plan.root);
     let n = flat.nodes.len();
-    let mut entries: Vec<Vec<SelectorId>> = flat.direct.clone();
+
+    // Pass 2: each node's owner, folded upward. Reverse pre-order, so a
+    // node is merged into its parent after every one of its descendants
+    // has been merged into it.
+    let mut owner: Vec<Owner> = flat.direct.clone();
     for i in (0..n).rev() {
+        work_tick();
         if let Some(p) = flat.parent[i] {
-            let mine = entries[i].clone();
-            for id in mine {
-                if !entries[p].contains(&id) {
-                    entries[p].push(id);
-                }
-            }
+            owner[p] = owner[p].merge(owner[i]);
         }
     }
 
-    (0..plan.selectors.len())
-        .map(|id| {
-            // The nodes on this entry's chain form a path from the
-            // selector upward, so ordering them by depth descending is
-            // ordering them innermost first. The index tie-break is
-            // unreachable for a path and is there so the order is total.
-            let mut on_chain: Vec<(usize, usize)> = (0..n)
-                .filter(|&i| entries[i].len() == 1 && entries[i][0] == id)
-                .map(|i| (flat.depth[i], i))
-                .collect();
-            on_chain.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            let mut links = Vec::with_capacity(on_chain.len() + 1);
+    // Pass 3: one bucket per entry, filled in ONE pass over the nodes.
+    // Pre-order visits an ancestor before its descendants, so each
+    // bucket comes out ordered by increasing depth.
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); plan.selectors.len()];
+    for (i, own) in owner.iter().enumerate() {
+        work_tick();
+        if let Owner::One(id) = own
+            && let Some(bucket) = buckets.get_mut(*id)
+        {
+            bucket.push(i);
+        }
+    }
+
+    // Pass 4: one chain per entry, reading only that entry's bucket. The
+    // nodes on a chain form a path from the selector upward, so reversing
+    // the bucket's increasing depth is ordering them innermost first.
+    buckets
+        .into_iter()
+        .enumerate()
+        .map(|(id, bucket)| {
+            let mut links = Vec::with_capacity(bucket.len() + 1);
             links.push(PqlLink::Select(id));
-            links.extend(
-                on_chain
-                    .into_iter()
-                    .filter_map(|(_, i)| node_kind(flat.nodes[i]).map(PqlLink::Node)),
-            );
+            links.extend(bucket.into_iter().rev().filter_map(|i| {
+                work_tick();
+                node_kind(flat.nodes[i]).map(PqlLink::Node)
+            }));
             Chain {
                 selector: id,
                 links,
@@ -469,13 +522,45 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
         .collect()
 }
 
+/// Counts one unit of chain-building work, where **one unit is one node
+/// examined by one pass**.
+///
+/// **Test-only, and a no-op with no storage in every other build.** The
+/// cost claim above is a property a check has to be able to fail, and a
+/// wall clock is not one: a clock is not scale-invariant and it measures
+/// the machine rather than the algorithm. Counting the visits is, and
+/// `the_explain_walk_is_linear_in_the_tree` bounds them by a multiple of
+/// `nodes + entries` at four widths.
+#[cfg(test)]
+fn work_tick() {
+    WORK.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn work_tick() {}
+
+#[cfg(test)]
+thread_local! {
+    static WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` and reports the nodes examined while it ran.
+#[cfg(test)]
+fn work_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    WORK.with(|c| c.set(0));
+    let out = f();
+    (out, WORK.with(std::cell::Cell::get))
+}
+
 /// The plan tree flattened into pre-order, with each node's parent, its
-/// depth, and the entries it consumes DIRECTLY (before any propagation).
+/// depth, and the entry it consumes DIRECTLY (before any propagation).
 struct Flat<'a> {
     nodes: Vec<&'a PlanExpr>,
     parent: Vec<Option<usize>>,
     depth: Vec<usize>,
-    direct: Vec<Vec<SelectorId>>,
+    /// Never [`Owner::Many`]: no node names two entries of its own
+    /// account, so a `Many` can only ever arise from the merge.
+    direct: Vec<Owner>,
 }
 
 fn flatten(root: &PlanExpr) -> Flat<'_> {
@@ -493,7 +578,7 @@ fn flatten(root: &PlanExpr) -> Flat<'_> {
         flat.nodes.push(node);
         flat.parent.push(parent);
         flat.depth.push(depth);
-        flat.direct.push(direct_entries(node));
+        flat.direct.push(direct_owner(node));
         kids.clear();
         children(node, &mut kids);
         // Pushed in reverse so the first child is popped first and the
@@ -505,26 +590,29 @@ fn flatten(root: &PlanExpr) -> Flat<'_> {
     flat
 }
 
-/// The entries a node consumes **without** looking at its children.
+/// The entry a node consumes **without** looking at its children.
+///
+/// At most one, always — which is why the return type is an [`Owner`]
+/// that is never `Many` here.
 ///
 /// `Absent::selector` and `Timestamp::bare_selector` are deliberately not
-/// read here: each names a selector that is already the node's own
-/// argument, so counting it would be a second spelling of one occurrence.
+/// read: each names a selector that is already the node's own argument,
+/// so counting it would be a second spelling of one occurrence.
 /// `Info::info_selector` IS read, because the synthetic metadata selector
 /// is a selector-list entry that appears nowhere in the tree — which is
 /// why `info(m)` consumes two entries and is on no chain.
-fn direct_entries(e: &PlanExpr) -> Vec<SelectorId> {
+fn direct_owner(e: &PlanExpr) -> Owner {
     match e {
-        PlanExpr::Selector(id) => vec![*id],
+        PlanExpr::Selector(id) => Owner::One(*id),
         PlanExpr::RangeVector { source }
         | PlanExpr::RangeFn { source, .. }
         | PlanExpr::OverTime { source, .. }
         | PlanExpr::OverTimeParam { source, .. }
         | PlanExpr::AbsentOverTime { source } => match source {
-            RangeSource::Selector(id) => vec![*id],
-            RangeSource::Subquery(_) => Vec::new(),
+            RangeSource::Selector(id) => Owner::One(*id),
+            RangeSource::Subquery(_) => Owner::None,
         },
-        PlanExpr::Info { info_selector, .. } => vec![*info_selector],
+        PlanExpr::Info { info_selector, .. } => Owner::One(*info_selector),
         PlanExpr::Absent { .. }
         | PlanExpr::Sort { .. }
         | PlanExpr::SortByLabel { .. }
@@ -546,7 +634,7 @@ fn direct_entries(e: &PlanExpr) -> Vec<SelectorId> {
         | PlanExpr::ScalarOf { .. }
         | PlanExpr::VectorOf { .. }
         | PlanExpr::Scalar(_)
-        | PlanExpr::StringLiteral(_) => Vec::new(),
+        | PlanExpr::StringLiteral(_) => Owner::None,
     }
 }
 
@@ -922,14 +1010,23 @@ pub fn plan_shapes(
         config: &config,
     };
     let lower_cx = LowerCx::<Pql>::new(&bounds);
+    // The reads, indexed by the entry they belong to, built once. A
+    // linear search per chain made this quadratic in the selector count
+    // on a request an untrusted caller can send (code review round 2):
+    // 4,096 selectors did 8,390,656 comparisons.
+    let mut by_selector: Vec<Option<&Pred>> = vec![None; plan.selectors.len()];
+    for read in reads {
+        if let Some(slot) = by_selector.get_mut(read.selector) {
+            *slot = Some(&read.pred);
+        }
+    }
     let mut out = Vec::new();
     for chain in chain_of(plan) {
-        let Some(read) = reads.iter().find(|r| r.selector == chain.selector) else {
+        let Some(pred) = by_selector.get(chain.selector).copied().flatten() else {
             continue;
         };
         let names = stage_names(&chain);
-        let lowering =
-            lower_chain::<Pql>(&chain.links, seed_relation(read.pred.clone()), &lower_cx)?;
+        let lowering = lower_chain::<Pql>(&chain.links, seed_relation(pred.clone()), &lower_cx)?;
         let query_plan = core_plan_of::<Pql>(&chain.links, lowering, &cx)?;
         out.push(query_plan.shape(&names));
     }
@@ -1232,6 +1329,80 @@ mod tests {
         assert_eq!(shapes.len(), 2);
         assert_eq!(shapes[0].links[0].stage, "Select(0)");
         assert_eq!(shapes[1].links[0].stage, "Select(1)");
+    }
+
+    /// A balanced sum of `terms` selectors: 4,096 of them is a query the
+    /// accept surface admits, because the depth cap is on DEPTH and a
+    /// balanced sum of 4,096 terms is twelve deep.
+    fn wide_query(terms: usize) -> String {
+        let mut level: Vec<String> = (0..terms).map(|i| format!("m{i}")).collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [a, b] => format!("({a} + {b})"),
+                    [a] => a.clone(),
+                    _ => unreachable!("chunks(2) yields one or two"),
+                })
+                .collect();
+        }
+        level.pop().expect("one root")
+    }
+
+    /// **The explain walk is linear in the tree, not quadratic in the
+    /// selector list.**
+    ///
+    /// A 4,096-selector query is an ACCEPTED request from an untrusted
+    /// caller, so the cost of building its plan is reachable. Before this
+    /// was fixed the builder scanned every node once per entry and, on
+    /// that query, examined 33,550,336 nodes (issue #548, code review
+    /// round 2).
+    ///
+    /// Two assertions, and the second is the one that says LINEAR rather
+    /// than "small on this machine": the work per node must not grow with
+    /// the width. Counted rather than timed — a wall clock measures the
+    /// machine, and a bound on it would be neither scale-invariant nor
+    /// reproducible on another one.
+    #[test]
+    fn the_explain_walk_is_linear_in_the_tree() {
+        let mut rows: Vec<(usize, usize, usize, u64)> = Vec::new();
+        for terms in [64usize, 256, 1024, 4096] {
+            let q = wide_query(terms);
+            let plan = planned(&q);
+            assert_eq!(plan.selectors.len(), terms, "{terms}: entries");
+            let (chains, work) = work_of(|| chain_of(&plan));
+            assert_eq!(chains.len(), terms, "{terms}: one chain per entry");
+            // Every operator over two entries is on no chain, so each
+            // chain here is its source link alone.
+            assert_eq!(chains[0].links, vec![PqlLink::Select(0)], "{terms}");
+            assert_eq!(
+                chains[terms - 1].links,
+                vec![PqlLink::Select(terms - 1)],
+                "{terms}"
+            );
+            // A balanced sum of `terms` selectors is `terms` leaves and
+            // `terms - 1` operators.
+            let nodes = 2 * terms - 1;
+            let bound = 3 * (nodes + terms) as u64;
+            assert!(
+                work <= bound,
+                "{terms} entries, {nodes} nodes, {} query bytes: the walk examined {work} nodes, \
+                 over the bound of {bound}. A pass over every node inside the per-entry loop is \
+                 what puts it there.",
+                q.len()
+            );
+            rows.push((terms, nodes, q.len(), work));
+        }
+        let per_node = |&(terms, nodes, _, work): &(usize, usize, usize, u64)| {
+            work as f64 / (nodes + terms) as f64
+        };
+        let (narrow, wide) = (per_node(&rows[0]), per_node(&rows[rows.len() - 1]));
+        assert!(
+            wide <= narrow * 1.05,
+            "work per node grew from {narrow} at {} entries to {wide} at {} entries: {rows:?}",
+            rows[0].0,
+            rows[rows.len() - 1].0
+        );
     }
 
     /// A 250-link chain is built without aborting, and the depth cap
