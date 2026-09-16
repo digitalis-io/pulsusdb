@@ -7,21 +7,37 @@
 //! statement text and index pruning.
 //!
 //! What that leaves open is narrower than "any wrong value", and it is
-//! worth stating exactly, because the wider claim is false. Measured on
-//! the base commit `7a6fd7e7`, one mutation at a time:
+//! worth stating exactly, because the wider claim is false.
+//!
+//! The read path builds a float sample at two places — `group_rows` and
+//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2116` and
+//! `:2170`). Mutating **both**, one mutation at a time, against the three
+//! live suites for this engine (`live_metrics_engine`,
+//! `live_metrics_cache`, `live_discovery_fallback` — 39 tests) and the two
+//! crates' unit tests (`pulsus-read --lib` 1,348 and `pulsus-promql --lib`
+//! 829 — 2,177):
 //!
 //! ```text
-//!   mutation in the read path            86 live tests   2,177 unit tests
-//!   ---------------------------------    -------------   ----------------
-//!   every float sample + 1.0                   6 red            -
-//!   every float sample + 0.0                   0 red          0 red
+//!   mutation                      39 live   2,177 unit   this suite (19)
+//!   --------------------------    -------   ----------   ---------------
+//!   every float sample + 1.0       6 red      1 red          11 red
+//!   every float sample + 0.0       0 red      0 red           6 red
 //!     (so only -0.0 moves)
 //! ```
 //!
-//! A wholesale value change is seen, incidentally, by six live tests. A
-//! change that preserves `==` is seen by nothing at all: `-0.0` normalised
-//! to `0.0` leaves the entire tree green, and it is a wrong answer a user
-//! reads — `min by (status)` rendering `0` where the answer is `-0`.
+//! The one unit test `+ 1.0` reddens is `metrics::exec::tests::`
+//! `fetch_all_concurrently_result_matches_a_single_chunk_reference_bit_for_bit`.
+//! Mutating `group_rows` alone gives 4 live rather than 6, because
+//! `group_multi_rows` serves the multi-metric fan-out and nothing else;
+//! the two sites are easy to confuse, so both figures are recorded.
+//!
+//! So a wholesale value change is seen, incidentally, by seven of those
+//! 2,216 tests. A change that preserves `==` is seen by none of them:
+//! `-0.0` normalised to `0.0` leaves every one green. It is a wrong answer
+//! a user reads — `min by (status)` rendering `0` where the answer is
+//! `-0`. The figures are for the production source at this head, which is
+//! byte-identical to the base commit `7a6fd7e7`: this change adds a test
+//! binary and one CI step and alters no production file.
 //!
 //! ## The two sides
 //!
