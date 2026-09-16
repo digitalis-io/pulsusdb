@@ -535,7 +535,7 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
 // The instrument
 // ---------------------------------------------------------------------
 
-/// Collections whose every element ACCESS is charged.
+/// Collections whose every element access THROUGH THEM is charged.
 ///
 /// **This is the whole instrument, and its point is that nobody has to
 /// know it is here.** Two earlier versions did not have that property
@@ -550,8 +550,8 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
 ///
 /// > **Every collection the walk reads back is a [`Counted`], and every
 /// > collection that is not is write-only.** The first half is what
-/// > charges a scan; the second is what makes "not counted" mean "cannot
-/// > hold a scan". Both halves are checked by
+/// > charges a scan OVER THOSE COLLECTIONS; the second is what makes
+/// > "not counted" mean "cannot hold a scan". Both halves are checked by
 /// > `every_collection_the_walk_reads_back_is_counted`, which parses
 /// > this file.
 ///
@@ -1565,8 +1565,10 @@ mod tests {
     /// **What is counted is element ACCESSES, charged by the collections
     /// themselves.** Nothing here and nothing in the walk calls a
     /// counter: `Counted` charges on `get`, `set` and each element an
-    /// `iter` yields, so a scan anyone adds pays for what it reads
-    /// without having to remember anything. The previous version counted
+    /// `iter` yields, so a scan anyone adds **through those accessors**
+    /// pays for what it reads without having to remember anything. A scan
+    /// over a copy taken out of one of them does not; that is the bound
+    /// below, and it is the limit of the technique. The previous version counted
     /// at hand-written call sites and stayed green when either quadratic
     /// path was restored without them.
     ///
@@ -1771,7 +1773,7 @@ mod tests {
     /// reader sees in the diff rather than something discovered the day
     /// it breaks.
     ///
-    /// # What this rule does NOT catch, measured
+    /// # What this rule does NOT refuse, measured
     ///
     /// Twenty shapes, each a genuine unmetered read of a plain collection
     /// inside the walk, all twenty compiled into `chain_of` in **one**
@@ -1804,13 +1806,14 @@ mod tests {
     /// one. A shape is **recognised** when this rule sees a plain
     /// collection at all, and **refused** when it also reports a read of
     /// it; the table above is 5 refused, 6 recognised and permitted, 9
-    /// unrecognised. The round-6 review ran its own twenty and its run
-    /// **detected** nine — its binding census failed first, so the read
-    /// assertion never ran, and its own diagnostic named four. Different
-    /// code, and a different question. What both runs establish is the
-    /// same thing: as a detector of unmetered reads this rule is weak,
-    /// and widening it has been beaten by the next shape every time it
-    /// was tried.
+    /// unrecognised. The round-6 review ran its own twenty, and its run
+    /// **recognised** nine — its binding census failed first, so the read
+    /// assertion never ran and nothing was refused; its own diagnostic
+    /// named four. Different code, and the first of the two questions
+    /// rather than the second. What both runs establish is the same
+    /// thing: as a way of refusing unmetered reads this rule is weak, and
+    /// widening it has been beaten by the next shape every time it was
+    /// tried.
     ///
     /// **So this is not what keeps the walk honest, and the linearity
     /// claim does not rest on it.** What keeps the walk honest is that
@@ -1819,13 +1822,13 @@ mod tests {
     /// walk's INPUT arrives counted, so a plain slice cannot be aliased
     /// out of a parameter. This rule is the backstop for the one case
     /// that remains — a plain collection someone writes inside the walk —
-    /// and it catches the obvious form of that and not the ingenious
+    /// and it refuses the obvious form of that and not the ingenious
     /// ones.
     ///
     /// **What is outside this rule entirely**, so that nobody reads a
     /// guarantee that is not on offer:
     ///
-    /// * the fifteen shapes above that it does not catch;
+    /// * the fifteen shapes above that it does not refuse;
     /// * a scan written in a helper function the walk calls, since the
     ///   rule is per function and a bare identifier is a move;
     /// * the planner's own `QueryPlan`, which the walk borrows and does
