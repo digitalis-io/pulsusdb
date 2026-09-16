@@ -6,7 +6,7 @@ what each query costs before and after.
 
 **Who it is for.** Someone who has not read the code and will not open it. A term is
 defined where it first appears. A structural claim points at a file, and at a line range
-where the claim is about particular lines — 110 such ranges, all quoted in Appendix C,
+where the claim is about particular lines — 109 such ranges, all quoted in Appendix C,
 and twelve places that name a file without one. **Every figure says whether it was
 derived (from those files, on paper) or measured (on a running ClickHouse)**: §5's cost
 table marks each row `[D]` or `[M]`, and a figure outside that table says in words which
@@ -18,8 +18,8 @@ product ships with. §8 says what that means in practice.
 
     this tree            86081ef1eaceaad37d8ede1f5cf47b46a9ce41ec — where the readings were taken
     citations pinned at  8f3348e88a1ff5033d7be623fabbbfd24b189e59 — the tip of main when
-                         Appendix C was written.  The body cites 110 line ranges and
-                         Appendix C quotes all 110.  Every range into CODE is byte-identical
+                         Appendix C was written.  The body cites 109 line ranges and
+                         Appendix C quotes all 109.  Every range into CODE is byte-identical
                          between the two revisions, so no reading of the code has gone stale;
                          the two exceptions are document lines, marked where they appear,
                          and they are the citations round one corrected
@@ -240,11 +240,17 @@ Per span, compressed, at Appendix A's parameters:
 
 | where the bytes are | B/span | share |
 |---|---|---|
-| `trace_spans` base row | 122.9 | 11.7% |
-| `service_time` projection (`SELECT *`, so a second payload) | 137.6 | 13.1% |
-| **`trace_attrs_idx`** | **787.3** | **75.1%** |
+| `trace_spans` base row | 122.93 | 11.7% |
+| `service_time` projection (`SELECT *`, so a second payload) | 137.60 | 13.1% |
+| **`trace_attrs_idx`** | **787.33** | **75.1%** |
 | `trace_tag_catalog` | ≈0 | ≈0% |
 | **total** | **1047.9** | 7.34 TB at 10⁹ spans/day, 7-day retention |
+
+**Two decimals in that table, because one does not add up.** `122.9 + 137.6 + 787.3` is
+1047.8 against a total of 1047.9. The unrounded components are 122.933, 137.600 and
+787.333 and they sum to 1047.87; Appendix B carries them at full precision. The 0.07
+residual is in the first and third rows, and every other decomposition in this document
+is rounded from the same unrounded figures.
 
 Derived. The 75% depends on `A`, the number of attributes a span carries:
 
@@ -271,12 +277,19 @@ and all three are ordinary:**
   which is the whole of what the collapse factor `d` counts — at Appendix A's
   parameters a trace's rows for one value are `d` = 2.5 deep. Their `trace_id` bytes are
   identical and adjacent; their `span_id` bytes differ;
-- **one span repeating a key at the same scope with the same value.** §4 Q1 establishes
-  that a span may carry a key more than once — that is the whole of the duplicate-key
-  rule. If the repeat carries the same value and the same scope, the two index rows agree
-  on every one of the six sort columns, including `timestamp_ns`, `trace_id` and
-  `span_id`, so **both identity columns are adjacent copies of themselves**. No replay is
-  involved and the writer produces it from one delivery;
+- **one span repeating a key at the same scope with two different values.** §4 Q1
+  establishes that a span may carry a key more than once — that is the whole of the
+  duplicate-key rule. Two such rows differ in `val` and agree on everything else, so they
+  sort adjacently and **both identity columns are adjacent copies of themselves**, from
+  one delivery, with no replay. Measured on 26.3.29.7 against the committed DDL: a span
+  carrying `k = 'x'` and `k = 'y'` leaves **two rows after `OPTIMIZE … FINAL`**, adjacent
+  in sort order, `uniqExact((trace_id, span_id))` = 1 across them.
+
+  **The same-value variant does not survive to be measured, and an earlier version of
+  this list named it instead.** Two rows identical in all six sort columns collapse in the
+  insert's own optimisation pass; with `optimize_on_insert = 0` they survive the insert as
+  two and collapse at `OPTIMIZE … FINAL`. Since the figures below are taken after
+  `OPTIMIZE … FINAL`, that variant is transient input and can explain nothing in them;
 - **an allowed replay.** The table is a `ReplacingMergeTree` keyed on all six sort
   columns, so re-delivering a span writes a byte-identical row that sits next to its
   twin until a merge collapses it. That is not a fault state; it is the at-least-once
@@ -284,7 +297,9 @@ and all three are ordinary:**
 
 **So the 16 bytes are a worked-model price, not a floor**, and measured they compress:
 by how much depends on how often one trace id lands inside one granule, and the table
-below is the reading.
+below is the reading. **Every figure in it is taken after `OPTIMIZE … FINAL`**, so what
+it prices is what survives a merge — the first and second cases above — and not anything
+transient.
 
 ```
    one index row, 39.4 compressed bytes
@@ -2011,22 +2026,27 @@ same statement on both: 35,073,281 against 35,073,241, a 40-byte difference in
 how the two runs' blocks happened to fall.
 ```
 
-**The same script run four times does not give the same bytes, and the printed B/span
-can cross a rounding boundary.** Four runs of the block above on the same corpus, same
-server, nothing else changed:
+**The same script run six times does not give the same bytes, and the printed B/span
+can cross a rounding boundary.** Six complete rebuilds from the block above — four here
+and two taken independently by a reviewer on their own server and corpus build — same
+script, nothing else changed:
 
-    run   old side, bytes   B/span    new side, bytes   B/span    ratio
-    1       612,990,389      306.5      425,536,930      212.8     0.6942
-    2       613,004,438      306.5      425,450,382    **212.7**   0.6940
-    3       613,023,509      306.5      425,543,663      212.8     0.6942
-    4       613,014,196      306.5      425,541,572      212.8     0.6942
+    run   old side, bytes   B/span    new side, bytes   B/span    ratio     where
+    1       612,990,389      306.5      425,536,930      212.8     0.6942    here
+    2       613,004,438      306.5      425,450,382    **212.7**   0.6940    here
+    3       613,023,509      306.5      425,543,663      212.8     0.6942    here
+    4       613,014,196      306.5      425,541,572      212.8     0.6942    here
+    5       613,005,595      306.5      425,428,616    **212.7**   0.6940    independent
+    6       613,011,384      306.5      425,528,267      212.8     0.6942    independent
 
-The old side spans 33,120 bytes across the four (0.005%) and the new side 93,281
-(0.022%) — merge and block boundaries land differently each time. **Every run gives
-−30.6% and every run gives 306.5 on the old side; the new side prints 212.7 once and
-212.8 three times**, because 212.75 sits inside that spread. Row counts were identical
-on every table on every run. So the ratio is the figure to carry, and the one-decimal
-B/span is the figure that can move by a digit.
+The old side spans 33,120 bytes across the six (0.005%) and the new side 115,047
+(0.027%) — merge and block boundaries land differently each time, and the lowest new-side
+total of the six came from the independent runs, which is why this table is not a bound.
+**Every run gives −30.6% and every run gives 306.5 on the old side; the new side prints
+212.7 on two runs and 212.8 on four**, because 212.75 sits inside that spread. Row counts
+were identical on every table on every run. So the ratio is the figure to carry, and the
+one-decimal B/span is the figure that can move by a digit. **No bound is claimed**: six
+runs say what the variation looked like, not what it cannot exceed.
 
 −30.6%. The row that predicts it is the worked model's −40.3%; the gap between the two
 is the identity-column compressibility §7 carries, and this corpus's `A` = 8 against the
@@ -2424,8 +2444,9 @@ an existing part.
 What **is** available is a rebuild plus `EXCHANGE TABLES`, which is what §8.1's second
 backfill uses. With no data to keep, the drop is the same thing at lower cost.
 
-**One grammar note, because every example in this section is a statement someone will
-paste.** `SETTINGS` goes **before** `VALUES` in an `INSERT`, or in the HTTP query string.
+**One grammar note, because the executable examples below are statements someone will
+paste.** (The migration table above is schematic — it abbreviates column lists and shapes
+— and is read against §3.1's DDL, not pasted.) `SETTINGS` goes **before** `VALUES` in an `INSERT`, or in the HTTP query string.
 After `VALUES` it is parsed as row data and rejected. Measured on 26.3.29.7:
 
     INSERT INTO t VALUES (1) SETTINGS async_insert=0        HTTP 400  Code: 27  Cannot parse input: expected '(' before: 'SETTINGS …
@@ -2637,22 +2658,21 @@ there is none; that was false.
    cheap one is choosing to let duplicated keys answer differently on either side of the
    cut-over, and that is a choice rather than a limitation.
 
-Under the issue's premise — no tagged release, no deployments, CI databases created fresh
-per run — none of this arises. **The premise should be
-checked rather than assumed**: `run_init` already refuses on a server below the minimum
-version (`crates/pulsus-schema/src/controller.rs`'s `check_version`, called at `:89`), and the same place can
-refuse when `trace_spans` is non-empty at the point ids 44–69 would first apply, naming
-the remedy (drop the database and re-reconcile) in the error.
+**This question is settled, and the answer is that it does not arise.** Nothing is
+deployed and there are no users, so there is no stored trace data anywhere that anyone
+needs to keep; a developer with spans in a local database drops them. So **nothing is
+built for it**: no backfill from the index table, no backfill from the payload, and no
+refusal to start over a populated `trace_spans`. An earlier version of this section
+proposed that refusal — a non-empty check beside `run_init`'s existing version check —
+and worked out that the count would have to be cluster-wide rather than local. That
+proposal is withdrawn; the readings above and below it stay, because they are readings.
 
-**That count must be cluster-wide, not local.** A count of the local `trace_spans`
-reports 0 on a shard that holds none of the rows, while another shard holds them, and the
-sequence then runs and destroys the search state of rows it never saw. So:
-
-    cluster mode   SELECT count() FROM clusterAllReplicas('<cluster>', <db>, trace_spans)
-    single node    SELECT count() FROM <db>.trace_spans
-
-Measured on 26.3.29.7 with the rows placed where the local count cannot see them: local
-`0`, `clusterAllReplicas` `1`.
+What they are worth, now that nothing is built on them: the split of what survives ids
+44–69 and what does not is what a developer sees before dropping the database; the two
+backfill mechanisms are recorded as having been tried and found to work, for whoever
+faces this question after there is data to keep; and the finding that a `CHECK`
+constraint does not run during a mutation is a fact about the engine that outlives this
+section.
 
 The MV list and `TTL_STMTS` change either way:
 
@@ -2714,8 +2734,7 @@ The MV list and `TTL_STMTS` change either way:
 | the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `crates/pulsus-write/src/protocols/otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
 | the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
 | the duplicate-key rule is left to `arrayFirstIndex` without being stated | `avg`, `select` and `by` change answer on a span that repeats a key, silently | §4 Q1 states the rule and why it is the right one; it is a change of answer and needs a ledger row |
-| ids 44–69 run against a database that already holds trace rows | those spans stay reachable by service, name, duration and id, and unreachable by the empty search, every attribute condition, `status = error` and the tag dropdown | §8.1, which also gives two working backfills |
-| the precondition that guards that state counts the LOCAL table | a shard holding none of the rows reports 0 and lets the sequence run | §8. The count has to be `clusterAllReplicas`; measured local 0 against cluster-wide 1 |
+| ids 44–69 run against a database that already holds trace rows | those spans stay reachable by service, name, duration and id, and unreachable by the empty search, every attribute condition, `status = error` and the tag dropdown | **not a risk this design carries.** §8.1: there is no deployment and no data to keep, so the answer is to drop the database. Nothing refuses, nothing backfills |
 | a backfill is written as a mutation and trusted to be checked | `CHECK` constraints do not run during `ALTER … UPDATE`; a mutation can leave arrays of unequal length that an `INSERT` would reject | §8.1. Measured `HTTP 200` with `length(attr_key)=2`, `length(attr_num)=1`, and `Code: 469` for the same row inserted |
 | five materialized views instead of two make ingest slower than the measurements suggest | insert wall time rises rather than falls | the nine write takes in §5 already measured the two-view case against the one-INSERT case; two of the three new views are a narrow filter and a narrow group. `trace_attr_traces_mv` is the one that expands and groups `A` rows per span, and it is the one to measure on its own. Measure insert wall time with each view added in turn |
 | the metrics range query stays the slowest shape and someone adds a rollup later without re-checking §3.5 | `rate()` starts under-counting or over-counting after a client resends spans | §3.5 states the property the rollup must have and shows one form that has it — a distinct-span state, measured duplicate-safe at 16.30 B/span. Any future rollup is checked against the duplicate table in §3.4 before it is built |
@@ -2850,11 +2869,24 @@ ZSTD(3)-to-LZ4 cost ratio. Every worked byte figure moves with them.
   It would be wrong if any scope needed a field the others do not have. Read, not run:
   no ingest path has been exercised end to end into the arrays.
 - *That the scalar value read can replace `attr_values_sql`* rests on the read being
-  scalar — one value per (span, key) — so `arrayFirstIndex` plus one element yields the
-  row shape the hydration read already has. Measured that the SQL works
-  (`arrayFirstIndex` over four aligned arrays returned index 3, skipping a NULL element,
-  with the element's own `val_type`); not measured against today's `any(val_num)`, which
-  picks arbitrarily where the new form picks the sender's first.
+  scalar — one value per (span, key) — so one located element yields the row shape the
+  hydration read already has. **The locator is over `(key, scope)` and nothing else**,
+  which is §4 Q1's rule; an earlier version of this line cited a measurement of a
+  locator that also required `isNotNull(val_num)`, and that is the form §4 Q1 names as
+  wrong. Re-measured with the right one, on four spans:
+
+      the span's stored k                     located   val     val_type   attr_num
+      j=1, k=400                                 2       400      int        400
+      k=400 then k=600                           1       400      int        400
+      k='bad' (string) then k=400                1       bad      string     NULL
+      no k at all                                0       —        —          NULL
+
+  The third row is the whole of it: the located element is not numeric, so the numeric
+  read is NULL and a numeric test on it is false. The locator that folds in
+  `isNotNull(val_num)` returns element 2 on that span — `400 / int / 400` — which is a
+  different value for the same attribute on the same span, and it is the value §4 Q1
+  refuses. Not measured against today's `any(val_num)`, which picks arbitrarily where
+  this form picks the element the span resolves to.
 - *That no statement needs an attribute array from a projection* rests on
   enumerating the builders in `crates/pulsus-read/src/traces/search_sql.rs` (8), `crates/pulsus-read/src/traces/tags_sql.rs` (4), `crates/pulsus-read/src/traces/sql.rs`
   (1) and `crates/pulsus-read/src/traces/graph_sql.rs` (1), plus the structural fact that every attribute
@@ -3319,8 +3351,8 @@ Every claim this document makes about what the code does today names a file and 
 line range. **This appendix quotes those lines**, so a reading can be checked
 against the code without leaving the document.
 
-**Completeness, stated exactly and counted twice.** The body carries **110** citations
-that name a line range, over 33 files, and all 110 are quoted below. It also carries
+**Completeness, stated exactly and counted twice.** The body carries **109** citations
+that name a line range, over 33 files, and all 109 are quoted below. It also carries
 **12** citations that name a file with no line range — they point at a whole builder, a
 whole golden file, or a document rather than at a reading — and those are not quoted
 here:
@@ -3346,10 +3378,11 @@ not resolve a **shorthand** citation — a path given once and then continued wi
 `` `:220-304` ``" and "`crates/pulsus-schema/src/controller.rs`'s `check_version`, called
 at `` `:89` ``". Six such shorthands appear in the body; resolving them adds
 `crates/pulsus-write/src/writer/trace.rs:220-304` and
-`crates/pulsus-schema/src/controller.rs:89` to the quoted set and takes the controller
-out of the file-level list. The file-level list then grew to 12 when this round added
-four citations that name a file and no line — the two documents and the two source files
-that now record the duplicate-key divergence (§4 Q1).
+`crates/pulsus-schema/src/controller.rs:89` to the quoted set at the time. That second
+citation has since gone: the passage that made it proposed a refusal to start over a
+populated table, and a later ruling withdrew that passage (§8.1), so the count is 109 and
+the controller is cited only by its two other ranges. The file-level list grew to 12 when
+the duplicate-key divergence was recorded in two documents and two source files (§4 Q1).
 
 **Pinned at `8f3348e8`** — the tip of `main` when this appendix was written. The
 line numbers are that revision's and will drift; the quoted bytes are what the
@@ -3855,12 +3888,6 @@ repository-relative.
 ```
 
 ### `crates/pulsus-schema/src/controller.rs`
-
-**`:89-89`**
-
-```rust
-   89      check_version(&version)?;
-```
 
 **`:436-436`**
 
