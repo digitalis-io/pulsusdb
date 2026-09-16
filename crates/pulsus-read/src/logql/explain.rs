@@ -35,6 +35,20 @@ pub struct PlanExplain {
     /// to the one it produced before this field existed. The three
     /// existing fields do not move.
     pub plan: Option<PlanShape>,
+    /// The compiled plans' shapes, one per selector-list entry that READS
+    /// (issue #548), rendered as one additive key `data.explain.plans`.
+    ///
+    /// **`plans`, not a second `plan`, and the reason is not cosmetic.**
+    /// `QueryPlan::parts` is an ORDERED list, and a PromQL request's
+    /// selector fetches are issued concurrently. Merging N chains into
+    /// one ordered part list would assert an order the executor does not
+    /// have, and would need part-index renumbering the core does not
+    /// provide.
+    ///
+    /// Empty on every route but the metrics one, and empty there without
+    /// the header — so every other response is byte-identical to the one
+    /// it produced before this field existed.
+    pub plans: Vec<PlanShape>,
 }
 
 impl PlanExplain {
@@ -44,6 +58,7 @@ impl PlanExplain {
             stages: Vec::new(),
             routing: None,
             plan: None,
+            plans: Vec::new(),
         }
     }
 
@@ -64,6 +79,13 @@ impl PlanExplain {
     /// is absent from every response this tree sends.
     pub fn set_plan(&mut self, shape: PlanShape) {
         self.plan = Some(shape);
+    }
+
+    /// Appends one compiled plan's shape. One call per selector-list
+    /// entry that reads, in the planner's own selector order (issue
+    /// #548).
+    pub fn push_plan(&mut self, shape: PlanShape) {
+        self.plans.push(shape);
     }
 }
 
@@ -94,6 +116,15 @@ mod tests {
     fn a_new_explain_carries_no_plan_shape() {
         let mut explain = PlanExplain::new("streams");
         assert!(explain.plan.is_none());
+        assert!(
+            explain.plans.is_empty(),
+            "issue #548: the `plans` key is additive and empty by default"
+        );
+        explain.push_plan(crate::compile::plan::PlanShape {
+            parts: Vec::new(),
+            links: Vec::new(),
+        });
+        assert_eq!(explain.plans.len(), 1);
         explain.set_plan(crate::compile::plan::PlanShape {
             parts: Vec::new(),
             links: Vec::new(),
