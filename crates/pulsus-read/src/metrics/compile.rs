@@ -461,18 +461,20 @@ impl Owner {
 /// passes, each over the nodes or over the entries and never over both:
 ///
 /// ```text
-///   flatten          nodes, their parents and their depths      O(nodes)
-///   own              each node's Owner, folded into its parent  O(nodes)
-///   bucket           each One node filed under its entry        O(nodes)
-///   build            one chain per entry, from its bucket only  O(entries + nodes)
+///   flatten          the nodes and their parents, in pre-order   O(nodes)
+///   own              each node's Owner, folded into its parent   O(nodes)
+///   bucket           each One node filed under its entry         O(nodes)
+///   build            one chain per entry, from its bucket only   O(entries + nodes)
 /// ```
 ///
 /// The third pass is what removes the per-entry scan: **every node is
 /// placed at most once**, so the buckets hold no more than `nodes`
 /// entries between them however many selectors the query has.
-/// `the_explain_walk_is_linear_in_the_tree` bounds the counted work and
-/// reddens if a pass over all nodes is put back inside the per-entry
-/// loop.
+///
+/// Both node collections are [`Counted`], so any pass anyone adds is
+/// charged for what it reads whether or not they know the gate exists;
+/// `the_explain_walk_is_linear_in_the_tree` is what fails when the total
+/// stops being linear.
 pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     let flat = flatten(&plan.root);
     let n = flat.nodes.len();
@@ -480,12 +482,14 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     // Pass 2: each node's owner, folded upward. Reverse pre-order, so a
     // node is merged into its parent after every one of its descendants
     // has been merged into it.
-    let mut owner: Vec<Owner> = flat.direct.clone();
+    let mut owner: Counted<Vec<Owner>> = Counted::new(flat.direct);
     for i in (0..n).rev() {
-        work_tick();
-        if let Some(p) = flat.parent[i] {
-            owner[p] = owner[p].merge(owner[i]);
-        }
+        let (Some(mine), Some(Some(p))) = (owner.get(i).copied(), flat.parent.get(i).copied())
+        else {
+            continue;
+        };
+        let merged = owner.get(p).copied().unwrap_or(Owner::None).merge(mine);
+        owner.set(p, merged);
     }
 
     // Pass 3: one bucket per entry, filled in ONE pass over the nodes.
@@ -493,7 +497,6 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     // bucket comes out ordered by increasing depth.
     let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); plan.selectors.len()];
     for (i, own) in owner.iter().enumerate() {
-        work_tick();
         if let Owner::One(id) = own
             && let Some(bucket) = buckets.get_mut(*id)
         {
@@ -510,10 +513,13 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
         .map(|(id, bucket)| {
             let mut links = Vec::with_capacity(bucket.len() + 1);
             links.push(PqlLink::Select(id));
-            links.extend(bucket.into_iter().rev().filter_map(|i| {
-                work_tick();
-                node_kind(flat.nodes[i]).map(PqlLink::Node)
-            }));
+            links.extend(
+                bucket
+                    .into_iter()
+                    .rev()
+                    .filter_map(|i| flat.nodes.get(i).and_then(|node| node_kind(node)))
+                    .map(PqlLink::Node),
+            );
             Chain {
                 selector: id,
                 links,
@@ -522,29 +528,100 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
         .collect()
 }
 
-/// Counts one unit of chain-building work, where **one unit is one node
-/// examined by one pass**.
+// ---------------------------------------------------------------------
+// The instrument
+// ---------------------------------------------------------------------
+
+/// Collections whose every element ACCESS is charged.
 ///
-/// **Test-only, and a no-op with no storage in every other build.** The
-/// cost claim above is a property a check has to be able to fail, and a
-/// wall clock is not one: a clock is not scale-invariant and it measures
-/// the machine rather than the algorithm. Counting the visits is, and
-/// `the_explain_walk_is_linear_in_the_tree` bounds them by a multiple of
-/// `nodes + entries` at four widths.
+/// **This is the whole instrument, and its point is that nobody has to
+/// know it is here.** The previous version counted at call sites a
+/// person had to remember to write, so a scan reintroduced by someone
+/// who had never heard of the counter sat there green — the gate
+/// measured a number maintained by hand rather than the work the walk
+/// does (issue #548, code review round 3, which reintroduced both
+/// quadratic paths without the hand-written calls and watched the gate
+/// pass).
+///
+/// The collection inside [`Counted`] is private to this module, so from
+/// outside it there is **no way to reach an element at all** except
+/// through an accessor below, and every accessor charges. A scan anyone
+/// writes is therefore counted whether or not they know the counter
+/// exists.
+mod counted {
+    use std::ops::{Deref, DerefMut};
+
+    /// A collection whose elements can only be reached by charging for
+    /// them. `C` is `Vec<T>` for what the walk builds and `&[T]` for
+    /// what it is handed.
+    pub(super) struct Counted<C>(C);
+
+    impl<C> Counted<C> {
+        pub(super) fn new(inner: C) -> Self {
+            Self(inner)
+        }
+    }
+
+    impl<T, C: Deref<Target = [T]>> Counted<C> {
+        /// How many elements there are. **Not charged**: a length is not
+        /// an element access, and charging it would make the bound
+        /// depend on how often a loop asks how long something is.
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// One element, or `None` past the end. Charged.
+        #[inline]
+        pub(super) fn get(&self, i: usize) -> Option<&T> {
+            super::charge();
+            self.0.get(i)
+        }
+
+        /// Every element, charged one at a time as they are yielded — so
+        /// a scan that stops early pays for what it read and no more.
+        pub(super) fn iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
+        where
+            T: 'a,
+        {
+            self.0.iter().inspect(|_| super::charge())
+        }
+    }
+
+    impl<T: Copy, C: DerefMut<Target = [T]>> Counted<C> {
+        /// Replaces one element. Charged: a write is an access.
+        #[inline]
+        pub(super) fn set(&mut self, i: usize, v: T) {
+            super::charge();
+            self.0[i] = v;
+        }
+    }
+}
+
+use counted::Counted;
+
+/// Charges one element access.
+///
+/// **Test-only, and nothing at all in every other build**: the cost
+/// claim is a property a check has to be able to fail, and a wall clock
+/// is not one — a clock is not scale-invariant and measures the machine
+/// rather than the algorithm. `the_explain_walk_is_linear_in_the_tree`
+/// bounds the accesses by a multiple of `nodes + entries` at four widths
+/// and asserts the ratio does not grow with the width.
 #[cfg(test)]
-fn work_tick() {
+fn charge() {
     WORK.with(|c| c.set(c.get() + 1));
 }
 
 #[cfg(not(test))]
-fn work_tick() {}
+#[inline(always)]
+fn charge() {}
 
 #[cfg(test)]
 thread_local! {
     static WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `f` and reports the nodes examined while it ran.
+/// Runs `f` and reports the element accesses charged while it ran.
 #[cfg(test)]
 fn work_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
     WORK.with(|c| c.set(0));
@@ -552,42 +629,45 @@ fn work_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (out, WORK.with(std::cell::Cell::get))
 }
 
-/// The plan tree flattened into pre-order, with each node's parent, its
-/// depth, and the entry it consumes DIRECTLY (before any propagation).
+/// The plan tree flattened into pre-order, with each node's parent and
+/// the entry it consumes DIRECTLY (before any propagation).
+///
+/// **No depth column.** The build pass reverses each bucket rather than
+/// sorting it, because pre-order already files a bucket by increasing
+/// depth, so a depth per node would be a column nothing reads.
 struct Flat<'a> {
-    nodes: Vec<&'a PlanExpr>,
-    parent: Vec<Option<usize>>,
-    depth: Vec<usize>,
+    nodes: Counted<Vec<&'a PlanExpr>>,
+    parent: Counted<Vec<Option<usize>>>,
     /// Never [`Owner::Many`]: no node names two entries of its own
     /// account, so a `Many` can only ever arise from the merge.
     direct: Vec<Owner>,
 }
 
 fn flatten(root: &PlanExpr) -> Flat<'_> {
-    let mut flat = Flat {
-        nodes: Vec::new(),
-        parent: Vec::new(),
-        depth: Vec::new(),
-        direct: Vec::new(),
-    };
-    // (node, parent index, depth). A stack, not recursion.
-    let mut stack: Vec<(&PlanExpr, Option<usize>, usize)> = vec![(root, None, 0)];
+    let mut nodes: Vec<&PlanExpr> = Vec::new();
+    let mut parent: Vec<Option<usize>> = Vec::new();
+    let mut direct: Vec<Owner> = Vec::new();
+    // (node, parent index). A stack, not recursion.
+    let mut stack: Vec<(&PlanExpr, Option<usize>)> = vec![(root, None)];
     let mut kids: Vec<&PlanExpr> = Vec::new();
-    while let Some((node, parent, depth)) = stack.pop() {
-        let i = flat.nodes.len();
-        flat.nodes.push(node);
-        flat.parent.push(parent);
-        flat.depth.push(depth);
-        flat.direct.push(direct_owner(node));
+    while let Some((node, parent_of)) = stack.pop() {
+        let i = nodes.len();
+        nodes.push(node);
+        parent.push(parent_of);
+        direct.push(direct_owner(node));
         kids.clear();
         children(node, &mut kids);
         // Pushed in reverse so the first child is popped first and the
         // flattened order is a genuine pre-order.
         for child in kids.iter().rev() {
-            stack.push((child, Some(i), depth + 1));
+            stack.push((child, Some(i)));
         }
     }
-    flat
+    Flat {
+        nodes: Counted::new(nodes),
+        parent: Counted::new(parent),
+        direct,
+    }
 }
 
 /// The entry a node consumes **without** looking at its children.
@@ -1014,12 +1094,20 @@ pub fn plan_shapes(
     // linear search per chain made this quadratic in the selector count
     // on a request an untrusted caller can send (code review round 2):
     // 4,096 selectors did 8,390,656 comparisons.
-    let mut by_selector: Vec<Option<&Pred>> = vec![None; plan.selectors.len()];
-    for read in reads {
-        if let Some(slot) = by_selector.get_mut(read.selector) {
+    //
+    // **The parameter is shadowed by a counted view of itself**, so a
+    // search over `reads` written here later — the very shape that was
+    // removed — is charged per element it touches and fails the gate,
+    // whether or not whoever writes it knows the gate exists (code
+    // review round 3). The index is counted for the same reason.
+    let reads = Counted::new(reads);
+    let mut index: Vec<Option<&Pred>> = vec![None; plan.selectors.len()];
+    for read in reads.iter() {
+        if let Some(slot) = index.get_mut(read.selector) {
             *slot = Some(&read.pred);
         }
     }
+    let by_selector = Counted::new(index);
     let mut out = Vec::new();
     for chain in chain_of(plan) {
         let Some(pred) = by_selector.get(chain.selector).copied().flatten() else {
@@ -1349,20 +1437,33 @@ mod tests {
         level.pop().expect("one root")
     }
 
-    /// **The explain walk is linear in the tree, not quadratic in the
-    /// selector list.**
+    /// **The whole explain build is linear in the tree, not quadratic in
+    /// the selector list.**
     ///
     /// A 4,096-selector query is an ACCEPTED request from an untrusted
     /// caller, so the cost of building its plan is reachable. Before this
     /// was fixed the builder scanned every node once per entry and, on
-    /// that query, examined 33,550,336 nodes (issue #548, code review
-    /// round 2).
+    /// that query, examined 33,550,336 nodes, with a further 8,390,656
+    /// comparisons to find each chain's recorded read (issue #548, code
+    /// review round 2).
+    ///
+    /// **It measures `plan_shapes`, not `chain_of`**, because the read
+    /// lookup lives there: a gate over the walk alone could not see
+    /// `reads.iter().find` come back, and did not (code review round 3).
+    ///
+    /// **What is counted is element ACCESSES, charged by the collections
+    /// themselves.** Nothing here and nothing in the walk calls a
+    /// counter: `Counted` charges on `get`, `set` and each element an
+    /// `iter` yields, so a scan anyone adds pays for what it reads
+    /// without having to remember anything. The previous version counted
+    /// at hand-written call sites and stayed green when either quadratic
+    /// path was restored without them.
     ///
     /// Two assertions, and the second is the one that says LINEAR rather
-    /// than "small on this machine": the work per node must not grow with
-    /// the width. Counted rather than timed — a wall clock measures the
-    /// machine, and a bound on it would be neither scale-invariant nor
-    /// reproducible on another one.
+    /// than "small on this machine": the accesses per node must not grow
+    /// with the width. Counted rather than timed — a wall clock measures
+    /// the machine, and a bound on one would be neither scale-invariant
+    /// nor reproducible on another.
     #[test]
     fn the_explain_walk_is_linear_in_the_tree() {
         let mut rows: Vec<(usize, usize, usize, u64)> = Vec::new();
@@ -1370,25 +1471,40 @@ mod tests {
             let q = wide_query(terms);
             let plan = planned(&q);
             assert_eq!(plan.selectors.len(), terms, "{terms}: entries");
-            let (chains, work) = work_of(|| chain_of(&plan));
-            assert_eq!(chains.len(), terms, "{terms}: one chain per entry");
+            // One recorded read per entry, so every chain finds one and
+            // the lookup is exercised once per chain — the path the
+            // round-2 index replaced a linear search on.
+            let reads: Vec<SelectorRead> = (0..terms)
+                .map(|selector| SelectorRead {
+                    selector,
+                    pred: pred("http_requests_total"),
+                })
+                .collect();
+            let (shapes, work) =
+                work_of(|| plan_shapes(&plan, &reads, &params()).expect("plan shapes"));
+            assert_eq!(
+                shapes.len(),
+                terms,
+                "{terms}: one plan per entry that reads"
+            );
             // Every operator over two entries is on no chain, so each
             // chain here is its source link alone.
-            assert_eq!(chains[0].links, vec![PqlLink::Select(0)], "{terms}");
+            assert_eq!(shapes[0].links.len(), 1, "{terms}");
+            assert_eq!(shapes[0].links[0].stage, "Select(0)", "{terms}");
             assert_eq!(
-                chains[terms - 1].links,
-                vec![PqlLink::Select(terms - 1)],
+                shapes[terms - 1].links[0].stage,
+                format!("Select({})", terms - 1),
                 "{terms}"
             );
             // A balanced sum of `terms` selectors is `terms` leaves and
             // `terms - 1` operators.
             let nodes = 2 * terms - 1;
-            let bound = 3 * (nodes + terms) as u64;
+            let bound = 8 * (nodes + terms) as u64;
             assert!(
                 work <= bound,
-                "{terms} entries, {nodes} nodes, {} query bytes: the walk examined {work} nodes, \
-                 over the bound of {bound}. A pass over every node inside the per-entry loop is \
-                 what puts it there.",
+                "{terms} entries, {nodes} nodes, {} query bytes: building the plans took {work} \
+                 element accesses, over the bound of {bound}. A pass over every node inside the \
+                 per-entry loop, or a search of the reads per chain, is what puts it there.",
                 q.len()
             );
             rows.push((terms, nodes, q.len(), work));
@@ -1399,7 +1515,7 @@ mod tests {
         let (narrow, wide) = (per_node(&rows[0]), per_node(&rows[rows.len() - 1]));
         assert!(
             wide <= narrow * 1.05,
-            "work per node grew from {narrow} at {} entries to {wide} at {} entries: {rows:?}",
+            "accesses per node grew from {narrow} at {} entries to {wide} at {} entries: {rows:?}",
             rows[0].0,
             rows[rows.len() - 1].0
         );
