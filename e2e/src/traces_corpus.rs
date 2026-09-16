@@ -646,6 +646,16 @@ fn attr_bool(span: &GeneratedSpan, key: &str) -> Option<bool> {
 /// Unscoped attribute lookup (`.key`): resource scope then span scope,
 /// string values only (the one unscoped case is a string attr).
 #[cfg(test)]
+/// **Resolves resource-first, which is the opposite of TraceQL's precedence,
+/// and is safe only because this corpus never puts one key at two scopes**
+/// (resource carries `run_id`/`env`/`region`, span carries
+/// `http.status_code`/`cache_hit`/`sample_ratio`/`tier` — disjoint sets).
+/// TraceQL resolves an unscoped attribute span-first: span, resource, event,
+/// link, instrumentation, taking the first stored element within the scope it
+/// lands in. If a span carrying one key at both scopes is ever added to this
+/// corpus, this helper must change with it, or the expectation will disagree
+/// with both engines. See `docs/benchmarks/traces-differential-ledger.md`,
+/// entry `traceql-attribute-resolves-to-one-element` (issue #537).
 fn unscoped_str<'a>(span: &'a GeneratedSpan, key: &str) -> Option<&'a str> {
     res_str(span, key).or(match attr_val(span, key) {
         Some(AnyVal::Str(s)) => Some(s.as_str()),

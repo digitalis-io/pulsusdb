@@ -961,6 +961,77 @@ when we are asking it to slow down, so we keep `429`; recorded as
   exit 0. It fires the moment a step in a live job runs the suite without
   its `env:` block.
 
+### `traceql-attribute-resolves-to-one-element` (issue #537) — **a decision recorded before the change it describes; the reference disagrees with itself here**
+
+- **What.** A span may carry the same attribute key more than once, and may
+  carry it at more than one scope. TraceQL has to say which value the span
+  *has*. PulsusDB's rule, settled in `docs/traceql-schema-migration.md` §4 Q1:
+  **the first stored element within the highest-precedence scope that is
+  present**, taking scopes in the order span → resource → event → link →
+  instrumentation. One value per span per attribute, and **every** operation
+  uses it — the filter, the negation, `select()`, `avg()` and a `by()` key.
+
+- **Why that rule, before looking at the reference.** Four alternatives were
+  eliminated on what they cost a reader: an arbitrary choice (today's `any()`
+  over a `GROUP BY`) cannot be reproduced twice; refusing the query lets one
+  malformed span empty a dashboard; returning every value changes the type of
+  every attribute read from one value to a set; and "last" would make the
+  search answer disagree with what the stored payload shows first. Of the two
+  deterministic candidates, first-within-the-resolved-scope is the one that
+  makes the search answer, the projected value and the rendered payload name
+  the same value.
+
+- **Where the reference stands, both halves.** Its value path agrees:
+  `AttributeFor` scans a scope's slice and returns at the first match
+  (`tempodb/encoding/vparquet4/block_traceql.go:128-151 @ v3.0.2`), and its
+  unscoped chain takes span, then resource, then event, then link, then
+  instrumentation (`:249-280`, whose own comment says the order exists to give
+  span precedence). Its **condition** path does not: `createAttributeIterator`
+  (`:2981`) builds per-type predicates over the attribute rows and joins the
+  matching ones, so a pushed-down condition accepts a span because a **later**
+  duplicate matched. On a span that repeats a key the reference therefore
+  filters by one rule and renders by another. **We do not copy that.**
+
+- **What changes here, and it is a change against our own shipped answer.**
+  Today PulsusDB's phase-2 membership read is a set: a span is in it if any of
+  its attribute rows matched. Measured on an eight-span fixture (26.3.29.7),
+  three rows move, of two kinds:
+
+  | the span's stored attributes | the query | today | after |
+  |---|---|---|---|
+  | `span.k = 'y'` then `span.k = 'x'` | `{ span.k = "x" }` | matches | does not match — the span's `k` is `y` |
+  | the same span | `{ span.k != "x" }` | does not match | matches |
+  | `resource.k = 'x'`, `span.k = 'y'` | `{ .k = "x" }` | matches | does not match — `.k` resolves to `y` |
+
+  Counted as fixture rows the answer moves on, three; counted as kinds of
+  shape, two, the third being the first kind seen through a negation.
+
+- **Which differential cases this affects: none, and here is why.** The corpus
+  in `e2e/src/traces_corpus.rs` attaches `run_id`, `env` and `region` at
+  resource scope and `http.status_code`, `cache_hit`, `sample_ratio` and
+  `tier` at span scope — **disjoint key sets** — and no generated span carries
+  one key twice. So no case in `test/fixtures/traces/differential.json` can
+  separate the two rules, including the two unscoped cases
+  (`{ resource.run_id = "{R}" && .tier = "gold" }` and its spanset variant),
+  and **no case needs an exemption or a mode change**.
+
+- **What must move if a case is ever added that can separate them.** The
+  corpus's own expectation helper resolves an unscoped key **resource first,
+  then span** (`unscoped_str` in `e2e/src/traces_corpus.rs`), which is the
+  opposite of the precedence above. It is invisible today because the key sets
+  are disjoint; a span carrying one key at both scopes would make the oracle
+  disagree with both the reference and with us. Adding such a span means
+  changing that helper in the same commit.
+
+- **How it is recorded while it is unbuilt.** The rule is a decision taken in
+  the design record; the code still does the old thing, and
+  `crates/pulsus-read/src/traces/search_eval.rs`'s
+  `dual_scope_membership_satisfies_an_unscoped_negation_correctly` still
+  asserts the old cross-scope answer. That test now carries a doc comment
+  naming this entry and saying which assertion the change will move. When the
+  change lands, the assertion moves with it and a differential case covering
+  both kinds is added.
+
 ### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
 
 - **What.** `compare(f[, topN[, start, end]])` keeps, per attribute and per
