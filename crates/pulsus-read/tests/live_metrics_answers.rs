@@ -4,9 +4,24 @@
 //! Nothing else in the tree does this. The PromQL correctness corpus runs
 //! against a synthetic in-memory store and never reaches
 //! `crates/pulsus-read`; the live suites that do reach it assert labels,
-//! statement text and index pruning, not values. So a read path that
-//! returned `value + 1.0` for every float, or normalised `-0.0` to `0.0`,
-//! could pass the whole test tree.
+//! statement text and index pruning.
+//!
+//! What that leaves open is narrower than "any wrong value", and it is
+//! worth stating exactly, because the wider claim is false. Measured on
+//! the base commit `7a6fd7e7`, one mutation at a time:
+//!
+//! ```text
+//!   mutation in the read path            86 live tests   2,177 unit tests
+//!   ---------------------------------    -------------   ----------------
+//!   every float sample + 1.0                   6 red            -
+//!   every float sample + 0.0                   0 red          0 red
+//!     (so only -0.0 moves)
+//! ```
+//!
+//! A wholesale value change is seen, incidentally, by six live tests. A
+//! change that preserves `==` is seen by nothing at all: `-0.0` normalised
+//! to `0.0` leaves the entire tree green, and it is a wrong answer a user
+//! reads — `min by (status)` rendering `0` where the answer is `-0`.
 //!
 //! ## The two sides
 //!
@@ -41,8 +56,18 @@
 //! no result conversion, so a disagreement localises there. It is *not* an
 //! oracle for the parser, the planner, the evaluator, the value types or
 //! `render_hist` — a defect in any of those five moves both answers
-//! together. Sixteen tests below carry hand-written literal answers, which
-//! is what covers the part the two sides share.
+//! together, which is measured, not assumed: a one-second error in the
+//! planner's matrix-selector `@` resolution left every differential pair
+//! agreeing.
+//!
+//! What covers the shared part is the literals. Of the nineteen tests
+//! below, one asserts the fixture's own size and reaches no database, one
+//! is the differential and carries no literal, and **seventeen assert an
+//! answer the read path returned against a value stated here**. Fifteen of
+//! those seventeen write every expected value out by hand; the other two —
+//! the 501-series chunked set and the 241-point staleness grid — build
+//! theirs from the fixture's arithmetic, because writing 501 and 241
+//! values out would be transcription rather than an oracle.
 //!
 //! Every value is compared as `f64::to_bits`. That is what makes `NaN`
 //! equal `NaN`, keeps `-0.0` different from `0.0`, and keeps the stale
@@ -52,15 +77,29 @@
 //!
 //! ## What this suite does not cover
 //!
-//! A fetch window that is too *wide* (extra rows change no answer; the
-//! statement-text tests in `metrics::sample_sql` guard the window
-//! expression, including its lower bound's inclusivity). Any defect in the
-//! five shared surfaces, except where a literal below names it. Histogram
-//! shapes other than the one exponential the fixture carries -- no NHCB,
-//! no negative buckets, no zero buckets, no histogram-valued answer. The
-//! info-family selector, the `anchored`/`smoothed` range modifiers, the
-//! cardinality and memory caps, the multi-shard distributed read, and
-//! cold-cache combined with the multi-metric fan-out.
+//! * **A fetch window that is too *wide*.** The in-memory side is given
+//!   every sample the fixture declares, so extra fetched rows change no
+//!   answer. It costs bytes, not correctness. The statement-text tests in
+//!   `metrics::sample_sql` guard the window expression, including the
+//!   lower bound's inclusivity, which no answer can see at all: the
+//!   evaluator's lookback is left-open over the same instant, so a sample
+//!   exactly on the bound is discarded whichever way the SQL reads.
+//! * **Any defect in the five shared surfaces, outside a literal's
+//!   reach.** The planner resolves `@` at four call sites; two of them
+//!   have a literal oracle here — `plan_vector_selector`
+//!   (`crates/pulsus-promql/src/plan.rs:1699`) and
+//!   `plan_matrix_selector_id` (`:1729`). The subquery site (`:1825`) and
+//!   the info-family site (`:2439`) have none, and no query below is a
+//!   subquery.
+//! * **Histogram shapes other than the one the fixture carries** — one
+//!   exponential, `schema 0`, three positive buckets, no negative buckets,
+//!   no zero bucket, no custom values. Nothing here covers NHCB or a
+//!   histogram-valued answer. And `render_hist` is shared, so a field it
+//!   did not print would be a field the differential could not compare.
+//! * **Not reached at all:** the info-family selector, the
+//!   `anchored`/`smoothed` range modifiers, the cardinality and memory
+//!   caps, the multi-shard distributed read, and a cold cache combined
+//!   with the multi-metric fan-out.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1` through
 //! `pulsus_testkit::live_clickhouse_enabled`, so it skips on a machine
@@ -1229,6 +1268,34 @@ async fn offset_and_anchor_answer_the_instant_they_name() {
         Answer::Vector(vec![(Vec::new(), Val::Float(102.0f64.to_bits()))]),
         "offset 30s must select the sample AT t-30s (102), never the one a second either side"
     );
+    // The planner resolves `@` and `offset` in two places, and the two
+    // above reach only the first: `plan_vector_selector`
+    // (`crates/pulsus-promql/src/plan.rs:1699`, :1700) for an instant
+    // selector, and `plan_matrix_selector_id` (:1729, :1731) for a range
+    // one. Measured: a one-second defect at :1729 alone leaves every
+    // other test in this suite green, because both sides of the
+    // differential share the planner and a planner defect moves them
+    // together. So the range-selector answers are written out by hand
+    // here, exactly as the instant ones are.
+    //
+    // A range selector is left-open right-closed, so `[1s] @ t-30s`
+    // spans `(t-31s, t-30s]` and holds one sample, 102. One second late
+    // it spans `(t-30s, t-29s]` and holds 103; one second early,
+    // `(t-32s, t-31s]` and 101.
+    assert_eq!(
+        h.read_path(&format!("sum_over_time(anchor_probe[1s] @ {at_s})"), &p)
+            .await,
+        Answer::Vector(vec![(lbl(&[("a", "x")]), Val::Float(102.0f64.to_bits()))]),
+        "a RANGE selector anchored at t-30s spans (t-31s, t-30s], so its sum is 102 — \
+         never 103 (a second late) or 101 (a second early)"
+    );
+    assert_eq!(
+        h.read_path("sum_over_time(anchor_probe[1s] offset 30s)", &p)
+            .await,
+        Answer::Vector(vec![(lbl(&[("a", "x")]), Val::Float(102.0f64.to_bits()))]),
+        "and a RANGE selector offset by 30s spans the same one-second window, so its sum \
+         is 102"
+    );
     // `offset 1m` evaluates at t-60s, where the four live series hold
     // 1, 10, 0.1 and -0.0.
     assert_eq!(
@@ -1470,15 +1537,45 @@ async fn the_dual_read_merge_preserves_every_float_sample() {
     drop_database(&h.bootstrap, &h.db).await;
 }
 
+/// A selector that matches nothing answers an empty vector, never an
+/// error — on **both** of the read path's zero-result returns, which are
+/// separate branches reached by different selector shapes:
+///
+/// ```text
+///   the selector                              where it stops
+///   ------------------------------------      ------------------------
+///   a concrete metric name whose series   ->   the chunked fetch with no
+///   set resolves empty                         SQL to send, exec.rs:961
+///
+///   a name-less selector whose fan-out    ->   SelectorFetchPlan::Empty,
+///   resolves no metric group                   built at exec.rs:871
+///
+///   a residual `__name__` matcher that    ->   SelectorFetchPlan::Empty,
+///   excludes the concrete name                 built at exec.rs:557
+///                                                     |
+///                                              both consumed at
+///                                              exec.rs:954
+/// ```
+///
+/// The first three queries below reach `:961` only; the last two reach
+/// `:954`, which the first three never take. Each break reddens this
+/// test, and each does so through the query written for it.
 #[tokio::test]
 async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
     skip_unless_live!();
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_empty")).await;
     let p = h.instant();
     for q in [
+        // concrete name, warm cache, no series carries that label value
         r#"http_requests_total{status="418"}"#,
+        // a concrete name no series in the fixture carries
         "no_such_metric_at_all",
+        // a self-contradicting matcher pair on one label
         r#"http_requests_total{instance="a",instance="b"}"#,
+        // name-less: the fan-out resolves no metric group at all
+        r#"{status="418"}"#,
+        // a second `__name__` matcher excluding the first one's name
+        r#"{__name__="gauge_nan",__name__="edge_probe"}"#,
     ] {
         assert_eq!(h.read_path(q, &p).await, Answer::Vector(Vec::new()), "{q}");
     }
