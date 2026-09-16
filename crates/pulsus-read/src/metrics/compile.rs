@@ -475,9 +475,12 @@ impl Owner {
 /// caps the depth — so even a scan of one bucket against itself is
 /// bounded by a constant rather than by the tree.
 ///
-/// Every collection here is [`Counted`], construction included, so any
-/// pass anyone adds is charged for what it reads or writes whether or
-/// not they know the gate exists.
+/// Every collection here is [`Counted`], construction included, so a pass
+/// anyone adds **over these collections** is charged for what it reads or
+/// writes whether or not they know the gate exists. A pass over a copy
+/// taken out of one of them is not — see the bound published on
+/// `the_explain_walk_is_linear_in_the_tree`, which is where the limits of
+/// the counting are stated.
 pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     let flat = flatten(&plan.root);
     let n = flat.nodes.len();
@@ -1592,13 +1595,26 @@ mod tests {
     ///   }
     ///   ```
     ///
-    ///   Measured in review: both checks green and all four access rows
-    ///   at their published values. The same materialisation works for
-    ///   the flattened nodes, the buckets and the read index. **No
-    ///   per-access counter can see this**, here or anywhere — the copy
-    ///   is an ordinary value and the work over it touches nothing the
-    ///   counter owns. It is why this gate is the last one built for this
-    ///   claim rather than the sixth of a series.
+    ///   Measured: both checks green and all four access rows at their
+    ///   published values. The same materialisation works for the
+    ///   flattened nodes, the buckets and the read index.
+    ///
+    ///   **The escape is an UNCHARGED copy, not a copy.** A copy whose
+    ///   iteration still charges is seen — measured both ways at this
+    ///   head, on the shape above:
+    ///
+    ///   ```text
+    ///   raw.iter().inspect(|_| charge(1)).find(…)   RED, 4,175 over a bound of 3,056
+    ///   raw.iter().find(…)                          green
+    ///   ```
+    ///
+    ///   So the true statement is the narrow one: **this counter cannot
+    ///   see reads over a copy that is no longer charged.** And what
+    ///   cannot be closed by counting harder is exactly that case — the
+    ///   copy is an ordinary value the counter has no hold on, so whether
+    ///   it charges is the writer's choice rather than the collection's.
+    ///   It is why this gate is the last one built for this claim rather
+    ///   than the sixth of a series.
     /// * **Work that touches no collection.** Nested loops over
     ///   `0..len()` whose sums escape through `black_box` move no count.
     ///   `len()` is deliberately free; arithmetic over indices is
@@ -1759,34 +1775,42 @@ mod tests {
     ///
     /// Twenty shapes, each a genuine unmetered read of a plain collection
     /// inside the walk, all twenty compiled into `chain_of` in **one**
-    /// run: **it caught 5.**
+    /// run: **it refuses 5 of them.**
     ///
     /// ```text
-    ///   caught      1 a plain binding read          `let v: Vec<usize> = …; v.len()`
-    ///               4 a closure capture             `let f = || v.len();`
-    ///              13 a boxed slice from a Vec      `let v: Box<[usize]> = Vec::new().into_boxed_slice();`
-    ///              19 a `ref` pattern               `let ref v = vec![0usize];`
-    ///              20 a nested function's local     `fn inner() { let v: Vec<usize> = …; v.len() }`
+    ///   REFUSED      1 a plain binding read          `let v: Vec<usize> = …; v.len()`
+    ///   (recognised, 4 a closure capture             `let f = || v.len();`
+    ///    and the    13 a boxed slice from a Vec      `let v: Box<[usize]> = Vec::new().into_boxed_slice();`
+    ///    read       19 a `ref` pattern               `let ref v = vec![0usize];`
+    ///    reported)  20 a nested function's local     `fn inner() { let v: Vec<usize> = …; v.len() }`
     ///
-    ///   detected,   2 rebinding                     `let w = v; w.len()`
-    ///   not caught  5 `format!`                     `format!("{v:?}")`  — the use is inside a macro
-    ///               6 a match binding               `let w = match … { _ => v }; w.len()`
-    ///               7 `&*name`                      `let s: &[usize] = &*v;`
-    ///               8 a helper, by move             `helper(v)`
-    ///               9 UFCS, by move                 `Vec::into_iter(v)`
+    ///   RECOGNISED,  2 rebinding                     `let w = v; w.len()`
+    ///   permitted    5 `format!`                     `format!("{v:?}")`  — the use is inside a macro
+    ///   (the         6 a match binding               `let w = match … { _ => v }; w.len()`
+    ///    binding     7 `&*name`                      `let s: &[usize] = &*v;`
+    ///    is seen,    8 a helper, by move             `helper(v)`
+    ///    the read    9 UFCS, by move                 `Vec::into_iter(v)`
+    ///    is not)
     ///
-    ///   not even    3 a tuple field                 `let t = (Vec::new(), 0); t.0.len()`
-    ///   detected   10 `VecDeque`                   11 `HashMap`              12 an array
-    ///              14 an inferred `collect()`       15 a type alias          16 a Vec from a function
-    ///              17 a tuple pattern               18 a method on a struct
+    ///   UNRECOGNISED 3 a tuple field                 `let t = (Vec::new(), 0); t.0.len()`
+    ///   (not seen   10 `VecDeque`                   11 `HashMap`              12 an array
+    ///    as a       14 an inferred `collect()`       15 a type alias          16 a Vec from a function
+    ///    collection 17 a tuple pattern               18 a method on a struct
+    ///    at all)
     /// ```
     ///
-    /// **The number is a property of the twenty shapes, not a constant.**
-    /// The round-6 review ran its own twenty and caught nine; the two
-    /// sets are different code. What both runs establish is the same
-    /// thing: as a detector of unmetered reads this rule is weak, and
-    /// widening it has been beaten by the next shape every time it was
-    /// tried.
+    /// **The number is a property of the twenty shapes, not a constant**,
+    /// and the two words for what happens to a shape are not the same
+    /// one. A shape is **recognised** when this rule sees a plain
+    /// collection at all, and **refused** when it also reports a read of
+    /// it; the table above is 5 refused, 6 recognised and permitted, 9
+    /// unrecognised. The round-6 review ran its own twenty and its run
+    /// **detected** nine — its binding census failed first, so the read
+    /// assertion never ran, and its own diagnostic named four. Different
+    /// code, and a different question. What both runs establish is the
+    /// same thing: as a detector of unmetered reads this rule is weak,
+    /// and widening it has been beaten by the next shape every time it
+    /// was tried.
     ///
     /// **So this is not what keeps the walk honest, and the linearity
     /// claim does not rest on it.** What keeps the walk honest is that
