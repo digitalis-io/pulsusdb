@@ -457,10 +457,15 @@ fn fixture(t: i64) -> Vec<FixtureSeries> {
         fp: 70,
         metric: "anchor_probe",
         labels: lbl(&[("a", "x")]),
+        // Written as `30_000 -/+ 1_000` rather than `31_000`/`29_000`:
+        // the fixed-port guard
+        // (`crates/pulsus-server/tests/live_port_uniqueness.rs`) reads any
+        // bare 31000-31999 literal in a live suite as a listener-port
+        // declaration, and `31_000` would be one.
         samples: vec![
-            (t - 31_000, 101.0f64.to_bits()),
+            (t - 30_000 - 1_000, 101.0f64.to_bits()),
             (t - 30_000, 102.0f64.to_bits()),
-            (t - 29_000, 103.0f64.to_bits()),
+            (t - 30_000 + 1_000, 103.0f64.to_bits()),
         ],
         hist_samples: Vec::new(),
     });
@@ -855,11 +860,17 @@ struct Harness {
     t: i64,
 }
 
-async fn harness(name: &str) -> Harness {
+/// `db` is already composed by `pulsus_testkit::test_db` at the call site,
+/// not here: the naming guard
+/// (`crates/pulsus-server/tests/live_db_naming.rs`) requires the reserved
+/// `pulsus_*_it_*` name to sit inside the helper's own argument list, so
+/// that every test shows the per-checkout prefix reaching its database
+/// rather than trusting a helper to apply it out of sight.
+async fn harness(db: &str) -> Harness {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = pulsus_testkit::test_db(name);
+    let db = db.to_string();
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(test_config(&db)).await.expect("connect");
     let now = now_ms();
@@ -1008,7 +1019,7 @@ fn the_fixture_is_the_size_the_plan_states() {
 #[tokio::test]
 async fn every_seeded_sample_arrives_with_its_exact_bits() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_samples").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_samples")).await;
     let p = MetricQueryParams {
         start_ms: h.t - 60_000,
         end_ms: h.t,
@@ -1076,7 +1087,7 @@ async fn every_seeded_sample_arrives_with_its_exact_bits() {
 #[tokio::test]
 async fn the_aggregations_answer_their_fixture_values_bit_for_bit() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_agg").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_agg")).await;
     let p = h.instant();
     assert_eq!(
         h.read_path("max by (status) (http_requests_total)", &p)
@@ -1114,7 +1125,7 @@ async fn the_aggregations_answer_their_fixture_values_bit_for_bit() {
 #[tokio::test]
 async fn a_gap_longer_than_the_lookback_drops_the_series_for_exactly_its_grid_points() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_gap").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_gap")).await;
     let start = h.t - HOUR_MS;
     let p = MetricQueryParams {
         start_ms: start,
@@ -1194,7 +1205,10 @@ async fn a_gap_longer_than_the_lookback_drops_the_series_for_exactly_its_grid_po
 #[tokio::test]
 async fn offset_and_anchor_answer_the_instant_they_name() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_window_modifiers").await;
+    let h = harness(&pulsus_testkit::test_db(
+        "pulsus_read_it_answers_window_modifiers",
+    ))
+    .await;
     let p = h.instant();
     let at_s = (h.t - 30_000) / 1000;
 
@@ -1256,7 +1270,7 @@ async fn offset_and_anchor_answer_the_instant_they_name() {
 #[tokio::test]
 async fn every_live_series_is_counted_and_the_silent_one_is_not() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_lookback").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_lookback")).await;
     let p = h.instant();
     let got = h
         .read_path("count by (status) (http_requests_total)", &p)
@@ -1272,7 +1286,10 @@ async fn every_live_series_is_counted_and_the_silent_one_is_not() {
 #[tokio::test]
 async fn every_nan_member_is_delivered_and_counted() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_nan_delivered").await;
+    let h = harness(&pulsus_testkit::test_db(
+        "pulsus_read_it_answers_nan_delivered",
+    ))
+    .await;
     let p = h.instant();
     // The read path's share of NaN handling is delivery: a NaN-valued
     // series must arrive and be counted like any other. Whether an
@@ -1293,7 +1310,7 @@ async fn every_nan_member_is_delivered_and_counted() {
 #[tokio::test]
 async fn min_and_max_skip_a_nan_member_when_the_group_has_a_number() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_nan_skip").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_nan_skip")).await;
     let p = h.instant();
     let one = |a: &Answer| -> u64 {
         match a {
@@ -1330,7 +1347,7 @@ async fn min_and_max_skip_a_nan_member_when_the_group_has_a_number() {
 #[tokio::test]
 async fn an_all_nan_group_answers_infinity_today_which_issue_551_corrects() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_nan_all").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_nan_all")).await;
     let p = h.instant();
     let two = |a: &Answer| -> u64 {
         match a {
@@ -1361,7 +1378,7 @@ async fn an_all_nan_group_answers_infinity_today_which_issue_551_corrects() {
 #[tokio::test]
 async fn the_stale_marker_removes_its_series_from_the_answer() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_stale").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_stale")).await;
     let p = h.instant();
     let got = h.read_path("count by (g) (gauge_nan)", &p).await;
     assert_eq!(
@@ -1375,7 +1392,7 @@ async fn the_stale_marker_removes_its_series_from_the_answer() {
 #[tokio::test]
 async fn the_fetch_window_includes_a_sample_on_its_upper_bound() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_upper").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_upper")).await;
     let p = h.instant();
     let got = h.read_path(r#"edge_probe{edge="upper"}"#, &p).await;
     assert_eq!(
@@ -1392,7 +1409,7 @@ async fn the_fetch_window_includes_a_sample_on_its_upper_bound() {
 #[tokio::test]
 async fn a_sample_one_millisecond_inside_the_lower_bound_survives_the_fetch() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_lower").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_lower")).await;
     let p = h.instant();
     let got = h.read_path("edge_probe", &p).await;
     assert_eq!(
@@ -1415,7 +1432,7 @@ async fn a_sample_one_millisecond_inside_the_lower_bound_survives_the_fetch() {
 #[tokio::test]
 async fn the_chunked_fingerprint_set_returns_every_series_in_fingerprint_order() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_chunks").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_chunks")).await;
     let p = h.instant();
     let got = h.read_path("chunked_total", &p).await;
     let want = Answer::Vector(
@@ -1438,7 +1455,7 @@ async fn the_chunked_fingerprint_set_returns_every_series_in_fingerprint_order()
 #[tokio::test]
 async fn the_dual_read_merge_preserves_every_float_sample() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_dual").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_dual")).await;
     let p = h.instant();
     assert_eq!(
         h.read_path("max(dual_probe)", &p).await,
@@ -1456,7 +1473,7 @@ async fn the_dual_read_merge_preserves_every_float_sample() {
 #[tokio::test]
 async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_empty").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_empty")).await;
     let p = h.instant();
     for q in [
         r#"http_requests_total{status="418"}"#,
@@ -1471,7 +1488,7 @@ async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
 #[tokio::test]
 async fn two_series_sharing_a_label_set_reach_the_evaluator_as_two_series() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_dup").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_dup")).await;
     let p = h.instant();
     let expr = parse("dup_labels").expect("parse");
     let err = h.engine.query(&expr, &p).await.expect_err("must reject");
@@ -1491,7 +1508,7 @@ async fn two_series_sharing_a_label_set_reach_the_evaluator_as_two_series() {
 #[tokio::test]
 async fn the_multi_metric_fan_out_answers_each_name_with_its_own_values() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_fanout").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_fanout")).await;
     let p = h.instant();
     let got = h
         .read_path(
@@ -1562,7 +1579,7 @@ async fn the_multi_metric_fan_out_answers_each_name_with_its_own_values() {
 #[tokio::test]
 async fn the_cold_cache_fallback_answers_exactly_what_the_warm_cache_does() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_cold").await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_cold")).await;
     let p = h.instant();
     let want = vec_answer(&[(&[("status", "200")], 30.5), (&[("status", "500")], 0.3)]);
     let warm = h
@@ -1582,7 +1599,10 @@ async fn the_cold_cache_fallback_answers_exactly_what_the_warm_cache_does() {
 #[tokio::test]
 async fn every_query_answers_the_same_through_the_read_path_and_in_memory() {
     skip_unless_live!();
-    let h = harness("pulsus_read_it_answers_differential").await;
+    let h = harness(&pulsus_testkit::test_db(
+        "pulsus_read_it_answers_differential",
+    ))
+    .await;
     let instant = h.instant();
     let range = MetricQueryParams {
         start_ms: h.t - 60_000,
