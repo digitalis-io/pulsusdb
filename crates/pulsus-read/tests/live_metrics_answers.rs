@@ -1553,15 +1553,15 @@ async fn the_dual_read_merge_preserves_every_float_sample() {
     drop_database(&h.bootstrap, &h.db).await;
 }
 
-/// A selector that matches nothing answers an empty vector, never an
-/// error — at **every** zero-result return the metrics read path has for
-/// a selector. There are five, in three branches, reached by different
-/// selector shapes and by the state of the label cache:
+/// A selector that matches nothing — or matches series with nothing to
+/// say — answers an empty vector, never an error. The read path arrives
+/// at that answer by **six routes that this test covers**, which differ
+/// by the selector's shape and by whether the label cache is warm:
 ///
 /// ```text
-///   the selector                          cache   where it stops
+///   the selector                          cache   how it ends up empty
 ///   ----------------------------------    -----   ---------------------
-///   a concrete metric name whose          warm    the chunked fetch with
+///   a concrete metric name whose          warm    the chunked fetch has
 ///   series set resolves empty                     no SQL to send,
 ///                                                 exec.rs:961
 ///
@@ -1575,14 +1575,39 @@ async fn the_dual_read_merge_preserves_every_float_sample() {
 ///   a concrete metric name, of any of     cold    the sub-query
 ///   the shapes above or merely silent             fallback's zero-row
 ///   for longer than the lookback                  return, exec.rs:1018
+///
+///   a concrete metric name that DOES      warm    no early return at
+///   resolve, whose fetch then returns             all: `group_rows`
+///   no rows (silent past the lookback)            falls out of its loop
+///                                                 over zero rows
 /// ```
 ///
-/// Measured, so the queries are known not to cover one another: a marker
-/// error at each of the five sites reddens this test, and each does so
-/// through the query written for it. The first three queries reach `:961`
-/// only; the fourth and fifth reach `:954`, which the first three never
-/// take; and the cold loop reaches `:1018`, which the warm loop never
-/// takes.
+/// **How those six were found, and what that does not settle.** Five are
+/// explicit early returns and were found by text search:
+///
+/// ```text
+/// git grep -n 'Ok(Vec::new())\|Ok(vec!\[\])\|SelectorFetchPlan::Empty' \
+///     -- crates/pulsus-read/src/metrics/
+/// ```
+///
+/// which returns exactly those five, plus `exec.rs:1485` — the discovery
+/// path's empty wide-set branch, which is not a selector's answer and
+/// which a marker error leaves this whole suite green.
+///
+/// The sixth has no spelling to search for. It was found by marking all
+/// five sites at once and asking which queries still answered empty:
+/// `http_requests_total{status="404"}` on a warm cache did, because its
+/// fingerprint resolves, its SQL is sent, no rows come back, and the
+/// result is empty by falling out of a loop rather than by returning
+/// early.
+///
+/// **So this is not a claim that six is all there are.** A text search
+/// cannot enumerate fall-throughs, and the marking experiment ranges only
+/// over the queries written below. What is established is that these six
+/// exist, that each is covered, and that the queries do not stand in for
+/// one another: a marker error at each of the five returns reddens this
+/// test through its own query, and the sixth is the one query that
+/// survives all five markers.
 ///
 /// **A name-less selector is deliberately absent from the cold loop.**
 /// `{status="418"}` against a cold cache is `NamelessSelectorUnresolvable
@@ -1607,6 +1632,11 @@ async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
         r#"{status="418"}"#,
         // a second `__name__` matcher excluding the first one's name
         r#"{__name__="gauge_nan",__name__="edge_probe"}"#,
+        // the sixth route: this one RESOLVES. Its fingerprint reaches the
+        // SQL, the fetch returns no rows because its only sample is ten
+        // minutes old, and the empty answer comes from falling out of
+        // `group_rows`'s loop — past every early return above.
+        r#"http_requests_total{status="404"}"#,
     ] {
         assert_eq!(
             h.read_path(q, &p).await,
