@@ -5624,37 +5624,43 @@ Every row below `Selector` is residual today with `BlockReason::NotYetLowered`, 
 `Never`**: every candidate is "no SQL form has been written", which is what `NotYetLowered` says. A
 `Never` would put a word on a public surface that no code can produce.
 
+Every variant named in the first column is declared in
+`crates/pulsus-promql/src/plan.rs`; the variant name is the pointer rather than a line number,
+because a line number in this record has to carry an anchor row in
+`crates/pulsus-read/tests/design_record_citations.tsv` and an enum variant is the more stable
+address in any case.
+
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
-| `Selector` → `PqlLink::Select(i)` (`plan.rs:592`) | — → `Samples` | none; the seed **is** the two statements the shipped builders render, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts that rather than leaving the exemption silent | **always lowers**, `Fidelity::Wider`: `SelectorSpec::fetch_window` subtracts one lookback unconditionally, so the evaluator MUST re-apply | *none* — the entry's two statements are this plan's two SQL parts, the second cut `Cut::DisjointSources` |
-| `RangeVector` (`plan.rs:603`) | `Samples` → `Samples` | none today | **none — the identity**: no label name is in the column set, so nothing to rewrite | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `RangeFn` (`plan.rs:606`) | `Samples` → `Series` | none today: the per-step grid has no SQL form written | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `OverTime` (`plan.rs:613`) | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `OverTimeParam` (`plan.rs:626`) | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `AbsentOverTime` (`plan.rs:639`) | `Samples` → `Series` | none today; the answer is a statement about rows that are ABSENT, which is the shape §5 calls out | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Absent` (`plan.rs:648`) | `Series` → `Series` | as `AbsentOverTime` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Sort` (`plan.rs:655`) | `Series` → `Series` | an ordering over a VALUE our own evaluator computes | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `SortByLabel` (`plan.rs:664`) | `Series` → `Series` | natural (numeric-aware) label collation, which has no SQL form here | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `LabelReplace` (`plan.rs:674`) | `Series` → `Series` | a label rewrite, and a label is not a column in this model | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `LabelJoin` (`plan.rs:686`) | `Series` → `Series` | as `LabelReplace` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `HistogramQuantile` (`plan.rs:693`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `HistogramQuantiles` (`plan.rs:712`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `HistogramAccessor` (`plan.rs:739`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `HistogramFraction` (`plan.rs:748`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Aggregate` (`plan.rs:760`) | `Series` → `Series` grouped | the grouping key must be expressible, and a group key is a LABEL: the piece that lowers `by (l)` must first decide how a label enters the column set | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part. **A pushed aggregate may not be a plain `GROUP BY` over the fetched rows** — the source is `Wider`, so it has to produce the per-step grid |
-| `CountValues` (`plan.rs:783`) | `Series` → `Series` grouped | as `Aggregate`, and its parameter is an injected LABEL name | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Binary` (`plan.rs:788`) | `Series` × `Series` → `Series` | **a tree, not a chain.** A left fold cannot represent two operands; when both operands bear entries the link is on no chain at all, and when one does it is on that entry's | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `SetOp` (`plan.rs:812`) | `Series` × `Series` → `Series` | as `Binary` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `MathFn` (`plan.rs:823`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `ScalarFn` (`plan.rs:833`) | — → scalar | none today; it bears an entry only when a scalar argument does | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `DateFn` (`plan.rs:846`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Timestamp` (`plan.rs:858`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `ScalarOf` (`plan.rs:866`) | `Series` → scalar | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `VectorOf` (`plan.rs:872`) | scalar → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Info` (`plan.rs:876`) | `Series` × `Series` → `Series` | — | n/a — **always consumes two entries**, its own argument and the synthetic metadata selector the planner pushes for it, so it is on no chain by the rule rather than by an exception to it | not in the chain | n/a |
-| `Scalar` (`plan.rs:903`) | — → scalar | — | n/a — a leaf that bears no entry, ever, so its entry set is empty and no chain can carry it | not in the chain | n/a |
-| `StringLiteral` (`plan.rs:915`) | — → string | — | n/a — as `Scalar`; only ever the plan ROOT | not in the chain | n/a |
-| `Time` (`plan.rs:838`) | — → scalar | — | n/a — as `Scalar`: `time()` emits no selector | not in the chain | n/a |
+| `Selector` → `PqlLink::Select(i)` | — → `Samples` | none; the seed **is** the two statements the shipped builders render, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts that rather than leaving the exemption silent | **always lowers**, `Fidelity::Wider`: `SelectorSpec::fetch_window` subtracts one lookback unconditionally, so the evaluator MUST re-apply | *none* — the entry's two statements are this plan's two SQL parts, the second cut `Cut::DisjointSources` |
+| `RangeVector` | `Samples` → `Samples` | none today | **none — the identity**: no label name is in the column set, so nothing to rewrite | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `RangeFn` | `Samples` → `Series` | none today: the per-step grid has no SQL form written | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `OverTime` | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `OverTimeParam` | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `AbsentOverTime` | `Samples` → `Series` | none today; the answer is a statement about rows that are ABSENT, which is the shape §5 calls out | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Absent` | `Series` → `Series` | as `AbsentOverTime` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Sort` | `Series` → `Series` | an ordering over a VALUE our own evaluator computes | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `SortByLabel` | `Series` → `Series` | natural (numeric-aware) label collation, which has no SQL form here | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `LabelReplace` | `Series` → `Series` | a label rewrite, and a label is not a column in this model | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `LabelJoin` | `Series` → `Series` | as `LabelReplace` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramQuantile` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramQuantiles` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramAccessor` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramFraction` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Aggregate` | `Series` → `Series` grouped | the grouping key must be expressible, and a group key is a LABEL: the piece that lowers `by (l)` must first decide how a label enters the column set | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part. **A pushed aggregate may not be a plain `GROUP BY` over the fetched rows** — the source is `Wider`, so it has to produce the per-step grid |
+| `CountValues` | `Series` → `Series` grouped | as `Aggregate`, and its parameter is an injected LABEL name | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Binary` | `Series` × `Series` → `Series` | **a tree, not a chain.** A left fold cannot represent two operands; when both operands bear entries the link is on no chain at all, and when one does it is on that entry's | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `SetOp` | `Series` × `Series` → `Series` | as `Binary` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `MathFn` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `ScalarFn` | — → scalar | none today; it bears an entry only when a scalar argument does | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `DateFn` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Timestamp` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `ScalarOf` | `Series` → scalar | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `VectorOf` | scalar → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Info` | `Series` × `Series` → `Series` | — | n/a — **always consumes two entries**, its own argument and the synthetic metadata selector the planner pushes for it, so it is on no chain by the rule rather than by an exception to it | not in the chain | n/a |
+| `Scalar` | — → scalar | — | n/a — a leaf that bears no entry, ever, so its entry set is empty and no chain can carry it | not in the chain | n/a |
+| `StringLiteral` | — → string | — | n/a — as `Scalar`; only ever the plan ROOT | not in the chain | n/a |
+| `Time` | — → scalar | — | n/a — as `Scalar`: `time()` emits no selector | not in the chain | n/a |
 
 **Two consequences of the rule, each with its smallest witness**, because four wrong rules were
 built during review that satisfy some of the rows above and not the rule:

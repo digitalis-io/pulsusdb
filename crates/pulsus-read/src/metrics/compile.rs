@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn the_worked_query_yields_two_sql_parts_and_one_engine_part() {
         let plan = planned("max by (status) (http_requests_total{status=\"500\"})");
-        let reads = vec![SelectorRead {
+        let reads = [SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
         }];
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn a_selectors_two_statements_are_two_sql_parts_cut_on_disjoint_sources() {
         let plan = planned("http_requests_total");
-        let reads = vec![SelectorRead {
+        let reads = [SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
         }];
