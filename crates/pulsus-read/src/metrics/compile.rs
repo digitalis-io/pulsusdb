@@ -469,12 +469,15 @@ impl Owner {
 ///
 /// The third pass is what removes the per-entry scan: **every node is
 /// placed at most once**, so the buckets hold no more than `nodes`
-/// entries between them however many selectors the query has.
+/// entries between them however many selectors the query has. **One
+/// bucket holds at most [`pulsus_promql::MAX_EXPR_DEPTH`] entries**,
+/// because a chain is a path from a selector to the root and the parser
+/// caps the depth — so even a scan of one bucket against itself is
+/// bounded by a constant rather than by the tree.
 ///
-/// Both node collections are [`Counted`], so any pass anyone adds is
-/// charged for what it reads whether or not they know the gate exists;
-/// `the_explain_walk_is_linear_in_the_tree` is what fails when the total
-/// stops being linear.
+/// Every collection here is [`Counted`], construction included, so any
+/// pass anyone adds is charged for what it reads or writes whether or
+/// not they know the gate exists.
 pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     let flat = flatten(&plan.root);
     let n = flat.nodes.len();
@@ -482,7 +485,7 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     // Pass 2: each node's owner, folded upward. Reverse pre-order, so a
     // node is merged into its parent after every one of its descendants
     // has been merged into it.
-    let mut owner: Counted<Vec<Owner>> = Counted::new(flat.direct);
+    let mut owner = flat.direct;
     for i in (0..n).rev() {
         let (Some(mine), Some(Some(p))) = (owner.get(i).copied(), flat.parent.get(i).copied())
         else {
@@ -495,37 +498,34 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
     // Pass 3: one bucket per entry, filled in ONE pass over the nodes.
     // Pre-order visits an ancestor before its descendants, so each
     // bucket comes out ordered by increasing depth.
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); plan.selectors.len()];
+    let mut buckets: Counted<Vec<Vec<usize>>> =
+        Counted::new((0..plan.selectors.len()).map(|_| Vec::new()).collect());
     for (i, own) in owner.iter().enumerate() {
-        if let Owner::One(id) = own
-            && let Some(bucket) = buckets.get_mut(*id)
-        {
-            bucket.push(i);
+        if let Owner::One(id) = own {
+            buckets.push_into(*id, i);
         }
     }
 
     // Pass 4: one chain per entry, reading only that entry's bucket. The
     // nodes on a chain form a path from the selector upward, so reversing
     // the bucket's increasing depth is ordering them innermost first.
-    buckets
-        .into_iter()
-        .enumerate()
-        .map(|(id, bucket)| {
-            let mut links = Vec::with_capacity(bucket.len() + 1);
-            links.push(PqlLink::Select(id));
-            links.extend(
-                bucket
-                    .into_iter()
-                    .rev()
-                    .filter_map(|i| flat.nodes.get(i).and_then(|node| node_kind(node)))
-                    .map(PqlLink::Node),
-            );
-            Chain {
-                selector: id,
-                links,
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(plan.selectors.len());
+    for (id, bucket) in buckets.into_counted_inners().enumerate() {
+        let mut links = Vec::with_capacity(bucket.len() + 1);
+        links.push(PqlLink::Select(id));
+        links.extend(
+            bucket
+                .into_iter_counted()
+                .rev()
+                .filter_map(|i| flat.nodes.get(i).and_then(|node| node_kind(node)))
+                .map(PqlLink::Node),
+        );
+        out.push(Chain {
+            selector: id,
+            links,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -535,25 +535,33 @@ pub fn chain_of(plan: &pulsus_promql::QueryPlan) -> Vec<Chain> {
 /// Collections whose every element ACCESS is charged.
 ///
 /// **This is the whole instrument, and its point is that nobody has to
-/// know it is here.** The previous version counted at call sites a
-/// person had to remember to write, so a scan reintroduced by someone
-/// who had never heard of the counter sat there green — the gate
-/// measured a number maintained by hand rather than the work the walk
-/// does (issue #548, code review round 3, which reintroduced both
-/// quadratic paths without the hand-written calls and watched the gate
-/// pass).
+/// know it is here.** Two earlier versions did not have that property
+/// and were beaten twice: the first counted at call sites a person had
+/// to remember to write, so a restored scan sat green (code review round
+/// 3); the second charged only the FINISHED collections, so quadratic
+/// work added inside the construction pass — a scan of everything pushed
+/// so far, right after each push — moved no count at all (round 4).
+///
+/// So the rule is now stated as a property of the walk rather than of
+/// any one collection:
+///
+/// > **Every collection the walk reads back is a [`Counted`], and every
+/// > collection that is not is write-only.** The first half is what
+/// > charges a scan; the second is what makes "not counted" mean "cannot
+/// > hold a scan". Both halves are checked by
+/// > `every_collection_the_walk_reads_back_is_counted`, which parses
+/// > this file.
 ///
 /// The collection inside [`Counted`] is private to this module, so from
-/// outside it there is **no way to reach an element at all** except
-/// through an accessor below, and every accessor charges. A scan anyone
-/// writes is therefore counted whether or not they know the counter
-/// exists.
+/// outside there is **no way to reach an element at all** except through
+/// an accessor below, and every accessor charges — including the ones
+/// that BUILD it, because a construction pass is part of the walk.
 mod counted {
     use std::ops::{Deref, DerefMut};
 
-    /// A collection whose elements can only be reached by charging for
-    /// them. `C` is `Vec<T>` for what the walk builds and `&[T]` for
-    /// what it is handed.
+    /// A collection whose elements can only be reached, or added, by
+    /// charging for them. `C` is `Vec<T>` for what the walk builds and
+    /// `&[T]` for what it is handed.
     pub(super) struct Counted<C>(C);
 
     impl<C> Counted<C> {
@@ -562,10 +570,55 @@ mod counted {
         }
     }
 
+    impl<T> Counted<Vec<T>> {
+        pub(super) fn empty() -> Self {
+            Self(Vec::new())
+        }
+
+        /// Appends one element. Charged: **a push is part of the work**,
+        /// which is what the round-4 probe exploited when only finished
+        /// collections were counted.
+        #[inline]
+        pub(super) fn push(&mut self, v: T) {
+            super::charge(1);
+            self.0.push(v);
+        }
+
+        /// Appends every element of `it`, charged one by one.
+        pub(super) fn extend(&mut self, it: impl Iterator<Item = T>) {
+            for v in it {
+                self.push(v);
+            }
+        }
+
+        /// Removes and returns the last element. Charged.
+        #[inline]
+        pub(super) fn pop(&mut self) -> Option<T> {
+            super::charge(1);
+            self.0.pop()
+        }
+
+        /// Empties the collection, charged for what it drops.
+        pub(super) fn clear(&mut self) {
+            super::charge(self.0.len() as u64);
+            self.0.clear();
+        }
+
+        /// Consumes the collection, charged for every element handed
+        /// over — so draining it is not a way to read it for free.
+        pub(super) fn into_iter_counted(self) -> impl DoubleEndedIterator<Item = T> {
+            super::charge(self.0.len() as u64);
+            self.0.into_iter()
+        }
+    }
+
     impl<T, C: Deref<Target = [T]>> Counted<C> {
         /// How many elements there are. **Not charged**: a length is not
         /// an element access, and charging it would make the bound
         /// depend on how often a loop asks how long something is.
+        /// Measured by the review: nested loops over `0..len()` whose
+        /// sums escape through `black_box` move no count, which is the
+        /// limit this gate states rather than hides.
         pub(super) fn len(&self) -> usize {
             self.0.len()
         }
@@ -573,7 +626,7 @@ mod counted {
         /// One element, or `None` past the end. Charged.
         #[inline]
         pub(super) fn get(&self, i: usize) -> Option<&T> {
-            super::charge();
+            super::charge(1);
             self.0.get(i)
         }
 
@@ -583,7 +636,7 @@ mod counted {
         where
             T: 'a,
         {
-            self.0.iter().inspect(|_| super::charge())
+            self.0.iter().inspect(|_| super::charge(1))
         }
     }
 
@@ -591,30 +644,61 @@ mod counted {
         /// Replaces one element. Charged: a write is an access.
         #[inline]
         pub(super) fn set(&mut self, i: usize, v: T) {
-            super::charge();
+            super::charge(1);
             self.0[i] = v;
+        }
+
+        /// Replaces one element if there is one there. Charged once
+        /// whether or not there is, because the reach is the work.
+        #[inline]
+        pub(super) fn try_set(&mut self, i: usize, v: T) {
+            super::charge(1);
+            if let Some(slot) = self.0.get_mut(i) {
+                *slot = v;
+            }
+        }
+    }
+
+    impl<T> Counted<Vec<Vec<T>>> {
+        /// Appends to the inner collection at `i`. Charged once for
+        /// reaching it, which is what a per-entry scan over the outer
+        /// collection would pay per entry.
+        #[inline]
+        pub(super) fn push_into(&mut self, i: usize, v: T) {
+            super::charge(1);
+            if let Some(inner) = self.0.get_mut(i) {
+                inner.push(v);
+            }
+        }
+
+        /// Consumes the outer collection, handing each inner one over
+        /// **still counted** — so a bucket cannot be read for free by
+        /// draining the collection that holds it.
+        pub(super) fn into_counted_inners(self) -> impl Iterator<Item = Counted<Vec<T>>> {
+            super::charge(self.0.len() as u64);
+            self.0.into_iter().map(Counted::new)
         }
     }
 }
 
 use counted::Counted;
 
-/// Charges one element access.
+/// Charges `n` element accesses.
 ///
-/// **Test-only, and nothing at all in every other build**: the cost
-/// claim is a property a check has to be able to fail, and a wall clock
-/// is not one — a clock is not scale-invariant and measures the machine
-/// rather than the algorithm. `the_explain_walk_is_linear_in_the_tree`
-/// bounds the accesses by a multiple of `nodes + entries` at four widths
-/// and asserts the ratio does not grow with the width.
+/// **Test-only, and nothing at all in every other build** — measured on
+/// both built libraries, and the artifact is named in the notes because
+/// a symbol query that looked at the wrong one would read exactly like
+/// an absence. The cost claim is a property a check has to be able to
+/// fail, and a wall clock is not one: a clock is not scale-invariant and
+/// measures the machine rather than the algorithm.
 #[cfg(test)]
-fn charge() {
-    WORK.with(|c| c.set(c.get() + 1));
+fn charge(n: u64) {
+    WORK.with(|c| c.set(c.get() + n));
 }
 
 #[cfg(not(test))]
 #[inline(always)]
-fn charge() {}
+fn charge(_n: u64) {}
 
 #[cfg(test)]
 thread_local! {
@@ -640,16 +724,25 @@ struct Flat<'a> {
     parent: Counted<Vec<Option<usize>>>,
     /// Never [`Owner::Many`]: no node names two entries of its own
     /// account, so a `Many` can only ever arise from the merge.
-    direct: Vec<Owner>,
+    direct: Counted<Vec<Owner>>,
 }
 
+/// The nodes in pre-order.
+///
+/// **The collections are counted while they are being BUILT**, not only
+/// once they are finished. That is what the round-4 probe found missing:
+/// a scan of everything pushed so far, placed right after a push, cost
+/// nothing on any of four widths while the construction vectors were
+/// plain. Reaching an element of `nodes`, `parent`, `direct`, `stack` or
+/// `kids` charges here exactly as it does in the passes above.
 fn flatten(root: &PlanExpr) -> Flat<'_> {
-    let mut nodes: Vec<&PlanExpr> = Vec::new();
-    let mut parent: Vec<Option<usize>> = Vec::new();
-    let mut direct: Vec<Owner> = Vec::new();
+    let mut nodes: Counted<Vec<&PlanExpr>> = Counted::empty();
+    let mut parent: Counted<Vec<Option<usize>>> = Counted::empty();
+    let mut direct: Counted<Vec<Owner>> = Counted::empty();
     // (node, parent index). A stack, not recursion.
-    let mut stack: Vec<(&PlanExpr, Option<usize>)> = vec![(root, None)];
-    let mut kids: Vec<&PlanExpr> = Vec::new();
+    let mut stack: Counted<Vec<(&PlanExpr, Option<usize>)>> = Counted::empty();
+    stack.push((root, None));
+    let mut kids: Counted<Vec<&PlanExpr>> = Counted::empty();
     while let Some((node, parent_of)) = stack.pop() {
         let i = nodes.len();
         nodes.push(node);
@@ -659,13 +752,16 @@ fn flatten(root: &PlanExpr) -> Flat<'_> {
         children(node, &mut kids);
         // Pushed in reverse so the first child is popped first and the
         // flattened order is a genuine pre-order.
-        for child in kids.iter().rev() {
-            stack.push((child, Some(i)));
+        let arity = kids.len();
+        for k in (0..arity).rev() {
+            if let Some(child) = kids.get(k).copied() {
+                stack.push((child, Some(i)));
+            }
         }
     }
     Flat {
-        nodes: Counted::new(nodes),
-        parent: Counted::new(parent),
+        nodes,
+        parent,
         direct,
     }
 }
@@ -727,7 +823,7 @@ fn direct_owner(e: &PlanExpr) -> Owner {
 /// `RangeSource` reach it through [`range_source_child`]. Skipping that
 /// one arm stops the entry set propagating and drops every link above a
 /// sub-query source off its chain.
-fn children<'a>(e: &'a PlanExpr, out: &mut Vec<&'a PlanExpr>) {
+fn children<'a>(e: &'a PlanExpr, out: &mut Counted<Vec<&'a PlanExpr>>) {
     match e {
         PlanExpr::Selector(_)
         | PlanExpr::Time
@@ -790,7 +886,7 @@ fn children<'a>(e: &'a PlanExpr, out: &mut Vec<&'a PlanExpr>) {
     }
 }
 
-fn range_source_child<'a>(source: &'a RangeSource, out: &mut Vec<&'a PlanExpr>) {
+fn range_source_child<'a>(source: &'a RangeSource, out: &mut Counted<Vec<&'a PlanExpr>>) {
     match source {
         RangeSource::Selector(_) => {}
         RangeSource::Subquery(sq) => out.push(&sq.inner),
@@ -1101,13 +1197,11 @@ pub fn plan_shapes(
     // whether or not whoever writes it knows the gate exists (code
     // review round 3). The index is counted for the same reason.
     let reads = Counted::new(reads);
-    let mut index: Vec<Option<&Pred>> = vec![None; plan.selectors.len()];
+    let mut by_selector: Counted<Vec<Option<&Pred>>> =
+        Counted::new(vec![None; plan.selectors.len()]);
     for read in reads.iter() {
-        if let Some(slot) = index.get_mut(read.selector) {
-            *slot = Some(&read.pred);
-        }
+        by_selector.try_set(read.selector, Some(&read.pred));
     }
-    let by_selector = Counted::new(index);
     let mut out = Vec::new();
     for chain in chain_of(plan) {
         let Some(pred) = by_selector.get(chain.selector).copied().flatten() else {
@@ -1459,11 +1553,37 @@ mod tests {
     /// at hand-written call sites and stayed green when either quadratic
     /// path was restored without them.
     ///
-    /// Two assertions, and the second is the one that says LINEAR rather
-    /// than "small on this machine": the accesses per node must not grow
-    /// with the width. Counted rather than timed — a wall clock measures
-    /// the machine, and a bound on one would be neither scale-invariant
-    /// nor reproducible on another.
+    /// Three assertions. The bound is the ceiling; the ratio is what
+    /// says LINEAR rather than "small on this machine", because accesses
+    /// per node plus entry must not grow with the width; and the link
+    /// total bounds what the per-chain callees are handed. Counted
+    /// rather than timed — a wall clock measures the machine, and a
+    /// bound on one would be neither scale-invariant nor reproducible on
+    /// another.
+    ///
+    /// # What this gate does NOT see
+    ///
+    /// Named here rather than left to be found, because a check whose
+    /// limits are unstated gets read as covering everything.
+    ///
+    /// * **Work that touches no collection.** Nested loops over
+    ///   `0..len()` whose sums escape through `black_box` move no count —
+    ///   measured by the round-4 review. `len()` is deliberately free;
+    ///   arithmetic over indices is invisible. What makes this narrow
+    ///   rather than open is that a walk over a tree has to REACH the
+    ///   tree, and every collection holding it is counted.
+    /// * **Allocation and string cost.** Building `Vec`s and formatting
+    ///   stage names allocate; none of it is charged. A change that kept
+    ///   the access count and doubled the bytes would pass.
+    /// * **The per-chain callees' internals** — `stage_names`,
+    ///   `lower_chain`, `plan_of`, `shape`. What they are HANDED is
+    ///   bounded below; what they do with it is their own business, and
+    ///   `lower_chain` and `plan_of` belong to the shared core, which
+    ///   this module does not instrument.
+    /// * **Any collection the walk adds that is not a `Counted`** — which
+    ///   is why `every_collection_the_walk_reads_back_is_counted` exists
+    ///   beside this: the two together are the claim, and neither is it
+    ///   alone.
     #[test]
     fn the_explain_walk_is_linear_in_the_tree() {
         let mut rows: Vec<(usize, usize, usize, u64)> = Vec::new();
@@ -1499,7 +1619,7 @@ mod tests {
             // A balanced sum of `terms` selectors is `terms` leaves and
             // `terms - 1` operators.
             let nodes = 2 * terms - 1;
-            let bound = 8 * (nodes + terms) as u64;
+            let bound = 16 * (nodes + terms) as u64;
             assert!(
                 work <= bound,
                 "{terms} entries, {nodes} nodes, {} query bytes: building the plans took {work} \
@@ -1507,17 +1627,213 @@ mod tests {
                  per-entry loop, or a search of the reads per chain, is what puts it there.",
                 q.len()
             );
+            // **What the per-chain callees are handed is linear too.**
+            // `stage_names`, `lower_chain`, `plan_of` and `shape` are
+            // called once per chain and read only that chain's links,
+            // and the links total no more than one per entry plus one
+            // per node. Their own internals are not charged here — that
+            // is named below as a limit — but the INPUT they get cannot
+            // grow faster than the tree.
+            let links: usize = shapes.iter().map(|s| s.links.len()).sum();
+            assert!(
+                links <= terms + nodes,
+                "{terms} entries, {nodes} nodes: the chains carry {links} links between them,                  more than one per entry plus one per node, so the callees are handed more than                  linear work"
+            );
             rows.push((terms, nodes, q.len(), work));
         }
-        let per_node = |&(terms, nodes, _, work): &(usize, usize, usize, u64)| {
+        // Per NODE PLUS ENTRY — the same denominator the bound uses and
+        // the same one the `O(nodes + entries)` claim names. Divided by
+        // tree nodes alone the figures are about 1.5 times these, which
+        // is a different quantity and not the one claimed.
+        let per_node_plus_entry = |&(terms, nodes, _, work): &(usize, usize, usize, u64)| {
             work as f64 / (nodes + terms) as f64
         };
-        let (narrow, wide) = (per_node(&rows[0]), per_node(&rows[rows.len() - 1]));
+        let (narrow, wide) = (
+            per_node_plus_entry(&rows[0]),
+            per_node_plus_entry(&rows[rows.len() - 1]),
+        );
         assert!(
             wide <= narrow * 1.05,
-            "accesses per node grew from {narrow} at {} entries to {wide} at {} entries: {rows:?}",
+            "accesses per (node + entry) grew from {narrow} at {} entries to {wide} at {}              entries: {rows:?}",
             rows[0].0,
             rows[rows.len() - 1].0
+        );
+    }
+
+    /// **Every collection the walk reads back is a [`Counted`], and every
+    /// collection that is not is write-only.**
+    ///
+    /// This is the half of the linearity claim that a measurement cannot
+    /// make. The access counter charges what goes through `Counted`; it
+    /// says nothing about a plain `Vec` somebody adds tomorrow, and that
+    /// is exactly how the gate was beaten twice — first by a scan with no
+    /// counter call, then by a scan over the construction vectors while
+    /// only the finished collections were counted. Counting one more
+    /// collection each time is not a fix; the fix is a rule over the
+    /// walk, checked here.
+    ///
+    /// The rule, and it has no exemption list:
+    ///
+    /// > In the walk's functions, a local binding of a plain collection
+    /// > may appear only as its own initialiser, as the receiver of
+    /// > `push` or `extend`, or as a bare identifier. Any other use —
+    /// > indexing, `iter`, `get`, `len`, a `for` loop over it, taking a
+    /// > reference to it — is a READ, and a collection the walk reads
+    /// > must be a `Counted`.
+    ///
+    /// **Where the rule stops**, stated rather than left to be found: a
+    /// bare identifier is a move, so a collection moved into another
+    /// function becomes that function's business. In this file the two
+    /// that are moved are the returned accumulators, and what receives
+    /// them is the caller.
+    ///
+    /// Parsed with a syntax tree rather than matched textually, because a
+    /// token rule cannot see a method call inside a macro body or a
+    /// generic call — the same reason this crate already parses its own
+    /// sources for the variants census.
+    #[test]
+    fn every_collection_the_walk_reads_back_is_counted() {
+        use syn::visit::Visit;
+
+        /// The functions that make up the walk: everything reachable
+        /// from `plan_shapes` that holds a collection of its own.
+        const WALK: [&str; 5] = [
+            "plan_shapes",
+            "chain_of",
+            "flatten",
+            "children",
+            "range_source_child",
+        ];
+        const ALLOWED: [&str; 2] = ["push", "extend"];
+
+        fn named(e: &syn::Expr, name: &str) -> bool {
+            matches!(e, syn::Expr::Path(p) if p.path.is_ident(name))
+        }
+
+        struct Uses<'a> {
+            name: &'a str,
+            bad: Vec<String>,
+        }
+
+        impl<'ast> Visit<'ast> for Uses<'_> {
+            fn visit_expr(&mut self, e: &'ast syn::Expr) {
+                match e {
+                    syn::Expr::MethodCall(c) if named(&c.receiver, self.name) => {
+                        let m = c.method.to_string();
+                        if !ALLOWED.contains(&m.as_str()) {
+                            self.bad.push(format!("{}.{m}(…)", self.name));
+                        }
+                        // The receiver is accounted for; only the
+                        // arguments are still to visit.
+                        for a in &c.args {
+                            self.visit_expr(a);
+                        }
+                        return;
+                    }
+                    syn::Expr::Index(i) if named(&i.expr, self.name) => {
+                        self.bad.push(format!("{}[…]", self.name));
+                    }
+                    syn::Expr::Reference(r) if named(&r.expr, self.name) => {
+                        self.bad.push(format!("&{}", self.name));
+                    }
+                    syn::Expr::ForLoop(f) if named(&f.expr, self.name) => {
+                        self.bad.push(format!("for … in {}", self.name));
+                    }
+                    _ => {}
+                }
+                syn::visit::visit_expr(self, e);
+            }
+        }
+
+        /// Every `let` in a function body, at any depth.
+        struct Locals(Vec<syn::Local>);
+
+        impl<'ast> Visit<'ast> for Locals {
+            fn visit_local(&mut self, l: &'ast syn::Local) {
+                self.0.push(l.clone());
+                syn::visit::visit_local(self, l);
+            }
+        }
+
+        /// The binding's name, when it is a PLAIN collection — a `Vec`
+        /// in its type or its initialiser, and no `Counted` in either.
+        fn plain_collection(local: &syn::Local) -> Option<String> {
+            let (name, ty) = match &local.pat {
+                syn::Pat::Ident(i) => (i.ident.to_string(), None),
+                syn::Pat::Type(t) => match &*t.pat {
+                    syn::Pat::Ident(i) => (i.ident.to_string(), Some(&*t.ty)),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let ty_text = ty
+                .map(|t| quote::quote!(#t).to_string())
+                .unwrap_or_default();
+            let init_text = local
+                .init
+                .as_ref()
+                .map(|i| {
+                    let e = &*i.expr;
+                    quote::quote!(#e).to_string()
+                })
+                .unwrap_or_default();
+            let counted = ty_text.contains("Counted") || init_text.contains("Counted");
+            let plain = ty_text.contains("Vec <")
+                || init_text.starts_with("Vec ::")
+                || init_text.starts_with("vec !");
+            (plain && !counted).then_some(name)
+        }
+
+        let file = syn::parse_file(include_str!("compile.rs")).expect("this file parses");
+        let mut seen: Vec<&str> = Vec::new();
+        let mut examined: Vec<String> = Vec::new();
+        let mut problems: Vec<String> = Vec::new();
+        for item in &file.items {
+            let syn::Item::Fn(f) = item else { continue };
+            let name = f.sig.ident.to_string();
+            let Some(which) = WALK.iter().find(|w| **w == name) else {
+                continue;
+            };
+            seen.push(which);
+            // EVERY local in the body, not only the ones at the top
+            // level: a scratch collection added inside a loop is the
+            // likeliest place for a scan, and a check that looked only
+            // at the outermost statements would not see it.
+            let mut locals = Locals(Vec::new());
+            locals.visit_block(&f.block);
+            for local in locals.0 {
+                let Some(binding) = plain_collection(&local) else {
+                    continue;
+                };
+                examined.push(format!("{name}::{binding}"));
+                let mut uses = Uses {
+                    name: &binding,
+                    bad: Vec::new(),
+                };
+                uses.visit_block(&f.block);
+                for bad in uses.bad {
+                    problems.push(format!(
+                        "{name}: `{binding}` is a plain collection and is READ as `{bad}`. A \
+                         collection the walk reads must be a `Counted`, or the access counter \
+                         cannot see a scan over it."
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            WALK.len(),
+            "the walk's functions were not all found; this check parsed {seen:?} of {WALK:?}"
+        );
+        assert!(
+            !examined.is_empty(),
+            "no plain collection was examined, so this check checked nothing"
+        );
+        assert!(
+            problems.is_empty(),
+            "{} of the walk's plain collections are read:\n{}\nexamined: {examined:?}",
+            problems.len(),
+            problems.join("\n")
         );
     }
 
