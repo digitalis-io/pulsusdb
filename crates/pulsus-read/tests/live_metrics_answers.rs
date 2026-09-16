@@ -1538,35 +1538,50 @@ async fn the_dual_read_merge_preserves_every_float_sample() {
 }
 
 /// A selector that matches nothing answers an empty vector, never an
-/// error — on **both** of the read path's zero-result returns, which are
-/// separate branches reached by different selector shapes:
+/// error — at **every** zero-result return the metrics read path has for
+/// a selector. There are five, in three branches, reached by different
+/// selector shapes and by the state of the label cache:
 ///
 /// ```text
-///   the selector                              where it stops
-///   ------------------------------------      ------------------------
-///   a concrete metric name whose series   ->   the chunked fetch with no
-///   set resolves empty                         SQL to send, exec.rs:961
+///   the selector                          cache   where it stops
+///   ----------------------------------    -----   ---------------------
+///   a concrete metric name whose          warm    the chunked fetch with
+///   series set resolves empty                     no SQL to send,
+///                                                 exec.rs:961
 ///
-///   a name-less selector whose fan-out    ->   SelectorFetchPlan::Empty,
-///   resolves no metric group                   built at exec.rs:871
+///   a name-less selector whose fan-out    warm    SelectorFetchPlan::
+///   resolves no metric group                      Empty, built at
+///                                                 exec.rs:871      \
+///                                                                   >- both
+///   a residual `__name__` matcher that    warm    ... built at      /   consumed
+///   excludes the concrete name                    exec.rs:557     _/    at :954
 ///
-///   a residual `__name__` matcher that    ->   SelectorFetchPlan::Empty,
-///   excludes the concrete name                 built at exec.rs:557
-///                                                     |
-///                                              both consumed at
-///                                              exec.rs:954
+///   a concrete metric name, of any of     cold    the sub-query
+///   the shapes above or merely silent             fallback's zero-row
+///   for longer than the lookback                  return, exec.rs:1018
 /// ```
 ///
-/// The first three queries below reach `:961` only; the last two reach
-/// `:954`, which the first three never take. Each break reddens this
-/// test, and each does so through the query written for it.
+/// Measured, so the queries are known not to cover one another: a marker
+/// error at each of the five sites reddens this test, and each does so
+/// through the query written for it. The first three queries reach `:961`
+/// only; the fourth and fifth reach `:954`, which the first three never
+/// take; and the cold loop reaches `:1018`, which the warm loop never
+/// takes.
+///
+/// **A name-less selector is deliberately absent from the cold loop.**
+/// `{status="418"}` against a cold cache is `NamelessSelectorUnresolvable
+/// { reason: "ColdCache" }`, and that is correct: without the cache there
+/// is no way to enumerate the metric names such a selector could match.
+/// Asserting an empty vector there would be asserting a wrong answer.
 #[tokio::test]
 async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
     skip_unless_live!();
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_empty")).await;
     let p = h.instant();
+    // The three shapes a concrete-name selector can take, plus the two
+    // name-channel shapes, against a WARM cache.
     for q in [
-        // concrete name, warm cache, no series carries that label value
+        // concrete name, no series carries that label value
         r#"http_requests_total{status="418"}"#,
         // a concrete name no series in the fixture carries
         "no_such_metric_at_all",
@@ -1577,7 +1592,28 @@ async fn an_unmatched_selector_is_an_empty_answer_not_an_error() {
         // a second `__name__` matcher excluding the first one's name
         r#"{__name__="gauge_nan",__name__="edge_probe"}"#,
     ] {
-        assert_eq!(h.read_path(q, &p).await, Answer::Vector(Vec::new()), "{q}");
+        assert_eq!(
+            h.read_path(q, &p).await,
+            Answer::Vector(Vec::new()),
+            "warm: {q}"
+        );
+    }
+    // The same concrete-name shapes against a COLD cache, which plans the
+    // sub-query fallback instead and has its own zero-row return.
+    for q in [
+        r#"http_requests_total{status="418"}"#,
+        "no_such_metric_at_all",
+        r#"http_requests_total{instance="a",instance="b"}"#,
+        // resolved, but silent for longer than the lookback: its
+        // fingerprint IS in the sub-query's result and the sample fetch
+        // still comes back with nothing
+        r#"http_requests_total{status="404"}"#,
+    ] {
+        assert_eq!(
+            h.read_path_cold(q, &p).await,
+            Answer::Vector(Vec::new()),
+            "cold: {q}"
+        );
     }
     drop_database(&h.bootstrap, &h.db).await;
 }
