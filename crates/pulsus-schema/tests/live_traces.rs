@@ -160,6 +160,25 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DigestRow {
+    digest: String,
+}
+
+/// The single `digest` column of a one-row query.
+async fn scalar_digest(client: &ChClient, sql: &str) -> String {
+    let mut stream = client
+        .query_stream::<DigestRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("digest query failed: {e}\nSQL:\n{sql}"));
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode DigestRow")
+        .digest
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ExplainRow {
     explain: String,
 }
@@ -661,6 +680,316 @@ async fn stage1_intrinsics_query_selects_the_service_time_projection() {
         read_rows > 0 && read_rows < CORPUS_ROWS,
         "projection read must not scan the full corpus (read_rows = {read_rows} of {CORPUS_ROWS})"
     );
+}
+
+/// Issue #555 criterion 1: after `run_init` no active projection part
+/// stores a `payload` column, and every active base part carries BOTH
+/// `service_time` and `name_time`.
+///
+/// **Per part, not per table.** The table-level inventory —
+/// `SELECT arraySort(groupArray(DISTINCT name)) FROM system.projections
+/// WHERE database = … AND table = 'trace_spans' AND name IN
+/// ('service_time','name_time')` — returns `['name_time','service_time']`
+/// on a table whose projections are DECLARED and only partly
+/// MATERIALISED, so it cannot tell the shipped state from a half-applied
+/// one. Measured on the two states: fully materialised `3, 6, 6`; partly
+/// materialised `3, 4, 6`, where the table-level statement says
+/// `['name_time','service_time']` for both.
+///
+/// The `base_parts > 0` assertion is not decoration: a statement about
+/// part contents over an empty table passes having inspected nothing.
+#[tokio::test]
+async fn projection_parts_store_no_payload_and_cover_every_active_base_part() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_proj_parts");
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    let end_ns = now_ns();
+    seed_spans_corpus(&client, db, end_ns - CORPUS_SPAN_NS).await;
+
+    // (a) no projection stores the payload.
+    let payload_columns = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.projection_parts_columns \
+             WHERE database = '{db}' AND table = 'trace_spans' AND active \
+               AND column = 'payload'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        payload_columns, 0,
+        "migrations 44-48 narrow service_time to the 14 non-payload columns and add name_time \
+         over the same 14, so no active projection part may hold a payload column"
+    );
+
+    // (b) every active base part carries both projections.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct PartsRow {
+        n_base: u64,
+        n_projection: u64,
+        n_required: u64,
+    }
+    // `ifNull(…, 0)` on every output column, and the aliases are renamed
+    // off the `WITH` binding. ClickHouse types a scalar subquery
+    // `Nullable(UInt64)` — it has to allow for a subquery that returns no
+    // row — and the typed client then refuses to decode it as `u64`:
+    // `attempting to (de)serialize ClickHouse type Nullable(UInt64) as u64`.
+    // The values do not move: measured on a two-projection table, the plan's
+    // form answers `1, 2, 2` typed `Nullable(UInt64)` and this one answers
+    // `1, 2, 2` typed `UInt64`. A count() subquery over an empty set is 0,
+    // not NULL, so the `0` branch is unreachable here — and were it ever
+    // taken, `n_base > 0` below is what fails.
+    let sql = format!(
+        "WITH (SELECT count() FROM system.parts \
+                 WHERE database = '{db}' AND table = 'trace_spans' AND active) AS base_parts \
+         SELECT ifNull(base_parts, 0) AS n_base, \
+                ifNull((SELECT count() FROM system.projection_parts \
+                          WHERE database = '{db}' AND table = 'trace_spans' AND active \
+                            AND name IN ('service_time','name_time') \
+                            AND parent_name IN (SELECT name FROM system.parts \
+                                                  WHERE database = '{db}' \
+                                                    AND table = 'trace_spans' \
+                                                    AND active)), 0) AS n_projection, \
+                ifNull(base_parts * 2, 0) AS n_required"
+    );
+    let mut stream = client
+        .query_stream::<PartsRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("per-part query failed: {e}\nSQL:\n{sql}"));
+    let row = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode PartsRow");
+    drop(stream);
+    assert!(
+        row.n_base > 0,
+        "the seeded table must have active base parts, or this check inspects nothing"
+    );
+    assert_eq!(
+        row.n_projection, row.n_required,
+        "every active base part must carry both projections: {} base parts, {} projection parts, \
+         {} required",
+        row.n_base, row.n_projection, row.n_required
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #555 criterion 2: a span-name search reads the `name_time`
+/// projection (migrations 47/48) and prunes on it.
+///
+/// Neither the base order `(trace_id, timestamp_ns)` nor `service_time`
+/// `(service, timestamp_ns)` leads with `name`, so before this change the
+/// same statement scanned every granule in the window.
+///
+/// **The assertion is a relation, never a count.** Selected-granule
+/// numbers are a reading of one build's part layout: the same 2,000,000-row
+/// corpus built at a different `max_threads` selects 6 of 245 where another
+/// build selects 7 of 245 for the same statement.
+///
+/// `name = 'op-7'` is what this file's own `seed_spans_corpus` writes —
+/// `concat('op-', toString(number % 20))` over `CORPUS_ROWS` rows, so
+/// `op-0` … `op-19`, 6,000 rows each.
+#[tokio::test]
+async fn a_span_name_search_selects_the_name_time_projection_and_prunes() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_name_time");
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    let end_ns = now_ns();
+    let base_ns = end_ns - CORPUS_SPAN_NS;
+    seed_spans_corpus(&client, db, base_ns).await;
+
+    let search = format!(
+        "SELECT trace_id, max(timestamp_ns) AS bound_ts FROM {db}.trace_spans \
+         WHERE timestamp_ns > {base_ns} AND timestamp_ns <= {end_ns} \
+           AND (name = 'op-7') \
+         GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001"
+    );
+
+    let plan = explain_indexes(&client, &search).await;
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("ReadFromMergeTree (name_time)"),
+        "a span-name search must read the name_time projection, got:\n{plan_text}"
+    );
+    assert_primary_key_keys(&plan, &["name", "timestamp_ns"]);
+    let (selected, total) = last_granules(&plan);
+    assert!(
+        selected < total,
+        "the name prefix must prune granules ({selected}/{total}):\n{plan_text}"
+    );
+
+    // The answer, so the plan claim is about a read that returns rows:
+    // 120,000 rows over 20 names, one span per trace.
+    let traces = count(&client, &format!("SELECT count() AS n FROM ({search})")).await;
+    assert_eq!(
+        traces,
+        CORPUS_ROWS / 20,
+        "op-7 covers one twentieth of the corpus"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #555 criterion 4: the trace-by-ID point read returns the same
+/// rows and the same payload bytes before and after migrations 44-48.
+///
+/// **The "before" state has to be built by hand.** Every other test in this
+/// file calls `run_init`, which applies all five at once, so after it there
+/// is no pre-44 state left to digest. This test therefore writes the pre-44
+/// `trace_spans` itself — id 16's frozen `CREATE` plus the columns ids 31,
+/// 35 and 37 add and the `span_name_day` projection of ids 42/43 — seeds
+/// it, digests it, calls `run_init`, and digests it again.
+///
+/// **`run_init` does more than apply 44-48 to this database, and none of it
+/// touches what is asserted.** Only the trace-table statements are no-ops
+/// against what this test built: ids 1-43 also create eighteen further
+/// objects (`schema_migrations`, `mv_checksums`, the metric and log tables,
+/// `trace_attrs_idx`, `trace_tag_catalog`, `trace_edges` and the four
+/// materialized views), and `apply_ttl`
+/// (`crates/pulsus-schema/src/controller.rs:493`) rewrites this table's TTL
+/// to the saturating form, which the plain interval below is not. The
+/// digest is over the point read's rows; the TTL and the other objects do
+/// not appear in it.
+///
+/// **Two digests compared alone can pass having read nothing.** Over zero
+/// rows `groupArray` gives `[]`, `arrayStringConcat` gives `''`, and the
+/// digest is `SHA256('')` =
+/// `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` on
+/// both sides. The exact seeded count is what catches a mis-typed trace id,
+/// a seed that did not land, or a filter that stopped matching.
+///
+/// **The row order is total.** Two legal rows can share a `span_id`, so
+/// ordering the rows themselves is not a total order and the two sides
+/// could be joined differently on data that did not change. The per-row
+/// digests are sorted instead, which is a total order on any multiset.
+///
+/// The function is spelled `SHA256`: `sha256` is
+/// `Code: 46 … Function with name 'sha256' does not exist` on 26.3.
+#[tokio::test]
+async fn trace_by_id_returns_the_same_rows_and_payload_bytes_across_the_projection_migrations() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_point_read_parity");
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create db");
+
+    // The pre-44 trace_spans: id 16's CREATE, the columns ids 31/35/37 add,
+    // and ids 42/43's aggregate projection. `service_time` is `SELECT *` —
+    // the payload copy this change removes.
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.trace_spans (\
+                     trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8), \
+                     name LowCardinality(String), service LowCardinality(String), \
+                     timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), \
+                     duration_ns Int64 CODEC(T64, ZSTD(1)), status_code Int8, kind Int8, \
+                     payload_type Int8, payload String CODEC(ZSTD(3)), \
+                     shared UInt8 DEFAULT 0, status_message String DEFAULT '', \
+                     scope_name LowCardinality(String) DEFAULT '', \
+                     scope_version LowCardinality(String) DEFAULT '', \
+                     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4, \
+                     PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)), \
+                     PROJECTION span_name_day (\
+                         SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() \
+                         GROUP BY d, name) \
+                 ) ENGINE = MergeTree \
+                 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns)) \
+                 ORDER BY (trace_id, timestamp_ns) \
+                 TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE \
+                 SETTINGS ttl_only_drop_parts = 1"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the pre-44 trace_spans");
+
+    seed_spans_corpus(&client, db, now_ns() - CORPUS_SPAN_NS).await;
+
+    // Ten seeded trace ids, written with the seeder's own id expression.
+    // One span per trace and no hash collision in this corpus, so ten ids
+    // are ten spans — a fact about a deterministic corpus, and the count
+    // assertion prints both numbers if a seeder change ever breaks it.
+    const EXPECTED_SPANS: u64 = 10;
+    const TEN_SEEDED_IDS: &str =
+        "trace_id IN (SELECT toFixedString(hex(cityHash64(number)), 16) FROM numbers(10))";
+    let count_sql = format!("SELECT count() AS n FROM {db}.trace_spans WHERE {TEN_SEEDED_IDS}");
+    // Every column the point read returns
+    // (`crates/pulsus-read/src/traces/sql.rs:22`), one digest per row, the
+    // per-row digests SORTED so the comparison has a total order.
+    let digest_sql = format!(
+        "SELECT lower(hex(SHA256(arrayStringConcat(arraySort(groupArray(row_digest)), '\\n')))) \
+             AS digest \
+         FROM ( \
+           SELECT lower(hex(SHA256(concat( \
+                    hex(trace_id), '|', hex(span_id), '|', hex(parent_id), '|', \
+                    toString(payload_type), '|', toString(kind), '|', lower(hex(SHA256(payload))) \
+                  )))) AS row_digest \
+           FROM {db}.trace_spans \
+           WHERE {TEN_SEEDED_IDS} \
+         )"
+    );
+
+    let before_count = count(&client, &count_sql).await;
+    let before_digest = scalar_digest(&client, &digest_sql).await;
+
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    let after_count = count(&client, &count_sql).await;
+    let after_digest = scalar_digest(&client, &digest_sql).await;
+
+    assert_eq!(
+        before_count, EXPECTED_SPANS,
+        "the pre-migration read must return the ten seeded spans, or the digest below compares \
+         two empty sets and passes having read nothing"
+    );
+    assert_eq!(
+        after_count, EXPECTED_SPANS,
+        "the post-migration read must return the same ten spans"
+    );
+    assert_eq!(
+        after_digest, before_digest,
+        "migrations 44-48 move no span row and no payload byte: the point read's digest over the \
+         ten seeded traces must be identical before and after"
+    );
+
+    // The projections did change, or the parity above would be about
+    // nothing: `service_time` is now the 14 named columns and `name_time`
+    // exists.
+    let payload_columns = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.projection_parts_columns \
+             WHERE database = '{db}' AND table = 'trace_spans' AND active AND column = 'payload'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        payload_columns, 0,
+        "run_init must have narrowed service_time — otherwise this test compares a table with \
+         itself"
+    );
+
+    drop_database(&client, db).await;
 }
 
 /// AC3b (issue #53 plan v2 delta 3, re-proven under issue #54's amended

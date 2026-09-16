@@ -925,6 +925,115 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the span projections stop storing the payload (issue #555) ---
+    //
+    // Id 16's frozen CREATE declares `service_time` as `SELECT *`, so every
+    // span's `payload` is stored a SECOND time inside the projection and
+    // re-compressed on every merge. Nothing reads it there: the only
+    // statement that selects `payload` is the trace-by-id point read
+    // (`crates/pulsus-read/src/traces/sql.rs:22`), which filters on
+    // `trace_id` — the BASE table's first sort key — so the optimizer never
+    // reaches the projection for it.
+    //
+    // Ids 44-46 replace `service_time` with the same key order over the 14
+    // non-payload columns; ids 47/48 add `name_time`, the same 14 sorted by
+    // `(name, timestamp_ns)`, which gives a span-name search a sorted path
+    // the table does not have today (neither the base order nor
+    // `service_time` leads with `name`).
+    //
+    // Measured on the 2,000,000-span corpus of
+    // docs/traceql-schema-migration.md §4: the span table falls from
+    // 130.43 to 105.94 B/span, and a span-name search over that corpus goes
+    // from 2,000,000 rows / 245 marks to 57,344 rows / 7 marks. No answer
+    // moves anywhere: no read-path statement's text changes, only the plan
+    // the optimizer picks.
+    //
+    // The column list is alphabetical on purpose — that is the order
+    // `system.projection_parts_columns` returns, so the live check in
+    // `crates/pulsus-schema/tests/live_traces.rs` compares two sorted lists
+    // rather than two orderings.
+    //
+    // Append-only, never an amendment of id 16: the frozen CREATE keeps its
+    // `SELECT *` text for ever and id 44 drops that projection on the first
+    // reconcile (docs/architecture.md §4, docs/schemas.md §7, and this
+    // module's amendment policy above).
+    //
+    // No `StaticClusterOnly` sibling, for ids 42/43's reason: a projection
+    // lives on the local `MergeTree` table and a `Distributed` wrapper has
+    // none, so `{{on_cluster}}` alone puts these on every node.
+    Migration {
+        id: 44,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             DROP PROJECTION IF EXISTS service_time;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 45,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD PROJECTION IF NOT EXISTS service_time (\n\
+                 SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,\n\
+                        scope_version, service, shared, span_id, status_code,\n\
+                        status_message, timestamp_ns, trace_id\n\
+                 ORDER BY (service, timestamp_ns)\n\
+             );",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // `ADD PROJECTION` covers only parts written AFTER it, so materializing
+    // is a separate statement — ids 42/43's pattern. On an already-populated
+    // table this is an asynchronous mutation and `--mode init` does not
+    // block on it: between ids 44 and 46 a `resource.service.name` search
+    // reads the base table instead of the projection. A correct answer, a
+    // slower one. Measured on 2,000,000 spans: 2,000,000 rows / 245 marks
+    // during the interval, 114,688 rows / 14 marks once it finished. On a
+    // fresh database the interval is empty.
+    Migration {
+        id: 46,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             MATERIALIZE PROJECTION service_time;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 47,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD PROJECTION IF NOT EXISTS name_time (\n\
+                 SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,\n\
+                        scope_version, service, shared, span_id, status_code,\n\
+                        status_message, timestamp_ns, trace_id\n\
+                 ORDER BY (name, timestamp_ns)\n\
+             );",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 48,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             MATERIALIZE PROJECTION name_time;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1728,6 +1837,101 @@ mod tests {
             "ALTER TABLE pulsus.trace_spans_dist ON CLUSTER 'prod'\n\
              ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '',\n\
              ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT '';",
+        );
+    }
+
+    /// Issue #555: the five appended projection migrations render exactly
+    /// the statements this change ships — the payload is out of both
+    /// projections, and id 16's frozen `CREATE` is not amended.
+    ///
+    /// **Why the whole string and not a `contains`.** Nothing in this suite
+    /// sees a column added to a projection's `SELECT` list: measured at
+    /// `f4092cf5`, adding `payload` to migration 42's DDL leaves all 80
+    /// shipped `pulsus-schema --lib` tests green. A full-text pin is what
+    /// notices.
+    ///
+    /// **The rendered statement is flat.** Rust's `\` at end of line eats
+    /// the newline AND the next line's leading whitespace, so the `\n`
+    /// escapes are the only line breaks and nothing below the first line is
+    /// indented — whatever the source appears to say.
+    #[test]
+    fn projection_migrations_render_exactly() {
+        assert_eq!(
+            rendered_static(44),
+            "ALTER TABLE pulsus.trace_spans\n\
+             DROP PROJECTION IF EXISTS service_time;",
+        );
+        assert_eq!(
+            rendered_static(45),
+            "ALTER TABLE pulsus.trace_spans\n\
+             ADD PROJECTION IF NOT EXISTS service_time (\n\
+             SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,\n\
+             scope_version, service, shared, span_id, status_code,\n\
+             status_message, timestamp_ns, trace_id\n\
+             ORDER BY (service, timestamp_ns)\n\
+             );",
+        );
+        assert_eq!(
+            rendered_static(46),
+            "ALTER TABLE pulsus.trace_spans\n\
+             MATERIALIZE PROJECTION service_time;",
+        );
+        assert_eq!(
+            rendered_static(47),
+            "ALTER TABLE pulsus.trace_spans\n\
+             ADD PROJECTION IF NOT EXISTS name_time (\n\
+             SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,\n\
+             scope_version, service, shared, span_id, status_code,\n\
+             status_message, timestamp_ns, trace_id\n\
+             ORDER BY (name, timestamp_ns)\n\
+             );",
+        );
+        assert_eq!(
+            rendered_static(48),
+            "ALTER TABLE pulsus.trace_spans\n\
+             MATERIALIZE PROJECTION name_time;",
+        );
+
+        // A copy-paste that leaves two entries with the same DDL *and* the
+        // same expected literal passes every equality above and ships one
+        // projection where two are intended. Deduping the list's own clone
+        // and comparing LENGTHS is what sees it; a `HashSet` compared
+        // against a set of expected strings would not.
+        let rendered: Vec<String> = (44..=48).map(rendered_static).collect();
+        let mut deduped = rendered.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            5,
+            "the five projection statements must all differ, got:\n{}",
+            rendered.join("\n---\n")
+        );
+
+        // Standing: the payload leaves both projections, and the frozen
+        // id-16 CREATE keeps its `SELECT *` (it is dropped by id 44 on the
+        // first reconcile, never amended).
+        for id in 44..=48 {
+            let ddl = rendered_static(id);
+            assert!(
+                !ddl.contains("SELECT *"),
+                "migration {id} must name its columns, got:\n{ddl}"
+            );
+            // On DELIMITED tokens, not a substring: `payload_type` is a
+            // legitimate column of the projection and contains the word.
+            let tokens: Vec<&str> = ddl
+                .split([',', '\n', ' ', '(', ')', ';'])
+                .map(str::trim)
+                .collect();
+            assert!(
+                !tokens.contains(&"payload"),
+                "migration {id} must not store the payload, got:\n{ddl}"
+            );
+        }
+        assert!(
+            static_tmpl(16).contains("SELECT * ORDER BY (service, timestamp_ns)"),
+            "id 16's CREATE is frozen: ids 44-46 replace its projection at reconcile time, \
+             they do not amend the statement"
         );
     }
 

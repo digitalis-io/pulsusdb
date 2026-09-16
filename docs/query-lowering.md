@@ -2471,8 +2471,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1657` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1708` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1766` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1817` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -3340,6 +3340,14 @@ SELECT toFixedString(concat('T',leftPad(toString(n),15,'0')),16) FROM numbers(32
 
 #### The corpus, as the text that builds it
 
+**This recipe and every counter below it record the span table as it was before issue #555 (2026-09-17),
+which narrowed `service_time` to the 14 non-payload columns and added `name_time` sorted
+`(name, timestamp_ns)`.** The `CREATE TABLE` below is left as it was taken, because the counters in
+this section were measured on the table it builds: editing the DDL alone would leave a recipe that
+builds a fourteen-column projection beside counters taken on a fifteen-column one. Anyone re-taking
+these counters gets a different physical layout and should say so; re-measuring them is a
+measurement on a corpus this section does not own.
+
 Run this through `clickhouse-client --multiquery --queries-file`. It is not runnable over HTTP: a
 multi-statement body answers `SYNTAX_ERROR`.
 
@@ -3451,8 +3459,10 @@ statement projects that column (`hydration_sql`,
 `crates/pulsus-read/src/traces/search_sql.rs:230`, and any `== phase2 hydration ==` section in the
 committed goldens), so a reduced span shape fails with `UNKNOWN_IDENTIFIER` before the query starts
 rather than returning a wrong number. That is the good failure, but only if the recipe carries the
-column — which is why it carries the full shipped span shape: migration 16 plus `shared`,
-`status_message`, `scope_name`/`scope_version` and the `span_name_day` projection.
+column — which is why it carries the shipped span shape **as it was when these counters were
+taken**: migration 16 plus `shared`, `status_message`, `scope_name`/`scope_version` and the
+`span_name_day` projection. Issue #555 has since narrowed `service_time` and added `name_time`; see
+the dated note above the recipe.
 
 **What that recipe produced here.** The physical layout:
 
