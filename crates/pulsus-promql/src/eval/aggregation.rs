@@ -149,7 +149,16 @@ fn ignored_in_aggregation_name(op: AggOp) -> &'static str {
 
 struct Acc {
     kahan: KahanSum,
+    /// Running minimum. Seeded `NaN` — "no member yet" — and replaced by
+    /// every later member while it is still `NaN`, which is the pin's own
+    /// rule: the first float initializes the group
+    /// (engine.go:3601-3659 at 40af9c2, the seed at :3604) and the update
+    /// arms replace on `old > new || IsNaN(old)` for `min` and
+    /// `old < new || IsNaN(old)` for `max` (:3812-3828). Issue #551: the
+    /// former `+Inf`/`-Inf` seeds were returned verbatim as the answer
+    /// for a group whose float members are all `NaN`.
     min: f64,
+    /// Running maximum; see [`Acc::min`] for the shared extremum rule.
     max: f64,
     count: f64,
     /// Issue #86 (M6-08d): the group's delayed name-removal verdict — the
@@ -223,8 +232,8 @@ impl Acc {
     fn fresh(t_ms: i64) -> Self {
         Acc {
             kahan: KahanSum::new(),
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
+            min: f64::NAN,
+            max: f64::NAN,
             count: 0.0,
             drop_name: false,
             mean: 0.0,
@@ -549,8 +558,20 @@ fn aggregate_reduce(
                 // member — this histogram is simply skipped.
             }
             (AggOp::Min | AggOp::Max, None) => {
-                acc.min = acc.min.min(s.v);
-                acc.max = acc.max.max(s.v);
+                // Issue #551: the pin's own replacement rule
+                // (engine.go:3812-3828 at 40af9c2), NOT `f64::min`/
+                // `f64::max`. A `NaN` accumulator means "no member yet",
+                // so it is replaced by whatever arrives; a `NaN` member
+                // never displaces a number. `f64::min`/`f64::max` cannot
+                // express the first half — they discard `NaN` outright,
+                // which is why the seed used to survive an all-`NaN`
+                // group and be returned as its answer.
+                if acc.min > s.v || acc.min.is_nan() {
+                    acc.min = s.v;
+                }
+                if acc.max < s.v || acc.max.is_nan() {
+                    acc.max = s.v;
+                }
                 acc.count += 1.0;
             }
             (AggOp::Stddev | AggOp::Stdvar, Some(_)) => {
@@ -1337,6 +1358,167 @@ mod tests {
             annos.as_strings("", 0, 0).1,
             vec![messages::histogram_ignored_in_aggregation_info("max")]
         );
+    }
+
+    // --- Issue #551: `min`/`max` over a group with no non-NaN member ---
+
+    /// The fixture NaN payload — the one `crates/pulsus-read/tests/
+    /// live_metrics_answers.rs:331` writes into its all-NaN group. It is
+    /// NOT `f64::NAN`'s own bit pattern (`0x7FF8_0000_0000_0000`), which
+    /// is what makes "the answer carries the members' payload" an
+    /// assertion rather than a coincidence.
+    const MEMBER_NAN_BITS: u64 = 0x7FF8_0000_0000_0001;
+    /// A second, distinct quiet-NaN payload, so that fold order is
+    /// observable.
+    const OTHER_NAN_BITS: u64 = 0x7FF8_0000_0000_00AB;
+
+    /// Issue #551: folds one ungrouped group whose members are given as
+    /// raw bit patterns, in that order, and returns `(min, max)` as raw
+    /// bit patterns. Bits in, bits out: a NaN answer's payload is the
+    /// thing under test, and `f64` equality cannot see it.
+    fn extrema_bits(members: &[u64]) -> (u64, u64) {
+        let labels: Vec<String> = (0..members.len()).map(|i| i.to_string()).collect();
+        let vector: Vec<InstantSample> = members
+            .iter()
+            .zip(labels.iter())
+            .map(|(bits, l)| sample(&[("s", l.as_str())], f64::from_bits(*bits)))
+            .collect();
+        let mut annos = Annotations::new();
+        let min = aggregate(AggOp::Min, &vector, None, None, zero_pos(), &mut annos).unwrap();
+        let max = aggregate(AggOp::Max, &vector, None, None, zero_pos(), &mut annos).unwrap();
+        assert_eq!(min.len(), 1, "min produced no group");
+        assert_eq!(max.len(), 1, "max produced no group");
+        (min[0].v.to_bits(), max[0].v.to_bits())
+    }
+
+    /// Issue #551 criterion 1. A group with no non-NaN member answers the
+    /// NaN its members carried, for both extrema, at one member and at
+    /// three. Before the fix the accumulator's seed leaked out instead:
+    /// `-Inf` for `max`, `+Inf` for `min`. The group of ONE is the
+    /// narrowest witness — a single silent series with a NaN sample is
+    /// enough, and it is far more reachable than three simultaneous NaNs.
+    ///
+    /// The answer is the LAST NaN member in fold order (ascending
+    /// fingerprint), which is the pin's rule too: it replaces a NaN
+    /// accumulator with every later member (engine.go:3812-3828 at
+    /// 40af9c2). Both two-payload orders are asserted, so the rule is
+    /// pinned rather than inferred from a single-payload fixture.
+    ///
+    /// The `assert_ne!` against the stale marker names the failure mode
+    /// an `is_nan()` assertion cannot see: the fold has no notion of a
+    /// reserved payload, so a stale marker reaching it would come out as
+    /// the group's answer. Nothing lets one reach it today — the lookback
+    /// selection excludes it first — and this assertion is what would
+    /// notice if that stopped being true.
+    #[test]
+    fn min_and_max_of_a_group_with_no_non_nan_member_answer_their_nan_bits() {
+        for (label, members, want) in [
+            ("one member", vec![MEMBER_NAN_BITS], MEMBER_NAN_BITS),
+            ("three members", vec![MEMBER_NAN_BITS; 3], MEMBER_NAN_BITS),
+            (
+                "two payloads, the fixture's last",
+                vec![OTHER_NAN_BITS, MEMBER_NAN_BITS],
+                MEMBER_NAN_BITS,
+            ),
+            (
+                "two payloads, the other last",
+                vec![MEMBER_NAN_BITS, OTHER_NAN_BITS],
+                OTHER_NAN_BITS,
+            ),
+        ] {
+            let (min, max) = extrema_bits(&members);
+            assert_eq!(
+                min, want,
+                "Min / {label}: answered {min:#018X}, the members carried {want:#018X}"
+            );
+            assert_eq!(
+                max, want,
+                "Max / {label}: answered {max:#018X}, the members carried {want:#018X}"
+            );
+            assert_ne!(
+                min,
+                pulsus_model::STALE_NAN_BITS,
+                "Min / {label}: answered the reserved stale marker"
+            );
+            assert_ne!(
+                max,
+                pulsus_model::STALE_NAN_BITS,
+                "Max / {label}: answered the reserved stale marker"
+            );
+        }
+    }
+
+    /// Issue #551 criterion 2. Exactly one non-NaN member among NaNs is
+    /// the answer for BOTH extrema — the fix must not swallow the
+    /// ordinary case. A NaN member never displaces a number, because the
+    /// replacement rule's first half (`acc.min > s.v`) is false against a
+    /// NaN and its second half (`acc.min.is_nan()`) is false once a
+    /// number is in place.
+    #[test]
+    fn min_and_max_of_a_group_with_one_non_nan_member_answer_that_member() {
+        let (min, max) = extrema_bits(&[MEMBER_NAN_BITS, 3.0f64.to_bits(), MEMBER_NAN_BITS]);
+        assert_eq!(min, 3.0f64.to_bits(), "Min: answered {min:#018X}");
+        assert_eq!(max, 3.0f64.to_bits(), "Max: answered {max:#018X}");
+    }
+
+    /// Issue #551 criterion 3. An infinity is a MEMBER, not an unset
+    /// accumulator. This is the case the old seeds made unreadable: an
+    /// answer of `-Inf` meant either "the group's largest member is
+    /// `-Inf`" or "nothing replaced the seed", and the two were the same
+    /// bits. The infinity-first orders are the discriminating ones —
+    /// with `NaN` last, a rule that replaces on "not finite" rather than
+    /// on "is NaN" throws the real member away again.
+    #[test]
+    fn min_and_max_of_a_group_whose_only_non_nan_member_is_an_infinity_answer_it() {
+        for (label, members, want) in [
+            (
+                "-Inf first",
+                vec![f64::NEG_INFINITY.to_bits(), MEMBER_NAN_BITS],
+                f64::NEG_INFINITY.to_bits(),
+            ),
+            (
+                "+Inf first",
+                vec![f64::INFINITY.to_bits(), MEMBER_NAN_BITS],
+                f64::INFINITY.to_bits(),
+            ),
+            (
+                "-Inf last",
+                vec![MEMBER_NAN_BITS, f64::NEG_INFINITY.to_bits()],
+                f64::NEG_INFINITY.to_bits(),
+            ),
+        ] {
+            let (min, max) = extrema_bits(&members);
+            assert_eq!(min, want, "Min / {label}: answered {min:#018X}");
+            assert_eq!(max, want, "Max / {label}: answered {max:#018X}");
+        }
+    }
+
+    /// Issue #551 criterion 4. `-0.0` and `+0.0` compare equal, so the
+    /// replacement rule decides which one's bits the group answers with:
+    /// strict `<`/`>` never replaces on a tie, so the FIRST member's bits
+    /// survive. That is the pin's rule (engine.go:3812-3828 at 40af9c2,
+    /// `group.floatValue < f` / `>`), and it is the one thing
+    /// `f64::min`/`f64::max` are documented not to promise — for inputs
+    /// that compare equal, either may be returned. No other test here
+    /// distinguishes the two forms.
+    #[test]
+    fn min_and_max_of_a_signed_zero_tie_keep_the_first_members_bits() {
+        for (label, members, want) in [
+            (
+                "-0.0 first",
+                vec![(-0.0f64).to_bits(), 0.0f64.to_bits()],
+                (-0.0f64).to_bits(),
+            ),
+            (
+                "+0.0 first",
+                vec![0.0f64.to_bits(), (-0.0f64).to_bits()],
+                0.0f64.to_bits(),
+            ),
+        ] {
+            let (min, max) = extrema_bits(&members);
+            assert_eq!(min, want, "Min / {label}: answered {min:#018X}");
+            assert_eq!(max, want, "Max / {label}: answered {max:#018X}");
+        }
     }
 
     /// `topk`/`bottomk` skip a histogram member + info (`aggregationK`'s

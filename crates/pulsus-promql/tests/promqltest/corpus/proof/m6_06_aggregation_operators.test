@@ -474,3 +474,24 @@ eval_fail instant at 50m limitk(NaN, non_existent)
 
 eval_fail instant at 50m limit_ratio(NaN, non_existent)
 	expected_fail_message Ratio value is NaN
+
+# Issue #551: min/max over a group with no non-NaN member. The upstream
+# corpus has no such group, which is why nothing caught the accumulator's
+# identity element leaking out as the answer.
+load 1m
+  nanmetric{g="allnan", i="0"} NaN
+  nanmetric{g="allnan", i="1"} NaN
+  nanmetric{g="one",    i="0"} NaN
+  nanmetric{g="one",    i="1"} 3
+  nanmetric{g="ninf",   i="0"} -Inf
+  nanmetric{g="ninf",   i="1"} NaN
+
+eval instant at 0m max by (g) (nanmetric)
+  {g="allnan"} NaN
+  {g="one"} 3
+  {g="ninf"} -Inf
+
+eval instant at 0m min by (g) (nanmetric)
+  {g="allnan"} NaN
+  {g="one"} 3
+  {g="ninf"} -Inf
