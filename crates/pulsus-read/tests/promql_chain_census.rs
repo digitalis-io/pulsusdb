@@ -1008,11 +1008,28 @@ fn a_two_selector_expression_yields_one_chain_per_selector() {
 /// The metadata join is two chains of one link each: `info` always
 /// consumes the synthetic metadata selector as well as its argument, so
 /// it is on neither.
+///
+/// **`info(m)` alone cannot see the synthetic entry being dropped**, and
+/// that is measured rather than assumed: forget it and the planner still
+/// makes two entries, the `Info` node is a link in neither reading, and
+/// both chains still read `Select(i)`. What sees it is a node ABOVE the
+/// join, which stops consuming two entries and attaches — so the second
+/// row here is `abs(info(m))`, and it is the row this test's own break
+/// reddens.
 #[test]
 fn the_metadata_join_yields_two_chains_of_one_link() {
     let c = chains_of(&format!("info({M})"));
     assert_eq!(c.len(), 2);
     assert_eq!(links(&c, 0), ["Select(0)"]);
+    assert_eq!(links(&c, 1), ["Select(1)"]);
+
+    let c = chains_of(&format!("abs(info({M}))"));
+    assert_eq!(c.len(), 2, "the join still consumes both entries");
+    assert_eq!(
+        links(&c, 0),
+        ["Select(0)"],
+        "no `MathFn` above a node that consumes two entries"
+    );
     assert_eq!(links(&c, 1), ["Select(1)"]);
 }
 
