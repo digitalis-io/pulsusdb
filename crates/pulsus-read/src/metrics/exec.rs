@@ -521,7 +521,7 @@ impl MetricsEngine {
         // core's predicate lattice, recorded ONLY under the explain
         // header. On the unexplained path this vector is never pushed to
         // and never allocates.
-        let mut reads: Vec<compile::SelectorRead> = Vec::new();
+        let mut reads = compile::SelectorReads::empty();
         for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
             let window = DataWindow {

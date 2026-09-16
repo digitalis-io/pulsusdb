@@ -562,16 +562,16 @@ mod counted {
     /// A collection whose elements can only be reached, or added, by
     /// charging for them. `C` is `Vec<T>` for what the walk builds and
     /// `&[T]` for what it is handed.
-    pub(super) struct Counted<C>(C);
+    pub(crate) struct Counted<C>(C);
 
     impl<C> Counted<C> {
-        pub(super) fn new(inner: C) -> Self {
+        pub(crate) fn new(inner: C) -> Self {
             Self(inner)
         }
     }
 
     impl<T> Counted<Vec<T>> {
-        pub(super) fn empty() -> Self {
+        pub(crate) fn empty() -> Self {
             Self(Vec::new())
         }
 
@@ -579,7 +579,7 @@ mod counted {
         /// which is what the round-4 probe exploited when only finished
         /// collections were counted.
         #[inline]
-        pub(super) fn push(&mut self, v: T) {
+        pub(crate) fn push(&mut self, v: T) {
             super::charge(1);
             self.0.push(v);
         }
@@ -682,6 +682,18 @@ mod counted {
 }
 
 use counted::Counted;
+
+/// What [`plan_shapes`] is handed: the reads, **already metered**.
+///
+/// **The type is the boundary, and that is the point.** A plain
+/// `&[SelectorRead]` parameter could be aliased in one line —
+/// `let raw = reads;`, a shared slice being `Copy` — and searched per
+/// chain with the access counter and the source rule both green, which is
+/// round 2's defect restored (code review round 5). There is no plain
+/// slice to alias here: the signature never offers one, and [`Counted`]
+/// hands out no way to get one back — it has no `Deref`, so even
+/// `&*reads` does not compile.
+pub(crate) type SelectorReads = Counted<Vec<SelectorRead>>;
 
 /// Charges `n` element accesses.
 ///
@@ -1174,9 +1186,9 @@ pub fn request_bounds(params: &MetricQueryParams) -> RequestBounds {
 /// would say a statement was sent. So `plans.len()` can be less than
 /// `selectors.len()`, and the mapping back to a selector is link 0's
 /// `Select(i)` stage name.
-pub fn plan_shapes(
+pub(crate) fn plan_shapes(
     plan: &pulsus_promql::QueryPlan,
-    reads: &[SelectorRead],
+    reads: &SelectorReads,
     params: &MetricQueryParams,
 ) -> Result<Vec<PlanShape>, ReadError> {
     let bounds = request_bounds(params);
@@ -1191,12 +1203,10 @@ pub fn plan_shapes(
     // on a request an untrusted caller can send (code review round 2):
     // 4,096 selectors did 8,390,656 comparisons.
     //
-    // **The parameter is shadowed by a counted view of itself**, so a
-    // search over `reads` written here later — the very shape that was
-    // removed — is charged per element it touches and fails the gate,
-    // whether or not whoever writes it knows the gate exists (code
-    // review round 3). The index is counted for the same reason.
-    let reads = Counted::new(reads);
+    // **The reads arrive counted**, so there is no plain slice in scope to
+    // alias and search per chain — the shape that beat the shadowing this
+    // replaced (code review round 5). The index is counted for the same
+    // reason.
     let mut by_selector: Counted<Vec<Option<&Pred>>> =
         Counted::new(vec![None; plan.selectors.len()]);
     for read in reads.iter() {
@@ -1415,10 +1425,11 @@ mod tests {
     #[test]
     fn the_worked_query_yields_two_sql_parts_and_one_engine_part() {
         let plan = planned("max by (status) (http_requests_total{status=\"500\"})");
-        let reads = [SelectorRead {
+        let mut reads = SelectorReads::empty();
+        reads.push(SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
-        }];
+        });
         let shapes = plan_shapes(&plan, &reads, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 1, "one plan per selector that reads");
         let json = serde_json::to_value(&shapes[0]).expect("serialize");
@@ -1446,10 +1457,11 @@ mod tests {
     #[test]
     fn a_selectors_two_statements_are_two_sql_parts_cut_on_disjoint_sources() {
         let plan = planned("http_requests_total");
-        let reads = [SelectorRead {
+        let mut reads = SelectorReads::empty();
+        reads.push(SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
-        }];
+        });
         let bounds = request_bounds(&params());
         let config = PlanConfig::default();
         let cx = PlanCx {
@@ -1459,7 +1471,7 @@ mod tests {
         let chain = chain_of(&plan).remove(0);
         let lowering = lower_chain::<Pql>(
             &chain.links,
-            seed_relation(reads[0].pred.clone()),
+            seed_relation(reads.get(0).expect("one read").pred.clone()),
             &LowerCx::<Pql>::new(&bounds),
         )
         .expect("fold");
@@ -1490,23 +1502,23 @@ mod tests {
     fn a_selector_that_sends_no_statement_contributes_no_plan() {
         let plan = planned("http_requests_total and http_errors_total");
         assert_eq!(plan.selectors.len(), 2);
-        let reads = vec![SelectorRead {
+        let mut reads = SelectorReads::empty();
+        reads.push(SelectorRead {
             selector: 1,
             pred: pred("http_errors_total"),
-        }];
+        });
         let shapes = plan_shapes(&plan, &reads, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 1, "one selector read, so one plan");
         assert_eq!(shapes[0].links[0].stage, "Select(1)");
-        let both = vec![
-            SelectorRead {
-                selector: 0,
-                pred: pred("http_requests_total"),
-            },
-            SelectorRead {
-                selector: 1,
-                pred: pred("http_errors_total"),
-            },
-        ];
+        let mut both = SelectorReads::empty();
+        both.push(SelectorRead {
+            selector: 0,
+            pred: pred("http_requests_total"),
+        });
+        both.push(SelectorRead {
+            selector: 1,
+            pred: pred("http_errors_total"),
+        });
         let shapes = plan_shapes(&plan, &both, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 2);
         assert_eq!(shapes[0].links[0].stage, "Select(0)");
@@ -1594,12 +1606,13 @@ mod tests {
             // One recorded read per entry, so every chain finds one and
             // the lookup is exercised once per chain — the path the
             // round-2 index replaced a linear search on.
-            let reads: Vec<SelectorRead> = (0..terms)
-                .map(|selector| SelectorRead {
+            let mut reads = SelectorReads::empty();
+            for selector in 0..terms {
+                reads.push(SelectorRead {
                     selector,
                     pred: pred("http_requests_total"),
-                })
-                .collect();
+                });
+            }
             let (shapes, work) =
                 work_of(|| plan_shapes(&plan, &reads, &params()).expect("plan shapes"));
             assert_eq!(
