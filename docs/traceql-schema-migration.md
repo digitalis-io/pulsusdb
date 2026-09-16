@@ -4,10 +4,13 @@
 store today, what is wrong with it in numbers, what we would store instead, and
 what each query costs before and after.
 
-**Who it is for.** Someone who has not read the code and will not open it. Every
-term is defined where it first appears. Every structural claim points at a file
-and a line in this repository. Every number says whether it was **derived** (from
-those files, on paper) or **measured** (on a running ClickHouse).
+**Who it is for.** Someone who has not read the code and will not open it. A term is
+defined where it first appears. A structural claim points at a file, and at a line range
+where the claim is about particular lines — 110 such ranges, all quoted in Appendix C,
+and twelve places that name a file without one. **Every figure says whether it was
+derived (from those files, on paper) or measured (on a running ClickHouse)**: §5's cost
+table marks each row `[D]` or `[M]`, and a figure outside that table says in words which
+it is and what produced it.
 
 **Nothing has ever shipped.** No users, no deployments, no stored data. So this is
 not a data migration. It is a decision about which `CREATE TABLE` statements the
@@ -15,14 +18,21 @@ product ships with. §8 says what that means in practice.
 
     this tree            86081ef1eaceaad37d8ede1f5cf47b46a9ce41ec — where the readings were taken
     citations pinned at  8f3348e88a1ff5033d7be623fabbbfd24b189e59 — the tip of main when
-                         Appendix C was written.  All 97 cited ranges are byte-identical
-                         between the two, so nothing here has gone stale under the code
+                         Appendix C was written.  The body cites 110 line ranges and
+                         Appendix C quotes all 110.  Every range into CODE is byte-identical
+                         between the two revisions, so no reading of the code has gone stale;
+                         the two exceptions are document lines, marked where they appear,
+                         and they are the citations round one corrected
     ClickHouse           26.3 is the live target (.github/workflows/ci.yml:567-572)
-    every derived number Appendix B's calculator, at Appendix A's parameters.  It prints
-                         the output block printed beside it: run it and compare
+    every derived number Appendix B's calculator, at Appendix A's parameters, or stated
+                         arithmetic on what it prints.  It prints the output block beside
+                         it: run it and compare
     every code citation  a path from the repository root, and **Appendix C quotes the
                          lines**, so a reading can be checked without opening the tree
-    every measured number the corpus, the server version and the settings sit beside it.
+    every measured number the corpus and the server version sit beside it, and so do the
+                         settings wherever they were recorded.  One row's were not: §5's
+                         write wall time says so in the row itself, and it is the only
+                         [M] row in the document with no per-statement settings behind it.
                          Corpus C1 is built by the script in §4 and pinned by a content
                          digest; §7 lists what is not measured, including the figures
                          whose corpus is not published
@@ -43,8 +53,11 @@ product ships with. §8 says what that means in practice.
 | bytes the writer sends ClickHouse | 1838 raw B/span in 2 statements | **1038 in 1** — **−44%** |
 | SQL statements a one-condition search issues | 4 … 6252 | **3 … 3127** |
 
-Every number in that table is derived. The parameters they depend on are in Appendix A;
-substitute your own and Appendix B's calculator recomputes them.
+**The figures in that table are derived** — Appendix B's calculator at Appendix A's
+parameters, so substitute your own and it recomputes them — **with two exceptions, both
+marked in the cells themselves**: the storage row's −30.6%, which is the two families
+built and measured on corpus C1 (§5), and the rollup's 16.30 B/span, which is §3.5's own
+measurement.
 
 **The read that was reported here as getting worse, restated.** A search batch's
 phase-2 read was given as 2.2× the bytes it reads today. That figure was taken by
@@ -251,12 +264,19 @@ points at**, and the worked model prices them at their full width.
 
 **The assumption behind that price, stated as an assumption.** The model assumes a
 workload in which no two rows adjacent under `(key, val, scope, timestamp_ns, trace_id,
-span_id)` carry the same identity bytes. **Two things in the shipped system break it,
-and both are ordinary:**
+span_id)` carry the same identity bytes. **Three things in the shipped system break it,
+and all three are ordinary:**
 
 - **two spans of one trace sharing an attribute value** sort together under that key,
   which is the whole of what the collapse factor `d` counts — at Appendix A's
-  parameters a trace's rows for one value are `d` = 2.5 deep;
+  parameters a trace's rows for one value are `d` = 2.5 deep. Their `trace_id` bytes are
+  identical and adjacent; their `span_id` bytes differ;
+- **one span repeating a key at the same scope with the same value.** §4 Q1 establishes
+  that a span may carry a key more than once — that is the whole of the duplicate-key
+  rule. If the repeat carries the same value and the same scope, the two index rows agree
+  on every one of the six sort columns, including `timestamp_ns`, `trace_id` and
+  `span_id`, so **both identity columns are adjacent copies of themselves**. No replay is
+  involved and the writer produces it from one delivery;
 - **an allowed replay.** The table is a `ReplacingMergeTree` keyed on all six sort
   columns, so re-delivering a span writes a byte-identical row that sits next to its
   twin until a merge collapses it. That is not a fault state; it is the at-least-once
@@ -820,9 +840,10 @@ so it scales with `N` and not with `n_grp`; a wider grouping key would not make 
 smaller, and a narrower one would not either.
 
 **This design still does not take it**, and the reason is now a choice rather than
-a wall: one query shape of nine, 16.30 B/span on every span ingested whether or not
-anyone runs a metrics query, and a second write path to keep consistent with the
-span table. Whoever revisits it has the numbers above rather than an assertion.
+a wall: one query shape of nine, **16.30 B/span on C1** — every span contributes an
+entry to the state whether or not anyone runs a metrics query, and the figure itself is
+one corpus's, not a rate checked at a second scale (§7) — and a second write path to
+keep consistent with the span table. Whoever revisits it has the numbers above rather than an assertion.
 The rule the rest of this document follows is exact-or-refuse, and refusing is
 always available.
 
@@ -867,7 +888,9 @@ The "before" SQL is copied from committed golden files under
 `crates/pulsus-read/tests/golden/`, which are byte-frozen against the builders.
 The "after" SQL is what the same builders would produce against the new tables.
 
-**Corpus C1, which every `[M]` figure below names.** 2,000,000 spans,
+**Corpus C1, which every `[M]` figure below names except one** — §5's write wall time,
+whose 20,000,000-span corpus is not this one and is not published, as that row says.
+C1 is 2,000,000 spans,
 166,667 traces (166,666 of 12 spans and one of 8 — 2,000,000 does not divide
 by 12), 8 attributes per span, three hours from
 `1700000000000000000`, two UTC day partitions. `spans_old` and `spans_new` are built by
@@ -1251,7 +1274,7 @@ above.
 the reader inverts. That stays exactly as it is; only what the positive probe computes
 changes, from "some element matches" to "the resolved element matches".
 
-**The six negation cases, with the two the locate rule changes.** `probe0` is the
+**The six negation cases, and the one the locate rule changes.** `probe0` is the
 positive column; the returned answer is `NOT probe0`:
 
     the span's stored k        it HAS   probe0 today   probe0 new   { k != "x" } today / new
@@ -1715,7 +1738,8 @@ The arithmetic, so it is not asserted as rounder than it is:
 **The residue is 816 bytes, and it is not attributed.** The mechanism is established —
 the wrapper does not read the two id columns — the exact total is not, and no round
 `24 × 2,000,000` identity holds. **A counter taken through a wrapper is a counter for the
-wrapper.** Every `[M]` figure in this document was taken by running the statement itself.
+wrapper.** Every query counter in this document was taken by running the statement
+itself, never by reading one out of a wrapper around it.
 
 ### Q7 — the service graph
 
@@ -1986,6 +2010,23 @@ trace_edges is excluded from both sides because it is the same table fed by the
 same statement on both: 35,073,281 against 35,073,241, a 40-byte difference in
 how the two runs' blocks happened to fall.
 ```
+
+**The same script run four times does not give the same bytes, and the printed B/span
+can cross a rounding boundary.** Four runs of the block above on the same corpus, same
+server, nothing else changed:
+
+    run   old side, bytes   B/span    new side, bytes   B/span    ratio
+    1       612,990,389      306.5      425,536,930      212.8     0.6942
+    2       613,004,438      306.5      425,450,382    **212.7**   0.6940
+    3       613,023,509      306.5      425,543,663      212.8     0.6942
+    4       613,014,196      306.5      425,541,572      212.8     0.6942
+
+The old side spans 33,120 bytes across the four (0.005%) and the new side 93,281
+(0.022%) — merge and block boundaries land differently each time. **Every run gives
+−30.6% and every run gives 306.5 on the old side; the new side prints 212.7 once and
+212.8 three times**, because 212.75 sits inside that spread. Row counts were identical
+on every table on every run. So the ratio is the figure to carry, and the one-decimal
+B/span is the figure that can move by a digit.
 
 −30.6%. The row that predicts it is the worked model's −40.3%; the gap between the two
 is the identity-column compressibility §7 carries, and this corpus's `A` = 8 against the
@@ -2641,10 +2682,23 @@ The MV list and `TTL_STMTS` change either way:
    here: the column it applies to is on a table this design deletes.)
 2. **The read path changes with the schema, in the same commit.** Two SQL
    builders are deleted (`crates/pulsus-read/src/traces/search_sql.rs:286, 325`) and one is retargeted
-   (`:397` — §4 Q1 says why it cannot become a column); the hydration builder gains an
-   `arrayExists` column per attribute leaf and a value column pair per read field; and
-   the tag builders gain a `date` and a `service` clause. A schema that ships ahead of
-   the builders answers nothing.
+   (`:397` — §4 Q1 says why it cannot become a column); the hydration builder gains **one
+   resolved-element predicate column per attribute leaf** and a value column pair per read
+   field; and the tag builders gain a `date` and a `service` clause. A schema that ships
+   ahead of the builders answers nothing.
+
+   **The predicate column is not `arrayExists`**, and this is the one place in §8 where
+   getting it wrong changes answers rather than performance. Each leaf **locates one
+   element and tests that element** — for a scoped condition
+
+       arrayFirstIndex((key, scope) -> key = K AND scope = S, attr_key, attr_scope) AS i0
+       (i0 != 0) AND <the value test applied to element i0>
+
+   and for an unscoped one the five-index chain of §4 Q1, taking scopes span → resource →
+   event → link → instrumentation and testing the element the chain lands on. §4 Q1
+   measures three fixture spans on which `arrayExists` and this form give different
+   answers, and §6.1 records the two kinds of change against what ships. An implementer
+   who builds `arrayExists` here has built the semantics §4 argues against.
 
 ---
 
@@ -2655,7 +2709,8 @@ The MV list and `TTL_STMTS` change either way:
 | ~~the `SimpleAggregateFunction` half of the new view is rejected~~ | — | **read: it is not.** §11 P1 |
 | ~~a search batch's 2.2× byte cost is structural~~ | — | **read: on a first-seen batch there is no 2.2×.** The cost of that batch turns on how selective the probed value is, and it is worse than today only for a highly selective probe. §4 Q1 |
 | a materialized view throws and leaves the span stored with **some** derived rows and not others | a trace answers some search shapes and not others, and which ones varies between runs of the identical write | **read: this happens, non-deterministically.** §6.3's twenty trials. No remedy is chosen here |
-| a probe's negation is rendered inside `arrayExists` rather than left to the reader | `{ span.k != "x" }` starts matching spans that carry `k = "x"` and stops matching spans with no `k` | §4 Q1's five-case table is the test. Three of the five cases go wrong |
+| a probe's negation is rendered inside the array function rather than left to the reader | `{ span.k != "x" }` starts matching spans that carry `k = "x"` and stops matching spans with no `k` | §4 Q1's six-case negation table is the test |
+| a leaf's predicate column is built as `arrayExists` rather than as locate-then-test | a span whose resolved value does not satisfy the query is returned, and then rendered with the value that does not match it | §4 Q1's eight-span fixture is the test: three of its eight rows separate the two forms. §8 says which column to build |
 | the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `crates/pulsus-write/src/protocols/otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
 | the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
 | the duplicate-key rule is left to `arrayFirstIndex` without being stated | `avg`, `select` and `by` change answer on a span that repeats a key, silently | §4 Q1 states the rule and why it is the right one; it is a change of answer and needs a ledger row |
@@ -2673,12 +2728,26 @@ The MV list and `TTL_STMTS` change either way:
 
 - **A dropdown narrowed by an attribute** rather than by a service still has no
   cheap path. With no span-grained attribute index, the attribute half of the
-  narrowing becomes an `ARRAY JOIN` over the window. On the query mix of §2.2
-  that is 23% of the rows an investigation reads, and it is unchanged. It is the one place this design is
-  structurally worse than today, and it is not priced here.
-- **It does not remove a derived table.** `trace_tag_catalog` has to stay:
-  answering the dropdown off the span table costs 3,256 MB against the catalog's
-  43 KB (measured, at 2,000,000 spans). "One INSERT" is not "one table".
+  narrowing becomes an `ARRAY JOIN` over the window. On the query mix of §2.2 that is
+  23% of the rows an investigation reads — a **derived** share, from the same unreproduced
+  mix reading §7 lists, not a measurement — and it is unchanged. It is the one place this
+  design is structurally worse than today, and it is not priced here.
+- **It does not remove a derived table.** `trace_tag_catalog` has to stay: answering
+  the dropdown off the span table reads the whole window where the catalog answers from
+  a primary-key seek. Measured on corpus C1 with the two tables of §5's published build
+  (26.3.29.7; `use_query_condition_cache=0`, `optimize_move_to_prewhere=1`,
+  `max_block_size=65409`, `max_threads=16`; three repetitions, zero spread), both
+  statements returning the same four values `200 400 500 503`, all `int`:
+
+  | answering `values for http.status_code` | read_rows | read_bytes | marks |
+  |---|---|---|---|
+  | off the span row's arrays, `ARRAY JOIN` over the window | 2,000,000 | 360,155,560 | 245 |
+  | off `trace_tag_catalog`, a primary-key seek | 16,384 | 52,172 | 2 |
+
+  **6,903× the bytes**, for the same four values. An earlier version of this line gave
+  `3,256 MB against 43 KB` with no statement, no settings and no repetition count behind
+  it; those two figures are withdrawn and replaced by the table above. "One INSERT" is
+  not "one table".
 - **It does not speed up metrics range queries at all.** `| rate()`,
   `| count_over_time()` and every other metrics function still scan the window.
   §3.5 prices the exact rollup — built and measured, same answer, 16.30 B/span —
@@ -2797,12 +2866,17 @@ ZSTD(3)-to-LZ4 cost ratio. Every worked byte figure moves with them.
   bitwise on 6,000,000 values (§6). It fails if any future path populates
   `attr_num` from something other than the stored text.
 
-**A figure taken through a wrapper is not a figure.** Every `[M]` counter in this
-document was taken by running the statement itself, on the corpus defined at the head of
-§4, with that section's instrument. Figures whose method was not recorded and whose corpus
-no longer exists — the 20,000,000-span Q6b byte and timing ratio, and Q7's original
-1,516,384 / 65,764,280 — are **withdrawn rather than carried**, and are not replaced by
-estimates.
+**A figure taken through a wrapper is not a figure.** Every **query** counter in this
+document was taken by running the statement itself rather than a wrapper around it, and
+each carries the corpus and the settings it was taken with — §4's instrument for the
+query counters in §§2, 4 and 5, §3.5's own thread sweep for the rollup, and
+`sum(bytes_on_disk)` over `system.parts` for the storage readings in §2.1 and §5, which
+are stored quantities and take no query settings. **One `[M]` row is weaker than that and
+says so in itself**: §5's write wall time, on an unpublished 20,000,000-span corpus with
+no per-statement settings recorded, claiming a direction and no ratio. Figures whose
+method was not recorded and whose corpus no longer exists — the 20,000,000-span Q6b byte
+and timing ratio, and Q7's original 1,516,384 / 65,764,280 — are **withdrawn rather than
+carried**, and are not replaced by estimates.
 
 **Three things are established more narrowly than an earlier version of this document
 said.**
