@@ -1,0 +1,510 @@
+== http_requests_total{status="500"} ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== abs(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== max by (status) (http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== min without (instance) (http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== count(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== group(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== topk(3, http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== count_values("v", http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== stddev by (status) (http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== histogram_quantile(0.5, http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== label_replace(http_requests_total{status="500"}, "l", "$1", "status", "(.*)") ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== timestamp(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== absent(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== sort_desc(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782907200000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782907200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782907200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== rate(http_requests_total{status="500"}[5m]) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== sum by (status) (rate(http_requests_total{status="500"}[5m])) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== max_over_time(http_requests_total{status="500"}[1m]) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=60000 window=(1782906840000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906840000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906840000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== quantile_over_time(0.5, http_requests_total{status="500"}[10m]) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=600000 window=(1782906300000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906300000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906300000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== avg_over_time(http_requests_total{status="500"}[5m] offset 1h) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782903000000, 1782925200000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782903000000 AND unix_milli <= 1782925200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782903000000 AND unix_milli <= 1782925200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== sum_over_time(http_requests_total{status="500"}[5m] @ 1782900000) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782899400000, 1782900000000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782899400000 AND unix_milli <= 1782900000000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782899400000 AND unix_milli <= 1782900000000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== rate(http_requests_total{status="500"}[5m:1m]) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906600000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== http_requests_total{status="500"}[5m] ==
+params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
+selectors 1
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782907200000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782907200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782907200000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== time() ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 0
+
+== vector(1) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 0
+
+== pi() ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 0
+
+== info(http_requests_total{status="500"}) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 2
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+-- selector[1] name=target_info range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'target_info'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'target_info'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== rate(http_requests_total{status="500"}[5m]) / on (instance) rate(http_errors_total{status="500"}[5m]) ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 2
+-- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+-- selector[1] name=http_errors_total range_ms=300000 window=(1782906600000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_errors_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_errors_total'
+WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== http_requests_total{status="500"} and http_requests_total{status="200"} ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 2
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+-- selector[1] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== http_requests_total{status="500"} * 100 ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
+SELECT fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name = 'http_requests_total'
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY fingerprint, unix_milli
+
+== {__name__=~"http_.*",status="500"} ==
+params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
+selectors 1
+-- selector[0] name=<none> range_ms=- window=(1782906900000, 1782928800000]
+SELECT metric_name, fingerprint, unix_milli, value
+FROM metric_samples
+PREWHERE metric_name IN ('http_requests_total', 'http_errors_total')
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY metric_name, fingerprint, unix_milli
+SELECT metric_name, fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+FROM metric_hist_samples
+PREWHERE metric_name IN ('http_requests_total', 'http_errors_total')
+WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
+  AND fingerprint IN (101, 205, 990)
+ORDER BY metric_name, fingerprint, unix_milli
+

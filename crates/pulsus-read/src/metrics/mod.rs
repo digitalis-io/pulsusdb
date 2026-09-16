@@ -46,6 +46,10 @@
 //! - [`exec`] *(issue #31)* — [`exec::MetricsEngine`]: `pulsus_promql::plan`
 //!   -> resolve/fetch -> `pulsus_promql::evaluate` orchestration, the only
 //!   async/ClickHouse-touching code #31 added.
+//! - [`compile`] *(issue #548)* — PromQL against the shared compile core:
+//!   the chain link set, the [`Lang`](crate::compile::fold::Lang) impl and
+//!   the chain builder. Built only under `X-Pulsus-Explain: 1`, and it
+//!   changes no statement.
 //! - [`sample_sql`] *(issue #31)* — pure `metric_samples` fetch SQL
 //!   builders (the §2.3 fetch shape), snapshot-testable without a
 //!   database.
@@ -68,6 +72,7 @@
 //! #30 — see the architecture.md §5.2 amendment for both roles stated
 //! explicitly).
 
+pub mod compile;
 mod dispatch;
 pub mod exec;
 pub mod labels;

@@ -45,10 +45,12 @@ use pulsus_promql::{
     RangeSeries, Sample, SelectorSpec, SeriesData,
 };
 
+use super::compile;
 use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
 use super::matcher::{DataWindow, DiscoveryFilter};
 use super::sample_rows::{HistSampleRow, MultiHistSampleRow, MultiSampleRow, SampleRow};
 use super::sample_sql;
+use crate::compile::fold::Pred;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::exec::{
     HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, QueryResult, VectorSample,
@@ -515,7 +517,12 @@ impl MetricsEngine {
         // not just a table name + series count). Nothing here awaits — see
         // `LabelCache::resolve_labelled`'s own purity contract.
         let mut fetch_plans = Vec::with_capacity(plan.selectors.len());
-        for sel in &plan.selectors {
+        // Issue #548: what each selector's statements read, in the compile
+        // core's predicate lattice, recorded ONLY under the explain
+        // header. On the unexplained path this vector is never pushed to
+        // and never allocates.
+        let mut reads = compile::SelectorReads::empty();
+        for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
             let window = DataWindow {
                 start_ms: lower_excl,
@@ -526,13 +533,19 @@ impl MetricsEngine {
             // metric name resolves through the name-keyed cache into a
             // capped per-metric fan-out and ONE flat IN-set fetch.
             let Some(metric_name) = &sel.metric_name else {
-                let fetch_plan = self.plan_multi_metric_fetch(
+                let (fetch_plan, read) = self.plan_multi_metric_fetch(
                     sel,
                     window,
                     lower_excl,
                     upper_incl,
                     explain.as_deref_mut(),
                 )?;
+                if let Some(pred) = read {
+                    reads.push(compile::SelectorRead {
+                        selector: selector_id,
+                        pred,
+                    });
+                }
                 fetch_plans.push(fetch_plan);
                 continue;
             };
@@ -624,6 +637,39 @@ impl MetricsEngine {
                         pairs.iter().cloned().collect();
                     let fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
                     let total_fps = fps.len();
+                    // Issue #548: the leaf carries the FIRST chunk's
+                    // fingerprint list, which is the rule the explain
+                    // surface already follows for stage SQL — the chunk
+                    // driver is not represented and the module doc says
+                    // so. Sorted here the way `build_chunk_sqls` sorts,
+                    // so the leaf and the statement carry one list.
+                    //
+                    // **A read is recorded only where a chunk exists, and
+                    // that is the same condition as a statement being
+                    // sent**: `build_chunk_sqls` renders one statement per
+                    // chunk of this same list. An empty fingerprint set —
+                    // a concrete metric name the cache does not know —
+                    // yields ZERO chunks and zero statements, and a read
+                    // recorded there would put a plan naming two
+                    // statements on the explain surface for a read the
+                    // database never performed (code review round 2).
+                    if explain.is_some() {
+                        let mut sorted = fps.clone();
+                        sorted.sort_unstable();
+                        if let Some(first_chunk) =
+                            sample_sql::chunk_fingerprints(&sorted, sample_sql::CHUNK_THRESHOLD)
+                                .first()
+                        {
+                            reads.push(compile::SelectorRead {
+                                selector: selector_id,
+                                pred: compile::selector_pred(
+                                    &sample_sql::name_predicate(metric_name),
+                                    &sample_sql::window_predicate(lower_excl, upper_incl),
+                                    &sample_sql::fingerprints_predicate(first_chunk),
+                                ),
+                            });
+                        }
+                    }
                     let hist_sqls = build_hist_chunk_sqls(
                         &self.config.hist_samples_table,
                         metric_name,
@@ -667,6 +713,16 @@ impl MetricsEngine {
                     }
                 }
                 LabelledResolution::SqlFallback { sql, .. } => {
+                    if explain.is_some() {
+                        reads.push(compile::SelectorRead {
+                            selector: selector_id,
+                            pred: compile::selector_pred(
+                                &sample_sql::name_predicate(metric_name),
+                                &sample_sql::window_predicate(lower_excl, upper_incl),
+                                &sample_sql::subquery_predicate(&sql),
+                            ),
+                        });
+                    }
                     let fetch_sql = sample_sql::sample_fetch_subquery(
                         &self.config.samples_table,
                         metric_name,
@@ -703,6 +759,17 @@ impl MetricsEngine {
                 }
             };
             fetch_plans.push(fetch_plan);
+        }
+
+        // Issue #548: the chain model, built once, only under the
+        // explain header, and rendered as one additive key. It is
+        // O(tree nodes) with no I/O and no round trip, and it drives
+        // nothing: phase 2 below fetches and evaluates exactly as it did
+        // before this existed.
+        if let Some(e) = explain.as_mut() {
+            for shape in compile::plan_shapes(&plan, &reads, p)? {
+                e.push_plan(shape);
+            }
         }
 
         // Phase 2 (async, concurrent across the full selector set — the
@@ -783,7 +850,7 @@ impl MetricsEngine {
         lower_excl: i64,
         upper_incl: i64,
         mut explain: Option<&mut PlanExplain>,
-    ) -> Result<SelectorFetchPlan, ReadError> {
+    ) -> Result<(SelectorFetchPlan, Option<Pred>), ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
             &sel.name_matchers,
             &sel.matchers,
@@ -868,7 +935,7 @@ impl MetricsEngine {
             );
         }
         if groups.is_empty() {
-            return Ok(SelectorFetchPlan::Empty);
+            return Ok((SelectorFetchPlan::Empty, None));
         }
 
         // Group order is sorted-by-name (the resolver's contract) and
@@ -915,12 +982,24 @@ impl MetricsEngine {
             e.push("sample_fetch", sql.clone(), None);
             e.push("hist_sample_fetch", hist_sql.clone(), None);
         }
-        Ok(SelectorFetchPlan::Multi {
-            sql,
-            hist_sql,
-            labels_by,
-            labels_by_fp,
-        })
+        // Issue #548: the fan-out's own predicate, built only under the
+        // explain header.
+        let read = explain.is_some().then(|| {
+            compile::selector_pred(
+                &sample_sql::names_predicate(&names),
+                &sample_sql::window_predicate(lower_excl, upper_incl),
+                &sample_sql::fingerprints_predicate(&fps),
+            )
+        });
+        Ok((
+            SelectorFetchPlan::Multi {
+                sql,
+                hist_sql,
+                labels_by,
+                labels_by_fp,
+            },
+            read,
+        ))
     }
 
     /// Executes one selector's already-built [`SelectorFetchPlan`]: the

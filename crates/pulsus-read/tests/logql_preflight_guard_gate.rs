@@ -14,35 +14,75 @@
 //! assert **exactly zero bytes requested**, not a ceiling. A ceiling
 //! would have passed on the code this gate was written against.
 //!
-//! Own binary and one `#[test]`, like `logql_preflight_alloc_gate.rs`:
-//! the counting allocator is process-global, so a second test in the same
-//! binary would race it.
+//! Own binary and one `#[test]`, like `logql_preflight_alloc_gate.rs`.
+//!
+//! **What is counted is what the MEASURING THREAD requested** (issue
+//! #548). A `#[global_allocator]` serves every thread in the process, so
+//! a counter kept in one process-wide figure charges whatever any other
+//! thread allocates to whichever measured window happens to be open —
+//! and an allocation made elsewhere is then indistinguishable from one
+//! the code under test made itself. That is not a theory: this gate
+//! failed in CI with `requested 900 B`, and a thread spawned beside the
+//! test, allocating 900 bytes every 50 µs and touching nothing the code
+//! under test can see, reproduces the failure with the same wording and
+//! the same figure — only the size pair moves, because the case that
+//! reddens is whichever window the foreign allocation lands in.
+//!
+//! So the counter is a thread-local cell. The assertion is unchanged and
+//! is still **exactly zero**, not a ceiling: the quantity is "did the
+//! decision path allocate at all", which is a property of the code and
+//! not of the operand width, and a ceiling would pass on the code this
+//! gate was written against.
 //!
 //! **The non-vacuity half.** Every fixture is also driven at a REFUSING
 //! charge, where it must request more than zero. Without that, a deleted
 //! preflight, an empty fixture set or a probe that returned early would
-//! all read as "the guard works".
+//! all read as "the guard works". It covers the counter too: a counter
+//! that counted nothing would make the admitted rows read zero for the
+//! wrong reason, and the refusing rows fail when that happens.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 struct CountingAlloc;
 
-static BYTES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Bytes requested BY THIS THREAD. `const`-initialised, so the slot
+    /// is a plain TLS word with no lazy heap box behind it — the
+    /// allocator can read it without re-entering itself.
+    static REQUESTED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What the calling thread has requested so far. The two marks either
+/// side of the call under test read this, so another thread's
+/// allocations are not in the difference.
+fn requested_here() -> u64 {
+    REQUESTED.with(Cell::get)
+}
+
+/// Adds to the calling thread's tally.
+///
+/// `try_with`, not `with`: during thread-local destruction the slot is
+/// gone and `with` would panic inside the allocator. An allocation at
+/// that point belongs to teardown and to no measured window, so dropping
+/// it is the right answer as well as the safe one.
+fn charge_here(bytes: usize) {
+    let _ = REQUESTED.try_with(|c| c.set(c.get() + bytes as u64));
+}
 
 // SAFETY: delegates verbatim to the system allocator; the only side
-// effect is a relaxed atomic add, which allocates nothing and cannot
-// re-enter the allocator.
+// effect is a `Cell` update on a `const`-initialised thread-local, which
+// allocates nothing and cannot re-enter the allocator.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_here(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_here(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -178,10 +218,10 @@ fn an_admitted_binary_operation_requests_no_preflight_bytes() {
                 for (mode, &(lk, rk)) in MODES.iter().enumerate() {
                     // The admitted row: zero, by equality.
                     let (lhs, rhs) = (build(nl, lk, matrix), build(nr, rk, matrix));
-                    let before = BYTES.load(Ordering::Relaxed);
+                    let before = requested_here();
                     let out =
                         preflight_alloc_probe(BinOp::Div, m.as_ref(), lhs, rhs, ADMITS.0, ADMITS.1);
-                    let requested = BYTES.load(Ordering::Relaxed) - before;
+                    let requested = requested_here() - before;
                     assert!(
                         out.is_ok(),
                         "({nl}, {nr}) {mname} matrix = {matrix} mode = {mode}: an admitted charge \
@@ -199,7 +239,7 @@ fn an_admitted_binary_operation_requests_no_preflight_bytes() {
                     // This is what stops the assertion above from being
                     // satisfied by a preflight that does nothing at all.
                     let (lhs, rhs) = (build(nl, lk, matrix), build(nr, rk, matrix));
-                    let before = BYTES.load(Ordering::Relaxed);
+                    let before = requested_here();
                     let _ = preflight_alloc_probe(
                         BinOp::Div,
                         m.as_ref(),
@@ -208,7 +248,7 @@ fn an_admitted_binary_operation_requests_no_preflight_bytes() {
                         REFUSING.0,
                         REFUSING.1,
                     );
-                    let requested = BYTES.load(Ordering::Relaxed) - before;
+                    let requested = requested_here() - before;
                     assert!(
                         requested > 0,
                         "({nl}, {nr}) {mname} matrix = {matrix} mode = {mode}: a REFUSING charge \

@@ -1635,6 +1635,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_answers
 
+      # Issue #548: the statements the database actually received, read
+      # back out of `system.query_log` and compared against text the test
+      # writes out itself, plus the plan's own SQL part names against the
+      # tables those statements read. The hermetic statement freeze cannot
+      # see the engine calling the builders with different arguments —
+      # measured: a one-millisecond shift of every fetch window leaves the
+      # freeze digest unmoved and `pulsus-read --lib` green.
+      - name: Live metrics plan-parts suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_plan_parts
+
       - name: Live discovery fallback suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

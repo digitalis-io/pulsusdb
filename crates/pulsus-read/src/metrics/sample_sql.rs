@@ -23,6 +23,53 @@
 
 use crate::logql::escape::ch_string;
 
+// ---------------------------------------------------------------------
+// The predicate fragments (issue #548)
+// ---------------------------------------------------------------------
+//
+// One producer per fragment, used by the statement builders below AND by
+// `super::compile::selector_pred`, which expresses the same read in the
+// compile core's predicate lattice. Two producers for one predicate is
+// how a plan comes to describe a statement the engine does not send.
+//
+// **No fragment carries statement layout.** Each renders one clause's
+// text and nothing else: the newlines, the `PREWHERE`/`WHERE` keywords
+// and the two-space continuation are the builders' business, which is
+// what keeps the rendered statements byte-identical to the ones this
+// module rendered before the fragments existed (issue #548 criterion 1).
+
+/// `metric_name = 'x'` — the concrete-name `PREWHERE` term.
+pub fn name_predicate(metric_name: &str) -> String {
+    format!("metric_name = {}", ch_string(metric_name))
+}
+
+/// `metric_name IN ('a', 'b')` — the fan-out `PREWHERE` term.
+pub fn names_predicate(metric_names: &[String]) -> String {
+    let name_list = metric_names
+        .iter()
+        .map(|n| ch_string(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("metric_name IN ({name_list})")
+}
+
+/// `unix_milli > A AND unix_milli <= B` — left-open right-closed, always.
+pub fn window_predicate(lower_excl_ms: i64, upper_incl_ms: i64) -> String {
+    format!("unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}")
+}
+
+/// `fingerprint IN (101, 205, 990)` — the resolved fingerprint set.
+pub fn fingerprints_predicate(fps: &[u64]) -> String {
+    format!("fingerprint IN ({})", render_fingerprint_list(fps))
+}
+
+/// `fingerprint IN (\n<subquery>\n  )` — the degraded-cache path's
+/// inlined series selection, layout included because the sub-query is
+/// rendered on its own lines.
+pub fn subquery_predicate(subquery: &str) -> String {
+    format!("fingerprint IN (\n{subquery}\n  )")
+}
+
 /// The §2.3 fast-path fetch: an explicit, sorted `fingerprint IN (...)`
 /// list. Callers pre-sort/dedup `fps` (the resolver's own contract); this
 /// function renders whatever order it is given, unmodified — snapshot
@@ -34,10 +81,11 @@ pub fn sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let fp_list = render_fingerprint_list(fps);
+    let name = name_predicate(metric_name);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE metric_name = {}\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN ({fp_list})\nORDER BY fingerprint, unix_milli",
-        ch_string(metric_name)
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -52,9 +100,11 @@ pub fn sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    let name = name_predicate(metric_name);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE metric_name = {}\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN (\n{subquery}\n  )\nORDER BY fingerprint, unix_milli",
-        ch_string(metric_name)
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -77,14 +127,11 @@ pub fn sample_fetch_multi(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let name_list = metric_names
-        .iter()
-        .map(|n| ch_string(n))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let fp_list = render_fingerprint_list(fps);
+    let names = names_predicate(metric_names);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT metric_name, fingerprint, unix_milli, value\nFROM {table}\nPREWHERE metric_name IN ({name_list})\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN ({fp_list})\nORDER BY metric_name, fingerprint, unix_milli"
+        "SELECT metric_name, fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
     )
 }
 
@@ -112,10 +159,11 @@ pub fn hist_sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let fp_list = render_fingerprint_list(fps);
+    let name = name_predicate(metric_name);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE metric_name = {}\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN ({fp_list})\nORDER BY fingerprint, unix_milli",
-        ch_string(metric_name)
+        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -130,9 +178,11 @@ pub fn hist_sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    let name = name_predicate(metric_name);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE metric_name = {}\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN (\n{subquery}\n  )\nORDER BY fingerprint, unix_milli",
-        ch_string(metric_name)
+        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -148,18 +198,19 @@ pub fn hist_sample_fetch_multi(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let name_list = metric_names
-        .iter()
-        .map(|n| ch_string(n))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let fp_list = render_fingerprint_list(fps);
+    let names = names_predicate(metric_names);
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT metric_name, fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE metric_name IN ({name_list})\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN ({fp_list})\nORDER BY metric_name, fingerprint, unix_milli"
+        "SELECT metric_name, fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
     )
 }
 
-fn render_fingerprint_list(fps: &[u64]) -> String {
+/// The bare comma-separated `u64` list an `IN (...)` carries. `pub`
+/// because `super::compile`'s `handoff_cost` bound is asserted against
+/// what this renders (issue #548 criterion 7), and a bound asserted
+/// against a second renderer would bound the wrong text.
+pub fn render_fingerprint_list(fps: &[u64]) -> String {
     fps.iter()
         .map(u64::to_string)
         .collect::<Vec<_>>()

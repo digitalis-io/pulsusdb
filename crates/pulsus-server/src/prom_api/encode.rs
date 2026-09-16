@@ -257,6 +257,13 @@ struct ExplainWire<'a> {
     /// Skipped when absent, which it is on every path today.
     #[serde(skip_serializing_if = "Option::is_none")]
     plan: Option<&'a pulsus_read::compile::plan::PlanShape>,
+    /// Issue #548: one compiled plan per selector-list entry that reads.
+    /// **Skipped when empty**, which it is on every route but this one
+    /// and on every request here without the header — so a response that
+    /// carries no plan is byte-identical to one from before the key
+    /// existed.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    plans: &'a [pulsus_read::compile::plan::PlanShape],
 }
 
 #[derive(Serialize)]
@@ -280,6 +287,7 @@ fn explain_json(e: &PlanExplain) -> String {
             })
             .collect(),
         plan: e.plan.as_ref(),
+        plans: &e.plans,
     };
     serde_json::to_string(&wire).unwrap_or_else(|_| "{}".to_string())
 }
@@ -1357,6 +1365,94 @@ mod tests {
         assert_eq!(json["data"]["explain"]["result_type"], "vector");
         assert_eq!(json["data"]["explain"]["exactness"], "raw-exact");
         assert_eq!(json["data"]["explain"]["stages"][0]["name"], "sample_fetch");
+    }
+
+    /// Issue #548 criterion 5, half one: **the explain surface gains
+    /// `plans` and loses nothing.**
+    ///
+    /// Two responses, both byte-exact:
+    ///
+    /// 1. no header at all — no `explain` key;
+    /// 2. the header, on a query whose plan produced no chain that reads
+    ///    (`time()` sends no statement) — an `explain` object with the
+    ///    same three keys it carried before `plans` existed.
+    ///
+    /// The second is what the `skip_serializing_if` on `plans` buys, and
+    /// it is why this test and not another one reddens when that
+    /// attribute is dropped.
+    #[tokio::test]
+    async fn an_unexplained_metrics_response_is_byte_identical() {
+        let res = query_response(QueryResult::Scalar(2.0), None, 1_000, false);
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":{"resultType":"scalar","result":[1,"2"]}}"#,
+            "a response without the header carries no explain key at all"
+        );
+
+        let mut explain = PlanExplain::new("scalar");
+        explain.push("literal", "SELECT 2", None);
+        assert!(explain.plans.is_empty(), "time() reads no selector");
+        let res = query_response(QueryResult::Scalar(2.0), Some(explain), 1_000, false);
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":{"resultType":"scalar","result":[1,"2"],"explain":{"result_type":"scalar","exactness":"raw-exact","stages":[{"name":"literal","sql":"SELECT 2","note":null}]}}}"#,
+            "an explain object with no plan is byte-identical to one from before the key existed"
+        );
+    }
+
+    /// Issue #548 criterion 5, half two: with plans present the three
+    /// existing keys keep their names, their values and their order, and
+    /// `plans` is the fourth.
+    #[tokio::test]
+    async fn the_explain_object_keeps_result_type_exactness_and_stages() {
+        let mut explain = PlanExplain::new("matrix");
+        explain.push("series_resolution", "SELECT fingerprint", None);
+        explain.push("sample_fetch", "SELECT value", Some("note".to_string()));
+        explain.push_plan(pulsus_read::compile::plan::PlanShape {
+            parts: vec![pulsus_read::compile::plan::PartShape::Engine(
+                pulsus_read::compile::plan::EnginePartShape {
+                    kind: "engine",
+                    links: vec![0],
+                },
+            )],
+            links: vec![pulsus_read::compile::plan::LinkShape {
+                i: 0,
+                part: 0,
+                stage: "Select(0)".to_string(),
+                how: "lowered",
+                fidelity: Some("wider"),
+                why: None,
+            }],
+        });
+        let res = query_response(QueryResult::Matrix(Vec::new()), Some(explain), 0, false);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let e = &json["data"]["explain"];
+        assert_eq!(e["result_type"], "matrix");
+        assert_eq!(e["exactness"], "raw-exact");
+        assert_eq!(e["stages"][0]["name"], "series_resolution");
+        assert_eq!(e["stages"][0]["sql"], "SELECT fingerprint");
+        assert_eq!(e["stages"][0]["note"], serde_json::Value::Null);
+        assert_eq!(e["stages"][1]["name"], "sample_fetch");
+        assert_eq!(e["stages"][1]["note"], "note");
+        assert_eq!(e["plans"][0]["links"][0]["stage"], "Select(0)");
+        assert_eq!(e["plans"][0]["parts"][0]["kind"], "engine");
+        // The key ORDER, which a `Value` comparison cannot see: the
+        // three existing keys open the object exactly as they did, and
+        // `plans` follows them.
+        let object = body.split_once(r#""explain":"#).expect("explain object").1;
+        assert!(
+            object.starts_with(
+                r#"{"result_type":"matrix","exactness":"raw-exact","stages":[{"name":"series_resolution""#
+            ),
+            "the three existing keys keep their order: {object}"
+        );
+        let stages_at = object.find(r#""stages":"#).expect("stages key");
+        let plans_at = object.find(r#""plans":"#).expect("plans key");
+        assert!(
+            stages_at < plans_at,
+            "`plans` is the fourth key, after `stages`: {object}"
+        );
     }
 
     #[tokio::test]
