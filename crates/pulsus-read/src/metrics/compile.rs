@@ -560,8 +560,10 @@ mod counted {
     use std::ops::{Deref, DerefMut};
 
     /// A collection whose elements can only be reached, or added, by
-    /// charging for them. `C` is `Vec<T>` for what the walk builds and
-    /// `&[T]` for what it is handed.
+    /// charging for them. `C` is `Vec<T>` throughout: the walk builds
+    /// its own collections and is HANDED one built the same way, so
+    /// there is no borrowed-slice form and nothing that could hand a
+    /// plain slice back.
     pub(crate) struct Counted<C>(C);
 
     impl<C> Counted<C> {
@@ -1576,44 +1578,82 @@ mod tests {
     /// # What this gate does NOT see
     ///
     /// Named here rather than left to be found, because a check whose
-    /// limits are unstated gets read as covering everything.
+    /// limits are unstated gets read as covering everything. The list is
+    /// what six rounds of review established, and the first item is the
+    /// limit of the technique rather than a gap in this use of it.
     ///
+    /// * **Work over a COPY taken out of a counted collection.** One
+    ///   metered pass buys an unmetered buffer:
+    ///
+    ///   ```text
+    ///   let raw = reads.iter().collect::<Vec<_>>();   // charged once, per element
+    ///   for chain in … {                              // then free, for ever
+    ///       raw.iter().find(|r| r.selector == chain.selector);
+    ///   }
+    ///   ```
+    ///
+    ///   Measured in review: both checks green and all four access rows
+    ///   at their published values. The same materialisation works for
+    ///   the flattened nodes, the buckets and the read index. **No
+    ///   per-access counter can see this**, here or anywhere — the copy
+    ///   is an ordinary value and the work over it touches nothing the
+    ///   counter owns. It is why this gate is the last one built for this
+    ///   claim rather than the sixth of a series.
     /// * **Work that touches no collection.** Nested loops over
-    ///   `0..len()` whose sums escape through `black_box` move no count —
-    ///   measured by the round-4 review. `len()` is deliberately free;
-    ///   arithmetic over indices is invisible. What makes this narrow
-    ///   rather than open is that a walk over a tree has to REACH the
-    ///   tree, and every collection holding it is counted.
-    /// * **Allocation and string cost.** Building `Vec`s and formatting
-    ///   stage names allocate; none of it is charged. A change that kept
+    ///   `0..len()` whose sums escape through `black_box` move no count.
+    ///   `len()` is deliberately free; arithmetic over indices is
+    ///   invisible.
+    /// * **Allocation and string cost.** Not charged. A change that kept
     ///   the access count and doubled the bytes would pass.
     /// * **The per-chain callees' internals** — `stage_names`,
     ///   `lower_chain`, `plan_of`, `shape`. What they are HANDED is
     ///   bounded below; what they do with it is their own business, and
-    ///   `lower_chain` and `plan_of` belong to the shared core, which
-    ///   this module does not instrument.
-    /// * **Any collection the walk adds that is not a `Counted`** — which
-    ///   is why `every_collection_the_walk_reads_back_is_counted` exists
-    ///   beside this: the two together are the claim, and neither is it
-    ///   alone. That rule's own bound is stated on it, and it is narrow.
+    ///   two of them belong to the shared core, which this module does
+    ///   not instrument.
+    /// * **The planner's own `QueryPlan`.** The walk borrows it and does
+    ///   not own it: `plan.selectors` is a plain `Vec` on someone else's
+    ///   struct, and a scan of it per node would be charged nothing. The
+    ///   walk reads its length and its root, and nothing else.
+    /// * **A collection the walk adds that is not a `Counted`** — which
+    ///   is what `every_collection_the_walk_reads_back_is_counted` is
+    ///   for, and that rule's own bound is published on it and is narrow.
     ///
+    /// **So what does this gate guarantee?** Exactly one thing: a scan
+    /// written *against the counted collections* is priced, and the three
+    /// shapes that reached production review — a pass over every node per
+    /// entry, a search of the reads per chain, and a scan of what has
+    /// been pushed so far during construction — each redden it at the
+    /// narrowest width. That is worth having and it is not a proof of
+    /// total work.
     /// # The figures
     ///
-    /// ```text
-    ///   entries   nodes   query bytes   accesses   per (node + entry)
-    ///       64      127           497      2,095               10.969
-    ///      256      511         2,189      8,431               10.992
-    ///     1024    2,047         9,125     33,775               10.998
-    ///     4096    8,191        39,845    135,151               11.000
-    /// ```
+    /// They are in [`ROWS`] below, **asserted exactly**, not written in
+    /// this comment. A table in prose beside a test cannot go wrong
+    /// loudly: changing one of these numbers here left the test green,
+    /// which is a table that looks authoritative and is not (code review
+    /// round 6). A change to the charged surface now reddens this test
+    /// and prints both numbers.
     ///
-    /// The denominator is nodes PLUS entries, which is the one the
-    /// `O(nodes + entries)` claim names; per tree node the same figures
-    /// are about 1.5 times these and are a different quantity.
+    /// The denominator in the ratio is nodes PLUS entries, which is the
+    /// one the `O(nodes + entries)` claim names; per tree node the same
+    /// figures are about 1.5 times these and are a different quantity.
     #[test]
     fn the_explain_walk_is_linear_in_the_tree() {
+        /// `(entries, nodes, query bytes, element accesses)` — what the
+        /// walk costs at four widths, as the shipped code produces it.
+        /// The counter is deterministic: one charge per accessor call,
+        /// one thread, no dependence on the allocator, so these are
+        /// equalities rather than ceilings and they reproduced on two
+        /// machines.
+        const ROWS: [(usize, usize, usize, u64); 4] = [
+            (64, 127, 497, 2_095),
+            (256, 511, 2_189, 8_431),
+            (1_024, 2_047, 9_125, 33_775),
+            (4_096, 8_191, 39_845, 135_151),
+        ];
+
         let mut rows: Vec<(usize, usize, usize, u64)> = Vec::new();
-        for terms in [64usize, 256, 1024, 4096] {
+        for terms in ROWS.map(|r| r.0) {
             let q = wide_query(terms);
             let plan = planned(&q);
             assert_eq!(plan.selectors.len(), terms, "{terms}: entries");
@@ -1668,6 +1708,13 @@ mod tests {
             );
             rows.push((terms, nodes, q.len(), work));
         }
+        assert_eq!(
+            rows,
+            ROWS.to_vec(),
+            "the walk's cost moved. Each row is (entries, nodes, query bytes, element accesses); \
+             if the charged surface changed on purpose, the new numbers go here and the reason \
+             goes in the notes."
+        );
         // Per NODE PLUS ENTRY — the same denominator the bound uses and
         // the same one the `O(nodes + entries)` claim names. Divided by
         // tree nodes alone the figures are about 1.5 times these, which
@@ -1708,39 +1755,59 @@ mod tests {
     /// reader sees in the diff rather than something discovered the day
     /// it breaks.
     ///
-    /// # What this rule does NOT catch, measured rather than supposed
+    /// # What this rule does NOT catch, measured
     ///
-    /// The round-5 review wrote eighteen shapes that pass it: rebinding,
-    /// a tuple field, a closure capture, `format!`, `match`, `&*name`, a
-    /// helper function, UFCS, `VecDeque`, `HashMap`, an array,
-    /// `Box<[T]>`, an inferred `collect()`, a type alias, a
-    /// function-built `Vec`, a tuple pattern and an `impl` method. **It
-    /// catches two of twenty.** As a detector of unmetered reads it is
-    /// weak, and no amount of widening the syntax rule would make it
-    /// strong — each round of widening has been beaten by the next shape.
+    /// Twenty shapes, each a genuine unmetered read of a plain collection
+    /// inside the walk, all twenty compiled into `chain_of` in **one**
+    /// run: **it caught 5.**
     ///
-    /// **So this is not what keeps the walk honest, and it is not what
-    /// the linearity claim rests on.** What keeps the walk honest is that
+    /// ```text
+    ///   caught      1 a plain binding read          `let v: Vec<usize> = …; v.len()`
+    ///               4 a closure capture             `let f = || v.len();`
+    ///              13 a boxed slice from a Vec      `let v: Box<[usize]> = Vec::new().into_boxed_slice();`
+    ///              19 a `ref` pattern               `let ref v = vec![0usize];`
+    ///              20 a nested function's local     `fn inner() { let v: Vec<usize> = …; v.len() }`
+    ///
+    ///   detected,   2 rebinding                     `let w = v; w.len()`
+    ///   not caught  5 `format!`                     `format!("{v:?}")`  — the use is inside a macro
+    ///               6 a match binding               `let w = match … { _ => v }; w.len()`
+    ///               7 `&*name`                      `let s: &[usize] = &*v;`
+    ///               8 a helper, by move             `helper(v)`
+    ///               9 UFCS, by move                 `Vec::into_iter(v)`
+    ///
+    ///   not even    3 a tuple field                 `let t = (Vec::new(), 0); t.0.len()`
+    ///   detected   10 `VecDeque`                   11 `HashMap`              12 an array
+    ///              14 an inferred `collect()`       15 a type alias          16 a Vec from a function
+    ///              17 a tuple pattern               18 a method on a struct
+    /// ```
+    ///
+    /// **The number is a property of the twenty shapes, not a constant.**
+    /// The round-6 review ran its own twenty and caught nine; the two
+    /// sets are different code. What both runs establish is the same
+    /// thing: as a detector of unmetered reads this rule is weak, and
+    /// widening it has been beaten by the next shape every time it was
+    /// tried.
+    ///
+    /// **So this is not what keeps the walk honest, and the linearity
+    /// claim does not rest on it.** What keeps the walk honest is that
     /// there is nothing unmetered in scope to read: the tree collections
     /// are built counted, the buckets hand out counted inners, and the
     /// walk's INPUT arrives counted, so a plain slice cannot be aliased
     /// out of a parameter. This rule is the backstop for the one case
     /// that remains — a plain collection someone writes inside the walk —
-    /// and it is worth what it catches, which is the obvious form of
-    /// that and not the ingenious ones.
+    /// and it catches the obvious form of that and not the ingenious
+    /// ones.
     ///
-    /// **What is genuinely outside every check here**, so that nobody
-    /// reads a guarantee that is not on offer:
+    /// **What is outside this rule entirely**, so that nobody reads a
+    /// guarantee that is not on offer:
     ///
-    /// * a new collection of a type this rule does not recognise —
-    ///   `HashMap`, `VecDeque`, an array, a type alias — read inside the
-    ///   walk;
+    /// * the fifteen shapes above that it does not catch;
     /// * a scan written in a helper function the walk calls, since the
     ///   rule is per function and a bare identifier is a move;
-    /// * the planner's own `QueryPlan`, which is borrowed, not owned by
-    ///   the walk: `plan.selectors` is a plain `Vec` on someone else's
-    ///   struct and a scan of it per node would be charged nothing. The
-    ///   walk reads its length and its root, and nothing else.
+    /// * the planner's own `QueryPlan`, which the walk borrows and does
+    ///   not own: `plan.selectors` is a plain `Vec` on someone else's
+    ///   struct. The walk reads its length and its root, and nothing
+    ///   else.
     ///
     /// Parsed with a syntax tree rather than matched textually, because a
     /// token rule cannot see a method call inside a macro body or a
