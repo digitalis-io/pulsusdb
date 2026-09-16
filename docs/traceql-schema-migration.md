@@ -38,7 +38,7 @@ product ships with. §8 says what that means in practice.
 | client `INSERT`s per batch of spans | 2, on two independent flush generations | 1 |
 | materialized views on the trace family | 2 | 5 |
 | query shapes with no sorted path | 4 of 9 | **1 of 9** — the metrics range query keeps its full-window scan. §3.5 prices the exact rollup that would remove it: built, measured, same answer, 16.30 B/span, not taken |
-| storage | 1047.9 B/span, 7.34 TB at 10⁹ spans/day and 7-day retention | **625.7 B/span, 4.38 TB** — **−40%** |
+| storage | 1047.9 B/span, 7.34 TB at 10⁹ spans/day and 7-day retention | **625.7 B/span, 4.38 TB** — **−40% in the worked model** (Appendix A's parameters). Two readings qualify it and both are in §5: substituting the identity columns' measured compressibility gives **−35.5%**, and the two families built and measured on corpus C1 give **−30.6%** at that corpus's `A` = 8 |
 | merge work per span | 9856 LZ4-equivalent B per merge level | **5341** — **−46%** |
 | bytes the writer sends ClickHouse | 1838 raw B/span in 2 statements | **1038 in 1** — **−44%** |
 | SQL statements a one-condition search issues | 4 … 6252 | **3 … 3127** |
@@ -102,7 +102,7 @@ proving what happened there.
  | val_num Nullable(Float64)   <- val's f64 parse, when finite       |
  | val_type LC     (migration 39, crates/pulsus-schema/src/catalog.rs:812-822)                |
  | timestamp_ns Int64          <- no codec                           |
- | trace_id FixedString(16)    <- 16 bytes, never beside a copy      |
+ | trace_id FixedString(16)    <- 16 raw bytes; 5.65 on disk, §2.1  |
  | span_id  FixedString(8)                                           |
  | duration_ns Int64           <- a second copy of the span's        |
  +------------------------------------------------------------------+
@@ -327,14 +327,23 @@ stores the pair at 13.69 B/row, and `ZSTD(1)` takes it to 12.82, a further 6.3%
 **one** id drawn uniformly from `2¹²⁸` and sorted within a run of 10⁴ — a bound on
 the incompressible case, which C1 is not, because its ids repeat.
 
-**What survives, and it is the part the design rests on:** even at the cheapest
-codec measured, the two identity columns are **62.3%** of the table
-(205,149,971 of 329,530,186 once the swap is applied to the table above), and they
-are paid `A` times per span. **The number of rows has to fall, not their width.**
-The codec change is worth 13,882,220 bytes — 4.0% of the index table, 3.3% of the
-two C1 tables together (423,339,156 bytes). The row-count change in §3 is worth
-40% of the family. Taking the codec as well is not part of this design and is not
-priced beyond this table; it is listed in §7.
+**What survives, and the scope of it.** Even at the cheapest of the seven codecs
+tried, the two identity columns are **62.3%** of the table (205,149,971 of
+329,530,186 once the swap is applied to the table above), and they are paid `A`
+times per span. The codec change is worth 13,882,220 bytes — 4.0% of the index
+table, 3.3% of the two C1 tables together (423,339,156 bytes) — against the 40% of
+the family the row-count change in §3 is worth.
+
+**Stated as measured, not as a law:** *of the seven codecs tried, on this corpus,
+in this sort order, the best narrows the pair by 6.3% and the design's row-count
+change is worth an order of magnitude more.* An earlier version of this line read
+"the number of rows has to fall, not their width", which is a claim about every
+possible encoding and is not what was run — a column-level re-encoding this
+document did not try (a dictionary over trace ids, a per-part id table, a shorter
+synthetic id) is not covered by seven codecs. §11.1 carries the one such idea the
+document has priced: a 40-bit fingerprint, which the calculator prices at 24.85
+bytes a row against 36.85. Taking any of them is not part of this design; §7 lists
+it.
 
 ### 2.2 Four of the nine query shapes have no sorted path
 
@@ -547,19 +556,38 @@ feeding `SimpleAggregateFunction` columns of an `AggregatingMergeTree`, is what
 `crates/pulsus-schema/src/catalog.rs:266-281`). And the two **together in one view** — `ARRAY JOIN` over
 `trace_spans`'s arrays plus a `GROUP BY` — was built and run for the tag catalog,
 where it produced the same rows as the two-table build. Re-run on corpus C1 with
-the index table of §2.1, ClickHouse 26.3.29.7:
+the index table of §2.1, ClickHouse 26.3.29.7 — **as a comparison of the two row
+SETS, because equal counts are not equal rows:**
 
-    SELECT count() FROM (SELECT DISTINCT scope, key, val, val_type FROM c1.attrs_old)
-      -> 2,166,747          the two-table build, through the index
+```sql
+WITH a AS (SELECT DISTINCT scope, key, val, val_type FROM c1.attrs_old),
+     b AS (SELECT DISTINCT sc AS scope, k AS key, v AS val, vt AS val_type
+           FROM c1.spans_new
+           ARRAY JOIN attr_key AS k, attr_val AS v, attr_scope AS sc, attr_type AS vt)
+SELECT (SELECT count() FROM a),
+       (SELECT count() FROM b),
+       (SELECT count() FROM (SELECT * FROM a EXCEPT SELECT * FROM b)),
+       (SELECT count() FROM (SELECT * FROM b EXCEPT SELECT * FROM a))
+```
 
-    SELECT count() FROM (SELECT DISTINCT sc, k, v, vt FROM c1.spans_new
-                         ARRAY JOIN attr_key AS k, attr_val AS v,
-                                    attr_scope AS sc, attr_type AS vt)
-      -> 2,166,747          the one-table build, off the span row's arrays
+    rows through the index          2,166,747
+    rows off the span row's arrays  2,166,747
+    in the index build, not the array build          0
+    in the array build, not the index build          0
+    SHA256 over the sorted tuples, both sides
+        8f0971e15e588e0413f979fc63947140e690bb388a8132a557915df1cab9a7cb
 
 An earlier version of this passage gave 1,094,467 for both, on a corpus that is
-not C1 and is not published. The claim the passage makes is that the two builds
-agree, and on C1 they agree exactly.
+not C1 and is not published, and a later one compared only the two counts. Equal
+counts would have been satisfied by two different sets of the same size; the two
+`EXCEPT` counts and the digest are what establish the claim.
+
+**One mechanical fact about this view, measured because it bit the build in §5.** Its
+`SELECT` lists columns in a different order from the target table's columns, and that is
+safe because a `TO` view matches **by name** — verified on 26.3.29.7 with a two-column
+target and a view listing them reversed. The same body used as `INSERT … SELECT` with no
+column list matches by **position** and fails with `Code: 48`. Any backfill names its
+columns.
 
 **What has never been run is that combination writing `SimpleAggregateFunction`
 columns**, which is what `ts_max`, `dur_max` and `dur_min` are. That is the first
@@ -724,9 +752,28 @@ uniqExactMerge(spans) … GROUP BY …` and the same query against `spans_new` w
 `uniqExact((trace_id, span_id))` produce byte-identical result sets — `sha256` of
 the TSV agrees, `3377317c4a7fdca4…` on both.
 
+**Instrument for the read comparison below**: ClickHouse 26.3.29.7,
+`use_query_condition_cache = 0`, `max_block_size = 65409`, three repetitions at each of
+`max_threads` = 1, 4 and 16, corpus C1. `read_rows` and `read_bytes` are identical at
+every setting; **memory is not, and its ordering reverses**:
+
+| `max_threads` | full scan, peak memory | rollup, peak memory | which is higher | full scan, ms | rollup, ms |
+|---|---|---|---|---|---|
+| 1 | 127,640,933 – 127,641,093 | 142,020,704 – 142,022,400 | the rollup | 416 / 474 / 475 | 98 / 104 / 154 |
+| 4 | 137,638,581 – 141,724,728 | 145,086,633 – 147,361,597 | the rollup | 144 / 146 / 160 | 75 / 81 / 85 |
+| 16 | 188,430,810 – 196,099,808 | 145,086,633 – 151,557,949 | **the full scan** | 95 / 95 / 107 | 70 / 89 / 90 |
+
+An earlier version of this section printed one memory pair with no thread setting beside
+it, which is the pair at `max_threads` = 4 and is the setting at which the rollup looks
+worst. The honest summary is that peak memory is of the same order either way and which
+is larger depends on the thread count, while the read is 5.8× fewer bytes at every
+setting.
+
 **And it is duplicate-safe, which is the property §3.4 rejected the plain rollup
-for.** One block's worth of rollup rows — the first ten minutes, 111,015 spans —
-was inserted a second time:
+for.** The rollup rows for one interval — `WHERE timestamp_ns < 1700000000000000000 +
+600000000000`, the corpus's first ten minutes, which is 111,015 of its 2,000,000 spans —
+were inserted a second time by re-running the same `INSERT … SELECT` with that predicate
+added:
 
     sum(cnt)              2,000,000  ->  2,111,015     <- counts ROWS, inflates
     uniqExactMerge(spans) 2,000,000  ->  2,000,000     <- counts DISTINCT SPANS
@@ -737,8 +784,8 @@ was inserted a second time:
 | | rollup, exact | the full scan today |
 |---|---|---|
 | rows read for the 3-hour query | 54,300 | 2,000,000 |
-| bytes read | 11,348,700 | 66,001,328 |
-| peak memory | 145,088,329 | 137,973,035 |
+| bytes read | 11,348,700 | 66,001,296 – 66,001,328 |
+| peak memory | see the table above — it depends on `max_threads` and the ordering reverses | |
 | storage added | 16.30 B/span | — |
 
 5.8× fewer bytes read, the same answer, at 16.30 B/span of extra storage — 2.6% of
@@ -795,7 +842,8 @@ The "before" SQL is copied from committed golden files under
 The "after" SQL is what the same builders would produce against the new tables.
 
 **Corpus C1, which every `[M]` figure below names.** 2,000,000 spans,
-166,667 traces of 12 spans, 8 attributes per span, three hours from
+166,667 traces (166,666 of 12 spans and one of 8 — 2,000,000 does not divide
+by 12), 8 attributes per span, three hours from
 `1700000000000000000`, two UTC day partitions. `spans_old` and `spans_new` are built by
 the **same** eight `INSERT … SELECT … FROM numbers(<lo>, 250000)` statements at
 `max_insert_threads = 1, max_threads = 1, max_block_size = 65409`; `payload` is
@@ -1045,12 +1093,12 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 **New: the membership read becomes a column of the first statement.**
 
 ```sql
+WITH arrayFirstIndex((key, scope) -> key = 'http.status_code' AND scope = 'span',
+                     attr_key, attr_scope) AS i0
 SELECT trace_id, span_id, parent_id, <byte-capped service>, <byte-capped name>,
        timestamp_ns, duration_ns, status_code, <byte-capped status_message>, kind,
        <byte-capped scope_name>, <byte-capped scope_version>,
-       arrayExists((key, scope, val_num) ->
-                   (key = 'http.status_code' AND val_num >= 500 AND scope = 'span'),
-                   attr_key, attr_scope, attr_num) AS probe0
+       (i0 != 0) AND ifNull(attr_num[i0] >= 500, 0) AS probe0
 FROM trace_spans
 PREWHERE trace_id IN (…32 ids…)
 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
@@ -1058,41 +1106,108 @@ ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 ```
 
-**The lambda body is the existing predicate string, unaltered.**
-`crates/pulsus-read/src/traces/search_plan.rs:661` already carries `probe_predicates: Vec<String>`, documented as
-"Each probe's pre-escaped **positive** predicate", built by `membership_predicate`
-(`crates/pulsus-read/src/traces/search_plan.rs:1077`) against the column names `key`, `scope`, `val`, `val_num`.
-Naming the lambda parameters after those columns makes the string reusable verbatim —
-measured on ClickHouse 26.3.29.7 for a numeric range, a string equality, a
-`match(val, …)` regex and a bare key-existence predicate, all four accepted and all four
-returning 1 on a span that carries the attribute.
+**Locate, then test — and an earlier version of this section got that wrong.** It
+rendered the probe as
+`arrayExists((key, scope, val_num) -> (key = … AND val_num >= 500 AND scope = …), …)`,
+which asks *does SOME element satisfy the predicate*. That contradicts the rule this
+document settles three paragraphs below: a span has **one** value for an attribute, the
+first in stored order, and every operation has to use that one. The two forms disagree
+on exactly the spans that repeat a key. Measured, on a fixture of eight spans:
 
-**Only the arrays the predicate names are passed**, because a column a statement does
+| the span's stored attributes | the value it HAS | `arrayExists(… = 'x')` | locate-then-test | correct |
+|---|---|---|---|---|
+| no `k` | absent | 0 | 0 | 0 |
+| `k='x'` | x | 1 | 1 | 1 |
+| `k='x'`, `k='y'` | x | 1 | 1 | 1 |
+| **`k='y'`, `k='x'`** | **y** | **1** | **0** | **0** |
+| `k='y'` | y | 0 | 0 | 0 |
+| `j='x'` only | absent | 0 | 0 | 0 |
+| **`resource.k='x'`, `span.k='y'`, unscoped `.k`** | **y** | **1** | **0** | **0** |
+| **`n='7'`, `n='5'`, filter `span.n = 5`** | **7** | **1** | **0** | **0** |
+
+Three of the eight disagree, and in each the `arrayExists` form returns a span whose
+own value does not satisfy the query — the span would then be rendered with the other
+value by `select()`. **Filtering and reading now follow one rule.**
+
+**The locate is the same expression the value read uses**, so there is one rule and one
+place it is written: `arrayFirstIndex` over `(key, scope)` for a scoped condition, and
+for an unscoped one the five-scope chain of §4's read fields, in the order span →
+resource → event → link → instrumentation.
+
+**It costs nothing on this corpus.** The two forms read the same columns over the same
+granules; five repetitions of each, zero counter spread, instrument as the table below:
+
+    arrayExists form,   PREWHERE   449,736 rows / 30,144,320 bytes / 56 marks
+    locate-then-test,   PREWHERE   449,736 rows / 30,144,320 bytes / 56 marks
+    locate-then-test,   WHERE      449,736 rows / 32,529,648 bytes / 56 marks
+
+**C1 cannot tell the two apart**, which is why the fixture above exists:
+`countIf(arrayCount(k -> k = 'http.status_code', attr_key) > 1)` over `spans_new`
+returns **0** — no span in C1 repeats a key — and both forms return the same
+1,000,000 matching spans.
+
+**The predicate string is still the one the planner rendered, and it is still
+positive.** `crates/pulsus-read/src/traces/search_plan.rs:661` carries
+`probe_predicates: Vec<String>`, documented as "Each probe's pre-escaped **positive**
+predicate", built by `membership_predicate`
+(`crates/pulsus-read/src/traces/search_plan.rs:1077`) against the column names `key`,
+`scope`, `val`, `val_num`. What changes is where the string is spent: the
+`key`/`scope` conjuncts become the locate, and the value conjunct becomes the test on
+the located element. Splitting it that way is what the planner must render — the
+predicate is no longer reusable as one opaque string, and that is a cost this change
+carries.
+
+**What the reference does here, and why we do not copy it.** Its value path returns the
+first match (`AttributeFor`, quoted below). Its **condition** path is a different
+mechanism: `createAttributeIterator`
+(`tempodb/encoding/vparquet4/block_traceql.go:2981 @ v3.0.2`) builds per-column
+predicates over the attribute rows and joins them, so a pushed-down condition matches a
+span if **any** of its attribute entries satisfies it. On a span that repeats a key
+those two disagree with each other — the same defect measured above. We resolve the
+value once and use it everywhere, which is the rule §6 states and the rule this SQL
+now implements.
+
+**Only the arrays the condition names are read**, because a column a statement does
 not read costs it nothing. Measured on the corpus below, same statement, the metrics
-form of the probe:
+form of the probe, in the earlier `arrayExists` rendering:
 
-    lambda over (key, scope, val_num)             288,001,456 bytes   144/162/147 ms
-    lambda over (key, scope, val)                 376,157,016 bytes   172/167/169 ms
-    lambda over (key, scope, val, val_num)        536,157,016 bytes   214/221/239 ms
+    arrays read: key, scope, val_num              288,001,456 bytes   144/162/147 ms
+    arrays read: key, scope, val                  376,157,016 bytes   172/167/169 ms
+    arrays read: key, scope, val, val_num         536,157,016 bytes   214/221/239 ms
+
+**The locate-then-test form reads the same set and the same bytes.** Its locate touches
+`attr_key` and `attr_scope`, and the test touches whichever value array the predicate
+names — for the metrics probe, `attr_num`. Re-measured at `max_threads = 16`, three
+repetitions: 2,000,000 rows / **288,001,456 bytes**, the same figure as the first row
+above.
 
 **The probe is POSITIVE and stays positive. Negation is not done in SQL.**
-`crates/pulsus-read/src/traces/search_eval.rs:1213-1216` evaluates a leaf as `member != *negated`, so `{ span.k != "x" }`
-is a positive `k = 'x'` probe whose result the reader inverts. Rendering the negation
-inside `arrayExists` instead changes the answer on three of five cases. Measured:
+`crates/pulsus-read/src/traces/search_eval.rs:1213-1216` evaluates a leaf as
+`member != *negated`, so `{ span.k != "x" }` is a positive `k = 'x'` probe whose result
+the reader inverts. That stays exactly as it is; only what the positive probe computes
+changes, from "some element matches" to "the resolved element matches".
 
-    span's attributes        today, and required   arrayExists(val != 'x')   NOT arrayExists(val = 'x')
-    []            (no key)            1                      0                        1
-    ['x']                             0                      0                        0
-    ['x','y']                         0                      1                        0
-    ['y']                             1                      1                        1
-    ['j' = 'x']   (other key)         1                      0                        1
+**The six negation cases, with the two the locate rule changes.** `probe0` is the
+positive column; the returned answer is `NOT probe0`:
 
-An absent key must match `!= "x"` and a span carrying both `x` and `y` must not.
-`arrayExists` over a negated element predicate gets both backwards, because it asks
-"does SOME element differ" where the question is "does NO element match".
-`arrayAll(NOT positive)` is equivalent to `NOT arrayExists(positive)` and returns the
-required column on all five; either renders the same answer, and neither belongs in the
-SQL, because the reader already holds the `negated` flag.
+    the span's stored k        it HAS   probe0 today   probe0 new   { k != "x" } today / new
+    (no k)                     absent        0             0               1    /   1
+    ['x']                      x             1             1               0    /   0
+    ['x','y']                  x             1             1               0    /   0
+    ['y','x']                  y             1             0               0    /  *1*
+    ['y']                      y             0             0               1    /   1
+    j='x' only                 absent        0             0               1    /   1
+
+Five of the six are unchanged. The one that moves is `['y','x']`: its value is `y`, so
+`k != "x"` is true, and today's answer of 0 is the same inconsistency the filter table
+above measures, seen through a negation. **It is a change of answer and it shares the
+duplicate-key ledger row.**
+
+Rendering the negation **inside** the array function instead is a third thing and is
+still refused. `arrayExists(val != 'x')` asks "does SOME element differ" where the
+question is "does the resolved element differ", and it gets the absent-key and
+two-value cases backwards. The reader already holds the `negated` flag; nothing about
+negation belongs in the SQL.
 
 **Two of the eight search builders disappear; one is retargeted, not deleted.**
 
@@ -1214,7 +1329,8 @@ Both forms were measured on 26.3.29.7:
                attrs ['link','resource','event']                          chose 'resource'
 
 **The byte cost of the batch, measured on a first-seen batch.** Corpus: 2,000,000 spans,
-166,667 traces of 12 spans, 8 attributes per span, three hours from
+166,667 traces (166,666 of 12 spans and one of 8 — 2,000,000 does not divide
+by 12), 8 attributes per span, three hours from
 `1700000000000000000`. **Both span tables are built by the same eight
 `INSERT … SELECT … FROM numbers(<lo>, 250000)` statements at
 `max_insert_threads = 1, max_threads = 1, max_block_size = 65409`, with a payload that is
@@ -1236,13 +1352,33 @@ zero counter spread. The 32 ids are the first batch phase 1 returns for
 | new, one statement, `WHERE` | 449,736 | 32,529,648 | 56 | 38/20/21/41/24 |
 | **new, one statement, `PREWHERE`** | 449,736 | **30,144,320** | 56 | 20/20/20/20/20 |
 
-Every counter above was re-taken after the index table's construction was
-published (§2.1), because the membership read's bytes depend on how that table was
-built and the earlier build was not in the document. `read_rows` and `marks` came
-back identical on all five statements; `read_bytes` moved on the one row that
-reads the index, from 48,523,078 to 48,571,546 — 0.1% — and the batch total with
-it, from 64,332,690 to 64,381,158. The five `ms` readings are this machine's and
-are given as a spread, not as a ratio; nothing below rests on them.
+**The membership row's byte count moved between two versions of this document, and
+the reason is not the one first given.** An earlier version said the index table had
+been rebuilt. It had not: the build is deterministic and reproduces to the byte
+(16,000,000 rows, 343,412,406 bytes on disk, §2.1). **The whole difference is
+`with_value`** — whether the statement projects the matched value. Measured on the
+same table, the same 32 ids, three repetitions each, zero spread:
+
+    SELECT DISTINCT trace_id, span_id                                   48,523,078 bytes
+    SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v,
+                    val_type AS t                                       48,571,546 bytes
+                                                    both 2,015,232 rows / 246 marks
+
+**Which of the two production sends is not a choice made at the call site**, and that
+is why the wrong explanation survived a round: the builder takes `with_value` as an
+argument (`crates/pulsus-read/src/traces/search_sql.rs:286`), but the caller passes
+`self.probe_values[probe_idx]`
+(`crates/pulsus-read/src/traces/search_plan.rs:888-896`), and that vector is filled at
+plan time by `projection_value`
+(`crates/pulsus-read/src/traces/search_plan.rs:2308-2352`), which sets it **true** for
+exactly four predicate classes — `Regex`, `Num`, `KeyExists`, `NumExpr` — because those
+are the ones whose matched value the response needs and cannot take from the query's own
+literal. Q1's probe is `val_num >= 500`, a `Num`, so production sends the **with-value**
+form and **48,571,546 is the figure for the statement printed above**. The batch total
+is 15,809,612 + 48,571,546 = 64,381,158.
+
+The five `ms` readings are this machine's and are given as a spread, not as a ratio;
+nothing below rests on them.
 
 **0.47×, not 2.2×.** The 2.2× reading is the warm one. Same corpus, same statements,
 instrument as above but `use_query_condition_cache = 1`, after
@@ -1436,10 +1572,11 @@ A metrics query with an attribute filter is a semi-join today
       WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
         AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
         AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
--- new
-… AND arrayExists((key, scope, val_num) ->
-                  (key = 'http.status_code' AND val_num >= 500 AND scope = 'span'),
-                  attr_key, attr_scope, attr_num)
+-- new: the same locate-then-test column as the search batch, so the metrics
+--      filter and the search filter answer a duplicated key the same way
+WITH arrayFirstIndex((key, scope) -> key = 'http.status_code' AND scope = 'span',
+                     attr_key, attr_scope) AS i0
+… AND ((i0 != 0) AND ifNull(attr_num[i0] >= 500, 0))
 ```
 
 **The 20,000,000-span pair that stood here — "3.9× more bytes … 1.7–2.3× faster
@@ -1459,8 +1596,14 @@ spread:
 | Q6b, the semi-join, today | 4,015,232 | 121,706,304 | 494 | 181 | 429/416/458 |
 | Q6b, the inline probe, new | 2,000,000 | 288,001,456 | 248 | 181 | 154/153/144 |
 
-So at this corpus size the inline form reads **2.37×** the bytes and is **2.7–3.0×
-faster**.
+So at this corpus size the inline form reads **2.37×** the bytes and finishes in
+**2.7–3.0× less wall time**. **Wall time is not CPU, and here the two disagree**: the
+same pair re-measured with `ProfileEvents['OSCPUVirtualTimeMicroseconds']` at
+`max_threads = 16`, three repetitions, gives the semi-join 943–998 ms of CPU and the
+inline form **1191–1324 ms** — the inline form spends about **1.25× more** CPU and
+returns sooner because it spreads that work over the threads while the semi-join's
+sub-select does not. §5 row 5 carries both readings. An earlier version of this
+paragraph reported the wall-time ratio under the heading "ClickHouse CPU".
 
 **Where the earlier 34,000,000 and 240,000,000 came from.** They were taken through a
 `SELECT count() FROM ( <the statement> )` wrapper. `EXPLAIN header = 1` shows what that
@@ -1505,8 +1648,8 @@ spans.
 
 | # | dimension | today | new | change | |
 |---|---|---|---|---|---|
-| 1 | storage, B/span, at `A` = 20 | 1047.9 | **625.7** | **−40.3%** | [D] |
-| 1 | storage, B/span, **measured** at `A` = 8 and `Z_p` = 15.91 on corpus C1; `sum(bytes_on_disk)` over `system.parts` after `OPTIMIZE … FINAL`, both span tables built identically, ClickHouse 26.3.29.7 | 306.6 | **212.9** | **−30.6%** | [M] |
+| 1 | storage, B/span, **the worked model at `A` = 20** — Appendix A's parameters, not a measurement. It prices the identity columns at their full width; the measured row below and the sensitivity in §7 say what happens when they compress | 1047.9 | **625.7** | **−40.3% at those parameters; −35.5% at C1's measured identity cost** | [D] |
+| 1 | storage, B/span, **measured** at `A` = 8 and `Z_p` = 15.91 on corpus C1, ClickHouse 26.3.29.7, `sum(bytes_on_disk)` over `system.parts` after `OPTIMIZE … FINAL`. **The build is published below this table**, and `trace_edges` is excluded from both sides because it is byte-identical in both (35,073,475 against 35,073,272 — the same rows through the same statement) | 306.5 | **212.8** | **−30.6%** | [M] |
 | 1 | … the payload component of each, so `Z_p` can be substituted: today 180,471,375 B (base 51,292,209 + a second copy of 129,179,166 in `service_time`), new 51,292,209 B (its two projections carry none). Payload-free: today 216.4 B/span, new 187.2 B/span | | | | [M] |
 | 1 | storage at 10⁹ spans/day, 7 days | 7.34 TB | **4.38 TB** | −2.96 TB | [D] |
 | 2 | rows read, `{}` | 4.17·10⁷ | 3.48·10⁶ | **÷12** | [D] |
@@ -1525,8 +1668,8 @@ spans.
 | 4 | SQL statements, one-condition search, `M`=20 | 4 | **3** | −25% | [D] |
 | 4 | … a search that compares an `event:`/`link:` intrinsic against another field | | **keeps its extra per-batch statement** — §4 Q1 says why the multi-valued read cannot become a column | [D] |
 | 4 | … at the candidate ceiling | 6252 | **3127** | −50% | [D] |
-| 5 | ClickHouse CPU | tracks the uncompressed bytes of the selected columns | | ÷2.5 on attribute search; ÷2.1 on a first-seen search batch; 2.7–3.0× **faster** on an attribute metrics query at 2M (26.3.29.7; `use_query_condition_cache=0`, `optimize_move_to_prewhere=1`, `max_block_size=65409`, `max_threads=auto(16)`; 3 reps, zero spread; corpus C1). The 20,000,000-span claim is withdrawn with the figures it rested on | [M] |
-| 6 | our own CPU | 66 statements, 28,384 rows decoded at `M`=1000 | 34 statements, 25,312 rows | **strictly lower** | [D] |
+| 5 | **ClickHouse CPU, measured** — `ProfileEvents['OSCPUVirtualTimeMicroseconds']` from `system.query_log`, not inferred from bytes (26.3.29.7; `use_query_condition_cache=0`, `optimize_move_to_prewhere=1`, `max_block_size=65409`, `max_threads=16`; 3 reps; corpus C1) | attribute search 62–81 ms; search batch 68–78 ms (hydration 21–25 + membership 46–53); attribute metrics query 943–998 ms | attribute search 46–63 ms; search batch 25–27 ms; attribute metrics query **1191–1324 ms** | **it does not track bytes, and one of the three goes the other way**: the batch falls ≈2.7×, the attribute search ≈1.5×, and the metrics query's CPU **rises ≈1.25×** while its wall time falls ≈3× (400–445 ms → 134–140 ms) because the inline form parallelises where the semi-join does not. An earlier version of this row asserted that CPU "tracks the uncompressed bytes" and reported the metrics figure as a CPU ratio when it was a wall-time one | [M] |
+| 6 | our own CPU | 66 statements, 28,384 rows decoded at `M`=1000 | 34 statements, 25,312 rows | **strictly fewer statements and strictly fewer decoded rows.** That is what was counted. Our process's CPU was **not** measured — no reader was run against either schema — and an earlier version of this row called the counts "strictly lower" CPU. §7 carries it | [D] |
 | 7 | disk read work | tracks the compressed bytes of the selected columns | | as row 2 and row 3 | [D] |
 | 8 | merge, LZ4-equivalent B/span/level | 9856 | **5341** | **−45.8%** | [D] |
 | 8 | write wall time, 20,000,000 spans, four takes. **Instrument, stated in full because it is weaker than every other row here:** the corpus is a 20,000,000-span build, not C1, and it is not published — §5's own 20,000,000-span readings are withdrawn elsewhere in this row set, and this one survives only as a direction; the machine carried a load average between 11 and 29 from other work; ClickHouse 26.3.29.7; no per-statement settings were recorded | 387.6 / 500.4 / 441.3 / 337.4 s | 200.1 / 272.8 / 239.7 / 304.0 s | one statement was faster in **all nine takes** at both corpus sizes, margin 1.02×–2.48×. **No ratio is claimed and none should be read off these numbers**; what nine of nine takes support is the sign | [M] |
@@ -1534,6 +1677,73 @@ spans.
 The write-time takes were taken on a machine carrying a load average between 11
 and 29 from other work. No ratio is claimed; the direction is what all nine
 agree on.
+
+**The storage build, published.** Row 1's measured pair is the two table families built
+from corpus C1 and compared. Both sides carry the same 2,000,000 spans; the old side's
+index is the `attrs_old` of §2.1; every table is `OPTIMIZE … FINAL` before it is
+measured. The new side's tables are the DDL of §3.1 verbatim. Written out so the pair
+can be rebuilt:
+
+```sql
+-- OLD family  ---------------------------------------------------------------
+CREATE TABLE c1.o_spans (<the 15 columns of §1.1>,
+  INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
+  PROJECTION service_time  (SELECT * ORDER BY (service, timestamp_ns)),
+  PROJECTION span_name_day (SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d,
+                                   name, count() GROUP BY d, name))
+ENGINE = MergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1;
+INSERT INTO c1.o_spans SELECT <those 15 columns> FROM c1.spans_old;
+
+c1.attrs_old                     -- §2.1's statements, unchanged
+CREATE TABLE c1.o_catalog (scope LowCardinality(String), key LowCardinality(String),
+  val String, val_type LowCardinality(String))
+ENGINE = ReplacingMergeTree ORDER BY (scope, key, val, val_type);
+INSERT INTO c1.o_catalog SELECT scope, key, val, val_type FROM c1.attrs_old;
+
+-- NEW family  ---------------------------------------------------------------
+CREATE TABLE c1.n_spans (<the same 15 columns>, <the five arrays>,
+  CONSTRAINT attr_arrays_aligned CHECK <the four equalities of §3.1>,
+  INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
+  PROJECTION service_time (SELECT <the 14 non-payload, non-array columns>
+                           ORDER BY (service, timestamp_ns)),
+  PROJECTION name_time    (SELECT <the same 14> ORDER BY (name, timestamp_ns)),
+  PROJECTION span_name_day (<as above>))
+ENGINE = MergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1;
+INSERT INTO c1.n_spans SELECT * FROM c1.spans_new;
+
+c1.n_attr_traces, c1.n_error, c1.n_recent, c1.n_catalog
+                                 -- the four CREATE statements of §3.1, and one
+                                 -- INSERT … SELECT per table with the SAME body as
+                                 -- that table's materialized view
+```
+
+**One thing to get right when rebuilding it by hand, measured because it bit this
+build.** The views of §3.1 select their columns in a different order from the target
+tables' column order, and that is safe **only because a `TO` view matches by name** —
+verified on 26.3.29.7 with a two-column target and a view whose `SELECT` lists them
+reversed: the values land under the right names. An `INSERT … SELECT` with no column
+list matches by **position** instead, so the same body used as a backfill fails with
+`Code: 48 … while converting source column val_num to destination column trace_id`.
+Name the columns in any backfill.
+
+**What it gave**, `sum(bytes_on_disk)` over `system.parts`, active parts only:
+
+| | old | new |
+|---|---|---|
+| span table | 260,858,017 | 248,575,334 |
+| attribute index | 343,412,406 | 160,928,751 |
+| tag catalog | 8,737,438 | 11,860,643 |
+| error table | — | 501,117 |
+| recency table | — | 3,707,783 |
+| **total, `trace_edges` excluded** | **613,007,861** | **425,573,628** |
+| **B/span** | **306.5** | **212.8** |
+| `trace_edges`, identical in both and excluded | 35,073,475 | 35,073,272 |
+
+−30.6%. The row that predicts it is the worked model's −40.3%; the gap between the two
+is the identity-column compressibility §7 carries, and this corpus's `A` = 8 against the
+model's 20.
 
 ### 5.1 Where the storage goes
 
@@ -1573,8 +1783,8 @@ from names.
 | declared OTLP type | `LowCardinality(String)` | element reads as `String` | none | **agree** |
 | numeric value | `Nullable(Float64)` | `Nullable(Float64)` | none — same width, same NULL rule, same `toFloat64OrNull` source | **agree** |
 | the comparison `val_num >= 500` | `Nullable(UInt8)` | `Nullable(UInt8)` | none | **agree** |
-| the PROBE's result, as the reader sees it | a row present or absent in the membership set | `arrayExists(…)`, printed `UInt8` | none on the row set: `arrayExists` returns 0 exactly where the column form returns NULL, and a `WHERE` treats NULL as 0. Measured for `>=`, `!=` and `=` against a NULL element, all three 0 | **agree** |
-| the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside `arrayExists` differs on an absent key and on a multi-valued key — §4 Q1's five-case table | **agree only if the negation stays out of the SQL** |
+| the PROBE's result, as the reader sees it | a row present or absent in the membership set | `(i0 != 0) AND ifNull(<test on the located element>, 0)`, printed `UInt8` | **the row set moves on one class and only on it**: a span that carries the probed key more than once, or carries it at two scopes under an unscoped condition. There the membership set answers "some entry matched" and the column answers "the entry this span resolves to matched". Measured on the eight-span fixture in §4 Q1: three of eight differ. Everywhere else they agree, and `ifNull(…, 0)` keeps a NULL element reading as 0 exactly where the membership form returned no row | **differs, deliberately — the duplicate-key ledger row covers it** |
+| the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside the array function differs on an absent key and on a multi-valued key — §4 Q1's six-case table. The inversion itself is unchanged; the positive column it inverts is the locate-then-test one, so `['y','x']` under `!= "x"` moves from 0 to 1 | **agree on five of six; the sixth is the duplicate-key change** |
 | the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | **locate on `(key, scope)` only, then read that element**; scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7. On `['bad','5']`: today's numeric read returns 5, the new form returns NULL, because the FIRST match is not numeric | **CHANGED, deliberately.** The rule is first-in-stored-order, derived in §4 Q1 from what the alternatives cost a user and then checked against the reference, which does the same — `tempodb/encoding/vparquet4/block_traceql.go:128-151` and `:249-280 @ v3.0.2`, quoted there. Today's has no contract. Needs a ledger row and a differential test |
 | `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`crates/pulsus-write/src/protocols/otlp_traces.rs:558-607` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
 | `timestamp_ns`, `duration_ns` | `Int64` nanoseconds | `Int64` nanoseconds | none | **agree** |
@@ -1603,6 +1813,8 @@ storage. If that answer should change, it should change on its own.
 | text that looks numeric but was sent as a string | `build.id = "500"` | `val_num` is set from the text regardless of the declared type | same function, same column | **identical** |
 | an event or link intrinsic | `event:name`, `link:spanID` | its own scope, one row per span | same tuple, trace grain | as the first row |
 | the tag dropdown's rows | any key ever ingested | every tuple ever seen | tuples seen in the retention window | **changed, deliberately** — a value last seen 400 days ago stops appearing. That is what every other endpoint already does |
+| **a span that carries the probed key twice** | `span.n = "7"` then `span.n = "5"`, filter `{ span.n = 5 }` | the membership row for the second entry exists, so the span **matches** — and `select(span.n)` then renders whichever entry `any()` reached | the span resolves to `7`, so it does **not** match, and `select(span.n)` renders `7` | **changed, deliberately.** Today's two answers contradict each other; the new pair agrees. §4 Q1 measures three such spans out of eight. One ledger row covers filter, negation and read |
+| **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3656` pins today's union behaviour and moves with it |
 
 **Where the two candidate generators first disagree**, as a case rather than a
 description:
@@ -1750,9 +1962,26 @@ source at 1 row and moved the view target from 2 rows to 4. A retry after a view
 does re-run the views even where the source block deduplicates — and it writes view rows
 a second time, which is what §3.4's collapse rules absorb.
 
-**The remedy is not in this document.** It is a decision about the write path: a repair
-pass over spans whose derived rows are absent, `materialized_views_ignore_errors` plus an
-explicit repair, view bodies that cannot throw, or accepting and documenting it.
+**The decision has been taken: the behaviour is accepted as it is, and written down
+here. No machinery is built for it** — no insert-setting change, no replay path in the
+writer, no rebuild-on-demand, no repair pass. The reason given is that it is reached
+when a limit is hit or a disk fills, and it has not been reached.
+
+**The accepted contract, in the words a reader needs.**
+
+| | |
+|---|---|
+| what the caller is told | the insert **fails**: `HTTP 500`, `Code: 395 … while pushing to view`, on every one of the 300 trials |
+| what the caller is **not** told | which targets survived |
+| what is guaranteed | the throwing view's own target holds nothing for that block — 300 of 300 |
+| what is not guaranteed | anything else. The source rows were present in 297 of 300 and absent in 3. The three healthy sibling views committed 28, 25 and 32 times out of 300, and all three together 7 times against about 0.25 if they were independent, so they are not independent and the coupling is not explained |
+| what a retry does | it re-runs the views even where the source block deduplicates, so derived rows can be written a second time. §3.4's collapse rules are what absorb that, and they are the reason every derived table in §3.1 is a `ReplacingMergeTree` or an `AggregatingMergeTree` keyed so a repeat is idempotent |
+| what a reader sees meanwhile | a span that is fetchable by id but missing from one derived table answers some query shapes and not others. §8.1 splits which |
+
+**So the failure is visible to the writer and invisible to the reader**, and that is the
+part to carry forward: a client that receives the `500` and retries gets a consistent
+database; a client that receives the `500` and gives up leaves one block's derived rows
+partly written, with no record of which.
 
 ---
 
@@ -1785,7 +2014,13 @@ What remains unmeasured:
 | **the corpus behind the write wall-time row** (§5 row 8) | it is a 20,000,000-span build that is not published and not C1, taken on a machine carrying other work. It supports a direction and no ratio, and it is the only row in §5 whose corpus cannot be rebuilt from this document |
 | **the corpus behind the earlier catalog row count** | §3.1's "1,094,467 rows either way" came from a corpus that is not C1 and is not published. The claim was re-run on C1 (2,166,747 both ways) and it is the re-run that is stated; the earlier figure is not reproducible |
 | **whether the reference behaves the way its source reads** | §4 Q1 now quotes the two functions at the pinned tag rather than paraphrasing them, but nothing here was observed on a running instance of it. A conformance suite is where that belongs, not a design record |
-| **the exact rollup at another scale** (§3.5) | it was built and measured on C1: 16.30 B/span, 98.7% of it the distinct-span state, the same answer as the full scan, duplicate-safe. The state holds one entry per distinct span, so it should scale with `N` and not with the grouping key — that last step is an argument, and it was not run at a second corpus size |
+| **the exact rollup at another scale** (§3.5) | it was built and measured on C1: 16.30 B/span, 98.7% of it the distinct-span state, the same answer as the full scan, duplicate-safe. The state holds one entry per distinct span, so it should scale with `N` and not with the grouping key — that last step is an argument, and it was not run at a second corpus size. C1's 54,300 groups are also not Appendix A's `n_grp` = 3·10⁴ per day |
+| **our own CPU** (§5 row 6) | the row counts statements and decoded rows, both strictly lower. **No reader was run against either schema**, so the CPU claim those counts are a proxy for is unmeasured on both sides. The database's own CPU *is* measured, in row 5, and it does not track bytes — which is the reason not to assume the reader's does either |
+| **the rollup's peak memory beyond three thread settings** | §3.5 measures `max_threads` 1, 4 and 16 on one idle machine, and the ordering between the rollup and the full scan reverses inside that range. Nothing was measured under concurrency, on another machine, or at another `max_block_size`, and no rule is offered for where the crossover sits |
+| **that the published DDL is the DDL the product would create** | §5's two families were built by typing the `CREATE TABLE` statements of §1.1 and §3.1 into a container, not by running the repository's own initialiser. A difference between what this document prints and what the migration catalogue renders would not show up in that measurement — §8's statement sequence is what checks it, and it was run separately |
+| **the with-projection reading in §2.4** | it is a copy of C1's span table with `service_time` added by hand, because the published corpus script creates no projections. It matches the shipped shape in the one respect the statement depends on, and it was not produced by the product's own path |
+| **the locate-then-test probe for the other three predicate classes** | §4 Q1 measures bytes for one shape — a numeric range — and checks the answers for a string equality, a numeric equality and an unscoped condition on an eight-span fixture. A regex probe and a bare key-existence probe are rendered the same way and were not measured at all |
+| **the changed answers at corpus scale** | no span in C1 repeats a key (`countIf(arrayCount(k -> k = 'http.status_code', attr_key) > 1)` returns 0), and no C1 span carries one key at two scopes. The three answer changes §6.1 records are therefore measured on an eight-span fixture and on nothing larger |
 
 ---
 
@@ -2232,6 +2467,8 @@ and the reading that refutes it.
 | **P9** | trace-by-id, the service graph and a bare-column metrics query are **identical** on every counter | `read_rows`, `SelectedMarks`, `OSCPUVirtualTimeMicroseconds`, `NetworkSendBytes` on both schemas | any differs by more than the run-to-run spread |
 | **P10** | statements per search are `2 + (1+P)·⌈C/32⌉` today and `2 + ⌈C/32⌉` after | count `QueryFinish` rows in `system.query_log` for one request | the count is not 4 for a one-batch, one-condition search today, or not 3 after |
 | **P11** | **every table in §3.4 gives the same answer when a span row is written twice** | insert one block; record the answer to each of the nine queries in §4; insert the byte-identical block again; record again | any of the nine answers differs. That would mean a table in §3.4's safe column is not safe, and it is the same defect §3.5 rejected the rollup for |
+
+| **P12** | **the resolved-value rule holds on every read path**: for a span that carries one key twice, and for a span that carries one key at two scopes, the filter, the negation, the scalar read and the grouping key all answer from the SAME element — the first in stored order, and the first scope in the precedence span → resource → event → link → instrumentation | the eight-span fixture of §4 Q1, ingested through our own writer rather than written as literals, then four requests per case: `{ span.n = 5 }`, `{ span.n != 5 }`, a `select(span.n)` pipe and a `by(span.n)` pipe; and the same four unscoped against a span carrying `resource.k` and `span.k` | any of the four disagrees with the others on the same span. **This is the reading the SQL correction in §4 Q1 exists for, and it is the one C1 cannot give**: no span in C1 repeats a key, so the corpus answers both forms identically and only a fixture separates them. Not yet run through the writer; run as SQL over a hand-built table, where three of the eight spans separate the two forms |
 
 **Reading any of these against the DDL of §3.1 needs a current timestamp.** Every table
 in §3.1 carries `TTL … + INTERVAL <retention> DAY DELETE` with
@@ -2760,16 +2997,35 @@ one index row: today 39.37 | new 36.85 | new with a 40-bit fingerprint 24.85
 
 Every claim this document makes about what the code does today names a file and a
 line range. **This appendix quotes those lines**, so a reading can be checked
-against the code without leaving the document. 97 distinct ranges over 26 files.
+against the code without leaving the document.
+
+**Completeness, stated exactly.** The body carries **108** citations that name a line
+range, over 33 files, and all 108 are quoted below. It also carries **9** citations that
+name a file with no line range — they point at a whole builder or a whole golden file
+rather than at a reading — and those are **not** quoted here:
+`crates/pulsus-read/src/traces/graph_sql.rs`,
+`crates/pulsus-read/src/traces/metrics_sql.rs`,
+`crates/pulsus-read/src/traces/search_sql.rs`,
+`crates/pulsus-read/src/traces/sql.rs`,
+`crates/pulsus-read/src/traces/tags_sql.rs`,
+`crates/pulsus-read/tests/golden/traces_graph/single_node.sql`,
+`crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql`,
+`crates/pulsus-schema/src/controller.rs` and `docs/schemas.md`.
+An earlier version of this appendix said 97 ranges and omitted 8 — five golden `.sql`
+files and three document lines — because the script that built it matched only `.rs`,
+`.toml` and `.yml`. The count above was taken with a pattern that matches every
+extension the body cites.
 
 **Pinned at `8f3348e8`** — the tip of `main` when this appendix was written. The
 line numbers are that revision's and will drift; the quoted bytes are what the
 reading rests on.
 
-**Checked, not assumed:** every one of the 97 ranges was compared byte for byte
-between `86081ef1` — the commit this branch is cut from, and the revision the
-readings were taken at — and `8f3348e8`. **All 97 are identical**, so no reading in
-this document has gone stale under it. A range that had moved would be marked here.
+**Checked, not assumed:** every range was compared byte for byte between `86081ef1` —
+the commit this branch is cut from, and the revision the readings were taken at — and
+`8f3348e8`. **Every code range is identical**, so no reading in this document has gone
+stale under it. The two `docs/schemas.md` lines are the exception and are marked where
+they appear: they are the citations round one corrected, and they differ between the two
+revisions because the file moved under them.
 
 **What is quoted.** A range of 25 lines or fewer is quoted in full. A longer one is
 quoted with its comments and blank lines removed and the first 30 remaining lines
@@ -2785,7 +3041,7 @@ repository-relative.
 
 **`:567-572`**
 
-```toml
+```yaml
   567        - name: Start ClickHouse 26.3
   568          run: |
   569            docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
@@ -3559,6 +3815,20 @@ repository-relative.
   103  }
 ```
 
+### `docs/schemas.md`
+
+**`:720-720`**  — this is one of the two citations round one corrected; the branch base's line 720 holds different text, which is what made the correction necessary
+
+```markdown
+  720  | `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
+```
+
+**`:897-897`**  — the second corrected citation; same reason
+
+```markdown
+  897  **Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
+```
+
 ### `crates/pulsus-config/src/model.rs`
 
 **`:514-514`**
@@ -3954,6 +4224,33 @@ repository-relative.
    12  //! because `span_id` is trace-local).
 ```
 
+### `crates/pulsus-read/tests/golden/traces_search/existence_absent.sql`
+
+**`:5-10`**
+
+```sql
+    5  SELECT trace_id, max(timestamp_ns) AS bound_ts
+    6  FROM trace_spans
+    7  WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+    8  GROUP BY trace_id
+    9  ORDER BY bound_ts DESC, trace_id ASC
+   10  LIMIT 100001
+```
+
+### `crates/pulsus-read/tests/golden/traces_search/worked_example.sql`
+
+**`:5-11`**
+
+```sql
+    5  SELECT trace_id, max(timestamp_ns) AS bound_ts
+    6  FROM trace_spans
+    7  PREWHERE service = 'checkout'
+    8  WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+    9  GROUP BY trace_id
+   10  ORDER BY bound_ts DESC, trace_id ASC
+   11  LIMIT 100001
+```
+
 ### `crates/pulsus-read/src/traces/search_sql.rs`
 
 **`:184-184`**
@@ -4089,10 +4386,59 @@ repository-relative.
   661      pub(crate) probe_predicates: Vec<String>,
 ```
 
+**`:888-896`**
+
+```rust
+  888      pub fn membership_sql_for(&self, probe_idx: usize, trace_ids: &[[u8; 16]]) -> String {
+  889          search_sql::membership_sql(
+  890              &self.attrs_table,
+  891              &self.probe_predicates[probe_idx],
+  892              trace_ids,
+  893              self.window,
+  894              self.probe_values[probe_idx],
+  895          )
+  896      }
+```
+
 **`:1077-1077`**
 
 ```rust
  1077  fn membership_predicate(probe: &AttrProbe) -> Result<String, PlanError> {
+```
+
+**`:2308-2352`**  (45 lines in the range; comments and blanks elided, 30 shown)
+
+```rust
+ 2308  fn projection_value(
+ 2309      leaf: &PlannedLeafEval,
+ 2310      probes: &[AttrProbe],
+ 2311      probe_values: &mut [bool],
+ 2312  ) -> Option<ProjectionValue> {
+ 2313      match leaf {
+ 2314          PlannedLeafEval::Physical(p) => match p {
+ 2315              PhysicalEval::Name { .. } => Some(ProjectionValue::Name),
+ 2316              PhysicalEval::Service { .. } => Some(ProjectionValue::Service),
+ 2317              PhysicalEval::Status { .. } => Some(ProjectionValue::Status),
+ 2318              PhysicalEval::Kind { .. } => Some(ProjectionValue::Kind),
+ 2319              PhysicalEval::StatusMessage { .. } => Some(ProjectionValue::StatusMessage),
+ 2320              PhysicalEval::ParentIdHex { .. } => Some(ProjectionValue::ParentIdHex),
+ 2321              PhysicalEval::InstrumentationName { .. } => Some(ProjectionValue::ScopeName),
+ 2322              PhysicalEval::InstrumentationVersion { .. } => Some(ProjectionValue::ScopeVersion),
+ 2326              PhysicalEval::Duration { .. } | PhysicalEval::SpanIdHex { .. } => None,
+ 2327          },
+ 2330          PlannedLeafEval::Attr { negated: true, .. } => None,
+ 2331          PlannedLeafEval::Attr {
+ 2332              probe_idx,
+ 2333              negated: false,
+ 2334          } => match &probes[*probe_idx].pred {
+ 2337              ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral {
+ 2338                  text: v.clone(),
+ 2339                  literal_type: StoredType::String,
+ 2340              }),
+ 2341              ValuePred::BoolEq(b) => Some(ProjectionValue::ProbeLiteral {
+ 2342                  text: b.to_string(),
+ 2343                  literal_type: StoredType::Bool,
+ 2344              }),
 ```
 
 **`:3072-3092`**
@@ -4130,6 +4476,55 @@ repository-relative.
  1214              let member =
  1215                  env.attrs.membership[*probe_idx].contains(&(env.ctx.trace_id, span.span_id));
  1216              member != *negated
+```
+
+**`:3656-3656`**
+
+```rust
+ 3656      fn dual_scope_membership_satisfies_an_unscoped_negation_correctly() {
+```
+
+### `crates/pulsus-read/tests/golden/traces_search/val_num_range.sql`
+
+**`:5-12`**
+
+```sql
+    5  SELECT trace_id, max(timestamp_ns) AS bound_ts
+    6  FROM trace_attrs_idx
+    7  WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+    8    AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+    9    AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+   10  GROUP BY trace_id
+   11  ORDER BY bound_ts DESC, trace_id ASC
+   12  LIMIT 100001
+```
+
+### `crates/pulsus-read/tests/golden/traces_search/status_only.sql`
+
+**`:5-11`**
+
+```sql
+    5  SELECT trace_id, max(timestamp_ns) AS bound_ts
+    6  FROM trace_spans
+    7  WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+    8    AND (status_code = 2)
+    9  GROUP BY trace_id
+   10  ORDER BY bound_ts DESC, trace_id ASC
+   11  LIMIT 100001
+```
+
+### `crates/pulsus-read/tests/golden/traces_metrics/rate_by_service.sql`
+
+**`:5-11`**
+
+```sql
+    5  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, service AS g0,
+    6         uniqExact(trace_id, span_id) AS n
+    7  FROM trace_spans
+    8  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    9    AND duration_ns > 1000000000
+   10  GROUP BY t, g0
+   11  ORDER BY t ASC, g0
 ```
 
 ### `crates/pulsus-read/src/traces/compile.rs`
@@ -4210,6 +4605,14 @@ repository-relative.
 
 ```rust
   443      pub custom_values: Vec<f64>,
+```
+
+### `docs/architecture.md`
+
+**`:96-96`**
+
+```markdown
+   96  All DDL is owned by `pulsus-schema` as templated SQL (parameters: database, cluster clause, engine family, storage policy). Migrations are idempotent, and append-only from the first tagged release onward — in-place amendment of an already-listed migration was permitted only pre-release (the trace-index scope amendment, issue #54, was the last such window; see schemas.md §6); a `schema_migrations` bookkeeping table records applied statements. When `PULSUS_CLUSTER` is set, `MergeTree` families swap to `ReplicatedMergeTree` equivalents and `*_dist` Distributed tables are created. Raw sample/span tables partition **daily** (short TTL, whole-part drops); series/index/tier tables partition **monthly**.
 ```
 
 ### `crates/pulsus-write/tests/trace_ingest_roundtrip.rs`
