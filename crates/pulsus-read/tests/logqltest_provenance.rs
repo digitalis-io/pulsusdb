@@ -285,8 +285,16 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // label_replace: ` prefix and quotes no reference-verbatim text,
         // and the WRAPPED-form reporting (#276) is on the other branch,
         // untouched.
+        // Issue #507 (W2) takes TWO out of `exec.rs` and adds none:
+        // 14 -> 12. Both were the same refusal — a range metric plan
+        // reaching the SQL-aggregated path — one in the reader and its
+        // deliberate twin in EXPLAIN, each arguing the state was
+        // structurally unreachable. The routing relaxation makes the
+        // state reachable and both arms now serve it. #240's sweep
+        // numbers stand: neither carried a regex or reference-verbatim
+        // text.
         ("plan.rs", 17),
-        ("exec.rs", 14),
+        ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
         ("post_agg.rs", 5),
@@ -1988,16 +1996,31 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// Issue #294 added `t6_errors_edges.test`'s raw-byte `duration` /
 /// `duration_seconds` failure rows, captured 2026-08-26 on the same
 /// pinned digest under that file's `captured` default.
-const CAPTURED: usize = 1_513;
+/// Issue #507 moved the `b23_json_raw_read.test` rows whose line is not a
+/// JSON text off that file's `captured` default (they now hold our answer,
+/// with the reference's captured answer in the comment above each), and
+/// added `b27_logfmt_token_scan.test` and `b28_reserved_names.test` under
+/// their files' `captured` defaults: the logfmt rows were captured on the
+/// pinned digest with the shared config, the reserved-name rows on the same
+/// digest with `ci/logql/config-463.yaml`, both at the query text committed
+/// in the file.
+const CAPTURED: usize = 1_665;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
 /// boundary fix added the domain-edge rows (each off-axis row with its
 /// on-axis control), same file default.
-const DERIVED: usize = 31;
+const DERIVED: usize = 32;
 /// Issue #389's residual rows — the mid-line-malformed class, and its
-/// bound where both sides answer the empty string — all name
-/// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
+/// bound where both sides answered the empty string — named
+/// `json-nonvalidating-scan-residual` (issue #507 moved the bound row to
+/// `json-targeted-line-that-does-not-parse`). Issue #507's other
+/// `b23_json_raw_read.test` rows name `json-text-is-one-value` and
+/// `json-targeted-line-that-does-not-parse`, and its
+/// `b27_logfmt_token_scan.test` rows where the reference reads a label from
+/// inside a quoted value or replaces a value holding U+FFFD name
+/// `logfmt-quoted-value-ends-its-token` and
+/// `logfmt-replacement-character-value`. Issue #397's wrapped-variant rows
 /// on the reference's surviving-error surface name
 /// `variants-surviving-error-status`. Issue #393's rows where several
 /// logfmt extraction identifiers share a source key name
@@ -2006,13 +2029,14 @@ const DERIVED: usize = 31;
 /// file's `ported(...)` default onto `sort-tie-order`: their expected
 /// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
 /// ported reference order — the reference specifies none.
-const DIVERGENCE: usize = 30;
+const DIVERGENCE: usize = 90;
 const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
 /// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
-/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`.
-const TOTAL: usize = 1_604;
+/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`, and issue #507
+/// by `b27_logfmt_token_scan.test` and `b28_reserved_names.test`.
+const TOTAL: usize = 1_817;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------
@@ -2029,11 +2053,16 @@ const TOTAL: usize = 1_604;
 /// their own `mod tests` (one surviving pre-#286 expectation plus one
 /// `match(body, '(')` fixture proving `MetricShape`/`source_shape` refuse a
 /// foreign column pair).
+///
+/// Issue #507: `predicate.rs` gains the extracted-field group key read's
+/// spelling guards (8 -> 15), and `sql.rs` loses the unwrapped statement's
+/// two value-guard renderings and their byte-exact test (6 -> 2), so its
+/// production code renders no `match(` again.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
-    ("pulsus-read/src/logql/plan.rs", 2),
-    ("pulsus-read/src/logql/predicate.rs", 8),
+    ("pulsus-read/src/logql/plan.rs", 1),
+    ("pulsus-read/src/logql/predicate.rs", 15),
     ("pulsus-read/src/logql/sql.rs", 2),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     ("pulsus-read/src/metrics/series_where.rs", 10),
@@ -2051,7 +2080,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 60;
+const MATCH_RENDER_TOTAL: usize = 66;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2309,7 +2338,7 @@ fn check_g_match_render_inventory() {
 /// mint added to an existing `impl` block, which is exactly where a future
 /// contributor would reach first (issue #286 review round 1).
 const PREDICATE_ITEMS: &[&str] = &[
-    "use pulsus_logql::{LineFilter, LineFilterOp}",
+    "use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage}",
     "use super::escape::ch_like_contains",
     "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
     "use super::pipeline::PipelineError",
@@ -2335,9 +2364,97 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum MetadataTerm",
+    "pub enum MetadataTerm :: Project,",
+    "pub enum MetadataTerm :: Group,",
+    "const METADATA_COLUMN: &str = _",
+    "impl MetadataTerm",
+    "impl MetadataTerm :: pub fn as_sql(self) -> &'static str",
+    "fn metadata_non_empty_guard() -> CheckedFragment",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ParsedFilterRefusal",
+    "pub enum ParsedFilterRefusal :: OperatorNotServed,",
+    "pub enum ParsedFilterRefusal :: AmbiguousName,",
+    "pub enum ParsedFilterRefusal :: NoKeyExpression,",
+    "pub enum ParsedFilterRefusal :: ThresholdNotFinite,",
+    "pub enum ParsedFilterRefusal :: NameNotRenderable,",
+    "pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool",
+    "fn name_is_renderable(name: &str) -> bool",
+    "fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String>",
+    "pub fn parsed_string_filter(name: &str, op: MatchOp, value: &str, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
+    "pub fn parsed_numeric_filter(name: &str, op: CompareOp, threshold: f64, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum BucketGridRefusal",
+    "pub enum BucketGridRefusal :: StepNotPositive,",
+    "pub enum BucketGridRefusal :: AnchorAboveScanStart,",
+    "pub enum BucketGridRefusal :: WouldOverflow,",
+    "pub fn bucket_expr(bucket_col: &'static str, lo_ns: i64, step_ns: i64, scan_start_ns: i64, scan_end_ns: i64) -> Result<CheckedFragment, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
+    "const KEY_TRIM_CLASS: &str = r_",
+    "const JSON_WS: &str = r_",
+    "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",
+    "const MAX_JSON_NESTING: u32 = 127",
+    "const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ReaderColumns",
+    "pub enum ReaderColumns :: Unwrap,",
+    "pub enum ReaderColumns :: Key(usize),",
+    "impl ReaderColumns",
+    "impl ReaderColumns :: fn prefix(self) -> String",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum KeyReaderRefusal",
+    "pub enum KeyReaderRefusal :: NameNotRenderable,",
+    "pub enum KeyReaderRefusal :: PatternNotCompilable,",
+    "fn key_regex(pattern: &str) -> Result<String, KeyReaderRefusal>",
+    "fn parts_joined(name: &str) -> bool",
+    "fn only_underscores(name: &str) -> bool",
+    "fn parts_with_sep(parts: &[&str]) -> String",
+    "fn spelled_pattern(name: &str) -> String",
+    "fn prefix_parent_pattern(name: &str) -> String",
+    "fn spelled_otherwise_pattern(name: &str) -> String",
+    "fn unwrap_name_escaped(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal>",
+    "fn unwrap_transparent_parent() -> Result<String, KeyReaderRefusal>",
+    "pub fn unwrap_name_ambiguity(name: &str) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn json_depth_bound() -> CheckedFragment",
+    "pub fn json_flatten_key_budget_bound() -> CheckedFragment",
+    "pub fn unwrap_name_absence(columns: ReaderColumns, name: &str, form: super::sql::UnwrapForm) -> Result<CheckedFragment, KeyReaderRefusal>",
+    "pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment",
+    "pub fn metadata_holds_name(name: &str) -> CheckedFragment",
+    "pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment",
+    "pub const MAX_METADATA_FRAGMENT_BYTES: usize = 2 * 1024 * 1024",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub struct MetadataNameClasses<'a>",
+    "pub struct MetadataNameClasses<'a> :: pub selected: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub stream_label: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub stream_label_true: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub unsuffixed: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub direct: &'a [u64],",
+    "pub struct MetadataNameClasses<'a> :: pub base_name: Option<&'a str>,",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ComplementClass",
+    "pub enum ComplementClass :: StreamLabel,",
+    "pub enum ComplementClass :: Unsuffixed,",
+    "pub enum ComplementClass :: Direct,",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum MetadataFilterRefusal",
+    "pub enum MetadataFilterRefusal :: OperatorNotServed,",
+    "pub enum MetadataFilterRefusal :: ReservedName,",
+    "pub enum MetadataFilterRefusal :: NameNotRenderable,",
+    "pub enum MetadataFilterRefusal :: FragmentTooLarge,",
+    "pub enum MetadataFilterRefusal :: ClassesDoNotPartition,",
+    "pub fn metadata_leaf_is_servable(name: &str, op: MatchOp) -> Result<(), MetadataFilterRefusal>",
+    "fn class_expression(class: ComplementClass, name: &str, cmp: &str, value: &str, base_name: Option<&str>) -> Option<String>",
+    "fn fingerprint_test(fps: &[u64], negated: bool) -> String",
+    "pub fn metadata_string_filter(name: &str, op: MatchOp, value: &str, classes: MetadataNameClasses<'_>, budget_remaining: usize) -> Result<(CheckedFragment, Option<ComplementClass>), MetadataFilterRefusal>",
+    "fn class_list<'a>(classes: &MetadataNameClasses<'a>, which: ComplementClass) -> &'a [u64]",
+    "fn render_encoding(name: &str, cmp: &str, value: &str, classes: &MetadataNameClasses<'_>, complement: Option<ComplementClass>, a_all: bool) -> String",
+    "pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
+    "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
+    "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use super::*",
@@ -2366,6 +2483,46 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle() :: const SHAPED: &[&str] = &[ _, _, _, _, _, _, _, _, _, _, _, ]",
     "mod tests :: #[test]",
     "mod tests :: fn a_contains_line_filter_renders_an_escaped_like_pattern()",
+    "mod tests :: pub(crate) struct Witness",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) form: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) parser: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) arg: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) name: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) value: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) body: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) keeps: bool,",
+    "mod tests :: pub(crate) fn witnesses() -> Vec<Witness>",
+    "mod tests :: pub(crate) fn witness_query(w: &Witness) -> String",
+    "mod tests :: #[test]",
+    "mod tests :: fn every_witness_row_states_the_answer_the_pipeline_gives()",
+    "mod tests :: fn json_parser() -> ParserStage",
+    "mod tests :: fn logfmt_parser() -> ParserStage",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_parsed_name_filter_renders_the_specified_fragment()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_numeric_threshold_renders_as_a_float_literal()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_parsed_name_filter_refuses_with_the_stated_reason()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_metadata_column_is_named_in_one_place()",
+    "mod tests :: fn fps(n: usize) -> Vec<u64>",
+    "mod tests :: fn classes<'a>(selected: &'a [u64], stream_label: &'a [u64], stream_label_true: &'a [u64], unsuffixed: &'a [u64], direct: &'a [u64], base_name: Option<&'a str>) -> MetadataNameClasses<'a>",
+    "mod tests :: const TRACE_ID: &str = _",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_collapsed_metadata_fragments_are_87_and_1_bytes()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_three_classes_partition_the_selected_fingerprints()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_encoding_is_the_shortest_admissible_render()",
+    "mod tests :: fn the_encoding_is_the_shortest_admissible_render() :: type Case = (&'static str, &'static [usize], &'static [usize], &'static [usize], &'static [usize], Option<ComplementClass>)",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_complement_excludes_every_other_class_not_only_the_rendered_arms()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_bare_metadata_fragment_matches_the_design_record()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_render_past_the_budget_is_refused_rather_than_truncated()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_metadata_cell_refuses_what_it_says_it_refuses()",
 ];
 
 /// The number of MINT-shaped entries: an `fn` whose OWN signature (the last
@@ -2375,11 +2532,28 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// Judging the own segment rather than the qualified string matters:
 /// `impl CheckedFragment :: pub fn as_sql(&self) -> &str` must NOT count (it
 /// is the unwrap point, not a mint), and `-> Self` inside the impl must.
-const MINT_COUNT: usize = 7;
+/// **11 at issue #507**: `bucket_expr`, `metadata_non_empty_guard`,
+/// `parsed_string_filter` and `parsed_numeric_filter` join the seven, each
+/// a function outside an `impl` whose signature names [`CheckedFragment`]
+/// and can therefore produce one. `metadata_non_empty_guard` is private
+/// and still counts: the count is over what can MINT, not over what is
+/// reachable. **18 at issue #507's group key read**: `unwrap_name_ambiguity`,
+/// `json_depth_bound`, `json_flatten_key_budget_bound`, `unwrap_name_absence`,
+/// `unwrap_label_integer_text`, `metadata_holds_name` and
+/// `metadata_names_projection` join them. **21 at issue #544**:
+/// `metadata_string_filter`, which renders the structured-metadata label
+/// filter, and the two combiners `metadata_filter_and` and
+/// `metadata_filter_or`, which join one stage's leaves — a fragment can
+/// only be minted in this module, so an `and`/`or` tree has to be
+/// combined here rather than at the caller.
+const MINT_COUNT: usize = 21;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
     "#[derive(Debug, Clone, PartialEq, Eq)]",
+    // Issue #507: `BucketGridRefusal` is a fieldless enum of three
+    // reasons, so it is `Copy` where the three sealed newtypes are not.
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "#[cfg(test)]",
     "#[test]",
 ];
@@ -2389,6 +2563,13 @@ const PREDICATE_IMPLS: &[&str] = &[
     "impl CheckedFragment",
     "impl CheckedLiteral",
     "impl MonthLiteral",
+    // Issue #507 (W3): `MetadataTerm` is not a sealed newtype — it carries
+    // no text at all. Its `impl` renders the column name from the one
+    // private constant that holds it.
+    "impl MetadataTerm",
+    // Issue #507: `ReaderColumns` carries no text either — it names which
+    // reader columns (`uw_` or `l<i>_`) a key-route fragment reads.
+    "impl ReaderColumns",
 ];
 
 const NEWTYPES: &[&str] = &["CheckedFragment", "CheckedLiteral", "MonthLiteral"];

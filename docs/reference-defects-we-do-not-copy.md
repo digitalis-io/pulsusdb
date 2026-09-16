@@ -77,6 +77,14 @@ replaces one.
 | [22](#22-a-fault-that-can-never-be-fixed-by-retrying-is-answered-500) | Prometheus | ingest | B | An OTLP exporter retries a payload forever that can never be accepted. |
 | [23](#23-a-grouping-after-a-select-puts-every-span-into-one-group-called-nil) | Tempo | queries | A, D | A query grouping four named spans by their name answers one group called `nil`, in a response that prints each span's name beside it. |
 | [24](#24-a-groups-sum-and-avg-over-one-attribute-give-different-answers-depending-on-which-span-arrived-first) | Tempo | queries | C, D | A group's `sum` and `avg` over one attribute give different answers depending on which span arrived first. |
+| [25](#25-a-json-line-with-a-space-before-it-is-not-read-by-one-form-of--json-and-is-read-by-the-other) | Loki | queries | A | A JSON line with a space before it is not read by `\| json <id>="<path>"` or `\| unpack`, while the bare `\| json` reads it. |
+| [26](#26-text-after-a-json-value-is-read-as-if-it-were-json) | Loki | queries | C, D | `{"a":1}trailing` answers `a="1"`: labels come out of a line that is not JSON, and `\| __error__=""` keeps it. |
+| [27](#27-the-targeted--json-reports-nothing-for-a-line-that-is-not-json) | Loki | queries | A | `\| json latency="latency"` counts `{garbage` as a line with an empty field, where `\| json` refuses the same line. |
+| [28](#28-the-targeted--json-refuses-a-line-that-is-json-and-accepts-an-empty-line) | Loki | queries | A, D | An empty line passes the targeted `\| json` and `\| unpack` with no error, while the JSON line `5` is refused. |
+| [29](#29-the-targeted--logfmt-stops-reading-a-line-at-a-renamed-destination) | Loki | queries | C | On a stream carrying `code`, `\| logfmt code="a", code_extracted="b"` over `a=x b=z` answers `code_extracted=""`: the line's `b=z` is never read. |
+| [30](#30-text-inside-a-quoted-logfmt-value-comes-back-as-labels) | Loki | queries | C | A quote inside a logfmt value turns the rest of the value into labels: `msg="user "bob" role=admin now"` answers `role="admin"`. |
+| [31](#31-a-logfmt-value-holding-a-replacement-character-is-changed-to-hold-a-space) | Loki | queries | C | A logfmt value holding U+FFFD comes back with a space in its place. |
+| [32](#32-a-grouped-avg_over_time-fails-on-a-line-its-own-ungrouped-form-ignores) | Loki | queries | A | `avg_over_time … by (a)` fails on a line that is not JSON, where the same average without `by` and the grouped sum ignore it. |
 
 ---
 
@@ -1692,6 +1700,347 @@ own hermetic guard fails if either order is deleted.
 
 ---
 
+## 25. A JSON line with a space before it is not read by one form of `| json` and is read by the other
+
+**Grafana Loki v3.7.4 · queries · test A**
+
+### What the reference does
+
+`| json <id>="<path>"` and `| unpack` test ONE raw byte, the line's first,
+before they read anything (`isValidJSONStart`,
+`pkg/logql/log/parser.go:724-731`; `UnpackParser.Process`, `:759`).
+Whitespace is not skipped. The bare `| json` hands the line to a scanner
+that skips whitespace before the opening brace
+(`vendor/github.com/grafana/jsonparser/parser.go:1086-1093`).
+
+```
+line: ` {"latency":5,"a":"x"}`      (one space, then an object)
+
+| json                     -> reads latency="5", a="x"
+| json latency="latency"   -> __error__="JSONParserErr", nothing read
+| unpack                   -> __error__="JSONParserErr", nothing read
+```
+
+### Why that is wrong rather than different
+
+Two of the reference's own paths give opposite verdicts on one line
+(**A**). RFC 8259 §2 allows whitespace before a JSON value, so the line is
+JSON, and the bare form agrees.
+
+### What PulsusDB does
+
+Every `| json` form and `| unpack` start the JSON text after at most one
+leading byte-order mark and then JSON whitespace (space, tab, LF, CR).
+Nothing else is skipped. Ignoring a leading mark is allowed by RFC 8259 §8.1
+and is the owner's choice, not a claim about the reference.
+
+`sum_over_time({…} | json latency="latency" | unwrap latency [1m])` over
+`{"latency":5}` and ` {"latency":7}` in one window: the reference `5`,
+PulsusDB `12`.
+
+### Evidence
+
+Ledger row `json-leading-whitespace-and-byte-order-mark` in
+docs/benchmarks/logs-differential-ledger.md (s01–s14, both answers).
+Pinned by `json_expression_reads_one_json_text` and
+`unpack_reads_one_json_text` in
+`crates/pulsus-read/tests/logql_pipeline_golden.rs`.
+
+---
+
+## 26. Text after a JSON value is read as if it were JSON
+
+**Grafana Loki v3.7.4 · queries · tests C, D**
+
+### What the reference does
+
+The scanner returns the moment it reaches the first value's closing brace
+and never looks at the rest of the line
+(`vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160`).
+So `{"a":1}trailing` answers `a="1"` on `| json`, `| json <id>="<path>"` and
+`| unpack` alike, and `{"latency":1}{"latency":2}` answers `latency="1"`.
+
+### Why that is wrong rather than different
+
+RFC 8259 §2 defines a JSON text as one value with optional whitespace
+around it; `{"a":1}trailing` is not one. Labels are extracted from a line
+that is not JSON and no error says so (**C**), and no reading of "parse
+this line as JSON" supports a successful parse of a line that is not JSON
+(**D**). `| __error__=""`, the documented way to keep only lines that
+parsed, keeps it.
+
+### What PulsusDB does
+
+A line with anything but whitespace after its value is not JSON on every
+form: `__error__="JSONParserErr"` with the bare form's details, nothing
+extracted.
+
+`count_over_time({…} | json [1m])` over `{"latency":1,"a":"x"}trailing`:
+the reference `{a="x",latency="1"} 1`, PulsusDB `400 pipeline error:
+'JSONParserErr'`.
+
+### Evidence
+
+Ledger row `json-text-is-one-value` (s20–s31, s43, s44). Pinned by
+`json_flatten_refuses_bytes_after_the_value`,
+`json_expression_refuses_bytes_after_the_value` and
+`unpack_refuses_bytes_after_the_value` in
+`crates/pulsus-read/tests/logql_pipeline_golden.rs`, and the
+`b23_json_raw_read.test` rows carrying
+`# provenance: divergence(json-text-is-one-value)`.
+
+---
+
+## 27. The targeted `| json` reports nothing for a line that is not JSON
+
+**Grafana Loki v3.7.4 · queries · test A**
+
+### What the reference does
+
+Past its first-byte test the targeted form runs a scan that does not
+validate, and every path it did not find is filled with `""`
+(`pkg/logql/log/parser.go:684-719`). A line such as `{garbage` passes the
+first-byte test, so it answers `latency=""` with no error. The bare form
+refuses the same line with `__error__="JSONParserErr"`.
+
+```
+line: `{garbage`
+
+count_over_time({…} | json [1m])                      -> 400 JSONParserErr
+count_over_time({…} | json latency="latency" [1m])    -> {latency=""} 1
+```
+
+### Why that is wrong rather than different
+
+The two forms of one parser disagree about whether one line is JSON
+(**A**). A user who switches from `| json` to `| json latency="latency"`
+for speed silently starts counting lines that are not JSON as lines with
+an empty field.
+
+### What PulsusDB does
+
+The targeted form reports a line that is not one JSON text exactly as the
+bare form does: the error pair, no fill. `{garbage` answers
+`400 pipeline error: 'JSONParserErr'` on both forms, and
+`| json latency="latency" | __error__=""` drops it.
+
+### Evidence
+
+Ledger row `json-targeted-line-that-does-not-parse` (s32, s34, s35,
+p01.06). Pinned by `json_expression_reads_one_json_text` and the
+`b23_json_raw_read.test` rows carrying
+`# provenance: divergence(json-targeted-line-that-does-not-parse)`.
+
+---
+
+## 28. The targeted `| json` refuses a line that is JSON and accepts an empty line
+
+**Grafana Loki v3.7.4 · queries · tests A, D**
+
+### What the reference does
+
+The targeted form returns with no label and no error for an empty line
+(`pkg/logql/log/parser.go:672-674`), and `| unpack` does the same
+(`:754-756`), where the bare form reports `JSONParserErr` for it. Its
+first-byte test admits only `"`, `{` and `[` (`:724-731`), so the line `5`,
+which is a JSON text, is refused with `JSONParserErr`.
+
+| line | query | reference |
+|---|---|---|
+| (empty) | `count_over_time({…} \| json level="level" [1m])` | `{} 1` |
+| (empty) | `count_over_time({…} \| json [1m])` | `400 JSONParserErr` |
+| (empty) | `count_over_time({…} \| unpack [1m])` | `{} 1` |
+| `5` | `count_over_time({…} \| json level="level" [1m])` | `400 JSONParserErr` |
+
+### Why that is wrong rather than different
+
+The forms disagree about the empty line (**A**). An empty line is not a
+JSON text under RFC 8259 §2 and `5` is one; a test that refuses the second
+and admits the first is not a JSON test under any reading (**D**).
+
+### What PulsusDB does
+
+An empty line is not JSON on every form (`400 pipeline error:
+'JSONParserErr'` for both `count_over_time` queries above and for
+`| unpack`). `5` is JSON; the path `level` does not resolve in it, so the
+targeted form fills `level=""`, as it does for `[1,2]`:
+`{level=""} 1`.
+
+### Evidence
+
+Ledger row `json-targeted-line-that-does-not-parse` (s38, s40, s41, s42).
+Pinned by `json_expression_reads_one_json_text` and
+`unpack_reads_one_json_text`.
+
+---
+
+## 29. The targeted `| logfmt` stops reading a line at a renamed destination
+
+**Grafana Loki v3.7.4 · queries · test C**
+
+### What the reference does
+
+In `| logfmt <id>="<key>", …`, a destination whose name the stream already
+carries is renamed to `<id>_extracted`. When that renamed name is already
+written on the line, the parser leaves its scan loop
+(`pkg/logql/log/parser.go:601-607`, the `break` under "Don't extract
+duplicates if we don't have to"), so every later pair on the line is lost,
+including pairs for other destinations. A name counts as written as soon as
+the parser's own pre-fill sets it to `""` before the line is read
+(`:545-550`; `LabelsBuilder.Set` records it, `pkg/logql/log/labels.go:378-386`),
+so in the first row below the scan ends at `a=x`.
+
+A stream carrying `code="s"`, the query
+`{…} | logfmt code="a", code_extracted="b"`:
+
+| line | reference |
+|---|---|
+| `a=x b=z` | `{code="s", code_extracted=""}` |
+| `b=z a=x` | `{code="s", code_extracted="z"}` |
+
+### Why that is wrong rather than different
+
+The line holds `b=z`, and the query asks for `b` as `code_extracted`. The
+answer depends on whether an unrelated pair came first, and the value is
+dropped with no error (**C**).
+
+### What PulsusDB does
+
+The renamed repeat is skipped and the scan reads on: both lines answer
+`{code="s", code_extracted="z"}`.
+
+### Evidence
+
+Ledger row `logfmt-expression-renamed-repeat` (c13, c14).
+
+---
+
+## 30. Text inside a quoted logfmt value comes back as labels
+
+**Grafana Loki v3.7.4 · queries · test C**
+
+### What the reference does
+
+The logfmt decoder returns a quoted pair the moment its closing quote
+arrives and starts the next key at the very next byte, whatever that byte
+is (`pkg/logql/log/logfmt/decode.go:151-186`). After a malformed token it
+skips to the next byte at or below a space with no notion of quotes
+(`:140-149`). So the text of a value that holds a quote is split and read
+as pairs:
+
+```
+line: level=info msg="user "bob" role=admin now" status=200
+
+reference  {level="info", msg="user ", role="admin", status="200"}
+PulsusDB   {level="info", status="200"}
+```
+
+### Why that is wrong rather than different
+
+`role="admin"` is not a pair the producer wrote; it is text inside `msg`'s
+value, and `msg` itself is cut at the inner quote to `user `. Both are
+labels nobody sent, returned with no error (**C**). A query filtering on
+`role="admin"` counts this line.
+
+### What PulsusDB does
+
+A token is `key`, `key=`, `key=value` or `key="quoted value"` in full, and a
+closing quote must be followed by a separator or the end of the line;
+anything else contributes nothing, and `--strict` stops at it. After a
+malformed token the scan skips to the next separator outside a quoted
+value, so no label is read from inside a value however the token broke.
+The cost: a producer that omits the space after a quoted value loses those
+pairs (`time="…"level=info msg=ok` keeps only `msg`), where the reference
+guesses the boundary.
+
+### Evidence
+
+Ledger row `logfmt-quoted-value-ends-its-token` (x01, x02, u01, u02, v01,
+v02, v04, w01, m02, m03, m14–m16, and the 91 generated line–mode pairs by
+id). Pinned by `b27_logfmt_token_scan.test` and
+`logfmt_a_malformed_token_contributes_nothing_and_the_scan_resumes` in
+`crates/pulsus-read/tests/logql_pipeline_golden.rs`.
+
+---
+
+## 31. A logfmt value holding a replacement character is changed to hold a space
+
+**Grafana Loki v3.7.4 · queries · test C**
+
+### What the reference does
+
+The implicit `| logfmt` replaces each U+FFFD in a value with a space
+(`pkg/logql/log/parser.go:419-421`, `removeInvalidUtf` at `:45-50`), with
+the stated reason that the character "is rejected by Prometheus".
+
+| line | reference | PulsusDB |
+|---|---|---|
+| `a=` U+FFFD ` d=2` | `{a=" ", d="2"}` | `{a="<U+FFFD>", d="2"}` |
+| `a="\ud800" c=2` | `{a=" ", c="2"}` | `{a="<U+FFFD>", c="2"}` |
+
+### Why that is wrong rather than different
+
+The line holds U+FFFD, a valid Unicode scalar value that encodes as valid
+UTF-8, and a label value may hold it. The space is a value no producer
+wrote, returned with no error (**C**).
+
+### What PulsusDB does
+
+The value keeps the character the line holds, in all three modes.
+
+### Evidence
+
+Ledger row `logfmt-replacement-character-value` (x09, x22). Pinned by the
+x09 and x22 rows of `b27_logfmt_token_scan.test`, each carrying
+`# provenance: divergence(logfmt-replacement-character-value)`.
+
+---
+
+## 32. A grouped `avg_over_time` fails on a line its own ungrouped form ignores
+
+**Grafana Loki v3.7.4 · queries · test A**
+
+### What the reference does
+
+The query planner rewrites a grouped
+`avg_over_time(<log range> | unwrap x [r]) by (L)` into
+`sum by (L) (sum_over_time(… | unwrap x [r])) / sum by (L) (count_over_time(… [r]))`
+and strips the unwrap from the count side
+(`pkg/logql/shardmapper.go:476-534`, `case syntax.OpRangeTypeAvg`,
+`expr.Left.WithoutUnwrap()`). The count side then counts every line that
+survives the pipeline, including a line with no value and a line whose
+parser failed:
+
+| query | lines | reference |
+|---|---|---|
+| `avg_over_time({…} \| json \| unwrap latency [1m]) by (a)` | `{garbage`, `{"latency":3,"a":"x"}` | `400 JSONParserErr` |
+| `avg_over_time({…} \| json \| unwrap latency [1m])` | the same | `{a="x"} 3` |
+| `sum_over_time({…} \| json \| unwrap latency [1m])` | the same | `{a="x"} 3` |
+| `avg_over_time({…} \| json c="code", lat="latency" \| unwrap lat [1m]) by (c)` | `{"latency":3,"code":"a"}`, `{"code":"a"}` | `{c="a"} 1.5` |
+
+### Why that is wrong rather than different
+
+One average gives three answers depending on whether a grouping is
+written: it fails on a line its own ungrouped form and its grouped sum
+ignore, and it divides by a line that carried no value (**A**). The last
+row's mean of the one value `3` is `3`, not `1.5`.
+
+### What PulsusDB does
+
+Computes the reducer's own recurrence whether or not the query is grouped;
+a line with no readable value for the unwrapped label contributes no
+sample and no error, for every range aggregation. All four rows above
+answer `{a="x"} 3` or `{c="a"} 3`.
+
+### Evidence
+
+Ledger row `grouped-avg-over-time-unexplained` (the id predates the
+mechanism; b04, b13, b16, b20, b23, a11 and the `54.25` rows). The
+ungrouped recurrence is pinned by the `service_name="avgr"` rows of
+`crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`.
+
+---
+
 ## Two mechanisms that produce several of these
 
 Worth stating because a reader meeting one entry will meet the others.
@@ -1764,22 +2113,16 @@ they are named so nobody adds them later.
   defect to decline. The row was corrected on 2026-09-02 and keeps the
   superseded sentence beside the correction.
 
-## Two claims recorded elsewhere that this file deliberately does not make
+## A claim recorded elsewhere that this file deliberately does not make
 
-Both are real measurements and both are in the ledgers. Neither is here,
-because in each case the reference's behaviour was observed but its
-mechanism was never located in the reference's source, and this file only
-lists defects that were confirmed against the source.
+It is a real measurement and it is in the traces ledger. It is not here,
+because the reference's behaviour was observed but its mechanism was never
+located in the reference's source, and this file only lists defects that
+were confirmed against the source. (A grouped `avg_over_time` answering
+differently from an ungrouped one used to be listed here for the same
+reason; issue #507 located its mechanism in the query planner, and it is
+entry 32.)
 
-- **A grouped `avg_over_time` answers differently from an ungrouped one.**
-  Measured on the pinned Loki container over the same four samples in the
-  same order: the ungrouped form answers `54.24999999999999` (the range
-  reducer's own recurrence) and every grouped form answers `54.25`
-  (`sum/count`). Stable over 25 consecutive runs, so not a map walk, and
-  not a fold-order effect — `stdvar_over_time` does not move. The
-  ledger records the mechanism as unidentified. PulsusDB answers the
-  recurrence either way. Row:
-  `grouped-avg-over-time-unexplained` in the logs ledger.
 - **Tempo under-reports a narrowed tag-value list.** Measured on the
   captured corpus, the reference's own three answers contradict each
   other: a value present on a matching span was absent from the narrowed

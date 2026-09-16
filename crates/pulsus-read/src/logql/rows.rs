@@ -181,6 +181,78 @@ pub struct MetricInstantRow {
     pub structured_metadata: String,
 }
 
+/// A bucketed range-query partial (issue #507, W2): one
+/// `(fingerprint, grid point, structured_metadata)` group from
+/// [`crate::logql::sql::metric_range_bucketed`], which counts in the
+/// database instead of returning one row per log line.
+///
+/// `bucket_ns` is the emit GRID POINT — the anchored ceiling
+/// `lo + intDiv(timestamp_ns - lo + step - 1, step) * step` with
+/// `lo = grid_start_ns - step_ns`, so a row's bucket is the grid point
+/// whose window `(g - range, g]` contains it. It is a timestamp, never a
+/// duration, which is why it is `Int64` on both sides.
+///
+/// `n` is `count()` or `sum(length(body))` — both `UInt64`, both exact
+/// under client-side addition, which is what lets the four counting
+/// reducers claim [`crate::compile::plan::Fidelity::Equivalent`] on this
+/// path.
+///
+/// `structured_metadata` is LAST, the [`MetricInstantRow`]/[`SampleRow`]
+/// convention. Empty string = none. The column is carried raw and
+/// uninterpreted; the reader decides what it means.
+///
+/// **One row type, always four columns.** [`crate::logql::sql::ScanProjection::Lean`]
+/// would drop the fourth, and its only caller is `absent_over_time`, which
+/// is never lowered onto this path — the same argument [`MetricInstantRow`]
+/// already carries.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricRangeBucketRow {
+    pub fingerprint: u64,
+    pub bucket_ns: i64,
+    pub n: u64,
+    pub structured_metadata: String,
+}
+
+/// One row of the extracted-field group key statement, S1 (issue #507,
+/// [`crate::logql::sql::metric_range_unwrapped`]): one (class, grid point,
+/// key labels, projected metadata) group.
+///
+/// `keys` is `(present, text)` per key label, in the plan's key order;
+/// `present = 0` is an absent or blanked key. `v` sums the decided rows'
+/// values; `n_value` counts them, `n_missing` counts the rows dropped for
+/// having no value, and `n_undecided` the rows the database could not
+/// decide (zero whenever the statement throws on them).
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricRangeUnwrappedRow {
+    pub class: u64,
+    pub bucket_ns: i64,
+    pub keys: Vec<(u8, String)>,
+    pub v: f64,
+    pub n_value: u64,
+    pub n_missing: u64,
+    pub n_undecided: u64,
+    pub sm_text: String,
+    pub sm_kept: Vec<(String, String)>,
+}
+
+/// One row of the one read, L (issue #507,
+/// [`crate::logql::sql::metric_range_unwrapped_rows`]): a decided row with
+/// its key labels and value, or an undecided row with its `body`, its
+/// `fingerprint` and its stored metadata in `sm_text`. A missing row is
+/// never sent.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct UnwrappedLaneRow {
+    pub class: u64,
+    pub bucket_ns: i64,
+    pub decided: u8,
+    pub keys: Vec<(u8, String)>,
+    pub v: f64,
+    pub body: String,
+    pub fingerprint: u64,
+    pub sm_text: String,
+    pub sm_kept: Vec<(String, String)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,265 @@
+=== s1_bare_by_status
+SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|63|65|6c|6e|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS uw_missing,
+    JSONExtractRaw(body, 'status') AS l0_r,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|73|74|75)')) OR (countSubstrings(body, 'status') > countSubstrings(body, '"status"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'status') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'status') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS l0_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== s1_bare_by_status_counting_undecided
+SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|63|65|6c|6e|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS uw_missing,
+    JSONExtractRaw(body, 'status') AS l0_r,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|73|74|75)')) OR (countSubstrings(body, 'status') > countSubstrings(body, '"status"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'status') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'status') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS l0_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== l_bare_by_status
+SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, decided, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint, if(decided = 1, '', structured_metadata) AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    body,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|63|65|6c|6e|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS uw_missing,
+    JSONExtractRaw(body, 'status') AS l0_r,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|73|74|75)')) OR (countSubstrings(body, 'status') > countSubstrings(body, '"status"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'status') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'status') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS l0_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE NOT (decided = 0 AND uw_missing = 1)
+SETTINGS precise_float_parsing = 1
+=== s1_targeted_no_key
+SELECT fingerprint AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, CAST([], 'Array(Tuple(UInt8, String))') AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, structured_metadata AS sm_text, CAST([], 'Array(Tuple(String, String))') AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8(0) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS uw_missing,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8(uw_q * (1 - uw_amb) * depth_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== s1_targeted_nested_path
+SELECT fingerprint AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, CAST([], 'Array(Tuple(UInt8, String))') AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, structured_metadata AS sm_text, CAST([], 'Array(Tuple(String, String))') AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'req', 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8(0) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS uw_missing,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8(uw_q * (1 - uw_amb) * depth_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== s1_targeted_keys_text_metadata
+SELECT fingerprint AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(decided * (l0_str + l0_int)), if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')), (toUInt8(decided * (l1_str + l1_int)), if(decided = 1, if(l1_str = 1, substring(l1_r, 2, length(l1_r) - 2), if(l1_int = 1, l1_r, '')), ''))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, structured_metadata AS sm_text, CAST([], 'Array(Tuple(String, String))') AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8(0) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS uw_missing,
+    JSONExtractRaw(body, 'code') AS l0_r,
+    toUInt8(0) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'code') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS l0_absent,
+    JSONExtractRaw(body, 'missing') AS l1_r,
+    toUInt8(0) AS l1_amb,
+    toUInt8(l1_amb = 0 AND startsWith(l1_r, '"') AND position(l1_r, '\\') = 0) AS l1_str,
+    toUInt8(l1_amb = 0 AND match(l1_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'missing') IN ('Int64', 'UInt64')) AS l1_int,
+    toUInt8(l1_r = '' AND l1_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS l1_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== l_targeted_keys_text_metadata
+SELECT fingerprint AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, decided, [(toUInt8(decided * (l0_str + l0_int)), if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')), (toUInt8(decided * (l1_str + l1_int)), if(decided = 1, if(l1_str = 1, substring(l1_r, 2, length(l1_r) - 2), if(l1_int = 1, l1_r, '')), ''))] AS keys, if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint, structured_metadata AS sm_text, CAST([], 'Array(Tuple(String, String))') AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    body,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8(0) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS uw_missing,
+    JSONExtractRaw(body, 'code') AS l0_r,
+    toUInt8(0) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'code') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS l0_absent,
+    JSONExtractRaw(body, 'missing') AS l1_r,
+    toUInt8(0) AS l1_amb,
+    toUInt8(l1_amb = 0 AND startsWith(l1_r, '"') AND position(l1_r, '\\') = 0) AS l1_str,
+    toUInt8(l1_amb = 0 AND match(l1_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'missing') IN ('Int64', 'UInt64')) AS l1_int,
+    toUInt8(l1_r = '' AND l1_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS l1_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE NOT (decided = 0 AND uw_missing = 1)
+SETTINGS precise_float_parsing = 1
+=== s1_bare_no_key
+SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, CAST([], 'Array(Tuple(UInt8, String))') AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|63|65|6c|6e|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS uw_missing,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== s1_bare_several_classes
+SELECT transform(fingerprint, [18374, 99120], [0, 1], toUInt64(0)) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if((fingerprint IN (99120) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if((fingerprint IN (99120) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|63|65|6c|6e|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS uw_missing,
+    JSONExtractRaw(body, 'status') AS l0_r,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:61|73|74|75)')) OR (countSubstrings(body, 'status') > countSubstrings(body, '"status"') AND match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+)"[ \\t\\n\\r]*:')) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'status') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'status') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*status(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS l0_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1
+=== s1_bare_underscore_names
+SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), ''))), (toUInt8(if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), 0, decided * (l1_str + l1_int))), if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), '', if(decided = 1, if(l1_str = 1, substring(l1_r, 2, length(l1_r) - 2), if(l1_int = 1, l1_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"_":', '"__error__":', '"__error_details__":', '"a_b":', '"latency_ms":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency_ms'), '1', x.2)), arrayFilter(x -> x.1 IN ('_', '__error__', '__error_details__', 'a_b', 'latency_ms'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+FROM (
+  SELECT fingerprint,
+    timestamp_ns,
+    structured_metadata,
+    JSONExtractRaw(body, 'latency_ms') AS uw_r,
+    trim(BOTH '"' FROM uw_r) AS uw_t,
+    toFloat64OrNull(uw_t) AS uw_x,
+    toUInt8(isNotNull(uw_x)) AS uw_q,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:5f|61|63|65|6c|6d|6e|73|74|79)')) OR (countSubstrings(body, 'latency') > countSubstrings(body, '"latency_ms"') AND (match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+latency(?:[^"\\\\]|\\\\.)+ms(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|latency(?:[^"\\\\]|\\\\.)+ms(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+|latency(?:(?:[^"\\\\_]|\\\\.)(?:[^"\\\\]|\\\\.)*|_(?:[^"\\\\]|\\\\.)+)ms)"[ \\t\\n\\r]*:') OR match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*(?:latency)(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS uw_amb,
+    toUInt8(uw_r = '' AND uw_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'latency') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*latency(?:[^"\\\\]|\\\\.)+ms(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:') AND NOT (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*(?:latency)(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))))) AS uw_missing,
+    JSONExtractRaw(body, '_') AS l0_r,
+    toUInt8(1) AS l0_amb,
+    toUInt8(l0_amb = 0 AND startsWith(l0_r, '"') AND position(l0_r, '\\') = 0) AS l0_str,
+    toUInt8(l0_amb = 0 AND match(l0_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, '_') IN ('Int64', 'UInt64')) AS l0_int,
+    toUInt8(l0_r = '' AND l0_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, '') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*_(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:')))) AS l0_absent,
+    JSONExtractRaw(body, 'a_b') AS l1_r,
+    toUInt8((position(body, '\\u') > 0 AND match(body, '\\\\u00(?i:5f|61|62)')) OR (countSubstrings(body, 'a') > countSubstrings(body, '"a_b"') AND (match(body, '"(?:(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+a(?:[^"\\\\]|\\\\.)+b(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*|a(?:[^"\\\\]|\\\\.)+b(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})+|a(?:(?:[^"\\\\_]|\\\\.)(?:[^"\\\\]|\\\\.)*|_(?:[^"\\\\]|\\\\.)+)b)"[ \\t\\n\\r]*:') OR match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*(?:a)(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) OR (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))) AS l1_amb,
+    toUInt8(l1_amb = 0 AND startsWith(l1_r, '"') AND position(l1_r, '\\') = 0) AS l1_str,
+    toUInt8(l1_amb = 0 AND match(l1_r, '^-?[1-9][0-9]{0,18}$') AND JSONType(body, 'a_b') IN ('Int64', 'UInt64')) AS l1_int,
+    toUInt8(l1_r = '' AND l1_amb = 0 AND isValidJSON(body) AND countSubstrings(body, '{') + countSubstrings(body, '[') <= 127 AND (length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864) AND (position(body, 'a') = 0 OR (NOT match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*a(?:[^"\\\\]|\\\\.)+b(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:') AND NOT (countSubstrings(body, '{') > 1 AND match(body, '"(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*(?:a)(?:[ \\t\\n\\r]|\\\\[tnrf]|\\\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\\x{00A0}|\\x{0085}|\\x{1680}|[\\x{2000}-\\x{200A}]|\\x{2028}|\\x{2029}|\\x{202F}|\\x{205F}|\\x{3000})*"[ \\t\\n\\r]*:[ \\t\\n\\r]*\\{'))))) AS l1_absent,
+    toUInt8(countSubstrings(body, '{') + countSubstrings(body, '[') <= 127) AS depth_ok,
+    toUInt8((length(body) <= 4050 OR if(countSubstrings(body, '{') <= 1, 88 * countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * length(body) + 104)) <= 67108864)) AS keybudget_ok,
+    toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok * keybudget_ok) AS decided
+  FROM log_samples
+  PREWHERE service = 'checkout'
+  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+)
+WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
+GROUP BY class, bucket_ns, keys, sm_text, sm_kept
+SETTINGS precise_float_parsing = 1

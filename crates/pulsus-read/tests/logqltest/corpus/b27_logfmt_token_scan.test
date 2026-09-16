@@ -1,0 +1,1347 @@
+# b27 — what `| logfmt` extracts from a line holding a malformed token
+# (issue #507).
+#
+# Reference of record: grafana/loki:3.7.4 (revision b318f282), the build the
+# rest of this corpus pins, with CI's shared configuration. Captured by push
+# and query, one stream per line, `[10m]` window, 2026-09-13 and 2026-09-14.
+# The reference attaches a `detected_level` label of its own; it is dropped
+# from the expected sets, as the live replay leg drops it from every file.
+#
+# THE RULE (docs/api.md §2). A token is `key`, `key=`, `key=value` or
+# `key="quoted value"` in full, ending at a byte at or below a space or at
+# the end of the line. Anything else contributes nothing: the lenient scan
+# resumes at the next token and `--strict` stops there, keeping the pairs
+# before it. A closing quote must be followed by a separator or the end of
+# the line. After a malformed token the scan skips to the next byte at or
+# below a space OUTSIDE a quoted value: a quote opens a quoted value when it
+# follows `=` or when the token has already opened one, and `\` escapes the
+# next byte inside it. Error positions are byte offsets + 1.
+#
+# The reference's decoder returns a quoted pair the moment its closing quote
+# arrives and starts the next key at the very next byte
+# (`pkg/logql/log/logfmt/decode.go:151-186 @ v3.7.4`), and after a
+# malformed token it skips to the next byte at or below a space with no
+# notion of quotes (`:140-149`). So it can read text inside a quoted value
+# as pairs. Where the two differ, the row carries our answer, the
+# reference's captured answer in the comment above it, and
+# `divergence(logfmt-quoted-value-ends-its-token)`. A value holding U+FFFD
+# is replaced with one space there (`pkg/logql/log/parser.go:419-421`) and
+# kept here: `divergence(logfmt-replacement-character-value)`.
+#
+# Case ids follow the plan's tables on issue #507: f01–f12 and g01–g06 (a
+# malformed token, and the lenient decoder resuming), x01, x02, x09, x22,
+# u01–u03, v01, v02, v04, w01–w06 and m01–m18 (quoted values), and three of
+# the 400 generated lines (L071, L276, L306). The suffix is the mode: `l`
+# `| logfmt`, `s` `--strict`, `k` `--keep-empty`. The 800 generated
+# line–mode pairs are in `logql_logfmt_token_scan_matrix.rs`.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+
+load
+  {service_name="lf27-f01l"}
+  0s  {"a":1} x=2
+
+eval instant at 60s {service_name="lf27-f01l"} | logfmt
+  {service_name="lf27-f01l", x="2"}  0s  {"a":1} x=2
+
+clear
+
+load
+  {service_name="lf27-f01s"}
+  0s  {"a":1} x=2
+
+eval instant at 60s {service_name="lf27-f01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 2 : unexpected '\"'", service_name="lf27-f01s"}  0s  {"a":1} x=2
+
+clear
+
+load
+  {service_name="lf27-f02l"}
+  0s  a=1"b" c=3
+
+eval instant at 60s {service_name="lf27-f02l"} | logfmt
+  {c="3", service_name="lf27-f02l"}  0s  a=1"b" c=3
+
+clear
+
+load
+  {service_name="lf27-f02s"}
+  0s  a=1"b" c=3
+
+eval instant at 60s {service_name="lf27-f02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-f02s"}  0s  a=1"b" c=3
+
+clear
+
+load
+  {service_name="lf27-f03l"}
+  0s  a=1"b"
+
+eval instant at 60s {service_name="lf27-f03l"} | logfmt
+  {service_name="lf27-f03l"}  0s  a=1"b"
+
+clear
+
+load
+  {service_name="lf27-f03s"}
+  0s  a=1"b"
+
+eval instant at 60s {service_name="lf27-f03s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-f03s"}  0s  a=1"b"
+
+clear
+
+load
+  {service_name="lf27-f04l"}
+  0s  "quoted=1 c=3
+
+eval instant at 60s {service_name="lf27-f04l"} | logfmt
+  {c="3", service_name="lf27-f04l"}  0s  "quoted=1 c=3
+
+clear
+
+load
+  {service_name="lf27-f04s"}
+  0s  "quoted=1 c=3
+
+eval instant at 60s {service_name="lf27-f04s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '\"'", service_name="lf27-f04s"}  0s  "quoted=1 c=3
+
+clear
+
+load
+  {service_name="lf27-f05l"}
+  0s  a=1=2 c=3
+
+eval instant at 60s {service_name="lf27-f05l"} | logfmt
+  {c="3", service_name="lf27-f05l"}  0s  a=1=2 c=3
+
+clear
+
+load
+  {service_name="lf27-f05s"}
+  0s  a=1=2 c=3
+
+eval instant at 60s {service_name="lf27-f05s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '='", service_name="lf27-f05s"}  0s  a=1=2 c=3
+
+clear
+
+load
+  {service_name="lf27-f06l"}
+  0s  a==1 c=3
+
+eval instant at 60s {service_name="lf27-f06l"} | logfmt
+  {c="3", service_name="lf27-f06l"}  0s  a==1 c=3
+
+clear
+
+load
+  {service_name="lf27-f06s"}
+  0s  a==1 c=3
+
+eval instant at 60s {service_name="lf27-f06s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 3 : unexpected '='", service_name="lf27-f06s"}  0s  a==1 c=3
+
+clear
+
+load
+  {service_name="lf27-f07l"}
+  0s  =1 c=3
+
+eval instant at 60s {service_name="lf27-f07l"} | logfmt
+  {c="3", service_name="lf27-f07l"}  0s  =1 c=3
+
+clear
+
+load
+  {service_name="lf27-f07s"}
+  0s  =1 c=3
+
+eval instant at 60s {service_name="lf27-f07s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '='", service_name="lf27-f07s"}  0s  =1 c=3
+
+clear
+
+load
+  {service_name="lf27-f08l"}
+  0s  a"b=1 c=3
+
+eval instant at 60s {service_name="lf27-f08l"} | logfmt
+  {c="3", service_name="lf27-f08l"}  0s  a"b=1 c=3
+
+clear
+
+load
+  {service_name="lf27-f08s"}
+  0s  a"b=1 c=3
+
+eval instant at 60s {service_name="lf27-f08s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 2 : unexpected '\"'", service_name="lf27-f08s"}  0s  a"b=1 c=3
+
+clear
+
+load
+  {service_name="lf27-f09l"}
+  0s  a=1 b"x c=3
+
+eval instant at 60s {service_name="lf27-f09l"} | logfmt
+  {a="1", c="3", service_name="lf27-f09l"}  0s  a=1 b"x c=3
+
+clear
+
+load
+  {service_name="lf27-f09s"}
+  0s  a=1 b"x c=3
+
+eval instant at 60s {service_name="lf27-f09s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", a="1", service_name="lf27-f09s"}  0s  a=1 b"x c=3
+
+clear
+
+load
+  {service_name="lf27-f10l"}
+  0s  a="unterminated c=3
+
+eval instant at 60s {service_name="lf27-f10l"} | logfmt
+  {service_name="lf27-f10l"}  0s  a="unterminated c=3
+
+clear
+
+load
+  {service_name="lf27-f10s"}
+  0s  a="unterminated c=3
+
+eval instant at 60s {service_name="lf27-f10s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 20 : unterminated quoted value", service_name="lf27-f10s"}  0s  a="unterminated c=3
+
+clear
+
+load
+  {service_name="lf27-f11l"}
+  0s  a=1 {"x":1} c=3
+
+eval instant at 60s {service_name="lf27-f11l"} | logfmt
+  {a="1", c="3", service_name="lf27-f11l"}  0s  a=1 {"x":1} c=3
+
+clear
+
+load
+  {service_name="lf27-f11s"}
+  0s  a=1 {"x":1} c=3
+
+eval instant at 60s {service_name="lf27-f11s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", a="1", service_name="lf27-f11s"}  0s  a=1 {"x":1} c=3
+
+clear
+
+load
+  {service_name="lf27-f12l"}
+  0s  a=b"c d=e
+
+eval instant at 60s {service_name="lf27-f12l"} | logfmt
+  {d="e", service_name="lf27-f12l"}  0s  a=b"c d=e
+
+clear
+
+load
+  {service_name="lf27-f12s"}
+  0s  a=b"c d=e
+
+eval instant at 60s {service_name="lf27-f12s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-f12s"}  0s  a=b"c d=e
+
+clear
+
+load
+  {service_name="lf27-g01"}
+  0s  status=abcd
+
+eval instant at 60s {service_name="lf27-g01"} | logfmt | status > 100
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"ab\": invalid syntax", service_name="lf27-g01", status="ab"}  0s  status=abcd
+
+clear
+
+load
+  {service_name="lf27-g02"}
+  0s  took=abcd
+
+eval instant at 60s {service_name="lf27-g02"} | logfmt | took > 5s
+  {__error__="LabelFilterErr", __error_details__="time: invalid duration \"ab\"", service_name="lf27-g02", took="ab"}  0s  took=abcd
+
+clear
+
+load
+  {service_name="lf27-g03"}
+  0s  =x b=1
+
+eval instant at 60s {service_name="lf27-g03"} | logfmt a="b"
+  {a="1", service_name="lf27-g03"}  0s  =x b=1
+
+clear
+
+load
+  {service_name="lf27-g04"}
+  0s  =x b=1
+
+eval instant at 60s {service_name="lf27-g04"} | logfmt --strict a="b"
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '='", a="", service_name="lf27-g04"}  0s  =x b=1
+
+clear
+
+load
+  {service_name="lf27-g05"}
+  0s  ab=1 c=2
+
+eval instant at 60s {service_name="lf27-g05"} | logfmt
+  {b="1", c="2", service_name="lf27-g05"}  0s  ab=1 c=2
+
+clear
+
+load
+  {service_name="lf27-g06"}
+  0s  ab=1 c=2
+
+eval instant at 60s {service_name="lf27-g06"} | logfmt --strict
+  {b="1", c="2", service_name="lf27-g06"}  0s  ab=1 c=2
+
+clear
+
+load
+  {service_name="lf27-x01l"}
+  0s  a="x"b c=1
+
+# The reference answers `{a="x", c="1", service_name="lf27-x01l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x01l"} | logfmt
+  {c="1", service_name="lf27-x01l"}  0s  a="x"b c=1
+
+clear
+
+load
+  {service_name="lf27-x01s"}
+  0s  a="x"b c=1
+
+# The reference answers `{a="x", c="1", service_name="lf27-x01s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected 'b'", service_name="lf27-x01s"}  0s  a="x"b c=1
+
+clear
+
+load
+  {service_name="lf27-x01k"}
+  0s  a="x"b c=1
+
+# The reference answers `{a="x", b="", c="1", service_name="lf27-x01k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x01k"} | logfmt --keep-empty
+  {c="1", service_name="lf27-x01k"}  0s  a="x"b c=1
+
+clear
+
+load
+  {service_name="lf27-x02l"}
+  0s  a="x"=1 c=2
+
+# The reference answers `{a="x", c="2", service_name="lf27-x02l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x02l"} | logfmt
+  {c="2", service_name="lf27-x02l"}  0s  a="x"=1 c=2
+
+clear
+
+load
+  {service_name="lf27-x02s"}
+  0s  a="x"=1 c=2
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '='", a="x", service_name="lf27-x02s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '='", service_name="lf27-x02s"}  0s  a="x"=1 c=2
+
+clear
+
+load
+  {service_name="lf27-x02k"}
+  0s  a="x"=1 c=2
+
+# The reference answers `{a="x", c="2", service_name="lf27-x02k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-x02k"} | logfmt --keep-empty
+  {c="2", service_name="lf27-x02k"}  0s  a="x"=1 c=2
+
+clear
+
+load
+  {service_name="lf27-x09l"}
+  0s  a="\ud800" c=2
+
+# The reference answers `{a=" ", c="2", service_name="lf27-x09l"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x09l"} | logfmt
+  {a="�", c="2", service_name="lf27-x09l"}  0s  a="\ud800" c=2
+
+clear
+
+load
+  {service_name="lf27-x09s"}
+  0s  a="\ud800" c=2
+
+# The reference answers `{a=" ", c="2", service_name="lf27-x09s"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x09s"} | logfmt --strict
+  {a="�", c="2", service_name="lf27-x09s"}  0s  a="\ud800" c=2
+
+clear
+
+load
+  {service_name="lf27-x09k"}
+  0s  a="\ud800" c=2
+
+# The reference answers `{a=" ", c="2", service_name="lf27-x09k"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x09k"} | logfmt --keep-empty
+  {a="�", c="2", service_name="lf27-x09k"}  0s  a="\ud800" c=2
+
+clear
+
+load
+  {service_name="lf27-x22l"}
+  0s  a=� d=2
+
+# The reference answers `{a=" ", d="2", service_name="lf27-x22l"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x22l"} | logfmt
+  {a="�", d="2", service_name="lf27-x22l"}  0s  a=� d=2
+
+clear
+
+load
+  {service_name="lf27-x22s"}
+  0s  a=� d=2
+
+# The reference answers `{a=" ", d="2", service_name="lf27-x22s"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x22s"} | logfmt --strict
+  {a="�", d="2", service_name="lf27-x22s"}  0s  a=� d=2
+
+clear
+
+load
+  {service_name="lf27-x22k"}
+  0s  a=� d=2
+
+# The reference answers `{a=" ", d="2", service_name="lf27-x22k"}` here (captured).
+# provenance: divergence(logfmt-replacement-character-value)
+eval instant at 60s {service_name="lf27-x22k"} | logfmt --keep-empty
+  {a="�", d="2", service_name="lf27-x22k"}  0s  a=� d=2
+
+clear
+
+load
+  {service_name="lf27-u01l"}
+  0s  level=info msg="user "bob" logged in" status=200
+
+# The reference answers `{level="info", msg="user ", service_name="lf27-u01l", status="200"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u01l"} | logfmt
+  {level="info", service_name="lf27-u01l", status="200"}  0s  level=info msg="user "bob" logged in" status=200
+
+clear
+
+load
+  {service_name="lf27-u01s"}
+  0s  level=info msg="user "bob" logged in" status=200
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 26 : unexpected '\"'", level="info", msg="user ", service_name="lf27-u01s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 23 : unexpected 'b'", level="info", service_name="lf27-u01s"}  0s  level=info msg="user "bob" logged in" status=200
+
+clear
+
+load
+  {service_name="lf27-u01k"}
+  0s  level=info msg="user "bob" logged in" status=200
+
+# The reference answers `{level="info", logged="", msg="user ", service_name="lf27-u01k", status="200"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u01k"} | logfmt --keep-empty
+  {level="info", service_name="lf27-u01k", status="200"}  0s  level=info msg="user "bob" logged in" status=200
+
+clear
+
+load
+  {service_name="lf27-u02l"}
+  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+# The reference answers `{level="info", msg="ok", service_name="lf27-u02l", time="2026-09-13T10:00:00Z"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u02l"} | logfmt
+  {msg="ok", service_name="lf27-u02l"}  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+clear
+
+load
+  {service_name="lf27-u02s"}
+  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+# The reference answers `{level="info", msg="ok", service_name="lf27-u02s", time="2026-09-13T10:00:00Z"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 28 : unexpected 'l'", service_name="lf27-u02s"}  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+clear
+
+load
+  {service_name="lf27-u02k"}
+  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+# The reference answers `{level="info", msg="ok", service_name="lf27-u02k", time="2026-09-13T10:00:00Z"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-u02k"} | logfmt --keep-empty
+  {msg="ok", service_name="lf27-u02k"}  0s  time="2026-09-13T10:00:00Z"level=info msg=ok
+
+clear
+
+load
+  {service_name="lf27-u03l"}
+  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+eval instant at 60s {service_name="lf27-u03l"} | logfmt
+  {level="info", msg="user bob logged in", path="/api/v1/items", service_name="lf27-u03l", status="200"}  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+clear
+
+load
+  {service_name="lf27-u03s"}
+  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+eval instant at 60s {service_name="lf27-u03s"} | logfmt --strict
+  {level="info", msg="user bob logged in", path="/api/v1/items", service_name="lf27-u03s", status="200"}  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+clear
+
+load
+  {service_name="lf27-u03k"}
+  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+eval instant at 60s {service_name="lf27-u03k"} | logfmt --keep-empty
+  {level="info", msg="user bob logged in", path="/api/v1/items", service_name="lf27-u03k", status="200"}  0s  level=info msg="user bob logged in" status=200 path="/api/v1/items"
+
+clear
+
+load
+  {service_name="lf27-v01l"}
+  0s  level=info msg="user "bob" role=admin now" status=200
+
+# The reference answers `{level="info", msg="user ", role="admin", service_name="lf27-v01l", status="200"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v01l"} | logfmt
+  {level="info", service_name="lf27-v01l", status="200"}  0s  level=info msg="user "bob" role=admin now" status=200
+
+clear
+
+load
+  {service_name="lf27-v01s"}
+  0s  level=info msg="user "bob" role=admin now" status=200
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 26 : unexpected '\"'", level="info", msg="user ", service_name="lf27-v01s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 23 : unexpected 'b'", level="info", service_name="lf27-v01s"}  0s  level=info msg="user "bob" role=admin now" status=200
+
+clear
+
+load
+  {service_name="lf27-v01k"}
+  0s  level=info msg="user "bob" role=admin now" status=200
+
+# The reference answers `{level="info", msg="user ", role="admin", service_name="lf27-v01k", status="200"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v01k"} | logfmt --keep-empty
+  {level="info", service_name="lf27-v01k", status="200"}  0s  level=info msg="user "bob" role=admin now" status=200
+
+clear
+
+load
+  {service_name="lf27-v02l"}
+  0s  msg="a "b=c" d=e"
+
+# The reference answers `{msg="a ", service_name="lf27-v02l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v02l"} | logfmt
+  {service_name="lf27-v02l"}  0s  msg="a "b=c" d=e"
+
+clear
+
+load
+  {service_name="lf27-v02s"}
+  0s  msg="a "b=c" d=e"
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 12 : unexpected '\"'", msg="a ", service_name="lf27-v02s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 9 : unexpected 'b'", service_name="lf27-v02s"}  0s  msg="a "b=c" d=e"
+
+clear
+
+load
+  {service_name="lf27-v02k"}
+  0s  msg="a "b=c" d=e"
+
+# The reference answers `{msg="a ", service_name="lf27-v02k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v02k"} | logfmt --keep-empty
+  {service_name="lf27-v02k"}  0s  msg="a "b=c" d=e"
+
+clear
+
+load
+  {service_name="lf27-v04l"}
+  0s  a="x""y" c=1
+
+# The reference answers `{a="x", c="1", service_name="lf27-v04l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v04l"} | logfmt
+  {c="1", service_name="lf27-v04l"}  0s  a="x""y" c=1
+
+clear
+
+load
+  {service_name="lf27-v04s"}
+  0s  a="x""y" c=1
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", a="x", service_name="lf27-v04s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v04s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", service_name="lf27-v04s"}  0s  a="x""y" c=1
+
+clear
+
+load
+  {service_name="lf27-v04k"}
+  0s  a="x""y" c=1
+
+# The reference answers `{a="x", c="1", service_name="lf27-v04k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-v04k"} | logfmt --keep-empty
+  {c="1", service_name="lf27-v04k"}  0s  a="x""y" c=1
+
+clear
+
+load
+  {service_name="lf27-w01l"}
+  0s  level=info filter=name="john x=1 smith" status=200
+
+# The reference answers `{level="info", service_name="lf27-w01l", status="200", x="1"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-w01l"} | logfmt
+  {level="info", service_name="lf27-w01l", status="200"}  0s  level=info filter=name="john x=1 smith" status=200
+
+clear
+
+load
+  {service_name="lf27-w01s"}
+  0s  level=info filter=name="john x=1 smith" status=200
+
+eval instant at 60s {service_name="lf27-w01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 23 : unexpected '='", level="info", service_name="lf27-w01s"}  0s  level=info filter=name="john x=1 smith" status=200
+
+clear
+
+load
+  {service_name="lf27-w01k"}
+  0s  level=info filter=name="john x=1 smith" status=200
+
+# The reference answers `{level="info", service_name="lf27-w01k", status="200", x="1"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-w01k"} | logfmt --keep-empty
+  {level="info", service_name="lf27-w01k", status="200"}  0s  level=info filter=name="john x=1 smith" status=200
+
+clear
+
+load
+  {service_name="lf27-w02l"}
+  0s  level=info "msg=user x=1" status=200
+
+eval instant at 60s {service_name="lf27-w02l"} | logfmt
+  {level="info", service_name="lf27-w02l", status="200"}  0s  level=info "msg=user x=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w02s"}
+  0s  level=info "msg=user x=1" status=200
+
+eval instant at 60s {service_name="lf27-w02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 12 : unexpected '\"'", level="info", service_name="lf27-w02s"}  0s  level=info "msg=user x=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w02k"}
+  0s  level=info "msg=user x=1" status=200
+
+eval instant at 60s {service_name="lf27-w02k"} | logfmt --keep-empty
+  {level="info", service_name="lf27-w02k", status="200"}  0s  level=info "msg=user x=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w03l"}
+  0s  a=1"b c=2" d=3
+
+eval instant at 60s {service_name="lf27-w03l"} | logfmt
+  {d="3", service_name="lf27-w03l"}  0s  a=1"b c=2" d=3
+
+clear
+
+load
+  {service_name="lf27-w03s"}
+  0s  a=1"b c=2" d=3
+
+eval instant at 60s {service_name="lf27-w03s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-w03s"}  0s  a=1"b c=2" d=3
+
+clear
+
+load
+  {service_name="lf27-w03k"}
+  0s  a=1"b c=2" d=3
+
+eval instant at 60s {service_name="lf27-w03k"} | logfmt --keep-empty
+  {d="3", service_name="lf27-w03k"}  0s  a=1"b c=2" d=3
+
+clear
+
+load
+  {service_name="lf27-w04l"}
+  0s  level=info q=a="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w04l"} | logfmt
+  {d="2", level="info", service_name="lf27-w04l"}  0s  level=info q=a="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-w04s"}
+  0s  level=info q=a="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w04s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 15 : unexpected '='", level="info", service_name="lf27-w04s"}  0s  level=info q=a="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-w04k"}
+  0s  level=info q=a="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w04k"} | logfmt --keep-empty
+  {d="2", level="info", service_name="lf27-w04k"}  0s  level=info q=a="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-w05l"}
+  0s  level=info url=http://x?a="b c=1" status=200
+
+eval instant at 60s {service_name="lf27-w05l"} | logfmt
+  {level="info", service_name="lf27-w05l", status="200"}  0s  level=info url=http://x?a="b c=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w05s"}
+  0s  level=info url=http://x?a="b c=1" status=200
+
+eval instant at 60s {service_name="lf27-w05s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 26 : unexpected '='", level="info", service_name="lf27-w05s"}  0s  level=info url=http://x?a="b c=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w05k"}
+  0s  level=info url=http://x?a="b c=1" status=200
+
+eval instant at 60s {service_name="lf27-w05k"} | logfmt --keep-empty
+  {level="info", service_name="lf27-w05k", status="200"}  0s  level=info url=http://x?a="b c=1" status=200
+
+clear
+
+load
+  {service_name="lf27-w06l"}
+  0s  level=info ke"y="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w06l"} | logfmt
+  {d="2", level="info", service_name="lf27-w06l"}  0s  level=info ke"y="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-w06s"}
+  0s  level=info ke"y="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w06s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 14 : unexpected '\"'", level="info", service_name="lf27-w06s"}  0s  level=info ke"y="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-w06k"}
+  0s  level=info ke"y="b c=1" d=2
+
+eval instant at 60s {service_name="lf27-w06k"} | logfmt --keep-empty
+  {d="2", level="info", service_name="lf27-w06k"}  0s  level=info ke"y="b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-m01l"}
+  0s  a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m01l"} | logfmt
+  {e="2", service_name="lf27-m01l"}  0s  a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m01s"}
+  0s  a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m01s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-m01s"}  0s  a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m01k"}
+  0s  a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m01k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m01k"}  0s  a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m02l"}
+  0s  k="a b"="c d=1" e=2
+
+# The reference answers `{e="2", k="a b", service_name="lf27-m02l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m02l"} | logfmt
+  {e="2", service_name="lf27-m02l"}  0s  k="a b"="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m02s"}
+  0s  k="a b"="c d=1" e=2
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 8 : unexpected '='", k="a b", service_name="lf27-m02s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m02s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 8 : unexpected '='", service_name="lf27-m02s"}  0s  k="a b"="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m02k"}
+  0s  k="a b"="c d=1" e=2
+
+# The reference answers `{e="2", k="a b", service_name="lf27-m02k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m02k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m02k"}  0s  k="a b"="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m03l"}
+  0s  k=x="a b=1 c"d e=2
+
+# The reference answers `{b="1", e="2", service_name="lf27-m03l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m03l"} | logfmt
+  {e="2", service_name="lf27-m03l"}  0s  k=x="a b=1 c"d e=2
+
+clear
+
+load
+  {service_name="lf27-m03s"}
+  0s  k=x="a b=1 c"d e=2
+
+eval instant at 60s {service_name="lf27-m03s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '='", service_name="lf27-m03s"}  0s  k=x="a b=1 c"d e=2
+
+clear
+
+load
+  {service_name="lf27-m03k"}
+  0s  k=x="a b=1 c"d e=2
+
+# The reference answers `{b="1", e="2", service_name="lf27-m03k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m03k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m03k"}  0s  k=x="a b=1 c"d e=2
+
+clear
+
+load
+  {service_name="lf27-m04l"}
+  0s  "k"="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m04l"} | logfmt
+  {e="2", service_name="lf27-m04l"}  0s  "k"="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m04s"}
+  0s  "k"="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m04s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '\"'", service_name="lf27-m04s"}  0s  "k"="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m04k"}
+  0s  "k"="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m04k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m04k"}  0s  "k"="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m05l"}
+  0s  k=="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m05l"} | logfmt
+  {e="2", service_name="lf27-m05l"}  0s  k=="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m05s"}
+  0s  k=="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m05s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 3 : unexpected '='", service_name="lf27-m05s"}  0s  k=="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m05k"}
+  0s  k=="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m05k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m05k"}  0s  k=="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m06l"}
+  0s  ="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m06l"} | logfmt
+  {e="2", service_name="lf27-m06l"}  0s  ="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m06s"}
+  0s  ="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m06s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '='", service_name="lf27-m06s"}  0s  ="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m06k"}
+  0s  ="a b=1" e=2
+
+eval instant at 60s {service_name="lf27-m06k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m06k"}  0s  ="a b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m07l"}
+  0s  k=v\"x b=1" e=2
+
+eval instant at 60s {service_name="lf27-m07l"} | logfmt
+  {e="2", service_name="lf27-m07l"}  0s  k=v\"x b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m07s"}
+  0s  k=v\"x b=1" e=2
+
+eval instant at 60s {service_name="lf27-m07s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 5 : unexpected '\"'", service_name="lf27-m07s"}  0s  k=v\"x b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m07k"}
+  0s  k=v\"x b=1" e=2
+
+eval instant at 60s {service_name="lf27-m07k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m07k"}  0s  k=v\"x b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m08l"}
+  0s  k="a\" b=1" e=2
+
+eval instant at 60s {service_name="lf27-m08l"} | logfmt
+  {e="2", k="a\" b=1", service_name="lf27-m08l"}  0s  k="a\" b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m08s"}
+  0s  k="a\" b=1" e=2
+
+eval instant at 60s {service_name="lf27-m08s"} | logfmt --strict
+  {e="2", k="a\" b=1", service_name="lf27-m08s"}  0s  k="a\" b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m08k"}
+  0s  k="a\" b=1" e=2
+
+eval instant at 60s {service_name="lf27-m08k"} | logfmt --keep-empty
+  {e="2", k="a\" b=1", service_name="lf27-m08k"}  0s  k="a\" b=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m09l"}
+  0s  a=x"y" b=1
+
+eval instant at 60s {service_name="lf27-m09l"} | logfmt
+  {b="1", service_name="lf27-m09l"}  0s  a=x"y" b=1
+
+clear
+
+load
+  {service_name="lf27-m09s"}
+  0s  a=x"y" b=1
+
+eval instant at 60s {service_name="lf27-m09s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-m09s"}  0s  a=x"y" b=1
+
+clear
+
+load
+  {service_name="lf27-m09k"}
+  0s  a=x"y" b=1
+
+eval instant at 60s {service_name="lf27-m09k"} | logfmt --keep-empty
+  {b="1", service_name="lf27-m09k"}  0s  a=x"y" b=1
+
+clear
+
+load
+  {service_name="lf27-m10l"}
+  0s  x=1 y="unterminated z=2
+
+eval instant at 60s {service_name="lf27-m10l"} | logfmt
+  {service_name="lf27-m10l", x="1"}  0s  x=1 y="unterminated z=2
+
+clear
+
+load
+  {service_name="lf27-m10s"}
+  0s  x=1 y="unterminated z=2
+
+eval instant at 60s {service_name="lf27-m10s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 24 : unterminated quoted value", service_name="lf27-m10s", x="1"}  0s  x=1 y="unterminated z=2
+
+clear
+
+load
+  {service_name="lf27-m10k"}
+  0s  x=1 y="unterminated z=2
+
+eval instant at 60s {service_name="lf27-m10k"} | logfmt --keep-empty
+  {service_name="lf27-m10k", x="1"}  0s  x=1 y="unterminated z=2
+
+clear
+
+load
+  {service_name="lf27-m11l"}
+  0s  k=é="a b=1" c=2
+
+eval instant at 60s {service_name="lf27-m11l"} | logfmt
+  {c="2", service_name="lf27-m11l"}  0s  k=é="a b=1" c=2
+
+clear
+
+load
+  {service_name="lf27-m11s"}
+  0s  k=é="a b=1" c=2
+
+eval instant at 60s {service_name="lf27-m11s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 5 : unexpected '='", service_name="lf27-m11s"}  0s  k=é="a b=1" c=2
+
+clear
+
+load
+  {service_name="lf27-m11k"}
+  0s  k=é="a b=1" c=2
+
+eval instant at 60s {service_name="lf27-m11k"} | logfmt --keep-empty
+  {c="2", service_name="lf27-m11k"}  0s  k=é="a b=1" c=2
+
+clear
+
+load
+  {service_name="lf27-m12l"}
+  0s  k=1"="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m12l"} | logfmt
+  {c="3", service_name="lf27-m12l"}  0s  k=1"="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-m12s"}
+  0s  k=1"="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m12s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '\"'", service_name="lf27-m12s"}  0s  k=1"="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-m12k"}
+  0s  k=1"="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m12k"} | logfmt --keep-empty
+  {c="3", service_name="lf27-m12k"}  0s  k=1"="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-m13l"}
+  0s  level=info msg="a" "b c=1" d=2
+
+eval instant at 60s {service_name="lf27-m13l"} | logfmt
+  {d="2", level="info", msg="a", service_name="lf27-m13l"}  0s  level=info msg="a" "b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-m13s"}
+  0s  level=info msg="a" "b c=1" d=2
+
+eval instant at 60s {service_name="lf27-m13s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 20 : unexpected '\"'", level="info", msg="a", service_name="lf27-m13s"}  0s  level=info msg="a" "b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-m13k"}
+  0s  level=info msg="a" "b c=1" d=2
+
+eval instant at 60s {service_name="lf27-m13k"} | logfmt --keep-empty
+  {d="2", level="info", msg="a", service_name="lf27-m13k"}  0s  level=info msg="a" "b c=1" d=2
+
+clear
+
+load
+  {service_name="lf27-m14l"}
+  0s  k="a"b="c d=1" e=2
+
+# The reference answers `{b="c d=1", e="2", k="a", service_name="lf27-m14l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m14l"} | logfmt
+  {e="2", service_name="lf27-m14l"}  0s  k="a"b="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m14s"}
+  0s  k="a"b="c d=1" e=2
+
+# The reference answers `{b="c d=1", e="2", k="a", service_name="lf27-m14s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m14s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected 'b'", service_name="lf27-m14s"}  0s  k="a"b="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m14k"}
+  0s  k="a"b="c d=1" e=2
+
+# The reference answers `{b="c d=1", e="2", k="a", service_name="lf27-m14k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m14k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m14k"}  0s  k="a"b="c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m15l"}
+  0s  k="a"\"b c=1" e=2
+
+# The reference answers `{e="2", k="a", service_name="lf27-m15l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m15l"} | logfmt
+  {e="2", service_name="lf27-m15l"}  0s  k="a"\"b c=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m15s"}
+  0s  k="a"\"b c=1" e=2
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 7 : unexpected '\"'", k="a", service_name="lf27-m15s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m15s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\\'", service_name="lf27-m15s"}  0s  k="a"\"b c=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m15k"}
+  0s  k="a"\"b c=1" e=2
+
+# The reference answers `{e="2", k="a", service_name="lf27-m15k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m15k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m15k"}  0s  k="a"\"b c=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m16l"}
+  0s  k="a""b=c d=1" e=2
+
+# The reference answers `{e="2", k="a", service_name="lf27-m16l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m16l"} | logfmt
+  {e="2", service_name="lf27-m16l"}  0s  k="a""b=c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m16s"}
+  0s  k="a""b=c d=1" e=2
+
+# The reference answers `{__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", k="a", service_name="lf27-m16s"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m16s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 6 : unexpected '\"'", service_name="lf27-m16s"}  0s  k="a""b=c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m16k"}
+  0s  k="a""b=c d=1" e=2
+
+# The reference answers `{e="2", k="a", service_name="lf27-m16k"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-m16k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m16k"}  0s  k="a""b=c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m17l"}
+  0s  k=a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m17l"} | logfmt
+  {e="2", service_name="lf27-m17l"}  0s  k=a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m17s"}
+  0s  k=a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m17s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 4 : unexpected '='", service_name="lf27-m17s"}  0s  k=a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m17k"}
+  0s  k=a=b"c d=1" e=2
+
+eval instant at 60s {service_name="lf27-m17k"} | logfmt --keep-empty
+  {e="2", service_name="lf27-m17k"}  0s  k=a=b"c d=1" e=2
+
+clear
+
+load
+  {service_name="lf27-m18l"}
+  0s  k==x y=1 z="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m18l"} | logfmt
+  {c="3", service_name="lf27-m18l", y="1", z="a b=2"}  0s  k==x y=1 z="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-m18s"}
+  0s  k==x y=1 z="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m18s"} | logfmt --strict
+  {__error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 3 : unexpected '='", service_name="lf27-m18s"}  0s  k==x y=1 z="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-m18k"}
+  0s  k==x y=1 z="a b=2" c=3
+
+eval instant at 60s {service_name="lf27-m18k"} | logfmt --keep-empty
+  {c="3", service_name="lf27-m18k", y="1", z="a b=2"}  0s  k==x y=1 z="a b=2" c=3
+
+clear
+
+load
+  {service_name="lf27-L071l"}
+  0s  "f=2{"j":1}be="openx g=3
+
+# The reference answers `{g="3", service_name="lf27-L071l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-L071l"} | logfmt
+  {service_name="lf27-L071l"}  0s  "f=2{"j":1}be="openx g=3
+
+clear
+
+load
+  {service_name="lf27-L276l"}
+  0s  a=1b="q"e="open d="u\"v" g=3x
+
+# The reference answers `{d="u\"v", g="3x", service_name="lf27-L276l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-L276l"} | logfmt
+  {g="3x", service_name="lf27-L276l"}  0s  a=1b="q"e="open d="u\"v" g=3x
+
+clear
+
+load
+  {service_name="lf27-L306l"}
+  0s  é"v w"b="q"b="q"\c=" g=3
+
+# The reference answers `{g="3", service_name="lf27-L306l"}` here (captured).
+# provenance: divergence(logfmt-quoted-value-ends-its-token)
+eval instant at 60s {service_name="lf27-L306l"} | logfmt
+  {service_name="lf27-L306l"}  0s  é"v w"b="q"b="q"\c=" g=3
+
+clear

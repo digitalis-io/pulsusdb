@@ -1373,15 +1373,26 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            4,
+            7,
             0,
-            "streams :612, metric :906 (incl. every binary leaf), detected_fields :2290, tail \
-             :2576. `POSITIONS` reaches the first TWO and no more: every position is a \
-             `query_range`-shaped log or metric query, so nothing in this file executes \
-             `detected_fields` or `tail`. Those two call sites are therefore UNCOVERED by \
-             this file, and left visibly so — the sub-grammar RULE they would exercise is \
-             the same one the streams positions already pin, but the sites themselves are \
-             not driven by anything here",
+            "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
+             read's capability-join fallback, the extracted-field group key read, \
+             detected_fields, tail, and — since issue #544 — the restored client stage a \
+             metric read swaps in when its structured-metadata fragment exceeds its budget. \
+             That seventh site compiles `MetadataLowering::client_without_lowering`, which \
+             is the pipeline the planner would have carried, so any logfmt expression in it \
+             is one the metric site at :1444 already compiles for the same query. \
+             `POSITIONS` reaches the first TWO and no more: \
+             every position is a `query_range`-shaped log or metric query, so nothing in \
+             this file executes `detected_fields` or `tail`. Those two call sites are \
+             therefore UNCOVERED by this file, and left visibly so — the sub-grammar RULE \
+             they would exercise is the same one the streams positions already pin, but the \
+             sites themselves are not driven by anything here. The bucketed fallback is a \
+             fifth site no position needs: it compiles `bucketed_fallback_client_agg`'s \
+             pipeline, which is EMPTY by construction, so no user stage of any kind reaches \
+             that compiler. The extracted-field group key read compiles a pipeline this \
+             file's positions never write either: the planner admits only a `json` stage, \
+             label filters and an `unwrap` (issue #507), so no logfmt expression can be in it",
         ),
         (
             "plan.rs",
@@ -1391,6 +1402,15 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              (issue #247 round 2, mirroring `evaluator.go:1417 @ v3.7.4`) — the \
              `variants_variant_side` position covers it, and `Refusal::PlanTime` records that \
              it refuses here rather than at a pipeline compile",
+        ),
+        (
+            "unwrap_group.rs",
+            1,
+            0,
+            "the test-only group key probe (`group_key_probe`, issue #507) compiles the \
+             pipeline the planner admitted for the extracted-field group key read, for the \
+             agreement measurement; that pipeline is a `json` stage, label filters and an \
+             `unwrap`, so no logfmt expression can be in it, and no position here reaches it",
         ),
         (
             "variants.rs",

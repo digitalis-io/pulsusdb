@@ -2772,3 +2772,137 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     // reports no `<Combined skip indexes>` pseudo-block here (measured).
     assert!(!combined_skip_present(&raw));
 }
+
+/// The `Granules: m/n` line of the `PrimaryKey` block of raw
+/// `EXPLAIN indexes = 1` text.
+fn primary_key_granules(raw: &str) -> Option<(u64, u64)> {
+    let mut in_pk = false;
+    for line in raw.lines() {
+        let t = line.trim();
+        if matches!(t, "MinMax" | "Partition" | "PrimaryKey" | "Skip") {
+            in_pk = t == "PrimaryKey";
+        } else if in_pk && let Some(rest) = t.strip_prefix("Granules: ") {
+            let (m, n) = rest.split_once('/')?;
+            return Some((m.trim().parse().ok()?, n.trim().parse().ok()?));
+        }
+    }
+    None
+}
+
+/// **Criterion 10: the group key read selects the raw scan's granules**
+/// (issue #507).
+///
+/// S1, L and today's sliding raw scan read the same `log_samples` rows under
+/// the same service, fingerprint and time predicates, so the `(service,
+/// fingerprint, timestamp_ns)` primary key must select the same granules
+/// for all three. The corpus is 20 streams over twelve minutes, one row
+/// every 1.8 ms (400,000 rows, about 49 granules); the read is two minutes
+/// of 18 of the streams.
+#[tokio::test]
+async fn the_group_key_read_selects_the_raw_scans_granules() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let db = &pulsus_testkit::test_db("pulsus_read_it_group_key_granules");
+    let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    let client = setup(db, start).await;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 SELECT 'checkout', 1000 + (number % 20), {start} + 1 + number * 1800000, 0, \
+                 concat('{{\"status\":', toString([200,500][number % 2 + 1]), ',\"latency\":', toString(number % 97), '}}') \
+                 FROM numbers(400000)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the granule corpus");
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.log_samples FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("one part");
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start + 6 * MIN,
+            end_ns: start + 7 * MIN,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(
+        r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#,
+        &params,
+        db,
+    );
+    let sql::MetricValue::Unwrapped(u) = &mp.value else {
+        panic!("the plan is the group key read");
+    };
+    let fps: Vec<u64> = (1000..1018).collect();
+    let table = format!("{db}.log_samples");
+    let columns = sql::GroupKeyColumns {
+        keys: u.keys.iter().map(|k| (k.clone(), Vec::new())).collect(),
+        classes: Some(vec![fps.clone()]),
+    };
+    let step = mp.step_ns.expect("a range plan").get() as i64;
+    let scan = sql::BucketedScan {
+        window: TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        lower: mp.scan_lower,
+        lo_ns: mp.grid_start_ns - step,
+        step_ns: step,
+    };
+    let s1 = sql::metric_range_unwrapped(
+        &table,
+        u,
+        &columns,
+        &[literal("checkout")],
+        &fps,
+        scan,
+        &mp.extra_predicates,
+        sql::UndecidedRows::Throw,
+        None,
+    )
+    .expect("render S1");
+    let lane = sql::metric_range_unwrapped_rows(
+        &table,
+        u,
+        &columns,
+        &[literal("checkout")],
+        &fps,
+        scan,
+        &mp.extra_predicates,
+    )
+    .expect("render L");
+    let raw = sql::metric_raw_samples_sliding(
+        &table,
+        &[literal("checkout")],
+        &fps,
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        mp.scan_lower,
+        &mp.extra_predicates,
+        ScanProjection::WithStructuredMetadata,
+    );
+    let raw_granules = primary_key_granules(&explain_raw(&client, &raw).await)
+        .expect("the raw scan's PrimaryKey Granules");
+    assert!(
+        raw_granules.0 < raw_granules.1,
+        "the fixture must let the primary key prune: {raw_granules:?}"
+    );
+    for (what, sql) in [("S1", &s1), ("L", &lane)] {
+        let got = primary_key_granules(&explain_raw(&client, sql).await)
+            .unwrap_or_else(|| panic!("{what}: a PrimaryKey Granules line"));
+        assert_eq!(got, raw_granules, "{what} selects the raw scan's granules");
+    }
+    drop_database(&client, db).await;
+}

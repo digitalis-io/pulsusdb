@@ -234,7 +234,7 @@ fn discovery_from_where(
 /// matchers the `WHERE` renders them as `JSONExtractString(labels, '<key>')`
 /// predicates, so `labels` **is** read to evaluate the filter; the win
 /// there is transport and parse count (rows collapse from one-per-series to
-/// one-per-metric-name, and `parse_canonical_labels` is not called at all),
+/// one-per-metric-name, and `parse_canonical_label_set` is not called at all),
 /// not bytes read.
 ///
 /// **NO `LIMIT`.** The discovery `limit` stays a response-size cap applied

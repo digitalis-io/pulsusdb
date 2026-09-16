@@ -157,9 +157,24 @@ Out of this ledger's scope by design:
   the physical stream identity is not black-box-observable, and Loki exposes
   no comparable fingerprint. #97 pins that storage semantics hermetically
   (`protocols/loki_push.rs`, `writer/rows.rs`); this lane does not fabricate a
-  cross-store fingerprint assertion. There is **no SM predicate pushdown** —
-  SM label filters are evaluated client-side (the #97 baseline), so this lane
-  adds no read-path SQL and cannot regress the Tier-1 SQL/alloc goldens.
+  cross-store fingerprint assertion. **SM predicate pushdown exists for the equality
+  and inequality forms since issue #544**: `| trace_id="…"` and
+  `| trace_id!="…"` compile into the sample statement, and the request
+  `LIMIT` compiles with them. The regular-expression and numeric forms are
+  still evaluated client-side, and so are the two fallbacks, each of
+  which takes the route it takes today with the same answer: a filter
+  whose rendered fragments exceed `MAX_METADATA_FRAGMENT_BYTES`, and a
+  filter over a stream carrying both the name and that name without its
+  `_extracted` suffix as labels, where the renamed pair overwrites the
+  stream label of that name. The second half of the withdrawn
+  sentence goes with the first: this lane no longer "adds no read-path SQL
+  and cannot regress the Tier-1 SQL/alloc goldens" by construction. What
+  holds it to them instead is stated rather than assumed —
+  `crates/pulsus-read/tests/golden_sql_freeze.rs` and the Tier-1 gates in
+  `crates/pulsus-read/tests/query_log_gates.rs` carry no SM label filter,
+  so the predicate this lane can now emit appears in none of their frozen
+  statements, and a corpus entry that grew one would move those goldens
+  and redden them.
   **Cross-store duplicate-on-retry semantics are a permanent carve-out
   (issue #102 un-defer).** `grafana/loki:3.4.2`'s native `/loki/api/v1/push`
   has no idempotency-key or request-dedup contract, so whether a live
@@ -2645,13 +2660,15 @@ clients only display it).
 
 ### `json-nonvalidating-scan-residual` (issue #389, measured residual — the record, not a fix)
 
-- **What issue #389 CLOSED, so this row is not read as covering it.**
-  A line with bytes after a COMPLETE JSON value is now parsed as the
-  reference parses it, at all of `| json`, `| json <id>="<path>"` and
-  `| unpack`; a targeted extraction that lands on an object or array
-  now hands back the document's own bytes. Those are parity, gated by
-  `b23_json_raw_read.test` and `tests/logql_pipeline_golden.rs`. What
-  remains is the class below, which is a different mechanism.
+- **What issue #389 closed, what issue #507 changed, and so what this row
+  does not cover.** Issue #389 made a line with bytes after a complete JSON
+  value parse as the reference parses it; issue #507 reversed that: a line is
+  JSON only when it is one JSON text (`json-text-is-one-value`), and the
+  targeted form reports a line that is not one exactly as the bare form does
+  (`json-targeted-line-that-does-not-parse`). A targeted extraction that
+  lands on an object or array still hands back the document's own bytes.
+  What remains here is the class below, a line malformed in the middle, which
+  the reference reads past and we refuse on every form.
 - **Reference behaviour.** grafana/loki v3.7.4 reads a log line with
   `jsonparser`, a scanner that never validates the document. `EachKey`'s
   byte dispatch has no default case
@@ -2669,11 +2686,11 @@ clients only display it).
   | line | query | reference | PulsusDB |
   |---|---|---|---|
   | `{"o":{"z":1}x,"a":2}` | `\| json` | `o_z="1"` **and** the error pair | the error pair alone |
-  | `{"o":{"z":1}x,"a":2}` | `\| json v="a"` | `v="2"` | `v=""` |
-  | `{"o":{"z":1}x,"a":2}` | `\| json o="o"` | `o="{"z":1}"` | `o=""` |
+  | `{"o":{"z":1}x,"a":2}` | `\| json v="a"` | `v="2"` | the error pair (`v=""` before issue #507) |
+  | `{"o":{"z":1}x,"a":2}` | `\| json o="o"` | `o="{"z":1}"` | the error pair (`o=""` before issue #507) |
   | `{"o":["a\qb"],"a":2}` | `\| json` | `a="2"`, no error at all | the error pair, no label |
-  | `{"o":["a\qb"],"a":2}` | `\| json v="a"` | `v="2"` | `v=""` |
-  | `{"o":["a\qb"],"a":2}` | `\| json o="o"` | `o=""` | `o=""` — the bound: where the malformed part is INSIDE the selected span, both sides answer the empty string |
+  | `{"o":["a\qb"],"a":2}` | `\| json v="a"` | `v="2"` | the error pair (`v=""` before issue #507) |
+  | `{"o":["a\qb"],"a":2}` | `\| json o="o"` | `o=""` | the error pair; before issue #507 both answered `o=""`, and that row now names `json-targeted-line-that-does-not-parse` |
 
 - **Why deliberate, for now.** Closing it means writing a
   non-validating JSON scanner of our own; nothing short of that reaches
@@ -3786,55 +3803,68 @@ a divergence at a public surface, found while implementing the cap.
     `count_over_time({app="a…"}[5m])` at exactly 100,000 / 131,071 /
     131,072 bytes.
 
-### `grouped-avg-over-time-unexplained` (issue #344 review round 1, MEASURED, MECHANISM UNIDENTIFIED)
+### `grouped-avg-over-time-unexplained` (issue #344 review round 1; mechanism identified by issue #507, deliberate divergence)
 
-**This entry is not a deliberate divergence.** Every other entry in this
-file records a difference we chose, with a reason. This one records a
-difference we **measured and cannot yet explain**, and it is here so that
-the measurement is not lost and so that no future reader mistakes the
-absence of a corpus row for an oversight.
+The id is kept so existing references resolve; the mechanism is no longer
+unexplained.
 
-- **What was measured.** On the pinned `grafana/loki:3.7.4`, default
-  single-binary config, the reference answers a GROUPED `avg_over_time`
-  differently from an UNGROUPED one over the same samples in the same
-  order. One stream, four samples at distinct ascending timestamps
-  `{83.2, 42.2, 79.0, 12.6}`:
+- **The mechanism.** The reference's query planner rewrites a grouped
+  `avg_over_time(<log range> | unwrap x [r]) by (L)` into
+  `sum by (L) (sum_over_time(<log range> | unwrap x [r])) / sum by (L) (count_over_time(<log range> [r]))`
+  whenever the grouping is not the no-op `without ()` or a stage reduces
+  labels, and it strips the unwrap from the count side
+  (`pkg/logql/shardmapper.go:476-534 @ v3.7.4`, `case syntax.OpRangeTypeAvg`,
+  `expr.Left.WithoutUnwrap()`). The rewrite is part of the planner's split
+  for parallel execution; that it is active on the pinned build is inferred
+  from the answers, which match it on every grouped-average row below, not
+  read from its configuration.
+- **Three measured consequences.**
+  1. The division is `sum/count`, so a grouped form answers `54.25` where the
+     range reducer's own recurrence
+     (`mean += F/count - mean/count`, `pkg/logql/range_vector.go:379-401`
+     batched / `:716-744` streaming @ v3.7.4) answers `54.24999999999999`.
+     One stream, four samples at distinct ascending timestamps
+     `{83.2, 42.2, 79.0, 12.6}`:
 
-  | query | answer |
-  |---|---|
-  | `avg_over_time({…} \| logfmt \| unwrap v [5m])` | `54.24999999999999` |
-  | `… by (env)` / `by ()` / `by (service_name)` / `without (v)` | `54.25` |
-  | `… without ()` (the no-op grouping) | `54.24999999999999` |
+     | query | reference |
+     |---|---|
+     | `avg_over_time({…} \| logfmt \| unwrap v [5m])` | `54.24999999999999` |
+     | `… by (env)` / `by ()` / `by (service_name)` / `without (v)` | `54.25` |
+     | `… without ()` (the no-op grouping) | `54.24999999999999` |
 
-  `54.24999999999999` is the range reducer's own recurrence
-  (`mean += F/count - mean/count`, `pkg/logql/range_vector.go:379-401`
-  batched / `:716-744` streaming @ v3.7.4) folded in timestamp order.
-  `54.25` is `sum/count` — the reference also answers `sum_over_time`
-  = `217` over those four samples. Reproduced on a second fixture:
-  `{1, 5, 7}` grouped answers `4.333333333333333`, which is `13/3`.
+     Reproduced on a second fixture: `{1, 5, 7}` grouped answers
+     `4.333333333333333`, which is `13/3`. Stable over 25 consecutive runs;
+     `stdvar_over_time` over the same stream answers `832.6475000000002`
+     grouped and ungrouped, so the fold order does not move.
+  2. The count side counts every line that survives the pipeline, including
+     a line without the field: a11
+     `avg_over_time({…} | json c="code", lat="latency" | unwrap lat [1m]) by (c)`
+     over `{"latency":3,"code":"a"}` and `{"code":"a"}` answers `1.5` there
+     (3 ÷ 2 lines) and `3` here (3 ÷ 1 sample).
+  3. A line that is not JSON reaches the count with its `__error__` and fails
+     the query, where the same query's `sum_over_time`, `min`, `max`,
+     `quantile`, `stddev`, `first` and ungrouped `avg` answer without it:
 
-- **Stable, so not a Go-map walk.** 25 consecutive runs of each form
-  returned the same value every time.
+     | # | query | lines | reference | PulsusDB |
+     |---|---|---|---|---|
+     | b04 | `avg_over_time({…} \| json \| unwrap latency [1m]) by (a)` | `{garbage` | `400 JSONParserErr` | no series |
+     | b13 | same | `{garbage`, `{"latency":3,"a":"x"}` | `400 JSONParserErr` | `{a="x"} 3` |
+     | b16 | same | `plain text, not json`, `{"latency":3,"a":"x"}` | `400 JSONParserErr` | `{a="x"} 3` |
+     | b20 | same, as a range query | `{garbage`, `{"latency":3,"a":"x"}` | `400 JSONParserErr` | `{a="x"} 3` |
+     | b23 | `avg_over_time({…} \| json \| unwrap latency [1m]) without (a)` | `{garbage` | `400 JSONParserErr` | no series |
 
-- **NOT a fold-order effect**, which is the explanation to rule out first
-  and the one this issue's other work was about. `stdvar_over_time` over
-  the SAME stream answers `832.6475000000002` both grouped and ungrouped,
-  and that fixture's 24 permutations span five distinct values — so the
-  fold order is unchanged by the grouping and only `avg` moves.
-
-- **Not located in the query mappers.** `pkg/logql/rangemapper.go`'s
-  `splittableRangeVectorOp` does not list `OpRangeTypeAvg`, and
-  `pkg/logql/shardmapper.go`'s `avg -> sum(x)/count(x)` rewrite
-  (`:259-275`) is for the VECTOR aggregation, not the range one. **The
-  mechanism is unidentified.** No mechanism is asserted here.
-
-- **What PulsusDB does.** It computes the reducer's recurrence for both
-  the grouped and the ungrouped form, so it answers `54.24999999999999`
-  either way. **We do not reproduce the grouped value**, because doing so
-  would mean making our reducer return a different result depending on
-  whether the query carries a `by (…)` clause — copying an inconsistency
-  we cannot explain, at a cost of one ULP.
-
+     Over the same lines b01–b03, b05, b06, b11, b12, b14, b17, b21 and b22
+     (every other reducer, and the ungrouped average) answer the same on both.
+     b18 and b19 (`{"latency":5,"a":tru}`, where the reference also answers
+     `400` for `sum_over_time`) are `json-nonvalidating-scan-residual`, not
+     this row.
+- **What PulsusDB does, and why.** It computes the reducer's recurrence
+  whether or not the query is grouped, and a line with no readable value for
+  the unwrapped label contributes no sample and no error, for every range
+  aggregation, grouped or not. The reference is inconsistent with itself: a
+  grouped average reports a line its own grouped sum, max and ungrouped
+  average ignore, and averages a missing value in as a sample. Recorded as
+  reference defect 32.
 - **What IS proven, and where.** `avg_over_time`'s recurrence is pinned
   by the UNGROUPED row in
   `crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`
@@ -3962,11 +3992,7 @@ absence of a corpus row for an oversight.
 
 ### structured-metadata-collision-resolution (issue #381)
 
-- **Status: PARITY, with three named residuals.** The construct itself is
-  fixed, not exempted: PulsusDB now runs the reference's own builder at the
-  one shared structured-metadata seam, and reproduces its answer on every
-  measured row. What remains are the three residuals below, two of which are
-  cases where the reference has no stable answer of its own.
+- **Status: PARITY, with residuals A and B below.** The construct itself is fixed, not exempted: PulsusDB now runs the reference's own builder at the one shared structured-metadata seam, and reproduces its answer on every measured row. Residuals A and B are both cases where the reference has no stable answer of its own; residual C is closed by issue #507.
 - **Construct:** which of several structured-metadata pairs sharing a stored
   label name is the one stored, and what a value containing `utf8.RuneError`
   (U+FFFD) stores as.
@@ -4023,13 +4049,7 @@ absence of a corpus row for an oversight.
   `structured_metadata_collisions.rs`'s
   `the_row_the_reference_cannot_serve_is_stored_by_us_as_the_last_pair`,
   which asserts the captured 500 alongside our stored value.
-- **Residual C — inherited, unchanged.** The builder groups by PulsusDB's
-  `canonicalize_label_key` rather than the reference's `LabelNamer.Build`, so
-  wherever the two renamings differ the collision GROUPS differ (`a..b` and
-  `a__b` are `a_b` there and `a__b` here; `9bad` gains a `key_` prefix
-  there). That is the renaming divergence already registered under issue #259
-  / docs/api.md §8.2, not a second rule, and it disappears when that one
-  does.
+- **Residual C — closed by issue #507.** The builder groups by the stored name, which is now the reference's label name.
 - **In scope deliberately: the U+FFFD branch is a value change.** It is not
   separable from the collision rule — the branch is a `Set`, and `Set` is
   what decides the tier, so omitting it resolves `{a.b="x", a_b="p\ufffd"}`
@@ -4040,10 +4060,7 @@ absence of a corpus row for an oversight.
 - **Not in scope, and named rather than omitted:** stream-label collisions of
   any kind. Structured metadata is a per-entry column and never enters
   `stream_fingerprint`, so no stored stream identity moves here;
-  `LabelSet::from_normalized`'s frozen greatest-original-key rule (issue #4)
-  is untouched and still governs stream labels, including residual 4 of
-  `ingest-label-bounds` (a repeated OTLP index attribute) and the
-  `{service.name, service_name}` near-miss, which belong to issues #4/#109.
+  the frozen greatest-original-key rule (issue #4) is untouched and still governs stream labels (`LabelSet::from_normalized` for pushed stream labels, `LabelSet::from_log_attribute_pairs` for OTLP resource attributes), including residual 4 of `ingest-label-bounds` (a repeated OTLP index attribute) and the `{k8s.pod.name, k8s_pod_name}` near-miss, which belong to issues #4/#109. The `{service.name, service_name}` near-miss is stored as `service_name_extracted` (issue #507, `ingest-service-name-discovery`).
 - **Fixture status:** capture-backed parity in
   `crates/pulsus-write/tests/structured_metadata_collisions.rs`
   (`the_stored_string_reproduces_the_reference_capture`,
@@ -5174,10 +5191,7 @@ back up here.
   carries the same index attribute twice with different values is
   resolved last-write-wins upstream (`streamLabels` is a map,
   `otlp.go:191-193 @ v3.7.4`), so the bound is charged on whichever value
-  came last. PulsusDB collapses the repeat through
-  `LabelSet::from_normalized`, whose resolution is issue #4's frozen
-  greatest-`(key, value)` rule, so the bound is charged on the value that
-  would actually be stored. Measured: `[k8s.pod.name="ok",
+  came last. PulsusDB collapses the repeat by issue #4's frozen greatest-`(key, value)` rule — for the bound through `LabelSet::from_normalized`, in storage through `LabelSet::from_log_attribute_pairs`, which name the eighteen index attributes alike — so the bound is charged on the value that would actually be stored. Measured: `[k8s.pod.name="ok",
   k8s.pod.name="b"*2049]` is `400` upstream and `200` here; the reverse
   order agrees. Matching upstream's choice would mean validating a value
   we do not store — the defect this issue's first round was about — so
@@ -5613,17 +5627,7 @@ two.
   So a resource carrying `app=x` stores `{app="x", service_name="unknown_service"}`
   here and `{service_name="unknown_service"}` there: the `service_name` now
   agrees and the extra label does not. Two consequences of making the slot
-  authoritative, both of the same #109 mechanism: an attribute whose raw name
-  merely canonicalizes onto `service_name` (`service_name`, `service-name`,
-  `service name`) is now stored **nowhere** here, where the reference keeps it
-  as structured metadata; and that attribute no longer wins the
-  `from_normalized` collision (issue #4) it used to win, so
-  `{service.name: "ok", service_name: <2049 B>}` stores the validated `"ok"`
-  on both sides. The seventeen other index names still resolve that collision
-  the old way — `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` stores the
-  unvalidated value here — which is `ingest-label-bounds`' *What these bounds
-  do not cover*, unchanged. Issue #109 owns the placement rule and therefore
-  owns all of this.
+  authoritative, both of the same #109 mechanism: an attribute whose stored name would be `service_name` (`service_name`, `service-name`, `service..name`) is stored as `service_name_extracted` (issue #507), which is what the reference's query answers show for the same attribute: measured, `{service.name: "ao6", service_name: "v6"}` answers `{service_name="ao6", service_name_extracted="v6"}` on both. The seventeen other index names still resolve a near-miss collision by #4's frozen rule — `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` stores the unvalidated value here — which is `ingest-label-bounds`' *What these bounds do not cover*. Issue #109 owns the placement rule.
 
 - **Pinned by** `service_name`'s own unit tests (the thirteen defaults and
   their order, list order vs wire order asserted side by side so unifying the
@@ -6392,3 +6396,521 @@ gated by
 - **Pinned by** `b26_json_expr.test`'s two `eval_fail` rows and
   `json_expr.rs`'s
   `a_bracket_ends_a_quoted_key_so_such_a_key_is_unreachable`.
+
+### `unwrapped-summation-order-nondeterministic` (issue #507 W4, owner ruling — a deliberate divergence, not a defect)
+
+- **What we do:** on a query that **lowers** — a `json` extraction naming
+  one label, an `unwrap` of that label with no conversion, an
+  underscore-free name, a range equal to the step, no row whose structured
+  metadata carries that same name, and every row carrying a value both
+  float parsers agree on — `sum_over_time` and `avg_over_time` are summed
+  by the database. The database chooses the summation order, so **the same
+  query on the same data can answer different final digits between two
+  executions.**
+- **What the reference does:** accumulates in one order, in one process,
+  and answers the same bits every time.
+- **Three things decide our result, and the second is the one a user
+  meets:**
+  - the accumulation order is the database's, and it reorders **inside a
+    block of rows** — measured: at one thread and a block size of one the
+    database reproduces a left-to-right sum exactly, and every larger
+    block differs, non-monotonically;
+  - **the effective parallelism depends on how busy the server is.** The
+    thread setting is an upper bound, not a fixed value. Measured over
+    1,000,000 values in one part: quiet at four threads
+    `C1B845C49C9465EC`, under load at four threads `C1B845C49C9465E6`,
+    both constant within their condition. The part layout decides it too —
+    the same rows in 1, 2 and 8 parts give three different answers.
+  - `avg_over_time` additionally uses a different accumulation from the
+    reference's incremental mean — a sum divided by a count — so it
+    differs **even on a single thread**. Its row has two causes and
+    pinning the thread count removes neither.
+
+    **Not "in the last bits", and the earlier wording here said so
+    wrongly.** The two are different algorithms over the same values, so
+    their difference is bounded by the same `2(n−1)·u·Σ|vᵢ|` as the sums
+    and not by one unit in the last place. And the database's sum can
+    reach a magnitude the incremental mean never does: two samples of
+    `1e308` average to `inf` there and to `1e308` here. **That case is
+    refused rather than answered** — a non-finite aggregate sends the
+    whole query to the client path (`exec.rs`'s `PushdownUnwrappedGroups`)
+    — so the divergence that remains is inside the bound above, but the
+    row is written this way because a recorded divergence that understates
+    its own size is worse than none.
+- **The bound.** Two answers differ by at most `2(n−1)·u·Σ|vᵢ|` with
+  `u = 2⁻⁵³`. Measured against it: 1, 8 and 31 ULPs at `n` = 1e3, 1e5,
+  1e6, against derived bounds of 3.29e-5, 2.90e-1 and 2.86e+1.
+- **The parse is not part of the divergence, and one setting is why.** The
+  statement carries `SETTINGS precise_float_parsing = 1`
+  (`sql.rs`'s `UNWRAP_PARSER_SETTING`). Without it `toFloat64OrNull` is not
+  correctly rounded — `'9367469347402735e292'` converts to
+  `0x7fe0acb5cadc2918`, where `f64::from_str` gives `0x7fe0acb5cadc2917` —
+  and at `n = 1` the bound above is zero, so that is the whole answer
+  rather than a last-bits difference. With the setting, each text measured
+  for the read's guard either converts to the same bits as `f64::from_str`
+  or converts to NULL, and a NULL sends the query to the evaluator.
+- **Why it is accepted.** The owner ruled that the floating-point
+  summation moves into the database. Nothing here says an answer is wrong;
+  it says which digits are not reproducible, and the bound says by how
+  much they can move.
+- **What does NOT diverge.** Every query that does not lower — most of
+  them — is accumulated in one order here and answers the same bits every
+  time. `count_over_time` and `bytes_over_time` sum integers, which is
+  exact in any order. `min_over_time`, `max_over_time`, `first_over_time`,
+  `last_over_time`, `quantile_over_time` and `rate_counter` are not
+  lowered.
+- **The spread pair is NOT lowered, and the stable variants were not
+  enough.** `varPop`/`stddevPop` accumulate `Σx²` and subtract, which over
+  `{1e16, 1e16+2, +4, +8, +16}` answers `0` and `0` where the evaluator
+  answers `31.2` and `5.585696017507576`. `varPopStable`/`stddevPopStable`
+  returned the evaluator's bits on that corpus — and over 300,000 samples
+  at `max_threads = 8`, `max_block_size = 65536` the database's variance
+  came back FINITE and wrong: bits `9090485321501537692` against the
+  client's `9090485321501537553`, a difference of `1.0334767513920592e286`.
+  The bound above is a statement about sums; a partial-moment algorithm can
+  lose the answer without leaving the finite range, so nothing in the
+  reader sees it. `stddev_over_time` and `stdvar_over_time` are therefore
+  withdrawn at `sql::UnwrapReducer` and evaluated here.
+- **Pinned by** `query_log_gates.rs`'s
+  `the_thread_count_spread_stays_inside_the_summation_bound`, which fails
+  when the accepted divergence stops being a rounding difference,
+  `repeated_executions_agree_bit_for_bit_at_a_fixed_layout`, which fails
+  when a source of nondeterminism appears that is neither the thread count
+  nor the part layout, and
+  `the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value`,
+  which fails if either of the withdrawn pair comes back.
+
+### `json-leading-whitespace-and-byte-order-mark` (issue #507, deliberate divergence — the JSON standard's reading)
+
+- **Reference behaviour.** grafana/loki v3.7.4 gates `| json <id>="<path>"`
+  and `| unpack` on ONE raw first byte with whitespace not skipped
+  (`isValidJSONStart`, `pkg/logql/log/parser.go:724-731`; `UnpackParser.Process`,
+  `:753-762`), while its bare `| json` scans whatever it is given. So the
+  targeted form refuses ` {"latency":5}` that the bare form reads: two of its
+  own paths disagree about one line.
+- **PulsusDB.** A line's JSON text starts after at most one leading byte-order
+  mark and then JSON whitespace (space, tab, LF, CR), on all three entrypoints
+  (RFC 8259 §2 allows whitespace before a value; RFC 8259 §8.1 allows a parser
+  to ignore a leading mark, and ignoring one is the owner's choice). Nothing
+  else is skipped: a U+00A0 before the value is not JSON.
+- **Measured** (our engine end to end; the reference by push and query on the
+  pinned build, `[10m]`; one stream per case):
+
+  | # | query | lines | reference | PulsusDB |
+  |---|---|---|---|---|
+  | s01 | `sum_over_time({…} \| json latency="latency" \| unwrap latency [1m])` | ` {"latency":5}` | no series | `{} 5` |
+  | s02 | same | LF, then `{"latency":5}` | no series | `{} 5` |
+  | s03 | same | a byte-order mark, then `{"latency":5}` | no series | `{} 5` |
+  | s04 | same | `{"latency":5}` and ` {"latency":7}` | `{} 5` | `{} 12` |
+  | s06 | `count_over_time({…} \| json level="level" \| level="info" [1m])` | ` {"level":"info"}` and `{"level":"info"}` | `{level="info"} 1` | `{level="info"} 2` |
+  | s07 | `count_over_time({…} \| json level="level" [1m])` | the same two | `400 JSONParserErr` | `{level="info"} 2` |
+  | s08 | `count_over_time({…} \| json level="level" \| __error__="" [1m])` | the same two | `{level="info"} 1` | `{level="info"} 2` |
+  | s09 | `count_over_time({…} \| logfmt \| json level="level" [1m])` | ` {"level":"info"}` | `400 JSONParserErr` | `{level="info"} 1` |
+  | s10 | `count_over_time({…} \| json [1m])` | a mark then `{"level":"info"}`, and `{"level":"info"}` | `400 JSONParserErr` | `{level="info"} 2` |
+  | s11 | `count_over_time({…} \| unpack [1m])` | ` {"_entry":"hi","a":"1"}` | `400 JSONParserErr` | `{a="1"} 1` |
+  | s12 | `sum_over_time({…} \| json \| unwrap latency [1m])` | a mark then `{"latency":5,"a":"x"}` | no series | `{a="x"} 5` |
+
+  s05 (`{"latency":5}` then a tab) answers `{} 5` on both; s13 (U+00A0 first)
+  and s14 (a space, then a mark) answer no series on both.
+- **Gated by** `tests/logql_pipeline_golden.rs`'s
+  `json_expression_reads_one_json_text` and `unpack_reads_one_json_text`, and
+  `tests/logql_json_whitespace_alloc.rs` (skipping whitespace allocates
+  nothing). Recorded as reference defect 25.
+
+### `json-text-is-one-value` (issue #507, deliberate divergence — the JSON standard's reading)
+
+- **Reference behaviour.** The reference's scanner stops at the end of the
+  first value (`jsonparser.ObjectEach`,
+  `vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160` @ v3.7.4)
+  and reads `a="1"` out of `{"a":1}trailing`, on `| json`,
+  `| json <id>="<path>"` and `| unpack` alike. That extracts from text that is
+  not JSON.
+- **PulsusDB.** RFC 8259 §2 defines a JSON text as one value with optional
+  whitespace around it. A line holding anything else after the value is not
+  JSON on any form: `__error__="JSONParserErr"` with the bare form's details,
+  and nothing extracted. `| __error__=""` skips such a line.
+- **Measured:**
+
+  | # | query | line | reference | PulsusDB |
+  |---|---|---|---|---|
+  | s20 | `sum_over_time({…} \| json latency="latency" \| unwrap latency [1m])` | `{"latency":1,"a":"x"}trailing` | `{} 1` | no series |
+  | s21 | `sum_over_time({…} \| json \| unwrap latency [1m])` | same | `{a="x"} 1` | no series |
+  | s22 | `sum_over_time({…} \| json latency="latency" \| __error__="" \| unwrap latency [1m])` | same | `{} 1` | no series |
+  | s23 | `sum_over_time({…} \| json \| __error__="" \| unwrap latency [1m])` | same | `{a="x"} 1` | no series |
+  | s24 | `count_over_time({…} \| json latency="latency" [1m])` | same | `{latency="1"} 1` | `400 JSONParserErr` |
+  | s25 | `count_over_time({…} \| json [1m])` | same | `{a="x",latency="1"} 1` | `400 JSONParserErr` |
+  | s26 | `count_over_time({…} \| json latency="latency" \| __error__="" [1m])` | same | `{latency="1"} 1` | no series |
+  | s27 | `count_over_time({…} \| json \| __error__="" [1m])` | same | `{a="x",latency="1"} 1` | no series |
+  | s28 | `{…} \| json latency="latency", a="a"` | same | `{a="x", latency="1"}` | the error pair |
+  | s29 | `sum_over_time({…} \| json latency="latency" \| unwrap latency [1m])` | `{"latency":1}{"latency":2}` | `{} 1` | no series |
+  | s30 | `sum_over_time({…} \| json \| unwrap latency [1m])` | same | `{} 1` | no series |
+  | s31 | `count_over_time({…} \| unpack [1m])` | `{"_entry":"hi","a":"1"}x` | `{a="1"} 1` | `400 JSONParserErr` |
+  | s43 | `{…} \| json a="a"` | `x{"a":1}` | `__error__` alone | the error pair |
+  | s44 | `count_over_time({…} \| json level="level" [1m])` | a space, a tab, a space | `400 JSONParserErr` | `400 JSONParserErr` (with details) |
+
+- **Gated by** `b23_json_raw_read.test`'s `jr-flat-*`, `jr-expr-*`,
+  `jr-unpack-trail`, `jr-both`, `jr-gate-arr` and `jr-gate-str` rows, each
+  carrying `# provenance: divergence(json-text-is-one-value)` with the
+  reference's captured answer in its comment, and by
+  `json_flatten_refuses_bytes_after_the_value`,
+  `json_expression_refuses_bytes_after_the_value` and
+  `unpack_refuses_bytes_after_the_value`. Recorded as reference defect 26.
+
+### `json-targeted-line-that-does-not-parse` (issue #507, deliberate divergence — one form's rule for both)
+
+- **Reference behaviour.** The reference's targeted form writes nothing for an
+  empty line, writes `__error__` with no details for a first byte outside
+  `"`/`{`/`[`, and past that gate fills every path with `""` for a line that
+  does not parse (`pkg/logql/log/parser.go:671-722` @ v3.7.4). Its bare form
+  refuses the same `{garbage` with the error pair, so the two forms disagree.
+- **PulsusDB.** The targeted form reports a line that is not one JSON text
+  exactly as the bare form does: the error pair and no fill. Any JSON value is
+  accepted, and a path that does not resolve in it is the `""` fill, as before
+  (`[1,2]` gives `a=""`; `5` gives `level=""`).
+- **Measured:**
+
+  | # | query | line | reference | PulsusDB |
+  |---|---|---|---|---|
+  | s32 | `count_over_time({…} \| json latency="latency" [1m])` | `{garbage` | `{latency=""} 1` | `400 JSONParserErr` |
+  | s34 | `count_over_time({…} \| json latency="latency" \| __error__="" [1m])` | `{garbage` | `{latency=""} 1` | no series |
+  | s35 | `sum_over_time({…} \| json latency="latency" \| unwrap latency [1m])` | `{"latency":5,"a":tru}` | `{} 5` | no series |
+  | s38 | `count_over_time({…} \| json level="level" [1m])` | an empty line | `{} 1` | `400 JSONParserErr` |
+  | s40 | `count_over_time({…} \| unpack [1m])` | an empty line | `{} 1` | `400 JSONParserErr` |
+  | s41 | `count_over_time({…} \| json level="level" \| __error__="" [1m])` | an empty line | `{} 1` | no series |
+  | s42 | `count_over_time({…} \| json level="level" [1m])` | `5` | `400 JSONParserErr` | `{level=""} 1` |
+  | p01.06 | `sum by (__error__) (count_over_time({…} \| json a="a" [5m]))` | `{garbage` | `{} 1` | `{__error__="JSONParserErr"} 1` |
+
+  p01.06 is this rule composing with the parser hint that preserves an error
+  when a `by` requires `__error__` (`reserved-names-at-the-range-step`).
+- **Gated by** `b23_json_raw_read.test`'s `jr-gate-garb`, `jr-gate-nocolon`
+  and `jr-gate-lead` rows and `jr-mid-esc`'s `| json o="o"` row, each carrying
+  `# provenance: divergence(json-targeted-line-that-does-not-parse)`, and by
+  `json_expression_reads_one_json_text`. Recorded as reference defects 27 and
+  28.
+
+### `json-nesting-depth-limit` (issue #507, a deliberate limit — the shipped protection, on every route)
+
+- **Reference behaviour.** No nesting limit: the reference reads
+  `{"latency":5,"a":` followed by 128 nested arrays and answers `5`.
+- **PulsusDB.** The parser's 127-level limit stays (owner ruling,
+  2026-09-13). A line nested 128 levels or more is not JSON for that line,
+  exactly like `{garbage`, on the client path and on the extracted-field
+  group key read alike: the key statement's
+  `countSubstrings(body, '{') + countSubstrings(body, '[') <= 127` never
+  decides such a row, so our parser reads it.
+- **Measured** (bodies `{"latency":5,"a":` + N levels + `}`; total nesting
+  N + 1):
+
+  | # | query | nesting | reference | PulsusDB |
+  |---|---|---|---|---|
+  | s55, s65, s75, s81 | `sum_over_time({…} \| json latency="latency" \| unwrap latency [1m])` | 128 (arrays, objects, alternating, a 128-level sibling) | `{} 5` | no series |
+  | s56, s66, s76 | `sum by (service_name) (sum_over_time({…} \| json \| unwrap latency [1m]))` | 128 | `{} 5` | no series |
+  | s57, s67, s77 | `count_over_time({…} \| json latency="latency" [1m])` | 128 | `{latency="5"} 1` | `400 JSONParserErr` |
+  | s58, s68, s78 | `count_over_time({…} \| json [1m])` | 128 | `{latency="5"} 1` | `400 JSONParserErr` |
+  | s59, s69, s79 | `sum_over_time({…} \| json latency="latency" \| __error__="" \| unwrap latency [1m])` | 128 | `{} 5` | no series |
+  | s82 | `{…} \| json o="o"` after a 128-level sibling | 128 | `{"o": "{\"k\":1}"}` | the error pair |
+
+  At 127 levels every one of these answers as the reference does.
+- **Gated by** `json_expression_resolves_a_span_without_recursing` and the
+  group key agreement's H4 bodies (`query_log_gates.rs`).
+
+### `detected-fields-json-is-one-text` (issue #507, deliberate divergence — detection follows the parsers)
+
+- **Reference behaviour.** Detected fields try `| json` and then `| logfmt` on
+  each sampled line, and the reference's JSON reading accepts a line with
+  text after the first value and refuses one that starts with a byte-order
+  mark.
+- **PulsusDB.** A line is classified `json` exactly when `| json` reads it
+  (`json-text-is-one-value`, `json-leading-whitespace-and-byte-order-mark`),
+  and `logfmt` exactly when `| logfmt` reads it
+  (`logfmt-quoted-value-ends-its-token`). A line classified `json` that
+  `| json` refuses would make the suggested query answer `400 JSONParserErr`;
+  a line `| json` reads that is not classified `json` hides its fields.
+- **Measured** (our engine's `detected_fields`, the function the endpoint
+  calls; the reference's detected-fields endpoint on the pinned build; one
+  stream per line):
+
+  | # | line | reference | PulsusDB |
+  |---|---|---|---|
+  | d01 | `{"a":1}trailing` | `a` int `["json"]` 1 | no fields |
+  | d02 | a byte-order mark, then `{"a":1}` | no fields | `a` int `["json"]` 1 |
+  | d04 | `{"a":1} x=2` | `a` int `["json"]` 1 | `x` int `["logfmt"]` 1 |
+  | d05 | `{"a":1}{"b":2}` | `a` int `["json"]` 1 | no fields |
+
+  d03 (` {"a":1}`), d07 (`{"a":1}`) and d08 (a mark, then `a=1 b=2`) answer the
+  same on both. d04 differs by parser: the reference reads the JSON prefix,
+  and `count_over_time({…} | logfmt [1m])` over the same line answers
+  `{x="2"} 1` on both systems.
+- **Gated by** `detected::tests::auto_parse_does_not_call_a_line_with_text_after_the_object_json`,
+  `detected::tests::auto_parse_calls_an_object_after_a_byte_order_mark_json`,
+  and live by `logs_detected_live.rs`'s
+  `detected_fields_classify_a_line_as_json_exactly_when_json_reads_it`.
+
+### `logfmt-quoted-value-ends-its-token` (issue #507, deliberate divergence — no label from inside a value)
+
+- **Reference behaviour.** grafana/loki v3.7.4's logfmt decoder returns a
+  quoted pair the moment its closing quote arrives and starts the next key at
+  the very next byte, whatever that byte is
+  (`pkg/logql/log/logfmt/decode.go:151-186`), and after a malformed token it
+  skips to the next byte at or below a space with no notion of quotes
+  (`:140-149`). So text inside a quoted value can come back as pairs:
+  `level=info msg="user "bob" role=admin now" status=200` answers
+  `role="admin"`, read from inside `msg`'s value.
+- **PulsusDB.** A token is `key`, `key=`, `key=value` or `key="quoted value"` in
+  full; anything else contributes nothing, and `--strict` stops at it. A
+  closing quote must be followed by a separator or the end of the line. After
+  a malformed token the scan skips to the next byte at or below a space
+  OUTSIDE a quoted value, where a quote opens a quoted value when it follows
+  `=` or when the token has already opened one, and `\` escapes the next byte
+  inside it. So no label is ever read from inside a value, however the token
+  broke. Error positions are byte offsets + 1, the reference's numbering.
+- **The cost, stated.** A producer that omits the space after a quoted value
+  loses those pairs where the reference guesses the boundary and happens to be
+  right (u02 below). A missing pair is preferred to a value cut at an inner
+  quote (u01).
+- **Measured** (our engine end to end; the reference by push and query on the
+  pinned build; stream labels omitted):
+
+  | id | line | mode | reference | PulsusDB |
+  |---|---|---|---|---|
+  | x01 | `a="x"b c=1` | lenient | `{a="x", c="1"}` | `{c="1"}` |
+  | x01 | same | strict | `{a="x", c="1"}` | `LogfmtParserErr` `pos 6 : unexpected 'b'`, no labels |
+  | x02 | `a="x"=1 c=2` | lenient | `{a="x", c="2"}` | `{c="2"}` |
+  | u01 | `level=info msg="user "bob" logged in" status=200` | lenient | `{level="info", msg="user ", status="200"}` | `{level="info", status="200"}` |
+  | u01 | same | keep-empty | `{level="info", logged="", msg="user ", status="200"}` | `{level="info", status="200"}` |
+  | u02 | `time="2026-09-13T10:00:00Z"level=info msg=ok` | lenient | `{level="info", msg="ok", time="2026-09-13T10:00:00Z"}` | `{msg="ok"}` |
+  | v01 | `level=info msg="user "bob" role=admin now" status=200` | lenient, keep-empty | `{level="info", msg="user ", role="admin", status="200"}` | `{level="info", status="200"}` |
+  | v01 | same | strict | `pos 26 : unexpected '"'`, `{level="info", msg="user "}` | `pos 23 : unexpected 'b'`, `{level="info"}` |
+  | v02 | `msg="a "b=c" d=e"` | lenient, keep-empty | `{msg="a "}` | `{}` |
+  | v04 | `a="x""y" c=1` | lenient, keep-empty | `{a="x", c="1"}` | `{c="1"}` |
+  | w01 | `level=info filter=name="john x=1 smith" status=200` | lenient, keep-empty | `{level="info", status="200", x="1"}` | `{level="info", status="200"}` |
+  | m03 | `k=x="a b=1 c"d e=2` | lenient, keep-empty | `{b="1", e="2"}` | `{e="2"}` |
+  | m02 | `k="a b"="c d=1" e=2` | lenient, keep-empty | `{e="2", k="a b"}` | `{e="2"}` |
+  | m14 | `k="a"b="c d=1" e=2` | strict | `{b="c d=1", e="2", k="a"}`, no error | `LogfmtParserErr` `pos 6 : unexpected 'b'` |
+  | m15 | `k="a"\"b c=1" e=2` | lenient | `{e="2", k="a"}` | `{e="2"}` |
+  | m16 | `k="a""b=c d=1" e=2` | lenient | `{e="2", k="a"}` | `{e="2"}` |
+  | L071 | `"f=2{"j":1}be="openx g=3` | lenient | `{g="3"}` | `{}` |
+  | L276 | `a=1b="q"e="open d="u\"v" g=3x` | lenient | `{d="u\"v", g="3x"}` | `{g="3x"}` |
+  | L306 | `é"v w"b="q"b="q"\c=" g=3` | lenient | `{g="3"}` | `{}` |
+
+  x01, x02, u01, u02, v01, v02, v04, m02, m14, m15 and m16 differ in all three
+  modes; w01 and m03 in lenient and keep-empty. Of the 400 generated lines
+  (seed 5077) under `| logfmt` and `| logfmt --strict`, 91 line–mode pairs
+  differ from the reference and every one is this rule: lenient
+  L016, L019, L038, L042, L059, L062, L068, L071, L072, L079, L081, L089, L099,
+  L116, L118, L121, L130, L132, L140, L155, L173, L179, L185, L202, L204, L207,
+  L209, L230, L234, L237, L240, L241, L242, L248, L276, L288, L293, L306, L314,
+  L324, L327, L350, L354, L377, L379, L381, L387, L394, L398; strict L019, L038,
+  L042, L059, L062, L068, L072, L079, L081, L089, L099, L116, L118, L121, L130,
+  L132, L155, L173, L179, L185, L202, L204, L207, L230, L234, L237, L240, L241,
+  L242, L248, L288, L293, L314, L324, L327, L350, L377, L379, L381, L387, L394,
+  L398. No case differs in its error details alone.
+- **Gated by** `b27_logfmt_token_scan.test`, whose rows for these lines carry
+  `# provenance: divergence(logfmt-quoted-value-ends-its-token)`;
+  `logql_logfmt_token_scan_matrix.rs`, which asserts the generated lines differ
+  from the committed reference labels on exactly the ids above; and
+  `logfmt_a_malformed_token_contributes_nothing_and_the_scan_resumes`. Recorded
+  as reference defect 30.
+
+### `logfmt-replacement-character-value` (issue #507, deliberate divergence — the line's own bytes)
+
+- **Reference behaviour.** A logfmt value holding U+FFFD is replaced with one
+  space (`bytes.Map(removeInvalidUtf, val)`, `pkg/logql/log/parser.go:419-421`
+  @ v3.7.4).
+- **PulsusDB.** The value keeps the character the line holds. Replacing it
+  invents a value no producer wrote.
+- **Measured:** x09 `a="\ud800" c=2` and x22 `a=` U+FFFD ` d=2`, in all three
+  modes: the reference `{a=" ", …}`, PulsusDB `{a="<U+FFFD>", …}`.
+- **Gated by** `b27_logfmt_token_scan.test`'s x09 and x22 rows, each carrying
+  `# provenance: divergence(logfmt-replacement-character-value)`. Recorded as
+  reference defect 31.
+
+### `logfmt-expression-renamed-repeat` (issue #507, deliberate divergence — read the whole line)
+
+- **Reference behaviour.** In `| logfmt <id>="<key>"`, when a destination is
+  renamed to `<id>_extracted` (because the stream carries `<id>`) and that name
+  was already written on the line, the reference stops reading the rest of the
+  line.
+- **PulsusDB.** A renamed destination already written on the line is skipped,
+  and the scan reads on.
+- **Measured** (a stream carrying `code="s"`):
+
+  | # | query | line | reference | PulsusDB |
+  |---|---|---|---|---|
+  | c13 | `{…} \| logfmt code="a", code_extracted="b"` | `a=x b=z` | `{code="s", code_extracted=""}` | `{code="s", code_extracted="z"}` |
+  | c14 | same | `b=z a=x` | `{code="s", code_extracted="z"}` | `{code="s", code_extracted="z"}` (main answered `x`) |
+- Recorded as reference defect 29.
+
+### `reserved-names-at-the-range-step` (issue #507, parity ADOPTED — the reference's model, R1–R4)
+
+- **The rule, read at v3.7.4 and then measured end to end.** `__error__`,
+  `__error_details__`, `__preserve_error__` and `__variant__` answer as the
+  reference answers them, whichever source put the name on a line: a field in
+  the line, structured metadata, a stream label, or a query step.
+
+  ```
+  a line -> pipeline stages ........... labels: stream, metadata, parsed; the error slot
+         -> the range step: its labels
+              error slot set   -> every label, ungrouped
+              error slot empty -> the grouping it was handed:            R1
+                                  its own by/without, or the parent sum's
+         -> the check: a series with __error__ fails the query,
+              unless its __preserve_error__ is exactly "true"             R2
+  the parser hints (a by-grouping, or a singleton that requires a label):
+         __error__ required            -> a parser error also writes __preserve_error__="true"  R3
+         __preserve_error__ not required -> the implicit parsers skip a line key of that name   R4
+  ```
+
+  R1: a `sum` directly above `count_over_time`, `bytes_over_time`, `rate`,
+  `bytes_rate` or `sum_over_time` with no grouping of its own hands its
+  grouping to the range step, so a `__error__` label outside it that is not
+  the engine's error is gone before the check. R2: `__preserve_error__="true"`
+  lets an error series through, and a preserved failed conversion contributes
+  `0`. R3 and R4: the parser hints, reduced to the two names they change.
+- **Now equal to the reference** (main answered `400` on every row but g01, which it answered `{} 5`):
+
+  | id | query | reference = PulsusDB |
+  |---|---|---|
+  | c01.03 | `sum by (service_name) (count_over_time({service="c01"} [5m]))`, stream label `__error__="s"` | `{service_name="c01"} 1` |
+  | q2w | `sum by (service_name) (sum_over_time({service="q2w"} \| json \| unwrap latency [5m]))`, the same label | `{service_name="q2w"} 5` |
+  | a01.03 | `sum by (service_name) (count_over_time({service="a01"} \| json [5m]))` over `{"latency":5,"__error__":"boom"}` | `{service_name="a01"} 1` |
+  | a01.12 | `sum without (__error__) (count_over_time({service="a01"} \| json [5m]))` | `{latency="5", service_name="a01"} 1` |
+  | e03 | `variants(sum by (service_name) (count_over_time({service="e03"} [5m]))) of ({service="e03"} \| json [5m])` | `{__variant__="0", service_name="e03"} 1` |
+  | g01 | `sum by (latency) (sum_over_time({service="g01"} \| json \| unwrap latency [5m]))` | `{latency="5"} 5` (main `{} 5`) |
+  | b03.01 | `count_over_time({service="b03"} \| json [5m])` over `{garbage`, metadata `__preserve_error__="true"` | the error series with `__preserve_error__="true"`, `1` |
+  | a07.02 | `sum_over_time({service="a07"} \| logfmt \| unwrap latency [5m])` over `__preserve_error__=true latency=abc` | `SampleExtractionErr` series, `0` |
+  | p01 | `sum by (__error__) (count_over_time({service="p01"} \| json [5m]))` over `{garbage` | `{__error__="JSONParserErr"} 1` |
+  | h03.01 | `sum by (__preserve_error__) (count_over_time({service="h03"} \| logfmt \| latency > 1 [5m]))` | `{__preserve_error__="true"} 1` |
+
+  Rows that stay `400` on both (the rule's edges): no parent sum
+  (`count_over_time({service="a01"} | json [5m])`), not a sum
+  (`avg by (service_name) (…)`), a sum that keeps `__error__`
+  (`sum by (__error__) (…)` over a line field), metadata `__error__` (it sets
+  the slot), and R4 skipping a parsed `__preserve_error__`
+  (`sum by (service_name) (count_over_time({service="a07"} | logfmt | latency > 1 [5m]))`).
+- **The key route.** A by-label, filter label or targeted destination named
+  like one of the four, or one of them plus `_extracted`, takes today's route
+  at plan time; a row whose metadata carries `__error__` or
+  `__error_details__` takes today's route; every group document runs under
+  the query's range-step rules.
+- **Not modelled here:** the parser hints' other effects (a query that
+  requires no label skips parsing; a parser stops once every required label
+  is found), and the hints inside `variants(...)` (`variants-reserved-names`).
+- **Pinned by** the corpus file `b28_reserved_names.test` (captured rows),
+  `query_log_gates.rs`'s
+  `reserved_names_answer_as_the_reference_on_every_metric_route`, and the unit
+  tests `range_step_rules_follow_the_reference_sample_extractor`,
+  `a_parent_sum_removes_the_reserved_labels_it_does_not_keep`,
+  `the_parser_hints_decide_the_parsed_preserve_label`,
+  `a_preserved_error_passes_the_check_and_a_failed_conversion_counts_zero` and
+  `a_parent_sum_removes_a_stream_error_label_on_the_lowered_folds`.
+
+### `variants-reserved-names` (issue #507, deliberate divergence — owner decision)
+
+- **Reference behaviour.** Inside `variants(...)`, a line or stream that
+  already carries `__variant__`, or whose error survives inside a variant,
+  answers with no series for data that is there, a renamed
+  `__variant___extracted` label, or `500`.
+- **PulsusDB.** Keeps its recorded answers (`variants-label-collision-and-fanout-bounds`
+  and `variants-surviving-error-status`): the data's series, and `400` for a
+  surviving error. R1 and R2 of `reserved-names-at-the-range-step` still apply
+  inside a variant; the parser hints do not. Decided by the owner on #507:
+  these are recorded differences, not parity work.
+- **The seven rows** (measured end to end; `detected_level` and `service` left
+  out):
+
+  | id | query | data | reference | PulsusDB |
+  |---|---|---|---|---|
+  | a08.01 | `variants(count_over_time({service="a08"} [5m]), sum_over_time({service="a08"} \| json \| unwrap latency [5m])) of ({service="a08"} \| json [5m])` | `{"latency":5,"__variant__":"x"}` | no series | `{__variant__="0", latency="5", service_name="a08"} 1`; `{__variant__="1", service_name="a08"} 5` |
+  | b04.01 | `variants(count_over_time({service="b04"} [5m])) of ({service="b04"} [5m])` | metadata `__variant__="v"` | no series | `{__variant__="0", service_name="b04"} 1` |
+  | c04.00 | `variants(count_over_time({service="c04"} [5m])) of ({service="c04"} [5m])` | stream label `__variant__="v"` | no series | `{__variant__="0", service_name="c04"} 1` |
+  | e01.00 | `variants(count_over_time({service="e01"} [5m]), sum_over_time({service="e01"} \| json \| unwrap latency [5m])) of ({service="e01"} \| json [5m])` | `{"latency":5,"__variant__":"x"}`, `{"latency":3}` | no series | `{__variant__="0", latency="3", …} 1`; `{__variant__="0", latency="5", …} 1`; `{__variant__="1", …} 3`; `{__variant__="1", …} 5` |
+  | e02b.00 | `variants(count_over_time({grp="e02"} [5m])) of ({grp="e02"} [5m])` | two streams, one with stream label `__variant__="v"` | no series | `{__variant__="0", grp="e02", service_name="e02"} 1`; `{__variant__="0", grp="e02", service_name="e02b"} 1` |
+  | e03.01 | `variants(count_over_time({service="e03"} [5m])) of ({service="e03"} \| json [5m])` | `{"latency":5,"__error__":"boom"}` | `500 unexpected empty result` | `400 pipeline error: 'boom'` |
+  | e05.00 | `variants(count_over_time({service="e05"} [5m]), bytes_over_time({service="e05"} [5m])) of ({service="e05"} [5m])` | metadata `__variant__="1"` | `{__variant__="0", __variant___extracted="1", …} 1`; `{__variant__="1", __variant___extracted="1", …} 13` | `{__variant__="0", service_name="e05"} 1`; `{__variant__="1", service_name="e05"} 13` |
+
+  The reference also adds `detected_level_extracted="unknown"` to every
+  `variants(...)` result, with or without a reserved name; that is recorded
+  by `b13_variants.test` and is not part of this row.
+
+## Issue #539 — how a label value's C0 control characters are spelled on the wire
+
+### `label-value-c0-escape-form` (issue #539 — the two bodies decode to the same string; no action)
+
+- **What differs: the SPELLING of U+0008 and U+000C inside a
+  `query_range` stream-label object, and nothing else.** We write JSON's
+  two-character escapes, `\b` and `\f`; the reference writes the
+  six-character `\u0008` and `\u000c`. Both are valid JSON for the same
+  string, and every JSON client decodes them identically — the two
+  responses below parse to byte-identical label values.
+
+- **Measured** 2026-09-14 on one machine, single node, against the pinned
+  oracle (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
+  `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`) with
+  the committed `ci/logql/config.yaml`, and against PulsusDB at
+  `32253727` over ClickHouse `26.3.29.7`. One stream was pushed to each,
+  through each side's own `POST /loki/api/v1/push`, with the same body:
+
+  ```
+  {"streams":[{"stream":{"service_name":"s539","bs":"a\bb"},
+               "values":[["1789415775000000000","line with backspace label"]]}]}
+  ```
+
+  Both answered `204`. Both were then asked the same question —
+  `GET /loki/api/v1/query_range?query=%7Bbs%3D%22a%5Cbb%22%7D&start=…&end=…&limit=10`,
+  which is `{bs="a\bb"}` url-encoded. The `stream` objects, quoted from
+  the two response bodies (`stats` elided; nothing else is):
+
+  ```
+  ours        "stream":{"bs":"a\bb","detected_level":"unknown","service_name":"s539"}
+  reference   "stream":{"bs":"a\u0008b","detected_level":"unknown","service_name":"s539"}
+  ```
+
+  Decoded with `json.loads`, the `bs` value on both sides is the three
+  code points U+0061, U+0008, U+0062.
+
+  The form feed, same corpus shape and same request against both builds
+  (`{ff="a\fb"}`, label `ff`, service `s539f`):
+
+  ```
+  ours        "stream":{"detected_level":"unknown","ff":"a\fb","service_name":"s539f"}
+  reference   "stream":{"detected_level":"unknown","ff":"a\u000cb","service_name":"s539f"}
+  ```
+
+  Both decode to U+0061, U+000C, U+0062. Those two code points are the
+  whole of this row: every other C0 control is written `\u00XX` by both
+  sides, and every scalar value at or above U+0020 is written verbatim by
+  both.
+
+- **What this row is NOT.** It is not the defect issue #539 fixed. At
+  `92536d7a`, this branch's base, our reader's escape table had no `\b`
+  arm and its catch-all kept the letter, so the same request returned
+  `"stream":{"bs":"abb",…}` — a different string, one that belongs to a
+  different stream (measured the same day, same corpus, the base build
+  and the fixed build side by side on one database each). That was ours being wrong and is fixed;
+  `crates/pulsus-read/src/canonical_labels.rs` is the one decoder now.
+  The escape FORM above is what remains, and it was already the case
+  before that fix — the writer has always emitted `\b`.
+
+- **Why we do not change it.** Our renderer escapes exactly the mandatory
+  set the way `serde_json` does
+  (`crates/pulsus-read/src/logql/labels.rs`'s `push_json_string`), which
+  is the same set our own writer stores with
+  (`pulsus_model::LabelSet::to_canonical_json`). Making the response
+  spelling match the reference's would mean a second escaping rule that
+  disagrees with the stored one, to produce a string no client can
+  distinguish.
+
+- **Close condition:** none. This row is recorded so that a reader
+  comparing the two responses byte for byte knows the difference is
+  spelling, not value. A client that compares the raw bytes of a JSON
+  string rather than its decoded value would see it; nothing in this
+  repository does.
+
+- **Pinned by** `crates/pulsus-read/src/canonical_labels.rs`'s
+  `every_unicode_scalar_value_survives_the_writer_then_the_reader` (the
+  decode, over the whole domain) and `crates/pulsus-server/tests/`'s live
+  push case `c0_escaped_label_values_survive_push_and_come_back_decoded`
+  (the decoded value out of a real response). **Neither pins the escape
+  form itself** — no test asserts the raw bytes of this field, and the
+  measurement above is the only record of them.

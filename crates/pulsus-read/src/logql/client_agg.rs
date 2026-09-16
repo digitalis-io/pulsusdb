@@ -10,7 +10,9 @@
 //! no hot-path call crosses a codegen-unit boundary.
 
 use super::error::{ReadError, TooBroadReason};
-use super::pipeline::{ERROR_LABEL, MetricRun, RangeGrouping};
+use super::pipeline::{
+    ERROR_LABEL, MetricRun, PRESERVE_ERROR_LABEL, RangeGrouping, RangeStepRules,
+};
 use super::plan::{self, ClientAgg, ClientValue};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::RangeAggOp;
@@ -670,6 +672,12 @@ pub(in crate::logql) struct ClientAggState<'q> {
     /// Total timestamped points retained across every `rate_counter`
     /// accumulator, charged against [`MAX_COUNTER_VALUES`].
     counter_values: u64,
+    /// The range step's rules (issue #507), [`RangeStepRules::PLAIN`] until
+    /// [`ClientAggState::with_range_step`].
+    step_rules: RangeStepRules,
+    /// Fingerprints whose stored labels carry a reserved name the rules can
+    /// remove, so their rows never take the inert shortcut.
+    reserved_fps: HashSet<u64>,
     /// QUERY-LIFETIME bytes retained by `label_groups` — each distinct
     /// group's rendered key + cloned `LabelSet` + map-slot share. The same
     /// round-6 charge as the sliding path's `groups`, through the same
@@ -735,9 +743,18 @@ impl<'q> ClientAggState<'q> {
             ),
             quantile_values: 0,
             counter_values: 0,
+            step_rules: RangeStepRules::PLAIN,
+            reserved_fps: HashSet::new(),
             group_bytes: 0,
             caps,
         })
+    }
+
+    /// Applies the plan's [`RangeStepRules`] (issue #507).
+    pub(in crate::logql) fn with_range_step(mut self, step: RangeStepRules) -> Self {
+        self.reserved_fps = reserved_fingerprints(&self.base_labels, &step);
+        self.step_rules = step;
+        self
     }
 
     /// Folds one batch of rows into the reducer state: each row runs the
@@ -850,12 +867,13 @@ impl<'q> ClientAggState<'q> {
         let compiled = self.compiled;
         let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
         {
-            let (line, value) = match compiled.run_metric_into_with_sm(
+            let (line, value) = match compiled.run_metric_step_into(
                 &row.body,
                 pipeline_base,
                 row.timestamp_ns,
                 sm,
                 self.client.grouping.as_deref(),
+                &self.step_rules,
                 scratch,
             )? {
                 MetricRun::Dropped => return Ok(()),
@@ -872,14 +890,12 @@ impl<'q> ClientAggState<'q> {
             let v = match self.client.value {
                 ClientValue::Count => 1.0,
                 ClientValue::Bytes => line.len() as f64,
-                ClientValue::Unwrap => match value {
-                    Some(v) => v,
-                    // Defensive: a `None` unwrap value always carries a
-                    // nonempty `__error__` (checked above) unless a
-                    // filter dropped the line — unreachable, but never a
-                    // silent 0.
-                    None => return Ok(()),
-                },
+                // A `None` unwrap value is a failed conversion, which carries
+                // `__error__`: the check above failed the query unless
+                // `__preserve_error__="true"` let the series through (issue
+                // #507), and then the reference's sample is the converter's
+                // zero (`pkg/logql/log/metrics_extraction.go:219-230 @ v3.7.4`).
+                ClientValue::Unwrap => value.unwrap_or(0.0),
             };
             let op = self.client.range_op;
             // Issue #344: the sample's stream identity, the second key of
@@ -922,7 +938,9 @@ impl<'q> ClientAggState<'q> {
             // the same oracle `debug_assert_eq!` — see
             // `RangeSlideState::push_one_row` for why it is sound and where
             // it is checked.
-            let inert = sm_free && !self.fan_out;
+            let inert = sm_free
+                && !self.fan_out
+                && (self.reserved_fps.is_empty() || !self.reserved_fps.contains(&row.fingerprint));
             let route = if inert {
                 let fast = if fp_slider_safe {
                     RowRoute::Fingerprint
@@ -1917,6 +1935,12 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     /// (issue #249) — see [`slider_safe_fingerprints`]. Computed ONCE per
     /// query from the resolved stream set, `O(#streams)`, never per row.
     slider_safe: HashSet<u64>,
+    /// The range step's rules (issue #507), [`RangeStepRules::PLAIN`] until
+    /// [`RangeSlideState::with_range_step`].
+    step_rules: RangeStepRules,
+    /// Fingerprints whose stored labels carry a reserved name the rules can
+    /// remove, so their rows never take the inert shortcut.
+    reserved_fps: HashSet<u64>,
     /// Concurrent retained-point count (charge-on-load / discharge-on-evict),
     /// gated by [`charge_retention`]/[`discharge_retention`].
     retained: u64,
@@ -2108,7 +2132,16 @@ impl<'q> RangeSlideState<'q> {
             result_points: 0,
             fp_base_key: None,
             fold: None,
+            step_rules: RangeStepRules::PLAIN,
+            reserved_fps: HashSet::new(),
         })
+    }
+
+    /// Applies the plan's [`RangeStepRules`] (issue #507).
+    pub(in crate::logql) fn with_range_step(mut self, step: RangeStepRules) -> Self {
+        self.reserved_fps = reserved_fingerprints(&self.base_labels, &step);
+        self.step_rules = step;
+        self
     }
 
     /// The grid this state emits on — the fold indexes its dense slots by
@@ -2289,12 +2322,13 @@ impl<'q> RangeSlideState<'q> {
     {
         let compiled = self.compiled;
         let grouping = self.grouping;
-        let (line, value) = match compiled.run_metric_into_with_sm(
+        let (line, value) = match compiled.run_metric_step_into(
             &row.body,
             pipeline_base,
             row.timestamp_ns,
             sm,
             grouping,
+            &self.step_rules,
             scratch,
         )? {
             MetricRun::Dropped => return Ok(()),
@@ -2304,10 +2338,9 @@ impl<'q> RangeSlideState<'q> {
         let v = match self.value_kind {
             ClientValue::Count => 1.0,
             ClientValue::Bytes => line.len() as f64,
-            ClientValue::Unwrap => match value {
-                Some(v) => v,
-                None => return Ok(()),
-            },
+            // A failed conversion that survived the check (issue #507): the
+            // converter's zero, as on the instant path.
+            ClientValue::Unwrap => value.unwrap_or(0.0),
         };
         // Issue #249: WHERE this sample belongs, decided per row and
         // BEFORE `stage_member` sorts the scratch in place — the comparison
@@ -2325,7 +2358,9 @@ impl<'q> RangeSlideState<'q> {
         // every inert row in every hermetic test, the whole corpus
         // included, and `an_inert_pipeline_never_changes_the_label_set`
         // enumerates the stage kinds `!fan_out` admits.
-        let inert = sm_free && !self.fan_out;
+        let inert = sm_free
+            && !self.fan_out
+            && (self.reserved_fps.is_empty() || !self.reserved_fps.contains(&row.fingerprint));
         let route = if inert {
             let fast = if fp_slider_safe {
                 RowRoute::Fingerprint
@@ -3251,7 +3286,7 @@ impl<'q> RangeSlideState<'q> {
 /// (`ts := r.current/1e+6 + r.offset/1e+6`, tag `v3.7.4` /
 /// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) — the one place the offset
 /// is added back.
-fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
+pub(in crate::logql) fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
     if offset_ns == 0 {
         return result;
     }
@@ -3347,6 +3382,14 @@ pub fn run_client_agg_rows_folded_measured(
     rate_window_ns: Option<u64>,
     aggs: &[plan::VectorAggSpec],
 ) -> Result<(QueryResult, Option<u64>), ReadError> {
+    // Issue #507: the range step's rules, from the same plan fields the
+    // engine derives them from in `run_metric_client`.
+    let step = plan::range_step_rules(
+        client.range_op,
+        &client.pipeline,
+        client.grouping.as_deref(),
+        aggs,
+    );
     if matches!(window, ClientWindow::Range { .. }) {
         // Issue #227: a range query evaluates Loki's sliding windows, which
         // assume fingerprint-contiguous, ascending-ts input (the live
@@ -3361,7 +3404,8 @@ pub fn run_client_agg_rows_folded_measured(
             window,
             rate_window_ns,
             AggCaps::DEFAULT,
-        )?;
+        )?
+        .with_range_step(step);
         if let Some(spec) = aggs.last() {
             state.attach_fold(spec);
         }
@@ -3398,7 +3442,8 @@ pub fn run_client_agg_rows_folded_measured(
         instant,
         rate_window_ns,
         AggCaps::DEFAULT,
-    )?;
+    )?
+    .with_range_step(step);
     state.push_rows(rows)?;
     // `finish()` is `flush_pending` then `finish_folded`; the two halves
     // are spelled out here ONLY so the charge snapshot can sit between
@@ -3428,6 +3473,10 @@ fn instant_leaf_charged_bytes(state: &ClientAggState<'_>) -> u64 {
         // `&'q` borrows into the plan — no heap of their own.
         compiled: _,
         client: _,
+        // Issue #507: plan-time rules and a per-query fingerprint set,
+        // neither charged to the leaf.
+        step_rules: _,
+        reserved_fps: _,
         // Fixed-width scalars — no heap.
         rate_window_ns: _,
         fan_out: _,
@@ -3696,6 +3745,27 @@ impl MetricAggState<'_> {
 // allocate, #227 discipline) and released as `finish` consumes the state.
 // =====================================================================
 
+/// The fingerprints whose stored labels carry a reserved name the range
+/// step can remove (issue #507). Empty unless the rules can remove one, so
+/// an ordinary query builds nothing.
+fn reserved_fingerprints(
+    base_labels: &HashMap<u64, Vec<(String, String)>>,
+    step: &RangeStepRules,
+) -> HashSet<u64> {
+    if !step.may_remove_reserved() {
+        return HashSet::new();
+    }
+    base_labels
+        .iter()
+        .filter(|(_, labels)| {
+            labels
+                .iter()
+                .any(|(k, _)| k == ERROR_LABEL || k == PRESERVE_ERROR_LABEL)
+        })
+        .map(|(fp, _)| *fp)
+        .collect()
+}
+
 /// Adjudication #1: a line whose `__error__` is nonempty after the FULL
 /// pipeline fails the metric query with the oracle-matched named error —
 /// never silent exclusion.
@@ -3715,6 +3785,15 @@ where
     else {
         return Ok(());
     };
+    // Issue #507: a series carrying `__preserve_error__` exactly `true`
+    // passes, whatever put the label there, as the reference's error check
+    // does on every range step (`pkg/logql/evaluator.go:730` and `:762 @ v3.7.4`).
+    if labels
+        .iter()
+        .any(|(k, v)| k.as_ref() == PRESERVE_ERROR_LABEL && v.as_ref() == "true")
+    {
+        return Ok(());
+    }
     let err = err.as_ref();
     let mut sorted: Vec<(String, String)> = labels
         .iter()
@@ -3763,6 +3842,99 @@ fn mut_cells_for(class: ReducerClass, range: i64, step: u64, kmax: i64) -> MutCe
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #507: a series whose `__preserve_error__` is exactly `true`
+    /// passes the error check, as on the reference, and a
+    /// preserved failed conversion contributes the converter's zero.
+    #[test]
+    fn a_preserved_error_passes_the_check_and_a_failed_conversion_counts_zero() {
+        check_surviving_error(&[("__error__", "x"), ("__preserve_error__", "true")])
+            .expect("preserved");
+        for value in ["TRUE", "t", "1", ""] {
+            assert!(
+                check_surviving_error(&[("__error__", "x"), ("__preserve_error__", value)])
+                    .is_err(),
+                "{value:?} is not `true`"
+            );
+        }
+        let q = r#"sum_over_time({a="b"} | logfmt | unwrap latency [5m])"#;
+        let expr = pulsus_logql::parse(q).expect("parse");
+        let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) = &expr
+        else {
+            panic!("shape");
+        };
+        let compiled = CompiledPipeline::compile(&range.selector.pipeline).expect("compile");
+        let client = ClientAgg {
+            pipeline: range.selector.pipeline.clone(),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: Vec::new(),
+            grouping: None,
+        };
+        let mut meta = HashMap::new();
+        meta.insert(
+            1,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "s".to_string(),
+                labels: r#"{"app":"x","service_name":"s"}"#.to_string(),
+            },
+        );
+        let rows = vec![MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: 30_000_000_000,
+            body: "__preserve_error__=true latency=abc".to_string(),
+            structured_metadata: String::new(),
+        }];
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let QueryResult::Vector(v) =
+            run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+                .expect("a preserved error answers")
+        else {
+            panic!("instant");
+        };
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].value.to_bits(), 0.0f64.to_bits(), "{v:?}");
+        assert!(
+            v[0].labels
+                .iter()
+                .any(|(k, v)| k == "__error__" && v == "SampleExtractionErr"),
+            "{v:?}"
+        );
+        // The same line through the range state: one point at 60 s, the
+        // converter's zero, on the error series.
+        let step =
+            super::super::params::validate_duration_ns(60_000_000_000, "step").expect("step");
+        let range = super::super::params::validate_duration_ns(300_000_000_000, "range selector")
+            .expect("range");
+        let window = ClientWindow::Range {
+            grid_start_ns: 60_000_000_000,
+            end_ns: 60_000_000_000,
+            step_ns: step,
+            range_ns: range,
+            offset_ns: 0,
+        };
+        let QueryResult::Matrix(m) =
+            run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+                .expect("a preserved error answers on the range state")
+        else {
+            panic!("range");
+        };
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].points.len(), 1, "{m:?}");
+        assert_eq!(m[0].points[0].1.to_bits(), 0.0f64.to_bits(), "{m:?}");
+        assert!(
+            m[0].labels
+                .iter()
+                .any(|(k, v)| k == "__error__" && v == "SampleExtractionErr"),
+            "{m:?}"
+        );
+    }
+
     use super::*;
     use crate::logql::CompiledPipeline;
     use crate::logql::charge::MAX_CLIENT_AGG_GROUP_BYTES;

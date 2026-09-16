@@ -99,7 +99,7 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet, canonicalize_label_key};
+use pulsus_model::{Date, LabelSet, log_label_name};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 use pulsus_write::writer::{LogSampleRow, LogStreamRow};
 use pulsus_write::{LogWriter, WriterTables};
@@ -447,9 +447,8 @@ fn sql_escape(s: &str) -> String {
 /// Path B's independent reconstruction of the scope structured-metadata JSON
 /// (issue #109 AC-12 path independence): its OWN last-write-wins loop over the
 /// fixture's raw scope fields, never calling `otlp_logs`. Sanitizes attribute
-/// keys with `canonicalize_label_key` (the same primitive
-/// `LabelSet::from_normalized` uses, so the resolved keys are its fixed
-/// points), builds the ordered list `[attributes …, scope_name?,
+/// keys with `log_label_name` (the name the OTLP scope path stores, so the
+/// resolved keys are its fixed points), builds the ordered list `[attributes …, scope_name?,
 /// scope_version?]`, drops every empty-valued pair BY NAME over that WHOLE
 /// list — identity fields included, so an empty attribute named `scope_name`
 /// takes the real one with it (issue #259 — Loki 3.7.4's distributor runs an
@@ -483,7 +482,7 @@ fn path_b_scope_structured_metadata(f: &Fixture) -> String {
         .file
         .scope_attributes
         .iter()
-        .map(|(k, v)| (canonicalize_label_key(k), v.clone()))
+        .map(|(k, v)| (log_label_name(k), v.clone()))
         .collect();
     if !f.file.scope_name.is_empty() {
         ordered.push(("scope_name".to_string(), f.file.scope_name.clone()));

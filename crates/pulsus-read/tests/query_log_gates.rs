@@ -705,6 +705,18 @@ async fn data_client(db: &str) -> ChClient {
     ChClient::new(cfg).await.expect("connect data client")
 }
 
+/// [`data_client`] with a deadline the caller sets, for a test whose own
+/// corpus needs longer than this file's 60 s: the deadline has to outlast
+/// the scan the query makes, and how long that scan takes is a property of
+/// the machine, not of the behaviour under test. See
+/// `every_refusal_lands_as_the_table_says`, row R2.
+async fn data_client_with_deadline(db: &str, deadline: Duration) -> ChClient {
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    cfg.query_timeout = deadline;
+    ChClient::new(cfg).await.expect("connect data client")
+}
+
 /// One finalized `system.query_log` row per keyset PAGE query for this
 /// test's run database, in issue order.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -882,6 +894,17 @@ async fn fetch_until_limit_pages_issue_strictly_decrementing_positive_scan_caps(
         );
         running += p.read;
     }
+
+    // Review round 5: this test returned without dropping its run
+    // database, so a PASSING run left one behind.
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }
 
 #[tokio::test]
@@ -919,6 +942,17 @@ async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page
         "the zero-budget guard must return before issuing any keyset page (got {} page(s))",
         pages.len()
     );
+
+    // Review round 5: this test returned without dropping its run
+    // database, so a PASSING run left one behind.
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }
 
 // ---------------------------------------------------------------------
@@ -2274,4 +2308,6215 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_003_600_000_000_000,
     }
+}
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the anchored bucket expression, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketRow {
+    label: String,
+    t: i64,
+    got: i64,
+    expected: i64,
+}
+
+/// **The grid the reference's window implies, computed by the database
+/// from the expression this repository renders** (issue #507, W2).
+///
+/// The window for grid point `g` is `(g - range, g]` on a grid anchored at
+/// the query's start, so a sample belongs to the SMALLEST grid point at or
+/// above it — a ceiling. The shipped range renderer instead floors onto a
+/// grid anchored at the epoch. The two are not spellings of one function:
+/// with a grid start that is not a multiple of the step, the floor form's
+/// output is not a grid point at all.
+///
+/// Six inputs, four of which are the four boundary pairs the design states
+/// and two of which extend them past the next grid point. The expression
+/// under test comes from `predicate::bucket_expr` — the renderer, not a
+/// retyped copy — so a change to the renderer moves this test.
+///
+/// **What makes it discriminating.** The floor form's answer for each input
+/// is computed alongside and asserted to DIFFER at every row, so the test
+/// cannot pass against the expression it exists to reject. That check
+/// matters more than usual here: the only other exercise of the shipped
+/// range renderer puts the same expression on both sides of a comparison,
+/// and a differential between two paths that share a defect cannot see it.
+#[tokio::test]
+async fn the_anchored_bucket_expression_is_the_grid_the_window_implies() {
+    skip_unless_live!();
+    // No corpus and no run database: the expression is evaluated over a
+    // literal row set, so there is nothing to seed and nothing to drop.
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    const G: i64 = 1_700_000_000_000_000_000;
+    const STEP: i64 = 60_000_000_000;
+    let lo = G - STEP;
+
+    // The renderer's own text, minted through the sealed fragment.
+    let bucket =
+        pulsus_read::logql::predicate::bucket_expr("timestamp_ns", lo, STEP, lo, G + 10 * STEP)
+            .expect("a renderable grid");
+
+    let cases: [(&str, i64, i64); 6] = [
+        ("G - 59.999999999s", G - 59_999_999_999, G),
+        ("G", G, G),
+        ("G + 1ns", G + 1, G + STEP),
+        ("G + 30s", G + 30_000_000_000, G + STEP),
+        ("G + 60s", G + STEP, G + STEP),
+        ("G + 60s + 1ns", G + STEP + 1, G + 2 * STEP),
+    ];
+    let rows_sql = cases
+        .iter()
+        .map(|(label, t, expected)| {
+            format!("SELECT '{label}' AS label, {t}::Int64 AS timestamp_ns, {expected}::Int64 AS expected")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!(
+        "SELECT label, timestamp_ns AS t, ({}) AS got, expected FROM ({rows_sql}) ORDER BY t ASC",
+        bucket.as_sql()
+    );
+
+    let mut stream = client
+        .query_stream::<BucketRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("execute the bucket expression");
+    let mut got = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("decode a bucket row"));
+    }
+    assert_eq!(got.len(), cases.len(), "one row per input: {got:?}");
+
+    for row in &got {
+        assert_eq!(
+            row.got, row.expected,
+            "`{}` at {} must bucket to {}, got {}",
+            row.label, row.t, row.expected, row.got
+        );
+        // The grid point is on the query's grid, which the floor form's
+        // answer need not be.
+        assert_eq!(
+            (row.got - G).rem_euclid(STEP),
+            0,
+            "`{}` must bucket to a point of the query's own grid",
+            row.label
+        );
+        // The expression this replaces gives a different answer here, so a
+        // build that kept it fails this test rather than passing it.
+        let floored = row.t.div_euclid(STEP) * STEP;
+        assert_ne!(
+            floored, row.got,
+            "`{}`: the epoch-anchored floor must not agree, or this test cannot reject it",
+            row.label
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// W3 (issue #507): the rule every pushdown cell is built to, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct KeptRow {
+    kept: u8,
+}
+
+/// **A pushed parsed-name filter never drops a row the evaluator keeps**
+/// (issue #507, W3).
+///
+/// A `Fidelity::Wider` predicate may emit rows the evaluator discards and
+/// may never discard one it keeps. The two halves of that claim live in
+/// one file, `tests/logql_parsed_filter_witnesses.tsv`: its `keeps` column
+/// is the shipped pipeline's own answer, verified by
+/// `logql::predicate::tests::every_witness_row_states_the_answer_the_pipeline_gives`,
+/// and this test executes the rendered fragment against the database over
+/// the same bodies.
+///
+/// **The assertion is one-directional on purpose.** A row the database
+/// keeps and the evaluator drops is the predicate being wider, which is
+/// allowed and is counted rather than failed — the count is asserted to be
+/// non-zero, because a predicate that admitted exactly the evaluator's set
+/// would mean the witnesses cannot tell the two directions apart.
+#[tokio::test]
+async fn a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/logql_parsed_filter_witnesses.tsv"
+    );
+    let text = std::fs::read_to_string(path).expect("the witness table is readable");
+    let mut checked = 0usize;
+    let mut wider = 0usize;
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() || line.starts_with("form\t") {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 7, "seven columns: {line:?}");
+        let (form, parser_name, arg, name, value, body) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+        let evaluator_keeps = f[6] == "1";
+
+        let parser = match parser_name {
+            "json" => pulsus_logql::ParserStage::Json {
+                extractions: Vec::new(),
+            },
+            "logfmt" => pulsus_logql::ParserStage::Logfmt {
+                strict: false,
+                keep_empty: false,
+                extractions: Vec::new(),
+            },
+            "regexp" => pulsus_logql::ParserStage::Regexp(arg.to_string()),
+            "pattern" => pulsus_logql::ParserStage::Pattern(arg.to_string()),
+            other => panic!("unknown parser {other}"),
+        };
+        let fragment = if form == "neq" {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Neq,
+                value,
+                &parser,
+            )
+        } else if form == "numeric" {
+            pulsus_read::logql::predicate::parsed_numeric_filter(
+                name,
+                pulsus_logql::CompareOp::Gte,
+                value.parse::<f64>().expect("a numeric witness value"),
+                &parser,
+            )
+        } else {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Eq,
+                value,
+                &parser,
+            )
+        };
+        // A refused filter emits nothing, so there is no predicate to be
+        // wrong about; the evaluator answers as it does today.
+        let Ok(fragment) = fragment else { continue };
+        checked += 1;
+
+        let body_literal = pulsus_read::logql::predicate::literal(body);
+        let sql = format!(
+            "SELECT toUInt8({}) AS kept FROM (SELECT {} AS body, '' AS structured_metadata)",
+            fragment.as_sql(),
+            body_literal.as_sql()
+        );
+        let mut stream = client
+            .query_stream::<KeptRow>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let row = stream
+            .next()
+            .await
+            .expect("one row")
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let sql_keeps = row.kept == 1;
+
+        if evaluator_keeps {
+            assert!(
+                sql_keeps,
+                "`{form} {parser_name} {name} {value}` over `{body}`: the evaluator keeps this \
+                 row and the pushed predicate drops it, which a Wider predicate may never do.\n\
+                 {sql}"
+            );
+        } else if sql_keeps {
+            wider += 1;
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} witness rows reached a fragment"
+    );
+    assert!(
+        wider > 0,
+        "no witness row is kept by the predicate and dropped by the evaluator, so these \
+         witnesses cannot tell a wider predicate from an exact one"
+    );
+}
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the bucketed range read, end to end.
+// ---------------------------------------------------------------------
+
+/// One series of a matrix answer: its sorted labels, and its points as
+/// `(timestamp, value bits)` so "bit for bit" is literally that.
+type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketedSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+/// Seeds the two-stream fixture the bucketed differential reads, into a
+/// fresh database, and returns `(admin, db, T)` where `T` is the emit
+/// grid's first point.
+///
+/// **The two streams fold into ONE output series**, which is the shape
+/// that separates folding before emission from folding after it:
+///
+/// ```text
+/// fp 111   {app=a,           service_name=…}   rows carry metadata lvl=info
+/// fp 222   {app=a, lvl=info, service_name=…}   rows carry none
+/// ```
+///
+/// ```text
+/// grid            T        T+60    T+120   T+180   T+240
+/// fp 111 rows     2 (info)   -        -      1       -
+/// fp 222 rows     -          -        3      -       -
+/// folded series   2          -        3      1       -
+/// ```
+///
+/// Two further rows on fp 111 at the first grid point — one with
+/// `lvl=warn`, one with no metadata at all — make three output series, so
+/// "everything at this grid point" is not the same answer as "this
+/// series at this grid point".
+async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
+    const STEP: i64 = 60_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_bucket_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    // A grid point on a round multiple of the step, an hour back, so the
+    // whole fixture sits inside one partition and one retention window.
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507bucket";
+    for (fp, labels) in [
+        (
+            111u64,
+            format!(r#"{{"app":"a","service_name":"{service}"}}"#),
+        ),
+        (
+            222u64,
+            format!(r#"{{"app":"a","lvl":"info","service_name":"{service}"}}"#),
+        ),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), \
+                     {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+    }
+
+    let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
+        service: service.to_string(),
+        fingerprint: fp,
+        timestamp_ns: ts,
+        severity: 0,
+        body: body.to_string(),
+        structured_metadata: sm.to_string(),
+    };
+    let info = r#"{"lvl":"info"}"#;
+    let rows = vec![
+        // Grid point T, window (T-60s, T].
+        row(111, t - 30_000_000_000, "a", info),
+        row(111, t - 20_000_000_000, "b", info),
+        row(111, t - 25_000_000_000, "c", r#"{"lvl":"warn"}"#),
+        row(111, t - 10_000_000_000, "d", ""),
+        // Grid point T+120s: fp 222 only — the point fp 111 has a gap at.
+        row(222, t + 90_000_000_000, "e", ""),
+        row(222, t + 95_000_000_000, "f", ""),
+        row(222, t + 100_000_000_000, "g", ""),
+        // Grid point T+180s: fp 111 only.
+        row(111, t + 150_000_000_000, "h", info),
+    ];
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the bucketed fixture");
+    (admin, db, t)
+}
+
+/// **The lowered answer is the client answer, bit for bit — and the two
+/// answers come from two different code paths** (issue #507, W2).
+///
+/// `count_over_time({…}[1m])` at a 1m step is a clean bucketed chain and
+/// plans `client: None`, so the database counts. The same selector with
+/// `| drop zzz` — a label the corpus does not carry, so the stage changes
+/// no label set — is a pipeline, so it plans `client: Some(..)` and every
+/// line crosses the wire to be counted here. The answers must be
+/// identical, which is what `Fidelity::Equivalent` claims for the four
+/// counting reducers.
+///
+/// The plan shapes are asserted first. Without that the test could be
+/// comparing one path against itself and would pass for the wrong reason.
+///
+/// It also pins the GAP: the folded series carries a point wherever
+/// either fingerprint had a row and no point at the two grid points where
+/// neither did — not a zero, not a NaN, no point.
+#[tokio::test]
+async fn a_bucketed_range_read_answers_exactly_what_the_client_path_answers() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lowered_query = format!(r#"count_over_time({{service_name="{service}"}}[1m])"#);
+    let client_query = format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1m])"#);
+
+    // The two paths, asserted to BE two paths.
+    let shape = |query: &str| match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db))
+        .expect("plan")
+    {
+        Plan::Metric(mp) => mp,
+        _ => panic!("expected a metric plan"),
+    };
+    assert!(
+        shape(&lowered_query).client.is_none(),
+        "the fixture query must lower its aggregation into the statement"
+    );
+    assert!(
+        shape(&client_query).client.is_some(),
+        "the control query must stay on the client path, or this compares one path with itself"
+    );
+
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let answer = |query: String| {
+        let engine = &engine;
+        let params = &params;
+        async move {
+            let (result, _warnings) = engine
+                .query(&parse(&query).expect("parse"), params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let QueryResult::Matrix(series) = result else {
+                panic!("{query}: expected a matrix");
+            };
+            let mut out: Vec<AnswerSeries> = series
+                .into_iter()
+                .map(|s| {
+                    let mut labels = s.labels;
+                    labels.sort();
+                    (
+                        labels,
+                        s.points
+                            .into_iter()
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    let lowered = answer(lowered_query).await;
+    let client = answer(client_query).await;
+
+    assert_eq!(
+        lowered, client,
+        "the lowered answer and the client answer must agree bit for bit"
+    );
+
+    // The fixture's own expectation, so a shared defect in both paths
+    // cannot pass this test: three series, and the folded one carries
+    // points only where a contributing row exists.
+    assert_eq!(lowered.len(), 3, "{lowered:?}");
+    let folded = lowered
+        .iter()
+        .find(|(labels, _)| labels.contains(&("lvl".to_string(), "info".to_string())))
+        .expect("the folded series");
+    assert_eq!(
+        folded.1,
+        vec![
+            (t, 2.0f64.to_bits()),
+            (t + 2 * STEP, 3.0f64.to_bits()),
+            (t + 3 * STEP, 1.0f64.to_bits()),
+        ],
+        "a grid point with no contributing row is not emitted at all"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The grid-resolution guard holds on the bucketed path too** (issue
+/// #507, W2).
+///
+/// The client path reaches `window::ensure_grid_resolution` by building a
+/// `ClientWindow::Range`; the bucketed path builds no window, so the guard
+/// is called from the arm itself. Without that call an over-cap grid would
+/// be answered instead of refused — a query that 422s today would start
+/// returning a matrix — and no other assertion in the tree would notice.
+///
+/// Both queries below ask for 14 400 intervals against a cap of 11 000:
+/// the lowered one and the client-path control, which must refuse the same
+/// way. The corpus must resolve at least one stream, because the guard
+/// sits after stream resolution on both paths.
+#[tokio::test]
+async fn an_over_cap_grid_is_refused_on_the_bucketed_path_as_on_the_client_path() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    // 4 hours at a 1s step: 14 400 intervals, against MAX_CLIENT_AGG_BUCKETS.
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 14_400_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    for (query, path) in [
+        (
+            format!(r#"count_over_time({{service_name="{service}"}}[1s])"#),
+            "the bucketed path",
+        ),
+        (
+            format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1s])"#),
+            "the client path",
+        ),
+    ] {
+        let err = engine
+            .query(&parse(&query).expect("parse"), &params)
+            .await
+            .expect_err("an over-cap grid must be refused");
+        assert!(
+            matches!(err, ReadError::QueryTooBroad(_)),
+            "{path}: expected the named buckets refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("11000"),
+            "{path}: the refusal must name the cap, got {err}"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The `/explain` seam reports the statement the engine issues** (issue
+/// #507, W2).
+///
+/// `LogQlEngine::explain` refused a range plan with no client aggregation
+/// until W2, arguing — correctly at the time — that the engine would
+/// refuse it too. The engine now serves it, so an EXPLAIN that still
+/// refused would be a wrong answer on a route a user can reach.
+///
+/// **This is the only caller of that seam in the repository**: the
+/// `X-Pulsus-Explain` header routes through `query_explained`, which
+/// collects the payload from the EXECUTION path. So the twin had no
+/// coverage at all, and a break placed in it stayed green everywhere —
+/// measured, which is why this test exists.
+///
+/// The assertion is equality with the executing path's own reported
+/// statement, not a snapshot: the two come from one function and this is
+/// what holds them there.
+#[tokio::test]
+async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let expr = parse(&format!(
+        r#"count_over_time({{service_name="{service}"}}[1m])"#
+    ))
+    .expect("parse");
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    let explained = engine.explain(&expr, &params).await.expect("explain");
+    let reported = explained
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the explain payload names the metric read");
+    assert!(
+        reported.contains("AS bucket_ns") && reported.contains("GROUP BY fingerprint, bucket_ns"),
+        "the explain seam must report the BUCKETED statement, got:\n{reported}"
+    );
+    assert_eq!(
+        explained.routing.as_ref().map(|r| r.reason.as_str()),
+        Some("raw: bucketed range aggregation (issue #507)")
+    );
+
+    // The executing path's own reported statement, for the same query.
+    let (_r, _w, executed) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query with explain");
+    let issued = executed
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the execution payload names the metric read");
+    assert_eq!(
+        reported, issued,
+        "the explain seam and the executing path must report ONE statement"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct UnwrapSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SumRow {
+    s: f64,
+    /// XOR of every extracted value's bit pattern — order-independent, so
+    /// it compares the VALUE SET and cannot be confused with a summation
+    /// order difference.
+    x: u64,
+    n: u64,
+}
+
+/// **The claim W4's exact comparison rested on, measured — and it is
+/// false** (issue #507 W4 §6).
+///
+/// The claim was: at `max_threads = 1` the database's `sum` accumulates a
+/// single fingerprint's rows in `(service, fingerprint, timestamp_ns)`
+/// order, which within one fingerprint is timestamp order, so the two
+/// summations are the same summation and agree bit for bit.
+///
+/// **They do not agree, at any of the three sizes**, measured on
+/// `clickhouse/clickhouse-server:26.3` (server 26.3.29.7):
+///
+/// ```text
+///  N        ours                 the database         ULPs   |diff|      bound
+///  1e3      0xc16bd86f1537bba1   0xc16bd86f1537bba2      1   1.86e-9   3.29e-5
+///  1e5      0x41b936b66d98bf1a   0x41b936b66d98bf12      8   4.77e-7   2.90e-1
+///  1e6      0x41ac0f9d50e2fd32   0x41ac0f9d50e2fd51     31   9.24e-7   2.86e+1
+/// ```
+///
+/// **The cause is the block, not the thread.** At `max_threads = 1` and
+/// `max_block_size = 1` the database reproduces the left-to-right sum
+/// exactly; every larger block size differs, and not monotonically —
+/// measured over 100 000 of these values against a strictly sequential
+/// `arrayFold` in the database itself:
+///
+/// ```text
+///  left to right (arrayFold)  C193FE7B56D2A381
+///  max_block_size = 1         C193FE7B56D2A381   equal
+///  max_block_size = 64        C193FE7B56D2A394
+///  max_block_size = 1024      C193FE7B56D2A3A9
+///  max_block_size = 8192      C193FE7B56D2A3AE
+///  max_block_size = 65505     C193FE7B56D2A193
+/// ```
+///
+/// A block size of one is not a setting a read path can carry, so pinning
+/// the thread count does not recover a bit-exact comparison.
+///
+/// **What this test therefore asserts** is the property that does hold and
+/// that a reader needs: the two answers differ by at most
+/// `2(n−1)·u·Σ|vᵢ|`, the bound any two evaluation orders of the same `n`
+/// values obey. It also rules out the one confound that would make the
+/// sums incomparable — a value set that is not the same on both sides —
+/// before reading anything from them.
+///
+/// The values are generated once, in Rust, and written with `{:?}` —
+/// Rust's shortest round-tripping float form — so the bytes the database
+/// parses decode back to exactly the `f64` this test summed.
+#[tokio::test]
+async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4sum_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4sum_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let mut results: Vec<(u64, f64, f64, f64, f64)> = Vec::new();
+    for (n, fp) in [(1_000u64, 901u64), (100_000, 902), (1_000_000, 903)] {
+        // Mixed magnitude and sign, deterministic (the splitmix64 pattern).
+        let values: Vec<f64> = (0..n)
+            .map(|i| {
+                let r = splitmix64(i);
+                let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+                let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+                let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+                sign * mag * (1.0 + frac)
+            })
+            .collect();
+        // Recent, not a fixed epoch: `log_samples` carries a TTL on
+        // `timestamp_ns` with `ttl_only_drop_parts`, so a part written at a
+        // date older than the retention window is dropped on arrival and
+        // the query answers `0` with no error. Measured: a 2023 timestamp
+        // inserted, reported success, and left zero rows.
+        let t0 = now_ns() - 3_600_000_000_000;
+        let rows: Vec<UnwrapSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| UnwrapSeedRow {
+                service: "w4".to_string(),
+                fingerprint: fp,
+                timestamp_ns: t0 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"v":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+
+        // Left to right, in timestamp order — the evaluator's accumulation.
+        let mut ours = 0.0f64;
+        for v in &values {
+            ours += *v;
+        }
+
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n \
+             FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let settings = QuerySettings::new().set("max_threads", 1);
+        let mut stream = client
+            .query_stream::<SumRow>(&sql, &settings)
+            .await
+            .expect("execute");
+        let row = stream.next().await.expect("one row").expect("decode");
+        drop(stream);
+
+        // The confound, ruled out first: if the database decoded even one
+        // value differently from the bytes we wrote, the sums would differ
+        // for a reason that has nothing to do with order. The XOR of the
+        // bit patterns is order-independent, so it compares the value SET.
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        assert_eq!(row.n, n, "N={n}: every row must be present");
+        assert_eq!(
+            row.x, our_xor,
+            "N={n}: the database decoded a different value set, so nothing \
+             about summation order can be read from the sums"
+        );
+
+        let theirs = row.s;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let bound = 2.0 * ((n - 1) as f64) * (f64::EPSILON / 2.0) * sum_abs;
+        let ulps = (ours.to_bits() as i64 - theirs.to_bits() as i64).abs();
+        eprintln!(
+            "N={n}: ours={ours:?} ({:#018x})  theirs={theirs:?} ({:#018x})  \
+             ulps={ulps}  diff={:e}  bound={bound:e}  sum|v|={sum_abs:e}",
+            ours.to_bits(),
+            theirs.to_bits(),
+            (ours - theirs).abs()
+        );
+        results.push((n, ours, theirs, sum_abs, bound));
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+
+    for (n, ours, theirs, sum_abs, bound) in &results {
+        eprintln!(
+            "N={n}: agree={}  |diff|={:e}  bound={:e}  sum|v|={:e}",
+            ours.to_bits() == theirs.to_bits(),
+            (ours - theirs).abs(),
+            bound,
+            sum_abs
+        );
+    }
+    // The property that holds, and the one a reader can rely on.
+    for (n, ours, theirs, _sum_abs, bound) in &results {
+        let diff = (ours - theirs).abs();
+        assert!(
+            diff <= *bound,
+            "N={n}: two evaluation orders of the same {n} values may differ by \
+             at most 2(n-1)*u*sum|v| = {bound:e}, got {diff:e}"
+        );
+    }
+    // And the non-vacuity of the sentence above: they DO differ, so the
+    // bound is doing work rather than passing on equality. If this ever
+    // stops holding, the database has changed its accumulation and W4's
+    // comparison can be tightened — which is good news and should not be
+    // discovered by a silent pass.
+    assert!(
+        results
+            .iter()
+            .any(|(_, o, t, _, _)| o.to_bits() != t.to_bits()),
+        "every size agreed bit for bit: re-read this test's doc comment, the \
+         measurement it records has changed"
+    );
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the spread gate and the reproducibility gate.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PartCountRow {
+    n: u64,
+}
+
+/// One database name, for [`sweep_leftovers`].
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DbNameRow {
+    name: String,
+}
+
+/// The name prefix a leftover sweep may match, or `None` when the sweep
+/// must not run.
+///
+/// **Why a suite sweeps at all.** A test that names its database with a
+/// UUID and drops it on the last line leaves that database behind whenever
+/// it fails — and a break test, which is how this suite's assertions are
+/// shown to work, fails on purpose. Each such run would leak one database
+/// for good.
+///
+/// **Why it refuses without a prefix** (issue #507 W4, review round 5).
+/// The sweep matches every database whose name starts with `stem`. With
+/// `PULSUS_TEST_CH_DATABASE_PREFIX` unset, `pulsus_testkit::test_db` leaves
+/// the name as written, so the stem is the same in every checkout, and one
+/// checkout's sweep would drop the database another checkout's run of the
+/// same test is using at that moment — a live run and a leftover look
+/// identical from the server. The prefix is the one thing that makes the
+/// stem this checkout's own, so without it nothing is known to be ours,
+/// and the leftovers are the lesser harm.
+///
+/// Blank is read as unset and surrounding whitespace is trimmed, exactly as
+/// `test_db` reads the same variable. With a prefix set, `stem` must begin
+/// with it — a stem that does not was not composed by `test_db` under this
+/// prefix, and sweeping it would reach names this checkout does not own.
+///
+/// `stem` must end in `_`, so that one test's stem cannot be a prefix of a
+/// sibling's (`…_w4spread_` against `…_w4spread2_`).
+fn leftover_stem<'a>(prefix: Option<&str>, stem: &'a str) -> Option<&'a str> {
+    assert!(
+        stem.ends_with('_'),
+        "a sweep stem must end in `_`, or it matches a sibling test's names: {stem:?}"
+    );
+    let prefix = prefix.map(str::trim).filter(|p| !p.is_empty())?;
+    assert!(
+        stem.starts_with(&format!("{prefix}_")),
+        "a sweep stem must be composed by test_db under the prefix {prefix:?}: {stem:?}"
+    );
+    Some(stem)
+}
+
+/// Drops the databases earlier runs of ONE test left behind, and only when
+/// this checkout has a database-name prefix — see [`leftover_stem`] for why
+/// both halves of that sentence are load-bearing.
+///
+/// `stem` is `pulsus_testkit::test_db(<the test's name stem>)`, the string
+/// its database name is composed from before the UUID.
+async fn sweep_leftovers(admin: &ChClient, stem: &str) {
+    let prefix = std::env::var(pulsus_testkit::DATABASE_PREFIX_VAR).ok();
+    let Some(stem) = leftover_stem(prefix.as_deref(), stem) else {
+        eprintln!(
+            "not sweeping leftovers of {stem}: {} is unset, so the stem is shared with every \
+             other checkout and a sweep could drop a database another run is using",
+            pulsus_testkit::DATABASE_PREFIX_VAR
+        );
+        return;
+    };
+    let mut names = admin
+        .query_stream::<DbNameRow>(
+            &format!("SELECT name FROM system.databases WHERE startsWith(name, '{stem}')"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("list leftover databases");
+    let mut found = Vec::new();
+    while let Some(row) = names.next().await {
+        found.push(row.expect("decode a database name").name);
+    }
+    drop(names);
+    for name in &found {
+        admin
+            .execute(
+                &format!("DROP DATABASE IF EXISTS {name}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop a leftover database");
+    }
+    if !found.is_empty() {
+        eprintln!(
+            "dropped {} database(s) an earlier run of this test left behind",
+            found.len()
+        );
+    }
+}
+
+/// [`leftover_stem`]'s refusal, hermetically: every reading of the prefix
+/// that `test_db` treats as unset refuses the sweep, and a set prefix
+/// admits a stem composed under it.
+#[test]
+fn the_leftover_sweep_refuses_without_a_prefix() {
+    let bare = "sweep_fixture_stem_";
+    for unset in [None, Some(""), Some("   "), Some("\t")] {
+        assert_eq!(
+            leftover_stem(unset, bare),
+            None,
+            "prefix {unset:?}: the stem would be shared with every checkout"
+        );
+    }
+    let composed = "wt3_sweep_fixture_stem_";
+    assert_eq!(leftover_stem(Some("wt3"), composed), Some(composed));
+    assert_eq!(
+        leftover_stem(Some(" wt3 "), composed),
+        Some(composed),
+        "trimmed, as test_db trims"
+    );
+}
+
+/// A stem without its trailing `_` would let `…_w4spread` sweep
+/// `…_w4spread2_…`, a different test's databases.
+#[test]
+#[should_panic(expected = "must end in `_`")]
+fn a_sweep_stem_without_its_trailing_underscore_is_refused() {
+    let _ = leftover_stem(Some("wt3"), "wt3_sweep_fixture_stem");
+}
+
+/// A set prefix and a stem that does not carry it: the stem was not
+/// composed under this prefix, so it may name another checkout's databases.
+#[test]
+#[should_panic(expected = "must be composed by test_db under the prefix")]
+fn a_sweep_stem_the_prefix_did_not_compose_is_refused() {
+    let _ = leftover_stem(Some("wt3"), "sweep_fixture_stem_");
+}
+
+/// The unwrapped-value corpus both W4 gates read: `n` deterministic values
+/// of mixed magnitude and sign, one fingerprint, one JSON body each.
+///
+/// Returns the values in timestamp order. **The caller asserts the row
+/// count against `n` before measuring anything** — the standing rule this
+/// issue adopted after an insert that reported success and left zero rows
+/// (a fixed 2023 timestamp against the table's retention rule, which drops
+/// whole parts).
+fn unwrap_values(n: u64) -> Vec<f64> {
+    (0..n)
+        .map(|i| {
+            let r = splitmix64(i);
+            let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+            let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+            let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+            sign * mag * (1.0 + frac)
+        })
+        .collect()
+}
+
+fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| UnwrapSeedRow {
+            service: "w4".to_string(),
+            fingerprint: fp,
+            timestamp_ns: t0 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"v":{v:?}}}"#),
+            structured_metadata: String::new(),
+        })
+        .collect()
+}
+
+/// `2(n−1)·u·Σ|vᵢ|` with `u = 2⁻⁵³` — the most two evaluation orders of the
+/// same `n` values can differ by (issue #507 W4 §5).
+fn summation_spread_bound(values: &[f64]) -> f64 {
+    let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+    2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+}
+
+/// **The gate that would tell us the ruling was wrong** (issue #507 W4 §6).
+///
+/// The owner accepted that the database chooses the summation order and may
+/// choose differently between two executions. What that ruling assumes is
+/// that the resulting answers stay within a rounding difference of each
+/// other. This asserts exactly that, and against nothing foreign: it
+/// compares our own answers at four thread counts **with each other**, so
+/// it needs no tolerance against another implementation, and it is
+/// scale-invariant, so it is a Tier-1 gate.
+///
+/// It fails precisely when the accepted divergence stops being last-bits.
+#[tokio::test]
+async fn the_thread_count_spread_stays_inside_the_summation_bound() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let values = unwrap_values(N);
+    let rows = unwrap_rows(1, now_ns() - 3_600_000_000_000, &values);
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert");
+
+    let sql = format!(
+        "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+         groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+         count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = 1"
+    );
+    let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+
+    let mut answers: Vec<(u64, f64)> = Vec::new();
+    for threads in [1u64, 2, 4, 8] {
+        for _rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", threads);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            // The standing rule: the input is asserted present, and the
+            // same values, before the result is read for anything.
+            assert_eq!(
+                row.n, N,
+                "max_threads={threads}: the corpus must be present"
+            );
+            assert_eq!(row.x, our_xor, "max_threads={threads}: the same value set");
+            answers.push((threads, row.s));
+        }
+    }
+
+    let bound = summation_spread_bound(&values);
+    for (ta, a) in &answers {
+        for (tb, b) in &answers {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= bound,
+                "max_threads={ta} answered {a:?} and max_threads={tb} answered {b:?}: two \
+                 evaluation orders of the same {N} values may differ by at most \
+                 2(n-1)*u*sum|v| = {bound:e}, got {diff:e} — the accepted divergence has \
+                 stopped being a rounding difference"
+            );
+        }
+    }
+    // Non-vacuity: the thread count DOES move the answer, so the bound is
+    // doing work rather than passing on equality.
+    let distinct: std::collections::BTreeSet<u64> =
+        answers.iter().map(|(_, v)| v.to_bits()).collect();
+    assert!(
+        distinct.len() > 1,
+        "every thread count answered the same bits: the spread this bounds no longer \
+         exists, and the gate is passing on equality rather than on the bound"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
+
+/// **Repeated executions of the same query on unchanged data agree bit for
+/// bit, at `max_threads = 1` and a fixed part layout** (issue #507 W4 §3).
+///
+/// Its failure means a source of nondeterminism exists that is neither the
+/// thread count nor the part count — which is a thing we would want to know
+/// and currently could not learn. It is exact, not tolerance-based: the
+/// claim is reproducibility, not closeness.
+///
+/// **The scope was measured rather than assumed**, because the plan scoped
+/// it to one part and named the measurement that would widen it. Six
+/// repetitions per cell, over 1 000 000 identical values laid out in 1, 2
+/// and 8 parts with merges stopped, **on an otherwise idle server**:
+///
+/// ```text
+///  parts  threads=1           threads=4           threads=8
+///  1      C1B845C49C9466C4    C1B845C49C9465EC    C1B845C49C946670
+///  2      C1B845C49C94663A    C1B845C49C946623    C1B845C49C946622
+///  8      C1B845C49C946663    C1B845C49C946662    C1B845C49C946663
+/// ```
+///
+/// Constant in every cell, and different between cells. So the part count
+/// is a **third source of divergence**, alongside the thread count and the
+/// block accumulation that separates us from the database in the first
+/// place.
+///
+/// **`max_threads = 1` is not a detail of this test, it is its subject.**
+/// The first version pinned four threads and passed alone and failed
+/// inside the suite, fourteen ULPs apart. The cause is not scheduling
+/// jitter: `max_threads` is an UPPER BOUND, and the server reduces the
+/// EFFECTIVE degree of parallelism when it is busy, so the answer moves
+/// with the load rather than with the setting. Measured directly, six
+/// repetitions each, with six concurrent heavy queries as the load:
+///
+/// ```text
+///  quiet,     threads=4   C1B845C49C9465EC   constant
+///  under load, threads=4  C1B845C49C9465E6   constant, and DIFFERENT
+///  under load, threads=1  C1B845C49C9466C4   constant, and equal to quiet
+/// ```
+///
+/// At one thread the effective degree is one whatever the server is doing,
+/// which is what makes the claim below reproducible rather than merely
+/// usually true. **The user-visible consequence is worth stating: two
+/// refreshes of an unchanged dashboard can differ because the server was
+/// busier, not because anything was configured differently.**
+///
+/// `SYSTEM STOP MERGES` is what makes the part count an input rather than a
+/// race: without it a background merge rewrites eight parts into three
+/// while the test runs, which was measured before this test was written.
+#[tokio::test]
+async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    const THREADS: u64 = 1;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4parts_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4parts_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.log_samples"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+
+    let values = unwrap_values(N);
+    let t0 = now_ns() - 3_600_000_000_000;
+    let mut per_layout: Vec<(usize, u64)> = Vec::new();
+    for (parts, fp) in [(1usize, 11u64), (2, 12), (8, 13)] {
+        let chunk = values.len() / parts;
+        for c in 0..parts {
+            let lo = c * chunk;
+            let hi = if c + 1 == parts {
+                values.len()
+            } else {
+                lo + chunk
+            };
+            let rows = unwrap_rows(fp, t0 + lo as i64, &values[lo..hi]);
+            client
+                .insert_block("log_samples", &rows)
+                .await
+                .expect("insert");
+        }
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        let mut seen: Vec<u64> = Vec::new();
+        for rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", THREADS);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            assert_eq!(row.n, N, "parts={parts}: the corpus must be present");
+            assert_eq!(row.x, our_xor, "parts={parts}: the same value set");
+            seen.push(row.s.to_bits());
+            assert_eq!(
+                seen[0], seen[rep],
+                "parts={parts}, max_threads={THREADS}: repetition {rep} answered different \
+                 bits from repetition 0, so a source of nondeterminism exists that is \
+                 neither the thread count nor the part count"
+            );
+        }
+        // The layout is the one asked for, not the one a merge left behind.
+        let layout_sql = format!(
+            "SELECT count() AS n FROM system.parts WHERE database = '{db}' \
+             AND table = 'log_samples' AND active AND rows > 0"
+        );
+        let mut stream = admin
+            .query_stream::<PartCountRow>(&layout_sql, &QuerySettings::new())
+            .await
+            .expect("read the part layout");
+        let observed = stream.next().await.expect("one row").expect("decode").n;
+        drop(stream);
+        per_layout.push((parts, seen[0]));
+        assert!(
+            observed >= parts as u64,
+            "parts={parts}: the table holds {observed} active parts, so the layout this cell \
+             names was merged away before it was measured"
+        );
+    }
+    // The measured finding this gate's scope rests on: the part layout
+    // moves the answer. If it stopped doing so, the scope could be widened
+    // and the user-facing sentence loses a clause — which should be a
+    // decision, not a silent pass.
+    let distinct: std::collections::BTreeSet<u64> = per_layout.iter().map(|(_, b)| *b).collect();
+    assert!(
+        distinct.len() > 1,
+        "every part layout answered the same bits: {per_layout:?} — the part count is no \
+         longer a source of divergence and the documentation says it is"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the unwrapped read, end to end, one case per measured
+// class of parser disagreement.
+// ---------------------------------------------------------------------
+
+/// **One case per measured class, each with the value that produces it**
+/// (issue #507 W4, review round 4).
+///
+/// ```text
+///  case        value                       expected     the two parsers
+///  ordinary    45.25, "2.25", 4            LOWERS       agree; the quoted form is the point
+///  one_ulp     "9367469347402735e292"      LOWERS       agree ONLY under the parser setting
+///  class A     "E12"                       FALLS BACK   NULL here, a parse error in ours
+///  class B     "1.7976931348623159e308"    FALLS BACK   NULL here, inf in ours
+///  class C     "5e-324"                    LOWERS       bits 0x1 on both sides
+///  over        "inf"                       FALLS BACK   both parse it; the prefix test does not
+///  nan_exp     "0e999999"                  FALLS BACK   both +0; the denotation clause refuses it
+///  under_exp   "9999999999999999e-324"     LOWERS       bits 0x730d67819e8d2 on both sides
+///  shadowed    metadata latency=5, bodies 7 and 8       FALLS BACK   TWO series, keyed by the
+///                                                       parsed value under latency_extracted
+///  fixed_sub   "0.000…0005", 326 chars     LOWERS       bits 0x1 on both sides
+///  avg_over    two × 1e308, avg_over_time  FALLS BACK   inf here, 1e308 in ours — a FINITE
+///                                                       mean turned into infinity
+/// ```
+///
+/// **Three cases moved from FALLS BACK to LOWERS in review round 4**, and
+/// the reason is one statement-level setting rather than a change to the
+/// guard. `sql::UNWRAP_PARSER_SETTING` renders `precise_float_parsing = 1`
+/// into the statement; under it C, `under_exp` and `fixed_sub` convert to
+/// the same bits as `f64::from_str` and qualify. `one_ulp` is the case that
+/// makes the setting necessary rather than tidy: with `n = 1` the
+/// summation-order bound `2(n−1)·u·Σ|vᵢ|` is ZERO, so the default parser's
+/// `0x7fe0acb5cadc2918` against our `0x7fe0acb5cadc2917` is a wrong answer
+/// with nothing to absorb it. Delete the setting from `metric_range_unwrapped`
+/// and this case is what goes red.
+///
+/// A and B are still refused, now by `isNotNull`: both texts convert to
+/// NULL under the setting. `over` and `nan_exp` are over-rejections — the
+/// two parsers agree on `"inf"` and on `"0e999999"` — kept because dropping
+/// a conjunct widens the lowered set, which is not a thing to do on one
+/// setting at the end of a wave.
+///
+/// **The control is the same query with `| drop zzz` after the unwrap** —
+/// a label filter after the unwrap blocks the lowering, and one naming a label the
+/// corpus does not carry keeps every line (an absent label reads as empty). The plan shapes are
+/// asserted to differ first, so the test cannot compare one path with
+/// itself.
+///
+/// The fallback is observed rather than inferred: on a fallback the
+/// explain payload's LAST `metric_read` is the client sliding scan, whose
+/// `ORDER BY service ASC` no lowered statement carries.
+#[tokio::test]
+async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4unwrap_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4unwrap_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    // Each class gets its own stream, so one class's fallback cannot
+    // decide another's.
+    // The 326-character fixed-point spelling of `5e-324`: no exponent, so
+    // round 1's `[eE]` clause did not see it (review round 2).
+    let fixed_subnormal = format!("\"0.{}5\"", "0".repeat(323));
+    /// One case of the differential: its name and stream, the values every
+    /// row carries, the structured metadata on every row, the reducer, and
+    /// whether the lowered query is expected to fall back.
+    type UnwrapCase<'a> = (&'a str, u64, &'a [&'a str], &'a str, &'a str, bool);
+    let cases: [UnwrapCase<'_>; 11] = [
+        (
+            "ordinary",
+            201,
+            &["45.25", "\"2.25\"", "4"],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 4: ONE row, so the summation-order bound is zero
+        // and the only slack is the parser's. The default parser converts
+        // this text to `0x7fe0acb5cadc2918` and `f64::from_str` gives
+        // `0x7fe0acb5cadc2917`; the statement's
+        // `SETTINGS precise_float_parsing = 1` is what makes the two sides
+        // equal, and this case is what reddens without it.
+        (
+            "one_ulp",
+            211,
+            &["\"9367469347402735e292\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        ("class_a", 202, &["1", "\"E12\""], "", "sum_over_time", true),
+        (
+            "class_b",
+            203,
+            &["1", "\"1.7976931348623159e308\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 4: under the parser setting this converts to bits
+        // `0x1`, which is what `f64::from_str` gives, so it QUALIFIES and
+        // the two paths must answer the same bits. It fell back before the
+        // setting, when the conversion was `0`.
+        (
+            "class_c",
+            204,
+            &["1", "\"5e-324\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        (
+            "over_reject",
+            205,
+            &["1", "\"inf\""],
+            "",
+            "sum_over_time",
+            true,
+        ),
+        // Review round 1: a digit with an exponent that overflows, and one
+        // that underflows. Both pass the anchored prefix test, so the hole
+        // was never in that test. Review round 4: under the parser setting
+        // `"0e999999"` converts to `+0` rather than to a negative NaN, and
+        // what refuses it now is the denotation clause — an over-rejection,
+        // since our parser also gives `+0`.
+        // Issue #507, criterion 11: on the group key read the text is decided
+        // (the database's `+0` is our parser's), so it answers there.
+        (
+            "nan_exp",
+            206,
+            &["1", "\"0e999999\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 4: the same move as `class_c` at a magnitude where
+        // the old divergence was obvious — `0` against
+        // `0x730d67819e8d2`. Under the setting both sides convert to
+        // `0x730d67819e8d2`.
+        (
+            "under_exp",
+            207,
+            &["1", "\"9999999999999999e-324\""],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 2: the same underflow written WITHOUT an exponent,
+        // which is why the guard asks what the text DENOTES rather than how
+        // it is spelled. Review round 4: under the parser setting this
+        // converts to bits `0x1` on both sides, so it lowers.
+        (
+            "fixed_subnormal",
+            209,
+            &["1", fixed_subnormal.as_str()],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 2: two accepted samples whose SUM overflows where
+        // the reference's incremental mean does not — the database
+        // answers `inf`, the evaluator `1e308`.
+        (
+            "avg_overflow",
+            210,
+            &["1e308", "1e308"],
+            "",
+            "avg_over_time",
+            true,
+        ),
+        // Review round 1: the metadata carries the unwrapped name, so the
+        // evaluator keys its series by the PARSED value under
+        // `latency_extracted` — two series here, which no group key the
+        // statement has can express.
+        (
+            "shadowed",
+            208,
+            &["7", "8"],
+            r#"{"latency":"5"}"#,
+            "sum_over_time",
+            true,
+        ),
+    ];
+    let mut rows: Vec<BucketedSeedRow> = Vec::new();
+    for (name, fp, values, sm, _, _) in cases {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        for (i, v) in values.iter().enumerate() {
+            rows.push(BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v}}}"#),
+                structured_metadata: sm.to_string(),
+            });
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the unwrapped fixture");
+    // The standing rule: the input is asserted present before anything is
+    // read from it.
+    let seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let seeded = {
+        let mut s = seeded;
+        let n = s.next().await.expect("one row").expect("decode").n;
+        drop(s);
+        n
+    };
+    assert_eq!(seeded, rows.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    for (name, _fp, _values, _sm, op, expect_fallback) in cases {
+        let lowered_q = format!(
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        let client_q = format!(
+            r#"{op}({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        );
+        // Two paths, asserted to BE two paths.
+        let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => mp,
+            other => panic!("{q}: {other:?}"),
+        };
+        assert!(
+            shape(&lowered_q).client.is_none(),
+            "{name}: the fixture query must plan the lowered read"
+        );
+        assert!(
+            shape(&client_q).client.is_some(),
+            "{name}: the control must stay on the client path"
+        );
+
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                match engine
+                    .query_explained(&parse(&q).expect("parse"), params)
+                    .await
+                {
+                    Ok((result, _w, explain)) => {
+                        let QueryResult::Matrix(series) = result else {
+                            panic!("{q}: expected a matrix");
+                        };
+                        let last_read = explain
+                            .stages
+                            .iter()
+                            .rfind(|s| s.name == "metric_read")
+                            .map(|s| s.sql.clone())
+                            .unwrap_or_default();
+                        let points: Vec<(i64, u64)> = series
+                            .into_iter()
+                            .flat_map(|s| s.points)
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect();
+                        Ok((points, last_read))
+                    }
+                    // A value the EVALUATOR rejects is a 400 for the whole
+                    // series, and the lowered statement cannot produce one:
+                    // it would have summed a `0` and answered a number. So
+                    // an error here is itself the proof that the query fell
+                    // back — a stronger observable than the reported SQL.
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        let lowered_res = answer(lowered_q.clone()).await;
+        let client_res = answer(client_q).await;
+
+        if let (Err(le), Err(ce)) = (&lowered_res, &client_res) {
+            assert_eq!(le, ce, "{name}: both paths must refuse the same way");
+            assert!(
+                expect_fallback,
+                "{name}: a refusal means the lowered path fell back, which this case did not \
+                 expect"
+            );
+            continue;
+        }
+        let (lowered, last_read) = lowered_res.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (client_ans, _) = client_res.unwrap_or_else(|e| panic!("{name} control: {e}"));
+
+        let fell_back = last_read.contains("ORDER BY service ASC");
+        assert_eq!(
+            fell_back, expect_fallback,
+            "{name}: expected fallback={expect_fallback}; the last reported metric_read was:\n\
+             {last_read}"
+        );
+
+        assert_eq!(
+            lowered, client_ans,
+            "{name}: the two paths must answer the same bits"
+        );
+        if name == "shadowed" {
+            // And the shape the collapse would have produced: TWO series,
+            // because the parsed value survives as `latency_extracted` and
+            // its two values are two series. A recomputed group answers
+            // ONE series of 10 here, which is what an earlier round did.
+            assert_eq!(
+                lowered.len(),
+                2,
+                "{name}: the parsed collision label splits the series: {lowered:?}"
+            );
+            for (_, v) in &lowered {
+                assert_eq!(
+                    *v,
+                    5.0f64.to_bits(),
+                    "{name}: each series is the metadata's own value"
+                );
+            }
+        }
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The spread reducers are NOT lowered, and the high-offset corpus is
+/// why** (issue #507 W4, review rounds 1 and 3).
+///
+/// They were lowered through `stddevPopStable`/`varPopStable`, which fixed
+/// the catastrophic cancellation the plain `stddevPop`/`varPop` have —
+/// over `{1e16, 1e16+2, +4, +8, +16}` those answer `0` and `0` against the
+/// evaluator's `31.2` and `5.585696017507576`. The stable variants
+/// returned the evaluator's bits on that corpus, and **that was not
+/// enough**: over 300,000 samples at `max_threads = 8` and
+/// `max_block_size = 65536` the database's variance came back FINITE and
+/// wrong — bits `9090485321501537692` against the client's
+/// `9090485321501537553`, a difference of `1.0334767513920592e286`.
+///
+/// **A finite wrong answer is what the reader's guard cannot see.** The
+/// non-finite fallback rests on overflow being absorbing, which holds for
+/// a sum and not for a partial-moment algorithm. So the pair is withdrawn
+/// at `sql::UnwrapReducer`, and this test is what fails if it comes back:
+/// the reported statement must be the client scan, and the answer must be
+/// the evaluator's.
+#[tokio::test]
+async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread2_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread2_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507spread";
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 301, \
+                 '{service}', '{{\"service_name\":\"{service}\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    let offsets = [0.0f64, 2.0, 4.0, 8.0, 16.0];
+    let rows: Vec<BucketedSeedRow> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, d)| BucketedSeedRow {
+            service: service.to_string(),
+            fingerprint: 301,
+            timestamp_ns: t - 30_000_000_000 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"latency":{:?}}}"#, 1e16f64 + d),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the high-offset fixture");
+    let mut seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let n = seeded.next().await.expect("one row").expect("decode").n;
+    drop(seeded);
+    assert_eq!(n, offsets.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    // The evaluator's own answers on this corpus, which are also the
+    // reference's: the variance of five values 0, 2, 4, 8, 16 above a
+    // shared offset is 31.2, and its square root 5.585696017507576.
+    for (op, want) in [
+        ("stdvar_over_time", 31.2f64),
+        ("stddev_over_time", 5.585696017507576f64),
+    ] {
+        let q = format!(
+            r#"{op}({{service_name="{service}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        match plan(&parse(&q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => assert!(
+                mp.client.is_some(),
+                "{op} must stay client-side: the database's partial-moment aggregate can be \
+                 finite and wrong"
+            ),
+            other => panic!("{q}: {other:?}"),
+        }
+        let (result, _w, explain) = engine
+            .query_explained(&parse(&q).expect("parse"), &params)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let QueryResult::Matrix(series) = result else {
+            panic!("{q}: expected a matrix");
+        };
+        let read = explain
+            .stages
+            .iter()
+            .rfind(|s| s.name == "metric_read")
+            .map(|s| s.sql.clone())
+            .unwrap_or_default();
+        assert!(
+            read.contains("ORDER BY service ASC"),
+            "{op}: the statement must be the client sliding scan, got:\n{read}"
+        );
+        let points: Vec<(i64, u64)> = series
+            .into_iter()
+            .flat_map(|s| s.points)
+            .map(|(ts, v)| (ts, v.to_bits()))
+            .collect();
+        assert_eq!(
+            points,
+            vec![(t, want.to_bits())],
+            "{op}: the evaluator's value, bit for bit"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The three boundary corpora of W4 §8** (issue #507), each chosen for
+/// where the two summations can differ rather than for being realistic.
+///
+/// The condition number `κ = Σ|vᵢ| / |Σvᵢ|` is what decides whether the
+/// summation-order bound is tight or vacuous: the absolute bound
+/// `2(n−1)·u·Σ|vᵢ|` is the same either way, but as a FRACTION of the answer
+/// it grows with `κ` without limit.
+///
+/// ```text
+///  corpus       values                        κ      the two paths
+///  exact        1, 2, 4, 8                    1      the same bits; no order can round
+///  mild         55 × +1e9+δ, 5 × −1e9+δ       1.2    inside 2(n−1)·u·Σ|vᵢ|
+///  cancelling   21 × (1e16, 1, −1e16)         huge   the same wrong answer, where the exact
+///                                                    sum of the STORED samples is 21
+/// ```
+///
+/// **The cancelling corpus is shared behaviour, not a divergence**, and it
+/// is here to be recorded as such: the reference's own summation is a plain
+/// accumulation with no compensation, so it loses the same digits. A
+/// compensated sum would answer 21.
+///
+/// **Every value is exactly representable, and the residual survives the
+/// INSERT.** An earlier fixture stored `-1e16 + 1.0`, which is already
+/// `-1e16` as an `f64`, so its sum was exactly zero before any
+/// accumulation and the agreement it asserted followed from the data. Nothing in this build promises
+/// otherwise, and the ledger carries no row for it.
+#[tokio::test]
+async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    // Review round 4: this test had no teardown at all, so every run left
+    // its database behind. The end of the test drops it; this sweeps what
+    // earlier runs left, including the deliberate failures a break test
+    // produces, which never reach the end.
+    sweep_leftovers(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4kappa_"),
+    )
+    .await;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4kappa_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("set up");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+
+    // exactly representable | well conditioned | catastrophic cancellation
+    let exact: Vec<f64> = vec![1.0, 2.0, 4.0, 8.0];
+    // 55 positive and 5 negative of the same magnitude gives
+    // `κ = 60/50 = 1.2`; the fractional parts are what force the rounding
+    // the two orders can differ on.
+    let mild: Vec<f64> = (0..60)
+        .map(|i| {
+            let m = 1e9 + (i as f64) / 8.0;
+            if i < 55 { m } else { -m }
+        })
+        .collect();
+    // **Every value is exactly representable and the residual is NOT
+    // rounded away before insertion** (review round 2): `-1e16 + 1.0` is
+    // already `-1e16` as an `f64`, so the earlier fixture stored exactly
+    // opposing values and its agreement on zero followed from the data
+    // rather than from the accumulation. Here each triple is
+    // `1e16, 1, -1e16` — the `1` survives in the stored samples, and it is
+    // the ACCUMULATION that loses it, which is the thing being measured.
+    let cancelling: Vec<f64> = (0..21).flat_map(|_| [1e16f64, 1.0, -1e16f64]).collect();
+
+    let mut out: Vec<(String, f64, u64, u64)> = Vec::new();
+    for (name, fp, values) in [
+        ("exact", 401u64, &exact),
+        ("mild", 402, &mild),
+        ("cancelling", 403, &cancelling),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        let rows: Vec<BucketedSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+        let mut seeded = admin
+            .query_stream::<PartCountRow>(
+                &format!("SELECT count() AS n FROM {db}.log_samples WHERE service = '{name}'"),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("count");
+        let n = seeded.next().await.expect("one row").expect("decode").n;
+        drop(seeded);
+        assert_eq!(n, values.len() as u64, "{name}: the corpus must be present");
+
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: t,
+                step_ns: STEP as u64,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                let (result, _w) = engine
+                    .query(&parse(&q).expect("parse"), params)
+                    .await
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                let QueryResult::Matrix(series) = result else {
+                    panic!("{q}: expected a matrix");
+                };
+                series
+                    .into_iter()
+                    .flat_map(|s| s.points)
+                    .map(|(_, v)| v)
+                    .next()
+                    .expect("one point")
+            }
+        };
+        let lowered = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        ))
+        .await;
+        let client_ans = answer(format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        ))
+        .await;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let mut lr = 0.0f64;
+        for v in values.iter() {
+            lr += *v;
+        }
+        let kappa = sum_abs / lr.abs();
+        eprintln!(
+            "{name}: kappa={kappa:e} lowered={lowered:?} ({:#018x}) client={client_ans:?} \
+             ({:#018x}) bound={:e}",
+            lowered.to_bits(),
+            client_ans.to_bits(),
+            2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+        );
+        out.push((
+            name.to_string(),
+            kappa,
+            lowered.to_bits(),
+            client_ans.to_bits(),
+        ));
+
+        let bound = 2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+        match name {
+            // κ = 1 and every partial sum exactly representable: no order
+            // can round, so the two answers are the same bits.
+            "exact" => {
+                assert_eq!(kappa, 1.0, "the fixture must be perfectly conditioned");
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: an exactly representable sum cannot depend on the order"
+                );
+                assert_eq!(lowered, 15.0);
+            }
+            // κ ≈ 1.2: the bound is meaningful and both answers are inside
+            // it. Measured on this corpus they are also equal; the
+            // assertion is the bound, because equality here is the
+            // corpus's size and not a property of the two paths.
+            "mild" => {
+                assert!(
+                    (kappa - 1.2).abs() < 0.01,
+                    "{name}: the fixture's condition number is {kappa}"
+                );
+                assert!(
+                    (lowered - client_ans).abs() <= bound,
+                    "{name}: {lowered:?} vs {client_ans:?} exceeds {bound:e}"
+                );
+            }
+            // The accumulated sum is zero, so the bound is vacuous as a
+            // fraction of the answer. **Both sides return the same wrong
+            // number** — the exact total of the stored values is 21, and
+            // each triple `1e16`, `1`, `−1e16` loses its `1` to rounding
+            // in either order. That is shared behaviour, not a divergence:
+            // the reference's own summation is a plain accumulation with
+            // no compensation. (This comment described the DISCARDED pair
+            // fixture and its stated `32` until review round 3.)
+            "cancelling" => {
+                // **The exact sum is DERIVED FROM THE STORED VALUES, not
+                // stated**, because an earlier fixture stated `32` for
+                // samples whose exact sum was `0`: `-1e16 + 1.0` is
+                // already `-1e16` as an `f64`, so the residual it claimed
+                // had been rounded away before the insert. A compensated
+                // (Neumaier) sum recovers the exact total that a plain
+                // accumulation of the same values loses, and the two
+                // together are what say the corpus is what it claims.
+                let mut acc = 0.0f64;
+                let mut comp = 0.0f64;
+                for v in values.iter() {
+                    let t = acc + v;
+                    comp += if acc.abs() >= v.abs() {
+                        (acc - t) + v
+                    } else {
+                        (v - t) + acc
+                    };
+                    acc = t;
+                }
+                let exact_sum = acc + comp;
+                assert_eq!(
+                    exact_sum, 21.0,
+                    "{name}: the stored values must carry a residual a plain accumulation \
+                     loses; their exact sum is {exact_sum}"
+                );
+                assert!(kappa > 1e14, "{name}: κ = {kappa}");
+                assert_ne!(
+                    lowered, exact_sum,
+                    "{name}: the fixture must be one an accumulation loses, or it is not \
+                     testing cancellation"
+                );
+                assert_eq!(
+                    lowered.to_bits(),
+                    client_ans.to_bits(),
+                    "{name}: both paths lose the same digits — the reference's own summation \
+                     is a plain accumulation with no compensation, so this is shared \
+                     behaviour and not a divergence"
+                );
+            }
+            other => panic!("unnamed corpus {other}"),
+        }
+    }
+    assert_eq!(out.len(), 3, "all three corpora ran");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+// ---------------------------------------------------------------------
+// Issue #507: the extracted-field group key read, end to end.
+// ---------------------------------------------------------------------
+
+/// One case of `tests/fixtures/group_key/cases.tsv`: one stream, its rows,
+/// one query, the route the planner must choose, what `system.query_log`
+/// must show, and the answer.
+#[derive(Debug, Clone)]
+struct GroupKeyCase {
+    id: String,
+    stream: std::collections::BTreeMap<String, String>,
+    /// `(body, structured metadata)` per row.
+    entries: Vec<(String, String)>,
+    query: String,
+    /// `key`: the plan is the group key read; `today`: it is not; `none`:
+    /// the query does not plan.
+    planned: String,
+    /// `s1`: the key statement answered and nothing followed; `s1+raw`: it
+    /// returned rows the fold sent to today's route; `throw`: it threw (395)
+    /// and today's raw scan followed; `lane`: it threw, today's route
+    /// refused, and the one read ran; `raw`: no key-route statement ran;
+    /// `none`: no statement ran.
+    observed: String,
+    expected: String,
+}
+
+fn unhex_utf8(h: &str) -> String {
+    let bytes: Vec<u8> = (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex"))
+        .collect();
+    String::from_utf8(bytes).expect("utf-8 fixture")
+}
+
+fn load_group_key_cases(path: &str) -> Vec<GroupKeyCase> {
+    let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .expect("read the fixture");
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert_eq!(f.len(), 7, "a fixture row has 7 fields: {l}");
+            let stream = if f[1].is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
+                serde_json::from_str(f[1]).expect("stream labels")
+            };
+            let entries = f[2]
+                .split(',')
+                .map(|e| {
+                    let (b, sm) = e.split_once(':').expect("body:metadata");
+                    (unhex_utf8(b), unhex_utf8(sm))
+                })
+                .collect();
+            GroupKeyCase {
+                id: f[0].to_string(),
+                stream,
+                entries,
+                query: f[3].to_string(),
+                planned: f[4].to_string(),
+                observed: f[5].to_string(),
+                expected: f[6].to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Seeds each case as its own stream `{service_name="<id>", …}` at
+/// fingerprint `fp_base + index`, its rows 50 s before `t`.
+async fn seed_group_key_cases(
+    admin: &ChClient,
+    client: &ChClient,
+    db: &str,
+    t: i64,
+    fp_base: u64,
+    cases: &[GroupKeyCase],
+) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let mut rows = Vec::new();
+    let mut streams = Vec::new();
+    let mut idx = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let fp = fp_base + i as u64;
+        let mut labels = case.stream.clone();
+        labels.insert("service_name".to_string(), case.id.clone());
+        let labels_json = serde_json::to_string(&labels).expect("labels json");
+        streams.push(format!(
+            "({month}, {fp}, {}, {}, 0)",
+            literal(&case.id).as_sql(),
+            literal(&labels_json).as_sql()
+        ));
+        for (k, v) in &labels {
+            idx.push(format!(
+                "({month}, {}, {}, {fp})",
+                literal(k).as_sql(),
+                literal(v).as_sql()
+            ));
+        }
+        for (j, (body, sm)) in case.entries.iter().enumerate() {
+            rows.push(BucketedSeedRow {
+                service: case.id.clone(),
+                fingerprint: fp,
+                timestamp_ns: t - 50_000_000_000 + j as i64,
+                severity: 0,
+                body: body.clone(),
+                structured_metadata: sm.clone(),
+            });
+        }
+    }
+    for (table, cols, values) in [
+        (
+            "log_streams",
+            "(month, fingerprint, service, labels, updated_ns)",
+            &streams,
+        ),
+        ("log_streams_idx", "(month, key, val, fingerprint)", &idx),
+    ] {
+        for chunk in values.chunks(500) {
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.{table} {cols} VALUES {}",
+                        chunk.join(", ")
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seed {table}: {e}"));
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the group key cases");
+}
+
+/// A case's query with its selector, and the request it runs as: a range
+/// query at one grid point `t` whose step is the query's range, so the
+/// planner can choose the group key read; `[2m]` keeps a one-minute step,
+/// which is the point of that case. A log query reads the five minutes
+/// before `t`.
+fn group_key_request(case: &GroupKeyCase, t: i64) -> (String, QueryParams) {
+    let query = case
+        .query
+        .replace("SEL", &format!("{{service_name={:?}}}", case.id));
+    let is_metric = query.contains("_over_time(") || query.contains("rate(");
+    let params = if is_metric {
+        let step: u64 = if query.contains("[5m]") {
+            300_000_000_000
+        } else {
+            60_000_000_000
+        };
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: t,
+                step_ns: step,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        }
+    } else {
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t - 300_000_000_000,
+                end_ns: t,
+                step_ns: 60_000_000_000,
+            },
+            limit: 10,
+            direction: Direction::Backward,
+        }
+    };
+    (query, params)
+}
+
+fn group_key_labels(labels: &[(String, String)]) -> String {
+    let mut l: Vec<&(String, String)> =
+        labels.iter().filter(|(k, _)| k != "service_name").collect();
+    l.sort();
+    format!(
+        "{{{}}}",
+        l.iter()
+            .map(|(k, v)| format!("{k}={v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The canonical text of an answer, as the fixture writes it: series sorted
+/// by label set, `service_name` left out, each value as Rust's `{:?}` of its
+/// `f64`.
+fn group_key_answer(res: Result<(QueryResult, pulsus_read::Warnings), ReadError>) -> String {
+    match res {
+        Ok((QueryResult::Vector(v), _)) if v.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Matrix(m), _)) if m.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Vector(v), _)) => {
+            let mut s: Vec<String> = v
+                .iter()
+                .map(|x| format!("{} {:?}", group_key_labels(&x.labels), x.value))
+                .collect();
+            s.sort();
+            s.join("; ")
+        }
+        Ok((QueryResult::Matrix(m), _)) => {
+            let mut s: Vec<String> = m
+                .iter()
+                .map(|x| {
+                    let pts: Vec<String> = x.points.iter().map(|(_, v)| format!("{v:?}")).collect();
+                    format!("{} {}", group_key_labels(&x.labels), pts.join(","))
+                })
+                .collect();
+            s.sort();
+            s.join("; ")
+        }
+        Ok((QueryResult::Streams { items, .. }, _)) if items.is_empty() => "no series".to_string(),
+        Ok((QueryResult::Streams { items, .. }, _)) => {
+            let mut s: Vec<String> = items
+                .iter()
+                .map(|x| {
+                    let m: std::collections::BTreeMap<String, String> =
+                        serde_json::from_str(&x.labels_json).expect("stream labels json");
+                    group_key_labels(&m.into_iter().collect::<Vec<_>>())
+                })
+                .collect();
+            s.sort();
+            format!("streams {}", s.join("; "))
+        }
+        Ok((other, _)) => format!("unexpected {other:?}"),
+        Err(ReadError::MetricPipelineError { error_type, .. }) => {
+            format!("400 pipeline error: '{error_type}'")
+        }
+        Err(ReadError::QueryTooBroad(reason)) => {
+            let name = format!("{reason:?}");
+            let name = name.split([' ', '{', '(']).next().unwrap_or("").to_string();
+            format!("422 {name}")
+        }
+        Err(ReadError::Parse(_) | ReadError::PipelineInvalid { .. }) => "400 parse".to_string(),
+        Err(other) => format!("error {other}"),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct GroupKeyStatementRow {
+    query: String,
+    exception_code: i32,
+}
+
+/// The exception codes `system.query_log` may record for **today's raw scan
+/// when the retained-label ceiling refuses it**.
+///
+/// The refusal is client-side: our engine stops folding and drops the row
+/// stream, which drops its connection. Whether the server had finished
+/// writing the result by then decides what it records — a clean finish, or
+/// its own failure to write to a socket nobody is reading.
+///
+/// **Measured, one build, one corpus, only the read window widened**
+/// (`the_undecided_rows_come_from_one_read`, its assertion replaced by a
+/// print):
+///
+/// ```text
+///   3 grid points    [(Key, 395), (Raw,   0), (Lane, 0)]
+///  12 grid points    [(Key, 395), (Raw, 210), (Lane, 0)]
+/// ```
+///
+/// The answer is the same either way — six series, from the lane statement.
+/// CI records 210 on the three-point window where this machine records 0,
+/// which is the same race decided by a slower server. Any OTHER code is a
+/// real failure and still fails these tests.
+const RAW_SCAN_REFUSED_ON_THE_CEILING: &[i32] = &[0, 210];
+
+/// `[(Key, 395), (Raw, 0 or 210), (Lane, 0)]` — the three statements a
+/// refused ceiling produces, asserted as the claim rather than as one
+/// literal triple. See [`RAW_SCAN_REFUSED_ON_THE_CEILING`] for the one
+/// code that is a race and for what it was measured on.
+fn assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+    statements: &[(GroupKeyStatement, i32)],
+    what: &str,
+) {
+    let kinds: Vec<GroupKeyStatement> = statements.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            GroupKeyStatement::Key,
+            GroupKeyStatement::Raw,
+            GroupKeyStatement::Lane,
+        ],
+        "{what}: the three statements, in that order — got {statements:?}"
+    );
+    assert_eq!(
+        statements[0].1, 395,
+        "{what}: S1 must THROW on an undecided row"
+    );
+    assert!(
+        RAW_SCAN_REFUSED_ON_THE_CEILING.contains(&statements[1].1),
+        "{what}: today's raw scan recorded exception {}, which is neither a clean finish (0) \
+         nor our own disconnect after the ceiling refused it (210, NETWORK_ERROR). Another \
+         code is a real failure of that read — {statements:?}",
+        statements[1].1
+    );
+    assert_eq!(
+        statements[2].1, 0,
+        "{what}: the lane statement is the one that answers, so it must succeed"
+    );
+}
+
+/// Which statement a logged query is, for the group key read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKeyStatement {
+    /// S1, the key statement.
+    Key,
+    /// L, the one read.
+    Lane,
+    /// Today's raw scan.
+    Raw,
+}
+
+/// Every finished or failed statement over `db`'s samples, per fingerprint,
+/// in the order they ran. `SYSTEM FLUSH LOGS` does not guarantee the rows
+/// are there, so this waits until `want` fingerprints have one.
+async fn group_key_statements(
+    admin: &ChClient,
+    db: &str,
+    want: usize,
+) -> std::collections::HashMap<u64, Vec<(GroupKeyStatement, i32)>> {
+    let fp_re = regex::Regex::new(r"fingerprint IN \((\d+)\)").expect("regex");
+    let mut out = std::collections::HashMap::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, exception_code FROM system.query_log \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' \
+             AND query NOT LIKE '%system.query_log%' \
+             ORDER BY event_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<GroupKeyStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        out = std::collections::HashMap::new();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode query_log row");
+            let kind = if row
+                .query
+                .contains("throwIf(decided = 0 AND uw_missing = 0)")
+            {
+                GroupKeyStatement::Key
+            } else if row
+                .query
+                .contains("WHERE NOT (decided = 0 AND uw_missing = 1)")
+            {
+                GroupKeyStatement::Lane
+            } else if row
+                .query
+                .starts_with("SELECT fingerprint, timestamp_ns, body")
+            {
+                GroupKeyStatement::Raw
+            } else {
+                continue;
+            };
+            let Some(fp) = fp_re
+                .captures(&row.query)
+                .and_then(|c| c[1].parse::<u64>().ok())
+            else {
+                continue;
+            };
+            out.entry(fp)
+                .or_insert_with(Vec::new)
+                .push((kind, row.exception_code));
+        }
+        drop(stream);
+        if out.len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// What `system.query_log` shows for one case, in the fixture's words.
+fn group_key_observed(statements: &[(GroupKeyStatement, i32)]) -> String {
+    use GroupKeyStatement::{Key, Lane, Raw};
+    match statements {
+        [] => "none".to_string(),
+        [(Key, 0)] => "s1".to_string(),
+        [(Key, 0), (Raw, _)] => "s1+raw".to_string(),
+        [(Key, 395), (Raw, _)] => "throw".to_string(),
+        [(Key, 395), (Raw, _), (Lane, 0)] => "lane".to_string(),
+        s if s.iter().all(|(k, _)| *k == Raw) => "raw".to_string(),
+        s => format!("{s:?}"),
+    }
+}
+
+/// Seeds `cases` into a fresh database, runs each through the engine and
+/// `system.query_log`, and returns every way a case differs from its row.
+async fn check_group_key_cases(stem: &str, fp_base: u64, cases: &[GroupKeyCase]) -> Vec<String> {
+    let (admin, client, db) = group_key_db(stem).await;
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    seed_group_key_cases(&admin, &client, &db, t, fp_base, cases).await;
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
+    let mut wrong = Vec::new();
+    for case in cases {
+        let (query, params) = group_key_request(case, t);
+        let planned = match parse(&query) {
+            Err(_) => "none",
+            Ok(expr) => match plan(&expr, &params, &plan_ctx(&db)) {
+                Ok(Plan::Metric(mp)) if matches!(mp.value, sql::MetricValue::Unwrapped(_)) => "key",
+                Ok(_) => "today",
+                Err(_) => "none",
+            },
+        };
+        if planned != case.planned {
+            wrong.push(format!(
+                "{}: planned {planned}, want {}",
+                case.id, case.planned
+            ));
+        }
+        let answer = match parse(&query) {
+            Ok(expr) => group_key_answer(engine.query(&expr, &params).await),
+            Err(_) => "400 parse".to_string(),
+        };
+        if answer != case.expected {
+            wrong.push(format!(
+                "{}: {query}\n    got  {answer}\n    want {}",
+                case.id, case.expected
+            ));
+        }
+    }
+    let want = cases.iter().filter(|c| c.observed != "none").count();
+    let statements = group_key_statements(&admin, &db, want).await;
+    for (i, case) in cases.iter().enumerate() {
+        let observed = group_key_observed(
+            statements
+                .get(&(fp_base + i as u64))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
+        if observed != case.observed {
+            wrong.push(format!(
+                "{}: observed {observed}, want {}",
+                case.id, case.observed
+            ));
+        }
+    }
+    drop_group_key_db(&admin, &db).await;
+    wrong
+}
+
+/// **Criterion 3: the group key read answers every case of the plan's
+/// tables as today's route does** (issue #507).
+///
+/// `tests/fixtures/group_key/cases.tsv` holds each case of the design's
+/// tables — the JSON text rules, nesting, text after a value, empty and
+/// absent values, lines that are not JSON, the q, g, e and k rows, the
+/// collision rows, the refused chains, the reserved-name rows at the
+/// reference's answers, the three rows of the unconvertible value under
+/// `__preserve_error__`, and a filter naming the unwrapped label — with its
+/// answer. For each, the test asserts:
+///
+/// ```text
+/// planned   the plan is the group key read, or it is not
+/// observed  system.query_log: S1 alone; S1 then today's raw scan (a fold
+///           fallback); S1 throwing (395) then the raw scan; that and L;
+///           or no key-route statement
+/// answer    the fixture's answer, value bits included
+/// ```
+///
+/// Each query runs as a range query at one grid point whose step is its
+/// range, which is what lets the planner choose the group key read; the
+/// design's tables give instant-query answers over the same rows.
+#[tokio::test]
+async fn the_group_key_read_agrees_with_the_client_path() {
+    skip_unless_live!();
+    let cases = load_group_key_cases("tests/fixtures/group_key/cases.tsv");
+    let wrong = check_group_key_cases("gk", 507_000, &cases).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases differ:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+}
+
+/// **Criterion 22: the group key read refuses where the flattened-key budget
+/// refuses** (issue #507, §3.1).
+///
+/// ```text
+/// k01  quadratic_line(32_761, 2_979) with "latency":5, 65,548 B   undecided: S1 throws, today's route: 422 budget
+/// k05  p 20, m 1,232, 13,590 B (the bound over, the charge under) undecided: S1 throws, today's route: {} 5
+/// k02  p 32,761, m 1,022, 44,021 B (the parser accepts it)        S1 throws, today's route refuses on its
+///                                                                  same-nanosecond staging, L: {} 5
+/// ```
+///
+/// The rows are the fixture's k01, k02 and k05, under
+/// `sum by (service_name) (sum_over_time({…} | json | unwrap latency [1m]))`.
+#[tokio::test]
+async fn the_group_key_read_refuses_where_the_key_budget_refuses() {
+    skip_unless_live!();
+    let cases: Vec<GroupKeyCase> = load_group_key_cases("tests/fixtures/group_key/cases.tsv")
+        .into_iter()
+        .filter(|c| ["k01", "k02", "k05"].contains(&c.id.as_str()))
+        .collect();
+    assert_eq!(cases.len(), 3, "the fixture holds k01, k02 and k05");
+    let wrong = check_group_key_cases("gk_budget", 522_000, &cases).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// **Criteria 29 and 42: reserved label names answer as the pinned reference
+/// build answers, on every metric route** (issue #507).
+///
+/// One stream per source of a reserved name, one row each, an hour back:
+///
+/// ```text
+/// fp 901  {__error__="s", service_name="rn1"}   {"latency":5}                     stream label
+/// fp 902  {service_name="rn2"}                   {"latency":5,"__error__":"boom"}  a field in the line
+/// fp 903  {service_name="rn3"}                   {garbage}  metadata __preserve_error__=true
+/// fp 904  {service_name="rn4"}                   {garbage}
+/// fp 905  {service_name="k3"}                    {"latency":"abc"}  metadata __preserve_error__=true
+/// fp 906  {service_name="k4"}                    {"latency":"abc","__preserve_error__":"true"}
+/// ```
+///
+/// Each query's route is asserted from its plan before its answer, so a
+/// query that stopped reaching its fold would fail here rather than pass on
+/// another path. Every expected answer was captured from the pinned
+/// reference build (issue #507, the reserved-name tables, and revision 10's
+/// k rows).
+#[tokio::test]
+async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_rn_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("db");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let streams = [
+        (
+            901u64,
+            "rn1",
+            r#"{"__error__":"s","service_name":"rn1"}"#,
+            r#"{"latency":5}"#,
+            "",
+        ),
+        (
+            902u64,
+            "rn2",
+            r#"{"service_name":"rn2"}"#,
+            r#"{"latency":5,"__error__":"boom"}"#,
+            "",
+        ),
+        (
+            903u64,
+            "rn3",
+            r#"{"service_name":"rn3"}"#,
+            "{garbage",
+            r#"{"__preserve_error__":"true"}"#,
+        ),
+        (904u64, "rn4", r#"{"service_name":"rn4"}"#, "{garbage", ""),
+        (
+            905u64,
+            "k3",
+            r#"{"service_name":"k3"}"#,
+            r#"{"latency":"abc"}"#,
+            r#"{"__preserve_error__":"true"}"#,
+        ),
+        (
+            906u64,
+            "k4",
+            r#"{"service_name":"k4"}"#,
+            r#"{"latency":"abc","__preserve_error__":"true"}"#,
+            "",
+        ),
+    ];
+    let mut rows = Vec::new();
+    for (fp, service, labels, body, sm) in streams {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                     VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 'service_name', '{service}', {fp})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams_idx");
+        rows.push(BucketedSeedRow {
+            service: service.to_string(),
+            fingerprint: fp,
+            timestamp_ns: t - 10_000_000_000,
+            severity: 0,
+            body: body.to_string(),
+            structured_metadata: sm.to_string(),
+        });
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert");
+
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: t },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    #[derive(Debug, PartialEq)]
+    enum Route {
+        Client,
+        Lowered,
+    }
+    let route = |query: &str, params: &QueryParams| match plan(
+        &parse(query).expect("parse"),
+        params,
+        &plan_ctx(&db),
+    )
+    .expect("plan")
+    {
+        Plan::Metric(mp) if mp.client.is_some() => Route::Client,
+        Plan::Metric(_) => Route::Lowered,
+        _ => panic!("{query}: a metric plan"),
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let render = |labels: &[(String, String)]| {
+        let mut l = labels.to_vec();
+        l.sort();
+        format!(
+            "{{{}}}",
+            l.iter()
+                .map(|(k, v)| format!("{k}={v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    // (query, params, route, the reference's answer)
+    let cases: [(&str, &QueryParams, Route, &str); 12] = [
+        (
+            r#"sum by (latency) (sum_over_time({service_name="rn1"} | json latency="latency" | unwrap latency [1m]))"#,
+            &range,
+            Route::Client,
+            r#"{latency="5"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn1"} [1m]))"#,
+            &instant,
+            Route::Lowered,
+            r#"{service_name="rn1"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn1"} [1m]))"#,
+            &range,
+            Route::Lowered,
+            r#"{service_name="rn1"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn1"} | json latency="latency" | unwrap latency [1m]))"#,
+            &range,
+            Route::Lowered,
+            r#"{service_name="rn1"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn2"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{service_name="rn2"} 5"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="rn2"} | json | unwrap latency [5m]))"#,
+            &range,
+            Route::Client,
+            r#"{service_name="rn2"} 5"#,
+        ),
+        (
+            r#"count_over_time({service_name="rn3"} | json [5m])"#,
+            &instant,
+            Route::Client,
+            r#"{__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", __preserve_error__="true", service_name="rn3"} 1"#,
+        ),
+        (
+            r#"sum by (__error__) (count_over_time({service_name="rn4"} | json [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{__error__="JSONParserErr"} 1"#,
+        ),
+        (
+            r#"sum by (service_name) (count_over_time({service_name="rn4"} | json | __error__!="" [5m]))"#,
+            &range,
+            Route::Client,
+            r#"{service_name="rn4"} 1"#,
+        ),
+        (
+            r#"count_over_time({service_name="rn1"} [1m])"#,
+            &instant,
+            Route::Lowered,
+            "400 pipeline error: 's'",
+        ),
+        // Revision 10's k3.00 and k4.00 on the client path: a preserved
+        // failed conversion counts zero (R2); a parsed `__preserve_error__`
+        // not required by the hints is skipped (R4), so k4's error fails the
+        // query.
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="k3"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            r#"{service_name="k3"} 0"#,
+        ),
+        (
+            r#"sum by (service_name) (sum_over_time({service_name="k4"} | json | unwrap latency [5m]))"#,
+            &instant,
+            Route::Client,
+            "400 pipeline error: 'SampleExtractionErr'",
+        ),
+    ];
+    for (query, params, want_route, want) in cases {
+        assert_eq!(route(query, params), want_route, "{query}: the route");
+        let got = match engine.query(&parse(query).expect("parse"), params).await {
+            Ok((QueryResult::Vector(v), _)) => v
+                .iter()
+                .map(|s| format!("{} {}", render(&s.labels), s.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {}",
+                        render(&s.labels),
+                        s.points
+                            .iter()
+                            .map(|(_, v)| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => panic!("{query}: {other:?}"),
+            Err(ReadError::MetricPipelineError { error_type, series }) => {
+                assert!(
+                    !series.contains("__preserve_error__"),
+                    "{query}: a parsed __preserve_error__ the hints do not require is skipped: {series}"
+                );
+                format!("400 pipeline error: '{error_type}'")
+            }
+            Err(e) => panic!("{query}: {e}"),
+        };
+        assert_eq!(got, want, "{query}");
+    }
+    // A `variants(...)` sub-state takes its variant's parent `sum` (the
+    // reference, `variants(sum by (service_name) (count_over_time({…} [5m])))
+    // of ({…} | json [5m])` over a line with a `__error__` field:
+    // `{__variant__="0", service_name=…} 1`).
+    let variants = r#"variants(sum by (service_name) (count_over_time({service_name="rn2"} [5m]))) of ({service_name="rn2"} | json [5m])"#;
+    let got = match engine
+        .query(&parse(variants).expect("parse"), &instant)
+        .await
+    {
+        Ok((QueryResult::Vector(v), _)) => v
+            .iter()
+            .map(|s| format!("{} {}", render(&s.labels), s.value))
+            .collect::<Vec<_>>()
+            .join("; "),
+        Ok((other, _)) => panic!("{variants}: {other:?}"),
+        Err(e) => panic!("{variants}: {e}"),
+    };
+    assert_eq!(
+        got, r#"{__variant__="0", service_name="rn2"} 1"#,
+        "{variants}"
+    );
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// A fresh run database with the schema, for one group key test.
+async fn group_key_db(stem: &str) -> (ChClient, ChClient, String) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_{stem}_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    (admin, client, db)
+}
+
+async fn drop_group_key_db(admin: &ChClient, db: &str) {
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// A one-stream case built in code, for the tests that do not read the
+/// fixture.
+fn group_key_case(id: &str, stream: &[(&str, &str)], entries: &[(&str, &str)]) -> GroupKeyCase {
+    GroupKeyCase {
+        id: id.to_string(),
+        stream: stream
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        entries: entries
+            .iter()
+            .map(|(b, sm)| (b.to_string(), sm.to_string()))
+            .collect(),
+        query: String::new(),
+        planned: String::new(),
+        observed: String::new(),
+        expected: String::new(),
+    }
+}
+
+/// **Criterion 44: the one read answers reserved-name rows under the query's
+/// rules** (issue #507, revision 10).
+///
+/// k3's and k4's rows and queries, with today's retained-label ceiling
+/// lowered so today's route refuses after S1 throws on the unconvertible
+/// value:
+///
+/// ```text
+/// S1 throws (395) ── today's route refuses (retained label bytes) ── L
+/// k3  {"latency":"abc"}, metadata __preserve_error__="true"   L: preserved, counts 0   {service_name="k3"} 0
+/// k4  {"latency":5}, then                                   L: decided, 5
+///     {"latency":"abc","__preserve_error__":"true"}           L: the hints skip the parsed name,
+///                                                                 so the error fails the query
+/// ```
+#[tokio::test]
+async fn the_lane_answers_reserved_name_rows_under_the_rules() {
+    skip_unless_live!();
+    const FP_BASE: u64 = 544_000;
+    let (admin, client, db) = group_key_db("gk_lane_rn").await;
+    let cases = [
+        group_key_case(
+            "k3",
+            &[],
+            &[(r#"{"latency":"abc"}"#, r#"{"__preserve_error__":"true"}"#)],
+        ),
+        // k4's row alone fails today's route with its pipeline error before
+        // any label set is retained, so today's route would answer rather than
+        // refuse. A decided row one nanosecond earlier is retained first, which
+        // trips the lowered ceiling and hands the query to L.
+        group_key_case(
+            "k4",
+            &[],
+            &[
+                (r#"{"latency":5}"#, ""),
+                (r#"{"latency":"abc","__preserve_error__":"true"}"#, ""),
+            ],
+        ),
+    ];
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    seed_group_key_cases(&admin, &client, &db, t, FP_BASE, &cases).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: Some(1),
+            key_statement_test_knobs: None,
+        });
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 300_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    for (case, want) in [
+        ("k3", r#"{service_name="k3"} 0"#),
+        ("k4", "400 pipeline error: 'SampleExtractionErr'"),
+    ] {
+        let query = format!(
+            r#"sum by (service_name) (sum_over_time({{service_name="{case}"}} | json | unwrap latency [5m]))"#
+        );
+        let expr = parse(&query).expect("parse");
+        match plan(&expr, &params, &plan_ctx(&db)).expect("plan") {
+            Plan::Metric(mp) => assert!(
+                matches!(mp.value, sql::MetricValue::Unwrapped(_)),
+                "{query}: the plan is the group key read"
+            ),
+            _ => panic!("{query}: a metric plan"),
+        }
+        let got = match engine.query(&expr, &params).await {
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    let mut l = s.labels.clone();
+                    l.sort();
+                    format!(
+                        "{{{}}} {}",
+                        l.iter()
+                            .map(|(k, v)| format!("{k}={v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        s.points
+                            .iter()
+                            .map(|(_, v)| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => panic!("{query}: {other:?}"),
+            Err(ReadError::MetricPipelineError { error_type, series }) => {
+                assert!(
+                    !series.contains("__preserve_error__"),
+                    "{query}: the hints skip a parsed __preserve_error__ the query does not require: {series}"
+                );
+                format!("400 pipeline error: '{error_type}'")
+            }
+            Err(e) => panic!("{query}: {e}"),
+        };
+        assert_eq!(got, want, "{query}");
+    }
+    let statements = group_key_statements(&admin, &db, cases.len()).await;
+    for (i, case) in cases.iter().enumerate() {
+        let seen = group_key_observed(
+            statements
+                .get(&(FP_BASE + i as u64))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
+        assert_eq!(
+            seen, "lane",
+            "{}: S1 throws, today's route refuses, and L answers",
+            case.id
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// The server's clock, in microseconds: a marker between two queries'
+/// `system.query_log` rows.
+async fn server_micros(admin: &ChClient) -> u64 {
+    let mut s = admin
+        .query_stream::<PartCountRow>(
+            "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("now64");
+    let n = s.next().await.expect("one row").expect("decode").n;
+    drop(s);
+    n
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TimedStatementRow {
+    query: String,
+    exception_code: i32,
+}
+
+/// The group key read's statements over `db` that finished or failed in
+/// `[from, to)` server microseconds, in the order they ran. Waits until at
+/// least `want` of them are logged.
+async fn group_key_statements_between(
+    admin: &ChClient,
+    db: &str,
+    from: u64,
+    to: u64,
+    want: usize,
+) -> Vec<(GroupKeyStatement, i32)> {
+    let mut out = Vec::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, exception_code FROM system.query_log \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' \
+             AND query NOT LIKE '%system.query_log%' \
+             AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+             AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+             ORDER BY query_start_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<TimedStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        out.clear();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode");
+            let kind = if row
+                .query
+                .contains("throwIf(decided = 0 AND uw_missing = 0)")
+            {
+                GroupKeyStatement::Key
+            } else if row
+                .query
+                .contains("WHERE NOT (decided = 0 AND uw_missing = 1)")
+            {
+                GroupKeyStatement::Lane
+            } else if row
+                .query
+                .starts_with("SELECT fingerprint, timestamp_ns, body")
+            {
+                GroupKeyStatement::Raw
+            } else {
+                continue;
+            };
+            out.push((kind, row.exception_code));
+        }
+        drop(stream);
+        if out.len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// **Criterion 8: the key statement does not throw on rows outside its
+/// filter** (issue #507, risk 2).
+///
+/// ```text
+/// fp 1009  5,000 rows, one per millisecond from T; rows 1,000..=2,000 {"latency":1,"status":1}  (decided)
+///          every other row {"latency":1,"status":1.5}                                        (undecided)
+/// fp 1010  5,000 undecided rows from T + 1 s
+/// S1 over fp 1009, (T + 999 ms, T + 2,000 ms]  ->  one group: n_value 1,001, no throw
+/// ```
+///
+/// The undecided rows share parts and granules with the decided ones, so a
+/// `throwIf` evaluated before the time and stream filters would throw. The
+/// same holds through the engine on a one-second grid.
+#[tokio::test]
+async fn the_key_statement_does_not_throw_on_rows_outside_its_filter() {
+    skip_unless_live!();
+    let (admin, client, db) = group_key_db("gk_tt").await;
+    let base = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base})))");
+    for (fp, pod) in [(1009u64, "a"), (1010u64, "b")] {
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+                     ({month}, {fp}, 'checkout', '{{\"pod\":\"{pod}\",\"service_name\":\"checkout\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("streams");
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES \
+                     ({month}, 'service_name', 'checkout', {fp}), ({month}, 'pod', '{pod}', {fp})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("idx");
+    }
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1009, {base} + number * 1000000, 0, \
+             if(number BETWEEN 1000 AND 2000, '{{\"latency\":1,\"status\":1}}', '{{\"latency\":1,\"status\":1.5}}') \
+             FROM numbers(5000)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1010, {base} + number * 1000000 + 1000000000, 0, \
+             '{{\"latency\":1,\"status\":1.5}}' FROM numbers(5000)"
+        ),
+        format!("OPTIMIZE TABLE {db}.log_samples FINAL"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("seed the throw layout");
+    }
+
+    // The statement itself, rendered by the reader's builder.
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout", pod="a"} | json | unwrap latency [1s]))"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + 2_000_000_000,
+            end_ns: base + 2_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db)).expect("plan") {
+        Plan::Metric(mp) => mp,
+        _ => panic!("a metric plan"),
+    };
+    let sql::MetricValue::Unwrapped(u) = &mp.value else {
+        panic!("{query}: the group key read");
+    };
+    let columns = sql::GroupKeyColumns {
+        keys: u.keys.iter().map(|k| (k.clone(), Vec::new())).collect(),
+        classes: Some(vec![vec![1009]]),
+    };
+    let s1 = sql::metric_range_unwrapped(
+        "log_samples",
+        u,
+        &columns,
+        &[literal("checkout")],
+        &[1009],
+        sql::BucketedScan {
+            window: TimeWindow {
+                start_ns: base + 999_000_000,
+                end_ns: base + 2_000_000_000,
+            },
+            lower: sql::ScanLowerBound::Exclusive,
+            lo_ns: base,
+            step_ns: 60_000_000_000,
+        },
+        &[],
+        sql::UndecidedRows::Throw,
+        None,
+    )
+    .expect("render S1");
+    let mut stream = client
+        .query_stream::<pulsus_read::logql::rows::MetricRangeUnwrappedRow>(
+            &s1.replace('?', "??"),
+            &QuerySettings::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}"));
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(
+            row.unwrap_or_else(|e| panic!("S1 must not throw on rows outside its filter: {e}")),
+        );
+    }
+    drop(stream);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (
+            rows[0].n_value,
+            rows[0].n_missing,
+            rows[0].n_undecided,
+            rows[0].v
+        ),
+        (1001, 0, 0, 1001.0),
+        "{rows:?}"
+    );
+
+    // And through the engine: the window (T + 1 s, T + 2 s] holds rows
+    // 1,001..=2,000.
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let from = server_micros(&admin).await;
+    let answer = group_key_answer(engine.query(&parse(query).expect("parse"), &params).await);
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(answer, r#"{status="1"} 1000.0"#);
+    let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
+    assert_eq!(
+        statements,
+        vec![(GroupKeyStatement::Key, 0)],
+        "the key statement answered, and nothing followed it"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// **Criterion 9: the key route falls back on its own memory error** (issue
+/// #507, code 241 end to end).
+///
+/// 20 streams `{service_name="checkout", pod="checkout-<fp>"}`, one hour,
+/// 360,000 lines `{"latency":1,"k":"k<n % 5>"}` (five per second per
+/// stream). `sum by (pod, k) (sum_over_time(… | json | unwrap latency [1s]))`
+/// over seconds 1–3,600 groups 20 × 5 × 3,600 keys:
+///
+/// ```text
+/// read ceiling 64 MiB   S1 fails (241) -> today's raw scan answers
+/// default ceiling       S1 answers, no raw scan
+/// both                  100 series, 359,980 points, each 1, bit-equal to the control
+/// ```
+///
+/// The control `… | unwrap latency | latency >= 0 [1s]` is today's route.
+#[tokio::test]
+async fn the_key_route_falls_back_on_its_own_memory_error() {
+    skip_unless_live!();
+    let (admin, _client, db) = group_key_db("gk_mem").await;
+    let base = ((now_ns() - 7_200_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base})))");
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+             SELECT {month}, 1000 + number, 'checkout', \
+             concat('{{\"pod\":\"checkout-', toString(1000 + number), '\",\"service_name\":\"checkout\"}}'), 0 \
+             FROM numbers(20)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+             SELECT {month}, k, v, 1000 + number FROM numbers(20) \
+             ARRAY JOIN ['service_name', 'pod'] AS k, ['checkout', concat('checkout-', toString(1000 + number))] AS v"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT 'checkout', 1000 + intDiv(number, 18000) % 20, \
+             {base} + intDiv(number % 18000, 5) * 1000000000 + (number % 5) * 1000, 0, \
+             concat('{{\"latency\":1,\"k\":\"k', toString(number % 5), '\"}}') FROM numbers(360000)"
+        ),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("seed the memory corpus");
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + 1_000_000_000,
+            end_ns: base + 3_600_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency [1s]))"#;
+    let control = r#"sum by (pod, k) (sum_over_time({service_name="checkout"} | json | unwrap latency | latency >= 0 [1s]))"#;
+    let matrix =
+        |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>, what: &str| match res {
+            Ok((QueryResult::Matrix(m), _)) => {
+                let mut out: MatrixBits = m
+                    .into_iter()
+                    .map(|s| {
+                        let mut l = s.labels;
+                        l.sort();
+                        (
+                            l,
+                            s.points
+                                .into_iter()
+                                .map(|(t, v)| (t, v.to_bits()))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                out.sort();
+                out
+            }
+            other => panic!("{what}: {other:?}"),
+        };
+    let today = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
+    let want = matrix(
+        today.query(&parse(control).expect("parse"), &params).await,
+        "the control",
+    );
+    assert_eq!(want.len(), 100, "100 series");
+    assert_eq!(
+        want.iter().map(|(_, p)| p.len()).sum::<usize>(),
+        359_980,
+        "359,980 points"
+    );
+    assert!(
+        want.iter()
+            .all(|(_, p)| p.iter().all(|(_, v)| *v == 1f64.to_bits())),
+        "every point is 1"
+    );
+    for (ceiling, statements_want) in [
+        (
+            64 * 1024 * 1024u64,
+            vec![(GroupKeyStatement::Key, 241), (GroupKeyStatement::Raw, 0)],
+        ),
+        (8 * 1024 * 1024 * 1024u64, vec![(GroupKeyStatement::Key, 0)]),
+    ] {
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            EngineConfig {
+                read_max_memory_bytes: ceiling,
+                ..engine_config(&db, 50 * 1024 * 1024 * 1024)
+            },
+        );
+        let from = server_micros(&admin).await;
+        let got = matrix(
+            engine.query(&parse(query).expect("parse"), &params).await,
+            &format!("the key route at a {ceiling}-byte ceiling"),
+        );
+        let to = server_micros(&admin).await + 1;
+        assert_eq!(
+            got, want,
+            "ceiling {ceiling}: the answer is the control's, bit for bit"
+        );
+        let statements =
+            group_key_statements_between(&admin, &db, from, to, statements_want.len()).await;
+        assert_eq!(
+            statements, statements_want,
+            "ceiling {ceiling}: S1 failed with 241 and today's raw scan answered, or S1 answered alone"
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// Seeds `rows` rows of the realistic corpus into `db`: 20 streams
+/// `{service_name="checkout", pod="checkout-<i>"}`, one row every 1.8 ms from
+/// `start`, 90% request bodies and 10% cache messages, each with its own
+/// `request_id` and `ts`. `undecided` writes every request body's `status`
+/// as a float (`200` becomes `0.200`), which the key statement cannot
+/// decide.
+async fn seed_realistic_corpus(admin: &ChClient, db: &str, start: i64, rows: u64, undecided: bool) {
+    seed_realistic_corpus_into(admin, db, "", start, rows, undecided).await;
+}
+
+/// [`seed_realistic_corpus`] into tables named with `suffix` (`_dist` on a
+/// cluster, where each insert waits for every shard).
+async fn seed_realistic_corpus_into(
+    admin: &ChClient,
+    db: &str,
+    suffix: &str,
+    start: i64,
+    rows: u64,
+    undecided: bool,
+) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({start})))");
+    let status = if undecided { "0." } else { "" };
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams{suffix} (month, fingerprint, service, labels, updated_ns) \
+             SELECT {month}, 1000 + number, 'checkout', \
+             concat('{{\"pod\":\"checkout-', toString(number), '\",\"service_name\":\"checkout\"}}'), 0 \
+             FROM numbers(20)"
+        ),
+        format!(
+            "INSERT INTO {db}.log_streams_idx{suffix} (month, key, val, fingerprint) \
+             SELECT {month}, k, v, 1000 + number FROM numbers(20) \
+             ARRAY JOIN ['service_name', 'pod'] AS k, ['checkout', concat('checkout-', toString(number))] AS v"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples{suffix} (service, fingerprint, timestamp_ns, severity, body, structured_metadata) \
+             SELECT 'checkout', 1000 + (number % 20), {start} + 1 + number * 1800000 AS ts, 0, \
+             if(number % 10 = 9, \
+               concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64(number))), lower(hex(cityHash64(number + 1))), \
+                 '\",\"service\":\"checkout\",\"level\":\"info\",\"msg\":\"cache refreshed\"}}'), \
+               concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64(number))), lower(hex(cityHash64(number + 1))), \
+                 '\",\"service\":\"checkout\",\"method\":\"', ['GET','POST','PUT','DELETE'][number % 4 + 1], \
+                 '\",\"status\":{status}', toString([200,201,204,400,404,500][number % 6 + 1]), \
+                 ',\"path\":\"/api/v1/items/', toString(number % 1000), \
+                 '\",\"latency\":', toString(round(((number * 7919) % 100000) / 100, 2)), '}}')), '' \
+             FROM numbers({rows})"
+        ),
+    ] {
+        admin
+            .execute(
+                &sql,
+                &QuerySettings::new().set("distributed_foreground_insert", 1),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed the realistic corpus");
+    }
+}
+
+/// A matrix answer: each series' sorted labels and its `(grid point, the
+/// value's bits)` points.
+type MatrixBits = Vec<(Vec<(String, String)>, Vec<(i64, u64)>)>;
+
+/// The same, with the grid points dropped: one series' values alone.
+type SeriesBits = Vec<(Vec<(String, String)>, Vec<u64>)>;
+
+/// One agreement group: its name, its corpus, and up to two label pairs to
+/// attach to the stream and to the metadata.
+type AgreementGroup = (String, &'static str, Option<Pair>, Option<Pair>);
+
+/// A label pair as the agreement groups carry it.
+type Pair = (&'static str, &'static str);
+
+/// A matrix answer, sorted, with each value's bits, or the error's text.
+fn matrix_bits(
+    res: Result<(QueryResult, pulsus_read::Warnings), ReadError>,
+) -> Result<MatrixBits, String> {
+    match res {
+        Ok((QueryResult::Matrix(m), _)) => {
+            let mut out: MatrixBits = m
+                .into_iter()
+                .map(|s| {
+                    let mut l = s.labels;
+                    l.sort();
+                    (
+                        l,
+                        s.points
+                            .into_iter()
+                            .map(|(t, v)| (t, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+        Ok((other, _)) => Err(format!("not a matrix: {other:?}")),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// **Criterion 19: the undecided rows come from one read** (issue #507, §4.1).
+///
+/// The realistic corpus with every request body's `status` a float, so the
+/// key statement cannot decide one of them, under
+/// `sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))`:
+///
+/// ```text
+/// 3 minutes, today's retained-label ceiling lowered
+///   S1 throws (395) -> today's raw scan refuses on the ceiling -> L, exactly one statement
+///   the query answers; no GROUP BY statement follows the raw scan
+/// 2 minutes
+///   without the lowered ceiling: S1 throws, today's route answers
+///   with it: L answers, and its answer equals today's, series by series
+/// ```
+///
+/// L folds each row under the grouping the range step uses (a parent `sum`
+/// by `status`), so 3 minutes of rows with a unique `request_id` each make
+/// six series, not one per row.
+///
+/// **On CI's two-shard leg** (`PULSUS_TEST_CH_CLUSTER` names the cluster) the
+/// same test runs against the `_dist` tables: the statements above are the
+/// initiator's, which run its own shard's part, and the other shard's own
+/// `system.query_log` holds exactly one part of L after its part of today's
+/// raw scan.
+#[tokio::test]
+async fn the_undecided_rows_come_from_one_read() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let cluster = std::env::var("PULSUS_TEST_CH_CLUSTER").ok();
+    let suffix = if cluster.is_some() { "_dist" } else { "" };
+    let (admin, db) = match &cluster {
+        None => {
+            let (admin, _client, db) = group_key_db("gk_oneread").await;
+            (admin, db)
+        }
+        Some(name) => {
+            let admin = ChClient::new(test_config()).await.expect("connect admin");
+            let db = pulsus_testkit::test_db(&format!(
+                "pulsus_read_it_qlg_gk_oneread_{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            admin
+                .execute(
+                    &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{name}' SYNC"),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("drop");
+            let ctx = RenderCtx {
+                cluster: Some(name.clone()),
+                ..test_ctx(&db)
+            };
+            run_init(&admin, &ctx).await.expect("run_init (clustered)");
+            (admin, db)
+        }
+    };
+    let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    // Twelve minutes at the corpus's density; the queries read minutes 8–11.
+    seed_realistic_corpus_into(&admin, &db, suffix, start, 400_000, true).await;
+    let config = || {
+        let mut c = engine_config(&db, 50 * 1024 * 1024 * 1024);
+        if cluster.is_some() {
+            c.streams_idx = "log_streams_idx_dist".to_string();
+            c.streams = "log_streams_dist".to_string();
+            c.samples = "log_samples_dist".to_string();
+            c.rollup_table = "log_metrics_5s_dist".to_string();
+            c.distributed = true;
+        }
+        c
+    };
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+    let expr = parse(query).expect("parse");
+    // `points` grid points ending at minute 11: 3 points read 3 minutes.
+    let range = |points: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start + (12 - points) * MIN,
+            end_ns: start + 11 * MIN,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lowered = LogQlEngine::new(data_client(&db).await, config()).with_key_route_test_hooks(
+        pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: Some(1),
+            key_statement_test_knobs: None,
+        },
+    );
+    let plain = LogQlEngine::new(data_client(&db).await, config());
+
+    // 3 minutes: the query answers from L.
+    let from = server_micros(&admin).await;
+    let three = matrix_bits(lowered.query(&expr, &range(3)).await).expect("L answers at 3 minutes");
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(
+        three.len(),
+        6,
+        "one series per status: {:?}",
+        three.iter().map(|s| &s.0).collect::<Vec<_>>()
+    );
+    assert!(three.iter().all(|(_, p)| p.len() == 3), "three points each");
+    let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &statements,
+        "S1 throws, today's raw scan runs, and exactly one key-route statement follows it",
+    );
+    // Every statement of the query, in order: none after today's raw scan
+    // holds a GROUP BY.
+    let mut s = admin
+        .query_stream::<TimedStatementRow>(
+            &format!(
+                "SELECT query, exception_code FROM system.query_log WHERE has(databases, '{db}') \
+                 AND type != 'QueryStart' AND is_initial_query AND query NOT LIKE '%system.query_log%' \
+                 AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+                 AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+                 ORDER BY query_start_time_microseconds ASC"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the query's statements");
+    let mut all = Vec::new();
+    while let Some(row) = s.next().await {
+        all.push(row.expect("decode").query);
+    }
+    drop(s);
+    let raw_at = all
+        .iter()
+        .position(|q| q.starts_with("SELECT fingerprint, timestamp_ns, body"))
+        .expect("today's raw scan ran");
+    let grouped_after: Vec<&String> = all[raw_at + 1..]
+        .iter()
+        .filter(|q| q.contains("GROUP BY"))
+        .collect();
+    assert!(
+        grouped_after.is_empty(),
+        "no GROUP BY statement after today's raw scan: {grouped_after:?}"
+    );
+    if let Some(name) = &cluster {
+        // The initiator runs its own shard's part inside the statements
+        // above; the other shard logs its parts as its own queries.
+        let per_shard = group_key_shard_statements(&admin, name, &db, from, to).await;
+        assert_eq!(
+            per_shard.len(),
+            1,
+            "the other shard ran its parts: {per_shard:?}"
+        );
+        for (host, kinds) in &per_shard {
+            let raw_at = kinds
+                .iter()
+                .position(|k| *k == GroupKeyStatement::Raw)
+                .unwrap_or_else(|| panic!("{host}: its part of today's raw scan: {kinds:?}"));
+            assert_eq!(
+                kinds[raw_at + 1..].to_vec(),
+                vec![GroupKeyStatement::Lane],
+                "{host}: exactly one part of L after its part of today's raw scan: {kinds:?}"
+            );
+        }
+    }
+
+    // 2 minutes: L's answer is today's route's, series by series.
+    let from = server_micros(&admin).await;
+    let today = matrix_bits(plain.query(&expr, &range(2)).await)
+        .expect("today's route answers at 2 minutes");
+    let mid = server_micros(&admin).await + 1;
+    let lane = matrix_bits(lowered.query(&expr, &range(2)).await).expect("L answers at 2 minutes");
+    let to = server_micros(&admin).await + 1;
+    // Series by series and point by point, within the summation-order bound
+    // `2(n−1)·u·Σ|vᵢ|` of each point's rows: L adds its rows in the order
+    // they arrive and today's route in its own, and the owner accepted that
+    // the order is not fixed (docs/query-to-sql.md §8).
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct PointRow {
+        status: f64,
+        bucket: i64,
+        n: u64,
+        sum_abs: f64,
+    }
+    let mut s = admin
+        .query_stream::<PointRow>(
+            &format!(
+                "SELECT JSONExtractFloat(body, 'status') AS status, \
+                 {start} + intDiv(timestamp_ns - {start} + {MIN} - 1, {MIN}) * {MIN} AS bucket, \
+                 count() AS n, sum(abs(JSONExtractFloat(body, 'latency'))) AS sum_abs \
+                 FROM {db}.log_samples{suffix} WHERE JSONHas(body, 'latency') \
+                 AND timestamp_ns > {} AND timestamp_ns <= {} GROUP BY status, bucket",
+                start + 8 * MIN,
+                start + 11 * MIN
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("each point's rows");
+    let mut points = std::collections::HashMap::new();
+    while let Some(row) = s.next().await {
+        let row = row.expect("decode");
+        points.insert((row.status.to_string(), row.bucket), (row.n, row.sum_abs));
+    }
+    drop(s);
+    assert_eq!(
+        lane.iter()
+            .map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        today
+            .iter()
+            .map(|(l, p)| (l.clone(), p.iter().map(|(t, _)| *t).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+        "at 2 minutes L answers the series and points today's route answers"
+    );
+    for ((labels, lp), (_, tp)) in lane.iter().zip(&today) {
+        let status = &labels
+            .iter()
+            .find(|(k, _)| k == "status")
+            .expect("status")
+            .1;
+        for ((t, a), (_, b)) in lp.iter().zip(tp) {
+            let (n, sum_abs) = points[&(status.clone(), *t)];
+            let bound = 2.0 * ((n as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            assert!(
+                (a - b).abs() <= bound,
+                "status {status} at {t}: L {a:?}, today's route {b:?}, bound {bound:e} over {n} rows"
+            );
+        }
+    }
+    assert_eq!(
+        group_key_statements_between(&admin, &db, from, mid, 2).await,
+        vec![(GroupKeyStatement::Key, 395), (GroupKeyStatement::Raw, 0)],
+        "without the lowered ceiling today's route answers"
+    );
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &group_key_statements_between(&admin, &db, mid, to, 3).await,
+        "with it, L answers",
+    );
+    match &cluster {
+        None => drop_group_key_db(&admin, &db).await,
+        Some(name) => admin
+            .execute(
+                &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{name}' SYNC"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop the run database"),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ShardStatementRow {
+    host: String,
+    query: String,
+}
+
+/// Each shard's own parts of the group key read's statements over `db` in
+/// `[from, to)` initiator microseconds, per host, in the order they ran.
+async fn group_key_shard_statements(
+    admin: &ChClient,
+    cluster: &str,
+    db: &str,
+    from: u64,
+    to: u64,
+) -> std::collections::BTreeMap<String, Vec<GroupKeyStatement>> {
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                &format!("SYSTEM FLUSH LOGS ON CLUSTER '{cluster}'"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs on the cluster");
+        let sql = format!(
+            "SELECT hostName() AS host, query FROM clusterAllReplicas('{cluster}', system.query_log) \
+             WHERE has(databases, '{db}') AND type != 'QueryStart' AND NOT is_initial_query \
+             AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({from})) \
+             AND query_start_time_microseconds < fromUnixTimestamp64Micro(toInt64({to})) \
+             ORDER BY host, query_start_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<ShardStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read each shard's system.query_log");
+        out.clear();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode");
+            // A shard's part is the initiator's statement rewritten over the
+            // local table, so the markers are what survives the rewrite: the
+            // key statement's throw, the per-row readers, or neither.
+            if !row.query.contains("`log_samples`") {
+                continue;
+            }
+            let kind = if row.query.contains("throwIf") {
+                GroupKeyStatement::Key
+            } else if row.query.contains("JSONExtractRaw") {
+                GroupKeyStatement::Lane
+            } else {
+                GroupKeyStatement::Raw
+            };
+            out.entry(row.host).or_insert_with(Vec::new).push(kind);
+        }
+        drop(stream);
+        if !out.is_empty() && out.values().all(|k| k.contains(&GroupKeyStatement::Lane)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// **Criterion 49: lane L keeps an error row's ungrouped labels** (issue
+/// #507 addendum 4 §D2).
+///
+/// A row whose `__error__` slot is set keeps the labels it had, exactly as
+/// the range step keeps them, so the query fails with that row's series —
+/// the same failure today's route reports, from the same data.
+///
+/// ```text
+/// T0        +60s        +120s        +177s +180s
+/// |-----------|------------|-------------xxx-|
+///   request lines on both pods, 20/s      x = the three error lines (pod 1002)
+/// W2 points:  *            *
+/// W3 points:  *            *                  *
+/// the lowered ceiling refuses inside the first 120 s, before any x
+/// ```
+///
+/// | run | ceiling | window | route | answer |
+/// |---|---|---|---|---|
+/// | (a) | shipped | W3 | S1 395, today's raw scan, no L | the pipeline error, series E177 |
+/// | (b) | lowered | W2 | S1 395, raw, then L | today's route's answer at the shipped ceiling |
+/// | (c) | lowered | W3 | S1 395, raw, then L | the pipeline error, series one of E177–E179 |
+/// | (c′) | — | — | — | (c)'s text with its series put back to (a)'s equals (a)'s |
+///
+/// `T0` and both window bounds are whole multiples of the step, asserted
+/// rather than assumed: an unaligned window is answered on a different grid
+/// by the reference (ledger `frontend-step-alignment`), which would compare
+/// two different grids.
+#[tokio::test]
+async fn the_lane_keeps_an_error_row_ungrouped() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    // The ceiling at which today's route refuses inside the first two
+    // minutes of this corpus, before any error line. Measured below by the
+    // test itself: both windows refuse.
+    const LOWERED_GROUP_BYTES: u64 = 1;
+    let (admin, _client, db) = group_key_db("gk_lane_err").await;
+    let t0 = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    assert_eq!(t0 % MIN, 0, "T0 is a whole multiple of the step");
+
+    // Two streams, 1,800 request lines each, one every 100 ms over
+    // (T0, T0+180 s]. Every `request_id` is different and every `status` is
+    // `0.200`, so every row is undecided on the key route.
+    for pod in [1001u64, 1002u64] {
+        seed_one_stream(
+            &admin,
+            &db,
+            t0,
+            pod,
+            "checkout",
+            &format!("checkout-{pod}"),
+            &format!(
+                "SELECT {t0} + number * 100000000 + 50000000 AS ts, \
+                 concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(ts), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                 '\",\"request_id\":\"', lower(hex(cityHash64({pod}, number))), \
+                 lower(hex(cityHash64(number, {pod}))), \
+                 '\",\"service\":\"checkout\",\"method\":\"', ['GET','POST'][number % 2 + 1], \
+                 '\",\"status\":0.200,\"path\":\"', ['/cart','/checkout','/items'][number % 3 + 1], \
+                 '\",\"latency\":', toString(5 + cityHash64(number, {pod}) % 496), '}}') AS body \
+                 FROM numbers(1800)"
+            ),
+        )
+        .await;
+    }
+    // Three error lines on pod 1002, at T0+177.075 s, +178.075 s and
+    // +179.075 s: a timed-out request, whose `latency` is the string `n/a`.
+    // Their `request_id`s are the ones the plan measured.
+    let err_ids = [
+        (177i64, "29bcab778732ded776228be2ccf48c4a"),
+        (178, "09a0625ad8dfcf64eaac7929d2030284"),
+        (179, "0e135bc3a9ca6dd103d7b196f18022bb"),
+    ];
+    for (second, id) in err_ids {
+        let ts = t0 + second * 1_000_000_000 + 75_000_000;
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                     SELECT 'checkout', 1002, {ts}, 0, \
+                     concat('{{\"ts\":\"', formatDateTime(fromUnixTimestamp64Nano(toInt64({ts})), '%Y-%m-%dT%H:%i:%S.%fZ'), \
+                     '\",\"request_id\":\"{id}\",\"service\":\"checkout\",\"method\":\"POST\",\
+\"status\":0.200,\"path\":\"/checkout\",\"latency\":\"n/a\"}}')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed an error line");
+    }
+
+    let query = r#"sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))"#;
+    let expr = parse(query).expect("parse");
+    let window = |end_s: i64| {
+        assert_eq!(
+            (60 * 1_000_000_000i64) % MIN,
+            0,
+            "the window's start is a whole multiple of the step"
+        );
+        assert_eq!(
+            (end_s * 1_000_000_000) % MIN,
+            0,
+            "the window's end is a whole multiple of the step"
+        );
+        QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t0 + 60 * 1_000_000_000,
+                end_ns: t0 + end_s * 1_000_000_000,
+                step_ns: MIN as u64,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        }
+    };
+    let w3 = window(180);
+    let w2 = window(120);
+    let shipped = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    );
+    let lowered = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 50 * 1024 * 1024 * 1024),
+    )
+    .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+        todays_route_group_bytes: Some(LOWERED_GROUP_BYTES),
+        key_statement_test_knobs: None,
+    });
+
+    // (a) the shipped ceiling at W3: the query fails on the first error line
+    // today's route reads, and no L runs.
+    let from = server_micros(&admin).await;
+    let a = shipped.query(&expr, &w3).await;
+    let to = server_micros(&admin).await + 1;
+    let (a_type, a_series) = match &a {
+        Err(ReadError::MetricPipelineError { error_type, series }) => {
+            (error_type.clone(), series.clone())
+        }
+        other => panic!("(a): the pipeline error, got {other:?}"),
+    };
+    assert_eq!(a_type, "SampleExtractionErr", "(a)");
+    assert!(
+        a_series.contains(&format!("request_id=\"{}\"", err_ids[0].1)),
+        "(a): the first error line's series, got {a_series}"
+    );
+    assert_eq!(
+        group_key_statements_between(&admin, &db, from, to, 2).await,
+        vec![(GroupKeyStatement::Key, 395), (GroupKeyStatement::Raw, 0),],
+        "(a): S1 throws and today's raw scan answers; no L"
+    );
+
+    // The lowered ceiling is what makes (b) and (c) reach L: today's route
+    // refuses on its retained-label ceiling inside the first two minutes,
+    // before any error line, and that refusal is the only way in. Each run
+    // below asserts it through `system.query_log`, where the refusal shows
+    // as today's raw scan followed by L.
+
+    // (b) the lowered ceiling at W2: L answers, and its answer is today's
+    // route's at the shipped ceiling.
+    let today_w2 = matrix_bits(shipped.query(&expr, &w2).await)
+        .expect("(b): today's route answers W2 at the shipped ceiling");
+    let from = server_micros(&admin).await;
+    let b = matrix_bits(lowered.query(&expr, &w2).await).expect("(b): L answers W2");
+    let to = server_micros(&admin).await + 1;
+    assert_eq!(
+        b.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+        vec![vec![("status".to_string(), "0.2".to_string())]],
+        "(b): one series, `status=\"0.2\"`"
+    );
+    assert_eq!(
+        b, today_w2,
+        "(b): L's answer is today's route's, bit for bit"
+    );
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &group_key_statements_between(&admin, &db, from, to, 3).await,
+        "(b): S1 throws, today's route refuses on its ceiling, and L answers",
+    );
+
+    // (c) the lowered ceiling at W3: L reaches an error row, and that row
+    // keeps its ungrouped labels, so the query fails with its series.
+    let from = server_micros(&admin).await;
+    let c = lowered.query(&expr, &w3).await;
+    let to = server_micros(&admin).await + 1;
+    let (c_type, c_series) = match &c {
+        Err(ReadError::MetricPipelineError { error_type, series }) => {
+            (error_type.clone(), series.clone())
+        }
+        other => panic!("(c): the pipeline error, got {other:?}"),
+    };
+    assert_eq!(c_type, "SampleExtractionErr", "(c)");
+    assert!(
+        err_ids
+            .iter()
+            .any(|(_, id)| c_series.contains(&format!("request_id=\"{id}\""))),
+        "(c): one of the three error lines' series, got {c_series}"
+    );
+    assert!(
+        c_series.contains("__error__=\"SampleExtractionErr\"")
+            && c_series.contains("latency=\"n/a\"")
+            && c_series.contains("pod=\"checkout-1002\""),
+        "(c): the row's ungrouped labels, got {c_series}"
+    );
+    let statements = group_key_statements_between(&admin, &db, from, to, 3).await;
+    assert_s1_throws_todays_route_is_abandoned_and_the_lane_answers(
+        &statements,
+        "(c): the error came from L, not from today's route",
+    );
+
+    // (c′) the two failures are the same response: equal variants, and equal
+    // text once (c)'s series is put back to (a)'s. The logs API renders
+    // `to_string()` into the body, so equal text is an equal response.
+    let c_as_a = ReadError::MetricPipelineError {
+        error_type: c_type,
+        series: a_series.clone(),
+    };
+    assert_eq!(
+        c_as_a.to_string(),
+        ReadError::MetricPipelineError {
+            error_type: a_type,
+            series: a_series,
+        }
+        .to_string(),
+        "(c′): the same failure, reported from whichever error row the read reached first"
+    );
+
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// **Criterion 31: a timeout of the key statement is the timeout response**
+/// (issue #507, owner ruling: no race, no fallback).
+///
+/// The realistic corpus; `avg_over_time({service_name="checkout"} | json |
+/// path != "" | unwrap latency [1m]) by (service, method, status, level,
+/// msg)` over two minutes, with S1 slowed by a per-row delay past a
+/// deadline:
+///
+/// ```text
+/// S1 ── the timeout ── the timeout response (ChError::Timeout, the logs API's 504)
+///                      today's route does not run
+/// ```
+///
+/// **Both deadlines are exercised, because either can arrive first and they
+/// are two code paths.** A run with the server's own `max_execution_time`
+/// below the client's stream deadline ends in the server's code 159, which
+/// `key_statement_refusal` maps to the timeout response; a run with the
+/// client's deadline below the server's ends in `ChError::Timeout` from the
+/// stream itself. With only the second, mapping 159 to today's route stays
+/// green — measured: that break left this test passing until the first run
+/// was added.
+#[tokio::test]
+async fn the_key_statement_timeout_is_the_timeout_response() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let (admin, _client, db) = group_key_db("gk_timeout").await;
+    let start = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+    seed_realistic_corpus(&admin, &db, start, 200_000, false).await;
+    let query = r#"avg_over_time({service_name="checkout"} | json | path != "" | unwrap latency [1m]) by (service, method, status, level, msg)"#;
+    let expr = parse(query).expect("parse");
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start + 3 * MIN,
+            end_ns: start + 4 * MIN,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    match plan(&expr, &params, &plan_ctx(&db)).expect("plan") {
+        Plan::Metric(mp) => assert!(
+            matches!(mp.value, sql::MetricValue::Unwrapped(_)),
+            "the plan is the group key read"
+        ),
+        _ => panic!("a metric plan"),
+    }
+    // (what, the client's stream deadline, the server's own limit on S1)
+    for (what, client_timeout, server_limit_s) in [
+        ("the server's own limit", Duration::from_secs(20), Some(0.3)),
+        ("the client's stream deadline", Duration::from_secs(1), None),
+    ] {
+        let mut cfg = test_config();
+        cfg.database = db.clone();
+        cfg.query_timeout = client_timeout;
+        let slow = LogQlEngine::new(
+            ChClient::new(cfg).await.expect("connect"),
+            engine_config(&db, 50 * 1024 * 1024 * 1024),
+        )
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: None,
+            key_statement_test_knobs: Some(sql::KeyStatementTestKnobs {
+                row_delay_micros: 40,
+                max_execution_s: server_limit_s,
+            }),
+        });
+        let from = server_micros(&admin).await;
+        let res = slow.query(&expr, &params).await;
+        // S1 may still be running on the server after the client's deadline;
+        // its row is logged when the server stops it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let to = server_micros(&admin).await + 1;
+        match &res {
+            Err(ReadError::Clickhouse(pulsus_clickhouse::ChError::Timeout(_))) => {}
+            other => panic!(
+                "{what}: the key statement's timeout must be the timeout response, got {other:?}"
+            ),
+        }
+        let statements = group_key_statements_between(&admin, &db, from, to, 1).await;
+        assert!(
+            matches!(statements.as_slice(), [(GroupKeyStatement::Key, code)] if *code != 0),
+            "{what}: S1 ended with its timeout and no raw scan followed it: {statements:?}"
+        );
+        if server_limit_s.is_some() {
+            assert!(
+                matches!(statements.as_slice(), [(GroupKeyStatement::Key, 159)]),
+                "the server's limit ends S1 with code 159, the code the reader maps: \
+                 {statements:?}"
+            );
+        }
+    }
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// Inserts `sql`'s rows as one stream `{service_name="<service>"}` at `fp`,
+/// with `pod` as a second stream label when it is not empty.
+async fn seed_one_stream(
+    admin: &ChClient,
+    db: &str,
+    t: i64,
+    fp: u64,
+    service: &str,
+    pod: &str,
+    rows_sql: &str,
+) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let (labels, idx) = if pod.is_empty() {
+        (
+            format!("{{\"service_name\":\"{service}\"}}"),
+            format!("({month}, 'service_name', '{service}', {fp})"),
+        )
+    } else {
+        (
+            format!("{{\"pod\":\"{pod}\",\"service_name\":\"{service}\"}}"),
+            format!(
+                "({month}, 'service_name', '{service}', {fp}), ({month}, 'pod', '{pod}', {fp})"
+            ),
+        )
+    };
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+             ({month}, {fp}, '{service}', '{labels}', 0)"
+        ),
+        format!("INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES {idx}"),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+             SELECT '{service}', {fp}, ts, 0, body FROM ({rows_sql})"
+        ),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed {service}: {e}"));
+    }
+}
+
+/// **Criterion 23: every refusal lands as the refusal table says** (issue
+/// #507, §5.5).
+///
+/// The key route reproduces every rule that decides one line's outcome and
+/// every ceiling on the answer, the scan or the statement; it does not
+/// reproduce the ceilings on buffers only today's route allocates. Each row
+/// runs the query on the key route and on today's route (the same query
+/// with `| zzz=""` after the unwrap, which keeps every line and takes
+/// today's route):
+///
+/// ```text
+/// row  data                                                 today's route               key route
+/// R1   6,213 {"latency":1} at one nanosecond                 {} 6213                     {} 6213
+/// R1   6,214 at one nanosecond                              422 same-nanosecond staging {} 6214
+/// R2   4,100,000 {"latency":1} within 50 s                  422 retained window points  {} 4100000
+/// R3   3,400 lines, each its own request_id, one per second 422 result point-slots      one series, 3,400 points of 1
+///      over an hour, step 1 s
+/// R4   the realistic corpus, 3 minutes                       422 retained label bytes    three points (the plan's figures)
+/// R5   501 values of r under by (r)                         422 series cap              422 series cap
+/// R6   the realistic corpus under a scan budget below it    422 scan budget             422 scan budget, no raw scan
+/// ```
+///
+/// R9 (the statement text cap) is the hermetic
+/// `plan::tests::a_key_statement_over_the_text_cap_takes_todays_route`, and
+/// R10 (the memory ceiling) is `the_key_route_falls_back_on_its_own_memory_error`.
+#[tokio::test]
+async fn every_refusal_lands_as_the_table_says() {
+    skip_unless_live!();
+    const MIN: i64 = 60_000_000_000;
+    let (admin, _client, db) = group_key_db("gk_refusals").await;
+    let base = ((now_ns() - 7_200_000_000_000) / MIN) * MIN;
+    // R1's two streams carry the labels the plan measured them under
+    // (`{pod="checkout-1000", service_name="checkout"}`), at the same
+    // lengths: the staging charge counts each line's rendered labels.
+    seed_one_stream(
+        &admin,
+        &db,
+        base,
+        2301,
+        "checkou1",
+        "checkout-1000",
+        &format!(
+            "SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6213)",
+            base + 90_000_000_000
+        ),
+    )
+    .await;
+    seed_one_stream(
+        &admin,
+        &db,
+        base,
+        2302,
+        "checkou2",
+        "checkout-1000",
+        &format!(
+            "SELECT {} AS ts, '{{\"latency\":1}}' AS body FROM numbers(6214)",
+            base + 90_000_000_000
+        ),
+    )
+    .await;
+    seed_one_stream(&admin, &db, base, 2303, "r2", "",
+        &format!("SELECT {} + intDiv(number * 50000000000, 4100000) AS ts, '{{\"latency\":1}}' AS body FROM numbers(4100000)", base + 1_000_000_000)).await;
+    seed_one_stream(&admin, &db, base, 2304, "r3", "",
+        &format!("SELECT {base} + (number + 1) * 1000000000 AS ts, concat('{{\"request_id\":\"', toString(number), '\",\"latency\":1}}') AS body FROM numbers(3400)")).await;
+    seed_one_stream(&admin, &db, base, 2305, "r5", "",
+        &format!("SELECT {} + number AS ts, concat('{{\"latency\":1,\"r\":\"', toString(number), '\"}}') AS body FROM numbers(501)", base + 30_000_000_000)).await;
+    // The realistic corpus's first 3 minutes and a little more.
+    seed_realistic_corpus(&admin, &db, base, 120_000, false).await;
+
+    // R2's control is the slowest query in this file by a wide margin: the
+    // retention cap is 4,000,000 points (`charge::MAX_RETAINED_WINDOW_POINTS`)
+    // and the row's stream holds 4,100,000 samples, so today's route reads
+    // 4,000,001 of them before it can refuse. The deadline therefore has to
+    // outlast that scan wherever the suite runs. At this file's 60 s it was a
+    // race the machine decided: it passed here and CI answered
+    // `timeout: query_stream exceeded 60s` for that one row instead of
+    // `422 MetricRetention`. Measured here with a deliberately short deadline,
+    // the failure reproduces exactly, and at 300 s the row answers on both.
+    const REFUSAL_TABLE_DEADLINE: Duration = Duration::from_secs(300);
+    let engine = |budget: u64| {
+        let db = db.clone();
+        async move {
+            LogQlEngine::new(
+                data_client_with_deadline(&db, REFUSAL_TABLE_DEADLINE).await,
+                engine_config(&db, budget),
+            )
+        }
+    };
+    let wide = engine(50 * 1024 * 1024 * 1024).await;
+    let range = |start_s: i64, end_s: i64, step: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: base + start_s * 1_000_000_000,
+            end_ns: base + end_s * 1_000_000_000,
+            step_ns: (step * 1_000_000_000) as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let is_key = |q: &str, p: &QueryParams| {
+        matches!(
+            plan(&parse(q).expect("parse"), p, &plan_ctx(&db)).expect("plan"),
+            Plan::Metric(mp) if matches!(mp.value, sql::MetricValue::Unwrapped(_))
+        )
+    };
+    let sum_by = |svc: &str, extra: &str, r: &str| {
+        format!(
+            r#"sum by (service_name) (sum_over_time({{service_name="{svc}"}} | json | unwrap latency{extra} [{r}]))"#
+        )
+    };
+    let short = |res: Result<(QueryResult, pulsus_read::Warnings), ReadError>| -> String {
+        match res {
+            Err(ReadError::QueryTooBroad(reason)) => {
+                let name = format!("{reason:?}");
+                format!("422 {}", name.split([' ', '{', '(']).next().unwrap_or(""))
+            }
+            Err(e) => format!("error {e}"),
+            Ok((QueryResult::Matrix(m), _)) => m
+                .iter()
+                .map(|s| {
+                    let vals: Vec<String> =
+                        s.points.iter().map(|(_, v)| format!("{v:?}")).collect();
+                    format!("{} {}", group_key_labels(&s.labels), vals.join(","))
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Ok((other, _)) => format!("unexpected {other:?}"),
+        }
+    };
+
+    // R1 and R2: (key-route query, today's control, params, today's answer, key answer)
+    for (svc, params, today_want, key_want) in [
+        ("checkou1", range(60, 120, 60), "{} 6213.0", "{} 6213.0"),
+        (
+            "checkou2",
+            range(60, 120, 60),
+            "422 TsCollisionGroup",
+            "{} 6214.0",
+        ),
+        (
+            "r2",
+            range(60, 120, 60),
+            "422 MetricRetention",
+            "{} 4100000.0",
+        ),
+    ] {
+        let key_q = sum_by(svc, "", "1m");
+        let today_q = sum_by(svc, r#" | zzz="""#, "1m");
+        assert!(is_key(&key_q, &params), "{key_q}: the key route");
+        assert!(!is_key(&today_q, &params), "{today_q}: today's route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            today_want,
+            "{svc}: today's route"
+        );
+        assert_eq!(
+            short(wide.query(&parse(&key_q).expect("parse"), &params).await),
+            key_want,
+            "{svc}: the key route"
+        );
+    }
+
+    // R3: one series of 3,400 points, each 1, where today's route runs out of
+    // result point-slots.
+    {
+        let params = range(1, 3600, 1);
+        let key_q = sum_by("r3", "", "1s");
+        let today_q = sum_by("r3", r#" | zzz="""#, "1s");
+        assert!(is_key(&key_q, &params), "R3: the key route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            "422 MetricResultPoints",
+            "R3: today's route"
+        );
+        match wide.query(&parse(&key_q).expect("parse"), &params).await {
+            Ok((QueryResult::Matrix(m), _)) => {
+                assert_eq!(m.len(), 1, "R3: one series");
+                assert_eq!(m[0].points.len(), 3400, "R3: 3,400 points");
+                assert!(m[0].points.iter().all(|(_, v)| *v == 1.0), "R3: each 1");
+            }
+            other => panic!("R3: the key route answers: {other:?}"),
+        }
+    }
+
+    // R4: the realistic corpus over 3 minutes.
+    {
+        let params = range(60, 180, 60);
+        let key_q = sum_by("checkout", "", "1m");
+        let today_q = sum_by("checkout", r#" | zzz="""#, "1m");
+        assert!(is_key(&key_q, &params), "R4: the key route");
+        assert_eq!(
+            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            "422 MetricGroupLabelBytes",
+            "R4: today's route"
+        );
+        match wide.query(&parse(&key_q).expect("parse"), &params).await {
+            Ok((QueryResult::Matrix(m), _)) => {
+                assert_eq!(m.len(), 1, "R4: one series");
+                let got: Vec<f64> = m[0].points.iter().map(|(_, v)| *v).collect();
+                let want = [14_999_019.46, 14_998_940.27, 15_001_940.27];
+                assert_eq!(got.len(), 3, "R4: three points: {got:?}");
+                for (g, w) in got.iter().zip(want) {
+                    assert!(
+                        (g - w).abs() < 0.005,
+                        "R4: {got:?} against the plan's {want:?}"
+                    );
+                }
+            }
+            other => panic!("R4: the key route answers: {other:?}"),
+        }
+    }
+
+    // R5: the series cap on both routes.
+    {
+        let params = range(60, 60, 60);
+        let key_q = r#"avg_over_time({service_name="r5"} | json | unwrap latency [1m]) by (r)"#;
+        let today_q =
+            r#"avg_over_time({service_name="r5"} | json | unwrap latency | zzz="" [1m]) by (r)"#;
+        assert!(is_key(key_q, &params), "R5: the key route");
+        assert_eq!(
+            short(wide.query(&parse(today_q).expect("parse"), &params).await),
+            "422 MetricSeries",
+            "R5: today's route"
+        );
+        assert_eq!(
+            short(wide.query(&parse(key_q).expect("parse"), &params).await),
+            "422 MetricSeries",
+            "R5: the key route"
+        );
+    }
+
+    // R6: the scan budget on both routes, and no raw scan after the key
+    // statement's 307.
+    {
+        let params = range(60, 180, 60);
+        let tight = engine(1_000_000).await;
+        let key_q =
+            r#"avg_over_time({service_name="checkout"} | json | unwrap latency [1m]) by (service)"#;
+        let today_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency | zzz="" [1m]) by (service)"#;
+        assert!(is_key(key_q, &params), "R6: the key route");
+        assert_eq!(
+            short(tight.query(&parse(today_q).expect("parse"), &params).await),
+            "422 ScanBudgetBytes",
+            "R6: today's route"
+        );
+        let from = server_micros(&admin).await;
+        assert_eq!(
+            short(tight.query(&parse(key_q).expect("parse"), &params).await),
+            "422 ScanBudgetBytes",
+            "R6: the key route"
+        );
+        let to = server_micros(&admin).await + 1;
+        assert_eq!(
+            group_key_statements_between(&admin, &db, from, to, 1).await,
+            vec![(GroupKeyStatement::Key, 307)],
+            "R6: the key statement meets the budget and no second read runs"
+        );
+    }
+    drop_group_key_db(&admin, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ProjectedMetadataRow {
+    pairs: Vec<(String, String)>,
+}
+
+/// **Criterion 5: the key route's reduced input answers as the full input**
+/// (issue #507, §6.3).
+///
+/// The fold never sees a row as it was stored. It sees:
+///
+/// ```text
+/// metadata      only the entries the plan names, projected by the key statement's own SQL
+/// bare keys     a key label's body value removed where a stream label or metadata entry holds the name
+/// stream labels only the class names
+/// ```
+///
+/// Each case is stored twice, as it is and reduced, and today's route (an
+/// instant query) answers both; the answers must be equal. 7 queries × 14
+/// metadata variants over the same four bodies on a stream
+/// `{pod="p1", zone="z1"}`: 98 cases, of which 20 carry a name that sends the
+/// key route to today's route (the unwrapped label, `__error__` or
+/// `__error_details__`), so they have no reduced input and are not compared.
+/// The names come from the plan the key route runs.
+#[tokio::test]
+async fn the_reduced_input_answers_as_the_full_input() {
+    skip_unless_live!();
+    let (admin, client, db) = group_key_db("gk_reduced").await;
+    let queries = [
+        (
+            "qa",
+            "sum by (code) (sum_over_time(SEL | json | unwrap latency [1m]))",
+        ),
+        (
+            "qb",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (code)",
+        ),
+        (
+            "qc",
+            r#"sum by (code) (sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#,
+        ),
+        (
+            "qd",
+            "sum by (pod) (sum_over_time(SEL | json | unwrap latency [1m]))",
+        ),
+        ("qe", "sum(sum_over_time(SEL | json | unwrap latency [1m]))"),
+        (
+            "qf",
+            r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) by (c)"#,
+        ),
+        (
+            "qg",
+            r#"avg_over_time(SEL | json c="code", lat="latency" | unwrap lat [1m]) without (pod)"#,
+        ),
+    ];
+    let bodies = [
+        r#"{"latency":1,"code":"a","a":"x"}"#,
+        r#"{"latency":2,"code":"b","a":"x","pod":"body-pod"}"#,
+        r#"{"latency":4,"code":"a","a":"y","c":"bc"}"#,
+        r#"{"latency":8}"#,
+    ];
+    let metadata: [&[&str]; 14] = [
+        &[""],
+        &[r#"{"code":"m"}"#],
+        &[r#"{"a":"x"}"#],
+        &[r#"{"a":"q"}"#],
+        &[r#"{"pod":"sm-pod"}"#],
+        &[r#"{"trace_id":"t1"}"#],
+        &[r#"{"zone":"sz"}"#],
+        &[r#"{"code":"m","trace_id":"t"}"#],
+        &[r#"{"latency":"9"}"#],
+        &[r#"{"__error__":"boom"}"#],
+        &[r#"{"__error_details__":"d"}"#],
+        &[r#"{"c":"k"}"#],
+        &[r#"{"lat":"7"}"#],
+        &[
+            r#"{"trace_id":"t1"}"#,
+            r#"{"trace_id":"t2"}"#,
+            r#"{"code":"m"}"#,
+            "",
+        ],
+    ];
+    let stream = [("pod", "p1"), ("zone", "z1")];
+    let t = ((now_ns() - 3_600_000_000_000) / 300_000_000_000) * 300_000_000_000;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut cases: Vec<GroupKeyCase> = Vec::new();
+    let mut compared: Vec<(String, String)> = Vec::new();
+    let mut to_today = 0;
+    for (qn, q) in queries {
+        let planned = q.replace("SEL", r#"{service_name="x"}"#);
+        let u = match plan(&parse(&planned).expect("parse"), &range, &plan_ctx(&db)).expect("plan")
+        {
+            Plan::Metric(mp) => match mp.value {
+                sql::MetricValue::Unwrapped(u) => *u,
+                other => panic!("{q}: the group key read, got {other:?}"),
+            },
+            _ => panic!("{q}: a metric plan"),
+        };
+        for (si, sms) in metadata.iter().enumerate() {
+            let id = format!("sm_{qn}_{si:02}");
+            let keys_of = |sm: &str| -> Vec<String> {
+                if sm.is_empty() {
+                    return Vec::new();
+                }
+                let m: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(sm).expect("metadata json");
+                m.keys().cloned().collect()
+            };
+            // A row naming the unwrapped label or a presence name sends the
+            // key route to today's route: it has no reduced input.
+            let presence: Vec<String> = match &u.metadata {
+                sql::MetadataSent::Projected { presence, .. } => presence.clone(),
+                sql::MetadataSent::Text => vec![u.label.clone(), "__error__".to_string()],
+            };
+            if sms.iter().any(|sm| {
+                keys_of(sm)
+                    .iter()
+                    .any(|k| presence.contains(k) || *k == u.label)
+            }) {
+                to_today += 1;
+                continue;
+            }
+            let mut full = group_key_case(&format!("{id}_f"), &stream, &[]);
+            let mut reduced_stream: Vec<(&str, &str)> = match &u.classes {
+                sql::ClassNames::Projected(names) => stream
+                    .iter()
+                    .copied()
+                    .filter(|(k, _)| names.iter().any(|n| n == k))
+                    .collect(),
+                _ => stream.to_vec(),
+            };
+            reduced_stream.sort();
+            let mut reduced = group_key_case(&format!("{id}_r"), &reduced_stream, &[]);
+            for (j, body) in bodies.iter().enumerate() {
+                let sm = sms[j % sms.len()];
+                full.entries.push((body.to_string(), sm.to_string()));
+                // The bare form's blank rule.
+                let rbody = if u.form == sql::UnwrapForm::Bare {
+                    let doc: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_str(body).expect("body json");
+                    let sm_keys = keys_of(sm);
+                    let kept: serde_json::Map<String, serde_json::Value> = doc
+                        .into_iter()
+                        .filter(|(k, _)| {
+                            let is_key = u.keys.iter().any(|key| key.source == *k);
+                            let held = stream.iter().any(|(s, _)| s == k) || sm_keys.contains(k);
+                            !(is_key && held)
+                        })
+                        .collect();
+                    serde_json::to_string(&kept).expect("json")
+                } else {
+                    body.to_string()
+                };
+                // The metadata the key statement sends, computed by its SQL.
+                let rsm = match &u.metadata {
+                    sql::MetadataSent::Text => sm.to_string(),
+                    sql::MetadataSent::Projected { values, presence } => {
+                        let expr = pulsus_read::logql::predicate::metadata_names_projection(
+                            values, presence,
+                        );
+                        let mut s = admin
+                            .query_stream::<ProjectedMetadataRow>(
+                                &format!(
+                                    "SELECT {} AS pairs FROM (SELECT {} AS structured_metadata)",
+                                    expr.as_sql(),
+                                    literal(sm).as_sql()
+                                ),
+                                &QuerySettings::new(),
+                            )
+                            .await
+                            .expect("project the metadata");
+                        let pairs = s.next().await.expect("one row").expect("decode").pairs;
+                        drop(s);
+                        if pairs.is_empty() {
+                            String::new()
+                        } else {
+                            let m: serde_json::Map<String, serde_json::Value> = pairs
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect();
+                            serde_json::to_string(&m).expect("json")
+                        }
+                    }
+                };
+                reduced.entries.push((rbody, rsm));
+            }
+            full.query = q.to_string();
+            reduced.query = q.to_string();
+            compared.push((full.id.clone(), reduced.id.clone()));
+            cases.push(full);
+            cases.push(reduced);
+        }
+    }
+    assert_eq!(
+        (compared.len(), to_today),
+        (78, 20),
+        "78 compared, 20 on today's route"
+    );
+    seed_group_key_cases(&admin, &client, &db, t, 588_000, &cases).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: t },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut answers = std::collections::HashMap::new();
+    for case in &cases {
+        let query = case
+            .query
+            .replace("SEL", &format!("{{service_name={:?}}}", case.id));
+        answers.insert(
+            case.id.clone(),
+            group_key_answer(engine.query(&parse(&query).expect("parse"), &instant).await),
+        );
+    }
+    let differ: Vec<String> = compared
+        .iter()
+        .filter(|(f, r)| answers[f] != answers[r])
+        .map(|(f, r)| format!("{f}: full {}, reduced {}", answers[f], answers[r]))
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// `quad(p, m)` of the key-budget corpus: `lead`, one key of `p` `a`s, and
+/// an object of `m` members under it.
+fn quadratic_body(p: usize, m: usize, lead: &str) -> String {
+    let members: Vec<String> = (0..m).map(|i| format!("\"k{i:05}\":0")).collect();
+    format!("{lead}\"{}\":{{{}}}}}", "a".repeat(p), members.join(","))
+}
+
+/// **Criterion 4: the group key read agrees with our parser on every fixed
+/// body** (issue #507, §6).
+///
+/// Each body is its own stream. For every corpus, stream-label or metadata
+/// variant, and form, the one read (L, the key statement's per-row columns)
+/// returns the database's verdict per body, and the reader's fold answers
+/// each returned row. The body's own answer is the fold of the same body as
+/// an undecided row: our parser over the line, under the query's rules.
+///
+/// ```text
+/// decided   the fold of L's row answers what the body answers (labels, value bits after + 0.0),
+///           or sends the query to today's route
+/// missing   no L row; the body contributes nothing
+/// undecided our parser reads the body: nothing to compare
+/// ```
+///
+/// Corpora: H1–H5 and G (1,026 bodies), H5B less its two flat bodies (6,
+/// generated here), and H6 (26 bodies, each about a reserved name). Variants:
+/// none; a stream label or one metadata entry of `__error__="s"`,
+/// `__preserve_error__="true"`, `__variant__="v"`, `__error_details__="d"`
+/// (H1–H5 + G and H6). Twenty form-rule cells each. The decided / missing /
+/// undecided counts of H1–H5 + G and of H5B are the design's.
+#[tokio::test]
+async fn the_group_key_read_agrees_on_every_fixed_body() {
+    skip_unless_live!();
+    use pulsus_read::logql::group_key_probe::{GroupKeyProbe, ProbeOutcome};
+    use pulsus_read::logql::rows::{StreamMetaRow, UnwrappedLaneRow};
+    const MIN: i64 = 60_000_000_000;
+    let (admin, client, db) = group_key_db("gk_agree").await;
+    let t = ((now_ns() - 3_600_000_000_000) / MIN) * MIN;
+
+    let mut corpora: std::collections::BTreeMap<&str, Vec<(String, String)>> = Default::default();
+    for line in std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/group_key/agreement_bodies.tsv"),
+    )
+    .expect("read the bodies")
+    .lines()
+    .filter(|l| !l.starts_with('#'))
+    {
+        let f: Vec<&str> = line.split('\t').collect();
+        let corpus = if f[0] == "NAMED6" { "NAMED6" } else { "H6" };
+        corpora
+            .entry(corpus)
+            .or_default()
+            .push((f[1].to_string(), unhex_utf8(f[2])));
+    }
+    corpora.insert(
+        "H5B6",
+        vec![
+            (
+                "H5B-budget-quadratic-32761-2979".into(),
+                quadratic_body(32_761, 2_979, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-quadratic-no-latency-32761-2979".into(),
+                quadratic_body(32_761, 2_979, "{"),
+            ),
+            (
+                "H5B-budget-parser-accepts-32761-1022".into(),
+                quadratic_body(32_761, 1_022, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-parser-refuses-32761-1023".into(),
+                quadratic_body(32_761, 1_023, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-bound-within-20-1231".into(),
+                quadratic_body(20, 1_231, "{\"latency\":5,"),
+            ),
+            (
+                "H5B-budget-bound-over-20-1232".into(),
+                quadratic_body(20, 1_232, "{\"latency\":5,"),
+            ),
+        ],
+    );
+    assert_eq!(
+        corpora
+            .iter()
+            .map(|(k, v)| (*k, v.len()))
+            .collect::<Vec<_>>(),
+        vec![("H5B6", 6), ("H6", 26), ("NAMED6", 1026)]
+    );
+
+    // (group, corpus, extra stream label, extra metadata)
+    let kvs = [
+        ("__error__", "s"),
+        ("__preserve_error__", "true"),
+        ("__variant__", "v"),
+        ("__error_details__", "d"),
+    ];
+    let mut groups: Vec<AgreementGroup> = Vec::new();
+    for corpus in ["NAMED6", "H5B6", "H6"] {
+        groups.push((format!("ag_{corpus}_none"), corpus, None, None));
+        if corpus != "H5B6" {
+            for (i, kv) in kvs.iter().enumerate() {
+                groups.push((format!("ag_{corpus}_s{i}"), corpus, Some(*kv), None));
+                groups.push((format!("ag_{corpus}_m{i}"), corpus, None, Some(*kv)));
+            }
+        }
+    }
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    let mut fp = 900_000u64;
+    let mut group_meta: Vec<std::collections::HashMap<u64, StreamMetaRow>> = Vec::new();
+    let mut group_bodies: Vec<std::collections::HashMap<u64, (String, String, String)>> =
+        Vec::new();
+    for (name, corpus, stream, sm) in &groups {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("service_name".to_string(), name.clone());
+        if let Some((k, v)) = stream {
+            labels.insert(k.to_string(), v.to_string());
+        }
+        let labels_json = serde_json::to_string(&labels).expect("json");
+        let sm_text = sm
+            .map(|(k, v)| format!("{{\"{k}\":\"{v}\"}}"))
+            .unwrap_or_default();
+        let mut meta = std::collections::HashMap::new();
+        let mut bodies = std::collections::HashMap::new();
+        let mut streams = Vec::new();
+        let mut idx = Vec::new();
+        let mut rows = Vec::new();
+        for (case, body) in &corpora[corpus] {
+            fp += 1;
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: name.clone(),
+                    labels: labels_json.clone(),
+                },
+            );
+            bodies.insert(fp, (case.clone(), body.clone(), sm_text.clone()));
+            streams.push(format!(
+                "({month}, {fp}, '{name}', {}, 0)",
+                literal(&labels_json).as_sql()
+            ));
+            idx.push(format!("({month}, 'service_name', '{name}', {fp})"));
+            rows.push(BucketedSeedRow {
+                service: name.clone(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000,
+                severity: 0,
+                body: body.clone(),
+                structured_metadata: sm_text.clone(),
+            });
+        }
+        for chunk in streams.chunks(2000) {
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES {}",
+                        chunk.join(", ")
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("streams");
+        }
+        for chunk in idx.chunks(2000) {
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES {}",
+                        chunk.join(", ")
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("idx");
+        }
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("rows");
+        group_meta.push(meta);
+        group_bodies.push(bodies);
+    }
+
+    // The twenty form-rule cells, as the queries the planner derives their
+    // rules from.
+    let targeted = r#"json c="code", lat="latency", m="missing""#;
+    let cells: [(&str, String); 20] = [
+        (
+            "B",
+            "sum(sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BK",
+            "sum by (a, a_b, code) (sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BU",
+            "sum by (_) (sum_over_time(SEL | json | unwrap latency [1m]))".into(),
+        ),
+        (
+            "BF",
+            r#"sum(sum_over_time(SEL | json | a="x" | unwrap latency [1m]))"#.into(),
+        ),
+        (
+            "BN",
+            "sum(sum_over_time(SEL | json | code > 100 | unwrap latency [1m]))".into(),
+        ),
+        (
+            "T plain",
+            r#"sum_over_time(SEL | json latency="latency" | unwrap latency [1m])"#.into(),
+        ),
+        (
+            "T parent",
+            r#"sum(sum_over_time(SEL | json latency="latency" | unwrap latency [1m]))"#.into(),
+        ),
+        (
+            "R plain",
+            r#"sum_over_time(SEL | json lat="latency" | unwrap lat [1m])"#.into(),
+        ),
+        (
+            "R parent",
+            r#"sum(sum_over_time(SEL | json lat="latency" | unwrap lat [1m]))"#.into(),
+        ),
+        (
+            "M plain",
+            format!("sum_over_time(SEL | {targeted} | unwrap lat [1m])"),
+        ),
+        (
+            "M parent",
+            format!("sum(sum_over_time(SEL | {targeted} | unwrap lat [1m]))"),
+        ),
+        (
+            "P plain",
+            r#"sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m])"#.into(),
+        ),
+        (
+            "P parent",
+            r#"sum(sum_over_time(SEL | json lat="req.latency" | unwrap lat [1m]))"#.into(),
+        ),
+        (
+            "GBY1",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (a)".into(),
+        ),
+        (
+            "GBY2",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (a_b, code)".into(),
+        ),
+        (
+            "GBYS",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (service_name)".into(),
+        ),
+        (
+            "GBYE",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by ()".into(),
+        ),
+        (
+            "GBU",
+            "avg_over_time(SEL | json | unwrap latency [1m]) by (_)".into(),
+        ),
+        (
+            "GTBY",
+            format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) by (c)"),
+        ),
+        (
+            "GTWO",
+            format!("avg_over_time(SEL | {targeted} | unwrap lat [1m]) without (m)"),
+        ),
+    ];
+    // The design's decided / missing / undecided counts (§6.2; H5B from
+    // revision 8, less its two flat bodies).
+    let design_counts = |corpus: &str, form: &str| -> Option<(u64, u64, u64)> {
+        let form = form.split(' ').next().unwrap_or(form);
+        let named = [
+            ("B", (819, 6, 201)),
+            ("BK", (594, 6, 426)),
+            ("BU", (0, 6, 1020)),
+            ("BF", (738, 6, 282)),
+            ("BN", (788, 6, 232)),
+            ("T", (909, 12, 105)),
+            ("R", (909, 12, 105)),
+            ("M", (879, 12, 135)),
+            ("P", (9, 943, 74)),
+            ("GBY1", (738, 6, 282)),
+            ("GBY2", (654, 6, 366)),
+            ("GBYS", (819, 6, 201)),
+            ("GBYE", (819, 6, 201)),
+            ("GBU", (0, 6, 1020)),
+            ("GTBY", (879, 12, 135)),
+            ("GTWO", (879, 12, 135)),
+        ];
+        let h5b = [
+            ("B", (1, 0, 5)),
+            ("BK", (1, 0, 5)),
+            ("BU", (0, 0, 6)),
+            ("BF", (1, 0, 5)),
+            ("BN", (1, 0, 5)),
+            ("T", (5, 1, 0)),
+            ("R", (5, 1, 0)),
+            ("M", (5, 1, 0)),
+            ("P", (0, 6, 0)),
+            ("GBY1", (1, 0, 5)),
+            ("GBY2", (1, 0, 5)),
+            ("GBYS", (1, 0, 5)),
+            ("GBYE", (1, 0, 5)),
+            ("GBU", (0, 0, 6)),
+            ("GTBY", (5, 1, 0)),
+            ("GTWO", (5, 1, 0)),
+        ];
+        let table: &[(&str, (u64, u64, u64))] = match corpus {
+            "NAMED6" => &named,
+            "H5B6" => &h5b,
+            _ => return None,
+        };
+        table.iter().find(|(f, _)| *f == form).map(|(_, c)| *c)
+    };
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: MIN as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let canon = |o: ProbeOutcome| -> Result<SeriesBits, String> {
+        match o {
+            ProbeOutcome::Answer(series) => Ok(series
+                .into_iter()
+                .map(|(mut l, p)| {
+                    l.sort();
+                    (l, p.into_iter().map(|(_, v)| (v + 0.0).to_bits()).collect())
+                })
+                .collect()),
+            ProbeOutcome::TodaysRoute(why) => Err(format!("today's route: {why}")),
+            ProbeOutcome::Refusal(e) => Err(format!("refusal: {e}")),
+        }
+    };
+    let mut comparisons = 0u64;
+    let mut wrong = Vec::new();
+    let mut h6_erroring: std::collections::BTreeMap<String, u64> = Default::default();
+    for (gi, (name, corpus, _, _)) in groups.iter().enumerate() {
+        for (form, q) in &cells {
+            let query = q.replace("SEL", &format!("{{service_name={name:?}}}"));
+            let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db))
+                .expect("plan")
+            {
+                Plan::Metric(mp) => mp,
+                _ => panic!("{query}: a metric plan"),
+            };
+            let probe = GroupKeyProbe::new(&mp, &group_meta[gi])
+                .unwrap_or_else(|| panic!("{query}: the group key read"));
+            let sql::MetricValue::Unwrapped(u) = &mp.value else {
+                unreachable!("the probe exists")
+            };
+            let lane = sql::metric_range_unwrapped_rows(
+                "log_samples",
+                u,
+                probe.columns(),
+                &[literal(name)],
+                probe.fingerprints(),
+                sql::BucketedScan {
+                    window: TimeWindow {
+                        start_ns: mp.start_ns,
+                        end_ns: mp.end_ns,
+                    },
+                    lower: mp.scan_lower,
+                    lo_ns: mp.grid_start_ns - MIN,
+                    step_ns: MIN,
+                },
+                &mp.extra_predicates,
+            )
+            .expect("render L");
+            let mut stream = client
+                .query_stream::<UnwrappedLaneRow>(&lane.replace('?', "??"), &QuerySettings::new())
+                .await
+                .unwrap_or_else(|e| panic!("{query}: L: {e}"));
+            let mut returned = std::collections::HashMap::new();
+            while let Some(row) = stream.next().await {
+                let row = row.unwrap_or_else(|e| panic!("{query}: L row: {e}"));
+                returned.insert(row.fingerprint, row);
+            }
+            drop(stream);
+            let (mut decided, mut missing, mut undecided) = (0u64, 0u64, 0u64);
+            for (fp, (case, body, sm)) in &group_bodies[gi] {
+                comparisons += 1;
+                let as_body = UnwrappedLaneRow {
+                    class: 0,
+                    bucket_ns: t,
+                    decided: 0,
+                    keys: probe
+                        .columns()
+                        .keys
+                        .iter()
+                        .map(|_| (0, String::new()))
+                        .collect(),
+                    v: 0.0,
+                    body: body.clone(),
+                    fingerprint: *fp,
+                    sm_text: sm.clone(),
+                    sm_kept: Vec::new(),
+                };
+                let body_answer = canon(probe.fold_lane_rows(std::slice::from_ref(&as_body)));
+                match returned.get(fp) {
+                    None => {
+                        missing += 1;
+                        if *corpus == "H6"
+                            && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json")
+                        {
+                            *h6_erroring.entry(format!("{case} missing")).or_default() += 1;
+                        }
+                        if body_answer != Ok(Vec::new()) {
+                            wrong.push(format!("{name} {form} {case}: missing, but the body answers {body_answer:?}"));
+                        }
+                    }
+                    Some(row) if row.decided == 0 => {
+                        undecided += 1;
+                        if *corpus == "H6"
+                            && (case == "H6-pe-bad-latency" || case == "H6-pe-invalid-json")
+                        {
+                            *h6_erroring.entry(format!("{case} undecided")).or_default() += 1;
+                        }
+                    }
+                    Some(row) => {
+                        decided += 1;
+                        let key = canon(probe.fold_lane_rows(std::slice::from_ref(row)));
+                        match (&key, &body_answer) {
+                            (Err(why), _) if why.starts_with("today's route") => {}
+                            (k, b) if k == b => {}
+                            _ => wrong.push(format!(
+                                "{name} {form} {case}: the key route {key:?}, the body {body_answer:?}"
+                            )),
+                        }
+                    }
+                }
+            }
+            if stream_is_plain(name)
+                && let Some(want) = design_counts(corpus, form)
+            {
+                assert_eq!(
+                    (decided, missing, undecided),
+                    want,
+                    "{name} {form}: decided / missing / undecided"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        comparisons,
+        1026 * 180 + 26 * 180 + 6 * 20,
+        "row–form comparisons"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // Over the 180 H6 cells, the two erroring bodies are never decided: an
+    // unconvertible latency is undecided except in the 18 P cells, whose path
+    // `req.latency` is absent from it (missing, so it contributes nothing on
+    // either route), and invalid JSON is always undecided. (The design's 166
+    // and 14 count the four P cells whose metadata carries a presence name as
+    // undecided: those rows take today's route whatever the verdict.)
+    assert_eq!(
+        h6_erroring,
+        [
+            ("H6-pe-bad-latency missing".to_string(), 18),
+            ("H6-pe-bad-latency undecided".to_string(), 162),
+            ("H6-pe-invalid-json undecided".to_string(), 180),
+        ]
+        .into_iter()
+        .collect(),
+        "the erroring H6 bodies' verdicts"
+    );
+    drop_group_key_db(&admin, &db).await;
+}
+
+/// Whether an agreement group carries no extra stream label or metadata.
+fn stream_is_plain(group: &str) -> bool {
+    group.ends_with("_none")
+}
+
+// ---------------------------------------------------------------------
+// Issue #545 — `docs/query-to-sql.md` §1.3: the selection operators
+// contribute no SQL on any route
+//
+// §1.3's row says `topk`, `bottomk`, `approx_topk`, `sort` and
+// `sort_desc` become no SQL and are evaluated after the read. Before this
+// issue nothing checked that sentence: the row was rewritten to claim a
+// `LIMIT 3 BY bucket_ns` and the three suites that read the document —
+// 34 tests — stayed green.
+//
+// **Five assertions, and no assertion takes its expected value from the
+// engine under test.**
+//
+//     A   §1.3's row, "SQL emitted today" column, is the literal `none`
+//         <- docs/query-to-sql.md, read from disk at run time
+//     B1  the committed statements carry no selection clause
+//         <- a closed vocabulary written as literals below
+//     B2  the committed statements hash to PINNED_SELECTION_STATEMENTS
+//         <- that constant, in this source file
+//     B3  every query — the base and every wrapping — issues exactly
+//         its route's committed statements, byte for byte
+//         <- crates/pulsus-read/tests/golden/logql_selection_statements.txt
+//     C   the answers differ as the corpus requires
+//         <- the seeded corpus
+//
+// A, B1 and B2 are hermetic and run before the live gate, so a developer
+// with no container still cannot regenerate the committed statements past
+// their digest. B3 and C need the container.
+//
+// **Two of the five call sites §1.3's row names are read, not run**: the
+// binary/`variants` tree (`exec.rs:2455`) and the extracted-field
+// group-key read (`exec.rs:5534`). Neither is reachable from the three
+// routes below, so the row carries them on the source alone and this
+// test does not close them.
+//
+// **What no test can close**, stated rather than left to be found: a
+// drift outside B1's vocabulary, regenerated with the digest deliberately
+// updated in the same change. The digest is this test's expected value,
+// so a change to both is indistinguishable, to any test, from a change
+// the author meant. It is caught by a person reading a diff that must
+// contain the changed SQL and the changed constant together.
+// ---------------------------------------------------------------------
+
+/// The committed statements, relative to the repository root.
+const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_statements.txt";
+
+/// `sha256sum crates/pulsus-read/tests/golden/logql_selection_statements.txt`
+///
+/// Pinned HERE, in the test source, and deliberately not beside the data
+/// — the posture `crates/pulsus-read/tests/golden_sql_freeze.rs` takes
+/// for its own corpus. Running `regenerate_the_logql_selection_statements`
+/// alone leaves this constant standing and B2 fails, so the author has to
+/// move a source line in the same change and the diff carries both.
+const PINNED_SELECTION_STATEMENTS: &str =
+    "6d0365da22a957554ed1eb6bfacad59601b85875d82c59bbbb6b190e896c7855";
+
+/// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
+///
+/// **Fixed, not `now_ns()`**, because a committed statement carries its
+/// window bounds and has to be reproducible. It is in the FUTURE, which
+/// `now_ns()`'s doc comment does not cover and the retention TTL forces:
+/// `log_samples` carries `TTL toDateTime(fromUnixTimestamp64Nano(
+/// timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and a
+/// fixed constant in the past is already expired. Measured on 26.3.29.7:
+/// 22 rows inserted at a timestamp 14 days old left
+/// `SELECT count() FROM log_samples` answering 0.
+const SEL_AT_NS: i64 = 1_893_456_000_000_000_000;
+const SEL_STEP_NS: i64 = 60_000_000_000;
+
+/// The six streams, their second grouping label, and how many samples
+/// each has in the one bucket.
+///
+/// `pod` exists so that a wrapping can group by something other than
+/// `service_name` between two aggregations — the middle-selection shape
+/// below. It changes no statement: the selector reads `env`, and
+/// `PREWHERE`/`fingerprint IN` are built from the resolved streams.
+///
+/// Six rather than three, with a deliberate tie at 3, so that `topk(2, …)`
+/// drops four series and `bottomk(1, …)` drops five: a row-limiting drift
+/// with a small literal changes an answer as well as a statement. It does
+/// not close that class — an attacker picks a larger literal, which is
+/// what red run 4's `<= 10` does — and B3 against the committed
+/// statements is what closes it.
+const SEL_STREAMS: [(u64, &str, &str, u32); 6] = [
+    (545_001, "c545a", "p1", 6),
+    (545_002, "c545b", "p2", 5),
+    (545_003, "c545c", "p3", 4),
+    (545_004, "c545d", "p4", 3),
+    (545_005, "c545e", "p5", 3),
+    (545_006, "c545f", "p6", 1),
+];
+
+/// One route's committed block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionBlock {
+    route: String,
+    query: String,
+    request: String,
+    /// `(explain stage name, statement text)`, in issue order.
+    statements: Vec<(String, String)>,
+}
+
+/// What each route drives: its base query, its request, and the seven
+/// wrappings of that base.
+///
+/// The two range routes differ in the ONE stage that decides the route —
+/// `| json | __error__=""` goes beyond a line filter, so the first
+/// aggregation level cannot lower — and the test asserts their routing
+/// reasons differ, so a change that quietly sent both down one path fails
+/// rather than passing twice over the same statements.
+///
+/// **Four wrappings put the selection OUTERMOST and three put it inside.**
+/// The chain is stored outer-first and walked with `aggs.iter().rev()`
+/// (`post_agg.rs:3018`), so an outermost-only matrix leaves
+/// `vector_aggs.last()` — the innermost spec — never a selection, and a
+/// change that lowered only an innermost selection would pass. Both
+/// nested shapes are ordinary queries that answer `200`:
+///
+///     sum by (service_name) (topk(2, count_over_time(SEL[1m])))
+///     topk(2, sum by (service_name) (bottomk(5, count_over_time(SEL[1m]))))
+///     sum by (service_name) (topk(2, sum by (pod) (count_over_time(SEL[1m]))))
+///
+/// The third has a selection that is neither the first spec nor the last,
+/// so a condition indexed at EITHER end misses it. What the check rests on
+/// is therefore membership of the chain, not a position in it.
+fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 7])> {
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: SEL_AT_NS,
+            end_ns: SEL_AT_NS,
+            step_ns: SEL_STEP_NS as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let instant = QueryParams {
+        spec: QuerySpec::Instant { at_ns: SEL_AT_NS },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    // The selector each route reads, and the base query over it. The
+    // nested wrappings are built from the SELECTOR rather than by
+    // wrapping the base, because their selection sits inside the `sum by`.
+    let plain = r#"{env="prod"}"#;
+    // The trailing space is deliberate: `__error__=""[1m]` does not parse
+    // as a range selector.
+    let parsed = r#"{env="prod"} | json | __error__=""#.to_string() + "\" ";
+    let base_of = |sel: &str| format!("sum by (service_name) (count_over_time({sel}[1m]))");
+    let bucketed = base_of(plain);
+    let client = base_of(&parsed);
+    // `second` is the operator and its parameter, e.g. `bottomk(1`.
+    let six = |sel: &str, second: &str| {
+        let base = base_of(sel);
+        [
+            format!("topk(2, {base})"),
+            format!("{second}, {base})"),
+            format!("sort({base})"),
+            format!("sort_desc({base})"),
+            // The selection is the INNERMOST spec: `vector_aggs.last()`.
+            format!("sum by (service_name) (topk(2, count_over_time({sel}[1m])))"),
+            // A selection at both ends of one chain.
+            format!("topk(2, sum by (service_name) (bottomk(5, count_over_time({sel}[1m]))))"),
+            // The selection is NEITHER the first spec NOR the last, so a
+            // condition indexed at either end misses it in both
+            // directions. `sum by (pod)` groups on the corpus's second
+            // label, so the middle stage is a real grouping rather than a
+            // repeat of the outer one.
+            format!("sum by (service_name) (topk(2, sum by (pod) (count_over_time({sel}[1m]))))"),
+        ]
+    };
+    vec![
+        (
+            "range, bucketed read",
+            bucketed.clone(),
+            range,
+            six(plain, "bottomk(1"),
+        ),
+        (
+            "range, client-aggregated read",
+            client,
+            range,
+            six(&parsed, "bottomk(1"),
+        ),
+        // `approx_topk` replaces `bottomk` here: it is refused on a range
+        // query and this is the only route that can carry it.
+        (
+            "instant read",
+            bucketed,
+            instant,
+            six(plain, "approx_topk(2"),
+        ),
+    ]
+}
+
+/// The five operators section 1.3's row names.
+fn is_selection_op(op: &pulsus_logql::VectorAggOp) -> bool {
+    matches!(
+        op,
+        pulsus_logql::VectorAggOp::Topk
+            | pulsus_logql::VectorAggOp::Bottomk
+            | pulsus_logql::VectorAggOp::ApproxTopk
+            | pulsus_logql::VectorAggOp::Sort
+            | pulsus_logql::VectorAggOp::SortDesc
+    )
+}
+
+/// **What red run 2's rationale rests on, asserted rather than assumed.**
+///
+/// That run conditions a mutation on the plan carrying a selection, and
+/// its evidence is that the route's BASE statement does not move. That
+/// holds only while no route's base carries a selection ANYWHERE in its
+/// chain — a property of these query strings, not of the code. A base
+/// changed to `sum by (pod) (topk(2, count_over_time(…)))` is a valid
+/// query on the same route and would silently make that run prove
+/// nothing, so it fails here instead, naming the operator it found.
+///
+/// **Membership, not position.** The seven wrappings put a selection
+/// first, last and in the middle, so nothing here may be indexed at an
+/// end: this walks the whole chain.
+fn every_base_query_carries_no_selection(db: &str) {
+    for (route, base, params, _) in selection_routes() {
+        let expr = parse(&base).unwrap_or_else(|e| panic!("parse {base}: {e:?}"));
+        let Plan::Metric(mp) = plan(&expr, &params, &plan_ctx(db)).expect("plan") else {
+            panic!("{route}: the base query must be a metric plan");
+        };
+        let found: Vec<String> = mp
+            .vector_aggs
+            .iter()
+            .filter(|(op, _, _)| is_selection_op(op))
+            .map(|(op, _, _)| format!("{op:?}"))
+            .collect();
+        assert!(
+            found.is_empty(),
+            "{route}: the base query {base} carries {found:?} in its chain. Red run 2's \
+             evidence is that the base statement does not move under a selection-conditioned \
+             mutation, and a base that carries a selection makes that run prove nothing"
+        );
+    }
+}
+
+fn selection_request_line(params: &QueryParams) -> String {
+    match params.spec {
+        QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        } => format!("range start={start_ns} end={end_ns} step={step_ns}"),
+        QuerySpec::Instant { at_ns } => format!("instant time={at_ns}"),
+    }
+}
+
+/// The one normalisation applied to a live statement before it is
+/// compared with the committed one.
+///
+/// The integers inside `fingerprint IN (...)` arrive in the order the
+/// database's `GROUP BY fingerprint` returned them —
+/// `resolve_fingerprints` (`exec.rs:969`) pushes rows as they stream and
+/// does not sort, where `all_active_fingerprints` sorts for exactly this
+/// reason. That order is an execution artefact, not a property of the
+/// corpus: measured on 26.3.29.7, one selector over four streams answers
+/// `99120 18374 30001 40001` at `max_block_size=1` and
+/// `30001 40001 99120 18374` at the default. Sorting pins the SET, which
+/// is what the statement means, and leaves nowhere for a selection clause
+/// to hide — a clause is not an integer.
+fn sort_fingerprint_lists(sql: &str) -> String {
+    let needle = "fingerprint IN (";
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(needle) {
+        let (head, tail) = rest.split_at(at + needle.len());
+        out.push_str(head);
+        match tail.find(')') {
+            None => {
+                rest = tail;
+                break;
+            }
+            Some(close) => {
+                let mut ids: Vec<u64> = tail[..close]
+                    .split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .collect();
+                ids.sort_unstable();
+                out.push_str(
+                    &ids.iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                rest = &tail[close..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// B1's vocabulary: the two clause shapes §2.3 and §2.7.2 name as the
+/// designed lowering of a selection, written here as literals.
+///
+/// - a `LIMIT` with a ` BY ` after it — ClickHouse's per-group row limit;
+/// - an `ORDER BY` whose first token in any item is the aggregate alias
+///   `n` or the group alias `g0` — the ordering that limit needs in front
+///   of it.
+///
+/// The `ORDER BY` test compares whole tokens, never substrings: every
+/// statement here orders by `fingerprint`, and `fingerprint` contains an
+/// `n`. The clause is read to the end of the statement or to a following
+/// `LIMIT`/`SETTINGS`, whichever comes first.
+fn selection_clause(sql: &str) -> Option<String> {
+    let upper = sql.to_ascii_uppercase();
+    if let Some(at) = upper.find("LIMIT ")
+        && upper[at..].contains(" BY ")
+    {
+        return Some(format!(
+            "a per-group limit: {:?}",
+            sql[at..].lines().next().unwrap_or("")
+        ));
+    }
+    let mut from = 0usize;
+    while let Some(rel) = upper[from..].find("ORDER BY ") {
+        let at = from + rel + "ORDER BY ".len();
+        let tail = &sql[at..];
+        let end = ["\nLIMIT", "\nSETTINGS"]
+            .iter()
+            .filter_map(|k| tail.find(k))
+            .min()
+            .unwrap_or(tail.len());
+        for item in tail[..end].split(',') {
+            let token = item.split_whitespace().next().unwrap_or("");
+            if token == "n" || token == "g0" {
+                return Some(format!(
+                    "an ordering on the selection's alias {token:?}: {:?}",
+                    tail[..end].lines().next().unwrap_or("")
+                ));
+            }
+        }
+        from = at;
+    }
+    None
+}
+
+fn render_selection_golden(blocks: &[SelectionBlock]) -> String {
+    let mut out = String::new();
+    out.push_str(SELECTION_GOLDEN_HEADER);
+    for b in blocks {
+        out.push_str(&format!("\n=== route: {}\n", b.route));
+        out.push_str(&format!("--- query\n{}\n", b.query));
+        out.push_str(&format!("--- request\n{}\n", b.request));
+        for (i, (name, sql)) in b.statements.iter().enumerate() {
+            out.push_str(&format!("--- statement {} {name}\n{sql}\n", i + 1));
+        }
+    }
+    out
+}
+
+const SELECTION_GOLDEN_HEADER: &str = "\
+# The statements the three LogQL routes issue for `docs/query-to-sql.md` §1.3's
+# selection row, committed so that the check compares live SQL with bytes this
+# engine did not produce at test time.
+#
+# GENERATED by the ignored `regenerate_the_logql_selection_statements` in
+# crates/pulsus-read/tests/query_log_gates.rs. Not hand-written: the digest
+# pinned there as PINNED_SELECTION_STATEMENTS has to move in the same change,
+# and that pairing in one diff is the review.
+#
+# ONE normalisation is applied to a live statement before it is compared: the
+# integers inside `fingerprint IN (...)` are sorted ascending. Their order is
+# the database's grouping order and moves with settings; the SET is what the
+# statement means and it is still pinned. `sort_fingerprint_lists` carries the
+# measurement.
+";
+
+fn parse_selection_golden(text: &str) -> Vec<SelectionBlock> {
+    let mut blocks: Vec<SelectionBlock> = Vec::new();
+    let mut section: Option<(String, String)> = None;
+    let mut body: Vec<&str> = Vec::new();
+    let flush = |blocks: &mut Vec<SelectionBlock>,
+                 section: &Option<(String, String)>,
+                 body: &mut Vec<&str>| {
+        // The blank line the renderer puts between two blocks belongs to
+        // neither of them.
+        while body.last() == Some(&"") {
+            body.pop();
+        }
+        let text = body.join("\n");
+        body.clear();
+        let Some((kind, arg)) = section else { return };
+        let b = blocks.last_mut().expect("a section before any route");
+        match kind.as_str() {
+            "query" => b.query = text,
+            "request" => b.request = text,
+            "statement" => b.statements.push((arg.clone(), text)),
+            other => panic!("{SELECTION_GOLDEN}: unknown section {other:?}"),
+        }
+    };
+    for line in text.lines() {
+        if let Some(route) = line.strip_prefix("=== route: ") {
+            flush(&mut blocks, &section, &mut body);
+            section = None;
+            blocks.push(SelectionBlock {
+                route: route.to_string(),
+                query: String::new(),
+                request: String::new(),
+                statements: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(marker) = line.strip_prefix("--- ")
+            && (marker == "query" || marker == "request" || marker.starts_with("statement "))
+        {
+            flush(&mut blocks, &section, &mut body);
+            section = Some(if let Some(rest) = marker.strip_prefix("statement ") {
+                let name = rest
+                    .split_once(' ')
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_else(|| panic!("{SELECTION_GOLDEN}: statement marker {marker:?}"));
+                ("statement".to_string(), name)
+            } else {
+                (marker.to_string(), String::new())
+            });
+            continue;
+        }
+        if section.is_none() {
+            // The header, before the first route.
+            continue;
+        }
+        body.push(line);
+    }
+    flush(&mut blocks, &section, &mut body);
+    blocks
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn repo_file(rel: &str) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// The cells of one markdown table row, respecting `\|` inside a cell.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells = vec![String::new()];
+    let mut escaped = false;
+    for c in line.chars() {
+        match c {
+            '\\' if !escaped => {
+                escaped = true;
+                cells.last_mut().expect("a cell").push(c);
+            }
+            '|' if !escaped => cells.push(String::new()),
+            _ => {
+                escaped = false;
+                cells.last_mut().expect("a cell").push(c);
+            }
+        }
+    }
+    cells
+}
+
+/// §1.3's selection row, located rather than restated.
+///
+/// Finding it is part of the contract: a moved section, a reworded
+/// heading or a second matching row each yield a row count that is not
+/// one, and that is a failure with its own message rather than a check
+/// that quietly stops checking anything.
+fn selection_row_cells(doc: &str) -> Vec<Vec<String>> {
+    const HEADING: &str = "### 1.3 LogQL — the parts that are not stages";
+    let mut inside = false;
+    let mut rows = Vec::new();
+    for line in doc.lines() {
+        if line.starts_with("### ") {
+            inside = line == HEADING;
+            continue;
+        }
+        if inside && line.starts_with('|') {
+            let cells = table_cells(line);
+            if cells.len() >= 4 && cells[1].contains("`topk(k, …)`") {
+                rows.push(cells);
+            }
+        }
+    }
+    rows
+}
+
+async fn seed_selection_corpus() -> (ChClient, String) {
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_sel_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    // **The retention TTL comes off this table before anything is
+    // seeded.** `test_ctx` renders `TTL toDateTime(fromUnixTimestamp64Nano(
+    // timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and this
+    // fixture's timestamps are a FIXED constant, so the fixture would
+    // start expiring once the wall clock passed it — a check that goes red
+    // on a date rather than on a change. Measured on 26.3.29.7 over two
+    // tables with this DDL and one row 14 days old: 0 rows with the TTL,
+    // 1 row with it removed. `log_streams` (`catalog.rs:209`) and
+    // `log_streams_idx` (`catalog.rs:227`) carry no TTL, so this one
+    // statement covers the fixture.
+    admin
+        .execute(
+            &format!("ALTER TABLE {db}.log_samples REMOVE TTL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("remove the retention TTL from the fixture table");
+    // **Asserted, not assumed.** The statement above is the only thing
+    // standing between this fixture and a check that reddens on a date;
+    // taking it away reddens here instead, at once and on any machine.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct DdlRow {
+        ddl: String,
+    }
+    let mut ddl = String::new();
+    {
+        let mut stream = admin
+            .query_stream::<DdlRow>(
+                &format!(
+                    "SELECT create_table_query AS ddl FROM system.tables WHERE database = \
+                     '{db}' AND name = 'log_samples'"
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("read the fixture table's DDL");
+        while let Some(row) = stream.next().await {
+            ddl = row.expect("decode the DDL row").ddl;
+        }
+    }
+    assert!(
+        !ddl.is_empty(),
+        "the fixture's log_samples has no DDL to read"
+    );
+    // Upper case, so the `ttl_only_drop_parts` setting in the same text is
+    // not mistaken for a TTL clause.
+    assert!(
+        !ddl.contains("TTL "),
+        "the fixture's log_samples still carries a TTL clause: {ddl}. Its timestamps are a \
+         fixed constant, so the fixture would expire once the wall clock passed it"
+    );
+    let client = data_client(&db).await;
+
+    let mut rows = Vec::new();
+    for (fp, service, pod, count) in SEL_STREAMS {
+        let labels = format!(r#"{{"env":"prod","pod":"{pod}","service_name":"{service}"}}"#);
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({\
+                     SEL_AT_NS}))), {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        for i in 0..count {
+            rows.push(BucketedSeedRow {
+                service: service.to_string(),
+                fingerprint: fp,
+                // Inside the one window `(T - 60s, T]`, and every body is
+                // JSON so `| json | __error__=""` keeps every line and the
+                // two range routes count the same rows.
+                timestamp_ns: SEL_AT_NS - 30_000_000_000 + i64::from(i) * 1_000_000_000,
+                severity: 0,
+                // **Every body is the same JSON**, so `| json` adds the
+                // same label to every line and the client-aggregated
+                // route's series are one per stream, as the bucketed
+                // route's are. A body that varied would split each
+                // stream's lines into one series per value, and the two
+                // routes would answer differently for a selection applied
+                // BEFORE the `sum by` — which is what the nested
+                // wrappings drive.
+                body: r#"{"ok":1}"#.to_string(),
+                structured_metadata: String::new(),
+            });
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the selection fixture");
+    (admin, db)
+}
+
+/// What one query issued and answered.
+struct SelectionRun {
+    query: String,
+    statements: Vec<(String, String)>,
+    result: QueryResult,
+}
+
+/// Every query's statements and answer, per route, from a live engine.
+///
+/// **The base query gets no special treatment here.** Its statements are
+/// what the regenerator commits, and the test compares every query —
+/// base and wrappings alike — against the COMMITTED file, never against
+/// the base's live statements. Comparing a wrapping with the base would
+/// take its expected value from the engine under test, and a drift
+/// applied to both moves them together.
+async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<SelectionRun>)> {
+    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024));
+    let mut out = Vec::new();
+    for (route, base, params, wrappings) in selection_routes() {
+        let mut runs: Vec<SelectionRun> = Vec::new();
+        let mut block = SelectionBlock {
+            route: route.to_string(),
+            query: base.clone(),
+            request: selection_request_line(&params),
+            statements: Vec::new(),
+        };
+        for (n, query) in std::iter::once(base.clone())
+            .chain(wrappings.iter().cloned())
+            .enumerate()
+        {
+            let expr = parse(&query).unwrap_or_else(|e| panic!("parse {query}: {e:?}"));
+            let (result, _warnings, explain) = engine
+                .query_explained(&expr, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{route}: {query}: {e:?}"));
+            let statements: Vec<(String, String)> = explain
+                .stages
+                .iter()
+                .map(|s| (s.name.to_string(), sort_fingerprint_lists(&s.sql)))
+                .collect();
+            if n == 0 {
+                block.statements = statements.clone();
+                block.request = format!(
+                    "{} routing={}",
+                    block.request,
+                    explain
+                        .routing
+                        .as_ref()
+                        .map(|r| r.reason.clone())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+            runs.push(SelectionRun {
+                query,
+                statements,
+                result,
+            });
+        }
+        out.push((block, runs));
+    }
+    out
+}
+
+/// The labels of a matrix or vector answer, in the order the engine
+/// returned them.
+fn answer_labels(result: &QueryResult) -> Vec<String> {
+    // A series named by its `service_name`, or — when a wrapping grouped
+    // on something else and dropped it — by its whole label set, so that
+    // `{}` is a readable name for the one unlabelled series the
+    // middle-selection wrapping answers.
+    let name = |labels: &[(String, String)]| {
+        labels
+            .iter()
+            .find(|(k, _)| k == "service_name")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                let mut kv: Vec<String> =
+                    labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+                kv.sort();
+                format!("{{{}}}", kv.join(", "))
+            })
+    };
+    match result {
+        QueryResult::Matrix(series) => series.iter().map(|s| name(&s.labels)).collect(),
+        QueryResult::Vector(samples) => samples.iter().map(|s| name(&s.labels)).collect(),
+        other => panic!("a selection answer is a matrix or a vector, not {other:?}"),
+    }
+}
+
+/// Every value in an answer, in the order the engine returned them.
+fn answer_values(result: &QueryResult) -> Vec<f64> {
+    match result {
+        QueryResult::Matrix(series) => series
+            .iter()
+            .flat_map(|s| s.points.iter().map(|(_, v)| *v))
+            .collect(),
+        QueryResult::Vector(samples) => samples.iter().map(|s| s.value).collect(),
+        other => panic!("a selection answer is a matrix or a vector, not {other:?}"),
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// **`docs/query-to-sql.md` §1.3's selection row, checked against the
+/// code** (issue #545). See this section's comment for the five
+/// assertions and where each one's expected value comes from.
+#[tokio::test]
+async fn the_selection_operators_add_no_clause_to_any_statement() {
+    // ---- A: the document's own cell -------------------------------
+    let doc = repo_file("docs/query-to-sql.md");
+    let rows = selection_row_cells(&doc);
+    assert_eq!(
+        rows.len(),
+        1,
+        "docs/query-to-sql.md §1.3 must carry exactly ONE row whose first cell names \
+         `topk(k, …)`; found {}. A moved row, a reworded heading or a second such row all \
+         land here rather than silently checking nothing",
+        rows.len()
+    );
+    assert_eq!(
+        rows[0][2].trim(),
+        "none",
+        "docs/query-to-sql.md §1.3's selection row says the SQL emitted today is {:?}. \
+         This test asserts the statements carry no selection clause, so the row and the \
+         code disagree: one of them is wrong",
+        rows[0][2].trim()
+    );
+
+    // ---- B1: the committed statements, against the vocabulary -----
+    let golden_text = repo_file(SELECTION_GOLDEN);
+    let golden = parse_selection_golden(&golden_text);
+    assert_eq!(
+        golden.len(),
+        3,
+        "{SELECTION_GOLDEN} holds one block per route"
+    );
+    for block in &golden {
+        for (name, sql) in &block.statements {
+            assert!(
+                selection_clause(sql).is_none(),
+                "{SELECTION_GOLDEN}: {}'s {name} statement carries {}. §1.3's row says the \
+                 selection becomes no SQL, so a regeneration that absorbed one fails here",
+                block.route,
+                selection_clause(sql).expect("just checked"),
+            );
+        }
+    }
+
+    // ---- B2: the committed bytes, against the pinned digest --------
+    assert_eq!(
+        sha256_hex(golden_text.as_bytes()),
+        PINNED_SELECTION_STATEMENTS,
+        "{SELECTION_GOLDEN} is not the file PINNED_SELECTION_STATEMENTS names. Regenerating \
+         it is not a way to make this green: move the constant in the same change and the \
+         diff carries both the statements and the pin"
+    );
+
+    skip_unless_live!();
+
+    // ---- B3 and C: the live engine ---------------------------------
+    let (admin, db) = seed_selection_corpus().await;
+    every_base_query_carries_no_selection(&db);
+    let observed = observed_selection_blocks(&db).await;
+
+    for (block, runs) in &observed {
+        let want = golden
+            .iter()
+            .find(|g| g.route == block.route)
+            .unwrap_or_else(|| panic!("{SELECTION_GOLDEN} has no block for {}", block.route));
+        assert_eq!(
+            block.query, want.query,
+            "{}: the committed base query is not the one this test drives",
+            block.route
+        );
+        assert_eq!(
+            block.request, want.request,
+            "{}: the committed request is not the one this test makes",
+            block.route
+        );
+        for run in runs {
+            assert_eq!(
+                run.statements.len(),
+                want.statements.len(),
+                "{}: {} issued {} statements, {SELECTION_GOLDEN} holds {}",
+                block.route,
+                run.query,
+                run.statements.len(),
+                want.statements.len()
+            );
+            for ((got_name, got_sql), (want_name, want_sql)) in
+                run.statements.iter().zip(want.statements.iter())
+            {
+                assert_eq!(
+                    got_name, want_name,
+                    "{}: {} moved a stage name",
+                    block.route, run.query
+                );
+                assert_eq!(
+                    got_sql, want_sql,
+                    "{}: {}'s {got_name} statement is not the committed one. §1.3's row says \
+                     the selection becomes no SQL; every query on this route — the base and \
+                     every wrapping of it, with the selection outermost, innermost and in the \
+                     middle — must issue these bytes",
+                    block.route, run.query
+                );
+            }
+        }
+    }
+
+    // The two range routes must be two routes.
+    let reason = |route: &str| {
+        observed
+            .iter()
+            .find(|(b, _)| b.route == route)
+            .map(|(b, _)| b.request.clone())
+            .unwrap_or_else(|| panic!("no observed block for {route}"))
+    };
+    assert_ne!(
+        reason("range, bucketed read"),
+        reason("range, client-aggregated read"),
+        "both range routes reported the same routing reason, so this compares one path with \
+         itself"
+    );
+
+    // ---- C: the answers ---------------------------------------------
+    let all: Vec<String> = SEL_STREAMS
+        .iter()
+        .map(|(_, s, _, _)| s.to_string())
+        .collect();
+    for (block, runs) in &observed {
+        for run in runs {
+            let (query, result) = (&run.query, &run.result);
+            let labels = answer_labels(result);
+            // `topk(2, …)` and `approx_topk(2, …)` must answer the same
+            // two series on this corpus: the sketch is exact well under
+            // its own error bound at six series.
+            //
+            // The two nested forms, over counts 6, 5, 4, 3, 3 and 1: an
+            // inner `topk(2, …)` keeps 6 and 5 before the `sum by` groups
+            // them; an inner `bottomk(5, …)` drops only the 6, and the
+            // outer `topk(2, …)` then takes 5 and 4. No tie decides
+            // either answer.
+            // The middle-selection wrapping groups by `pod` INSIDE, so
+            // its series carry no `service_name`, and the outer
+            // `sum by (service_name)` folds all of them into one
+            // unlabelled series. Its value is the only thing that says
+            // which two pods the selection kept, so it is asserted: 6 + 5.
+            let want_values: Option<Vec<f64>> =
+                if query.starts_with("sum by (service_name) (topk(2, sum by (pod)") {
+                    Some(vec![11.0])
+                } else {
+                    None
+                };
+            if let Some(want_values) = want_values {
+                assert_eq!(
+                    answer_values(result),
+                    want_values,
+                    "{}: {query} answered the wrong value",
+                    block.route
+                );
+            }
+            let want: Vec<String> =
+                if query.starts_with("sum by (service_name) (topk(2, sum by (pod)") {
+                    vec!["{}".to_string()]
+                } else if query.starts_with("sum by (service_name) (topk(2,") {
+                    vec!["c545a".to_string(), "c545b".to_string()]
+                } else if query.starts_with("topk(2, sum by (service_name) (bottomk(5,") {
+                    vec!["c545b".to_string(), "c545c".to_string()]
+                } else if query.starts_with("topk(2,") || query.starts_with("approx_topk(2,") {
+                    vec!["c545a".to_string(), "c545b".to_string()]
+                } else if query.starts_with("bottomk(1,") {
+                    vec!["c545f".to_string()]
+                } else {
+                    all.clone()
+                };
+            assert_eq!(
+                sorted(labels.clone()),
+                sorted(want.clone()),
+                "{}: {query} answered {labels:?}; the corpus requires {want:?}",
+                block.route
+            );
+        }
+    }
+
+    // The one refusal in the family: `approx_topk` on a RANGE query,
+    // before any statement is issued.
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: SEL_AT_NS,
+            end_ns: SEL_AT_NS,
+            step_ns: SEL_STEP_NS as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let refused = engine
+        .query_explained(
+            &parse(r#"approx_topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))"#)
+                .expect("parse"),
+            &range,
+        )
+        .await;
+    match refused {
+        Err(ReadError::PipelineInvalid { reason }) => assert_eq!(
+            reason, "count min sketches are only supported on instant queries",
+            "the range `approx_topk` refusal §1.3's row names"
+        ),
+        other => panic!("`approx_topk` on a range query must be refused, not {other:?}"),
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// Rewrites `crates/pulsus-read/tests/golden/logql_selection_statements.txt`
+/// from a live engine. Ignored, so it never runs in CI.
+///
+/// **Running it is not a way to make a red check green.** The committed
+/// statements are this test's oracle: rewriting them to match whatever
+/// the engine has started emitting is the defect the file exists to
+/// catch. `PINNED_SELECTION_STATEMENTS` stays where it is until a person
+/// has read the diff.
+///
+/// ```text
+/// PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test query_log_gates \
+///   -- --ignored regenerate_the_logql_selection_statements
+/// ```
+#[tokio::test]
+#[ignore = "writes crates/pulsus-read/tests/golden/logql_selection_statements.txt"]
+async fn regenerate_the_logql_selection_statements() {
+    assert!(
+        should_run(),
+        "the regenerator needs a live ClickHouse: set PULSUS_TEST_CLICKHOUSE=1"
+    );
+    let (admin, db) = seed_selection_corpus().await;
+    let blocks: Vec<SelectionBlock> = observed_selection_blocks(&db)
+        .await
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let text = render_selection_golden(&blocks);
+    std::fs::write(root.join(SELECTION_GOLDEN), &text).expect("write the committed statements");
+    eprintln!(
+        "wrote {SELECTION_GOLDEN} ({} bytes), sha256 {}",
+        text.len(),
+        sha256_hex(text.as_bytes())
+    );
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }

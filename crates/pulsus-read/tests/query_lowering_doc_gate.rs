@@ -2309,8 +2309,8 @@ fn the_boundary_diagram_names_only_links_the_document_defines() {
         }
     }
     assert!(
-        seen >= 20,
-        "only {seen} link names were checked; the diagram draws four pipelines"
+        seen >= 18,
+        "only {seen} link names were checked; the diagram draws three TraceQL pipelines"
     );
 }
 
@@ -2323,10 +2323,14 @@ fn the_boundary_diagram_names_only_links_the_document_defines() {
 fn every_boundary_diagram_pipeline_carries_the_three_synthesised_links() {
     let svg = repo_file(BOUNDARY_SVG);
     let drawn = boundary_pipelines(&svg);
-    assert!(
-        drawn.len() >= 4,
-        "{BOUNDARY_SVG} draws {} annotated pipelines; it has four panels",
-        drawn.len()
+    // Issue #507: LogQL keeps its own compiler, so the fold is drawn on
+    // TraceQL's three pipelines only; panel D compares LogQL's compiler and
+    // carries no annotated link box.
+    let names: Vec<&str> = drawn.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["A", "B", "C"],
+        "{BOUNDARY_SVG} annotates pipelines {names:?}; the fold is drawn on TraceQL's A, B and C only"
     );
     for (pipeline, links) in &drawn {
         let tail: Vec<&str> = links

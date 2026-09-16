@@ -655,6 +655,26 @@ mod tests {
         assert_eq!(namer.build("1"), "");
     }
 
+    /// **N8's other half (issue #507): the metrics namer keeps underscore
+    /// runs.** The log namer collapses a run to one `_`; this one escapes
+    /// each character on its own, because the reference's metrics translation
+    /// constructs its `LabelNamer` with `PreserveMultipleUnderscores` (the
+    /// `otlptranslate` setting Prometheus v3.13.0's receiver uses) where its
+    /// log path does not. Pinned so the log change cannot be applied here by
+    /// mistake.
+    #[test]
+    fn the_metrics_namer_keeps_underscore_runs() {
+        let namer = LabelNamer {
+            utf8_allowed: false,
+        };
+        assert_eq!(namer.build("a__b").expect("valid"), "a__b");
+        assert_eq!(namer.build("a..b").expect("valid"), "a__b");
+        assert_eq!(canonicalize_label_key("a..b"), "a__b");
+        // The log rule's answer for the same two names, for contrast.
+        assert_eq!(pulsus_model::log_label_name("a__b"), "a_b");
+        assert_eq!(pulsus_model::log_label_name("a..b"), "a_b");
+    }
+
     /// `label_namer.go:190-193`.
     #[test]
     fn label_namer_reproduces_the_references_doc_comment_examples() {

@@ -612,6 +612,28 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test explain_indexes
 
+      # Issue #544: the structured-metadata label filter's live behaviour —
+      # the 36 lowered queries' answers, the four refusals' answers and
+      # route, exactly one sample statement per lowered request counted in
+      # `system.query_log`, the metric routes' answers with the fragment in
+      # the statement, and the budget fallback on all three routes that can
+      # meet it.
+      - name: LogQL structured-metadata filter gate
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test logql_metadata_filter_live
+
+      # Issue #544: the writer-side half — every stored metadata text is
+      # its own render under the writer named for its column, with the
+      # database in the loop, and every ingest constraint the render does
+      # not re-apply has a row whose witness and closure both run.
+      - name: Stored metadata text identity gate
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test metadata_text_identity_live
+
       # Issue #171 (M7-C3): the `/api/logs/v1/patterns` Tier-1 gate — the
       # `(fingerprint, bucket_ns, pattern)` PK prefix time-key pruning (narrow
       # window selects fewer granules than the fingerprint's total) and daily
@@ -1075,6 +1097,16 @@ jobs:
         env:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
+
+      # Issue #507: `| logfmt` over 400 generated lines holding malformed
+      # tokens, under both modes. Pushes the lines to this container and
+      # asserts its labels equal the ones committed in
+      # tests/fixtures/logfmt_token_scan/reference_labels.tsv, which the
+      # hermetic half compares with ours.
+      - name: LogQL differential leg (logfmt token scan matrix, issue #507)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_logfmt_token_scan_matrix
 
       # Issue #388: the `| pattern "…"` argument sub-grammar
       # (pkg/logql/log/pattern/ @ v3.7.4) x every position the stage can
@@ -1593,6 +1625,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_engine
 
+      # Issue #547: the only suite that compares a PromQL answer computed
+      # through ClickHouse against a known value, bit for bit. The
+      # correctness corpus cannot reach the read path, and the live suites
+      # above assert labels, statement text and pruning, not values.
+      - name: Live metrics answer suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_answers
+
       - name: Live discovery fallback suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -2110,6 +2152,18 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
+      # Issue #507, criterion 19: the extracted-field group key read's one
+      # read (L) over the `_dist` tables — L answers where today's route
+      # refuses, its 2-minute answer is today's within the summation bound,
+      # and the other shard's system.query_log holds exactly one part of L
+      # after its part of today's raw scan.
+      - name: LogQL group key read, one read on two shards (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "18123"
+          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
+        run: cargo test -p pulsus-read --test query_log_gates the_undecided_rows_come_from_one_read -- --exact
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),

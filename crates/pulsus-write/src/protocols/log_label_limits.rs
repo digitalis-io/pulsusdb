@@ -141,10 +141,10 @@
 //! - an attribute whose raw name is not one of the eighteen —
 //!   `{app: "x"*2049}` stores a 2049-byte `app` label, and enough such
 //!   attributes store a set wider than fifteen;
-//! - an attribute whose raw name merely *canonicalizes onto* one of the
+//! - an attribute whose raw name is merely *stored under* one of the
 //!   eighteen — `{k8s.pod.name: "ok", k8s_pod_name: "x"*2049}`. Only
-//!   `k8s.pod.name` is validated; both collapse onto `k8s_pod_name` in
-//!   storage, and `from_normalized`'s frozen collision rule (issue #4) keeps
+//!   `k8s.pod.name` is validated; both are stored as `k8s_pod_name`, and
+//!   the frozen collision rule (issue #4, `LabelSet::from_log_attribute_pairs`) keeps
 //!   the greatest *original* key, where `_` (0x5F) sorts after `.` (0x2E). The
 //!   unvalidated near-miss therefore always wins, and the stored value of a
 //!   validated label is one no bound was ever charged on.
@@ -154,8 +154,10 @@
 //! [`super::service_name::otlp_service_name`] from the raw attributes and
 //! written last, exactly as the reference's `streamLabels[LabelServiceName] =
 //! …` map assignment is, so `from_normalized` is never asked to decide it and
-//! `{service.name: "ok", service_name: "x"*2049}` now stores `"ok"` — the
-//! value the bound was charged on — on both the value and the fingerprint.
+//! `{service.name: "ok", service_name: "x"*2049}` now stores
+//! `service_name="ok"` — the value the bound was charged on — and the
+//! unvalidated value as `service_name_extracted` (issue #507), a stored
+//! stream label no bound was charged on, which is the first path above.
 //! The seventeen other indexed names are unchanged.
 //!
 //! This is not a divergence note. Both examples are accepted by the reference
@@ -494,11 +496,13 @@ pub fn otlp_index_attributes() -> &'static [&'static str] {
 /// a 2049-byte value, or 16 arbitrary attributes, answers `204` there. Charging
 /// them on the indexed subset reproduces its answer in both directions.
 ///
-/// `LabelSet::from_normalized` performs the canonicalize-then-collapse that
-/// upstream's `attributeToLabels` + `streamLabels[name] = value` map assignment
-/// performs, and it is the *same* call that decides what is stored, so within
-/// the filtered subset the value a bound is charged on is the value that would
-/// be written. The resulting set is then run through [`StreamLabels`] for
+/// `LabelSet::from_normalized` performs the rename-then-collapse that the
+/// reference's attribute translation and stream-label map assignment perform.
+/// Storage uses `LabelSet::from_log_attribute_pairs`, a different grouping,
+/// but the two name the eighteen index attributes alike (pinned by
+/// `the_eighteen_index_attributes_are_named_alike_by_both_rules`) and apply
+/// the same collision rule, so within the filtered subset the value a bound is
+/// charged on is the value that would be written. The resulting set is then run through [`StreamLabels`] for
 /// `WithoutEmpty` and the name sort, exactly as `parseStreamLabels` re-parses
 /// the rendered literal upstream.
 ///

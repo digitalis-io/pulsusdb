@@ -1529,6 +1529,12 @@ const FLIPS: &[Flip] = &[
         expression: "[ \"b c\" ]",
         resolution: "the same widening, with a space inside the quoted key",
     },
+    Flip {
+        expression: "[\"la\\\"t\"]",
+        resolution: "a FIXTURE pinning the new verdict: issue #507's group key case r60 \
+                     (tests/fixtures/group_key/cases.tsv), whose expected answer is the parse \
+                     refusal",
+    },
 ];
 
 /// Every `| json <id>="…"` extraction expression on one line, as

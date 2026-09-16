@@ -1091,7 +1091,12 @@ async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() 
         return;
     }
     let port = 31_166;
-    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_collision_it");
+    // Its own database: this suite's tests run concurrently, and
+    // `structured_metadata_colliding_with_a_stream_label_lands_under_extracted_suffix`
+    // used to share this name and drop the database out from under this test
+    // (measured: 7 of 8 rows visible inside the read-back poll, all 8 present
+    // afterwards).
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_name_collision_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1301,11 +1306,11 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
     );
     assert_eq!(
         stored[ok_line].structured_metadata, r#"{"a_b":"v","detected_level":"unknown"}"#,
-        "an admissible dotted name is canonicalized, not rejected"
+        "an admissible dotted name is renamed, not rejected"
     );
     assert_eq!(
         stored[naive_line].structured_metadata, r#"{"detected_level":"unknown","na_ve":"v"}"#,
-        "an admissible non-ASCII name is canonicalized per character"
+        "an admissible non-ASCII name is renamed to its stored name"
     );
 }
 
@@ -2059,18 +2064,21 @@ async fn wait_for_count(db: &str, sql: &str, want: u64) -> u64 {
 /// spelling only (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes
 /// the underscored one to structured metadata, which no bound reaches.
 /// Storage does not agree: we index every resource attribute (#109), both
-/// spellings canonicalize onto `k8s_pod_name`, and `from_normalized`'s frozen
-/// rule (#4) keeps the greatest original key — `_` (0x5F) after `.` (0x2E) —
+/// spellings are stored under `k8s_pod_name`, and the frozen rule of issue #4
+/// (applied by `from_log_attribute_pairs`) keeps the greatest original key — `_` (0x5F) after `.` (0x2E) —
 /// so the **unvalidated** value is written under a label the validator passed
 /// at two bytes, and the stream's identity follows it.
 ///
-/// The same shape spelled `service.name`/`service_name` no longer behaves that
-/// way (issue #379): that slot is resolved from the raw attributes and written
-/// last, exactly as the reference's map assignment is, so the validated value
-/// wins and the near-miss is not stored at all. Measured on stock
-/// `grafana/loki@sha256:87f0a067…` via `/loki/api/v1/series`:
-/// `{service.name: "ok379", service_name: <2049 B>}` stores
-/// `{service_name="ok379"}`.
+/// The same shape spelled `service.name`/`service_name` behaves differently
+/// (issues #379, #507): that slot is resolved from the raw attributes and
+/// written last, exactly as the reference's map assignment is, so the
+/// validated value wins the slot and the near-miss is stored beside it under
+/// `service_name_extracted` — the name the reference's own read path gives
+/// that attribute, which it keeps as structured metadata (#109). Measured on
+/// the pinned reference build (the coder keeps the image citation) through
+/// its series route: `{service.name: "ok379", service_name: <2049 B>}` stores
+/// `{service_name="ok379"}` there and
+/// `{service_name="ok379", service_name_extracted=<2049 B>}` here.
 ///
 /// Four rounds of status-only oracle comparison could not see any of this.
 /// The hermetic twin is
@@ -2149,18 +2157,20 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
     let of_probe =
         format!("FROM log_streams WHERE JSONExtractString(labels, 'container_name') = '{probe}'");
 
-    // Three streams: (a) and (b) share one fingerprint because the near-miss
-    // won the collapse in both; (c) is a second; (d) and (e) share a third,
-    // because the SLOT decided `service_name` in both.
+    // Four streams: (a) and (b) share one fingerprint because the near-miss
+    // won the collapse in both; (c) is a second; (d) and (e) are a third and a
+    // fourth, because the SLOT still decides `service_name` in both while (d)
+    // stores its near-miss beside the slot as `service_name_extracted`
+    // (issue #507).
     assert_eq!(
         wait_for_count(
             db,
             &format!("SELECT count(DISTINCT fingerprint) AS c {of_probe}"),
-            3
+            4
         )
         .await,
-        3,
-        "(a)+(b), (c), and (d)+(e) are three streams"
+        4,
+        "(a)+(b), (c), (d) and (e) are four streams"
     );
 
     // The stored label is the 2049-byte value no bound was charged on...
@@ -2269,7 +2279,37 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
         )
         .await,
         2,
-        "(d) and (e) are one stream, under the VALIDATED `service.name` value"
+        "(d) and (e) both carry the VALIDATED `service.name` value in the slot"
+    );
+    // …and (d) is its own stream, because its near-miss is stored beside the
+    // slot instead of being dropped (issue #507). That value is the 2049-byte
+    // one no bound was charged on.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND JSONExtractString(labels, 'service_name_extracted') = '{wide}'"
+            ),
+        )
+        .await,
+        1,
+        "(d) stores the near-miss as `service_name_extracted`"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE fingerprint IN \
+                 (SELECT fingerprint FROM log_streams \
+                  WHERE JSONExtractString(labels, 'container_name') = '{probe}' \
+                  AND JSONExtractString(labels, 'service_name_extracted') = '{wide}') \
+                 AND body = 'otlp service name both'"
+            ),
+        )
+        .await,
+        1,
+        "(d)'s record is the one in that stream"
     );
     // And all five lines landed: nothing here was refused.
     assert_eq!(
@@ -3054,4 +3094,847 @@ async fn each_ingest_transport_supplies_its_own_detected_level_series() {
         "detected_labels must not list a structured-metadata name: {}",
         res.body
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #507 option A: a stored name is the reference's label name.
+// ---------------------------------------------------------------------
+
+/// An OTLP/JSON body carrying one resource with its scope and record
+/// attributes, for the cases whose answer depends on which list a key sits
+/// in.
+fn otlp_json_body_full(
+    resource_attrs: &[(&str, &str)],
+    scope_attrs: &[(&str, &str)],
+    record_attrs: &[(&str, &str)],
+    line: &str,
+    ts_ns: i64,
+) -> Vec<u8> {
+    let kv = |pairs: &[(&str, &str)]| -> Vec<serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| serde_json::json!({"key": k, "value": {"stringValue": v}}))
+            .collect()
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "resourceLogs": [{
+            "resource": {"attributes": kv(resource_attrs)},
+            "scopeLogs": [{
+                "scope": {"name": "sc", "attributes": kv(scope_attrs)},
+                "logRecords": [{
+                    "timeUnixNano": ts_ns.to_string(),
+                    "body": {"stringValue": line},
+                    "attributes": kv(record_attrs),
+                }],
+            }],
+        }],
+    }))
+    .expect("otlp body")
+}
+
+/// One series of an instant metric query: its labels and its value.
+fn metric_series(
+    port: u16,
+    path_prefix: &str,
+    query: &str,
+    at_ns: i64,
+) -> Vec<(std::collections::BTreeMap<String, String>, String)> {
+    let path = format!(
+        "{path_prefix}/query?query={}&time={at_ns}",
+        urlencode(query)
+    );
+    let res = http_get(port, &path).expect("query reachable");
+    assert_eq!(res.status, 200, "{query}: status (body: {})", res.body);
+    let json: serde_json::Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|e| panic!("json: {e}: {}", res.body));
+    let mut out: Vec<(std::collections::BTreeMap<String, String>, String)> = json["data"]["result"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|series| {
+            let labels = series["metric"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .filter(|(k, _)| k != "detected_level" && k != "scope_name")
+                        .collect()
+                })
+                .unwrap_or_default();
+            let value = series["value"][1].as_str().unwrap_or_default().to_string();
+            (labels, value)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The label names the `/labels` endpoint reports for `query`.
+fn label_names(port: u16, path_prefix: &str, query: &str, base_ns: i64) -> Vec<String> {
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let path = format!(
+        "{path_prefix}/labels?query={}&start={start}&end={end}",
+        urlencode(query)
+    );
+    let res = http_get(port, &path).expect("labels reachable");
+    assert_eq!(res.status, 200, "{query}: status (body: {})", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("json");
+    let mut out: Vec<String> = json["data"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|n| n != "detected_level" && n != "scope_name" && n != "service_name")
+        .collect();
+    out.sort();
+    out
+}
+
+/// The stored labels of the one stream `{service_name="<case>"}` returns,
+/// with the fields every case carries left out.
+fn stored_labels(
+    port: u16,
+    path_prefix: &str,
+    case: &str,
+    base_ns: i64,
+) -> std::collections::BTreeMap<String, String> {
+    let streams = query_streams(port, path_prefix, case, base_ns);
+    assert_eq!(streams.len(), 1, "{case}: one stream, got {streams:?}");
+    streams[0]
+        .0
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != "detected_level" && k.as_str() != "scope_name" && k.as_str() != "env"
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn label_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+/// One OTLP naming case: its id, then its resource, scope and record
+/// attribute pairs.
+type OtlpNameCase<'a> = (
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    &'a [(&'a str, &'a str)],
+    &'a [(&'a str, &'a str)],
+);
+
+/// **N9 (issue #507, criterion 46): every stored name answers as the
+/// reference's does**, end to end through the push and OTLP receivers and
+/// the query endpoints.
+///
+/// Each expectation is the plan's measured "A (chosen)" cell, which equals
+/// the pinned reference build's answer except where a row is a recorded
+/// divergence of its own; those name their ledger rows below.
+///
+/// Before this change: `a..b` was stored as `a__b`, `9bad` as `9bad` (a name
+/// no LogQL query can write), `--error--` as `__error__` (which failed every
+/// metric query over the stream), and an OTLP `service..name` was stored
+/// nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_and_otlp_attribute_names_answer_as_the_reference() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_229;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_names_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+    let prefix = "/loki/api/v1";
+    let base_ns = now_ns();
+
+    // ---- the push transport: structured-metadata names (am1-am10).
+    let sm_cases: &[(&str, &[(&str, &str)])] = &[
+        ("am1", &[("a..b", "1")]),
+        ("am2", &[("a__b", "1")]),
+        ("am3", &[("9bad", "1")]),
+        ("am4", &[("a..b", ""), ("a_b", "keep")]),
+        ("am5", &[("a__b", ""), ("a_b", "keep")]),
+        ("am6", &[("9bad", ""), ("key_9bad", "keep")]),
+        ("am7", &[("--error--", "boom")]),
+        (
+            "am8",
+            &[("__foo__", "1"), ("_x", "2"), ("naïve", "3"), ("a.b", "4")],
+        ),
+        ("am9", &[("a.b", "x"), ("a..b", "y")]),
+        (
+            "am10",
+            &[
+                ("k8s..pod", "p"),
+                ("__a", "1"),
+                ("___a___", "2"),
+                ("1.2", "3"),
+            ],
+        ),
+    ];
+    for (case, sm) in sm_cases {
+        let res = push(
+            port,
+            "application/json",
+            json_body_with_sm(case, base_ns, &format!("hello {case}"), sm).as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{case}: push status (body {})", res.body);
+    }
+    for (case, _) in sm_cases {
+        wait_for_line(port, case, base_ns, &format!("hello {case}"));
+    }
+
+    for (case, want) in [
+        ("am1", label_map(&[("a_b", "1"), ("service_name", "am1")])),
+        ("am2", label_map(&[("a_b", "1"), ("service_name", "am2")])),
+        (
+            "am3",
+            label_map(&[("key_9bad", "1"), ("service_name", "am3")]),
+        ),
+        ("am4", label_map(&[("service_name", "am4")])),
+        ("am5", label_map(&[("service_name", "am5")])),
+        ("am6", label_map(&[("service_name", "am6")])),
+        (
+            "am7",
+            label_map(&[("_error_", "boom"), ("service_name", "am7")]),
+        ),
+        (
+            "am8",
+            label_map(&[
+                ("__foo__", "1"),
+                ("_x", "2"),
+                ("a_b", "4"),
+                ("na_ve", "3"),
+                ("service_name", "am8"),
+            ]),
+        ),
+        ("am9", label_map(&[("a_b", "y"), ("service_name", "am9")])),
+        (
+            "am10",
+            label_map(&[
+                ("___a___", "2"),
+                ("_a", "1"),
+                ("k8s_pod", "p"),
+                ("key_1_2", "3"),
+                ("service_name", "am10"),
+            ]),
+        ),
+    ] {
+        assert_eq!(
+            stored_labels(port, prefix, case, base_ns),
+            want,
+            "{case}.00"
+        );
+    }
+
+    // A filter and a `by` over the stored name find the line (am1.01,
+    // am1.02, am2.01, am3.01): before this change the names were `a__b` and
+    // `9bad`, so both missed.
+    for (case, filter, value) in [
+        ("am1", "a_b", "1"),
+        ("am2", "a_b", "1"),
+        ("am3", "key_9bad", "1"),
+    ] {
+        let streams = query_streams_raw(
+            port,
+            prefix,
+            &format!(r#"{{service_name="{case}"}} | {filter}="{value}""#),
+            base_ns,
+        );
+        assert_eq!(streams.len(), 1, "{case}.01: the filter finds the line");
+    }
+    assert_eq!(
+        metric_series(
+            port,
+            prefix,
+            r#"sum by (a_b) (count_over_time({service_name="am1"} [5m]))"#,
+            base_ns,
+        ),
+        vec![(label_map(&[("a_b", "1")]), "1".to_string())],
+        "am1.02"
+    );
+
+    // am7: `--error--` is stored as `_error_`, an ordinary label, so the
+    // metric queries answer instead of failing with `pipeline error: 'boom'`.
+    assert_eq!(
+        metric_series(
+            port,
+            prefix,
+            r#"count_over_time({service_name="am7"} [5m])"#,
+            base_ns,
+        ),
+        vec![(
+            label_map(&[
+                ("_error_", "boom"),
+                ("service_name", "am7"),
+                ("env", "prod")
+            ]),
+            "1".to_string()
+        )],
+        "am7.01"
+    );
+    assert_eq!(
+        metric_series(
+            port,
+            prefix,
+            r#"sum by (_error_) (count_over_time({service_name="am7"} [5m]))"#,
+            base_ns,
+        ),
+        vec![(label_map(&[("_error_", "boom")]), "1".to_string())],
+        "am7.02"
+    );
+
+    // ---- the OTLP receiver: resource, scope and record attribute keys.
+    let otlp_cases: &[OtlpNameCase<'_>] = &[
+        (
+            "ao1",
+            &[
+                ("service.name", "ao1"),
+                ("k8s..pod", "p"),
+                ("9zone", "z"),
+                ("a__b", "x"),
+                ("--error--", "boom"),
+            ],
+            &[("s..x", "1"), ("9s", "2")],
+            &[("r..x", "3"), ("severity..text", "warn")],
+        ),
+        (
+            "ao2",
+            &[("service.name", "ao2"), ("a.b", "1"), ("a..b", "2")],
+            &[],
+            &[],
+        ),
+        (
+            "ao3",
+            &[
+                ("service.name", "ao3"),
+                ("k8s.pod.name", "p3"),
+                ("cloud.region", "r"),
+            ],
+            &[("x.y", "1")],
+            &[],
+        ),
+        (
+            "ao4",
+            &[
+                ("service.name", "ao4"),
+                ("k8s..pod", "p"),
+                ("9zone", "z"),
+                ("--error--", "boom"),
+            ],
+            &[("s..x", "1")],
+            &[],
+        ),
+        (
+            "ao5",
+            &[("container.name", "ao5"), ("service..name", "x")],
+            &[],
+            &[],
+        ),
+        (
+            "ao6",
+            &[("service.name", "ao6"), ("service_name", "v6")],
+            &[],
+            &[],
+        ),
+        (
+            "ao7",
+            &[("service.name", "ao7")],
+            &[("a..b", "x"), ("a_b", "y")],
+            &[],
+        ),
+        (
+            "ao8",
+            &[("service.name", "ao8")],
+            &[("a_b", "y"), ("a..b", "x")],
+            &[],
+        ),
+    ];
+    for (case, resource, scope, record) in otlp_cases {
+        let res = otlp_push(
+            port,
+            &otlp_json_body_full(resource, scope, record, &format!("hello {case}"), base_ns),
+        );
+        assert_eq!(res.status, 200, "{case}: otlp status (body {})", res.body);
+    }
+    for (case, _, _, _) in otlp_cases {
+        wait_for_line(port, case, base_ns, &format!("hello {case}"));
+    }
+
+    // The stored stream labels and metadata, case by case. Every cell is the
+    // reference's answer except where named below.
+    for (case, want) in [
+        (
+            // ao1: the reference also returns `r_x` and `severity_text`,
+            // which it keeps as record-attribute metadata and we do not store
+            // at all (#109 placement, ledger `ingest-attribute-placement`).
+            "ao1",
+            label_map(&[
+                ("_error_", "boom"),
+                ("a_b", "x"),
+                ("k8s_pod", "p"),
+                ("key_9s", "2"),
+                ("key_9zone", "z"),
+                ("s_x", "1"),
+                ("service_name", "ao1"),
+            ]),
+        ),
+        (
+            // ao2: the reference keeps the LAST in wire order (`2`); issue
+            // #4's frozen rule keeps the greatest original key (`a.b`).
+            "ao2",
+            label_map(&[("a_b", "1"), ("service_name", "ao2")]),
+        ),
+        (
+            "ao3",
+            label_map(&[
+                ("cloud_region", "r"),
+                ("k8s_pod_name", "p3"),
+                ("service_name", "ao3"),
+                ("x_y", "1"),
+            ]),
+        ),
+        (
+            "ao4",
+            label_map(&[
+                ("_error_", "boom"),
+                ("k8s_pod", "p"),
+                ("key_9zone", "z"),
+                ("s_x", "1"),
+                ("service_name", "ao4"),
+            ]),
+        ),
+        (
+            "ao5",
+            label_map(&[
+                ("container_name", "ao5"),
+                ("service_name", "ao5"),
+                ("service_name_extracted", "x"),
+            ]),
+        ),
+        (
+            "ao6",
+            label_map(&[("service_name", "ao6"), ("service_name_extracted", "v6")]),
+        ),
+        ("ao7", label_map(&[("a_b", "y"), ("service_name", "ao7")])),
+        ("ao8", label_map(&[("a_b", "x"), ("service_name", "ao8")])),
+    ] {
+        assert_eq!(
+            stored_labels(port, prefix, case, base_ns),
+            want,
+            "{case}.00"
+        );
+    }
+
+    // ao1.01 and ao4.01: a metric query over a stream carrying `--error--`
+    // answers, where it used to fail with `pipeline error: 'boom'`.
+    for case in ["ao1", "ao4"] {
+        let series = metric_series(
+            port,
+            prefix,
+            &format!(r#"count_over_time({{service_name="{case}"}} [5m])"#),
+            base_ns,
+        );
+        assert_eq!(series.len(), 1, "{case}.01");
+        assert_eq!(series[0].1, "1", "{case}.01");
+        assert_eq!(
+            series[0].0.get("_error_").map(String::as_str),
+            Some("boom"),
+            "{case}.01: an ordinary label, not the error slot"
+        );
+    }
+    // ao1.02 and ao4.02: a filter on the stored name finds the line.
+    for case in ["ao1", "ao4"] {
+        assert_eq!(
+            query_streams_raw(
+                port,
+                prefix,
+                &format!(r#"{{service_name="{case}"}} | k8s_pod="p""#),
+                base_ns,
+            )
+            .len(),
+            1,
+            "{case}.02"
+        );
+    }
+    // ao1.03 and ao4.03: `9zone` is queryable as `key_9zone`.
+    for case in ["ao1", "ao4"] {
+        assert_eq!(
+            metric_series(
+                port,
+                prefix,
+                &format!(r#"sum by (key_9zone) (count_over_time({{service_name="{case}"}} [5m]))"#),
+                base_ns,
+            ),
+            vec![(label_map(&[("key_9zone", "z")]), "1".to_string())],
+            "{case}.03"
+        );
+    }
+    // ao1.04: the level is read from the record attribute `severity..text`
+    // under its stored name.
+    let levels = metric_series(
+        port,
+        prefix,
+        r#"sum by (detected_level) (count_over_time({service_name="ao1"} [5m]))"#,
+        base_ns,
+    );
+    assert_eq!(levels.len(), 1, "ao1.04");
+    assert_eq!(levels[0].1, "1", "ao1.04");
+
+    // ao1.05 and ao1.06 are the #109 placement difference: we promote every
+    // resource attribute to a stream label, so the selector matches here and
+    // the label endpoint lists the promoted names. The reference keeps the
+    // ones outside its eighteen index names as structured metadata.
+    assert_eq!(
+        query_streams_raw(
+            port,
+            prefix,
+            r#"{service_name="ao1", k8s_pod="p"}"#,
+            base_ns,
+        )
+        .len(),
+        1,
+        "ao1.05 (#109 placement: the reference answers nothing here)"
+    );
+    assert_eq!(
+        label_names(port, prefix, r#"{service_name="ao1"}"#, base_ns),
+        vec![
+            "_error_".to_string(),
+            "a_b".to_string(),
+            "k8s_pod".to_string(),
+            "key_9zone".to_string(),
+        ],
+        "ao1.06 (#109 placement: the reference lists `service_name` alone)"
+    );
+    // ao6.01: the near-miss is queryable under the name the reference's read
+    // path gives it.
+    assert_eq!(
+        metric_series(
+            port,
+            prefix,
+            r#"sum by (service_name_extracted) (count_over_time({service_name="ao6"} [5m]))"#,
+            base_ns,
+        ),
+        vec![(
+            label_map(&[("service_name_extracted", "v6")]),
+            "1".to_string()
+        )],
+        "ao6.01"
+    );
+    // ao5.01: and it answers beside the slot.
+    let ao5 = metric_series(
+        port,
+        prefix,
+        r#"count_over_time({service_name="ao5"} [5m])"#,
+        base_ns,
+    );
+    assert_eq!(ao5.len(), 1, "ao5.01");
+    assert_eq!(
+        ao5[0].0.get("service_name_extracted").map(String::as_str),
+        Some("x"),
+        "ao5.01"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #539: the two escapes the reader decoded wrongly.
+//
+// Our writer has always escaped U+0008 and U+000C as JSON's `\b` and `\f`.
+// The reader's escape table listed neither, and its catch-all keeps the
+// letter after the backslash, so a label value stored as `a` U+0008 `b`
+// read back as the three letters `abb` — a different, real value one byte
+// away. Two streams that differ only at U+0008 therefore merged into one,
+// and a `| trace_id="abb"` filter admitted the row whose trace id is not
+// `abb`.
+//
+// These cases assert the DECODED value out of the response, never the
+// bytes: our response spells U+0008 with JSON's two-character escape and
+// the reference spells it as the six-character form backslash-u-0-0-0-8,
+// and both are the same string.
+// ---------------------------------------------------------------------
+
+/// `a` + `c` + `b` — the corpus shape. With `c` = U+0008 the wrong decode
+/// is `abb`, which is also in the corpus, so a wrong build is caught by
+/// two stored values colliding rather than by one going missing.
+fn around(c: char) -> String {
+    format!("a{c}b")
+}
+
+/// One pushed entry: its timestamp, its line, and its structured metadata.
+type PushEntry<'a> = (i64, &'a str, Vec<(&'a str, String)>);
+
+/// A JSON push body for one stream, built with `serde_json` so the wire
+/// escaping is the library's and not a hand-written literal.
+fn json_push_body(stream_labels: &[(&str, String)], entries: &[PushEntry<'_>]) -> String {
+    let labels: serde_json::Map<String, serde_json::Value> = stream_labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
+        .collect();
+    let values: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(ts, line, sm)| {
+            let sm_obj: serde_json::Map<String, serde_json::Value> = sm
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
+                .collect();
+            serde_json::json!([ts.to_string(), line, sm_obj])
+        })
+        .collect();
+    serde_json::json!({"streams": [{"stream": labels, "values": values}]}).to_string()
+}
+
+/// Polls `query_range` for `query` until it returns `want` streams, then
+/// returns them sorted by their lines, so a case can name entries rather
+/// than depend on the order two streams come back in.
+fn wait_for_streams(
+    port: u16,
+    query: &str,
+    base_ns: i64,
+    want: usize,
+) -> Vec<(std::collections::BTreeMap<String, String>, Vec<String>)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut streams = query_streams_raw(port, "/api/logs/v1", query, base_ns);
+        if streams.len() == want {
+            streams.sort_by(|a, b| a.1.cmp(&b.1));
+            return streams;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{query} returned {} stream(s), want {want}: {streams:?}",
+            streams.len()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Q1/Q2/Q3/Q5/Q6 of issue #539, pushed through the real receiver so the
+/// values reach the columns through the real writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn c0_escaped_label_values_survive_push_and_come_back_decoded() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_234;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_c0_escape_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let backspace = around('\u{8}');
+    let form_feed = around('\u{c}');
+
+    // Three streams that differ only in the one character, plus the value
+    // the wrong decode produced.
+    for (key, value, line) in [
+        ("bs", backspace.clone(), "line with backspace label"),
+        ("ff", form_feed.clone(), "line with form feed label"),
+        ("bs", "abb".to_string(), "line with the letters only"),
+    ] {
+        let body = json_push_body(
+            &[("service_name", "s539".to_string()), (key, value.clone())],
+            &[(base_ns, line, Vec::new())],
+        );
+        let res = push(port, "application/json", body.as_bytes());
+        assert_eq!(
+            res.status, 204,
+            "push of {key}={value:?} -> 204 (body {})",
+            res.body
+        );
+    }
+
+    // One stream, two entries, whose structured metadata differs only at
+    // U+0008 — the per-row decoder, not the per-stream one.
+    let sm_body = json_push_body(
+        &[("service_name", "s539sm".to_string())],
+        &[
+            (
+                base_ns,
+                "sm backspace",
+                vec![("trace_id", backspace.clone())],
+            ),
+            (
+                base_ns + 1,
+                "sm plain",
+                vec![("trace_id", "abb".to_string())],
+            ),
+        ],
+    );
+    let res = push(port, "application/json", sm_body.as_bytes());
+    assert_eq!(res.status, 204, "sm push -> 204 (body {})", res.body);
+
+    // Q1 — a stream selector on the TRUE value returns the stream, and the
+    // label it renders is the value that was stored.
+    let q1 = wait_for_streams(port, r#"{bs="a\bb"}"#, base_ns, 1);
+    assert_eq!(
+        q1[0].0.get("bs").map(String::as_str),
+        Some(backspace.as_str()),
+        "the backspace selector must render the stored value, not {:?}",
+        q1[0].0.get("bs")
+    );
+    assert_eq!(q1[0].1, vec!["line with backspace label".to_string()]);
+
+    // Q2 — the value the wrong decode DISPLAYED selects the other stream,
+    // and only that one. Q1 and Q2 together are the whole defect: before
+    // the fix Q1 showed a label value that Q2 proves belongs elsewhere.
+    let q2 = wait_for_streams(port, r#"{bs="abb"}"#, base_ns, 1);
+    assert_eq!(q2[0].0.get("bs").map(String::as_str), Some("abb"));
+    assert_eq!(q2[0].1, vec!["line with the letters only".to_string()]);
+
+    // Q3 — the form feed, through the same arm pair.
+    let q3 = wait_for_streams(port, r#"{ff="a\fb"}"#, base_ns, 1);
+    assert_eq!(
+        q3[0].0.get("ff").map(String::as_str),
+        Some(form_feed.as_str()),
+        "the form-feed selector must render the stored value, not {:?}",
+        q3[0].0.get("ff")
+    );
+
+    // Q5 — two entries whose structured metadata differs only at U+0008
+    // are TWO streams. Before the fix both decoded to `abb` and the two
+    // entries merged into one stream.
+    let q5 = wait_for_streams(port, r#"{service_name="s539sm"}"#, base_ns, 2);
+    let trace_ids: Vec<Option<&str>> = q5
+        .iter()
+        .map(|(labels, _)| labels.get("trace_id").map(String::as_str))
+        .collect();
+    assert_eq!(
+        trace_ids,
+        vec![Some(backspace.as_str()), Some("abb")],
+        "the two entries must stay two streams: {q5:?}"
+    );
+    assert_eq!(q5[0].1, vec!["sm backspace".to_string()]);
+    assert_eq!(q5[1].1, vec!["sm plain".to_string()]);
+
+    // Q6 — a label filter over the decoded value admits exactly the entry
+    // that matches it.
+    let q6 = wait_for_streams(
+        port,
+        r#"{service_name="s539sm"} | trace_id="abb""#,
+        base_ns,
+        1,
+    );
+    assert_eq!(
+        q6[0].1,
+        vec!["sm plain".to_string()],
+        "the label filter must not admit the entry whose trace id is not abb: {q6:?}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Q4 of issue #539 — the criterion that proves the DECODER rather than
+/// the storage.
+///
+/// One stream, two queries, one pipeline stage apart:
+///
+/// ```text
+///   {service_name="s539v"}                       labels spliced verbatim
+///                                                from the stored column
+///   {service_name="s539v"} | label_format x="1"  labels re-rendered
+///                                                through the decoder
+/// ```
+///
+/// Before the fix the first was right and the second was wrong, on the
+/// same server and the same stored bytes. The seed is written with
+/// `LabelSet::to_canonical_json` — the writer's own expression
+/// (`crates/pulsus-write/src/writer/rows.rs:103`) — and with EMPTY
+/// structured metadata, which is what makes the verbatim path reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_235;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_c0_verbatim_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let backspace = around('\u{8}');
+    let (labels, _collisions) = pulsus_model::LabelSet::from_normalized(vec![
+        ("service_name".to_string(), "s539v".to_string()),
+        ("b8".to_string(), backspace.clone()),
+    ]);
+
+    let client = ChClient::new(ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    })
+    .await
+    .expect("connect to seed");
+    let fingerprint = 539_539_539_u64;
+    client
+        .insert_block(
+            "log_streams",
+            &[pulsus_write::writer::LogStreamRow {
+                month: pulsus_model::Date::start_of_month_utc(base_ns)
+                    .expect("a month for now")
+                    .days_since_epoch(),
+                fingerprint,
+                service: "s539v".to_string(),
+                labels: labels.to_canonical_json(),
+                updated_ns: base_ns,
+            }],
+        )
+        .await
+        .expect("seed log_streams");
+    client
+        .insert_block(
+            "log_samples",
+            &[pulsus_write::writer::LogSampleRow {
+                service: "s539v".to_string(),
+                fingerprint,
+                timestamp_ns: base_ns,
+                severity: 0,
+                body: "verbatim vs re-rendered".to_string(),
+                structured_metadata: String::new(),
+            }],
+        )
+        .await
+        .expect("seed log_samples");
+
+    let verbatim = wait_for_streams(port, r#"{service_name="s539v"}"#, base_ns, 1);
+    let re_rendered = wait_for_streams(
+        port,
+        r#"{service_name="s539v"} | label_format x="1""#,
+        base_ns,
+        1,
+    );
+
+    assert_eq!(
+        verbatim[0].0.get("b8").map(String::as_str),
+        Some(backspace.as_str()),
+        "the verbatim path must render the stored value: {:?}",
+        verbatim[0].0
+    );
+    assert_eq!(
+        re_rendered[0].0.get("b8").map(String::as_str),
+        Some(backspace.as_str()),
+        "the re-rendered path must render the same value one pipeline stage later: {:?}",
+        re_rendered[0].0
+    );
+    assert_eq!(
+        verbatim[0].0.get("b8"),
+        re_rendered[0].0.get("b8"),
+        "the two rendering paths must agree on one stored value"
+    );
+    assert_eq!(
+        re_rendered[0].0.get("x").map(String::as_str),
+        Some("1"),
+        "the pipeline stage ran: {:?}",
+        re_rendered[0].0
+    );
+
+    drop_db(db).await;
 }

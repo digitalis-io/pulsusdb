@@ -224,7 +224,7 @@
 //! and a `Checked`-shaped name on an unchecked value is worse than an honest
 //! `&str`, because the next reader would trust it.
 
-use pulsus_logql::{LineFilter, LineFilterOp};
+use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
 
 use super::escape::ch_like_contains;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
@@ -269,7 +269,7 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// some unrelated reason breaks this one.
 ///
 /// ```
-/// use pulsus_logql::{LineFilter, LineFilterOp};
+/// use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
 /// use pulsus_read::logql::{escape, predicate};
 ///
 /// let sql = format!("match(body, {})", escape::ch_string("boom"));
@@ -523,6 +523,414 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     })
 }
 
+/// The ONLY two ways an emitted statement may NAME the
+/// structured-metadata column (issue #507, condition 6).
+///
+/// The column name is not reachable as a string from this module's public
+/// API: it lives in [`METADATA_COLUMN`], which is private, and every
+/// renderer that mentions the column takes one of these variants or calls
+/// the private guard mint below. An alias or a subquery cannot get around
+/// that, because no function renders an extraction over the column in the
+/// first place.
+///
+/// **No SQL this module emits reads INSIDE the column.** It may be
+/// projected, grouped by, and compared whole against a literal — nothing
+/// else. Two readers of a stored value disagree; one reader cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataTerm {
+    /// `structured_metadata` in a `SELECT` list.
+    Project,
+    /// `structured_metadata` in a `GROUP BY`.
+    Group,
+}
+
+/// The one place the column's name is written.
+const METADATA_COLUMN: &str = "structured_metadata";
+
+impl MetadataTerm {
+    /// The column reference this term renders. Both variants render the
+    /// bare name; they differ in where the caller puts it, which is why
+    /// they are two variants and not one.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            MetadataTerm::Project | MetadataTerm::Group => METADATA_COLUMN,
+        }
+    }
+}
+
+/// `structured_metadata != ''` — the whole-value guard.
+///
+/// **Private, and takes no argument.** A key-specific guard would be a
+/// second reader of the column, and a second reader disagrees with the
+/// first: our flat scanner accepts shapes a JSON parser rejects and
+/// decodes escapes differently, measured in both directions. This term
+/// reads no key. It is true on every row carrying any metadata at all,
+/// which is a superset of every row where the two readers could differ.
+///
+/// **Rows it drops: none the evaluator keeps.** It only ever adds a
+/// disjunct, so it can only widen the predicate it sits in.
+///
+/// Its cost is stated rather than hidden: on a corpus where every row
+/// carries metadata the term is true everywhere, so the predicate it
+/// guards keeps every row and buys nothing.
+fn metadata_non_empty_guard() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("{METADATA_COLUMN} != ''"),
+    }
+}
+
+/// Why a parsed-name label filter is not pushed down (issue #507, W3).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the filter is evaluated after the read, exactly as it is
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedFilterRefusal {
+    /// The operator has no specified fragment. Only `=` on the string
+    /// form is served; `!=`, `=~` and `!~` are not.
+    OperatorNotServed,
+    /// The label name can be produced by more than one raw key of this
+    /// parser's input, and no key-precise expression reads the one the
+    /// evaluator resolved. See [`name_is_unambiguous`].
+    AmbiguousName,
+    /// This parser has no key-precise expression at all — a capture's
+    /// value comes from running a regular expression over the line, which
+    /// the database cannot reproduce — and the value probe does not serve
+    /// this operator.
+    NoKeyExpression,
+    /// A non-finite threshold. `| k > 1e400` parses to an infinity here,
+    /// and the database refuses the literal with a syntax error.
+    ThresholdNotFinite,
+    /// The label name is not one a fragment may name.
+    NameNotRenderable,
+}
+
+/// Can this label name have been produced by more than one raw key?
+///
+/// **No, exactly when it contains no `_`.** `sanitize_label_key`
+/// (`pipeline.rs:3939-3952`) does three things and no more: it prepends
+/// `_` when the first character is an ASCII digit, keeps ASCII
+/// alphanumerics and `_`, and replaces every other character with `_`. It
+/// never deletes and never shortens. A bare `| json` additionally flattens
+/// nested objects, inserting `_` between levels (`pipeline.rs:27`).
+///
+/// So **every transformation either preserves the string or introduces a
+/// `_`.** A name with no `_` had nothing introduced, so it was not
+/// transformed, so its only preimage is that same key at the top level.
+///
+/// The bound is tight in that direction only. A name containing `_` is
+/// merely *capable* of ambiguity — it is actually ambiguous only when one
+/// document carries two of its preimages, which no plan-time predicate can
+/// know. Measured: `{"a":{"b":"nested"},"a_b":"top"}` gives the label
+/// `a_b = nested`, because extraction skips an already-extracted name and
+/// the first raw key in document order wins, while
+/// `JSONExtractString(body,'a_b')` reads `top` — the one the evaluator
+/// discarded.
+pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool {
+    !name.contains('_')
+}
+
+/// A label name a fragment may render. The parser cannot produce anything
+/// else, and a fragment builder does not take the word of a caller that
+/// did not come through it.
+fn name_is_renderable(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The expression a parser makes a name resolve to, for the two parsers
+/// that have one.
+fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String> {
+    let key = ch_string(name);
+    match parser {
+        ParserStage::Json { .. } => Some(format!("JSONExtractString(body, {key})")),
+        ParserStage::Logfmt { .. } => Some(format!(
+            "extractKeyValuePairs(body, '=', ' \\t\\r\\n', '\"')[{key}]"
+        )),
+        // A capture's value is produced by running a regular expression
+        // over the line. There is no key-precise expression to write.
+        ParserStage::Regexp(_) | ParserStage::Pattern(_) => None,
+    }
+}
+
+/// `| <parser> | NAME = "VALUE"`, pushed down (issue #507, W3).
+///
+/// # The rule every cell here is built to
+///
+/// A `Fidelity::Wider` predicate **may emit rows the evaluator discards,
+/// and may never discard a row the evaluator keeps.** Each route below
+/// states which it does.
+///
+/// # Route A — a key-precise comparison, for a name with no `_`
+///
+/// ```text
+/// | json    (JSONType(body,'k') != 'String' OR JSONExtractString(body,'k') = 'v' OR structured_metadata != '')
+/// | logfmt  (extractKeyValuePairs(body,'=',' \t\r\n','"')['k'] IN ('', 'v') OR position(body, '\\') > 0 OR structured_metadata != '')
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** The name has exactly one
+/// preimage ([`name_is_unambiguous`]), so the expression reads the key the
+/// evaluator resolved. Every other kind of stored value reaches the type
+/// guard or the empty alternative: a key that is absent, a line that is not
+/// JSON at all, a line with trailing bytes after the object, a number, an
+/// object, an array. Both sides decode `\uXXXX` the same way — measured,
+/// `{"k":"A"}` gives the label `A` here and `JSONExtractString` gives `A`
+/// there — so an escaped value is compared, not missed.
+///
+/// # Route B — a value probe, for a parser with no key expression
+///
+/// ```text
+/// | regexp, | pattern    body LIKE '%v%'
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** A capture is a literal
+/// byte slice of the line, so if the evaluator kept the row its capture
+/// equalled `v` and those bytes are in the body. Rows without `v` anywhere
+/// are dropped, and the evaluator drops them too.
+///
+/// It reaches the body skip indexes, so for a selective value it prunes
+/// better than a key-precise comparison would.
+///
+/// **Route B is NOT offered for `| json` or `| logfmt`**, and the reason is
+/// measured rather than assumed: those two decode their values, so a body
+/// may hold `A` where the label is `A` and the probe would miss a row
+/// the evaluator keeps. No test on the value alone can exclude that, since
+/// JSON permits any character to be written as an escape.
+pub fn parsed_string_filter(
+    name: &str,
+    op: MatchOp,
+    value: &str,
+    parser: &ParserStage,
+) -> Result<CheckedFragment, ParsedFilterRefusal> {
+    let cmp = match op {
+        MatchOp::Eq => "=",
+        MatchOp::Neq => "!=",
+        // The two regular-expression operators are not served, and the
+        // reason is not the SQL. Our label-filter regex semantics already
+        // differ from the reference at a width this plan records and has
+        // not repaired; pushing them down would bind that difference into
+        // a statement before anyone has decided about it.
+        MatchOp::Re | MatchOp::Nre => return Err(ParsedFilterRefusal::OperatorNotServed),
+    };
+    if !name_is_renderable(name) {
+        return Err(ParsedFilterRefusal::NameNotRenderable);
+    }
+    let guard = metadata_non_empty_guard();
+    let guard = guard.as_sql();
+    let Some(expr) = parsed_name_expr(name, parser) else {
+        // Route B, and it serves `=` alone.
+        //
+        // **Rows `=` drops: none the evaluator keeps.** A capture is a
+        // literal slice of the line, so a kept row's bytes are in the
+        // body.
+        //
+        // **`!=` has no probe form and is refused.** The evaluator keeps a
+        // row whose capture differs from the value; `NOT (body LIKE
+        // '%v%')` drops every row holding the value ANYWHERE, including a
+        // row where it sits outside the capture and the capture differs.
+        // That is the forbidden direction, and no test on the value
+        // repairs it — a substring probe cannot say where in the line the
+        // bytes sat.
+        if matches!(op, MatchOp::Neq) {
+            return Err(ParsedFilterRefusal::OperatorNotServed);
+        }
+        return Ok(CheckedFragment {
+            sql: contains_predicate(value),
+        });
+    };
+    if !name_is_unambiguous(name) {
+        return Err(ParsedFilterRefusal::AmbiguousName);
+    }
+    let v = ch_string(value);
+    let key = ch_string(name);
+    Ok(CheckedFragment {
+        sql: match parser {
+            ParserStage::Json { .. } => {
+                format!("(JSONType(body, {key}) != 'String' OR {expr} {cmp} {v} OR {guard})")
+            }
+            // Two extra alternatives, each for a case the comparison
+            // alone would get wrong. The empty one is the sanitising
+            // case: a raw key the database reads under a different
+            // spelling renders `''` here, and the evaluator decides. The
+            // backslash one is the escaping case: a quoted logfmt value
+            // may carry an escape that the two decoders resolve
+            // differently, so any line holding one is kept whole.
+            //
+            // **The empty alternative belongs to `=` and must NOT be
+            // carried over to `!=`.** For `!=` it would keep a row whose
+            // value EQUALS the filter's — harmless — and drop one whose
+            // value is neither empty nor equal, which the evaluator
+            // keeps. Checked rather than mirrored: with the label
+            // `other`, `!= "error"`, the evaluator keeps and the reused
+            // form drops.
+            _ if matches!(op, MatchOp::Neq) => {
+                format!("({expr} != {v} OR position(body, '\\\\') > 0 OR {guard})")
+            }
+            _ => format!("({expr} IN ('', {v}) OR position(body, '\\\\') > 0 OR {guard})"),
+        },
+    })
+}
+
+/// `| json | NAME <op> <number>`, pushed down (issue #507, W3).
+///
+/// ```text
+/// (JSONType(body,'k') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body,'k') >= 500.0 OR structured_metadata != '')
+/// ```
+///
+/// **Rows it drops: none the evaluator keeps.** It drops only a row whose
+/// key holds a JSON number failing the comparison, and the evaluator drops
+/// that row too. Every other type reaches the guard, including a
+/// numeric-looking STRING — which matters, because `JSONExtractFloat` of
+/// `"12abc"` is `0` while our conversion of the label text is not a number
+/// at all.
+///
+/// # The threshold is rendered as a float literal, and that is not cosmetic
+///
+/// `threshold` is rendered with `{:?}` — Rust's shortest round-tripping
+/// decimal, which always carries a `.` or an exponent, so the database
+/// lexes it as `Float64` and both sides have taken the same rounding.
+/// Written bare it would lex as `UInt64` and be compared against a
+/// `Float64` **exactly**: measured, `toTypeName(9007199254740993)` is
+/// `UInt64`, `toTypeName(9007199254740993.0)` is `Float64`, and
+/// `9007199254740992.0 = 9007199254740993` is false — so a bare literal at
+/// that magnitude returns no rows where the answer is two.
+///
+/// **`threshold` must be the `f64` OUR unit parser produced**, never a
+/// re-parse of the source text: a duration or size literal is interpreted
+/// by that parser and the database has no equivalent.
+///
+/// A non-finite threshold is refused. `| k > 1e400` parses to an infinity
+/// here and the database refuses the literal outright, so there is no
+/// fragment to emit and the filter is evaluated after the read.
+pub fn parsed_numeric_filter(
+    name: &str,
+    op: CompareOp,
+    threshold: f64,
+    parser: &ParserStage,
+) -> Result<CheckedFragment, ParsedFilterRefusal> {
+    if !name_is_renderable(name) {
+        return Err(ParsedFilterRefusal::NameNotRenderable);
+    }
+    if !threshold.is_finite() {
+        return Err(ParsedFilterRefusal::ThresholdNotFinite);
+    }
+    if !matches!(parser, ParserStage::Json { .. }) {
+        // The specified numeric cell reads `JSONExtractFloat`, which is a
+        // JSON reader. No other parser has one, and the value probe is a
+        // substring test that cannot serve an inequality.
+        return Err(ParsedFilterRefusal::NoKeyExpression);
+    }
+    if !name_is_unambiguous(name) {
+        return Err(ParsedFilterRefusal::AmbiguousName);
+    }
+    let key = ch_string(name);
+    let guard = metadata_non_empty_guard();
+    let guard = guard.as_sql();
+    let cmp = match op {
+        CompareOp::Eq => "=",
+        CompareOp::Neq => "!=",
+        CompareOp::Gt => ">",
+        CompareOp::Gte => ">=",
+        CompareOp::Lt => "<",
+        CompareOp::Lte => "<=",
+    };
+    Ok(CheckedFragment {
+        sql: format!(
+            "(JSONType(body, {key}) NOT IN ('Int64','UInt64','Double') OR \
+             JSONExtractFloat(body, {key}) {cmp} {threshold:?} OR {guard})"
+        ),
+    })
+}
+
+/// Why an anchored bucket grid cannot be rendered (issue #507, W2).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the range aggregation does not lower here, so the link stays
+/// residual and the evaluator answers exactly as it does today. A
+/// `PipelineError` would surface as a 400 for a query nothing is wrong
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketGridRefusal {
+    /// `step_ns` is zero or negative, so the grid has no points.
+    StepNotPositive,
+    /// The anchor does not sit at or below the first row the statement can
+    /// admit. `intDiv` truncates toward zero, which is a floor only for a
+    /// non-negative numerator, so an anchor above the scan start would
+    /// bucket the early rows upward instead of downward.
+    AnchorAboveScanStart,
+    /// The worst-case arithmetic is not representable in `Int64`.
+    WouldOverflow,
+}
+
+/// The anchored bucket expression: the grid point a row belongs to under a
+/// window that is **open below and closed above**.
+///
+/// ```text
+/// <lo> + intDiv(<col> - <lo> + <step> - 1, <step>) * <step>
+/// ```
+///
+/// **`lo` is `grid_start_ns - step_ns` and never the scan's own start.**
+/// The scan start is widened backwards by the range selector's duration
+/// (`plan.rs`'s `widen_scan_start`) so the first grid point's window is
+/// complete; using it as the anchor would shift the whole grid by one
+/// range. The two coincide exactly when the range equals the step, which
+/// is the case that would make a wrong implementation look right.
+///
+/// **Why a ceiling and not the floor the shipped range renderer uses.**
+/// The window for grid point `g` is `(g - range, g]`, on a grid anchored
+/// at the query's start. A floor onto a grid anchored at the epoch is a
+/// different function: it is closed below rather than above, and its
+/// output is a multiple of the step rather than a point of the query's
+/// grid. The two agree only when the grid start happens to be a multiple
+/// of the step, and then only at the grid points themselves.
+///
+/// `bucket_col` is a `&'static str` and its only callers pass
+/// [`super::sql::MetricShape::bucket_col`], which returns one of two
+/// literals — no caller text can reach it.
+///
+/// # Refusals
+///
+/// Three, each with its own reason and none of them a client error. The
+/// overflow bound is taken over the newest row the statement can admit,
+/// which is the same `scan_end_ns` the statement's own `WHERE` enforces —
+/// so "this statement's arithmetic cannot wrap" is a property of the pair,
+/// not of the expression alone.
+pub fn bucket_expr(
+    bucket_col: &'static str,
+    lo_ns: i64,
+    step_ns: i64,
+    scan_start_ns: i64,
+    scan_end_ns: i64,
+) -> Result<CheckedFragment, BucketGridRefusal> {
+    if step_ns <= 0 {
+        return Err(BucketGridRefusal::StepNotPositive);
+    }
+    if lo_ns > scan_start_ns {
+        return Err(BucketGridRefusal::AnchorAboveScanStart);
+    }
+    // The widest numerator the statement can evaluate, and the grid point
+    // it produces. Both checked: a wrapped bucket is a silently wrong
+    // answer, where a refusal is today's behaviour.
+    let numerator = scan_end_ns
+        .checked_sub(lo_ns)
+        .and_then(|d| d.checked_add(step_ns))
+        .and_then(|d| d.checked_sub(1))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    (numerator / step_ns)
+        .checked_mul(step_ns)
+        .and_then(|t| lo_ns.checked_add(t))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    Ok(CheckedFragment {
+        sql: format!(
+            "{lo_ns} + intDiv({bucket_col} - {lo_ns} + {step_ns} - 1, {step_ns}) * {step_ns}"
+        ),
+    })
+}
+
 /// `countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, '<UUID_RE>'))` —
 /// `/detected_labels`' non-ID-value aggregate. **Takes no argument**, so no
 /// user string can enter it; [`UUID_RE`] is a module constant.
@@ -544,6 +952,813 @@ fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
         "match(body, {})",
         ch_regex_unanchored_checked(pattern)?
     ))
+}
+
+// ---------------------------------------------------------------------
+// Issue #507: the per-row readers of the extracted-field group key read.
+// ---------------------------------------------------------------------
+//
+// Every `match(` and `countMatches(` below is the database deciding
+// whether a body holds a spelling of a name that OUR flatten maps to that
+// name and `JSONExtractRaw` does not read. A row where one does is
+// UNDECIDED: the statement throws on it and our parser reads the line
+// (docs/query-to-sql.md, the extracted-field group key). The spellings
+// over-approximate; a wrong guess costs the throw, never an answer.
+
+/// JSON whitespace, and every whitespace escape and character our flatten
+/// trims from a key.
+const KEY_TRIM_CLASS: &str = r"(?:[ \t\n\r]|\\[tnrf]|\\u(?:00(?:0[9a-dA-D]|20|85|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000)|\x{00A0}|\x{0085}|\x{1680}|[\x{2000}-\x{200A}]|\x{2028}|\x{2029}|\x{202F}|\x{205F}|\x{3000})";
+
+/// JSON whitespace between a key's closing quote and its colon.
+const JSON_WS: &str = r"[ \t\n\r]*";
+
+/// One or more key bytes that are not a quote, or an escaped byte: what
+/// a flatten join or a sanitised separator can stand for.
+const KEY_SEP: &str = r#"(?:[^"\\]|\\.)+"#;
+
+/// A key label's raw text is an integer our parser renders identically.
+const INTEGER_TEXT: &str = "^-?[1-9][0-9]{0,18}$";
+
+/// The deepest nesting our parser reads (`serde_json`'s limit, unchanged).
+const MAX_JSON_NESTING: u32 = 127;
+
+/// The bare flatten's per-line key budget (`pipeline.rs`'s
+/// `MAX_JSON_FLATTEN_KEY_BYTES`).
+const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Which reader columns a fragment names: the unwrapped value's (`uw_`) or
+/// the `i`-th key label's (`l<i>_`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderColumns {
+    Unwrap,
+    Key(usize),
+}
+
+impl ReaderColumns {
+    fn prefix(self) -> String {
+        match self {
+            ReaderColumns::Unwrap => "uw".to_string(),
+            ReaderColumns::Key(i) => format!("l{i}"),
+        }
+    }
+}
+
+/// Why a name cannot be read by the group key statement. A refusal sends
+/// the query to today's route; it is never a client error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyReaderRefusal {
+    /// The name is not a label name, so no spelling guard is written for it.
+    NameNotRenderable,
+    /// A spelling guard does not compile as a pattern. Unreachable for a
+    /// label name; kept so the mint has no panic path.
+    PatternNotCompilable,
+}
+
+fn key_regex(pattern: &str) -> Result<String, KeyReaderRefusal> {
+    ch_regex_unanchored_checked(pattern).map_err(|_| KeyReaderRefusal::PatternNotCompilable)
+}
+
+/// `a_b`: every `_`-separated part is non-empty.
+fn parts_joined(name: &str) -> bool {
+    name.contains('_') && name.split('_').all(|p| !p.is_empty())
+}
+
+/// `_`, `__`: nothing but underscores.
+fn only_underscores(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c == '_')
+}
+
+fn parts_with_sep(parts: &[&str]) -> String {
+    parts.join(KEY_SEP)
+}
+
+/// A quoted key our flatten maps to `name`, spelled with any trimmed
+/// whitespace and, for a joined name, any separator between its parts.
+fn spelled_pattern(name: &str) -> String {
+    let body = if parts_joined(name) {
+        parts_with_sep(&name.split('_').collect::<Vec<_>>())
+    } else {
+        name.to_string()
+    };
+    format!("\"{KEY_TRIM_CLASS}*{body}{KEY_TRIM_CLASS}*\"{JSON_WS}:")
+}
+
+/// A key naming a PREFIX of a joined name that holds an object: our
+/// flatten joins its members onto the prefix.
+fn prefix_parent_pattern(name: &str) -> String {
+    let parts: Vec<&str> = name.split('_').collect();
+    let alts: Vec<String> = (1..parts.len())
+        .map(|j| parts_with_sep(&parts[..j]))
+        .collect();
+    format!(
+        "\"{KEY_TRIM_CLASS}*(?:{}){KEY_TRIM_CLASS}*\"{JSON_WS}:{JSON_WS}\\{{",
+        alts.join("|")
+    )
+}
+
+/// A key that is not exactly `"name"` and still maps to it.
+fn spelled_otherwise_pattern(name: &str) -> String {
+    if !parts_joined(name) {
+        return format!(
+            "\"(?:{KEY_TRIM_CLASS}+{name}{KEY_TRIM_CLASS}*|{name}{KEY_TRIM_CLASS}+)\"{JSON_WS}:"
+        );
+    }
+    let parts: Vec<&str> = name.split('_').collect();
+    let any_sep = parts_with_sep(&parts);
+    let odd_sep = r#"(?:(?:[^"\\_]|\\.)(?:[^"\\]|\\.)*|_(?:[^"\\]|\\.)+)"#;
+    let odd: Vec<String> = (1..parts.len())
+        .map(|i| {
+            format!(
+                "{}{odd_sep}{}",
+                parts_with_sep(&parts[..i]),
+                parts_with_sep(&parts[i..])
+            )
+        })
+        .collect();
+    format!(
+        "\"(?:{KEY_TRIM_CLASS}+{any_sep}{KEY_TRIM_CLASS}*|{any_sep}{KEY_TRIM_CLASS}+|{})\"{JSON_WS}:",
+        odd.join("|")
+    )
+}
+
+/// `(position(body, '\u') > 0 AND match(body, '\\u00(?i:..)'))`: an
+/// escaped byte of the name.
+fn unwrap_name_escaped(name: &str) -> Result<String, KeyReaderRefusal> {
+    let esc = ch_string("\\u");
+    if !name.is_ascii() {
+        return Ok(format!("position(body, {esc}) > 0"));
+    }
+    let hex: std::collections::BTreeSet<String> =
+        name.bytes().map(|b| format!("{b:02x}")).collect();
+    let pattern = format!(
+        "\\\\u00(?i:{})",
+        hex.into_iter().collect::<Vec<_>>().join("|")
+    );
+    Ok(format!(
+        "(position(body, {esc}) > 0 AND match(body, {}))",
+        key_regex(&pattern)?
+    ))
+}
+
+/// A spelling our flatten maps to `name` that is not the exact key.
+fn unwrap_name_spelled_otherwise(name: &str) -> Result<String, KeyReaderRefusal> {
+    let exact = format!("\"{name}\"");
+    if name.contains('_') && !parts_joined(name) {
+        let parts: Vec<&str> = name.split('_').filter(|p| !p.is_empty()).collect();
+        let counts: Vec<String> = parts
+            .iter()
+            .map(|p| format!("countSubstrings(body, {}) > 1", ch_string(p)))
+            .collect();
+        let any_named = format!("\"[^\"]*(?:{})[^\"]*\"{JSON_WS}:", parts.join("|"));
+        return Ok(format!(
+            "(({}) AND countMatches(body, {}) > countMatches(body, {}))",
+            counts.join(" OR "),
+            key_regex(&any_named)?,
+            key_regex(&format!("{exact}{JSON_WS}:"))?
+        ));
+    }
+    let first = name.split('_').next().unwrap_or("");
+    let mut spelled = format!(
+        "match(body, {})",
+        key_regex(&spelled_otherwise_pattern(name))?
+    );
+    if parts_joined(name) {
+        spelled = format!(
+            "({spelled} OR match(body, {}))",
+            key_regex(&prefix_parent_pattern(name))?
+        );
+    }
+    Ok(format!(
+        "(countSubstrings(body, {}) > countSubstrings(body, {}) AND {spelled})",
+        ch_string(first),
+        ch_string(&exact)
+    ))
+}
+
+/// A whitespace-only key holding an object: our flatten joins its members
+/// onto the empty prefix, so they reach the top level.
+fn unwrap_transparent_parent() -> Result<String, KeyReaderRefusal> {
+    let pattern = format!("\"{KEY_TRIM_CLASS}*\"{JSON_WS}:{JSON_WS}\\{{");
+    Ok(format!(
+        "(countSubstrings(body, '{{') > 1 AND match(body, {}))",
+        key_regex(&pattern)?
+    ))
+}
+
+/// `toUInt8(…)`: whether a bare `| json` over this body can read `name`
+/// from a spelling `JSONExtractRaw(body, 'name')` does not read (issue
+/// #507). `_`-only names are always ambiguous.
+pub fn unwrap_name_ambiguity(name: &str) -> Result<CheckedFragment, KeyReaderRefusal> {
+    if !name_is_renderable(name) {
+        return Err(KeyReaderRefusal::NameNotRenderable);
+    }
+    if only_underscores(name) {
+        return Ok(CheckedFragment {
+            sql: "toUInt8(1)".to_string(),
+        });
+    }
+    Ok(CheckedFragment {
+        sql: format!(
+            "toUInt8({} OR {} OR {})",
+            unwrap_name_escaped(name)?,
+            unwrap_name_spelled_otherwise(name)?,
+            unwrap_transparent_parent()?
+        ),
+    })
+}
+
+/// `countSubstrings(body, '{') + countSubstrings(body, '[') <= 127` — a
+/// body that passes nests at most 127 levels, so our parser reads it
+/// (issue #507). Brackets inside strings are counted too, which only
+/// moves such a row to our parser.
+pub fn json_depth_bound() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "countSubstrings(body, '{{') + countSubstrings(body, '[') <= {MAX_JSON_NESTING}"
+        ),
+    }
+}
+
+/// An upper bound on the bare flatten's key-budget charge for this body,
+/// within the budget (issue #507). A body of at most 4,050 bytes has at
+/// most 4,050 colons, so its bound is at most 66,031,200 bytes and the
+/// counts are not computed.
+pub fn json_flatten_key_budget_bound() -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "(length(body) <= 4050 OR if(countSubstrings(body, '{{') <= 1, 88 * \
+             countSubstrings(body, ':') + 4 * length(body), countSubstrings(body, ':') * (4 * \
+             length(body) + 104)) <= {JSON_FLATTEN_KEY_BUDGET})"
+        ),
+    }
+}
+
+/// `toUInt8(…)`: no value at `name`, no spelling of it, a valid document
+/// within the nesting bound and, on the bare form, within the key budget
+/// (issue #507). `bare` is the bare `| json` flatten; otherwise the path is
+/// exact and only validity and depth are asked.
+pub fn unwrap_name_absence(
+    columns: ReaderColumns,
+    name: &str,
+    form: super::sql::UnwrapForm,
+) -> Result<CheckedFragment, KeyReaderRefusal> {
+    let t = columns.prefix();
+    let depth = json_depth_bound();
+    let depth = depth.as_sql();
+    match form {
+        super::sql::UnwrapForm::Targeted => Ok(CheckedFragment {
+            sql: format!("toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth})"),
+        }),
+        super::sql::UnwrapForm::Bare => {
+            if !name_is_renderable(name) {
+                return Err(KeyReaderRefusal::NameNotRenderable);
+            }
+            let budget = json_flatten_key_budget_bound();
+            let mut spelled = format!("NOT match(body, {})", key_regex(&spelled_pattern(name))?);
+            if parts_joined(name) {
+                spelled = format!(
+                    "{spelled} AND NOT (countSubstrings(body, '{{') > 1 AND match(body, {}))",
+                    key_regex(&prefix_parent_pattern(name))?
+                );
+            }
+            let first = name.split('_').next().unwrap_or("");
+            Ok(CheckedFragment {
+                sql: format!(
+                    "toUInt8({t}_r = '' AND {t}_amb = 0 AND isValidJSON(body) AND {depth} AND \
+                     {} AND (position(body, {}) = 0 OR ({spelled})))",
+                    budget.as_sql(),
+                    ch_string(first)
+                ),
+            })
+        }
+    }
+}
+
+/// `match(l<i>_r, '^-?[1-9][0-9]{0,18}$')` — the raw text of a key label
+/// is an integer our parser renders the same way (issue #507).
+pub fn unwrap_label_integer_text(columns: ReaderColumns) -> CheckedFragment {
+    // A constant pattern; the escaper cannot refuse it.
+    let pattern =
+        ch_regex_unanchored_checked(INTEGER_TEXT).unwrap_or_else(|_| ch_string(INTEGER_TEXT));
+    CheckedFragment {
+        sql: format!("match({}_r, {pattern})", columns.prefix()),
+    }
+}
+
+/// Whether a row's structured metadata holds an entry named `name`
+/// (issue #507): the substring test first, and the key list only on a row
+/// that passes it.
+pub fn metadata_holds_name(name: &str) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!(
+            "(position({METADATA_COLUMN}, {}) > 0 AND has(JSONExtractKeys({METADATA_COLUMN}), {}))",
+            ch_string(&format!("\"{name}\":")),
+            ch_string(name)
+        ),
+    }
+}
+
+/// The structured metadata a group needs (issue #507): the entries named
+/// in `values`, with their values, and the entries named in `presence`
+/// with the value `'1'` — only their presence changes an answer. A row
+/// holding none of the names projects nothing and parses nothing.
+pub fn metadata_names_projection(values: &[String], presence: &[String]) -> CheckedFragment {
+    let mut names: Vec<&str> = values
+        .iter()
+        .chain(presence.iter())
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let needles: Vec<String> = names
+        .iter()
+        .map(|n| ch_string(&format!("\"{n}\":")))
+        .collect();
+    let in_list: Vec<String> = names.iter().map(|n| ch_string(n)).collect();
+    let mut kept = format!(
+        "arrayFilter(x -> x.1 IN ({}), JSONExtractKeysAndValues({METADATA_COLUMN}, 'String'))",
+        in_list.join(", ")
+    );
+    if !presence.is_empty() {
+        let mut pres: Vec<&str> = presence.iter().map(String::as_str).collect();
+        pres.sort_unstable();
+        pres.dedup();
+        let pres: Vec<String> = pres.iter().map(|n| ch_string(n)).collect();
+        kept = format!(
+            "arrayMap(x -> (x.1, if(x.1 IN ({}), '1', x.2)), {kept})",
+            pres.join(", ")
+        );
+    }
+    CheckedFragment {
+        sql: format!(
+            "if(multiSearchAny({METADATA_COLUMN}, [{}]), {kept}, CAST([], 'Array(Tuple(String, \
+             String))'))",
+            needles.join(", ")
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// The structured-metadata label filter (issue #544)
+// ---------------------------------------------------------------------
+
+/// The total rendered length of every structured-metadata fragment in ONE
+/// statement (issue #544).
+///
+/// Chosen from the headroom under
+/// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] once the shipped envelope is
+/// paid for. The envelope that constant was sized against — 100,000
+/// worst-case fingerprint literals, 10,000 service literals, 1 MiB of
+/// line-filter text and the template — is 3,908,974 bytes, leaving
+/// 4,479,634. This takes under half of it, so
+/// `3,908,974 + 2,097,152 = 6,006,126` still leaves 2,382,482 bytes
+/// unspent against the 8,388,608 cap, whatever the class partition.
+///
+/// **What can approach it.** The two collapsed forms cost 87 bytes (the
+/// ordinary extraction) and 1 byte (a uniform stream-label verdict)
+/// whatever the stream count, so only a name that IS a stream label on
+/// some selected streams and metadata on others renders a fingerprint
+/// list at all. The largest leaf the partition space admits was searched
+/// and rendered at 4,400,299 bytes, at `A = 99,998`, `B = 1`, `C = 1`,
+/// `A_true = 99,997`, which one filter would fit under the query-text cap
+/// and two would not.
+///
+/// **Past it the filter does not lower and the query takes the route it
+/// takes today** — never a rejection: a request that is legal today stays
+/// legal.
+pub const MAX_METADATA_FRAGMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Which name-resolution class each selected fingerprint falls in, for one
+/// filter name (issue #544). Built once per name, after stage 2, by
+/// `super::exec`'s `classify_metadata_name`.
+///
+/// # The rule these three encode
+///
+/// Derived from `merge_metadata_pairs`
+/// (`crates/pulsus-read/src/logql/labels.rs:362-399`), which is the
+/// reference's `LabelsBuilder.Add` routing
+/// (`pkg/logql/log/labels.go:392-412 @ v3.7.4`). `S(fp)` is the stream's
+/// exposed label set, `sm` the row's stored metadata:
+///
+/// ```text
+/// value_of(k, fp) =
+///    k in S(fp)                          ->  S(fp)[k]   (stream_label) the label always wins
+///    else k in keys(sm)                  ->  sm[k]      (direct)       the ordinary case
+///    else k = m ++ "_extracted"
+///         and m in S(fp)                 ->  sm[m]      (unsuffixed)   the renamed one
+///    else                                ->  ""         absent
+/// ```
+///
+/// A metadata pair whose name collides with a stream label is renamed
+/// `<name>_extracted`, so a filter on `k_extracted` reads the renamed pair
+/// — **unless** the metadata carries a literal `k_extracted`, which is
+/// written to the same slot afterwards and wins. That is why the
+/// `unsuffixed` arm is guarded by `JSONHas`.
+///
+/// # They MUST partition the selected set
+///
+/// The renderer makes one class the `NOT IN` complement, so a fingerprint
+/// in none of them would be decided by the wrong expression — a wrong row,
+/// in either direction depending on which class it truly belonged to.
+/// [`metadata_string_filter`] checks the partition and refuses with
+/// [`MetadataFilterRefusal::ClassesDoNotPartition`] rather than rendering
+/// on trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataNameClasses<'a> {
+    /// Every selected fingerprint, in the statement's own order.
+    pub selected: &'a [u64],
+    /// The name is a label of this stream; the verdict is constant over
+    /// every row of the fingerprint.
+    pub stream_label: &'a [u64],
+    /// …of those, the ones whose constant verdict is `true`.
+    pub stream_label_true: &'a [u64],
+    /// The name un-suffixes onto a stream label of this stream.
+    pub unsuffixed: &'a [u64],
+    /// The ordinary case: the metadata key answers directly.
+    pub direct: &'a [u64],
+    /// The name minus its `_extracted` suffix, for the `unsuffixed` arm.
+    /// `Some` exactly when `unsuffixed` is non-empty.
+    pub base_name: Option<&'a str>,
+}
+
+/// Which class the renderer made the `NOT IN` complement — the encoding
+/// choice, returned so it is inspectable rather than implicit in a length
+/// comparison (issue #544).
+///
+/// **Declaration order is the tie rule.** Ties are broken by this order,
+/// so the choice is a function of the class sizes alone and two builds
+/// cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplementClass {
+    StreamLabel,
+    Unsuffixed,
+    Direct,
+}
+
+/// Why a structured-metadata label filter is not pushed down (issue #544).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the filter is evaluated after the read, exactly as it is
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataFilterRefusal {
+    /// A regular-expression operator, a numeric comparison or an `ip()`
+    /// form.
+    ///
+    /// The two regular-expression operators are refused on the ground the
+    /// merged parsed-name cell already refuses them on: the reference's
+    /// own regex label matcher disagrees with the pattern it says it
+    /// compiles — measured, a pattern of the form `a.b` does not match a
+    /// value holding a line break while `.*` does — so lowering either
+    /// binds an unsettled reading into a statement.
+    ///
+    /// A numeric comparison is not a comparison at all: a value that does
+    /// not convert **keeps the line and sets the error label**
+    /// (`pkg/logql/log/label_filter.go` @ v3.7.4, the float-parse failure
+    /// arm). No `Equivalent` predicate expresses that.
+    OperatorNotServed,
+    /// A reserved error name, or its `_extracted` spelling: an
+    /// out-of-band slot the merge routes away from the label set, not an
+    /// ordinary label.
+    ReservedName,
+    /// Not a name a fragment may quote.
+    NameNotRenderable,
+    /// The render would not fit the statement's metadata budget.
+    FragmentTooLarge,
+    /// The three classes are not a partition of the selected set. The
+    /// complement arm would then decide a fingerprint by the wrong
+    /// expression, so nothing is rendered.
+    ClassesDoNotPartition,
+}
+
+/// Is this leaf one the metadata cell serves at all — operator, name
+/// shape and reserved-name rule (issue #544)?
+///
+/// **One function, two callers**, because the answer is needed twice with
+/// different inputs: `super::plan::compile_metadata_label_filters` asks it
+/// at plan time, from the pipeline alone and before any stream is
+/// resolved, and [`metadata_string_filter`] asks it again at render time.
+/// Two spellings of the rule would be free to drift, and the plan-time
+/// answer is what decides whether the request `LIMIT` compiles.
+pub fn metadata_leaf_is_servable(name: &str, op: MatchOp) -> Result<(), MetadataFilterRefusal> {
+    match op {
+        MatchOp::Eq | MatchOp::Neq => {}
+        MatchOp::Re | MatchOp::Nre => return Err(MetadataFilterRefusal::OperatorNotServed),
+    }
+    if !name_is_renderable(name) {
+        return Err(MetadataFilterRefusal::NameNotRenderable);
+    }
+    if super::plan::is_reserved_key_name(name) {
+        return Err(MetadataFilterRefusal::ReservedName);
+    }
+    Ok(())
+}
+
+/// `k <op> 'v'` over the metadata column, for the two per-row classes.
+fn class_expression(
+    class: ComplementClass,
+    name: &str,
+    cmp: &str,
+    value: &str,
+    base_name: Option<&str>,
+) -> Option<String> {
+    let key = ch_string(name);
+    let v = ch_string(value);
+    match class {
+        // The verdict is constant per fingerprint, so there is no
+        // expression to render: membership IS the verdict.
+        ComplementClass::StreamLabel => None,
+        ComplementClass::Unsuffixed => {
+            let base = ch_string(base_name?);
+            Some(format!(
+                "if(JSONHas({METADATA_COLUMN}, {key}), JSONExtractString({METADATA_COLUMN}, \
+                 {key}), JSONExtractString({METADATA_COLUMN}, {base})) {cmp} {v}"
+            ))
+        }
+        ComplementClass::Direct => Some(format!(
+            "JSONExtractString({METADATA_COLUMN}, {key}) {cmp} {v}"
+        )),
+    }
+}
+
+/// `fingerprint IN (a, b, c)` / `fingerprint NOT IN (…)`.
+fn fingerprint_test(fps: &[u64], negated: bool) -> String {
+    let mut out = String::with_capacity(fps.len() * 22 + 24);
+    out.push_str(if negated {
+        "fingerprint NOT IN ("
+    } else {
+        "fingerprint IN ("
+    });
+    for (i, fp) in fps.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&fp.to_string());
+    }
+    out.push(')');
+    out
+}
+
+/// An equality or inequality filter over a structured-metadata name,
+/// rendered for the selected fingerprints (issue #544).
+///
+/// # The encoding
+///
+/// Partition the selected fingerprints by which name-resolution rule the
+/// name takes on each stream ([`MetadataNameClasses`]), render every
+/// admissible encoding — one per choice of which class is the `else`, plus
+/// the one with no `else` at all — and take the **shortest**. Ties are
+/// broken by [`ComplementClass`] declaration order, with the no-`else`
+/// form last, so the choice is a function of the class sizes alone and two
+/// builds cannot disagree.
+///
+/// ```text
+///    fingerprint IN (<stream_label_true>)
+/// OR (fingerprint IN (<unsuffixed>) AND if(JSONHas(sm,'k'),
+///                                          JSONExtractString(sm,'k'),
+///                                          JSONExtractString(sm,'m')) <op> 'v')
+/// OR (fingerprint IN (<direct>) AND JSONExtractString(sm,'k') <op> 'v')
+/// OR (fingerprint NOT IN (<every other class, IN FULL>) AND <the else class's expression>)
+/// ```
+///
+/// **The `NOT IN` list is every other class in full, never the
+/// fingerprints the other arms happened to render.** With no passing
+/// stream-label fingerprint the stream-label arm vanishes, and a list
+/// built from the rendered arms would be `NOT IN ()` — which admits the
+/// stream-label fingerprints into the metadata arm, where the key is read
+/// directly and the stream label that should have won is ignored.
+/// Measured on `{app="mix"} | env="fromSM2"`: the rule's render returns
+/// the one row the evaluator keeps, the arms-only render returns two.
+///
+/// **An arm covering an empty class is dropped**, and when exactly one
+/// class is non-empty the fragment carries no fingerprint test at all —
+/// **except** a non-uniform stream-label class, which emits the passing
+/// list, because `NOT IN` cannot express a per-fingerprint constant that
+/// differs within the class. That is what makes the two common shapes
+/// cheap whatever the stream count:
+///
+/// ```text
+/// no selected stream carries the name      JSONExtractString(structured_metadata, 'trace_id') = '<32 hex>'   87 bytes
+/// every stream carries it, one verdict     1                                                                  1 byte
+/// ```
+///
+/// # Rows it drops
+///
+/// **None the evaluator keeps, and none it drops is kept** — the
+/// predicate is `Fidelity::Equivalent`, which is what lets the request
+/// `LIMIT` compile. The three arms reproduce the merge's own routing
+/// exactly, and our decoder and the database read the same value out of
+/// every byte string a field source can write
+/// (`crates/pulsus-read/src/canonical_labels.rs`, issue #539).
+///
+/// # Errors
+///
+/// Every variant of [`MetadataFilterRefusal`] means the query is valid and
+/// the filter is evaluated after the read, exactly as it is today.
+pub fn metadata_string_filter(
+    name: &str,
+    op: MatchOp,
+    value: &str,
+    classes: MetadataNameClasses<'_>,
+    budget_remaining: usize,
+) -> Result<(CheckedFragment, Option<ComplementClass>), MetadataFilterRefusal> {
+    metadata_leaf_is_servable(name, op)?;
+    check_partition(&classes)?;
+    let cmp = match op {
+        MatchOp::Eq => "=",
+        MatchOp::Neq => "!=",
+        MatchOp::Re | MatchOp::Nre => return Err(MetadataFilterRefusal::OperatorNotServed),
+    };
+
+    // The stream-label class may be the `else` only when its verdict is
+    // uniform: `NOT IN` cannot express a per-fingerprint constant that
+    // differs within the class.
+    let a_all = classes.stream_label_true.len() == classes.stream_label.len();
+    let a_none = classes.stream_label_true.is_empty();
+    let a_uniform = a_all || a_none;
+
+    let mut best: Option<(String, Option<ComplementClass>)> = None;
+    let mut consider = |sql: String, which: Option<ComplementClass>| {
+        let shorter = match &best {
+            None => true,
+            Some((have, _)) => sql.len() < have.len(),
+        };
+        if shorter {
+            best = Some((sql, which));
+        }
+    };
+    for which in [
+        ComplementClass::StreamLabel,
+        ComplementClass::Unsuffixed,
+        ComplementClass::Direct,
+    ] {
+        let list = class_list(&classes, which);
+        if list.is_empty() {
+            continue;
+        }
+        if matches!(which, ComplementClass::StreamLabel) && !a_uniform {
+            continue;
+        }
+        consider(
+            render_encoding(name, cmp, value, &classes, Some(which), a_all),
+            Some(which),
+        );
+    }
+    consider(
+        render_encoding(name, cmp, value, &classes, None, a_all),
+        None,
+    );
+
+    let (sql, which) = best.expect("the no-complement encoding is always rendered");
+    if sql.len() > budget_remaining {
+        return Err(MetadataFilterRefusal::FragmentTooLarge);
+    }
+    Ok((CheckedFragment { sql }, which))
+}
+
+/// The fingerprints of one class.
+fn class_list<'a>(classes: &MetadataNameClasses<'a>, which: ComplementClass) -> &'a [u64] {
+    match which {
+        ComplementClass::StreamLabel => classes.stream_label,
+        ComplementClass::Unsuffixed => classes.unsuffixed,
+        ComplementClass::Direct => classes.direct,
+    }
+}
+
+/// One encoding: `complement` names the class that becomes the `else`, or
+/// `None` for the form where every non-empty class is listed explicitly.
+fn render_encoding(
+    name: &str,
+    cmp: &str,
+    value: &str,
+    classes: &MetadataNameClasses<'_>,
+    complement: Option<ComplementClass>,
+    a_all: bool,
+) -> String {
+    let order = [
+        ComplementClass::StreamLabel,
+        ComplementClass::Unsuffixed,
+        ComplementClass::Direct,
+    ];
+    let mut arms: Vec<String> = Vec::with_capacity(3);
+    // The explicit arms, in the fixed class order.
+    for which in order {
+        if Some(which) == complement {
+            continue;
+        }
+        let list = class_list(classes, which);
+        if list.is_empty() {
+            continue;
+        }
+        match which {
+            ComplementClass::StreamLabel => {
+                // Membership IS the verdict, so the arm lists the passing
+                // fingerprints and nothing else. None passing, no arm.
+                if !classes.stream_label_true.is_empty() {
+                    arms.push(fingerprint_test(classes.stream_label_true, false));
+                }
+            }
+            _ => {
+                let expr = class_expression(which, name, cmp, value, classes.base_name)
+                    .expect("a non-empty unsuffixed class carries its base name");
+                arms.push(format!("({} AND {expr})", fingerprint_test(list, false)));
+            }
+        }
+    }
+    // The complement arm, whose `NOT IN` list is every OTHER class in
+    // full — never the fingerprints the arms above happened to render.
+    if let Some(which) = complement {
+        let mut others: Vec<u64> = Vec::new();
+        for other in order {
+            if other == which {
+                continue;
+            }
+            others.extend_from_slice(class_list(classes, other));
+        }
+        match which {
+            ComplementClass::StreamLabel => {
+                // Uniform, by construction: this arm is only offered when
+                // it is. `a_all` is its constant verdict.
+                if a_all {
+                    if others.is_empty() {
+                        arms.push("1".to_string());
+                    } else {
+                        arms.push(fingerprint_test(&others, true));
+                    }
+                }
+            }
+            _ => {
+                let expr = class_expression(which, name, cmp, value, classes.base_name)
+                    .expect("a non-empty unsuffixed class carries its base name");
+                if others.is_empty() {
+                    arms.push(expr);
+                } else {
+                    arms.push(format!("({} AND {expr})", fingerprint_test(&others, true)));
+                }
+            }
+        }
+    }
+    match arms.len() {
+        // Nothing passes: the constant, which is one byte and is what the
+        // uniformly-false stream-label case renders.
+        0 => "0".to_string(),
+        1 => arms.pop().unwrap_or_default(),
+        _ => format!("({})", arms.join(" OR ")),
+    }
+}
+
+/// Conjoins two structured-metadata fragments — one `and` node of a
+/// label-filter stage's tree (issue #544).
+///
+/// **Here rather than at the caller** because a [`CheckedFragment`] can
+/// only be minted in this module (the seal), and a stage's tree is
+/// rendered leaf by leaf: each leaf has its own name and therefore its own
+/// class partition.
+pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("({} AND {})", a.sql, b.sql),
+    }
+}
+
+/// Disjoins two structured-metadata fragments — one `or` node. See
+/// [`metadata_filter_and`].
+pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("({} OR {})", a.sql, b.sql),
+    }
+}
+
+/// The three classes must partition the selected set, and the passing
+/// stream-label fingerprints must be a subset of the stream-label class.
+fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal> {
+    let mut union: Vec<u64> = Vec::with_capacity(
+        classes.stream_label.len() + classes.unsuffixed.len() + classes.direct.len(),
+    );
+    union.extend_from_slice(classes.stream_label);
+    union.extend_from_slice(classes.unsuffixed);
+    union.extend_from_slice(classes.direct);
+    if union.len() != classes.selected.len() {
+        return Err(MetadataFilterRefusal::ClassesDoNotPartition);
+    }
+    union.sort_unstable();
+    let mut want: Vec<u64> = classes.selected.to_vec();
+    want.sort_unstable();
+    if union != want {
+        return Err(MetadataFilterRefusal::ClassesDoNotPartition);
+    }
+    let mut a: Vec<u64> = classes.stream_label.to_vec();
+    a.sort_unstable();
+    if !classes
+        .stream_label_true
+        .iter()
+        .all(|fp| a.binary_search(fp).is_ok())
+    {
+        return Err(MetadataFilterRefusal::ClassesDoNotPartition);
+    }
+    if classes.unsuffixed.is_empty() != classes.base_name.is_none() {
+        return Err(MetadataFilterRefusal::ClassesDoNotPartition);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -725,5 +1940,684 @@ mod tests {
                 expected
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // W3 (issue #507): the parsed-name filter's fragments, its refusals,
+    // and the rule every cell is built to.
+    // -----------------------------------------------------------------
+
+    /// One row of `tests/logql_parsed_filter_witnesses.tsv`.
+    pub(crate) struct Witness {
+        pub(crate) form: String,
+        pub(crate) parser: String,
+        pub(crate) arg: String,
+        pub(crate) name: String,
+        pub(crate) value: String,
+        pub(crate) body: String,
+        pub(crate) keeps: bool,
+    }
+
+    /// The witness table, read from the file both halves of the rule read.
+    pub(crate) fn witnesses() -> Vec<Witness> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/logql_parsed_filter_witnesses.tsv"
+        );
+        let text = std::fs::read_to_string(path).expect("the witness table is readable");
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() || line.starts_with("form\t") {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 7, "seven columns: {line:?}");
+            out.push(Witness {
+                form: f[0].to_string(),
+                parser: f[1].to_string(),
+                arg: f[2].to_string(),
+                name: f[3].to_string(),
+                value: f[4].to_string(),
+                body: f[5].to_string(),
+                keeps: f[6] == "1",
+            });
+        }
+        assert!(!out.is_empty(), "the witness table is not empty");
+        out
+    }
+
+    /// The LogQL query one witness row describes.
+    pub(crate) fn witness_query(w: &Witness) -> String {
+        let stage = match w.parser.as_str() {
+            "json" => "| json".to_string(),
+            "logfmt" => "| logfmt".to_string(),
+            "regexp" => format!(r#"| regexp "{}""#, w.arg),
+            "pattern" => format!(r#"| pattern "{}""#, w.arg),
+            other => panic!("unknown parser {other}"),
+        };
+        let filter = match w.form.as_str() {
+            "numeric" => format!("| {} >= {}", w.name, w.value),
+            "neq" => format!(r#"| {}!="{}""#, w.name, w.value),
+            _ => format!(r#"| {}="{}""#, w.name, w.value),
+        };
+        format!(r#"{{s="m"}} {stage} {filter}"#)
+    }
+
+    /// W3 (issue #507) — **the `keeps` column is the answer the shipped
+    /// pipeline gives**, not a value someone typed and nobody ran.
+    ///
+    /// The column is hand-written, because it is the claim the live half
+    /// checks the database against; this test is what stops a typo in it
+    /// becoming a false expectation there.
+    #[test]
+    fn every_witness_row_states_the_answer_the_pipeline_gives() {
+        for w in witnesses() {
+            let query = witness_query(&w);
+            let expr = pulsus_logql::parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let pulsus_logql::Expr::Log(log) = expr else {
+                panic!("{query} is not a log expression")
+            };
+            let compiled = super::super::pipeline::CompiledPipeline::compile(&log.pipeline)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let mut out = Vec::new();
+            let kept = compiled
+                .run_into(&w.body, &[], 0, &mut out)
+                .expect("within budget")
+                .is_some();
+            assert_eq!(
+                kept, w.keeps,
+                "`{query}` over `{}`: the table says keeps={}, the pipeline says {kept}",
+                w.body, w.keeps
+            );
+        }
+    }
+
+    fn json_parser() -> ParserStage {
+        ParserStage::Json {
+            extractions: Vec::new(),
+        }
+    }
+
+    fn logfmt_parser() -> ParserStage {
+        ParserStage::Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: Vec::new(),
+        }
+    }
+
+    /// W3 (issue #507) — the three served fragments, byte for byte.
+    #[test]
+    fn a_parsed_name_filter_renders_the_specified_fragment() {
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Eq, "error", &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') = 'error' OR structured_metadata != '')"
+        );
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Neq, "error", &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') != 'error' OR structured_metadata != '')"
+        );
+        // The logfmt form BRANCHES on the operator: the empty alternative
+        // belongs to `=` and would drop a kept row under `!=`.
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Neq, "error", &logfmt_parser())
+                .expect("served")
+                .as_sql(),
+            concat!(
+                r#"(extractKeyValuePairs(body, '=', ' \t\r\n', "#,
+                r#"'"'"#,
+                r#")['level'] != 'error' OR position(body, '\\') > 0 "#,
+                r#"OR structured_metadata != '')"#,
+            )
+        );
+        assert_eq!(
+            parsed_string_filter(
+                "a",
+                MatchOp::Eq,
+                "err",
+                &ParserStage::Regexp("(?P<a>[a-z]+)".to_string())
+            )
+            .expect("served")
+            .as_sql(),
+            "body LIKE '%err%'"
+        );
+        assert_eq!(
+            parsed_numeric_filter("status", CompareOp::Gte, 500.0, &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'status') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body, 'status') >= 500.0 OR structured_metadata != '')"
+        );
+    }
+
+    /// W3 (issue #507) — **a numeric threshold is a float literal, and
+    /// that is not cosmetic.**
+    ///
+    /// Written bare, `9007199254740993` lexes as `UInt64` and is compared
+    /// against a `Float64` exactly. Measured on 26.3.29.7:
+    /// `toTypeName(9007199254740993)` is `UInt64`,
+    /// `toTypeName(9007199254740993.0)` is `Float64`, and
+    /// `9007199254740992.0 = 9007199254740993` is false — so the bare form
+    /// returns no rows at that magnitude where the answer is two.
+    ///
+    /// The four values are chosen where the two readings differ by the
+    /// least, on both sides of the point where they start to differ.
+    #[test]
+    fn a_numeric_threshold_renders_as_a_float_literal() {
+        for (threshold, want) in [
+            (500.0f64, "500.0"),
+            (0.25, "0.25"),
+            (9007199254740992.0, "9007199254740992.0"),
+            (9007199254740993.0, "9007199254740992.0"),
+            (9007199254740994.0, "9007199254740994.0"),
+            // The smallest positive subnormal, written as its bits so no
+            // decimal spelling is involved: `{:?}` renders it `5e-324`,
+            // and the database reads `5e-324` back as the same double.
+            // A string cast does not — `toFloat64('4.9406564584124654e-324')`
+            // is `0` on 26.3.29.7 — which is why the literal is a decimal
+            // and not a cast.
+            (f64::from_bits(1), "5e-324"),
+        ] {
+            let sql = parsed_numeric_filter("status", CompareOp::Gte, threshold, &json_parser())
+                .expect("served");
+            assert!(
+                sql.as_sql()
+                    .contains(&format!("JSONExtractFloat(body, 'status') >= {want} OR")),
+                "threshold {threshold} must render as `{want}`: {}",
+                sql.as_sql()
+            );
+        }
+    }
+
+    /// W3 (issue #507) — every refusal, each with the input that reaches
+    /// it and no other.
+    #[test]
+    fn a_parsed_name_filter_refuses_with_the_stated_reason() {
+        let json = json_parser();
+        let re = ParserStage::Regexp("(?P<a>.*)".to_string());
+        // The two regular-expression operators are not served, because
+        // our regex label-filter semantics already differ from the
+        // reference and pushing them down would bind that difference into
+        // a statement.
+        for op in [MatchOp::Re, MatchOp::Nre] {
+            assert_eq!(
+                parsed_string_filter("level", op, "error", &json),
+                Err(ParsedFilterRefusal::OperatorNotServed),
+                "{op:?}"
+            );
+        }
+        // A name with `_` can be produced by more than one raw key.
+        assert_eq!(
+            parsed_string_filter("trace_id", MatchOp::Eq, "x", &json),
+            Err(ParsedFilterRefusal::AmbiguousName)
+        );
+        assert_eq!(
+            parsed_numeric_filter("status_code", CompareOp::Gte, 500.0, &json),
+            Err(ParsedFilterRefusal::AmbiguousName)
+        );
+        // The value probe serves `=` alone: for `!=` it would drop every
+        // row holding the value anywhere, including a row where it sits
+        // outside the capture and the capture differs.
+        assert_eq!(
+            parsed_string_filter("a", MatchOp::Neq, "v", &re),
+            Err(ParsedFilterRefusal::OperatorNotServed)
+        );
+        assert!(
+            parsed_string_filter("a", MatchOp::Eq, "v", &re).is_ok(),
+            "the control: the probe serves `=` on the same input"
+        );
+        // A capture has no key-precise expression, so the numeric form has
+        // nothing to compare.
+        assert_eq!(
+            parsed_numeric_filter("a", CompareOp::Gte, 500.0, &re),
+            Err(ParsedFilterRefusal::NoKeyExpression)
+        );
+        assert_eq!(
+            parsed_numeric_filter("status", CompareOp::Gte, 500.0, &logfmt_parser()),
+            Err(ParsedFilterRefusal::NoKeyExpression)
+        );
+        // A non-finite threshold has no literal the database accepts.
+        for t in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(
+                parsed_numeric_filter("status", CompareOp::Gt, t, &json),
+                Err(ParsedFilterRefusal::ThresholdNotFinite)
+            );
+        }
+        // A name a fragment may not render.
+        for bad in ["1abc", "a-b", "", "a b"] {
+            assert_eq!(
+                parsed_string_filter(bad, MatchOp::Eq, "x", &json),
+                Err(ParsedFilterRefusal::NameNotRenderable),
+                "{bad:?}"
+            );
+        }
+        // The controls: the refusals must not be reachable from an
+        // ordinary filter.
+        assert!(parsed_string_filter("level", MatchOp::Eq, "error", &json).is_ok());
+        assert!(parsed_numeric_filter("status", CompareOp::Gte, 500.0, &json).is_ok());
+    }
+
+    /// W3 (issue #507), condition 6 — the metadata column is named in one
+    /// private constant, and the two public ways to name it both render
+    /// the bare column.
+    #[test]
+    fn the_metadata_column_is_named_in_one_place() {
+        assert_eq!(MetadataTerm::Project.as_sql(), "structured_metadata");
+        assert_eq!(MetadataTerm::Group.as_sql(), "structured_metadata");
+        assert_eq!(
+            metadata_non_empty_guard().as_sql(),
+            "structured_metadata != ''"
+        );
+    }
+    // -----------------------------------------------------------------
+    // Issue #544 — the structured-metadata label filter
+    // -----------------------------------------------------------------
+
+    /// A selection of `n` fingerprints, spread so no two are adjacent.
+    fn fps(n: usize) -> Vec<u64> {
+        (0..n as u64)
+            .map(|i| 18_000_000_000_000_000_000 + i * 7_919)
+            .collect()
+    }
+
+    fn classes<'a>(
+        selected: &'a [u64],
+        stream_label: &'a [u64],
+        stream_label_true: &'a [u64],
+        unsuffixed: &'a [u64],
+        direct: &'a [u64],
+        base_name: Option<&'a str>,
+    ) -> MetadataNameClasses<'a> {
+        MetadataNameClasses {
+            selected,
+            stream_label,
+            stream_label_true,
+            unsuffixed,
+            direct,
+            base_name,
+        }
+    }
+
+    const TRACE_ID: &str = "740e2a1b9c3d4f5061728394a5b6c7d8";
+
+    /// Issue #544 AC1 — **the two collapsed forms are exactly 87 and 1
+    /// bytes, at any stream count.**
+    ///
+    /// The ordinary shape (no selected stream carries the name) and the
+    /// uniform stream-label shape are the two every query in the design
+    /// record's corpus takes, and neither may carry a fingerprint list:
+    /// a list would put up to 100,000 literals into the statement text for
+    /// a predicate that does not need one.
+    #[test]
+    fn the_collapsed_metadata_fragments_are_87_and_1_bytes() {
+        for n in [3usize, 100_000] {
+            let sel = fps(n);
+            let (ordinary, complement) = metadata_string_filter(
+                "trace_id",
+                MatchOp::Eq,
+                TRACE_ID,
+                classes(&sel, &[], &[], &[], &sel, None),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .expect("the ordinary shape renders");
+            assert_eq!(
+                ordinary.as_sql(),
+                "JSONExtractString(structured_metadata, 'trace_id') = \
+                 '740e2a1b9c3d4f5061728394a5b6c7d8'",
+                "the ordinary shape at {n} fingerprints"
+            );
+            assert_eq!(ordinary.as_sql().len(), 87, "ordinary, {n} fingerprints");
+            assert_eq!(complement, Some(ComplementClass::Direct));
+
+            let (uniform, complement) = metadata_string_filter(
+                "env",
+                MatchOp::Eq,
+                "prod",
+                classes(&sel, &sel, &sel, &[], &[], None),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .expect("the uniform stream-label shape renders");
+            assert_eq!(uniform.as_sql(), "1", "uniform verdict at {n} fingerprints");
+            assert_eq!(uniform.as_sql().len(), 1, "uniform, {n} fingerprints");
+            assert_eq!(complement, Some(ComplementClass::StreamLabel));
+
+            // …and the uniformly-FALSE verdict is the other constant.
+            let (none_pass, _) = metadata_string_filter(
+                "env",
+                MatchOp::Eq,
+                "prod",
+                classes(&sel, &sel, &[], &[], &[], None),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .expect("renders");
+            assert_eq!(none_pass.as_sql(), "0", "uniformly false, {n} fingerprints");
+        }
+    }
+
+    /// Issue #544 AC2 — **the three classes partition the selected set**,
+    /// and a render over a partition that is not one is refused rather
+    /// than emitted.
+    ///
+    /// The complement arm's `NOT IN` list is every other class in full, so
+    /// a fingerprint in none of the three would be decided by the wrong
+    /// expression — a wrong row, in either direction.
+    #[test]
+    fn the_three_classes_partition_the_selected_fingerprints() {
+        let sel = fps(9);
+        let (a, b, c) = (&sel[0..3], &sel[3..6], &sel[6..9]);
+        let ok = metadata_string_filter(
+            "env_extracted",
+            MatchOp::Eq,
+            "x",
+            classes(&sel, a, &a[0..1], b, c, Some("env")),
+            MAX_METADATA_FRAGMENT_BYTES,
+        );
+        assert!(ok.is_ok(), "a true partition renders: {ok:?}");
+
+        // One fingerprint missing from every class.
+        let short: Vec<u64> = c[..2].to_vec();
+        assert_eq!(
+            metadata_string_filter(
+                "env_extracted",
+                MatchOp::Eq,
+                "x",
+                classes(&sel, a, &a[0..1], b, &short, Some("env")),
+                MAX_METADATA_FRAGMENT_BYTES,
+            ),
+            Err(MetadataFilterRefusal::ClassesDoNotPartition),
+            "a fingerprint in no class"
+        );
+        // One fingerprint in two classes at once.
+        let both: Vec<u64> = c.iter().chain(a.iter().take(1)).copied().collect();
+        assert_eq!(
+            metadata_string_filter(
+                "env_extracted",
+                MatchOp::Eq,
+                "x",
+                classes(&sel, a, &a[0..1], b, &both, Some("env")),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .map(|_| ()),
+            Err(MetadataFilterRefusal::ClassesDoNotPartition),
+            "a fingerprint in two classes"
+        );
+        // A passing fingerprint that is not in the stream-label class.
+        assert_eq!(
+            metadata_string_filter(
+                "env_extracted",
+                MatchOp::Eq,
+                "x",
+                classes(&sel, a, &c[0..1], b, c, Some("env")),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .map(|_| ()),
+            Err(MetadataFilterRefusal::ClassesDoNotPartition),
+            "a passing fingerprint outside its class"
+        );
+    }
+
+    /// Issue #544 AC3 — **the encoding chosen is the shortest admissible
+    /// render**, a non-uniform stream-label class is never offered as the
+    /// complement, and a tie goes to the class earliest in the fixed
+    /// order.
+    #[test]
+    fn the_encoding_is_the_shortest_admissible_render() {
+        let sel = fps(12);
+        // Every admissible complement, rendered independently here, so the
+        // expectation is not the renderer's own answer echoed back.
+        /// `(name, stream_label, stream_label_true, unsuffixed, direct,
+        /// the complement the renderer must choose)`, by index into
+        /// `sel`.
+        type Case = (
+            &'static str,
+            &'static [usize],
+            &'static [usize],
+            &'static [usize],
+            &'static [usize],
+            Option<ComplementClass>,
+        );
+        let cases: &[Case] = &[
+            // a non-uniform stream-label class with a larger direct class:
+            // the stream-label class cannot be the `else`, so `Direct` is.
+            (
+                "env",
+                &[0, 1],
+                &[0],
+                &[],
+                &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                Some(ComplementClass::Direct),
+            ),
+            // the same shape with the classes swapped: the stream-label
+            // class is the largest and still cannot be the `else`, and
+            // with only two fingerprints in the direct class the form
+            // with NO complement at all is shorter than making that class
+            // the `else` — the `NOT IN` would have to list all ten.
+            (
+                "env",
+                &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                &[2],
+                &[],
+                &[0, 1],
+                None,
+            ),
+            // a UNIFORM stream-label class may be the `else`.
+            (
+                "env",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                &[],
+                &[10, 11],
+                Some(ComplementClass::StreamLabel),
+            ),
+            // one non-empty class: no fingerprint test at all.
+            (
+                "trace_id",
+                &[],
+                &[],
+                &[],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                Some(ComplementClass::Direct),
+            ),
+        ];
+        for (name, a, a_true, b, c, want) in cases {
+            let pick = |ix: &[usize]| -> Vec<u64> { ix.iter().map(|i| sel[*i]).collect() };
+            let (a, a_true, b, c) = (pick(a), pick(a_true), pick(b), pick(c));
+            let base = if b.is_empty() { None } else { Some("env") };
+            let (fragment, complement) = metadata_string_filter(
+                name,
+                MatchOp::Eq,
+                "prod",
+                classes(&sel, &a, &a_true, &b, &c, base),
+                MAX_METADATA_FRAGMENT_BYTES,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(
+                complement,
+                *want,
+                "{name}: complement, rendered {}",
+                fragment.as_sql()
+            );
+            // …and it really is the shortest of the admissible ones.
+            let a_uniform = a_true.len() == a.len() || a_true.is_empty();
+            let mut shortest = fragment.as_sql().len();
+            for which in [
+                ComplementClass::StreamLabel,
+                ComplementClass::Unsuffixed,
+                ComplementClass::Direct,
+            ] {
+                let list = match which {
+                    ComplementClass::StreamLabel => &a,
+                    ComplementClass::Unsuffixed => &b,
+                    ComplementClass::Direct => &c,
+                };
+                if list.is_empty() {
+                    continue;
+                }
+                if matches!(which, ComplementClass::StreamLabel) && !a_uniform {
+                    assert_ne!(
+                        complement,
+                        Some(ComplementClass::StreamLabel),
+                        "{name}: a NON-UNIFORM stream-label class was offered as the complement"
+                    );
+                    continue;
+                }
+                let rendered = render_encoding(
+                    name,
+                    "=",
+                    "prod",
+                    &classes(&sel, &a, &a_true, &b, &c, base),
+                    Some(which),
+                    a_true.len() == a.len(),
+                );
+                shortest = shortest.min(rendered.len());
+            }
+            shortest = shortest.min(
+                render_encoding(
+                    name,
+                    "=",
+                    "prod",
+                    &classes(&sel, &a, &a_true, &b, &c, base),
+                    None,
+                    a_true.len() == a.len(),
+                )
+                .len(),
+            );
+            assert_eq!(
+                fragment.as_sql().len(),
+                shortest,
+                "{name}: the chosen encoding is not the shortest admissible one"
+            );
+        }
+    }
+
+    /// Issue #544 AC17 — **the complement's `NOT IN` list is every other
+    /// class in full**, never the fingerprints the other arms happened to
+    /// render.
+    ///
+    /// With no passing stream-label fingerprint the stream-label arm
+    /// vanishes. A list built from the rendered arms is then `NOT IN ()`,
+    /// which admits the stream-label fingerprints into the metadata arm —
+    /// where the key is read directly and the stream label that should
+    /// have won is ignored. Measured on `{app="mix"} | env="fromSM2"`:
+    /// the rule's render returns the one row the evaluator keeps, the
+    /// arms-only render returns two.
+    ///
+    /// **This has to be asserted on the SQL, and the live suite cannot do
+    /// it.** The client pipeline re-runs the label filter over whatever
+    /// comes back, so a predicate that is too WIDE is invisible in the
+    /// response — measured: with the arms-only list applied, the live
+    /// answers are unchanged on all 32 lowered queries. That is the
+    /// mitigation working, and it is why the rule needs a check that
+    /// reads the rendered text.
+    #[test]
+    fn the_complement_excludes_every_other_class_not_only_the_rendered_arms() {
+        let sel = fps(3);
+        let (fragment, complement) = metadata_string_filter(
+            "env",
+            MatchOp::Eq,
+            "fromSM2",
+            // fp0 carries `env` as a stream label whose value is not
+            // `fromSM2`, so nothing in the stream-label class passes.
+            classes(&sel, &sel[0..1], &[], &[], &sel[1..3], None),
+            MAX_METADATA_FRAGMENT_BYTES,
+        )
+        .expect("renders");
+        assert_eq!(complement, Some(ComplementClass::Direct));
+        let sql = fragment.as_sql();
+        assert!(
+            sql.contains(&format!("fingerprint NOT IN ({})", sel[0])),
+            "the complement must exclude the stream-label class in full: {sql}"
+        );
+        assert!(
+            !sql.contains("NOT IN ()"),
+            "an empty exclusion admits the stream-label class: {sql}"
+        );
+    }
+
+    /// Issue #544 AC11 — **the documented statement is the emitted
+    /// statement.** The bare fragment for the single-`trace_id` query with
+    /// no colliding stream is character for character what
+    /// `docs/query-to-sql.md` prints.
+    #[test]
+    fn the_bare_metadata_fragment_matches_the_design_record() {
+        let sel = fps(4);
+        let (fragment, _) = metadata_string_filter(
+            "trace_id",
+            MatchOp::Eq,
+            TRACE_ID,
+            classes(&sel, &[], &[], &[], &sel, None),
+            MAX_METADATA_FRAGMENT_BYTES,
+        )
+        .expect("renders");
+        let sql = fragment.as_sql();
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/query-to-sql.md"),
+        )
+        .expect("docs/query-to-sql.md");
+        assert!(
+            doc.contains(sql),
+            "docs/query-to-sql.md does not print the emitted fragment.\n  emitted: {sql}"
+        );
+    }
+
+    /// Issue #544 — the budget is a refusal, and the caller falls back.
+    #[test]
+    fn a_render_past_the_budget_is_refused_rather_than_truncated() {
+        let sel = fps(1_000);
+        let a: Vec<u64> = sel[..500].to_vec();
+        let c: Vec<u64> = sel[500..].to_vec();
+        let full = metadata_string_filter(
+            "env",
+            MatchOp::Eq,
+            "prod",
+            classes(&sel, &a, &a[..250], &[], &c, None),
+            MAX_METADATA_FRAGMENT_BYTES,
+        )
+        .expect("renders inside the budget");
+        let len = full.0.as_sql().len();
+        assert_eq!(
+            metadata_string_filter(
+                "env",
+                MatchOp::Eq,
+                "prod",
+                classes(&sel, &a, &a[..250], &[], &c, None),
+                len - 1,
+            )
+            .map(|_| ()),
+            Err(MetadataFilterRefusal::FragmentTooLarge),
+            "one byte under the render's own length"
+        );
+    }
+
+    /// Issue #544 — every refusal the metadata cell states, by operator
+    /// and by name.
+    #[test]
+    fn the_metadata_cell_refuses_what_it_says_it_refuses() {
+        for (name, op) in [("trace_id", MatchOp::Re), ("trace_id", MatchOp::Nre)] {
+            assert_eq!(
+                metadata_leaf_is_servable(name, op),
+                Err(MetadataFilterRefusal::OperatorNotServed),
+                "{name} {op:?}"
+            );
+        }
+        for name in ["__error__", "__error_details__", "__error___extracted"] {
+            assert_eq!(
+                metadata_leaf_is_servable(name, MatchOp::Eq),
+                Err(MetadataFilterRefusal::ReservedName),
+                "{name}"
+            );
+        }
+        for name in ["9lives", "a.b", "a-b", ""] {
+            assert_eq!(
+                metadata_leaf_is_servable(name, MatchOp::Eq),
+                Err(MetadataFilterRefusal::NameNotRenderable),
+                "{name}"
+            );
+        }
+        assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Eq), Ok(()));
+        assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Neq), Ok(()));
     }
 }

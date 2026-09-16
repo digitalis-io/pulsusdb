@@ -1,8 +1,14 @@
 //! OTLP logs parser (issue #8 architect plan, docs/architecture.md §4): a
 //! pure `bytes -> ExportLogsServiceRequest -> ParsedLogs` pipeline with no
-//! I/O. **Resource** attributes flatten through the frozen canonical label
-//! model (`pulsus_model::LabelSet::from_normalized` -> `stream_fingerprint`,
-//! issue #4) as stream labels; the log record's `InstrumentationScope`
+//! I/O. **Resource** attribute keys are stored under the reference's label
+//! name (issue #507), with one exception: a key other than `service.name`
+//! whose stored name would be `service_name` is stored as
+//! `service_name_extracted`, because that slot is resolved from the raw
+//! attributes and written last (issue #379). A collision between any two of
+//! the remaining keys is resolved by the frozen rule of issue #4, which the
+//! slot is therefore never asked to decide
+//! (`pulsus_model::LabelSet::from_log_attribute_pairs` ->
+//! `stream_fingerprint`), as stream labels; the log record's `InstrumentationScope`
 //! (name, version, and attributes) lands in per-entry **structured
 //! metadata**, never stream labels (issue #109 — Loki 3.4.2 parity), so
 //! scope leaves the stream fingerprint. Fingerprints and the `service`
@@ -16,8 +22,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, canonicalize_label_key,
-    stream_fingerprint,
+    Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, log_label_name, stream_fingerprint,
 };
 
 use crate::error::LogsIngestError;
@@ -116,9 +121,10 @@ pub struct StreamRow {
 pub struct ParsedLogs {
     pub rows: Vec<LogRow>,
     pub streams: Vec<StreamRow>,
-    /// Sum of every `(resource, scope)` label set's normalized-key
-    /// collision count (`LabelSet::from_normalized`'s lossy-resolution
-    /// counter) across the whole request — never swallowed, surfaced for
+    /// Sum of every `(resource, scope)` label set's stored-name collision
+    /// count (the lossy-resolution counter of
+    /// `LabelSet::from_log_attribute_pairs`, the constructor the resource
+    /// path uses since issue #507) across the whole request — never swallowed, surfaced for
     /// the writer's collision metric.
     pub collisions: u64,
     /// Count of individual log *records* dropped during parsing (not
@@ -258,7 +264,7 @@ pub fn parse(
         let (labels, collisions) = build_stream_labels(&raw_attributes, &service_name);
         // `WithoutEmpty` + the four per-stream label bounds (issue #374).
         // `WithoutEmpty` is applied inside `build_stream_labels` above, before
-        // `from_normalized`, because the reference drops empty values before
+        // `from_log_attribute_pairs`, because the reference drops empty values before
         // hashing on this transport too — its OTLP translation renders a label
         // literal (`pkg/loghttp/push/otlp.go:244 @ v3.7.4`) which the
         // distributor re-parses through `syntax.ParseLabels`
@@ -455,12 +461,26 @@ pub fn parse(
     Ok(out)
 }
 
+/// The name a resource attribute other than `service.name` is stored under
+/// when its own stored name would be `service_name` (issue #507): the
+/// `service_name` slot is resolved from the raw attributes and written last
+/// (issue #379), so such an attribute is stored beside it instead of being
+/// dropped. It is the name the reference's read path gives the same
+/// attribute, which it keeps as structured metadata: its read path renames a
+/// metadata name the stream already carries by appending `_extracted`
+/// (`LabelsBuilder::Add`, `pkg/logql/log/labels.go:391-397 @ v3.7.4`).
+const SERVICE_NAME_EXTRACTED_LABEL: &str = "service_name_extracted";
+
 /// Flattens `resource.attributes` — and ONLY those — into the stream
-/// [`LabelSet`] via [`LabelSet::from_normalized`] (issue #109: scope name/
-/// version/attributes are structured metadata, not stream labels — Loki
-/// 3.4.2 parity). A collision between two resource attributes resolves by
-/// `from_normalized`'s frozen deterministic rule (issue #4) and is counted,
-/// never swapped. Because scope no longer enters this set, `stream_fingerprint`
+/// [`LabelSet`] via [`LabelSet::from_log_attribute_pairs`], which groups the
+/// keys by the name the reference stores them under
+/// (`pulsus_model::log_label_name`, issue #507) — NOT by
+/// [`LabelSet::from_normalized`]'s per-character rule, which is the metrics
+/// namer and stays where it is. Issue #109: scope name/version/attributes are
+/// structured metadata, not stream labels — Loki 3.4.2 parity. A collision
+/// between two resource attributes resolves by the same frozen deterministic
+/// rule (issue #4), now over the stored names, and is counted, never
+/// swapped. Because scope no longer enters this set, `stream_fingerprint`
 /// is a pure function of the resource labels — a stream pushed with vs.
 /// without scope fingerprints identically, exactly as Loki does.
 ///
@@ -490,10 +510,10 @@ pub fn parse(
 /// attribute key the reference is order-dependent — it maps the promoted
 /// attributes last-write-wins before stripping (`otlp.go:193`), measured as
 /// `cloud.region=""` then `="eu"` -> `eu` kept, and `="eu"` then `=""` ->
-/// dropped. PulsusDB resolves a duplicate key by `from_normalized`'s frozen
-/// order-independent rule (issue #4) instead, which already diverges there and
-/// is unchanged by this strip: pair-wise leaves the non-empty twin for
-/// `from_normalized` to resolve exactly as it did before #259. By-name would
+/// dropped. PulsusDB resolves a duplicate key by `from_log_attribute_pairs`'s
+/// frozen order-independent rule (issue #4) instead, which already diverges
+/// there and is unchanged by this strip: pair-wise leaves the non-empty twin
+/// for `from_log_attribute_pairs` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
 fn build_stream_labels(
@@ -501,7 +521,7 @@ fn build_stream_labels(
     service_name: &str,
 ) -> (LabelSet, usize) {
     // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
-    // `from_normalized`: an empty-valued resource attribute is neither
+    // `from_log_attribute_pairs`: an empty-valued resource attribute is neither
     // validated nor stored, so it cannot change the stream's fingerprint and
     // cannot win a normalized-key collision. The reference drops it in
     // `parseStreamLabels`, which this transport reaches too — its OTLP
@@ -510,28 +530,35 @@ fn build_stream_labels(
     // `pkg/distributor/distributor.go:1370 @ v3.7.4`).
     //
     // `service_name` is the resolved slot (issue #379) and it is
-    // AUTHORITATIVE: every raw attribute that canonicalizes onto that name is
-    // dropped first, then the slot is appended. Upstream that name is written
-    // by a plain map assignment (`otlp.go:193,201,219 @ v3.7.4`) which no
-    // other attribute can reach — a raw `service_name` or `service-name`
-    // attribute is not an index attribute there, so it becomes structured
-    // metadata and never touches the stream label. `from_normalized`'s frozen
-    // greatest-key/greatest-value rule (issue #4) is therefore never asked to
-    // decide `service_name` on this path; it still decides every other
-    // collision, unchanged.
-    //
-    // What this costs, stated plainly: PulsusDB stores a `service_name`
-    // near-miss attribute nowhere, where the reference stores it as structured
-    // metadata. That is the #109 attribute-placement difference showing
-    // through, and it is ledgered under this issue's residual rather than
-    // fixed here.
+    // AUTHORITATIVE: every raw attribute other than `service.name` whose
+    // stored name (`log_label_name`) is `service_name` is stored as
+    // `service_name_extracted` instead (issue #507), then the slot is appended.
+    // In the reference no other attribute can reach the slot either; such an
+    // attribute is structured metadata there, and its read path shows it as
+    // `service_name_extracted` beside the stream's `service_name` (measured,
+    // #507 addendum 3, ao5 and ao6). The frozen greatest-key/greatest-value
+    // rule (issue #4) is therefore never asked to decide `service_name` on
+    // this path; it still decides every other collision, unchanged, through
+    // `LabelSet::from_log_attribute_pairs`. We store that attribute as a
+    // stream label where the reference stores structured metadata: the #109
+    // placement difference.
     let mut pairs: Vec<(String, String)> = raw_attributes
         .iter()
-        .filter(|(key, _)| canonicalize_label_key(key) != SERVICE_NAME_LABEL)
-        .cloned()
+        .filter_map(|(key, value)| {
+            if log_label_name(key) != SERVICE_NAME_LABEL {
+                return Some((key.clone(), value.clone()));
+            }
+            if key == "service.name" {
+                // The slot below carries this attribute's value.
+                return None;
+            }
+            Some((SERVICE_NAME_EXTRACTED_LABEL.to_string(), value.clone()))
+        })
         .collect();
     pairs.push((SERVICE_NAME_LABEL.to_string(), service_name.to_string()));
-    LabelSet::from_normalized(log_label_limits::StreamLabels::from_pairs(pairs).into_pairs())
+    LabelSet::from_log_attribute_pairs(
+        log_label_limits::StreamLabels::from_pairs(pairs).into_pairs(),
+    )
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -588,9 +615,10 @@ fn build_stream_labels(
 /// attributes from `:300-317`), so at the builder no OTLP pair is ever
 /// renamed, `add` stays empty but for the U+FFFD rewrites, and the builder
 /// degenerates to exactly the by-name delete + keep-last this function used to
-/// spell inline. [`canonicalize_label_key`] is the same primitive
-/// `LabelSet::from_normalized` uses, so the keys handed over are its fixed
-/// points and the seam only sorts + JSON-encodes them (byte-identical to the
+/// spell inline. The keys are renamed with `log_label_name`, the same
+/// renaming the builder applies, so the keys handed over are its fixed points
+/// (and fixed points of the grouping `render_structured_metadata` applies),
+/// and the seam only sorts + JSON-encodes them (byte-identical to the
 /// Loki-push representation). The surviving asymmetry — push hands the builder
 /// RAW names, this path hands it renamed ones — is the reference's own
 /// asymmetry, at the same place.
@@ -614,10 +642,10 @@ fn build_scope_metadata_pairs(
     // identity field empty-suppressed (#108).
     let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)?
         .into_iter()
-        .map(|(key, value)| (canonicalize_label_key(&key), value))
+        .map(|(key, value)| (log_label_name(&key), value))
         .collect();
     if !scope.name.is_empty() {
-        // `scope_name`/`scope_version` are already canonicalize fixed points.
+        // `scope_name`/`scope_version` are already `log_label_name` fixed points.
         ordered.push(("scope_name".to_string(), scope.name.clone()));
     }
     if !scope.version.is_empty() {
@@ -756,25 +784,50 @@ impl AttributeLookup for RecordAttributes<'_> {
     }
 }
 
-/// `canonicalize_label_key(raw) == canonical`, without building the
-/// canonical form. The reference reaches record attributes through the same
-/// key sanitizer every other attribute goes through
-/// (`pkg/loghttp/push/otlp.go:488-499 @ v3.7.4`), so the comparison has to
-/// be on the canonical name — but the rule asks about at most fifteen names
-/// per record, and allocating a canonical key per attribute per name to
-/// answer them would be the whole cost of the feature.
+/// `log_label_name(raw) == canonical`, without building the stored name.
+/// The reference renames record attribute keys with the same label namer as
+/// every other attribute (the coder keeps the citation), so the comparison has
+/// to be on the stored name — but the rule asks about at most fifteen names
+/// per record, and allocating a stored name per attribute per name to answer
+/// them would be the whole cost of the feature.
 ///
-/// `canonical_key_eq_matches_canonicalize_label_key` pins the two against
-/// each other.
+/// `a_record_attribute_level_is_found_under_its_stored_name` pins it.
 fn canonical_key_eq(raw: &str, canonical: &str) -> bool {
-    let mut want = canonical.chars();
-    for c in raw.chars() {
-        let mapped = if c.is_ascii_alphanumeric() || c == '_' {
-            c
-        } else {
-            '_'
+    // The reserved-affix case: the affixes are kept around the collapsed
+    // middle, so strip them from both sides and compare the middles.
+    let reserved = raw.len() >= 4 && raw.starts_with("__") && raw.ends_with("__");
+    let inner = if reserved {
+        &raw[2..raw.len() - 2]
+    } else {
+        raw
+    };
+    let mut want = canonical;
+    if reserved {
+        let Some(rest) = want.strip_prefix("__").and_then(|w| w.strip_suffix("__")) else {
+            return false;
         };
-        if want.next() != Some(mapped) {
+        want = rest;
+    } else if inner.starts_with(|c: char| c.is_ascii_digit()) {
+        // A stored name starting with a digit gains `key_`; a reserved name
+        // starts with `_`, so it never does.
+        let Some(rest) = want.strip_prefix("key_") else {
+            return false;
+        };
+        want = rest;
+    }
+    let mut want = want.chars();
+    let mut prev_was_underscore = false;
+    for c in inner.chars() {
+        let emitted = if c.is_ascii_alphanumeric() {
+            prev_was_underscore = false;
+            c
+        } else if !prev_was_underscore {
+            prev_was_underscore = true;
+            '_'
+        } else {
+            continue;
+        };
+        if want.next() != Some(emitted) {
             return false;
         }
     }
@@ -1768,7 +1821,7 @@ mod tests {
     }
 
     /// A literally duplicated resource-attribute key, one occurrence empty:
-    /// the pair-wise strip hands `from_normalized` the non-empty twin, so the
+    /// the pair-wise strip hands `from_log_attribute_pairs` the non-empty twin, so the
     /// stored label is what it was before #259 and the frozen issue-#4
     /// collision rule stays the only thing deciding duplicates. Pins the
     /// neutrality claim in `build_stream_labels`' doc — the by-name strip
@@ -3013,8 +3066,9 @@ mod tests {
     /// structured metadata, which no bound reaches.
     ///
     /// Storage still disagrees for seventeen of the eighteen: we index every
-    /// resource attribute (#109), both spellings canonicalize onto one label,
-    /// and `from_normalized`'s frozen collision rule (#4) keeps the greatest
+    /// resource attribute (#109), both spellings are stored under one label,
+    /// and the frozen collision rule (#4, applied by
+    /// `from_log_attribute_pairs`) keeps the greatest
     /// *original* key — `_` (0x5F) sorts after `.` (0x2E) — so the
     /// **unvalidated** near-miss wins and a 2049-byte value is stored under a
     /// label the validator passed at two bytes.
@@ -3073,21 +3127,23 @@ mod tests {
         .unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         let stored = &out.streams[0].labels;
-        assert_eq!(stored.len(), 1, "the near-miss is not stored at all");
+        assert_eq!(stored.len(), 2, "the near-miss is stored beside the slot");
         assert_eq!(stored.get("service_name"), Some("ok"));
+        assert_eq!(stored.get("service_name_extracted"), Some(wide.as_str()));
 
         let validated = parse_off(
             &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
             0,
         )
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             out.streams[0].fingerprint, validated.streams[0].fingerprint,
-            "the validated value fixes the identity now"
+            "the near-miss is a stored label of its own, so the two resources \
+             are two streams (issue #507)"
         );
         // ...and NOT the stream a bare over-wide `service_name` produces,
-        // which is the assertion that discriminates: were `from_normalized`
-        // still deciding this name, these two would be one stream.
+        // which is the assertion that discriminates: were the near-miss
+        // deciding the slot, these two would be one stream.
         let near_miss_alone = parse_off(
             &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
             0,
@@ -3098,9 +3154,16 @@ mod tests {
             "the unvalidated near-miss no longer decides `service_name`"
         );
         assert_eq!(
-            near_miss_alone.streams[0].labels.to_canonical_json(),
-            r#"{"service_name":"unknown_service"}"#,
+            near_miss_alone.streams[0].labels.get("service_name"),
+            Some("unknown_service"),
             "a near-miss alone leaves the slot at its fallback"
+        );
+        assert_eq!(
+            near_miss_alone.streams[0]
+                .labels
+                .get("service_name_extracted"),
+            Some(wide.as_str()),
+            "and is stored beside it, where it used to be stored nowhere"
         );
     }
 
@@ -3322,5 +3385,158 @@ mod tests {
         let out = parse_off(&req, 0).unwrap();
         assert_eq!(out.stream_errors.len(), 1);
         assert!(out.rows.is_empty());
+    }
+
+    // ---- issue #507: attribute names are stored as the reference stores
+    // them (option A). Each expectation below is a measured cell of the
+    // plan's OTLP table, taken from the pinned reference build.
+
+    /// **N4: a scope attribute key is stored under the reference's label
+    /// name.** `s..x` is stored as `s_x` and `9s` as `key_9s`, and two keys
+    /// that land on one stored name resolve by wire order — which is what
+    /// distinguishes renaming the keys here from repairing the names later:
+    /// the later pair wins in both orders only if the collision is decided on
+    /// the stored name.
+    #[test]
+    fn scope_attribute_names_are_stored_as_the_reference_names_them() {
+        let sm = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("s..x", "1"), attr("9s", "2")],
+        )));
+        assert_eq!(sm, r#"{"key_9s":"2","s_x":"1"}"#);
+
+        // ao7 and ao8 of the plan's table: `a..b` and `a_b` are one stored
+        // name, and the LAST pair in wire order wins.
+        let ao7 = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("a..b", "x"), attr("a_b", "y")],
+        )));
+        assert_eq!(ao7, r#"{"a_b":"y"}"#, "ao7");
+        let ao8 = scope_sm(Some(scope(
+            "",
+            "",
+            vec![attr("a_b", "y"), attr("a..b", "x")],
+        )));
+        assert_eq!(ao8, r#"{"a_b":"x"}"#, "ao8");
+    }
+
+    /// **N5: a promoted resource attribute is stored under the reference's
+    /// label name**, and the stream's fingerprint is the one those stored
+    /// names give. The attributes are the plan's ao4 resource.
+    #[test]
+    fn resource_attribute_stream_labels_are_named_as_the_reference_names_them() {
+        let (labels, _) = stream_labels(vec![
+            attr("service.name", "ao4"),
+            attr("k8s..pod", "p"),
+            attr("9zone", "z"),
+            attr("--error--", "boom"),
+        ]);
+        assert_eq!(
+            labels.to_canonical_json(),
+            r#"{"_error_":"boom","k8s_pod":"p","key_9zone":"z","service_name":"ao4"}"#
+        );
+        // `--error--` is stored as `_error_`, so it is an ordinary label and
+        // a metric query over the stream answers instead of failing on a
+        // pipeline error named `boom` (the plan's ao4.01).
+        assert!(labels.get("__error__").is_none());
+        let expected = pulsus_model::LabelSet::from_log_attribute_pairs(vec![
+            ("service_name".to_string(), "ao4".to_string()),
+            ("k8s_pod".to_string(), "p".to_string()),
+            ("key_9zone".to_string(), "z".to_string()),
+            ("_error_".to_string(), "boom".to_string()),
+        ])
+        .0;
+        assert_eq!(
+            pulsus_model::stream_fingerprint(&labels),
+            pulsus_model::stream_fingerprint(&expected),
+            "the fingerprint is the stored names'"
+        );
+    }
+
+    /// **N6: a `service_name` spelling other than the slot's is stored as
+    /// `service_name_extracted`**, where it used to be stored nowhere. Both
+    /// rows are the plan's ao5 and ao6, whose answers were measured on the
+    /// reference through its read path.
+    #[test]
+    fn a_service_name_spelling_other_than_the_slot_is_stored_as_service_name_extracted() {
+        let (ao6, _) = stream_labels(vec![
+            attr("service.name", "ao6"),
+            attr("service_name", "v6"),
+        ]);
+        assert_eq!(
+            ao6.to_canonical_json(),
+            r#"{"service_name":"ao6","service_name_extracted":"v6"}"#
+        );
+        let (ao5, _) = stream_labels(vec![
+            attr("container.name", "ao5"),
+            attr("service..name", "x"),
+        ]);
+        assert_eq!(
+            ao5.to_canonical_json(),
+            r#"{"container_name":"ao5","service_name":"ao5","service_name_extracted":"x"}"#,
+            "the slot is discovered from `container.name` and the near-miss is stored beside it"
+        );
+        // The slot's own attribute is not stored twice.
+        let (plain, _) = stream_labels(vec![attr("service.name", "only")]);
+        assert_eq!(plain.to_canonical_json(), r#"{"service_name":"only"}"#);
+    }
+
+    /// **N7: the level is read from a record attribute under its stored
+    /// name.** The reference renames record attribute keys with the same
+    /// namer before it looks for `severity_text`, so `severity..text=warn`
+    /// is the level there — and now here (the plan's ao1.04).
+    #[test]
+    fn a_record_attribute_level_is_found_under_its_stored_name() {
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "ao1")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                attributes: vec![attr("severity..text", "warn")],
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(
+            &req,
+            0,
+            LogIngestSettings {
+                discover_log_levels: true,
+            },
+        )
+        .expect("within the depth cap");
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"detected_level":"warn","scope_name":"my-scope","scope_version":"1.0.0"}"#,
+            "the record attribute is found under its stored name"
+        );
+    }
+
+    /// **N8: the eighteen index attributes are named alike by both rules.**
+    /// The bound check and the discovery comparison run over the raw index
+    /// names with the metrics canonicalizer; storage uses the log namer. The
+    /// two agree on every one of those names, which is what lets those call
+    /// sites stay as they are.
+    #[test]
+    fn the_eighteen_index_attributes_are_named_alike_by_both_rules() {
+        for raw in log_label_limits::otlp_index_attributes() {
+            assert_eq!(
+                pulsus_model::log_label_name(raw),
+                pulsus_model::canonicalize_label_key(raw),
+                "{raw:?}"
+            );
+        }
+        // And the two rules do differ in general, so the agreement above is
+        // a property of those names rather than of the rules.
+        assert_ne!(
+            pulsus_model::log_label_name("a..b"),
+            pulsus_model::canonicalize_label_key("a..b")
+        );
     }
 }

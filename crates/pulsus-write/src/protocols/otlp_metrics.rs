@@ -14,9 +14,11 @@
 //! [`build_attribute_labels`]. Keys are final by the time they reach
 //! `pulsus-model`, so this module calls
 //! [`LabelSet::from_verbatim`] — **not** `from_normalized`, whose
-//! canonicalize-and-pick-a-winner rule (issue #4, frozen) is the logs and
-//! traces rule and would re-resolve collisions the reference has already
-//! merged with `;`.
+//! rename-and-pick-a-winner rule (issue #4, frozen) is the log and trace
+//! rule — `from_normalized` for pushed stream labels, and the same collision
+//! rule under the log name rule in `from_log_attribute_pairs` for OTLP log
+//! attributes (issue #507) — and would re-resolve collisions the reference
+//! has already merged with `;`.
 //!
 //! Fingerprints derive *only* via `pulsus-model`, never re-derived here.
 //! `__name__` is never placed in a [`LabelSet`]: the metric name travels

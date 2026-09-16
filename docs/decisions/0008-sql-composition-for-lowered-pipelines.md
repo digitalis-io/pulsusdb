@@ -14,7 +14,7 @@ Related: [#507](https://github.com/digitalis-io/pulsusdb/issues/507) (the LogQL 
 
 ## Context
 
-[query-lowering.md](../query-lowering.md) introduces a shared lowering core: a LogQL or TraceQL
+[query-lowering.md](../query-lowering.md) introduces the lowering core TraceQL's compiler is built on; LogQL's compiler answers the same composition question in `logql/plan.rs`: a LogQL or TraceQL
 pipeline is folded left, each link contributing to a relational term, and the links that lower
 become SQL sent to ClickHouse. The lowered links need not be a prefix — a link that cannot
 lower becomes residual and the fold continues (query-lowering.md §2.5). The core deliberately leaves one thing
@@ -151,8 +151,9 @@ did not lower, and the handoff is a candidate set bounded by its own cap instead
   that driver, unnamed.
 - **A seed with no plan-time upper bound is not admissible, and the cut is refused rather than
   taken.** Every seed this design admits is bounded by a request parameter, a config field or a
-  named constant — the request `limit`, `DEFAULT_MAX_STREAMS`, `reader.traceql_max_candidates`,
-  `BATCH_TRACES`. A seed whose size grows with the rows read would cross the metered hop twice and
+  named constant — the request `limit`, `reader.traceql_max_candidates`, `BATCH_TRACES`. LogQL's
+  own compiler bounds its fingerprint seed by `DEFAULT_MAX_STREAMS` in the same way, outside the
+  core. A seed whose size grows with the rows read would cross the metered hop twice and
   grow with the read, which is the opposite of what this work is for; `Lang::handoff_bound`
   returning `None` is what refuses it (query-lowering.md §2.7.6, rule 2).
 

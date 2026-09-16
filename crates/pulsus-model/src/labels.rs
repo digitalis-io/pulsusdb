@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::canonical::{SERVICE_NAME_LABEL, canonicalize_label_key};
+use crate::canonical::{
+    SERVICE_NAME_LABEL, canonicalize_label_key, is_log_label_name, log_label_name,
+};
 
 /// Errors from constructing a [`LabelSet`] via the strict
 /// [`LabelSet::try_from_normalized`] constructor.
@@ -92,7 +94,9 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
 /// `vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:454-521`
 /// and `labels_common.go:163-200`). Input is the entry's pairs in WIRE order
 /// under their RAW names; output is pairs whose names are
-/// [`canonicalize_label_key`] fixed points and unique, so the caller's
+/// [`log_label_name`](crate::canonical::log_label_name) fixed points and
+/// unique — so also [`canonicalize_label_key`] fixed points, because a stored
+/// name holds only `[A-Za-z0-9_]` — and the caller's
 /// [`LabelSet::from_normalized`] never reaches its own collision branch.
 ///
 /// Use this — NOT [`retain_non_empty_values`] — wherever a STRUCTURED
@@ -210,16 +214,6 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
 ///
 /// # Residuals
 ///
-/// - **`normalized` here is [`canonicalize_label_key`], not the reference's
-///   `LabelNamer.Build`.** The rule is then statable against our own data —
-///   the name a pair is actually STORED under — and the two agree wherever the
-///   two renamings agree. Where they do not (`a..b` and `a__b` normalize to
-///   `a_b` there and to `a__b` here; `9bad` gains a `key_` prefix there) the
-///   collision GROUPS differ: measured, `{a..b="", a_b="keep"}` stores nothing
-///   there and `a_b="keep"` here. That is the label-RENAMING divergence
-///   already registered in docs/api.md §8.2 (issue #259), not a second rule;
-///   see `protocols::label_name`'s
-///   `sanitize_differs_from_our_storage_canonicalization`.
 /// - **Go's sort is unstable.** `base` is ordered by `slices.SortFunc`
 ///   (`ScratchBuilder.Sort`, `labels_stringlabels.go:627-629`), which is
 ///   insertion sort up to 12 elements and pdqsort above, so when one canonical
@@ -230,8 +224,8 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
 /// Only an exactly-empty value is dropped; a whitespace-only value is a value
 /// (`{"a":" "}` round-trips as `a=" "`) and nothing is trimmed.
 ///
-/// A caller that has already canonicalized its keys (the OTLP scope path)
-/// passes fixed points, for which no pair is renamed, `add` carries only the
+/// A caller that has already renamed its keys with `log_label_name` (the
+/// OTLP scope path) passes its fixed points, for which no pair is renamed, `add` carries only the
 /// U+FFFD rewrites, and the builder degenerates to a by-name delete plus
 /// keep-last — which is the reference's own shape there, because its OTLP
 /// translation runs `LabelNamer.Build` over every attribute key before the
@@ -241,15 +235,14 @@ pub fn resolve_structured_metadata(pairs: Vec<(String, String)>) -> Vec<(String,
     // common entry (`trace_id`, `span_id`, …) has non-empty values, no
     // U+FFFD, canonical names and no repeat. `del` and `add` are then both
     // empty, so `Labels()` returns `base` — the same pairs, modulo an order
-    // the caller re-derives anyway. A name is a `canonicalize_label_key`
-    // fixed point exactly when every char is in its allow-list
-    // (`canonical.rs:26-36`), which costs no allocation to test.
+    // the caller re-derives anyway. A name is a `log_label_name` fixed point
+    // exactly when `is_log_label_name` says so, which costs no allocation.
     let is_identity = {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         pairs.iter().all(|(name, value)| {
             !value.is_empty()
                 && !value.contains('\u{FFFD}')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && is_log_label_name(name)
                 && seen.insert(name.as_str())
         })
     };
@@ -257,10 +250,7 @@ pub fn resolve_structured_metadata(pairs: Vec<(String, String)>) -> Vec<(String,
         return pairs;
     }
 
-    let canon: Vec<String> = pairs
-        .iter()
-        .map(|(name, _)| canonicalize_label_key(name))
-        .collect();
+    let canon: Vec<String> = pairs.iter().map(|(name, _)| log_label_name(name)).collect();
     // `Reset`: the RAW name of every empty-valued base label.
     let mut deleted: BTreeSet<String> = pairs
         .iter()
@@ -396,6 +386,27 @@ impl LabelSet {
         I: IntoIterator<Item = (String, String)>,
     {
         let groups = group_by(pairs, canonicalize_label_key);
+        let mut collision_count = 0usize;
+        let mut entries = Vec::with_capacity(groups.len());
+        for (normalized, distinct) in groups {
+            collision_count += distinct.len().saturating_sub(1);
+            let (_original_key, value) = winner(&distinct);
+            entries.push((normalized, value.clone()));
+        }
+        (LabelSet { entries }, collision_count)
+    }
+
+    /// [`LabelSet::from_normalized`] grouping by [`log_label_name`] instead
+    /// of [`canonicalize_label_key`] (issue #507): the constructor for OTLP
+    /// resource attributes, whose keys the reference renames with its label
+    /// namer before it stores them. The collision rule is the frozen one of
+    /// issue #4 — greatest original key, then greatest value — so only the
+    /// grouping key differs.
+    pub fn from_log_attribute_pairs<I>(pairs: I) -> (LabelSet, usize)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let groups = group_by(pairs, log_label_name);
         let mut collision_count = 0usize;
         let mut entries = Vec::with_capacity(groups.len());
         for (normalized, distinct) in groups {
@@ -940,28 +951,49 @@ mod tests {
         }
     }
 
-    /// The residual of the label-RENAMING divergence registered in
-    /// docs/api.md §8.2, pinned so it stays visible: the reference groups
-    /// `a..b`, `a__b` and `a_b` under one name (`LabelNamer.Build` collapses
-    /// consecutive invalid runes) while PulsusDB stores them as three, so the
-    /// collision groups differently. Measured on `grafana/loki:3.7.4`:
-    /// `{a..b="", a_b="keep"}` and `{a__b="", a_b="keep"}` both store NOTHING
-    /// there, and `{9bad="", key_9bad="keep"}` likewise (`9bad` gains a
-    /// `key_` prefix there). This is one divergence, not two: fixing the
-    /// renaming fixes these rows with no change to the rule above.
+    /// **N3 (issue #507): the builder groups by the reference's stored
+    /// name.** Every structured-metadata name is stored under
+    /// [`log_label_name`], so `a..b`, `a__b` and `a_b` are one name here as
+    /// they are there, and a collision between them resolves as there.
+    /// Measured on the pinned reference build and reproduced here:
+    /// `{a..b="", a_b="keep"}`, `{a__b="", a_b="keep"}` and
+    /// `{9bad="", key_9bad="keep"}` store nothing; `{a.b="x", a..b="y"}`
+    /// stores `a_b="y"`; `{--error--="boom"}` stores `_error_="boom"` and
+    /// `{9bad="1"}` stores `key_9bad="1"`.
     #[test]
-    fn the_builder_groups_by_our_renaming_not_the_references() {
+    fn metadata_groups_by_the_references_stored_name() {
         for source in [
             [("a..b", ""), ("a_b", "keep")],
             [("a__b", ""), ("a_b", "keep")],
             [("9bad", ""), ("key_9bad", "keep")],
         ] {
             assert_eq!(
-                resolve_structured_metadata(pairs(&source)).len(),
-                1,
-                "the non-empty twin survives here and does not on the reference: {source:?}"
+                resolve_structured_metadata(pairs(&source)),
+                Vec::new(),
+                "the empty twin deletes the stored name, as on the reference: {source:?}"
             );
         }
+        assert_eq!(
+            resolve_structured_metadata(pairs(&[("a.b", "x"), ("a..b", "y")])),
+            pairs(&[("a_b", "y")]),
+            "two spellings of one stored name: the later wire copy wins"
+        );
+        assert_eq!(
+            resolve_structured_metadata(pairs(&[("--error--", "boom")])),
+            pairs(&[("_error_", "boom")]),
+            "a name that is not a reserved one loses its affixes"
+        );
+        assert_eq!(
+            resolve_structured_metadata(pairs(&[("9bad", "1")])),
+            pairs(&[("key_9bad", "1")]),
+            "a leading digit gains `key_`"
+        );
+        assert_eq!(
+            resolve_structured_metadata(pairs(&[("__error__", "boom")])),
+            pairs(&[("__error__", "boom")]),
+            "a reserved name keeps its affixes, so the key route's presence \
+             names are unchanged"
+        );
     }
 
     #[test]
@@ -1004,7 +1036,7 @@ mod tests {
             }
         }
         for (raw, value) in input {
-            let normalized = canonicalize_label_key(raw);
+            let normalized = log_label_name(raw);
             if normalized != *raw {
                 add.retain(|(an, _)| an != raw);
                 del.push(raw.clone());

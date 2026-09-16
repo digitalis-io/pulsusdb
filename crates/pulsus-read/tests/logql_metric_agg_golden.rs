@@ -1232,20 +1232,29 @@ fn a_range_aggregation_merging_several_streams_into_one_group_accumulates() {
         })
         .collect();
     // Stream 1 → 1 line, stream 2 → 2 lines, stream 3 → 4 lines, all
-    // inside the window `(0, 60s]` so all three land on the SAME grid
+    // inside the window `(-60s, 60s]` so all three land on the SAME grid
     // point with the same group key.
     let mut rows = vec![row(1, 10 * NS, "x")];
     rows.extend((0..2).map(|i| row(2, (10 + i) * NS, "x")));
     rows.extend((0..4).map(|i| row(3, (10 + i) * NS, "x")));
     let params = range_params(0, STEP);
 
+    // **The range is `[2m]` and the step is 60s, and the mismatch is
+    // deliberate** (issue #507): a range EQUAL to the step is lowered into
+    // the statement and plans `client: None`, which this fixture — whose
+    // whole subject is the CLIENT fold's per-slot accumulation — cannot
+    // drive. The two grid points are 0 and 60s either way, and neither
+    // window's membership changes: `(-120s, 0]` holds no row and
+    // `(-60s, 60s]` holds all seven, exactly as `(-60s, 0]` and `(0, 60s]`
+    // did.
+    //
     // (query, the value at t = 60s over members {1, 2, 4})
     let cases: [(&str, f64); 5] = [
-        (r#"sum(count_over_time({env="prod"}[1m]))"#, 7.0),
-        (r#"count(count_over_time({env="prod"}[1m]))"#, 3.0),
-        (r#"min(count_over_time({env="prod"}[1m]))"#, 1.0),
-        (r#"max(count_over_time({env="prod"}[1m]))"#, 4.0),
-        (r#"avg(count_over_time({env="prod"}[1m]))"#, 7.0f64 / 3.0f64),
+        (r#"sum(count_over_time({env="prod"}[2m]))"#, 7.0),
+        (r#"count(count_over_time({env="prod"}[2m]))"#, 3.0),
+        (r#"min(count_over_time({env="prod"}[2m]))"#, 1.0),
+        (r#"max(count_over_time({env="prod"}[2m]))"#, 4.0),
+        (r#"avg(count_over_time({env="prod"}[2m]))"#, 7.0f64 / 3.0f64),
     ];
     for (query, want) in cases {
         let result = run_client(query, &params, &rows, &meta).expect(query);

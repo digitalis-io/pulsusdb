@@ -194,7 +194,18 @@ fn the_splice_is_byte_identical_to_a_rebuild() {
         .map(|i| match i % 5 {
             0 => vec![],
             1 => vec![attr("only", "one")],
-            2 => vec![attr("quoted", r#"a"b\c"#), attr("ctl", "x\ty")],
+            // Issue #544: the two C0 controls the escape table was
+            // missing until issue #539 are HERE, not only in the reader's
+            // own tests. Widening the splice escaper's fast path so those
+            // two bytes are copied raw leaves this comparison GREEN
+            // without them — measured — and RED with them, which is the
+            // difference between a pin and a decoration.
+            2 => vec![
+                attr("quoted", r#"a"b\c"#),
+                attr("ctl", "x\ty"),
+                attr("bs", "a\u{8}b"),
+                attr("ff", "a\u{c}b"),
+            ],
             3 => vec![attr("a.b", "renamed"), attr("a_b", "base")],
             // Names either side of `detected_level` in sort order, so the
             // hole is exercised at the front, the middle and the back.

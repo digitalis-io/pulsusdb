@@ -117,6 +117,11 @@ pub mod predicate;
 pub mod rows;
 pub mod sql;
 pub mod template;
+mod unwrap_group;
+/// Test-only (issue #507): the key route's resolution and fold, for the live
+/// agreement measurement.
+#[doc(hidden)]
+pub use unwrap_group::probe as group_key_probe;
 /// Test-only helpers shared by more than one region module's
 /// `#[cfg(test)] mod tests` (issue #299). A SUBDIRECTORY, never a flat
 /// `.rs`.
@@ -165,7 +170,8 @@ pub use exec::{
     LogStats, MatrixSeries, PatternSeries, QueryResult, STREAM_FEED_CHUNK_BYTES, StreamAccumulator,
     StreamResult, StreamsFastPathProbe, StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    WireArity, final_series_gate_applies, read_query_settings, run_pipeline_rows,
+    WireArity, bucketed_fallback_client_agg, final_series_gate_applies, read_query_settings,
+    run_pipeline_rows, unwrapped_fallback_client_agg,
 };
 pub use explain::{ExplainStage, PlanExplain};
 /// The structured-metadata context [`pipeline::CompiledPipeline::run_into_with_sm`]

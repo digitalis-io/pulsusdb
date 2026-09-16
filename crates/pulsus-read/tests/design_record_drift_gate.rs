@@ -572,6 +572,24 @@ fn regenerate_the_count_site_lines() {
 // an identifier the cited line carries — the same rule the resolved ones
 // already satisfy. That is a per-site reading of each cited line against
 // the claim beside it, and it is recorded as work rather than promised.
+//
+// **A CONTINUATION citation is read too** (issue #545). The record
+// writes a second line of the same file as a bare `` `:825` ``, and
+// until this was added the reader saw only the `<file>.rs:<line>` form,
+// so a continuation could be moved to any number and every check here
+// stayed green. That is how `docs/query-to-sql.md`'s TraceQL row came to
+// cite two call sites that did not exist. The rule is narrow and stated
+// in full: a `` `:<line>` `` or `` `:<line>-<line>` `` is a citation when
+// it sits **on the same line as, and after**, a `<file>.rs:<line>`
+// occurrence, and it is attributed to the nearest such occurrence before
+// it. Its token is synthesised as `<that file>:<its line>`, so it
+// resolves, is frozen and is checked by exactly the same rules as a
+// written-out citation.
+//
+// **What it still does not read**, named rather than left to be found: a
+// continuation on a LATER line than the citation it continues, and a
+// continuation of a citation into a file that is not a `.rs` file.
+// Neither is scanned, so neither is checked.
 // ---------------------------------------------------------------------
 
 const CITATIONS_TSV: &str = "crates/pulsus-read/tests/design_record_citations.tsv";
@@ -688,6 +706,18 @@ fn ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How a citation was written. The census counts by this, so the figure
+/// comes from the reader that produces the occurrences rather than from a
+/// second implementation of the same rule beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CitationForm {
+    /// `<file>.rs:<line>[-<line>]`, the path written out.
+    WrittenOut,
+    /// `` `:<line>[-<line>]` ``, continuing the file a citation earlier on
+    /// the same line names.
+    Continuation,
+}
+
 /// One `<file>.rs:<line>[-<line>]` occurrence.
 #[derive(Debug, Clone)]
 struct Occurrence {
@@ -702,9 +732,14 @@ struct Occurrence {
     /// which of several `plan.rs` files a bare citation means is decided
     /// by whether the cited line carries an identifier this line prints.
     citing_line: String,
+    form: CitationForm,
 }
 
-/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts.
+/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts,
+/// and every continuation citation that follows one on the same line.
+///
+/// See the section comment above [`CITATIONS_TSV`] for the continuation
+/// rule and for the two forms it deliberately does not read.
 fn citation_occurrences() -> Vec<Occurrence> {
     let mut out = Vec::new();
     for doc in DESIGN_ARTEFACTS {
@@ -712,6 +747,10 @@ fn citation_occurrences() -> Vec<Occurrence> {
         for (doc_line, line) in text.lines().enumerate() {
             let doc_line = doc_line as u32 + 1;
             let bytes = line.as_bytes();
+            // `(byte offset of the citation, the file part of its
+            // token)`, in the order they occur, so a continuation can be
+            // attributed to the nearest one before it.
+            let mut written_out: Vec<(usize, String)> = Vec::new();
             let mut i = 0usize;
             while let Some(at) = line[i..].find(".rs:") {
                 let dot = i + at;
@@ -741,6 +780,7 @@ fn citation_occurrences() -> Vec<Occurrence> {
                     }
                 }
                 if !first.is_empty() && start < dot {
+                    written_out.push((start, line[start..dot + 3].to_string()));
                     out.push(Occurrence {
                         doc: doc.to_string(),
                         doc_line,
@@ -748,11 +788,72 @@ fn citation_occurrences() -> Vec<Occurrence> {
                         first: first.parse().expect("digits"),
                         last: last.parse().expect("digits"),
                         citing_line: line.to_string(),
+                        form: CitationForm::WrittenOut,
                     });
                 }
                 i = (dot + 4).max(j);
             }
+            // The continuations on this line. `written_out` is in
+            // increasing offset order, so the nearest citation before a
+            // continuation is the last entry whose offset is smaller.
+            for (at, first, last) in continuations(line) {
+                let Some((_, path)) = written_out.iter().rev().find(|(o, _)| *o < at) else {
+                    continue;
+                };
+                let token = if first == last {
+                    format!("{path}:{first}")
+                } else {
+                    format!("{path}:{first}-{last}")
+                };
+                out.push(Occurrence {
+                    doc: doc.to_string(),
+                    doc_line,
+                    token,
+                    first,
+                    last,
+                    citing_line: line.to_string(),
+                    form: CitationForm::Continuation,
+                });
+            }
         }
+    }
+    out
+}
+
+/// Every `` `:<line>` ``/`` `:<line>-<line>` `` on one line, as
+/// `(byte offset of the opening backtick, first, last)`.
+///
+/// The backticks are part of the form: a bare `:825` in prose is an
+/// ordinary colon before a number, and reading it as a citation would
+/// make the resolver answer for text nobody wrote as a citation.
+fn continuations(line: &str) -> Vec<(usize, u32, u32)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = line[at..].find("`:") {
+        let open = at + rel;
+        let mut j = open + 2;
+        let first: String = line[j..].chars().take_while(char::is_ascii_digit).collect();
+        j += first.len();
+        let mut last = first.clone();
+        if line[j..].starts_with('-') {
+            let second: String = line[j + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !second.is_empty() {
+                last = second.clone();
+                j += 1 + second.len();
+            }
+        }
+        if !first.is_empty() && bytes.get(j) == Some(&b'`') {
+            out.push((
+                open,
+                first.parse().expect("digits"),
+                last.parse().expect("digits"),
+            ));
+        }
+        at = open + 2;
     }
     out
 }
@@ -1555,7 +1656,34 @@ enum ReviewedVerdict {
 /// found three where the resolver was the one pointing at the wrong
 /// file. So no rate is published. These are the cases, and the note on
 /// each is the reasoning.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 9] = [
+// Issue #507 W4, review round 4: this was `; 10]`. The `sql.rs:996` case
+// left the table because the two rules now agree on it — a line shift in
+// `logql/sql.rs` moved the anchor the resolver reads, and the resolver's
+// answer became the one the reviewed note already called right
+// (`metric_raw_samples_sliding`, in `crates/pulsus-read/src/logql/sql.rs`).
+// The gate demands the removal: a judgement about a citation that no
+// longer diverges is a judgement about nothing.
+//
+// Review round 6: `docs/query-to-sql.md` §1's source lines were recomputed
+// from the definitions they name. Two consequences here, neither a new
+// judgement. `sql.rs:1130-1153` no longer appears in the record — the
+// citation now reads `sql.rs:1268-1291`, the span of
+// `metric_raw_samples_sliding` itself, on which the two rules agree — so
+// its case left the table (`; 9]` became `; 8]`). And the `sql.rs:489` case
+// is re-keyed from occurrence 3 to occurrence 1, because §1's two earlier
+// occurrences of that token now read `sql.rs:761`; the sentences that
+// remain at occurrences 0 and 1 both say "the second statement, which has
+// already read every selected stream's label set (`sql.rs:489`)", which is
+// `stage2`, so the note below reads the same against either.
+//
+// Review round 7: every citation in both design documents that this pull
+// request's code moves had broken was recomputed. Two consequences here. The
+// `sql.rs:489` case left the table: no occurrence of that token remains, each
+// now reads `sql.rs:761`, `stage2`'s own line, where the two rules agree. And
+// ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
+// candidate files and recorded with its reasoning below; the count of cases
+// is unchanged at eight and so are the counted verdicts.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1586,38 +1714,10 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the sentence describes the label ENCODER; the fallback answers          crates/pulsus-read/src/logql/labels.rs, which is not where it lives",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        1,
-        ReviewedVerdict::Ambiguous,
-        "this sentence describes both the writer and the flat reader; the fallback points at          the flat reader, so neither answer is wrong and the case is evidence for neither rule",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:363",
+        "labels.rs:318",
         0,
         ReviewedVerdict::FallbackRight,
-        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "sql.rs:996",
-        2,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes metric_raw_samples_sliding, in          crates/pulsus-read/src/logql/sql.rs — the fallback's answer",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "sql.rs:489",
-        3,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes stage2, in crates/pulsus-read/src/logql/sql.rs — the          fallback's answer; metrics/sql.rs:489 is a test literal",
+        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
     ),
 ];
 
@@ -1637,15 +1737,15 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// one that was measured against itself.** It called `resolve_citation`
 /// the truth and counted how often the fallback differed from it, which
 /// measures disagreement between two rules rather than error in either.
-/// Read one at a time, three of the nine divergences are cases where the
+/// Read one at a time, two of the six divergences are cases where the
 /// **resolver** points at the wrong file.
 ///
 /// What this test asserts instead: the divergence set is exactly the
-/// nine reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
-/// cannot appear without a person reading it; and five of the nine are
+/// six reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
+/// cannot appear without a person reading it; and four of the six are
 /// citations where the fallback answers a file the citing prose does not
-/// describe. **Five wrong answers out of nine disagreements is why the
-/// fallback is not applied** — not a percentage, five cases anyone can
+/// describe. **Four wrong answers out of six disagreements is why the
+/// fallback is not applied** — not a percentage, four cases anyone can
 /// read.
 #[test]
 fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
@@ -1739,7 +1839,11 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     }
     assert_eq!(
         (wrong.len(), right, ambiguous),
-        (5, 3, 1),
+        // Issue #544 removed one `FallbackRight` row: the citation it
+        // judged — `quantile_over_time` with no quantile — moved with the
+        // declaration it names, and at its new line the two rules agree,
+        // so there is no divergence left to hold a judgement about.
+        (4, 1, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }
@@ -1772,6 +1876,10 @@ fn census_block() -> String {
         .iter()
         .filter(|o| !o.token.split(':').next().unwrap_or("").contains('/'))
         .count();
+    let continuations = occurrences
+        .iter()
+        .filter(|o| o.form == CitationForm::Continuation)
+        .count();
     let covered = |keys: &BTreeSet<(String, String)>| {
         occurrences
             .iter()
@@ -1791,6 +1899,10 @@ fn census_block() -> String {
             occurrences.len(),
         ),
         ("of those, citing a bare basename", bare),
+        (
+            "of those, written as a continuation of a citation earlier on the line",
+            continuations,
+        ),
         (
             "`(document, token)` pairs the rule resolves",
             resolved_keys.len(),
@@ -1842,8 +1954,10 @@ fn census_block() -> String {
     ));
 
     out.push_str(&format!(
-        "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename. \
-         The rule resolves {} `(document, token)` pairs covering {resolved_occ} occurrences, and \
+        "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename \
+         and {continuations} are written as a continuation of a citation earlier on the same \
+         line. The rule resolves {} `(document, token)` pairs covering {resolved_occ} \
+         occurrences, and \
          cannot resolve {} covering {frozen_occ}. Of the resolved rows, {prose} are anchored on a \
          token the citing prose prints and {line} on a snapshot of the cited line.\n\n",
         occurrences.len(),
