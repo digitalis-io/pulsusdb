@@ -3652,6 +3652,25 @@ mod tests {
         assert_eq!(ids, vec![sid(1), sid(3)]);
     }
 
+    /// **This test pins behaviour that is scheduled to change (issue #537).**
+    /// It asserts today's rule: an unscoped condition is satisfied by a
+    /// matching attribute at ANY scope, because the membership set unions
+    /// the scopes. The design record for the trace storage change
+    /// (`docs/traceql-schema-migration.md` §4 Q1 and §6.1) settles a
+    /// different rule — an unscoped attribute resolves to ONE value, the
+    /// first stored element within the highest-precedence scope present,
+    /// taking scopes span → resource → event → link → instrumentation, and
+    /// the filter tests that one value. Under that rule a span carrying
+    /// `resource.env = "prod"` and `span.env = "staging"` resolves `.env`
+    /// to `"staging"` and therefore MATCHES `{ .env != "prod" }`, where
+    /// this assertion requires it not to.
+    ///
+    /// The divergence is recorded in
+    /// `docs/benchmarks/traces-differential-ledger.md`
+    /// (`traceql-attribute-resolves-to-one-element`) and in `docs/api.md`
+    /// §4.2. **The assertion below is deliberately left as it is**: it
+    /// describes the shipped engine, and it is the change that must move
+    /// it, not the record of the change.
     #[test]
     fn dual_scope_membership_satisfies_an_unscoped_negation_correctly() {
         // A span carrying env=prod at EITHER scope is excluded by
