@@ -1595,7 +1595,21 @@ mod tests {
     /// * **Any collection the walk adds that is not a `Counted`** — which
     ///   is why `every_collection_the_walk_reads_back_is_counted` exists
     ///   beside this: the two together are the claim, and neither is it
-    ///   alone.
+    ///   alone. That rule's own bound is stated on it, and it is narrow.
+    ///
+    /// # The figures
+    ///
+    /// ```text
+    ///   entries   nodes   query bytes   accesses   per (node + entry)
+    ///       64      127           497      2,095               10.969
+    ///      256      511         2,189      8,431               10.992
+    ///     1024    2,047         9,125     33,775               10.998
+    ///     4096    8,191        39,845    135,151               11.000
+    /// ```
+    ///
+    /// The denominator is nodes PLUS entries, which is the one the
+    /// `O(nodes + entries)` claim names; per tree node the same figures
+    /// are about 1.5 times these and are a different quantity.
     #[test]
     fn the_explain_walk_is_linear_in_the_tree() {
         let mut rows: Vec<(usize, usize, usize, u64)> = Vec::new();
@@ -1678,14 +1692,9 @@ mod tests {
     ///
     /// This is the half of the linearity claim that a measurement cannot
     /// make. The access counter charges what goes through `Counted`; it
-    /// says nothing about a plain `Vec` somebody adds tomorrow, and that
-    /// is exactly how the gate was beaten twice — first by a scan with no
-    /// counter call, then by a scan over the construction vectors while
-    /// only the finished collections were counted. Counting one more
-    /// collection each time is not a fix; the fix is a rule over the
-    /// walk, checked here.
+    /// says nothing about a plain collection somebody adds tomorrow.
     ///
-    /// The rule, and it has no exemption list:
+    /// The rule:
     ///
     /// > In the walk's functions, a local binding of a plain collection
     /// > may appear only as its own initialiser, as the receiver of
@@ -1694,19 +1703,56 @@ mod tests {
     /// > reference to it — is a READ, and a collection the walk reads
     /// > must be a `Counted`.
     ///
-    /// **Where the rule stops**, stated rather than left to be found: a
-    /// bare identifier is a move, so a collection moved into another
-    /// function becomes that function's business. In this file the two
-    /// that are moved are the returned accumulators, and what receives
-    /// them is the caller.
+    /// The collections it permits are **published in [`WRITE_ONLY`] and
+    /// asserted exactly**, so adding a fourth is a change to a list a
+    /// reader sees in the diff rather than something discovered the day
+    /// it breaks.
+    ///
+    /// # What this rule does NOT catch, measured rather than supposed
+    ///
+    /// The round-5 review wrote eighteen shapes that pass it: rebinding,
+    /// a tuple field, a closure capture, `format!`, `match`, `&*name`, a
+    /// helper function, UFCS, `VecDeque`, `HashMap`, an array,
+    /// `Box<[T]>`, an inferred `collect()`, a type alias, a
+    /// function-built `Vec`, a tuple pattern and an `impl` method. **It
+    /// catches two of twenty.** As a detector of unmetered reads it is
+    /// weak, and no amount of widening the syntax rule would make it
+    /// strong — each round of widening has been beaten by the next shape.
+    ///
+    /// **So this is not what keeps the walk honest, and it is not what
+    /// the linearity claim rests on.** What keeps the walk honest is that
+    /// there is nothing unmetered in scope to read: the tree collections
+    /// are built counted, the buckets hand out counted inners, and the
+    /// walk's INPUT arrives counted, so a plain slice cannot be aliased
+    /// out of a parameter. This rule is the backstop for the one case
+    /// that remains — a plain collection someone writes inside the walk —
+    /// and it is worth what it catches, which is the obvious form of
+    /// that and not the ingenious ones.
+    ///
+    /// **What is genuinely outside every check here**, so that nobody
+    /// reads a guarantee that is not on offer:
+    ///
+    /// * a new collection of a type this rule does not recognise —
+    ///   `HashMap`, `VecDeque`, an array, a type alias — read inside the
+    ///   walk;
+    /// * a scan written in a helper function the walk calls, since the
+    ///   rule is per function and a bare identifier is a move;
+    /// * the planner's own `QueryPlan`, which is borrowed, not owned by
+    ///   the walk: `plan.selectors` is a plain `Vec` on someone else's
+    ///   struct and a scan of it per node would be charged nothing. The
+    ///   walk reads its length and its root, and nothing else.
     ///
     /// Parsed with a syntax tree rather than matched textually, because a
     /// token rule cannot see a method call inside a macro body or a
-    /// generic call — the same reason this crate already parses its own
-    /// sources for the variants census.
+    /// generic call.
     #[test]
     fn every_collection_the_walk_reads_back_is_counted() {
         use syn::visit::Visit;
+
+        /// **The plain collections the walk is permitted to hold**, each
+        /// write-only and moved out. Asserted exactly, so a fourth is a
+        /// visible change to this list and not a silent permission.
+        const WRITE_ONLY: [&str; 3] = ["chain_of::links", "chain_of::out", "plan_shapes::out"];
 
         /// The functions that make up the walk: everything reachable
         /// from `plan_shapes` that holds a collection of its own.
@@ -1838,9 +1884,12 @@ mod tests {
             WALK.len(),
             "the walk's functions were not all found; this check parsed {seen:?} of {WALK:?}"
         );
-        assert!(
-            !examined.is_empty(),
-            "no plain collection was examined, so this check checked nothing"
+        examined.sort();
+        assert_eq!(
+            examined, WRITE_ONLY,
+            "the walk's plain collections are not the ones this check publishes. Every one of \
+             them is write-only and moved out; a new one belongs in `WRITE_ONLY` with that said \
+             of it, so that permitting it is a line in the diff."
         );
         assert!(
             problems.is_empty(),
