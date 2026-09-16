@@ -247,10 +247,24 @@ Derived. The 75% depends on `A`, the number of attributes a span carries:
 
 One `trace_attrs_idx` row is 39.4 compressed bytes at Appendix A's parameters.
 24 of them — `trace_id` 16 plus `span_id` 8 — are the **name of the span the row
-points at**. The sort order `(key, val, scope, timestamp_ns, trace_id, span_id)`
-puts no copy of those bytes beside another, so the worked model prices them at
-their full width. **Measured, they compress anyway** — by how much depends on how
-often one trace id lands inside one granule, and the table below is the reading.
+points at**, and the worked model prices them at their full width.
+
+**The assumption behind that price, stated as an assumption.** The model assumes a
+workload in which no two rows adjacent under `(key, val, scope, timestamp_ns, trace_id,
+span_id)` carry the same identity bytes. **Two things in the shipped system break it,
+and both are ordinary:**
+
+- **two spans of one trace sharing an attribute value** sort together under that key,
+  which is the whole of what the collapse factor `d` counts — at Appendix A's
+  parameters a trace's rows for one value are `d` = 2.5 deep;
+- **an allowed replay.** The table is a `ReplacingMergeTree` keyed on all six sort
+  columns, so re-delivering a span writes a byte-identical row that sits next to its
+  twin until a merge collapses it. That is not a fault state; it is the at-least-once
+  delivery the write path is built for (§3.4).
+
+**So the 16 bytes are a worked-model price, not a floor**, and measured they compress:
+by how much depends on how often one trace id lands inside one granule, and the table
+below is the reading.
 
 ```
    one index row, 39.4 compressed bytes
@@ -574,8 +588,20 @@ SELECT (SELECT count() FROM a),
     rows off the span row's arrays  2,166,747
     in the index build, not the array build          0
     in the array build, not the index build          0
-    SHA256 over the sorted tuples, both sides
-        8f0971e15e588e0413f979fc63947140e690bb388a8132a557915df1cab9a7cb
+
+**The digest, with the serialisation it is taken over**, because a hash of a set means
+nothing without one. Each row becomes `scope`, `key`, `val`, `val_type` joined by single
+tab characters; the rows are sorted ascending as strings; the sorted list is joined by
+single newlines; `SHA256` is taken over those bytes and printed lowercase hexadecimal.
+As a statement, run once per side:
+
+```sql
+SELECT lower(hex(SHA256(arrayStringConcat(
+         arraySort(groupArray(concat(scope, '\t', key, '\t', val, '\t', val_type))), '\n'))))
+FROM (SELECT DISTINCT scope, key, val, val_type FROM c1.attrs_old)
+```
+
+    both sides   8f0971e15e588e0413f979fc63947140e690bb388a8132a557915df1cab9a7cb
 
 An earlier version of this passage gave 1,094,467 for both, on a corpus that is
 not C1 and is not published, and a later one compared only the two counts. Equal
@@ -1111,7 +1137,8 @@ rendered the probe as
 `arrayExists((key, scope, val_num) -> (key = … AND val_num >= 500 AND scope = …), …)`,
 which asks *does SOME element satisfy the predicate*. That contradicts the rule this
 document settles three paragraphs below: a span has **one** value for an attribute, the
-first in stored order, and every operation has to use that one. The two forms disagree
+the first stored element within the highest-precedence scope that is present, and every
+operation has to use that one. The two forms disagree
 on exactly the spans that repeat a key. Measured, on a fixture of eight spans:
 
 | the span's stored attributes | the value it HAS | `arrayExists(… = 'x')` | locate-then-test | correct |
@@ -1129,10 +1156,47 @@ Three of the eight disagree, and in each the `arrayExists` form returns a span w
 own value does not satisfy the query — the span would then be rendered with the other
 value by `select()`. **Filtering and reading now follow one rule.**
 
+**All three of those rows are changes of answer against what ships today**, because
+`arrayExists` is what today's membership read amounts to: a span with a matching entry
+anywhere is in the set. Counted as **rows of the fixture the answer moves on, three**;
+counted as **kinds of shape that move it, two** — a key repeated inside one scope, and a
+key present at two scopes under an unscoped condition — with the third row being the
+first kind seen through a negation. The ledger row below is written against the two
+kinds and names all three shapes, so neither count is left to be inferred.
+
 **The locate is the same expression the value read uses**, so there is one rule and one
 place it is written: `arrayFirstIndex` over `(key, scope)` for a scoped condition, and
-for an unscoped one the five-scope chain of §4's read fields, in the order span →
-resource → event → link → instrumentation.
+for an unscoped one the five-scope chain, in the order span → resource → event → link →
+instrumentation:
+
+```sql
+WITH arrayFirstIndex((k, s) -> k = 'k' AND s = 'span',            attr_key, attr_scope) AS i_span,
+     arrayFirstIndex((k, s) -> k = 'k' AND s = 'resource',        attr_key, attr_scope) AS i_res,
+     arrayFirstIndex((k, s) -> k = 'k' AND s = 'event',           attr_key, attr_scope) AS i_evt,
+     arrayFirstIndex((k, s) -> k = 'k' AND s = 'link',            attr_key, attr_scope) AS i_lnk,
+     arrayFirstIndex((k, s) -> k = 'k' AND s = 'instrumentation', attr_key, attr_scope) AS i_ins,
+     if(i_span != 0, i_span,
+        if(i_res != 0, i_res,
+           if(i_evt != 0, i_evt,
+              if(i_lnk != 0, i_lnk, i_ins)))) AS i0
+SELECT (i0 != 0) AND ifNull(attr_num[i0] = 400, 0) AS probe0 …
+```
+
+**The five shapes it has to get right, and what it returned on each.** One row per
+shape, run on 26.3.29.7:
+
+| the span's stored `k` | element the chain picks | the value it resolves to | `arrayFirstIndex(k -> k = 'k')` alone would pick | `= 400` | `= 600` |
+|---|---|---|---|---|---|
+| no `k` at all | **0** | absent | 0 | 0 | 0 |
+| `span.k = 400` | 1 | 400, `int` | 1 | 1 | 0 |
+| `span.k = 400` then `span.k = 600` | 1 | 400, `int` | 1 | 1 | 0 |
+| **`resource.k = 600` then `span.k = 400`** | **2** | **400, `int`** | **1 — which is `600`, the wrong answer** | 1 | 0 |
+| `span.k = 'bad'` (a string) then `span.k = 400` | 1 | `bad`, `string`, numeric NULL | 1 | **0** | 0 |
+
+Row four is why the rule cannot be stated as "first in stored order": plain array order
+picks the `resource` entry, and the rule picks the `span` one that comes after it. Row
+five is the other end of the same rule — the located element is not numeric, so a
+numeric test is **false** rather than skipping to the next element.
 
 **It costs nothing on this corpus.** The two forms read the same columns over the same
 granules; five repetitions of each, zero counter spread, instrument as the table below:
@@ -1238,7 +1302,7 @@ implementation:
 | **refuse the query** | one malformed span would empty a dashboard that is otherwise fine, and the person reading it cannot fix the sender. A bad span must cost its own row, never the query |
 | **return every value** | it changes the type of every attribute read from one value to a set, for a case that is a sender bug, and it makes `avg()`, `by()` and `select()` each need a second rule for how to reduce the set |
 | **last in stored order** | deterministic, so it is a real candidate; see below |
-| **first in stored order** | deterministic; see below |
+| **first in stored order**, within the scope the query resolves to | deterministic; see below |
 
 Both surviving rules are deterministic and both are reproducible from what we store,
 because the arrays are written in the order the writer walks the sender's list and
@@ -1247,7 +1311,18 @@ this product agree**: the trace-by-id read returns `payload`, and a client rende
 shows the sender's list in order, first occurrence first. Choosing *first* makes the
 search answer, the projected value and the rendered payload name the same value.
 Choosing *last* would make a user see 7 in one panel and 5 in another. So the rule is
-**first in stored order**, chosen on that ground.
+**the first stored element within the highest-precedence scope that is present**, chosen
+on that ground.
+
+**Two halves, and the second is not "first".** A scoped condition — `span.k` — has one
+scope to look in, and there the rule is the first stored element carrying the key. An
+unscoped one — `.k` — first chooses a scope, by the precedence span → resource → event →
+link → instrumentation, and only then takes the first element within it. **Those two
+steps can disagree with plain array order**, and the case that shows it is a span that
+carries the key at `resource` before it carries it at `span`: measured on the five
+shapes below, the first element carrying the key is number 1 at `resource`, and the rule
+resolves to number 2 at `span`. Saying only "first in stored order" describes the scoped
+half and gets the unscoped half wrong.
 
 **The reference lands in the same place, and here is its source rather than a
 paraphrase of it.** Read at the pinned tag, `v3.0.2`, commit
@@ -1293,8 +1368,21 @@ derived above, and the derivation did not need them.
 
 So a stored span in sender order `[7, 5]` answers **7**, not 5. Today's `any()` returned
 5 in one measurement; that is not a contract, it is whichever row the aggregate reached
-first. **This is a change of answer** — a ledger row and a differential test, not a
-silent improvement.
+first. **This is a change of answer, and it is recorded in the tree rather than only
+here:**
+
+| where | what it says |
+|---|---|
+| `docs/benchmarks/traces-differential-ledger.md`, `traceql-attribute-resolves-to-one-element` | the rule, why it was chosen before the reference was consulted, the reference's two disagreeing paths, the three fixture rows that move, and which differential cases are affected |
+| `docs/api.md` §4.2 | what the route does today and what it will do, in the paragraph next to the projection rules, marked as a decision rather than as shipped behaviour |
+| `crates/pulsus-read/src/traces/search_eval.rs`, `dual_scope_membership_satisfies_an_unscoped_negation_correctly` | a doc comment on the test that pins the OLD cross-scope answer, naming the ledger entry and the assertion the change will move. The assertion is deliberately left alone: it describes the shipped engine |
+| `e2e/src/traces_corpus.rs`, `unscoped_str` | the differential corpus's own expectation helper resolves unscoped keys **resource-first**, the opposite of the precedence above. No case can see it today because the corpus's resource and span key sets are disjoint; a comment now says what must change if a case is added that can |
+
+**No differential case needs an exemption**, and that is a statement about the corpus
+rather than a hope: resource scope carries `run_id`, `env` and `region`, span scope
+carries `http.status_code`, `cache_hit`, `sample_ratio` and `tier`, no key appears at
+both, and no generated span carries one key twice — so no case, including the two
+unscoped ones, can separate the old rule from the new.
 
 **The locate and the type test are two steps, and putting them in one breaks the rule.**
 An earlier draft rendered the numeric read as
@@ -1681,65 +1769,223 @@ agree on.
 **The storage build, published.** Row 1's measured pair is the two table families built
 from corpus C1 and compared. Both sides carry the same 2,000,000 spans; the old side's
 index is the `attrs_old` of §2.1; every table is `OPTIMIZE … FINAL` before it is
-measured. The new side's tables are the DDL of §3.1 verbatim. Written out so the pair
-can be rebuilt:
+measured. **The script below is complete and literal** — it names every column, it has
+no placeholder, and it is what produced the numbers that follow. It takes the same
+endpoint argument as §4's corpus script and it runs after it.
 
-```sql
--- OLD family  ---------------------------------------------------------------
-CREATE TABLE c1.o_spans (<the 15 columns of §1.1>,
+```bash
+#!/bin/bash
+set -eu
+CH="${1:?usage: $0 <clickhouse-http-endpoint>}"
+q(){ curl -sS --data-binary @- "$CH/?database=c1&max_execution_time=7200&max_insert_threads=1&max_threads=4&max_block_size=65409"; }
+for T in o_spans o_catalog o_edges n_spans n_attr_traces n_error n_recent n_catalog n_edges; do
+  q <<< "DROP TABLE IF EXISTS c1.$T" >/dev/null
+done
+
+SPAN_COLS="trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns,
+  status_code, kind, payload_type, shared, status_message, scope_name, scope_version, payload"
+SPAN_DDL="trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8),
+  name LowCardinality(String), service LowCardinality(String),
+  timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), duration_ns Int64 CODEC(T64, ZSTD(1)),
+  status_code Int8, kind Int8, payload_type Int8, shared UInt8 DEFAULT 0,
+  status_message String DEFAULT '', scope_name LowCardinality(String) DEFAULT '',
+  scope_version LowCardinality(String) DEFAULT '', payload String CODEC(ZSTD(3))"
+PROJ14="duration_ns, kind, name, parent_id, payload_type, scope_name, scope_version,
+  service, shared, span_id, status_code, status_message, timestamp_ns, trace_id"
+DAY_PROJ="PROJECTION span_name_day (SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d,
+    name, count() GROUP BY d, name)"
+EDGE_DDL="date Date, side UInt8, trace_id FixedString(16), span_id FixedString(8),
+  pair_id FixedString(8), conn_type LowCardinality(String),
+  timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), service LowCardinality(String),
+  duration_ns Int64 CODEC(T64, ZSTD(1)), failed UInt8"
+EDGE_SEL="SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
+  toUInt8(kind IN (2, 5)) AS side, trace_id, span_id,
+  if(kind IN (3, 4) OR shared = 1, span_id, parent_id) AS pair_id,
+  if(kind IN (2, 3), 'rpc', 'messaging') AS conn_type, timestamp_ns, service, duration_ns,
+  toUInt8(status_code = 2) AS failed
+  FROM c1.spans_new
+  WHERE kind IN (3, 4)
+     OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)))"
+
+# ---- the family that ships today ------------------------------------------
+q <<EOF >/dev/null
+CREATE TABLE c1.o_spans ($SPAN_DDL,
   INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
-  PROJECTION service_time  (SELECT * ORDER BY (service, timestamp_ns)),
-  PROJECTION span_name_day (SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d,
-                                   name, count() GROUP BY d, name))
-ENGINE = MergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1;
-INSERT INTO c1.o_spans SELECT <those 15 columns> FROM c1.spans_old;
+  PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)),
+  $DAY_PROJ
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<EOF >/dev/null
+INSERT INTO c1.o_spans ($SPAN_COLS) SELECT $SPAN_COLS FROM c1.spans_old
+EOF
+q <<'EOF' >/dev/null
+CREATE TABLE c1.o_catalog (
+  scope LowCardinality(String), key LowCardinality(String), val String,
+  val_type LowCardinality(String)
+) ENGINE = ReplacingMergeTree ORDER BY (scope, key, val, val_type)
+EOF
+q <<'EOF' >/dev/null
+INSERT INTO c1.o_catalog (scope, key, val, val_type) SELECT scope, key, val, val_type FROM c1.attrs_old
+EOF
+q <<EOF >/dev/null
+CREATE TABLE c1.o_edges ($EDGE_DDL) ENGINE = ReplacingMergeTree
+PARTITION BY date ORDER BY (side, trace_id, span_id) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<EOF >/dev/null
+INSERT INTO c1.o_edges $EDGE_SEL
+EOF
 
-c1.attrs_old                     -- §2.1's statements, unchanged
-CREATE TABLE c1.o_catalog (scope LowCardinality(String), key LowCardinality(String),
-  val String, val_type LowCardinality(String))
-ENGINE = ReplacingMergeTree ORDER BY (scope, key, val, val_type);
-INSERT INTO c1.o_catalog SELECT scope, key, val, val_type FROM c1.attrs_old;
-
--- NEW family  ---------------------------------------------------------------
-CREATE TABLE c1.n_spans (<the same 15 columns>, <the five arrays>,
-  CONSTRAINT attr_arrays_aligned CHECK <the four equalities of §3.1>,
+# ---- the family this document proposes ------------------------------------
+q <<EOF >/dev/null
+CREATE TABLE c1.n_spans ($SPAN_DDL,
+  attr_key Array(LowCardinality(String)), attr_scope Array(LowCardinality(String)),
+  attr_val Array(String), attr_type Array(LowCardinality(String)),
+  attr_num Array(Nullable(Float64)),
+  CONSTRAINT attr_arrays_aligned CHECK length(attr_key) = length(attr_scope)
+    AND length(attr_key) = length(attr_val) AND length(attr_key) = length(attr_type)
+    AND length(attr_key) = length(attr_num),
   INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
-  PROJECTION service_time (SELECT <the 14 non-payload, non-array columns>
-                           ORDER BY (service, timestamp_ns)),
-  PROJECTION name_time    (SELECT <the same 14> ORDER BY (name, timestamp_ns)),
-  PROJECTION span_name_day (<as above>))
-ENGINE = MergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1;
-INSERT INTO c1.n_spans SELECT * FROM c1.spans_new;
-
-c1.n_attr_traces, c1.n_error, c1.n_recent, c1.n_catalog
-                                 -- the four CREATE statements of §3.1, and one
-                                 -- INSERT … SELECT per table with the SAME body as
-                                 -- that table's materialized view
+  PROJECTION service_time (SELECT $PROJ14 ORDER BY (service, timestamp_ns)),
+  PROJECTION name_time    (SELECT $PROJ14 ORDER BY (name, timestamp_ns)),
+  $DAY_PROJ
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<EOF >/dev/null
+INSERT INTO c1.n_spans ($SPAN_COLS, attr_key, attr_scope, attr_val, attr_type, attr_num)
+SELECT $SPAN_COLS, attr_key, attr_scope, attr_val, attr_type, attr_num FROM c1.spans_new
+EOF
+q <<'EOF' >/dev/null
+CREATE TABLE c1.n_attr_traces (
+  date Date, key LowCardinality(String), val String, scope LowCardinality(String),
+  bucket UInt32, trace_id FixedString(16), val_type LowCardinality(String),
+  val_num Nullable(Float64),
+  ts_max SimpleAggregateFunction(max, Int64), dur_max SimpleAggregateFunction(max, Int64),
+  dur_min SimpleAggregateFunction(min, Int64)
+) ENGINE = AggregatingMergeTree PARTITION BY date
+ORDER BY (key, val, scope, bucket, trace_id, val_type) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<'EOF' >/dev/null
+INSERT INTO c1.n_attr_traces
+  (date, key, val, scope, val_type, val_num, bucket, trace_id, ts_max, dur_max, dur_min)
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
+       key, val, scope, val_type, val_num,
+       toUInt32(intDiv(timestamp_ns, 300000000000)) AS bucket, trace_id,
+       max(timestamp_ns), max(duration_ns), min(duration_ns)
+FROM c1.spans_new
+ARRAY JOIN attr_key AS key, attr_scope AS scope, attr_val AS val,
+           attr_type AS val_type, attr_num AS val_num
+GROUP BY date, key, val, scope, val_type, val_num, bucket, trace_id
+EOF
+q <<'EOF' >/dev/null
+CREATE TABLE c1.n_error (
+  date Date, trace_id FixedString(16), span_id FixedString(8),
+  timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), duration_ns Int64 CODEC(T64, ZSTD(1)),
+  service LowCardinality(String), name LowCardinality(String), kind Int8
+) ENGINE = ReplacingMergeTree PARTITION BY date
+ORDER BY (timestamp_ns, trace_id, span_id) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<'EOF' >/dev/null
+INSERT INTO c1.n_error (date, trace_id, span_id, timestamp_ns, duration_ns, service, name, kind)
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)), trace_id, span_id, timestamp_ns,
+       duration_ns, service, name, kind
+FROM c1.spans_new WHERE status_code = 2
+EOF
+q <<'EOF' >/dev/null
+CREATE TABLE c1.n_recent (
+  date Date, bucket UInt32, trace_id FixedString(16),
+  ts_max SimpleAggregateFunction(max, Int64)
+) ENGINE = AggregatingMergeTree PARTITION BY date ORDER BY (bucket, trace_id)
+SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<'EOF' >/dev/null
+INSERT INTO c1.n_recent (date, bucket, trace_id, ts_max)
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
+       toUInt32(intDiv(timestamp_ns, 300000000000)) AS bucket, trace_id, max(timestamp_ns)
+FROM c1.spans_new GROUP BY date, bucket, trace_id
+EOF
+q <<'EOF' >/dev/null
+CREATE TABLE c1.n_catalog (
+  date Date, scope LowCardinality(String), key LowCardinality(String),
+  service LowCardinality(String), val String, val_type LowCardinality(String)
+) ENGINE = ReplacingMergeTree PARTITION BY date
+ORDER BY (scope, key, service, val, val_type) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<'EOF' >/dev/null
+INSERT INTO c1.n_catalog (date, scope, key, service, val, val_type)
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date, scope, key, service, val, val_type
+FROM c1.spans_new
+ARRAY JOIN attr_key AS key, attr_scope AS scope, attr_val AS val, attr_type AS val_type
+GROUP BY date, scope, key, service, val, val_type
+EOF
+q <<EOF >/dev/null
+CREATE TABLE c1.n_edges ($EDGE_DDL) ENGINE = ReplacingMergeTree
+PARTITION BY date ORDER BY (side, trace_id, span_id) SETTINGS ttl_only_drop_parts = 1
+EOF
+q <<EOF >/dev/null
+INSERT INTO c1.n_edges $EDGE_SEL
+EOF
+for T in o_spans o_catalog o_edges n_spans n_attr_traces n_error n_recent n_catalog n_edges; do
+  q <<< "OPTIMIZE TABLE c1.$T FINAL" >/dev/null
+done
+q <<'EOF'
+SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes,
+       round(sum(bytes_on_disk)/2000000.0, 2) AS b_per_span
+FROM system.parts
+WHERE database = 'c1' AND active AND table IN
+  ('o_spans','attrs_old','o_catalog','o_edges','n_spans','n_attr_traces','n_catalog','n_error','n_recent','n_edges')
+GROUP BY table ORDER BY table FORMAT TSV
+EOF
+q <<'EOF'
+SELECT 'old, trace_edges excluded' AS side, sum(bytes_on_disk) AS bytes,
+       round(sum(bytes_on_disk)/2000000.0, 1) AS b_per_span
+FROM system.parts WHERE database='c1' AND active AND table IN ('o_spans','attrs_old','o_catalog')
+UNION ALL
+SELECT 'new, trace_edges excluded', sum(bytes_on_disk), round(sum(bytes_on_disk)/2000000.0, 1)
+FROM system.parts WHERE database='c1' AND active
+  AND table IN ('n_spans','n_attr_traces','n_catalog','n_error','n_recent')
+FORMAT TSV
+EOF
 ```
 
 **One thing to get right when rebuilding it by hand, measured because it bit this
 build.** The views of §3.1 select their columns in a different order from the target
 tables' column order, and that is safe **only because a `TO` view matches by name** —
 verified on 26.3.29.7 with a two-column target and a view whose `SELECT` lists them
-reversed: the values land under the right names. An `INSERT … SELECT` with no column
-list matches by **position** instead, so the same body used as a backfill fails with
-`Code: 48 … while converting source column val_num to destination column trace_id`.
-Name the columns in any backfill.
+reversed: the values land under the right names. An `INSERT … SELECT` matches by
+**position** instead unless it names its columns, so the same bodies used as backfills
+fail with `Code: 48 … while converting source column val_num to destination column
+trace_id`. Every `INSERT` above names its columns for that reason.
 
-**What it gave**, `sum(bytes_on_disk)` over `system.parts`, active parts only:
+**What it gave**, run from the block above extracted out of this document, against a
+database holding only corpus C1 and the `attrs_old` of §2.1:
 
-| | old | new |
-|---|---|---|
-| span table | 260,858,017 | 248,575,334 |
-| attribute index | 343,412,406 | 160,928,751 |
-| tag catalog | 8,737,438 | 11,860,643 |
-| error table | — | 501,117 |
-| recency table | — | 3,707,783 |
-| **total, `trace_edges` excluded** | **613,007,861** | **425,573,628** |
-| **B/span** | **306.5** | **212.8** |
-| `trace_edges`, identical in both and excluded | 35,073,475 | 35,073,272 |
+```text
+table             rows        bytes on disk   B/span
+attrs_old         16,000,000    343,412,406    171.71
+n_attr_traces      6,505,828    160,928,751     80.46
+n_catalog          2,667,639     11,860,643      5.93
+n_edges            1,200,000     35,073,241     17.54
+n_error               20,000        501,117      0.25
+n_recent             167,277      3,707,783      1.85
+n_spans            2,000,000    248,538,636    124.27
+o_catalog          2,166,747      8,737,786      4.37
+o_edges            1,200,000     35,073,281     17.54
+o_spans            2,000,000    260,840,197    130.42
+```
+
+```text
+old, trace_edges excluded    612,990,389      306.5 B/span
+new, trace_edges excluded    425,536,930      212.8 B/span
+
+425,536,930 / 612,990,389 = 0.6942        -30.6%
+trace_edges is excluded from both sides because it is the same table fed by the
+same statement on both: 35,073,281 against 35,073,241, a 40-byte difference in
+how the two runs' blocks happened to fall.
+```
 
 −30.6%. The row that predicts it is the worked model's −40.3%; the gap between the two
 is the identity-column compressibility §7 carries, and this corpus's `A` = 8 against the
@@ -1785,7 +2031,7 @@ from names.
 | the comparison `val_num >= 500` | `Nullable(UInt8)` | `Nullable(UInt8)` | none | **agree** |
 | the PROBE's result, as the reader sees it | a row present or absent in the membership set | `(i0 != 0) AND ifNull(<test on the located element>, 0)`, printed `UInt8` | **the row set moves on one class and only on it**: a span that carries the probed key more than once, or carries it at two scopes under an unscoped condition. There the membership set answers "some entry matched" and the column answers "the entry this span resolves to matched". Measured on the eight-span fixture in §4 Q1: three of eight differ. Everywhere else they agree, and `ifNull(…, 0)` keeps a NULL element reading as 0 exactly where the membership form returned no row | **differs, deliberately — the duplicate-key ledger row covers it** |
 | the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside the array function differs on an absent key and on a multi-valued key — §4 Q1's six-case table. The inversion itself is unchanged; the positive column it inverts is the locate-then-test one, so `['y','x']` under `!= "x"` moves from 0 to 1 | **agree on five of six; the sixth is the duplicate-key change** |
-| the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | **locate on `(key, scope)` only, then read that element**; scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7. On `['bad','5']`: today's numeric read returns 5, the new form returns NULL, because the FIRST match is not numeric | **CHANGED, deliberately.** The rule is first-in-stored-order, derived in §4 Q1 from what the alternatives cost a user and then checked against the reference, which does the same — `tempodb/encoding/vparquet4/block_traceql.go:128-151` and `:249-280 @ v3.0.2`, quoted there. Today's has no contract. Needs a ledger row and a differential test |
+| the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | **locate on `(key, scope)` only, then read that element**; scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7. On `['bad','5']`: today's numeric read returns 5, the new form returns NULL, because the FIRST match is not numeric | **CHANGED, deliberately.** The rule is **the first stored element within the highest-precedence scope that is present** — first-in-stored-order is the scoped half of it only — derived in §4 Q1 from what the alternatives cost a user and then checked against the reference, whose value path does the same: `tempodb/encoding/vparquet4/block_traceql.go:128-151` and `:249-280 @ v3.0.2`, quoted there. Its condition path does not, which is the divergence recorded in `docs/api.md` and in `docs/benchmarks/traces-differential-ledger.md`. Today's behaviour has no contract |
 | `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`crates/pulsus-write/src/protocols/otlp_traces.rs:558-607` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
 | `timestamp_ns`, `duration_ns` | `Int64` nanoseconds | `Int64` nanoseconds | none | **agree** |
 | the bucket | — | `UInt32` | ingest bounds `timestamp_ns` to `[0, 4.29·10¹⁸]` (`crates/pulsus-write/src/protocols/otlp_traces.rs:465-486`), so the bucket is `≤ 1.43·10⁷` against a ceiling of 4.29·10⁹ | **cannot overflow** |
@@ -1813,7 +2059,7 @@ storage. If that answer should change, it should change on its own.
 | text that looks numeric but was sent as a string | `build.id = "500"` | `val_num` is set from the text regardless of the declared type | same function, same column | **identical** |
 | an event or link intrinsic | `event:name`, `link:spanID` | its own scope, one row per span | same tuple, trace grain | as the first row |
 | the tag dropdown's rows | any key ever ingested | every tuple ever seen | tuples seen in the retention window | **changed, deliberately** — a value last seen 400 days ago stops appearing. That is what every other endpoint already does |
-| **a span that carries the probed key twice** | `span.n = "7"` then `span.n = "5"`, filter `{ span.n = 5 }` | the membership row for the second entry exists, so the span **matches** — and `select(span.n)` then renders whichever entry `any()` reached | the span resolves to `7`, so it does **not** match, and `select(span.n)` renders `7` | **changed, deliberately.** Today's two answers contradict each other; the new pair agrees. §4 Q1 measures three such spans out of eight. One ledger row covers filter, negation and read |
+| **a span that carries the probed key twice** | `span.n = "7"` then `span.n = "5"`, filter `{ span.n = 5 }` | the membership row for the second entry exists, so the span **matches** — and `select(span.n)` then renders whichever entry `any()` reached | the span resolves to `7`, so it does **not** match, and `select(span.n)` renders `7` | **changed, deliberately.** Today's two answers contradict each other; the new pair agrees. §4 Q1's fixture moves on three rows, of two kinds — this one, and the next — and the third row is this kind under a negation. One ledger row covers filter, negation and read |
 | **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3656` pins today's union behaviour and moves with it |
 
 **Where the two candidate generators first disagree**, as a case rather than a
@@ -2468,7 +2714,7 @@ and the reading that refutes it.
 | **P10** | statements per search are `2 + (1+P)·⌈C/32⌉` today and `2 + ⌈C/32⌉` after | count `QueryFinish` rows in `system.query_log` for one request | the count is not 4 for a one-batch, one-condition search today, or not 3 after |
 | **P11** | **every table in §3.4 gives the same answer when a span row is written twice** | insert one block; record the answer to each of the nine queries in §4; insert the byte-identical block again; record again | any of the nine answers differs. That would mean a table in §3.4's safe column is not safe, and it is the same defect §3.5 rejected the rollup for |
 
-| **P12** | **the resolved-value rule holds on every read path**: for a span that carries one key twice, and for a span that carries one key at two scopes, the filter, the negation, the scalar read and the grouping key all answer from the SAME element — the first in stored order, and the first scope in the precedence span → resource → event → link → instrumentation | the eight-span fixture of §4 Q1, ingested through our own writer rather than written as literals, then four requests per case: `{ span.n = 5 }`, `{ span.n != 5 }`, a `select(span.n)` pipe and a `by(span.n)` pipe; and the same four unscoped against a span carrying `resource.k` and `span.k` | any of the four disagrees with the others on the same span. **This is the reading the SQL correction in §4 Q1 exists for, and it is the one C1 cannot give**: no span in C1 repeats a key, so the corpus answers both forms identically and only a fixture separates them. Not yet run through the writer; run as SQL over a hand-built table, where three of the eight spans separate the two forms |
+| **P12** | **the resolved-value rule holds on every read path**: for a span that carries one key twice, and for a span that carries one key at two scopes, the filter, the negation, the scalar read and the grouping key all answer from the SAME element — the first stored element within the highest-precedence scope present, taking scopes in the order span → resource → event → link → instrumentation | the eight-span fixture of §4 Q1, ingested through our own writer rather than written as literals, then four requests per case: `{ span.n = 5 }`, `{ span.n != 5 }`, a `select(span.n)` pipe and a `by(span.n)` pipe; and the same four unscoped against a span carrying `resource.k` and `span.k` | any of the four disagrees with the others on the same span. **This is the reading the SQL correction in §4 Q1 exists for, and it is the one C1 cannot give**: no span in C1 repeats a key, so the corpus answers both forms identically and only a fixture separates them. Not yet run through the writer; run as SQL over a hand-built table, where three of the eight spans separate the two forms |
 
 **Reading any of these against the DDL of §3.1 needs a current timestamp.** Every table
 in §3.1 carries `TTL … + INTERVAL <retention> DAY DELETE` with
@@ -2999,22 +3245,37 @@ Every claim this document makes about what the code does today names a file and 
 line range. **This appendix quotes those lines**, so a reading can be checked
 against the code without leaving the document.
 
-**Completeness, stated exactly.** The body carries **108** citations that name a line
-range, over 33 files, and all 108 are quoted below. It also carries **9** citations that
-name a file with no line range — they point at a whole builder or a whole golden file
-rather than at a reading — and those are **not** quoted here:
-`crates/pulsus-read/src/traces/graph_sql.rs`,
-`crates/pulsus-read/src/traces/metrics_sql.rs`,
-`crates/pulsus-read/src/traces/search_sql.rs`,
-`crates/pulsus-read/src/traces/sql.rs`,
-`crates/pulsus-read/src/traces/tags_sql.rs`,
-`crates/pulsus-read/tests/golden/traces_graph/single_node.sql`,
-`crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql`,
-`crates/pulsus-schema/src/controller.rs` and `docs/schemas.md`.
-An earlier version of this appendix said 97 ranges and omitted 8 — five golden `.sql`
-files and three document lines — because the script that built it matched only `.rs`,
-`.toml` and `.yml`. The count above was taken with a pattern that matches every
-extension the body cites.
+**Completeness, stated exactly and counted twice.** The body carries **110** citations
+that name a line range, over 33 files, and all 110 are quoted below. It also carries
+**12** citations that name a file with no line range — they point at a whole builder, a
+whole golden file, or a document rather than at a reading — and those are not quoted
+here:
+
+    crates/pulsus-read/src/traces/graph_sql.rs
+    crates/pulsus-read/src/traces/metrics_sql.rs
+    crates/pulsus-read/src/traces/search_eval.rs
+    crates/pulsus-read/src/traces/search_sql.rs
+    crates/pulsus-read/src/traces/sql.rs
+    crates/pulsus-read/src/traces/tags_sql.rs
+    crates/pulsus-read/tests/golden/traces_graph/single_node.sql
+    crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql
+    docs/api.md
+    docs/benchmarks/traces-differential-ledger.md
+    docs/schemas.md
+    e2e/src/traces_corpus.rs
+
+**Two earlier counts were wrong, and each was wrong in its own way.** The first said 97
+because the script that produced it matched three file extensions and dropped five
+golden `.sql` files and three document lines. The second said 108 and 9 because it did
+not resolve a **shorthand** citation — a path given once and then continued with a bare
+`` `:N` ``, as in "`crates/pulsus-write/src/writer/trace.rs:9-19`, and `admit_batch` at
+`` `:220-304` ``" and "`crates/pulsus-schema/src/controller.rs`'s `check_version`, called
+at `` `:89` ``". Six such shorthands appear in the body; resolving them adds
+`crates/pulsus-write/src/writer/trace.rs:220-304` and
+`crates/pulsus-schema/src/controller.rs:89` to the quoted set and takes the controller
+out of the file-level list. The file-level list then grew to 12 when this round added
+four citations that name a file and no line — the two documents and the two source files
+that now record the duplicate-key divergence (§4 Q1).
 
 **Pinned at `8f3348e8`** — the tip of `main` when this appendix was written. The
 line numbers are that revision's and will drift; the quoted bytes are what the
@@ -3521,6 +3782,12 @@ repository-relative.
 
 ### `crates/pulsus-schema/src/controller.rs`
 
+**`:89-89`**
+
+```rust
+   89      check_version(&version)?;
+```
+
 **`:436-436`**
 
 ```rust
@@ -3817,13 +4084,13 @@ repository-relative.
 
 ### `docs/schemas.md`
 
-**`:720-720`**  — this is one of the two citations round one corrected; the branch base's line 720 holds different text, which is what made the correction necessary
+**`:720-720`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   720  | `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
 ```
 
-**`:897-897`**  — the second corrected citation; same reason
+**`:897-897`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   897  **Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
@@ -4081,6 +4348,41 @@ repository-relative.
 
 ```rust
   172              on_flush_poisoned: None,
+```
+
+**`:220-304`**  (85 lines in the range; comments and blanks elided, 30 shown)
+
+```rust
+  220      fn admit_batch(
+  221          &self,
+  222          batch: ParsedTraces,
+  223          with_waiters: bool,
+  224      ) -> Result<Vec<oneshot::Receiver<Result<(), WriteError>>>, Backpressure> {
+  225          if self.shared.shutting_down.load(Ordering::Acquire) {
+  226              return Err(Backpressure);
+  227          }
+  229          self.shared
+  230              .metrics
+  231              .rejected_total
+  232              .fetch_add(batch.rejected, Ordering::Relaxed);
+  237          let span_bytes: u64 = batch.spans.iter().map(TraceSpanRow::est_source_bytes).sum();
+  238          let attr_bytes: u64 = batch.attrs.iter().map(TraceAttrRow::est_source_bytes).sum();
+  239          let total_bytes = span_bytes + attr_bytes;
+  243          super::reserve_queued_bytes(
+  244              &self.shared.queued_bytes,
+  245              &self.shared.metrics.backpressure_total,
+  246              total_bytes,
+  247              self.shared.runtime.queue_bytes_limit,
+  248          )?;
+  250          if self.shared.shutting_down.load(Ordering::Acquire) {
+  251              self.shared
+  252                  .queued_bytes
+  253                  .fetch_sub(total_bytes, Ordering::AcqRel);
+  254              return Err(Backpressure);
+  255          }
+  258          let span_rows: Vec<TraceSpanRow> = batch.spans.iter().map(TraceSpanRow::from).collect();
+  259          let attr_rows: Vec<TraceAttrRow> = batch.attrs.iter().map(TraceAttrRow::from).collect();
+  261          let mut receivers = Vec::new();
 ```
 
 ### `crates/pulsus-write/src/writer/backfill.rs`
