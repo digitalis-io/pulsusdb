@@ -5566,3 +5566,126 @@ is the review in both cases.
 **What a resolved row can and cannot show** depends on which kind of anchor it carries, and the
 block above says what each kind can show and how many rows carry it. The dataset's `anchor_kind`
 column is what records the difference per row, so it is visible rather than assumed away.
+
+---
+
+## 13. PromQL against the model
+
+**Numbered last, not placed beside §3 and §7.** This document's section numbers are cited by name
+from committed checks (`crates/pulsus-read/tests/query_lowering_doc_gate.rs` holds the headings of
+§2.7, §3.1, §7.1 and §12 as constants), so a third language section is appended rather than
+renumbering the two that are already anchored.
+
+**This section is read from source and carries no measurement.** PromQL's chain model is
+[#548](https://github.com/digitalis-io/pulsusdb/issues/548)'s, and it changes **no statement**: the
+chain is built from the planner's own tree, only when `X-Pulsus-Explain: 1` is set, and every link
+above the source is residual. What it buys is that the piece which writes SQL from it is reviewable
+as SQL rather than as SQL-and-model at once.
+
+**The chain rule**, stated in `crates/pulsus-read/src/metrics/compile.rs`'s module doc in the same
+words:
+
+> A chain is rooted at one entry of the planner's selector list — `QueryPlan::selectors`, indexed by
+> `SelectorId` — and `chain_of` returns exactly one chain per entry, always. A node of the plan tree
+> is on entry `i`'s chain iff `i` is the only entry whose rows it consumes, where *consumes* is
+> transitive: a node's entry set is the union of its children's. **An entry is a list position,
+> never a metric name.**
+
+The chain a PromQL request lowers is one per entry, innermost first:
+
+```
+Select(i) -> Node -> Node -> ... -> Node
+   |          \_____ the nodes whose entry set is exactly {i} _____/
+   |
+   the selector's OWN read, which is TWO statements: the float read and
+   its complementary histogram read, one SQL part each
+```
+
+The planner's tree has **29** `PlanExpr` variants and they decompose without remainder:
+
+```
+   1   Selector                      the chain ROOT -> PqlLink::Select(i)
+   3   Scalar, StringLiteral, Time   bear no entry, ever -> on no chain
+   1   Info                          always consumes two entries -> on no chain
+  24   everything else               PqlLink::Node(NodeKind), one variant each
+  --
+  29
+```
+
+`every_promql_plan_node_has_a_row_in_the_lowering_document` reads the 29 out of
+`crates/pulsus-promql/src/plan.rs` and requires a row below for each;
+`every_promql_node_kind_has_a_row_in_the_lowering_document` does the same for the 24 `NodeKind`
+variants. Neither holds a hand list, so a variant added to either enum and not written down here
+fails the build.
+
+### 13.1 The complete PromQL link set
+
+Every row below `Selector` is residual today with `BlockReason::NotYetLowered`, and **none is
+`Never`**: every candidate is "no SQL form has been written", which is what `NotYetLowered` says. A
+`Never` would put a word on a public surface that no code can produce.
+
+| link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
+|---|---|---|---|---|---|
+| `Selector` → `PqlLink::Select(i)` (`plan.rs:592`) | — → `Samples` | none; the seed **is** the two statements the shipped builders render, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts that rather than leaving the exemption silent | **always lowers**, `Fidelity::Wider`: `SelectorSpec::fetch_window` subtracts one lookback unconditionally, so the evaluator MUST re-apply | *none* — the entry's two statements are this plan's two SQL parts, the second cut `Cut::DisjointSources` |
+| `RangeVector` (`plan.rs:603`) | `Samples` → `Samples` | none today | **none — the identity**: no label name is in the column set, so nothing to rewrite | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `RangeFn` (`plan.rs:606`) | `Samples` → `Series` | none today: the per-step grid has no SQL form written | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `OverTime` (`plan.rs:613`) | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `OverTimeParam` (`plan.rs:626`) | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `AbsentOverTime` (`plan.rs:639`) | `Samples` → `Series` | none today; the answer is a statement about rows that are ABSENT, which is the shape §5 calls out | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Absent` (`plan.rs:648`) | `Series` → `Series` | as `AbsentOverTime` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Sort` (`plan.rs:655`) | `Series` → `Series` | an ordering over a VALUE our own evaluator computes | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `SortByLabel` (`plan.rs:664`) | `Series` → `Series` | natural (numeric-aware) label collation, which has no SQL form here | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `LabelReplace` (`plan.rs:674`) | `Series` → `Series` | a label rewrite, and a label is not a column in this model | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `LabelJoin` (`plan.rs:686`) | `Series` → `Series` | as `LabelReplace` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramQuantile` (`plan.rs:693`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramQuantiles` (`plan.rs:712`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramAccessor` (`plan.rs:739`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `HistogramFraction` (`plan.rs:748`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Aggregate` (`plan.rs:760`) | `Series` → `Series` grouped | the grouping key must be expressible, and a group key is a LABEL: the piece that lowers `by (l)` must first decide how a label enters the column set | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part. **A pushed aggregate may not be a plain `GROUP BY` over the fetched rows** — the source is `Wider`, so it has to produce the per-step grid |
+| `CountValues` (`plan.rs:783`) | `Series` → `Series` grouped | as `Aggregate`, and its parameter is an injected LABEL name | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Binary` (`plan.rs:788`) | `Series` × `Series` → `Series` | **a tree, not a chain.** A left fold cannot represent two operands; when both operands bear entries the link is on no chain at all, and when one does it is on that entry's | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `SetOp` (`plan.rs:812`) | `Series` × `Series` → `Series` | as `Binary` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `MathFn` (`plan.rs:823`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `ScalarFn` (`plan.rs:833`) | — → scalar | none today; it bears an entry only when a scalar argument does | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `DateFn` (`plan.rs:846`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Timestamp` (`plan.rs:858`) | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `ScalarOf` (`plan.rs:866`) | `Series` → scalar | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `VectorOf` (`plan.rs:872`) | scalar → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
+| `Info` (`plan.rs:876`) | `Series` × `Series` → `Series` | — | n/a — **always consumes two entries**, its own argument and the synthetic metadata selector the planner pushes for it, so it is on no chain by the rule rather than by an exception to it | not in the chain | n/a |
+| `Scalar` (`plan.rs:903`) | — → scalar | — | n/a — a leaf that bears no entry, ever, so its entry set is empty and no chain can carry it | not in the chain | n/a |
+| `StringLiteral` (`plan.rs:915`) | — → string | — | n/a — as `Scalar`; only ever the plan ROOT | not in the chain | n/a |
+| `Time` (`plan.rs:838`) | — → scalar | — | n/a — as `Scalar`: `time()` emits no selector | not in the chain | n/a |
+
+**Two consequences of the rule, each with its smallest witness**, because four wrong rules were
+built during review that satisfy some of the rows above and not the rule:
+
+```
+   abs( m / m2 )                      abs( m / 100 )
+        |    \                             |    \
+        |     2 entries below              |     1 entry below
+        v                                  v
+   the abs is on NO chain             the abs IS on m's chain
+   2 chains, 1 link each              1 chain, 3 links
+   no Binary, no MathFn               Select(0), Binary(div), MathFn(abs)
+```
+
+- **If a node is on no chain, no ancestor of it is on any chain.** An ancestor consumes at least
+  what its child consumed.
+- **Below such a node each chain carries on.** `sum(rate(m[5m])) / sum(rate(m2[5m]))` is two chains
+  of three links each, and only the `/` is off.
+
+`crates/pulsus-read/tests/promql_chain_census.rs` holds both as named rows and, beneath them, a
+differential: 219 corpus entries derived from the committed function registry and from the planner's
+own operator enums, each compared against a second implementation of the rule written from the
+sentence above.
+
+### 13.2 What this piece does not model, and who owes it
+
+| not represented | why, and who owes it |
+|---|---|
+| **Label names in the column set.** `ColSet` holds the statement's columns (`fingerprint`, `unix_milli`, `value`), and a PromQL group key is a *label*, which is not a column. | So every residual effect above is the identity and no link may lower against a label name. The piece that lowers `by (l)` must first decide how a label enters the column set — an `OpenSource` over the resolved fingerprint-to-labels map is the candidate — and it cannot be done by half. |
+| **The chunk driver.** A selector resolving to more than `CHUNK_THRESHOLD` = 500 fingerprints sends one statement per chunk per table (`crates/pulsus-read/src/metrics/sample_sql.rs`); 1,200 fingerprints is 3 + 3. The plan says `issue: once`. | The core attaches a chunk driver only to a *seeded* part, and this seed is a fingerprint set our own cache resolved, not a value an earlier statement produced. Owed by whichever piece first needs the count to be right. |
+| **The second and later chunks' predicate.** The `Pred` leaf carries the FIRST chunk's fingerprint list. | The rule the explain surface already follows for stage SQL. Same owner as the chunk driver. |
+| **The `info()` cardinality probe.** On the degraded-cache path an `info()` selector sends a `LIMIT`-bounded probe before the fetch. | It is a guard, not part of the answer, and not a part. No piece owes it until a plan drives execution. |
+| **The histogram branch's projection.** `plan_of` clones one relation per branch and only the predicate and the source differ, so both parts carry the float read's three projected columns rather than the histogram read's fifteen. | Invisible today: `PlanShape` has no projection key. Owed by the first piece that renders a statement from the relation. |
+| **A link's payload.** The stage name carries the link kind and its operator — `Aggregate(max)`, `RangeFn(rate)` — and not the grouping, so `sum by (status) (…)` and `sum (…)` render the same name. | Nothing here compares payloads beyond the stage name and no payload reaches a statement, so a wrong payload on a correctly placed link is outside every check this piece has. It becomes visible in the piece that builds SQL from a payload, and that piece owes a check on it. |

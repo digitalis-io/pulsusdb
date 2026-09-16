@@ -1904,6 +1904,8 @@ const S32_HEADING: &str = "### 3.2 Group 1 — cannot be lowered";
 const S71_HEADING: &str = "### 7.1 The complete LogQL link set";
 const S72_HEADING: &str = "### 7.2 Groups 1, 2 and 3";
 const S27_HEADING: &str = "### 2.7 The compiler's output is a PLAN, not a statement";
+const S131_HEADING: &str = "### 13.1 The complete PromQL link set";
+const S132_HEADING: &str = "### 13.2 What this piece does not model, and who owes it";
 const S28_HEADING: &str = "## 3. TraceQL against the model";
 const BOUNDARY_SVG: &str = "docs/diagrams/query-lowering-boundary.svg";
 
@@ -2100,6 +2102,35 @@ fn every_lql_link_variant_has_a_row_in_the_lowering_document() {
     let variants = enum_variants("crates/pulsus-read/src/logql/compile.rs", "LqlLink");
     assert_eq!(variants.len(), 9, "LqlLink: {variants:?}");
     assert_every_variant_has_a_row("LqlLink", &variants, &link_row_labels(s71), "§7.1");
+}
+
+/// Every `pulsus_promql::PlanExpr` variant has a row in §13.1 (issue
+/// #548).
+///
+/// The planner's tree has 29 variants and §13.1 decomposes them without
+/// remainder: one chain root, 24 links, and four that are on no chain —
+/// three leaves that bear no entry and the metadata join, which always
+/// consumes two. A row is required for every one, so a variant added to
+/// the planner and not written down here fails rather than becoming an
+/// unrepresented shape nobody notices.
+#[test]
+fn every_promql_plan_node_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s131 = section(&md, S131_HEADING, S132_HEADING);
+    let variants = enum_variants("crates/pulsus-promql/src/plan.rs", "PlanExpr");
+    assert_eq!(variants.len(), 29, "pulsus_promql::PlanExpr: {variants:?}");
+    assert_every_variant_has_a_row("PlanExpr", &variants, &link_row_labels(s131), "§13.1");
+}
+
+/// Every `NodeKind` variant has a row in §13.1 (issue #548) — the 24 of
+/// the 29 that become chain links.
+#[test]
+fn every_promql_node_kind_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s131 = section(&md, S131_HEADING, S132_HEADING);
+    let variants = enum_variants("crates/pulsus-read/src/metrics/compile.rs", "NodeKind");
+    assert_eq!(variants.len(), 24, "NodeKind: {variants:?}");
+    assert_every_variant_has_a_row("NodeKind", &variants, &link_row_labels(s131), "§13.1");
 }
 
 /// Every `TqlLink` variant has a row in §3.1.
@@ -2414,6 +2445,7 @@ fn every_chain_link_row_states_a_continuation() {
     for (name, heading, end) in [
         ("§3.1", S31_HEADING, S32_HEADING),
         ("§7.1", S71_HEADING, S72_HEADING),
+        ("§13.1", S131_HEADING, S132_HEADING),
     ] {
         for row in link_table_rows(section(&md, heading, end)) {
             let label = &row[0];
@@ -2437,8 +2469,9 @@ fn every_chain_link_row_states_a_continuation() {
         }
     }
     assert!(
-        checked >= 40,
-        "only {checked} link rows were checked; §3.1 carries 23 and §7.1 carries 24"
+        checked >= 69,
+        "only {checked} link rows were checked; §3.1 carries 23, §7.1 carries 24 and §13.1 \
+         carries 29"
     );
 }
 
