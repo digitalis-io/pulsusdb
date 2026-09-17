@@ -426,6 +426,37 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
             "docs/schemas.md §2.3 must say {needle:?} beside the block"
         );
     }
+
+    // **And the three claims the route retired must not come back**
+    // (review round 1, finding 4). Each shipped for a while beside a
+    // route that contradicted it, and each is a plain string, so absence
+    // is checkable where the claim itself is not:
+    //
+    //   "never in ClickHouse SQL"               four aggregations now are
+    //   "answered entirely from the label cache" withdrawn by issue #33
+    //   "The factor is series divided by groups" the run count is a
+    //                                            transition count
+    //
+    // The issue #33 erratum in architecture.md is not caught by the
+    // second: it says "originally answered from the label cache", in the
+    // past tense, which is a record of the withdrawal rather than a claim.
+    let config =
+        std::fs::read_to_string(root.join("docs/configuration.md")).expect("read configuration.md");
+    for (doc, text) in [
+        ("docs/schemas.md", &schemas),
+        ("docs/configuration.md", &config),
+    ] {
+        for retired in [
+            "never in ClickHouse SQL",
+            "answered entirely from the label cache",
+            "The factor is series divided by groups",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{doc} carries the retired claim {retired:?}; the shipped route contradicts it"
+            );
+        }
+    }
 }
 
 /// The first line the two texts disagree on, so a failure names the byte

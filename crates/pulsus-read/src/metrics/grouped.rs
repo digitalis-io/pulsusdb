@@ -37,15 +37,31 @@
 //! # The threshold
 //!
 //! `series >= 2 * groups`, computed from the gid map before anything is
-//! rendered. It is a heuristic and this comment says so. Rows are
-//! bounded — every run boundary is a sample's coverage opening or
-//! closing, so a sample can begin at most two runs and
-//! `pushed_rows <= 2 * raw_rows` — but BYTES are not: the run row is
-//! wider than a sample row and the wire size depends on framing. The
-//! factor the push buys is series divided by groups, so a query with as
-//! many groups as series gains nothing and pays the extra database time;
-//! the threshold declines that case without claiming a gain for the ones
-//! it admits.
+//! rendered.
+//!
+//! **It is a heuristic, and the quantity it stands in for is a TRANSITION
+//! count, not a ratio.** A run ends where the group's answer changes, so
+//! what a statement returns is how often that happens — which the series
+//! and group counts do not determine. Measured on two corpora with the
+//! same 100 series in the same 1 group:
+//!
+//! ```text
+//!   100 one-sample series, evenly spaced, count    39 rows
+//!   100 arrivals arranged to change the count at
+//!     nearly every grid point, count              199 rows
+//! ```
+//!
+//! The transition count is not knowable before the statement runs, so the
+//! threshold uses what the resolver's answer alone supplies. What it
+//! rules out is the case with no reduction to do — as many groups as
+//! series, where the push cannot return fewer rows than the raw read and
+//! would pay the extra database time for nothing. It claims nothing about
+//! the queries it admits.
+//!
+//! Rows ARE bounded either way: every run boundary is a sample's coverage
+//! opening or closing, so a sample can begin at most two runs and
+//! `pushed_rows <= 2 * raw_rows`. Bytes are not — the run row is wider
+//! than a sample row and the wire size depends on framing.
 //!
 //! # What the charge counts
 //!
