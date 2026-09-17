@@ -410,7 +410,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:732` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:756` already names the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the
@@ -2353,7 +2353,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:909`
+> — `docs/schemas.md:933`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`

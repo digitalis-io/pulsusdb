@@ -205,12 +205,22 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
 /// not delete this as noise.
 ///
 /// Applied at all three `table_primary_key_granules(…, "trace_spans")`
-/// call sites. Two of the three are load-bearing in the sense that
-/// removing the wrapper reddens this suite; the third (`base_full`) is
-/// not, because the full-window statement reads the base table under
-/// default settings anyway. It is still wrapped: leaving it bare would
-/// make the `full`/`narrow` pair one base-table reading against one
-/// projection reading, and the same for the `windowed`/`narrow` equality.
+/// call sites. Only two of the three are load-bearing today: measured one
+/// removal at a time against a seeded corpus, taking the wrapper off
+/// `base_narrow` or off `base_windowed` reddens this suite, and taking it
+/// off `base_full` leaves it green — the full-window statement reads the
+/// base table under default settings anyway, so with only that one bare
+/// BOTH readings of the `full`/`narrow` pair still come from the base
+/// table.
+///
+/// `base_full` is wrapped all the same, and the reason is not about
+/// today's plans. Which physical copy the optimiser picks for a
+/// predicate-free full-window scan is a property of the corpus and of the
+/// cost model, neither of which this suite controls. With the setting on
+/// every site, the three readings are pinned to the base table by the
+/// statement rather than by a coincidence, and a future corpus or
+/// optimiser cannot silently turn one of them into a projection reading
+/// while the assertions still pass.
 fn with_projections_off(sql: &str) -> String {
     format!("{sql}\nSETTINGS optimize_use_projections = 0")
 }

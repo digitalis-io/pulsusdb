@@ -941,12 +941,17 @@ pub const MIGRATIONS: &[Migration] = &[
     // the table does not have today (neither the base order nor
     // `service_time` leads with `name`).
     //
-    // Measured on the 2,000,000-span corpus of
-    // docs/traceql-schema-migration.md §4: the span table falls from
-    // 130.43 to 105.94 B/span, and a span-name search over that corpus goes
-    // from 2,000,000 rows / 245 marks to 57,344 rows / 7 marks. No answer
-    // moves anywhere: no read-path statement's text changes, only the plan
-    // the optimizer picks.
+    // What that is worth — the per-span storage it saves and the rows and
+    // marks a span-name search stops reading — is measured in
+    // docs/traceql-schema-migration.md §4 and §5, beside the corpus that
+    // produced it and the settings it was taken at. No figure is repeated
+    // here: a number away from its instrument cannot be checked, and these
+    // readings move with how the corpus was built (the same corpus built
+    // at a different `max_threads` selects a different number of granules
+    // for the same statement).
+    //
+    // No answer moves anywhere: no read-path statement's text changes,
+    // only the plan the optimizer picks.
     //
     // The column list is alphabetical on purpose — that is the order
     // `system.projection_parts_columns` returns, so the live check in
@@ -993,9 +998,11 @@ pub const MIGRATIONS: &[Migration] = &[
     // table this is an asynchronous mutation and `--mode init` does not
     // block on it: between ids 44 and 46 a `resource.service.name` search
     // reads the base table instead of the projection. A correct answer, a
-    // slower one. Measured on 2,000,000 spans: 2,000,000 rows / 245 marks
-    // during the interval, 114,688 rows / 14 marks once it finished. On a
-    // fresh database the interval is empty.
+    // slower one, for as long as the mutation takes
+    // (docs/traceql-schema-migration.md §8 describes the interval; its cost
+    // on a populated table is listed there as NOT measured, so no duration
+    // is quoted here). On a fresh database the interval is empty, which is
+    // what CI and a new developer database see.
     Migration {
         id: 46,
         name: "trace_spans",

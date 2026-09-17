@@ -27,7 +27,7 @@ docs/query-lowering.md	ast.rs:977	crates/pulsus-logql/src/ast.rs	977		prose	Bina
 docs/query-lowering.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
 docs/query-lowering.md	ast.rs:992	crates/pulsus-logql/src/ast.rs	992		prose	Variants
 docs/query-lowering.md	ast.rs:994	crates/pulsus-traceql/src/ast.rs	994		prose	Aggregate
-docs/query-lowering.md	catalog.rs:1766	crates/pulsus-schema/src/catalog.rs	1766		line	!static_tmpl(16).contains("status_message"),
+docs/query-lowering.md	catalog.rs:1773	crates/pulsus-schema/src/catalog.rs	1773		line	!static_tmpl(16).contains("status_message"),
 docs/query-lowering.md	catalog.rs:382	crates/pulsus-schema/src/catalog.rs	382		line	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	compile/fold.rs:242	crates/pulsus-read/src/compile/fold.rs	242		prose	set_provenance
 docs/query-lowering.md	compile/fold.rs:623	crates/pulsus-read/src/compile/fold.rs	623		line	pub struct Relation<L: Lang + ?Sized> {
@@ -178,7 +178,7 @@ docs/query-to-sql.md	catalog.rs:379	crates/pulsus-schema/src/catalog.rs	379		pro
 docs/query-to-sql.md	catalog.rs:381-382	crates/pulsus-schema/src/catalog.rs	381	382	line	PARTITION BY date\n\ ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-to-sql.md	catalog.rs:382	crates/pulsus-schema/src/catalog.rs	382		prose	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
 docs/query-to-sql.md	catalog.rs:441	crates/pulsus-schema/src/catalog.rs	441		prose	structured_metadata
-docs/query-to-sql.md	catalog.rs:980-986	crates/pulsus-schema/src/catalog.rs	980	986	prose	(service, timestamp_ns)
+docs/query-to-sql.md	catalog.rs:985-991	crates/pulsus-schema/src/catalog.rs	985	991	prose	(service, timestamp_ns)
 docs/query-to-sql.md	client_agg.rs:2168	crates/pulsus-read/src/logql/client_agg.rs	2168		line	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
 docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	if (major, minor) < (26, 3) {
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-config/src/model.rs	518		line	traceql_generator_max_memory_bytes: 536_870_912,

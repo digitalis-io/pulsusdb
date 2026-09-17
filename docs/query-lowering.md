@@ -2471,8 +2471,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1766` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1817` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1773` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1824` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
