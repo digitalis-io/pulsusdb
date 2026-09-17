@@ -16,25 +16,53 @@
 //! still fails by three orders of magnitude.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 struct CountingAlloc;
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: delegates verbatim to the system allocator; the only side
 // effect is a relaxed atomic increment, which allocates nothing and
 // cannot re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static ALLOCS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `ALLOCS` so far.
+fn allocs_here() -> u64 {
+    ALLOCS.with(Cell::get)
+}
+
+/// Adds to this thread's `ALLOCS` tally.
+fn charge_allocs(n: u64) {
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        charge_allocs(1);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        charge_allocs(1);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -74,13 +102,13 @@ fn count_run_into(query: &str, bodies: &[String], base: &[(String, String)]) -> 
         let out = pipeline.run_into(body, base, 0, &mut scratch);
         std::hint::black_box(&out);
     }
-    let start = ALLOCS.load(Ordering::Relaxed);
+    let start = allocs_here();
     for i in 0..ROWS {
         let body = &bodies[i as usize % bodies.len()];
         let out = pipeline.run_into(body, base, 0, &mut scratch);
         std::hint::black_box(&out);
     }
-    ALLOCS.load(Ordering::Relaxed) - start
+    allocs_here() - start
 }
 
 /// Counts allocations across one full `run_pipeline_rows` assembly over
@@ -97,9 +125,9 @@ fn count_assembly(
         run_pipeline_rows(rows.to_vec(), &pipeline, meta, u32::MAX).expect("no budget breach");
     assert!(!warm.is_empty(), "assembly fixture must produce output");
     let rows_clone = rows.to_vec(); // clone outside the window too
-    let start = ALLOCS.load(Ordering::Relaxed);
+    let start = allocs_here();
     let out = run_pipeline_rows(rows_clone, &pipeline, meta, u32::MAX).expect("no budget breach");
-    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    let total = allocs_here() - start;
     std::hint::black_box(&out);
     total
 }
@@ -126,9 +154,9 @@ fn count_streamed_assembly(
     let warm = drive(rows.to_vec());
     assert!(!warm.is_empty(), "assembly fixture must produce output");
     let rows_clone = rows.to_vec(); // clone outside the window too
-    let start = ALLOCS.load(Ordering::Relaxed);
+    let start = allocs_here();
     let out = drive(rows_clone);
-    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    let total = allocs_here() - start;
     std::hint::black_box(&out);
     total
 }
@@ -661,7 +689,7 @@ fn per_row_allocation_bounds_hold() {
         "fixture must produce buckets"
     );
     let rows_n = agg_rows.len() as u64;
-    let start = ALLOCS.load(Ordering::Relaxed);
+    let start = allocs_here();
     let out = run_client_agg_rows(
         &agg_rows,
         &compiled,
@@ -671,7 +699,7 @@ fn per_row_allocation_bounds_hold() {
         mp.rate_window_ns,
     )
     .expect("client agg");
-    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    let total = allocs_here() - start;
     std::hint::black_box(&out);
     // Flat budget: base-label setup + a handful of buckets + the output
     // series — never a per-row term. A real 1-per-row regression would
@@ -758,7 +786,7 @@ fn per_row_allocation_bounds_hold() {
             other => panic!("expected a matrix, got {other:?}"),
         };
         drop(warm);
-        let start = ALLOCS.load(Ordering::Relaxed);
+        let start = allocs_here();
         let out = run_client_agg_rows(
             rows,
             &compiled,
@@ -768,7 +796,7 @@ fn per_row_allocation_bounds_hold() {
             mp.rate_window_ns,
         )
         .expect("client agg");
-        let total = ALLOCS.load(Ordering::Relaxed) - start;
+        let total = allocs_here() - start;
         std::hint::black_box(&out);
         (total, series)
     };
@@ -897,7 +925,7 @@ fn per_row_allocation_bounds_hold() {
         other => panic!("expected a matrix, got {other:?}"),
     }
     let sm_n = sm_metric_rows.len() as u64;
-    let sm_start = ALLOCS.load(Ordering::Relaxed);
+    let sm_start = allocs_here();
     let sm_out = run_client_agg_rows(
         &sm_metric_rows,
         &sm_compiled,
@@ -907,7 +935,7 @@ fn per_row_allocation_bounds_hold() {
         sm_mp.rate_window_ns,
     )
     .expect("client agg");
-    let sm_total = ALLOCS.load(Ordering::Relaxed) - sm_start;
+    let sm_total = allocs_here() - sm_start;
     std::hint::black_box(&sm_out);
     assert!(
         sm_total <= SM_METRIC_PER_ROW * sm_n + ZERO_RESIDUE,
@@ -961,7 +989,7 @@ fn per_row_allocation_bounds_hold() {
         matches!(&warm, QueryResult::Matrix(m) if m.len() == JOIN_SERIES),
         "the group_left join must produce one output series per many-side series"
     );
-    let start = ALLOCS.load(Ordering::Relaxed);
+    let start = allocs_here();
     let out = combine_binary(
         BinOp::Div,
         false,
@@ -970,7 +998,7 @@ fn per_row_allocation_bounds_hold() {
         QueryResult::Matrix(one),
     )
     .expect("join");
-    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    let total = allocs_here() - start;
     std::hint::black_box(&out);
     // Per step the core touches ~(one-side + many-side) signatures, the
     // per-many output labels, and the output-point pushes — a small

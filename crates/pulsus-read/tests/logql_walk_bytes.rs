@@ -11,15 +11,46 @@
 //! never used as each other's expected value.
 //!
 //! Everything runs inside one `#[test]` so no parallel test thread can
-//! pollute the process-global counters.
+//! pollute the measuring thread's counters.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-static CALLS: AtomicU64 = AtomicU64::new(0);
-static BYTES: AtomicU64 = AtomicU64::new(0);
-static ON: AtomicBool = AtomicBool::new(false);
+// The counters, and the gate that opens them, are **per thread**, not per
+// process. A `#[global_allocator]` serves every thread in the test
+// binary, so a single process-wide figure charges whatever any other
+// thread allocates to whichever measured window happens to be open — and
+// an allocation made elsewhere is then indistinguishable from one the
+// code under test made itself.
+//
+// The gate moves with the counters for the same reason: a process-wide
+// `ON` would still admit another thread's allocations into an open
+// window even if the tallies themselves were thread-local.
+//
+// `const`-initialised, so each slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static CALLS: Cell<u64> = const { Cell::new(0) };
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+    static ON: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Adds one allocation of `size` bytes to this thread's tally, if this
+/// thread has a window open.
+fn charge_here(size: u64) {
+    let _ = ON.try_with(|on| {
+        if on.get() {
+            let _ = CALLS.try_with(|c| c.set(c.get() + 1));
+            let _ = BYTES.try_with(|c| c.set(c.get() + size));
+        }
+    });
+}
 
 struct CountingAlloc;
 
@@ -28,20 +59,14 @@ struct CountingAlloc;
 // cannot re-enter the allocator.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ON.load(Ordering::Relaxed) {
-            CALLS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        }
+        charge_here(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ON.load(Ordering::Relaxed) {
-            CALLS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-        }
+        charge_here(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -54,16 +79,12 @@ use pulsus_logql::{MeNode, MetricExpr, MetricScc};
 
 /// Runs `f` with the counters scoped to it, returning `(calls, bytes)`.
 fn measured<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
-    CALLS.store(0, Ordering::Relaxed);
-    BYTES.store(0, Ordering::Relaxed);
-    ON.store(true, Ordering::Relaxed);
+    CALLS.with(|c| c.set(0));
+    BYTES.with(|c| c.set(0));
+    ON.with(|c| c.set(true));
     let out = f();
-    ON.store(false, Ordering::Relaxed);
-    (
-        out,
-        CALLS.load(Ordering::Relaxed),
-        BYTES.load(Ordering::Relaxed),
-    )
+    ON.with(|c| c.set(false));
+    (out, CALLS.with(Cell::get), BYTES.with(Cell::get))
 }
 
 fn leaf() -> MetricExpr {

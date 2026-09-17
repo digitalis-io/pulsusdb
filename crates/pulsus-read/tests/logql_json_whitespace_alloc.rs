@@ -10,30 +10,68 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 use pulsus_read::logql::pipeline::CompiledPipeline;
 
 struct CountingAlloc;
 
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static BYTES: AtomicU64 = AtomicU64::new(0);
-
 // SAFETY: delegates verbatim to the system allocator; the only side effect
 // is two relaxed atomic adds, which allocate nothing and cannot re-enter the
 // allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `ALLOCS` so far.
+fn allocs_here() -> u64 {
+    ALLOCS.with(Cell::get)
+}
+
+/// Adds to this thread's `ALLOCS` tally.
+fn charge_allocs(n: u64) {
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + n));
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_allocs(1);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_allocs(1);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -53,15 +91,9 @@ fn compiled(query: &str) -> CompiledPipeline {
 /// `(allocations, bytes requested)` for one metric run of `line`.
 fn cost(c: &CompiledPipeline, line: &str, base: &[(String, String)]) -> (u64, u64) {
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::with_capacity(8);
-    let (a0, b0) = (
-        ALLOCS.load(Ordering::Relaxed),
-        BYTES.load(Ordering::Relaxed),
-    );
+    let (a0, b0) = (allocs_here(), bytes_here());
     let r = c.run_metric_into(line, base, 0, None, &mut labels);
-    let out = (
-        ALLOCS.load(Ordering::Relaxed) - a0,
-        BYTES.load(Ordering::Relaxed) - b0,
-    );
+    let out = (allocs_here() - a0, bytes_here() - b0);
     std::hint::black_box((r.is_ok(), labels.len()));
     out
 }

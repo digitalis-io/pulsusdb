@@ -12,36 +12,65 @@
 //! with N and blow past both the ceiling and the equality.
 //!
 //! Everything runs in the SINGLE `#[test]` below so no parallel test thread can
-//! pollute the process-global counter.
+//! pollute the per-thread counter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CountingAlloc;
 
-/// Total bytes requested from the allocator, process-global. Bytes (not call
-/// count) are the load-bearing metric: an exact allocation-*count* equality
-/// over a measured window flakes on stray runtime allocations (it turned main
-/// red on the sibling track-1 gate), whereas the pre-scan's own BYTE footprint
-/// is a fixed frame-stack `Vec` independent of the fan-out width, and an O(N)
-/// materialization regression overshoots the byte ceiling by orders of
-/// magnitude.
-static BYTES: AtomicU64 = AtomicU64::new(0);
+// Total bytes requested from the allocator, per thread. Bytes (not call
+// count) are the load-bearing metric: an exact allocation-*count* equality
+// over a measured window flakes on stray runtime allocations (it turned main
+// red on the sibling track-1 gate), whereas the pre-scan's own BYTE footprint
+// is a fixed frame-stack `Vec` independent of the fan-out width, and an O(N)
+// materialization regression overshoots the byte ceiling by orders of
+// magnitude.
 
 // SAFETY: delegates verbatim to the system allocator; the only side effect is a
 // relaxed atomic add of the requested size, which allocates nothing and cannot
 // re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -89,9 +118,9 @@ fn put_len(out: &mut Vec<u8>, mut v: usize) {
 /// Bytes charged only during the `prescan_traces` call on `body` (the fixture
 /// is already built), asserting the over-cap reject.
 fn prescan_bytes(body: &[u8]) -> u64 {
-    let start = BYTES.load(Ordering::Relaxed);
+    let start = bytes_here();
     let result = prescan_traces(body);
-    let bytes = BYTES.load(Ordering::Relaxed) - start;
+    let bytes = bytes_here() - start;
     black_box(&result);
     result.expect_err("over-cap span fan-out must be rejected");
     bytes
