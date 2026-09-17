@@ -9,32 +9,61 @@
 //! measured bytes with the extra wire width and blow both asserts.
 //!
 //! Everything runs in the SINGLE `#[test]` below so no parallel test thread
-//! can pollute the process-global counter. Per the project's alloc-bound
+//! can pollute the per-thread counter. Per the project's alloc-bound
 //! testing rule the asserts are byte CEILINGS, never exact allocation-count
-//! equalities (process-global counters flake on stray allocations).
+//! equalities (per-thread counters flake on stray allocations).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CountingAlloc;
 
-/// Total bytes requested from the allocator, process-global.
-static BYTES: AtomicU64 = AtomicU64::new(0);
+// Total bytes requested from the allocator, per thread.
 
 // SAFETY: delegates verbatim to the system allocator; the only side effect is
 // a relaxed atomic add of the requested size, which allocates nothing and
 // cannot re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -109,9 +138,9 @@ fn over_budget_body(extra: usize) -> Vec<u8> {
 /// Bytes requested during the `decode` call alone (the fixture is prebuilt),
 /// asserting the byte-budget reject fires.
 fn decode_bytes(body: &[u8]) -> u64 {
-    let start = BYTES.load(Ordering::Relaxed);
+    let start = bytes_here();
     let result = decode(body);
-    let bytes = BYTES.load(Ordering::Relaxed) - start;
+    let bytes = bytes_here() - start;
     match black_box(result) {
         Err(LogsIngestError::OversizeMessage { field, .. }) => {
             assert_eq!(field, "decoded bytes (estimated)");

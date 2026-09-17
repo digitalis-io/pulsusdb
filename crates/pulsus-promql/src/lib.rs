@@ -25,6 +25,7 @@ pub mod value;
 
 pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
 pub use error::PromqlError;
+pub use eval::aggregation::group_key_of;
 pub use eval::{CancelToken, evaluate, evaluate_cancellable};
 pub use limits::MAX_EXPR_DEPTH;
 pub use math::KahanSum;

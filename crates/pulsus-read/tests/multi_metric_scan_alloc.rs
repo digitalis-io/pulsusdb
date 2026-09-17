@@ -5,7 +5,7 @@
 //! bailing to `ScanBudgetExceeded`. Modeled on `otlp_depth_alloc.rs` /
 //! `logql_pipeline_alloc.rs`: a counting global allocator, scoped to this
 //! one test binary, sums BYTES (not allocation *count* — the alloc-bound
-//! test-flake lesson: a process-global counter measured over a tiny window
+//! test-flake lesson: a per-thread counter measured over a tiny window
 //! is noisy, but the correct walk's own byte footprint is a small,
 //! deterministic, width-independent constant).
 //!
@@ -33,25 +33,54 @@
 //!   universes bound asserted below by more than an order of magnitude.
 //!
 //! Everything runs in the SINGLE `#[test]` below so no parallel test
-//! thread can pollute the process-global counter.
+//! thread can pollute the per-thread counter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::cell::Cell;
 
 struct CountingAlloc;
 
-/// Total bytes requested from the allocator, process-global. Bytes (not
-/// call count) are the load-bearing metric here — see the module doc for
-/// why a regressed pre-loop name-universe materialization is only visible
-/// in bytes, not in the `examined` loop counter.
-static BYTES: AtomicU64 = AtomicU64::new(0);
+// Total bytes requested from the allocator, per thread. Bytes (not
+// call count) are the load-bearing metric here — see the module doc for
+// why a regressed pre-loop name-universe materialization is only visible
+// in bytes, not in the `examined` loop counter.
 
 // SAFETY: delegates verbatim to the system allocator; the only side effect
 // is a relaxed atomic add of the requested size, which allocates nothing
 // and cannot re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Relaxed);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -61,7 +90,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
         // A grow reallocation charges the new size — this is what makes an
         // O(name-universe) `Vec<&String>`'s repeated doublings visible in
         // bytes.
-        BYTES.fetch_add(new_size as u64, Relaxed);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -91,9 +120,9 @@ const AUX_CEILING_BYTES: u64 = 64 * 1024;
 /// walk bails to `ScanBudgetExceeded` (never a false `Groups`/`Unresolvable`
 /// on this reject-all fixture).
 fn reject_bytes(probe: &MultiMetricScanProbe, snapshot: &CacheSnapshot) -> (u64, usize, u64) {
-    let start = BYTES.load(Relaxed);
+    let start = bytes_here();
     let resolution = probe.resolve_for_test(snapshot, SCAN_BUDGET);
-    let bytes = BYTES.load(Relaxed) - start;
+    let bytes = bytes_here() - start;
     match resolution {
         MultiMetricResolution::ScanBudgetExceeded { examined, cap } => (bytes, examined, cap),
         other => panic!("expected ScanBudgetExceeded on the reject-all fixture, got {other:?}"),

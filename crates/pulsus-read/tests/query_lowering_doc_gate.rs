@@ -107,6 +107,7 @@ fn maximal_shape() -> PlanShape {
         parts: vec![
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
+                also_reads: Vec::new(),
                 name: "log_streams_idx".to_string(),
                 issue: "once",
                 cut: None,
@@ -115,6 +116,7 @@ fn maximal_shape() -> PlanShape {
             })),
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
+                also_reads: Vec::new(),
                 name: "log_samples".to_string(),
                 issue: "per_seed:keyset",
                 cut: Some(CutShape {
@@ -136,6 +138,7 @@ fn maximal_shape() -> PlanShape {
             })),
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
+                also_reads: Vec::new(),
                 name: "trace_attrs_idx".to_string(),
                 issue: "per_seed:chunks",
                 cut: Some(CutShape {
@@ -160,6 +163,7 @@ fn maximal_shape() -> PlanShape {
             })),
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
+                also_reads: Vec::new(),
                 name: "trace_spans".to_string(),
                 issue: "once",
                 cut: Some(CutShape {

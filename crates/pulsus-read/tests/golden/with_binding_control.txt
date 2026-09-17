@@ -1,0 +1,3 @@
+-- statement[000] offset=00000045 len=000041
+WITH q AS (SELECT 1 AS n)
+SELECT n FROM q

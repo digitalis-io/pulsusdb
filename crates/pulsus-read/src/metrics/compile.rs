@@ -145,12 +145,20 @@ impl SourceName for PqlSource {
 
 /// PromQL's shapes.
 ///
-/// One variant today. The rows a selector's statements return are
-/// samples; nothing this piece builds has any other shape. The piece that
-/// lowers an aggregate adds the grid.
+/// The rows a selector's statements return. Two shapes today, and the
+/// shape is what the aggregate link's capability reads: the decision to
+/// push rides in the DATA rather than in a flag the dispatcher consults,
+/// so the explain surface changes exactly when the statement changes and
+/// a query that is eligible but declines has an unchanged plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PqlShape {
+    /// One row per stored sample — `fingerprint, unix_milli, value`.
     Samples,
+    /// One row per RUN: a stretch of consecutive grid indices over which
+    /// one group's answer does not change (issue #549). Set by
+    /// [`seed_relation`] only for a selector whose grouped push was
+    /// taken.
+    GroupedRuns,
 }
 
 impl Shape for PqlShape {}
@@ -284,6 +292,18 @@ impl Lang for Pql {
             ast_elements: 3 + n,
         }
     }
+
+    /// The grouped instant read (issue #549) unions `metric_samples` and
+    /// `metric_hist_samples` inside ONE statement, so the part named for
+    /// the first also reads the second. Every other PromQL statement
+    /// reads exactly one table and this returns nothing for it, which is
+    /// what keeps the wire field absent from every plan but that one.
+    fn also_reads(rel: &Relation<Pql>) -> Vec<SourceRef> {
+        match rel.shape {
+            PqlShape::GroupedRuns => vec![METRIC_HIST_SAMPLES],
+            PqlShape::Samples => Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -323,12 +343,29 @@ impl Lower<Pql> for SelectLower {
 }
 
 impl Lower<Pql> for NodeLower {
-    /// No SQL form has been written for any of the 24 yet, which is what
-    /// `NotYetLowered` says. None of them is `Never`: every candidate —
-    /// `stddev`/`stdvar`, the binary-operator tree — is unwritten rather
-    /// than unwritable, and a `Never` here would put a word on a public
-    /// surface that no code can produce.
-    fn capability(&self, _s: &PqlLink, _rel: &Relation<Pql>) -> Capability {
+    /// One link lowers, and only over rows the grouped statement
+    /// produced: `min`/`max`/`count`/`group`, when the relation's shape
+    /// is [`PqlShape::GroupedRuns`] (issue #549). Every other link — and
+    /// those four over ordinary sample rows — is `NotYetLowered`.
+    ///
+    /// **The shape is the condition, not the operator.** Reading only the
+    /// operator would claim a lowering for `max by (status) (m)` on every
+    /// route, including the one where the push declined on the threshold
+    /// and the engine still does the reduction.
+    ///
+    /// None of the rest is `Never`: every candidate — `stddev`/`stdvar`,
+    /// the binary-operator tree — is unwritten rather than unwritable,
+    /// and a `Never` here would put a word on a public surface that no
+    /// code can produce.
+    fn capability(&self, s: &PqlLink, rel: &Relation<Pql>) -> Capability {
+        if rel.shape == PqlShape::GroupedRuns
+            && let PqlLink::Node(NodeKind::Aggregate(
+                AggOp::Min | AggOp::Max | AggOp::Count | AggOp::Group,
+                _,
+            )) = s
+        {
+            return Capability::Yes;
+        }
         Capability::No(BlockReason::NotYetLowered)
     }
 
@@ -370,8 +407,18 @@ pub fn selector_pred(name: &str, window: &str, fps: &str) -> Pred {
     Pred::leaf(text.clone(), METRIC_SAMPLES).or(Pred::leaf(text, METRIC_HIST_SAMPLES))
 }
 
+/// One pushed selector's read, as one predicate: the grouped statement
+/// reads `metric_samples` and `metric_hist_samples` in ONE statement, so
+/// it is one leaf naming the table the part is named for, with the other
+/// carried additively by [`Pql::also_reads`] rather than by a second
+/// branch (a disjunction here would split it into two parts, which is a
+/// plan describing two statements where the engine sends one).
+pub fn grouped_selector_pred(name: &str, window: &str, fps: &str) -> Pred {
+    Pred::leaf(format!("{name} AND {window} AND {fps}"), METRIC_SAMPLES)
+}
+
 /// The seed relation a PromQL chain folds from.
-pub fn seed_relation(predicate: Pred) -> Relation<Pql> {
+pub fn seed_relation(predicate: Pred, shape: PqlShape) -> Relation<Pql> {
     Relation {
         source: SourceTerm::Base(PqlSource(METRIC_SAMPLES)),
         predicate,
@@ -397,7 +444,7 @@ pub fn seed_relation(predicate: Pred) -> Relation<Pql> {
         grouping: None,
         ordering: None,
         limit: None,
-        shape: PqlShape::Samples,
+        shape,
         exact: true,
         depth: 0,
         having: Vec::new(),
@@ -1156,6 +1203,11 @@ fn date_fn_name(f: DateFn) -> &'static str {
 pub struct SelectorRead {
     pub selector: SelectorId,
     pub pred: Pred,
+    /// The rows this selector's statements return. [`PqlShape::Samples`]
+    /// for the sample fetch; [`PqlShape::GroupedRuns`] when the grouped
+    /// push was taken for this selector (issue #549) — which is the ONE
+    /// input the aggregate link's capability reads.
+    pub shape: PqlShape,
 }
 
 /// The request's bounds, in the core's nanoseconds.
@@ -1212,18 +1264,22 @@ pub(crate) fn plan_shapes(
     // alias and search per chain — the shape that beat the shadowing this
     // replaced (code review round 5). The index is counted for the same
     // reason.
-    let mut by_selector: Counted<Vec<Option<&Pred>>> =
+    let mut by_selector: Counted<Vec<Option<&SelectorRead>>> =
         Counted::new(vec![None; plan.selectors.len()]);
     for read in reads.iter() {
-        by_selector.try_set(read.selector, Some(&read.pred));
+        by_selector.try_set(read.selector, Some(read));
     }
     let mut out = Vec::new();
     for chain in chain_of(plan) {
-        let Some(pred) = by_selector.get(chain.selector).copied().flatten() else {
+        let Some(read) = by_selector.get(chain.selector).copied().flatten() else {
             continue;
         };
         let names = stage_names(&chain);
-        let lowering = lower_chain::<Pql>(&chain.links, seed_relation(pred.clone()), &lower_cx)?;
+        let lowering = lower_chain::<Pql>(
+            &chain.links,
+            seed_relation(read.pred.clone(), read.shape.clone()),
+            &lower_cx,
+        )?;
         let query_plan = core_plan_of::<Pql>(&chain.links, lowering, &cx)?;
         out.push(query_plan.shape(&names));
     }
@@ -1303,6 +1359,124 @@ mod tests {
         ]
     }
 
+    /// Issue #549 criterion 4: **the queries that keep today's route
+    /// keep today's plan, byte for byte.**
+    ///
+    /// The shape is taken from [`crate::metrics::grouped::shape_of`],
+    /// not chosen by this test — which is what makes each mutation below
+    /// reach it. **Every one was run** (review round 1 named one that did
+    /// not):
+    ///
+    /// ```text
+    ///   mutation                               query it turns eligible    case
+    ///   widen the pushed set to Stddev         stddev by (status) (m)     1
+    ///   accept ANY child, taking the plan's    max by (status) (abs(m))   3
+    ///     single selector
+    /// ```
+    ///
+    /// **`max by (status) (rate(m[5m]))` is case 2 and no mutation of the
+    /// direct-child check reaches it.** Lifting that check alone leaves it
+    /// declined, because a range selector is refused independently a few
+    /// lines further down — measured in review round 1, where the named
+    /// break stayed green. Two protections decline it and removing one
+    /// changes nothing, so case 2 is kept for the shape it pins and case
+    /// 3 is what the child check is tested by: `abs(…)` is a non-selector
+    /// child whose selector is still a plain INSTANT one, so the child
+    /// check is the only thing declining it.
+    ///
+    /// The flag is ON in the configuration this test builds, so a decline
+    /// here is a decline on the query's shape and not on the flag.
+    #[test]
+    fn every_unpushed_query_keeps_todays_plan_byte_for_byte() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "stddev by (status) (http_requests_total{status=\"500\"})",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"Aggregate(stddev)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+            (
+                "max by (status) (rate(http_requests_total{status=\"500\"}[5m]))",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"RangeFn(rate)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+            (
+                "max by (status) (abs(http_requests_total{status=\"500\"}))",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"MathFn(abs)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+        ];
+        for (query, want) in cases {
+            let shapes = rendered_plan(query);
+            assert_eq!(shapes.len(), 1, "{query}: one selector that reads");
+            let got = serde_json::to_string(&shapes[0]).expect("serialize");
+            assert_eq!(got, want, "{query}: the plan moved");
+        }
+    }
+
+    /// Issue #549: a PUSHED selector is ONE SQL part, named for
+    /// `metric_samples` and additively naming the histogram table it
+    /// reads inside the same statement — with no `disjoint_sources` cut,
+    /// because there is no second statement to cut from, and no engine
+    /// part, because the aggregate link lowers.
+    #[test]
+    fn a_pushed_selector_is_one_part_that_also_reads_the_histogram_table() {
+        let shapes = rendered_plan("max by (status) (http_requests_total{status=\"500\"})");
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&shapes[0]).expect("serialize"),
+            r#"{"parts":[{"kind":"sql","name":"metric_samples","also_reads":["metric_hist_samples"],"issue":"once","cut":null,"seed":null,"yields":"candidates"}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":0,"stage":"Aggregate(max)","how":"lowered","fidelity":"wider"}]}"#
+        );
+    }
+
+    /// The plan shapes for `query`, with each selector's seed shape taken
+    /// from `grouped::shape_of` — the same decision `exec` takes, so a
+    /// change to the eligibility rule reaches these literals.
+    fn rendered_plan(query: &str) -> Vec<PlanShape> {
+        let plan = planned(query);
+        let cfg = grouped_test_config();
+        let shape = crate::metrics::grouped::shape_of(&plan, &plan_params(), &cfg);
+        let mut reads = SelectorReads::empty();
+        for (i, _) in plan.selectors.iter().enumerate() {
+            let pushed = shape.as_ref().is_some_and(|s| s.selector == i);
+            reads.push(SelectorRead {
+                selector: i,
+                pred: if pushed {
+                    grouped_selector_pred(
+                        "metric_name = 'http_requests_total'",
+                        "unix_milli > 1 AND unix_milli <= 2",
+                        "fingerprint IN (7)",
+                    )
+                } else {
+                    pred("http_requests_total")
+                },
+                shape: if pushed {
+                    PqlShape::GroupedRuns
+                } else {
+                    PqlShape::Samples
+                },
+            });
+        }
+        plan_shapes(&plan, &reads, &params()).expect("plan shapes")
+    }
+
+    /// The engine configuration these tests plan against: the grouped
+    /// push ON, so a decline is a decline on the query and not on the
+    /// flag.
+    fn grouped_test_config() -> crate::metrics::MetricsConfig {
+        crate::metrics::MetricsConfig {
+            db: "d".to_string(),
+            samples_table: "metric_samples".to_string(),
+            hist_samples_table: "metric_hist_samples".to_string(),
+            series_table: "metric_series".to_string(),
+            metadata_table: "metric_metadata".to_string(),
+            experimental_functions: true,
+            max_metric_fanout: 1_000,
+            max_cache_scan: 200_000,
+            max_info_series: 100_000,
+            max_samples: 50_000_000,
+            distributed: false,
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            grouped_push: true,
+        }
+    }
+
     /// Criterion 4: **every link's residual state effect is asserted, not
     /// assumed.**
     ///
@@ -1312,8 +1486,8 @@ mod tests {
     /// where the row says it preserves one.
     #[test]
     fn every_promql_link_states_its_residual_state_effect() {
-        let mut s1 = seed_relation(pred("a"));
-        let mut s2 = seed_relation(pred("b"));
+        let mut s1 = seed_relation(pred("a"), PqlShape::Samples);
+        let mut s2 = seed_relation(pred("b"), PqlShape::Samples);
         // The two seeds differ in more than the predicate, so a row that
         // claims the identity is checked against two genuinely different
         // relations.
@@ -1434,6 +1608,7 @@ mod tests {
         reads.push(SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
+            shape: PqlShape::Samples,
         });
         let shapes = plan_shapes(&plan, &reads, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 1, "one plan per selector that reads");
@@ -1466,6 +1641,7 @@ mod tests {
         reads.push(SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
+            shape: PqlShape::Samples,
         });
         let bounds = request_bounds(&params());
         let config = PlanConfig::default();
@@ -1476,7 +1652,10 @@ mod tests {
         let chain = chain_of(&plan).remove(0);
         let lowering = lower_chain::<Pql>(
             &chain.links,
-            seed_relation(reads.get(0).expect("one read").pred.clone()),
+            seed_relation(
+                reads.get(0).expect("one read").pred.clone(),
+                PqlShape::Samples,
+            ),
             &LowerCx::<Pql>::new(&bounds),
         )
         .expect("fold");
@@ -1511,6 +1690,7 @@ mod tests {
         reads.push(SelectorRead {
             selector: 1,
             pred: pred("http_errors_total"),
+            shape: PqlShape::Samples,
         });
         let shapes = plan_shapes(&plan, &reads, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 1, "one selector read, so one plan");
@@ -1519,10 +1699,12 @@ mod tests {
         both.push(SelectorRead {
             selector: 0,
             pred: pred("http_requests_total"),
+            shape: PqlShape::Samples,
         });
         both.push(SelectorRead {
             selector: 1,
             pred: pred("http_errors_total"),
+            shape: PqlShape::Samples,
         });
         let shapes = plan_shapes(&plan, &both, &params()).expect("plan shapes");
         assert_eq!(shapes.len(), 2);
@@ -1683,6 +1865,7 @@ mod tests {
                 reads.push(SelectorRead {
                     selector,
                     pred: pred("http_requests_total"),
+                    shape: PqlShape::Samples,
                 });
             }
             let (shapes, work) =

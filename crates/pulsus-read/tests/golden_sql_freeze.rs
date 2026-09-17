@@ -527,85 +527,23 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     );
 }
 
-/// ADR 0008 D2: **no emitted SQL contains a `WITH` clause.**
-///
-/// The common-table form was rejected on measurement, not on taste, and
-/// the decision needs a check that fails when a wave writes one — the
-/// alternative is a rule nobody can see being broken.
-///
-/// **This is still vacuous after issue #492 part 4, and says so.** Part 4
-/// is the first part that compiles a query stage into SQL, and it adds a
-/// `HAVING` clause to an existing single-level statement — it wraps
-/// nothing, so the corpus still holds none of the case this gate exists
-/// for. The first corpus that can fail it for a real reason is the one
-/// with a WRAPPED statement, which is part 5's (`by()`, `coalesce()` and
-/// the wrap). The gate is written now rather than then because a gate
-/// added alongside the first violation is a gate nobody ever saw fail.
-///
-/// It CAN fail: inserting `WITH q AS (SELECT 1)` into one golden reddens
-/// it with `traces_search/<file>.sql:5: ADR 0008 D2 bans the common-table
-/// form`.
-///
-/// The word is matched case-insensitively and only where it stands as a
-/// whole token, so `WITH`, `with` and a leading `\nWITH` all trip it
-/// while `subqueries_with_x` and a `with(...)` hint inside a `-- q:`
-/// header line do not.
-#[test]
-fn the_golden_sql_corpus_contains_no_with_clause() {
-    let mut scanned = 0usize;
-    let mut entries = 0usize;
-    let mut statements = 0usize;
-    for (name, _) in CORPORA {
-        let dir = golden_dir(name);
-        for entry in corpus_entries(&dir) {
-            let Entry::File { rel, path } = entry else {
-                continue;
-            };
-            entries += 1;
-            if !rel.ends_with(".sql") {
-                continue;
-            }
-            scanned += 1;
-            let text = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            for (i, line) in text.lines().enumerate() {
-                // The two header lines carry the case name and the query
-                // text, not SQL; a `with(...)` search hint lives there.
-                if line.starts_with("-- ") {
-                    continue;
-                }
-                if line.starts_with("== ") {
-                    statements += 1;
-                    continue;
-                }
-                let has_with = line
-                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .any(|tok| tok.eq_ignore_ascii_case("with"));
-                assert!(
-                    !has_with,
-                    "{name}/{rel}:{}: ADR 0008 D2 bans the common-table form; the measured \
-                     alternative is a materialised value list. Line: {line}",
-                    i + 1
-                );
-            }
-        }
-    }
-    // The scan is not vacuous in the OTHER direction: it really did read
-    // the corpus. (It IS vacuous in the direction that matters until a
-    // wave emits a wrapped statement, which the doc comment states.)
-    assert_eq!(
-        entries, 99,
-        "every committed corpus entry is walked (the same 99 the membership gate counts)"
-    );
-    assert_eq!(
-        scanned, 98,
-        "every SQL golden is scanned; the one entry that is not a statement is          `traces_metrics/log2_reference_capture.json`"
-    );
-    assert!(
-        statements > 100,
-        "the corpus holds the statements this rule is about: {statements}"
-    );
-}
+// ADR 0008 D2 — **the check that enforces it lives in
+// `tests/live_sql_corpus_ast.rs`** (issue #549), not here.
+//
+// A text scan for the word `WITH` stood in this file until then. It was
+// the seventh such rule and, like the six before it, it asserted a
+// property of the TEXT; the rule is about what the SQL *is*, so the
+// check now asks ClickHouse's own parser for the AST and asserts that no
+// statement in the committed corpus carries a `WithElement` node. That
+// needs a server, so it moved into the live-gated set.
+//
+// Two consequences worth stating rather than leaving implicit:
+//
+// * **This file's digest is unchanged by the move.** The freeze still
+//   pins the corpus bytes; it simply no longer claims anything about
+//   what those bytes mean.
+// * **The hermetic half cannot see the binding property at all.** That
+//   is a stated limit, not a gate that implies otherwise.
 
 /// The root of the golden tree — every committed golden, not only the
 /// two byte-frozen corpora in [`CORPORA`].

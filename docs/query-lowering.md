@@ -1220,7 +1220,7 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `By { key }` (`ast.rs:1046`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
 | `Coalesce` (`ast.rs:1049`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
-| `Select { fields }` (`ast.rs:1024`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:242`), which the effect table already expects (`traces/compile.rs:1745`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:879`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
+| `Select { fields }` (`ast.rs:1024`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:242`), which the effect table already expects (`traces/compile.rs:1745`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:897`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
 | `Filter(SpansetExpr)` (`ast.rs:1021`, issue #492 item 9) | `Spans` → `Spans` | **never lowers** (`No(NotYetLowered)`) — and the reason is soundness, not unfinished work. Pushing the filter as a `WHERE` conjunct is WRONG whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span is supplied by the RIGHT operand, so `val = 'y'` ANDed onto the left leaf's `trace_attrs_idx` generator matches nothing and the trace is dropped. It would also favour one spelling over the identical `{A && B}`, which does not push its second leaf | **shape unchanged**; **clears `exact`** — the evaluator will drop spans, and traces, that the SQL returned | never lowers | *none*. It does decide WHICH generator statement phase 1 sends — `filter::collect`'s `&&` fold continued across the pipe, so `{A} \| {B}` sends the statement `{A && B}` sends — but that is a choice among statements the query already implies, not a fragment added to one |
 | `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:1854`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:90`) | n/a |
 | `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:1861`) | n/a | not in the chain | n/a |
@@ -2362,9 +2362,9 @@ beside the figures they govern rather than once here, and this list is the index
 | `max_block_size` | **4096** | the shipped value (`exec.rs:175`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
-| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`), applied by `generator_settings` (`exec.rs:2869`) |
+| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:543`), applied by `generator_settings` (`exec.rs:2869`) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:2869`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:515`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2830-2836`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:540`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2830-2836`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2892,7 +2892,7 @@ of them `String`, for the arithmetic form. Per span-group at the full window the
 1,129 / 1,116 / 1,104 / 454 / 571 bytes.
 
 Against that, `generator_settings` (`exec.rs:2869`) applies `max_memory_usage = 536870912` — the
-shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:518`) — with
+shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:543`) — with
 `max_bytes_before_external_group_by = 0`, so the statement throws rather than spilling:
 
 ```
@@ -3118,7 +3118,7 @@ Same answers on both tables — 1,666,667 and 10,000 matching rows — at 722x a
 So this is a second copy of the attribute rows, not a re-ordering of the existing one.
 
 **The budget it needs alongside.** `reader.traceql_scan_budget_rows`, raised from 50,000,000
-(`crates/pulsus-config/src/model.rs:515`) to cover the window's attribute rows; **200,000,000** was
+(`crates/pulsus-config/src/model.rs:540`) to cover the window's attribute rows; **200,000,000** was
 measured. Without it every one of the five classes returns
 `Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
 current rows: …` — the trailing figure is where the read had got when the limit tripped and varies
@@ -3146,7 +3146,7 @@ from an argument.
 **The finding first, because it is the one an amendment has to meet.** The per-query join form — the
 shape that justifies "replaces one statement per batch with one statement per query" — does not
 survive the shipped generator memory ceiling. At `max_memory_usage = 536870912`, the shipped
-`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`, applied by
+`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:543`, applied by
 `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:2869`), it refused on all three takes,
 `exception_code` 241, 721 marks selected, no rows out. **The refusal is asserted on `Code: 241` and
 `512.00 MiB`, and on nothing else.** Everything else in the message is a record, and the three
@@ -4055,7 +4055,7 @@ on issue #492, after part 8, and it is not scheduled work until the owner schedu
 Its three prerequisites, each with what a taker must read first:
 
 1. **`plan_of`'s rule 2 must change.** Today every residual link with a handoff gets its own SQL
-   part, unconditionally (`crates/pulsus-read/src/compile/plan.rs:543`, the
+   part, unconditionally (`crates/pulsus-read/src/compile/plan.rs:550`, the
    `Disposition::Residual(_)` arm: "The evaluator's way of owning this link is to send a second
    statement: it gets its own SQL part, not an engine part"). Merging two of them means a rule
    saying when two handoffs over the same source and window share one part.
@@ -4687,7 +4687,7 @@ a temporary root are all arguments to it, so it runs against a tree without bein
    because the sentence names no gate the inventory carries — which is limit 7.
 5. **A unit that mentions a wave-1 gate and an existing one together is checked for the wave
    evidence only.** *"`query_log_gates` does not exist at base, and neither does
-   `the_golden_sql_corpus_contains_no_with_clause`"* is `AGREES` to the identifier check at exit
+   `every_committed_statement_binds_no_relational_cte`"* is `AGREES` to the identifier check at exit
    **0**, although the first exists and prints `Starting 14 tests`. The retained sweep matches no
    claim verb in it, so it does not report it and exits **0**.
 6. **A qualified mention resolves to whatever identifiers its unit happens to carry, even when they
@@ -4805,7 +4805,7 @@ worth.
 | the six §11.2 gates | `--lib` | `Starting 0 tests across 1 binary (1208 tests skipped)` each | 4 each | **do not exist — wave 1** |
 | the three §11.2b gates | `--lib` | `Starting 0 tests across 1 binary (1208 tests skipped)` each | 4 each | **do not exist — wave 1** |
 | the §11.3 gates — **eight** before the plan-object revision, **eleven** since it added three; all eleven re-measured at `acf44c49` | `--test query_lowering_doc_gate` | `error: no test target named \`query_lowering_doc_gate\` in \`pulsus-read\` package` | 101 each | **binary does not exist — wave 1**; re-checked at `acf44c49` by `git ls-files` and by `ls`, both of which report no such file |
-| `the_golden_sql_corpus_contains_no_with_clause` | `--test golden_sql_freeze` | `Starting 0 tests across 1 binary (2 tests skipped)` | 4 | **does not exist — wave 1** |
+| `every_committed_statement_binds_no_relational_cte` | `--test live_sql_corpus_ast` | `Starting 0 tests across 1 binary` | 4 | **did not exist until issue #549, which writes it — the text-matching gate it replaces is retired** |
 | the `query_log` live half (whole binary) | `--test query_log_gates` | `Starting 14 tests across 1 binary` | 0 | **exists** — but see §11.4: it self-skips green |
 
 **Four of the 25 gates exist; twenty-one do not exist and are wave 1.** The absence was checked
@@ -5270,7 +5270,7 @@ synthesised links, and none of the six is any of those.
 
 | gate | selector (`-E`) | binary | at base | today |
 |---|---|---|---|---|
-| no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| no emitted SQL binds a relational subquery through a common table expression (ADR 0008 D2, as amended by issue #549) | `test(=every_committed_statement_binds_no_relational_cte)` | `crates/pulsus-read/tests/live_sql_corpus_ast.rs` | `Starting 0 tests`, exit 4 before #549 | **exists** |
 | the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below | — |
 | no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 | **exists** |
 
@@ -5386,7 +5386,7 @@ without being written down here.
 
 `Capability::Never(reason)` is the compiler's own word for *not lowerable in any state, ever* —
 distinct from `Capability::No(reason)`, which means *lowerable in principle, not here*. The two take
-byte-identical paths in the fold (`crates/pulsus-read/src/compile/fold.rs:960-967`) and differ only
+byte-identical paths in the fold (`crates/pulsus-read/src/compile/fold.rs:977-984`) and differ only
 in the reason string the explain surface renders, so nothing about a request changes with the
 choice. What changes is what a reader is entitled to conclude.
 
@@ -5462,12 +5462,12 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | citation occurrences in the five artefacts | 688 |
 | of those, citing a bare basename | 536 |
 | of those, written as a continuation of a citation earlier on the line | 43 |
-| `(document, token)` pairs the rule resolves | 385 |
+| `(document, token)` pairs the rule resolves | 384 |
 | occurrences those resolved pairs cover | 577 |
 | `(document, token)` pairs it cannot resolve | 78 |
 | occurrences those frozen pairs cover | 111 |
 | resolved rows anchored on a token the citing prose prints | 195 |
-| resolved rows anchored on a snapshot of the cited line | 190 |
+| resolved rows anchored on a snapshot of the cited line | 189 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5487,7 +5487,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 385 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
+Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 384 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
@@ -5630,9 +5630,17 @@ fails the build.
 
 ### 13.1 The complete PromQL link set
 
-Every row below `Selector` is residual today with `BlockReason::NotYetLowered`, and **none is
-`Never`**: every candidate is "no SQL form has been written", which is what `NotYetLowered` says. A
-`Never` would put a word on a public surface that no code can produce.
+Every row below `Selector` is residual with `BlockReason::NotYetLowered` **except `Aggregate` over
+rows the grouped instant read produced** (issue #549), and **none is `Never`**: every remaining
+candidate is "no SQL form has been written", which is what `NotYetLowered` says. A `Never` would put
+a word on a public surface that no code can produce.
+
+**The condition is the SHAPE of the rows, not the operator.** `Aggregate` lowers only when the
+relation it is asked against carries `PqlShape::GroupedRuns` — which `seed_relation` sets only for a
+selector whose push was taken. Reading the operator alone would claim a lowering for
+`max by (status) (m)` on every route, including the one where the push declined on the threshold and
+the engine still does the reduction. So the explain surface changes exactly when the statement
+changes, and a query that is eligible but declines has an unchanged plan.
 
 Every variant named in the first column is declared in
 `crates/pulsus-promql/src/plan.rs`; the variant name is the pointer rather than a line number,
@@ -5642,7 +5650,7 @@ address in any case.
 
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
-| `Selector` → `PqlLink::Select(i)` | — → `Samples` | none; the seed **is** the two statements the shipped builders render, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts that rather than leaving the exemption silent | **always lowers**, `Fidelity::Wider`: `SelectorSpec::fetch_window` subtracts one lookback unconditionally, so the evaluator MUST re-apply | *none* — the entry's two statements are this plan's two SQL parts, the second cut `Cut::DisjointSources` |
+| `Selector` → `PqlLink::Select(i)` | — → `Samples`, or → `GroupedRuns` when the push was taken | none; the seed **is** the statements the shipped builders render, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts that rather than leaving the exemption silent | **always lowers**, `Fidelity::Wider`: `SelectorSpec::fetch_window` subtracts one lookback unconditionally, so the evaluator MUST re-apply | *none* — the entry's two statements are this plan's two SQL parts, the second cut `Cut::DisjointSources`; a **pushed** selector is ONE part, named for the float sample table, with an additive `also_reads` naming the histogram table it unions inside the same statement, no cut, and no engine part |
 | `RangeVector` | `Samples` → `Samples` | none today | **none — the identity**: no label name is in the column set, so nothing to rewrite | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `RangeFn` | `Samples` → `Series` | none today: the per-step grid has no SQL form written | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `OverTime` | `Samples` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
@@ -5657,7 +5665,7 @@ address in any case.
 | `HistogramQuantiles` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `HistogramAccessor` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `HistogramFraction` | `Series` → `Series` | none today | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
-| `Aggregate` | `Series` → `Series` grouped | the grouping key must be expressible, and a group key is a LABEL: the piece that lowers `by (l)` must first decide how a label enters the column set | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part. **A pushed aggregate may not be a plain `GROUP BY` over the fetched rows** — the source is `Wider`, so it has to produce the per-step grid |
+| `Aggregate` | `Series` → `Series` grouped, or `GroupedRuns` → `GroupedRuns` | **lowers** for `min`/`max`/`count`/`group` when the relation's shape is `GroupedRuns`; `NotYetLowered` for every other operator and for those four over ordinary sample rows | **none — the identity** | `Yes` on `GroupedRuns`, else residual `No(NotYetLowered)` | *none*: the engine part when residual, and **no engine part at all** when it lowers, because the chain then has no residual link. **A pushed aggregate is not a plain `GROUP BY` over the fetched rows** — the source is `Wider`, so the statement produces the per-step grid itself, from each sample's coverage interval, and the group key never enters the SQL (issue #549) |
 | `CountValues` | `Series` → `Series` grouped | as `Aggregate`, and its parameter is an injected LABEL name | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `Binary` | `Series` × `Series` → `Series` | **a tree, not a chain.** A left fold cannot represent two operands; when both operands bear entries the link is on no chain at all, and when one does it is on that entry's | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |
 | `SetOp` | `Series` × `Series` → `Series` | as `Binary` | **none — the identity** | residual, `No(NotYetLowered)` | *none*: the engine part |

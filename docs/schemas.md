@@ -30,7 +30,7 @@ Fixes proposed elsewhere that this design deliberately **rejects**, and why:
 - **`minmax` skip indexes on unclustered string columns** — near-zero granule skipping unless data is physically clustered by that column; where we need that clustering we buy it explicitly (ordering key or projection).
 - **`ReplacingMergeTree` for sample data** — merge-time dedup forces `FINAL` or wrong results. Sample tables are plain `MergeTree`; only metadata tables use `ReplacingMergeTree`, and their read shapes (`LIMIT 1 BY`, `GROUP BY`) are duplicate-tolerant by construction.
 
-Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*` with a `_dist` Distributed wrapper (§7); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block and generated-SQL example in this document is executable and is run against a fresh ClickHouse in CI from M0 onward** — an unrunnable snippet is a build failure, not a docs bug. Latency figures in §9 are targets to validate, not guarantees.
+Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*` with a `_dist` Distributed wrapper (§7); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document is rendered from the schema catalogue and applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
 
 ---
 
@@ -38,7 +38,7 @@ Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every tab
 
 **Query shapes served:** instant/range PromQL over one metric with label selectors (dominant); label/series discovery; long-range dashboards (30d+); high-frequency `count by` meta-queries.
 
-The schema's PromQL obligation is **fetch shapes only**: full PromQL evaluation (all functions, operators, subqueries) happens in the engine against the columns below — never in ClickHouse SQL — so language coverage is independent of the schema ([architecture.md §5.1](architecture.md)). One planned extension: **native histogram samples get dedicated storage in M7** (a histogram-typed samples table or serialized sparse-histogram column, designed in that milestone); until then OTLP exponential histograms flatten to classic `_bucket`/`_sum`/`_count` series at ingest.
+The schema's PromQL obligation is **fetch shapes, plus one reduction**: full PromQL evaluation — all functions, operators and subqueries — happens in the engine against the columns below, with a single enumerated exception. `min`, `max`, `count` and `group` over a plain instant selector are reduced in ClickHouse SQL (§2.3, issue #549), because each is exactly reproducible in a statement with no runtime condition. Everything else, and those four in any other position, evaluate in the engine, so language coverage is still independent of the schema ([architecture.md §5.1](architecture.md)). One planned extension: **native histogram samples get dedicated storage in M7** (a histogram-typed samples table or serialized sparse-histogram column, designed in that milestone); until then OTLP exponential histograms flatten to classic `_bucket`/`_sum`/`_count` series at ingest.
 
 ### 2.1 Tables
 
@@ -188,7 +188,7 @@ WHERE unix_milli >  {start - 300000 - lookback}
 ORDER BY fingerprint, unix_milli
 ```
 
-Partition pruning (daily) → primary-index pruning (metric, then fingerprints) → sequential per-series reads. Evaluation (extrapolation, resets, staleness) happens in the engine, series-first. Fingerprint lists ≥ 500 split into parallel chunk fetches; selectors matching more than `PULSUS_CACHE_MAX_SERIES` fall back to:
+Partition pruning (daily) → primary-index pruning (metric, then fingerprints) → sequential per-series reads. Evaluation (extrapolation, resets, staleness) happens in the engine, series-first — **for every query but the four below**. Fingerprint lists ≥ 500 split into parallel chunk fetches; selectors matching more than `PULSUS_CACHE_MAX_SERIES` fall back to:
 
 ```sql
 ... AND fingerprint IN (
@@ -204,6 +204,72 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
 **Two details in that regex predicate.** ClickHouse's `match()` compiles with RE2's `dot_nl` option set, so `.` matches a newline there and does not in RE2 — and therefore not in Prometheus, which compiles matchers with Go's `regexp`. Every pattern this path renders is prefixed with RE2's own `(?-s)` flag group to restore the reference reading; a `(?s)` the user wrote still overrides it. And because ClickHouse compiles a pattern only when it evaluates `match()` on a row, a selector naming a metric with **no rows in the window** would never reach RE2 at all and an invalid pattern would answer an empty `200` instead of Prometheus's `400`. The lower bound therefore carries one constant `match()` per regex matcher: ClickHouse folds it during query analysis (so the primary-key condition, partition pruning and the PREWHERE move are all unchanged — EXPLAIN-gated) and rejects an uncompilable pattern before reading a part. A matcher set with no regex renders no probe at all.
 
 **Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subquery's `metric_series_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting that nested subquery to each shard's **local** `metric_series` table (exact under `metric_samples`/`metric_series`'s shared `cityHash64(metric_name, fingerprint)` co-sharding, §7; the same rewrite already applied to the traces metrics semi-join). Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+
+**`max by (status) (http_requests_total)`, one hour, 15 s step — the grouped instant read (issue #549).** `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name — do not take the fetch above. They compile into ONE statement per fingerprint chunk, which returns the answer already reduced:
+
+```sql
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS lookback,
+     [101, 205, 990] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, any(flags) AS flags
+FROM (
+  SELECT gid, gi, agg, flags,
+    sum(is_new) OVER (PARTITION BY gid ORDER BY gi ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run
+  FROM (
+    SELECT gid, gi, agg, flags,
+      toUInt8(gi != lagInFrame(gi) OVER w + 1
+              OR reinterpretAsUInt64(agg) != reinterpretAsUInt64(lagInFrame(agg) OVER w)
+              OR flags != lagInFrame(flags) OVER w) AS is_new
+    FROM (
+      SELECT gid, gi,
+        if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, argMaxIf(v, fingerprint, NOT is_hist),
+           maxIf(v, NOT is_hist AND NOT isNaN(v))) AS agg,
+        toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + if(countIf(is_hist) > 0, 2, 0)) AS flags
+      FROM (
+        SELECT gid, fingerprint, v, is_hist,
+          arrayJoin(range(
+            toUInt32(least(toInt64(grid_n),
+              if(ts <= grid_start, 0, intDiv(ts - grid_start + grid_step - 1, grid_step)))),
+            toUInt32(least(toInt64(grid_n),
+              if(cover_end <= grid_start, 0, intDiv(cover_end - grid_start + grid_step - 1, grid_step))))
+          )) AS gi
+        FROM (
+          SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint,
+            ts, v, is_hist, stale,
+            least(leadInFrame(ts, 1, toInt64(1782910800000) + lookback + 1) OVER (
+                    PARTITION BY fingerprint ORDER BY ts, is_hist
+                    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),
+                  ts + lookback) AS cover_end
+          FROM (
+            SELECT fingerprint, unix_milli AS ts, value AS v, CAST(0, 'UInt8') AS is_hist,
+                   reinterpretAsUInt64(value) = 9218868437227405314 AS stale
+            FROM metric_samples
+            PREWHERE metric_name = 'http_requests_total'
+            WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+            UNION ALL
+            SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, CAST(1, 'UInt8') AS is_hist,
+                   reinterpretAsUInt64(sum) = 9218868437227405314 AS stale
+            FROM metric_hist_samples
+            PREWHERE metric_name = 'http_requests_total'
+            WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+          )
+        )
+        WHERE NOT stale
+      )
+      GROUP BY gi, gid
+    )
+    WINDOW w AS (PARTITION BY gid ORDER BY gi ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  )
+)
+GROUP BY gid, run
+ORDER BY gid, gi_start
+```
+
+**How to read it, bottom up.** The union gives one row per stored sample from both channels with a stale flag; `leadInFrame` gives each sample a `cover_end`, the first millisecond it stops being its series' most recent one — the next sample's timestamp, or `ts + lookback`; `arrayJoin(range(...))` turns that interval into the grid indices the sample covers; `GROUP BY gi, gid` reduces; and the two window functions collapse consecutive grid points carrying the same answer into one **run** row. A stale sample still occupies its interval — it blocks the earlier sample — and is then dropped by `WHERE NOT stale`, which is the reference's rule: a stale marker makes the series absent rather than falling back to an older sample.
+
+**Three things that are not obvious.** The group key never enters the SQL: `gid` is assigned in our process from the label sets the resolver already returned, by the same function the evaluator's aggregation uses, and reaches the statement as the `fps`/`gids` arrays — so `by`, `without` and bare render byte-identical text outside the `gids` array. The extremum is written out rather than delegated to ClickHouse's own `max`, which answers `nan` over `[NaN, 1, 3]` and `3` over `[1, NaN, 3]`; the guarded expression answers `3` on every ordering and a NaN only when no member is a number, and the NaN it answers is the payload a member carried. And `flags` bit 0 says the group had a float member — a `min`/`max` group with none is dropped, which is the reference's not-seen rule — while `count` and `group` carry no `flags` at all, because they count a histogram member rather than ignoring it.
+
+**What it costs and what it buys.** The database does more work and this process does much less. On 400 series in 4 groups over an hour at a 15 s step, the statement returns 964 rows where the fetch above returns 96,400, and the bytes the coordinator sent this client went from 691,011 to 9,389 — measured, `ProfileEvents['NetworkSendBytes']` plus the statement text, median of three. **The threshold is a heuristic, and the row count it stands in for is a transition count.** A run ends when the group's answer CHANGES, so what the statement returns depends on how often that happens — not on how many series feed the group. Measured on two corpora with the same 100 series in the same 1 group: 39 rows where the count is flat through the middle, 199 rows where it changes at nearly every grid point. The transition count is not knowable before the statement runs, so the compiler uses what it can compute from the resolver's answer alone and declines below `series >= 2 * groups` — as many groups as series is the shape with no grouping work to do, and that is a proxy for the shape rather than a bound on rows: measured on a declined corpus of three constant series in one group each, the push returns 3 rows against the raw read's 723 under every one of the four operations. Bytes are not bounded in general — the run row is wider than a sample row — and on a 100-series expiry corpus the pushed read moved 5,433 bytes against the raw read's 2,754. Rows ARE bounded: each sample opens its coverage at one grid index and closes it at another, so `pushed_rows <= 2 * raw_rows`.
 
 **Same query over 30 days, step 1h.** Tier eligibility requires `tier.resolution ≤ step` *and* `tier.resolution ≤ the range-vector window` (a 5m-window `rate` can never be answered from 1h buckets, whatever the step). Routing then follows `PULSUS_TIER_POLICY`:
 
@@ -225,7 +291,7 @@ ORDER BY fingerprint, ts
 
 The engine computes reset-adjusted increases over the bucket sequence (§2.2), splices the raw segment's exact evaluation, and applies the sliding window per step. Any response containing a tier-served segment is flagged approximate when `X-Pulsus-Explain` is set.
 
-**`count by (job) (up)`** — answered entirely from the label cache, zero ClickHouse queries, **when the evaluation window lies inside the cache window**; historical evaluations resolve through `metric_series` like any other query.
+**`count by (job) (up)`** — **the cache-only answer was withdrawn** (issue #33; [architecture.md §5.1](architecture.md)): the label cache records activity at bucket granularity and cannot tell "had a sample inside the 5-minute staleness lookback" from "active somewhere in an up-to-24h-old bucket", and it returned 69 series where the reference correctly returned 57. `count`/`group` read samples like every other aggregation. What issue #549 changed is the SHAPE of that read, not the rule: over a plain instant selector it is one statement per fingerprint chunk that applies the lookback in SQL (§2.3), so the answer is still computed from real samples.
 
 ### 2.4 Native histogram samples
 
@@ -940,7 +1006,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|
-| `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster |
+| `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in) |
 | `trace_spans`, `trace_attrs_idx`, `trace_edges` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
@@ -952,6 +1018,7 @@ Fan-out analysis for the canonical operations:
 |-----------|-------------------|--------------------------|
 | Trace by ID | **1** (`optimize_skip_unused_shards` prunes by sharding key) | one trace |
 | PromQL selector fetch | all (each holds a disjoint series subset) | only matched series' samples, already time-cut |
+| PromQL grouped instant read (issue #549) | all (each holds a disjoint series subset) | the same matched rows, time-cut the same way — the reduction to the answer happens at the coordinator, not on the shard |
 | PromQL gauge-on-tier | all, **partial aggregation per shard** | per-step aggregate states, not samples |
 | LogQL stream resolution + read | all, but every stage completes shard-locally | matched log lines only |
 | TraceQL search | all; intersections shard-local (a trace's index rows and spans co-reside) | top-K candidates per shard |

@@ -29,25 +29,53 @@
 //! is zero and the bound is tight.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 struct CountingAlloc;
-
-static BYTES: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: delegates verbatim to the system allocator; the only side
 // effect is a relaxed atomic add, which allocates nothing and cannot
 // re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -198,7 +226,7 @@ fn the_preflight_requests_no_more_than_its_scratch_charge_covers() {
                     let (lm, rm) = (measure(&lhs), measure(&rhs));
                     let charge = preflight_scratch_bytes(&lm, &rm);
 
-                    let before = BYTES.load(Ordering::Relaxed);
+                    let before = bytes_here();
                     let out = preflight_alloc_probe(
                         BinOp::Div,
                         m.as_ref(),
@@ -207,7 +235,7 @@ fn the_preflight_requests_no_more_than_its_scratch_charge_covers() {
                         REFUSING.0,
                         REFUSING.1,
                     );
-                    let requested = BYTES.load(Ordering::Relaxed) - before;
+                    let requested = bytes_here() - before;
 
                     let payload = match &out {
                         Ok(()) => 0,

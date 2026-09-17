@@ -1,9 +1,11 @@
 //! Issue #291: the allocation gate over `compile_user_regex`.
 //!
-//! Single test binary, because the counting allocator is process-global
-//! and PEAK is a whole-process quantity. `--test-threads` does not have
-//! to be forced: every test here brackets its own measurement with
-//! [`measure`], which resets the counters, and the tests that measure are
+//! Single test binary. The counting allocator serves every thread in it,
+//! so its counters are kept **per thread**: a process-wide figure charges
+//! whatever any other thread allocates to whichever measured window
+//! happens to be open. `--test-threads` does not have to be forced:
+//! every test here brackets its own measurement with [`measure`], which
+//! resets this thread's counters, and the tests that measure are
 //! serialised by [`GATE`].
 //!
 //! What each test is for is on the test itself. What they are for
@@ -16,8 +18,8 @@
 //! value.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use pulsus_re2::{
     MAX_REGEX_COMPILE_TRANSIENT_BYTES, Re2Verdict, RegexCompileError, compile_user_regex,
@@ -30,14 +32,43 @@ use pulsus_re2::{
 
 struct CountingAlloc;
 
-static LIVE: AtomicU64 = AtomicU64::new(0);
-static PEAK: AtomicU64 = AtomicU64::new(0);
-static TOTAL: AtomicU64 = AtomicU64::new(0);
+// **Per thread, not per process.** A `#[global_allocator]` serves every
+// thread in the binary, so a single process-wide figure charges whatever
+// any other thread allocates to whichever measured window happens to be
+// open — and an allocation made elsewhere is then indistinguishable from
+// one the code under test made itself.
+//
+// `const`-initialised, so each slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the safe
+// one.
+thread_local! {
+    static LIVE: Cell<u64> = const { Cell::new(0) };
+    static PEAK: Cell<u64> = const { Cell::new(0) };
+    static TOTAL: Cell<u64> = const { Cell::new(0) };
+}
 
 fn bump(delta: u64) {
-    let live = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
-    TOTAL.fetch_add(delta, Ordering::Relaxed);
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    let _ = LIVE.try_with(|live| {
+        let now = live.get() + delta;
+        live.set(now);
+        let _ = PEAK.try_with(|peak| {
+            if now > peak.get() {
+                peak.set(now);
+            }
+        });
+    });
+    let _ = TOTAL.try_with(|c| c.set(c.get() + delta));
+}
+
+/// Subtracts from this thread's live gauge, clamped at zero: memory
+/// allocated before the window, or on another thread, can be freed
+/// inside it, and a clamp only ever over-states the peak.
+fn release(delta: u64) {
+    let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(delta)));
 }
 
 // SAFETY: every method delegates verbatim to the system allocator; the
@@ -49,19 +80,14 @@ unsafe impl GlobalAlloc for CountingAlloc {
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-            Some(live.saturating_sub(layout.size() as u64))
-        });
+        release(layout.size() as u64);
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if new_size >= layout.size() {
             bump((new_size - layout.size()) as u64);
         } else {
-            let shrunk = (layout.size() - new_size) as u64;
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                Some(live.saturating_sub(shrunk))
-            });
+            release((layout.size() - new_size) as u64);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -70,11 +96,13 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOCATOR: CountingAlloc = CountingAlloc;
 
-/// PEAK is process-wide, so only one TEST may run at a time — not just
-/// one measurement. A concurrent test allocating and freeing on another
-/// thread moves LIVE under the measurement and makes the peak meaningless
-/// (the alloc-gate flake rule: byte ceilings, and an instrument that
-/// cannot be raced). Every `#[test]` here takes this first.
+/// Only one TEST measures at a time — not just one measurement. This was
+/// load-bearing while the counters were process-wide: a concurrent test
+/// allocating and freeing on another thread moved LIVE under the
+/// measurement and made the peak meaningless. The counters are per thread
+/// now, so isolation no longer rests on it; the gate is kept because
+/// removing it is a separate question from where the counters live.
+/// Every `#[test]` here takes it first.
 static GATE: Mutex<()> = Mutex::new(());
 
 fn serialised(body: impl FnOnce()) {
@@ -88,11 +116,11 @@ fn serialised(body: impl FnOnce()) {
 /// the bracket so a retained `Regex` cannot leak into the next row's
 /// baseline.
 fn measure<T>(f: impl FnOnce() -> T) -> (u64, u64) {
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    TOTAL.store(0, Ordering::Relaxed);
+    LIVE.with(|c| c.set(0));
+    PEAK.with(|c| c.set(0));
+    TOTAL.with(|c| c.set(0));
     drop(f());
-    (PEAK.load(Ordering::Relaxed), TOTAL.load(Ordering::Relaxed))
+    (PEAK.with(Cell::get), TOTAL.with(Cell::get))
 }
 
 fn mb(bytes: u64) -> String {

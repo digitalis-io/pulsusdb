@@ -297,6 +297,11 @@ pub struct SqlPart<L: Lang + ?Sized> {
     /// Why this is its own statement and not folded into the previous
     /// one.
     pub cut: Option<Cut>,
+    /// Sources this ONE statement reads besides the one it is named for
+    /// ([`Lang::also_reads`]). Empty for every statement that reads a
+    /// single table, which is every statement but PromQL's grouped
+    /// instant read.
+    pub also_reads: Vec<SourceRef>,
 }
 
 /// One part of a plan: a statement, or work in our own process.
@@ -493,6 +498,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                 }
                 parts.push(Part::Sql(Box::new(SqlPart {
                     yields: boundary_output(&branch_rel),
+                    also_reads: L::also_reads(&branch_rel),
                     rel: branch_rel,
                     seed: None,
                     issue: Issue::Once,
@@ -509,6 +515,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
         _ => {
             parts.push(Part::Sql(Box::new(SqlPart {
                 yields: boundary_output(&rel),
+                also_reads: L::also_reads(&rel),
                 rel: rel.clone(),
                 seed: None,
                 issue: Issue::Once,
@@ -589,6 +596,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                         };
                         parts.push(Part::Sql(Box::new(SqlPart {
                             yields: boundary_output(&part_rel),
+                            also_reads: L::also_reads(&part_rel),
                             rel: part_rel,
                             seed: Some(Seed {
                                 from_parts: seed_from.clone(),
@@ -725,6 +733,11 @@ pub enum PartShape {
 pub struct SqlPartShape {
     pub kind: &'static str,
     pub name: String,
+    /// Additive (issue #549): the other sources this ONE statement
+    /// reads. Omitted from the wire entirely when empty, so every plan
+    /// that reads a single table per statement renders byte-unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_reads: Vec<String>,
     pub issue: &'static str,
     pub cut: Option<CutShape>,
     pub seed: Option<SeedShape>,
@@ -789,6 +802,11 @@ impl<L: Lang + ?Sized> QueryPlan<L> {
                 Part::Sql(s) => PartShape::Sql(Box::new(SqlPartShape {
                     kind: "sql",
                     name: s.rel.source_ref().as_str().to_string(),
+                    also_reads: s
+                        .also_reads
+                        .iter()
+                        .map(|src| src.as_str().to_string())
+                        .collect(),
                     issue: s.issue.wire(),
                     cut: s.cut.as_ref().map(cut_shape),
                     seed: s.seed.as_ref().map(|seed| SeedShape {
@@ -941,6 +959,7 @@ impl<L: Lang + ?Sized> Clone for SqlPart<L> {
             yields: self.yields.clone(),
             issue: self.issue,
             cut: self.cut.clone(),
+            also_reads: self.also_reads.clone(),
         }
     }
 }
@@ -953,6 +972,7 @@ impl<L: Lang + ?Sized> std::fmt::Debug for SqlPart<L> {
             .field("yields", &self.yields)
             .field("issue", &self.issue)
             .field("cut", &self.cut)
+            .field("also_reads", &self.also_reads)
             .finish()
     }
 }

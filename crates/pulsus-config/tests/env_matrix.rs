@@ -298,6 +298,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.promql_max_cache_scan == 500,
     },
     Row {
+        var: "PULSUS_PROMQL_GROUPED_PUSH",
+        value: "false",
+        check: |c| !c.reader.promql_grouped_push,
+    },
+    Row {
         var: "PULSUS_PROMQL_MAX_INFO_SERIES",
         value: "750",
         check: |c| c.reader.promql_max_info_series == 750,
@@ -437,8 +442,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        77,
-        "docs/configuration.md §§1-8 document exactly 77 variables"
+        78,
+        "docs/configuration.md §§1-8 document exactly 78 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

@@ -43,10 +43,12 @@
 //! an unbounded sweep would be the one metrics read competing for server
 //! memory with no ceiling at all. Its failure behaviour is unchanged.
 
+use futures::StreamExt;
 use pulsus_clickhouse::ChError;
 use pulsus_promql::PromqlError;
 
 use crate::logql::error::{ReadError, TooBroadReason};
+use crate::metrics::exec::SampleBudget;
 
 pub(super) use leaf::MetricsDispatch;
 
@@ -195,15 +197,20 @@ impl std::fmt::Debug for MetricsDispatch {
 /// can reach `client` and could dispatch around
 /// [`map_metrics_read_error`], and every item outside it provably cannot.
 /// New helpers belong in the parent module.
+///
+/// [`drain_charged`] lives in the parent module for that reason, and the
+/// seal is intact: it cannot CREATE a stream — only `client` can, and
+/// only this module holds `client` — it maps both `ChError` seams, and
+/// `fetch_rows_with` still hands out `Vec<R>`, so no caller ever obtains
+/// a `ChRowStream` to drain unmapped.
 mod leaf {
-    use futures::StreamExt;
     use pulsus_clickhouse::{ChClient, ChRow, ChRowStream, QuerySettings};
 
     use crate::logql::error::ReadError;
     use crate::logql::exec::escape_query_placeholders;
     use crate::metrics::exec::SampleBudget;
 
-    use super::map_metrics_read_error;
+    use super::{drain_charged, map_metrics_read_error};
 
     /// The sealed owner of the metrics engine's ClickHouse handle.
     pub(crate) struct MetricsDispatch {
@@ -274,27 +281,167 @@ mod leaf {
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
             }
-            let mut stream: ChRowStream<'_, R> = self
+            let stream: ChRowStream<'_, R> = self
                 .client
                 .query_stream::<R>(&sql, settings)
                 .await
                 .map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
-            let mut out = Vec::new();
-            while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
-                if let Some(b) = budget {
-                    b.charge_one().map_err(ReadError::QueryTooBroad)?;
-                }
-                out.push(row);
-            }
-            Ok(out)
+            drain_charged(stream, budget, self.read_max_memory_bytes).await
         }
     }
+}
+
+/// Drains one statement's row stream, charging `budget` **per row as
+/// rows arrive**, and returns the rows.
+///
+/// # Why this is a named function and not four lines inside the dispatch
+///
+/// The ordering inside this loop is the whole of issue #138's guarantee,
+/// and it is not observable from outside: a caller sees only
+/// `Result<Vec<R>, ReadError>` and cannot tell a per-row charge from a
+/// total taken after the stream finished. Both answer the same thing on
+/// every stream that ends cleanly. They differ on exactly one input — a
+/// stream that yields rows and then fails — and the only way to present
+/// that input is to hand the loop a stream directly.
+///
+/// So the loop takes any stream of the right item type, production hands
+/// it a `ChRowStream`, and `dispatch::tests` hands it a stand-in:
+///
+/// ```text
+///   stream:  Ok(row) Ok(row) Ok(row) Err(server exception)
+///
+///   cap 2, charging per row       -> QueryTooBroad at row 3    <- the guarantee
+///   cap 3, charging per row       -> the server exception
+///   cap 2, charging after drain   -> the server exception      <- the defect
+/// ```
+///
+/// The third line is why the previous regression test was not one: it
+/// used two statements, and a completed first statement is charged the
+/// same either way.
+///
+/// # The two seams are mapped, and the row error is mapped BEFORE its charge
+///
+/// Both `ChError` seams go through [`map_metrics_read_error`] (issue
+/// #280). A failing row returns before it is charged, which is correct —
+/// a row that did not arrive did not cost us memory — and is what makes
+/// the cap-at-charge and one-below readings differ rather than both
+/// answering the budget.
+pub(crate) async fn drain_charged<R, S>(
+    mut stream: S,
+    budget: Option<&SampleBudget>,
+    read_max_memory_bytes: u64,
+) -> Result<Vec<R>, ReadError>
+where
+    S: futures::Stream<Item = Result<R, ChError>> + Unpin,
+{
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.map_err(|e| map_metrics_read_error(e, read_max_memory_bytes))?;
+        if let Some(b) = budget {
+            b.charge_one().map_err(ReadError::QueryTooBroad)?;
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream that yields `rows` rows and then fails — the one input on
+    /// which charging per row and charging after the drain answer
+    /// differently, and the reason [`drain_charged`] takes a stream.
+    fn rows_then_error(rows: usize) -> impl futures::Stream<Item = Result<u32, ChError>> + Unpin {
+        let mut items: Vec<Result<u32, ChError>> = (0..rows as u32).map(Ok).collect();
+        items.push(Err(ChError::Server {
+            code: 241,
+            message: "DB::Exception: Memory limit (for query) exceeded".to_string(),
+        }));
+        futures::stream::iter(items)
+    }
+
+    /// **Issue #138's guarantee, and issue #549's criterion 10: the budget
+    /// is charged per row AS ROWS ARRIVE, within ONE statement.**
+    ///
+    /// Three readings over the same three-row-then-error stream:
+    ///
+    /// ```text
+    ///   cap 2   -> QueryTooBroad(MetricSamples { cap: 2 })   the budget wins
+    ///   cap 3   -> the server exception                      every row admitted
+    ///   cap 3, one row fewer in the stream -> the exception   (control)
+    /// ```
+    ///
+    /// The first reading is the discriminating one. **Measured against the
+    /// mutation the review named**: moving `charge_one` out of the loop and
+    /// charging `out.len()` after the stream finishes makes cap 2 answer
+    /// the server exception, because the loop never consults the budget
+    /// before the stream fails. The previous two-statement test stayed
+    /// green under that mutation, which is why this one exists.
+    #[tokio::test]
+    async fn the_budget_refuses_mid_statement_before_a_later_row_fails() {
+        let budget = SampleBudget::new(2);
+        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM)
+            .await
+            .expect_err("a cap below the rows must refuse");
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::MetricSamples { cap }) => {
+                assert_eq!(cap, 2, "the refusal names the cap it breached");
+            }
+            other => panic!(
+                "expected the sample budget to refuse the third row before the fourth failed,                  got {other:?}"
+            ),
+        }
+    }
+
+    /// The other side of the pair: a cap EQUAL to the rows admits them
+    /// all, so the stream's own failure is what surfaces. Without this,
+    /// the reading above would also pass on a loop that refused
+    /// everything.
+    #[tokio::test]
+    async fn a_cap_equal_to_the_rows_admits_them_and_the_streams_error_surfaces() {
+        let budget = SampleBudget::new(3);
+        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM)
+            .await
+            .expect_err("the stream ends in an error");
+        // Both refusals are `QueryTooBroad`; the REASON is what separates
+        // them, and here it must be the stream's mapped server exception
+        // rather than the budget.
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, TEST_READ_MEM);
+            }
+            other => panic!("expected the stream's own mapped error, got {other:?}"),
+        }
+    }
+
+    /// And the row that FAILED is not charged: a stream of `cap` good rows
+    /// followed by an error leaves exactly `cap` charges, so the next
+    /// statement of the same query still has none left and one more row
+    /// would refuse. A loop that charged before mapping would have spent
+    /// `cap + 1`.
+    #[tokio::test]
+    async fn a_failed_row_is_not_charged() {
+        let budget = SampleBudget::new(3);
+        let _ = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM).await;
+        // Three admitted, none spent on the failure: the fourth charge is
+        // the first to breach.
+        assert!(
+            budget.charge_one().is_err(),
+            "three rows admitted must exhaust a cap of three"
+        );
+    }
+
+    /// With no budget the loop drains to the stream's end and charges
+    /// nothing — the probe/hydration/discovery dispatches' shape.
+    #[tokio::test]
+    async fn an_uncharged_drain_returns_every_row() {
+        let rows: Vec<Result<u32, ChError>> = (0..5u32).map(Ok).collect();
+        let got = drain_charged(futures::stream::iter(rows), None, TEST_READ_MEM)
+            .await
+            .expect("a clean stream");
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+    }
 
     /// Issue #398: a distinctive, non-default
     /// `reader.promql_read_max_memory_bytes` for these tests.

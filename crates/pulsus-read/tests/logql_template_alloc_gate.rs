@@ -161,26 +161,54 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CountingAlloc;
-
-static BYTES: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: delegates verbatim to the system allocator; the only side
 // effect is a relaxed atomic add, which allocates nothing and cannot
 // re-enter the allocator.
+// The counters are **per thread**, not per process.
+//
+// A `#[global_allocator]` serves every thread in the test binary, so a
+// single process-wide figure charges whatever any other thread allocates
+// to whichever measured window happens to be open — and an allocation
+// made elsewhere is then indistinguishable from one the code under test
+// made itself. Three CI failures came from exactly that, none of them
+// caused by the change being tested.
+//
+// `const`-initialised, so the slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the
+// safe one.
+thread_local! {
+    static BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// What this thread has counted into `BYTES` so far.
+fn bytes_here() -> u64 {
+    BYTES.with(Cell::get)
+}
+
+/// Adds to this thread's `BYTES` tally.
+fn charge_bytes(n: u64) {
+    let _ = BYTES.try_with(|c| c.set(c.get() + n));
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        charge_bytes(layout.size() as u64);
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        charge_bytes(new_size as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -1543,9 +1571,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
             let inputs = input_bytes(&args, line.len());
             // Clone for the ordering rerun BEFORE the first call.
             let args_rerun = args.clone();
-            let before = BYTES.load(Ordering::Relaxed);
+            let before = bytes_here();
             let result = (def.call)(&ctx, &args);
-            let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+            let alloc = bytes_here().saturating_sub(before);
             let charged = gate.budget.charged_bytes();
             let (bound, kind) = match &result {
                 Ok(v) if is_retainable(v) => (4 * charged + SLACK, "retainable"),
@@ -1614,9 +1642,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
                     budget: &gate.budget,
                     _marker: std::marker::PhantomData,
                 };
-                let before = BYTES.load(Ordering::Relaxed);
+                let before = bytes_here();
                 let result = (def.call)(&ctx, &args_rerun);
-                let tiny_alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+                let tiny_alloc = bytes_here().saturating_sub(before);
                 if tiny_alloc > ORDERING_CEILING {
                     failures.push(format!(
                         "{} [{shape}] ORDERING: allocated {tiny_alloc} B under a \
@@ -1705,9 +1733,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
             .find(|d| d.name == "count")
             .expect("count registered");
         let args = vec![s("x+"), Value::Str(Cow::Owned(vec![0xFF; BIG]))];
-        let before = BYTES.load(Ordering::Relaxed);
+        let before = bytes_here();
         let result = (def.call)(&ctx, &args);
-        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        let alloc = bytes_here().saturating_sub(before);
         let charged = gate.budget.charged_bytes();
         assert!(
             result.is_ok(),
@@ -1768,9 +1796,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
             s("frontend"),
             s("Z"),
         ];
-        let before = BYTES.load(Ordering::Relaxed);
+        let before = bytes_here();
         let result = (def.call)(&ctx, &args);
-        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        let alloc = bytes_here().saturating_sub(before);
         let charged = gate.budget.charged_bytes();
         assert!(
             result.is_ok(),
@@ -1879,12 +1907,12 @@ fn every_registry_function_charge_dominates_its_allocations() {
         assert_eq!(text.len(), 86_033);
         assert_eq!(query_bytes, 129_033);
         assert!(query_bytes < 131_072, "premise: inside the query-text cap");
-        let before = BYTES.load(Ordering::Relaxed);
+        let before = bytes_here();
         let compiled = pulsus_read::logql::template::compile(
             &text,
             pulsus_read::logql::template::TemplateKind::Line,
         );
-        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        let alloc = bytes_here().saturating_sub(before);
         assert!(
             compiled.is_ok(),
             "premise: the TEMPLATE still parses — the budget declines to prewarm the \
@@ -2047,9 +2075,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
                     budget: &gate.budget,
                     _marker: std::marker::PhantomData,
                 };
-                let before = BYTES.load(Ordering::Relaxed);
+                let before = bytes_here();
                 let result = (def.call)(&ctx, &args);
-                let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+                let alloc = bytes_here().saturating_sub(before);
                 let charged = gate.budget.charged_bytes();
                 let err = result.expect_err("premise: the probe argument must not parse");
                 seen.push((alloc, charged, err.len()));

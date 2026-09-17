@@ -151,6 +151,17 @@ pub struct MetricsConfig {
     /// [`crate::logql::error::TooBroadReason::PromqlReadMemory`] → `422
     /// execution`.
     pub read_max_memory_bytes: u64,
+    /// Issue #549: `reader.promql_grouped_push` — compile `min`/`max`/
+    /// `count`/`group` over a plain instant selector into ONE statement
+    /// per fingerprint chunk ([`super::grouped`]), returning the answer
+    /// already reduced as a step function.
+    ///
+    /// **Read in exactly one place**, [`super::grouped::shape_of`]:
+    /// neither `decide` nor the statement builders re-check it, so there
+    /// is one line in the tree that decides whether the push is
+    /// available. `false` → every query takes today's route and nothing
+    /// else in this module changes.
+    pub grouped_push: bool,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -352,7 +363,12 @@ pub(super) struct SampleBudget {
 }
 
 impl SampleBudget {
-    fn new(cap: u64) -> Self {
+    /// `pub(super)` so `metrics::dispatch`'s hermetic drain tests can
+    /// build one (issue #549 review round 1) — the same visibility
+    /// [`Self::charge_one`] already has, and for the same reason: the
+    /// budget's guarantee lives in the drain loop, which is in that
+    /// module.
+    pub(super) fn new(cap: u64) -> Self {
         Self {
             used: std::sync::atomic::AtomicU64::new(0),
             cap,
@@ -406,6 +422,20 @@ pub struct MetricsEngine {
     /// one `Option` branch per selector fetch in `execute_fetch_plan` —
     /// zero atomics, zero clock.
     fetch_probe: Option<std::sync::Arc<FetchProbe>>,
+    /// TEST SEAM (issue #549) — how many fingerprints one grouped
+    /// statement carries. Always [`sample_sql::CHUNK_THRESHOLD`] in
+    /// production; `pulsus-server` never calls
+    /// [`MetricsEngine::with_grouped_chunk_size`].
+    ///
+    /// It exists because where the chunk boundary falls is **observable
+    /// in the charge**: the budget counts per-statement partial runs, so
+    /// one answer over 501 fingerprints charges differently as two
+    /// statements than as one. `CHUNK_THRESHOLD` is a compile-time
+    /// constant, so a test cannot reach the second reading without a
+    /// seam, and a boundary property nothing can exercise is a property
+    /// nobody has checked. Read at ONE site, `build_grouped_sqls`; the
+    /// sample fetch's own chunker is untouched by it.
+    grouped_chunk_size: usize,
 }
 
 impl MetricsEngine {
@@ -422,6 +452,7 @@ impl MetricsEngine {
                 crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
             )),
             fetch_probe: None,
+            grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
         }
     }
 
@@ -442,6 +473,14 @@ impl MetricsEngine {
     /// `fetch_probe: None`.
     pub fn with_fetch_probe(mut self, probe: std::sync::Arc<FetchProbe>) -> Self {
         self.fetch_probe = Some(probe);
+        self
+    }
+
+    /// TEST SEAM (issue #549) — see [`MetricsEngine::grouped_chunk_size`].
+    /// Never called by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_grouped_chunk_size(mut self, chunk: usize) -> Self {
+        self.grouped_chunk_size = chunk;
         self
     }
 
@@ -522,6 +561,16 @@ impl MetricsEngine {
         // header. On the unexplained path this vector is never pushed to
         // and never allocates.
         let mut reads = compile::SelectorReads::empty();
+        // Issue #549: is this query one the grouped statement can answer?
+        // PURE, decided before the loop, and `None` leaves every line
+        // below exactly as it was. `shape_of` is the sole reader of
+        // `config.grouped_push` and the sole owner of the grid-overflow
+        // guard.
+        let grouped_shape = super::grouped::shape_of(&plan, &plan_params, &self.config);
+        // The push, once a resolution has confirmed it: the decision and
+        // the statements it renders. A pushed plan has exactly one
+        // selector, so this is set at most once.
+        let mut grouped_plan: Option<(super::grouped::GroupedPush, Vec<String>)> = None;
         for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
             let window = DataWindow {
@@ -544,6 +593,7 @@ impl MetricsEngine {
                     reads.push(compile::SelectorRead {
                         selector: selector_id,
                         pred,
+                        shape: compile::PqlShape::Samples,
                     });
                 }
                 fetch_plans.push(fetch_plan);
@@ -631,6 +681,77 @@ impl MetricsEngine {
                 }
             }
 
+            // Issue #549: the grouped instant read, decided on the SAME
+            // resolution the declining path then consumes — `decide`
+            // borrows it, so there is no clone and no second resolve.
+            if let Some(shape) = &grouped_shape
+                && shape.selector == selector_id
+            {
+                match super::grouped::decide(shape, &resolution, shape.grid) {
+                    Ok(push) => {
+                        let sqls = build_grouped_sqls(
+                            &self.config,
+                            &push,
+                            lower_excl,
+                            upper_incl,
+                            self.grouped_chunk_size,
+                        );
+                        if explain.is_some()
+                            && let Some(first_chunk) = sample_sql::chunk_fingerprints(
+                                &push.fingerprints,
+                                self.grouped_chunk_size,
+                            )
+                            .first()
+                        {
+                            // The same rule the sample fetch follows: a
+                            // read is recorded only where a statement is
+                            // sent, and it carries the FIRST chunk's
+                            // fingerprint list.
+                            reads.push(compile::SelectorRead {
+                                selector: selector_id,
+                                pred: compile::grouped_selector_pred(
+                                    &sample_sql::name_predicate(metric_name),
+                                    &sample_sql::window_predicate(lower_excl, upper_incl),
+                                    &sample_sql::fingerprints_predicate(first_chunk),
+                                ),
+                                shape: compile::PqlShape::GroupedRuns,
+                            });
+                        }
+                        if let Some(e) = explain.as_mut()
+                            && let Some(first) = sqls.first()
+                        {
+                            let note = (sqls.len() > 1).then(|| {
+                                format!(
+                                    "(+{} more chunks like this one, {} fingerprints total)",
+                                    sqls.len() - 1,
+                                    push.fingerprints.len()
+                                )
+                            });
+                            e.push("grouped_fetch", first.clone(), note);
+                        }
+                        grouped_plan = Some((push, sqls));
+                        // The pushed route does not go through
+                        // `execute_fetch_plan` at all; the vector stays
+                        // aligned with `plan.selectors` for the code
+                        // below, which this path returns before reaching.
+                        fetch_plans.push(SelectorFetchPlan::Empty);
+                        continue;
+                    }
+                    Err(reason) => {
+                        if let Some(e) = explain.as_mut() {
+                            e.push(
+                                "grouped_push",
+                                format!("declined: {reason:?}"),
+                                Some(
+                                    "issue #549: this selector takes the sample fetch below"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
             let fetch_plan = match resolution {
                 LabelledResolution::Series(pairs) => {
                     let labels_by_fp: HashMap<Fingerprint, LabelSet> =
@@ -667,6 +788,7 @@ impl MetricsEngine {
                                     &sample_sql::window_predicate(lower_excl, upper_incl),
                                     &sample_sql::fingerprints_predicate(first_chunk),
                                 ),
+                                shape: compile::PqlShape::Samples,
                             });
                         }
                     }
@@ -721,6 +843,7 @@ impl MetricsEngine {
                                 &sample_sql::window_predicate(lower_excl, upper_incl),
                                 &sample_sql::subquery_predicate(&sql),
                             ),
+                            shape: compile::PqlShape::Samples,
                         });
                     }
                     let fetch_sql = sample_sql::sample_fetch_subquery(
@@ -778,6 +901,32 @@ impl MetricsEngine {
         // budget (issue #138) spans the whole set — the per-query bound,
         // not a per-selector one.
         let sample_budget = SampleBudget::new(self.config.max_samples);
+
+        // Issue #549: the pushed route. The statements return the answer
+        // already reduced, so there is no `SeriesData` to assemble — the
+        // fold IS the evaluation.
+        //
+        // The charge is the SAME `sample_budget`, charged per drained row
+        // inside the same drain loop, over what this path materialises:
+        // the per-statement partial runs.
+        //
+        // **The fold is offloaded and cancellable on exactly the same
+        // terms as the ordinary evaluator** (code review round 1). It is
+        // reduced data, but reducing it further is not free: a run is
+        // EXPANDED into the grid points it covers, one cell at a time, so
+        // the work is the sum of the run widths — bounded by (rows the
+        // budget admits) × (points the grid holds), not by the row count.
+        // Left inline it would hold a runtime worker for a client who has
+        // already gone. Every reason recorded below for the ordinary
+        // path's offload applies here unchanged, including why no pooled
+        // lease crosses it: `fetch_grouped_runs` returns owned `Vec<Run>`
+        // chunks and every `ChRowStream` is dropped before it returns.
+        if let Some((push, sqls)) = grouped_plan {
+            let chunks = self.fetch_grouped_runs(&push, sqls, &sample_budget).await?;
+            let (value, annotations) = fold_offloaded(&self.eval_gate, push, chunks).await?;
+            return Ok((value_to_query_result(value), annotations));
+        }
+
         let fetches = plan
             .selectors
             .iter()
@@ -1138,6 +1287,54 @@ impl MetricsEngine {
                 group_merged_multi_rows(rows, hist_rows, &labels_by, &labels_by_fp)
             }
         }
+    }
+
+    /// Issue #549: runs one grouped statement per chunk, CONCURRENTLY,
+    /// and returns each statement's partial runs as its own vector.
+    ///
+    /// **The per-chunk shape is load-bearing twice.** The charge is
+    /// per-statement partial runs, and the fold's replacement rule walks
+    /// chunks in order — which is fingerprint order, because
+    /// `build_grouped_sqls` chunks the ascending fingerprint list — so an
+    /// all-NaN group answers the payload its highest-fingerprint member
+    /// carried.
+    ///
+    /// `join_all` returns results in INPUT order regardless of which
+    /// statement finishes first, so a slow first chunk cannot reorder the
+    /// fold.
+    async fn fetch_grouped_runs(
+        &self,
+        push: &super::grouped::GroupedPush,
+        sqls: Vec<String>,
+        budget: &SampleBudget,
+    ) -> Result<Vec<Vec<super::grouped::Run>>, ReadError> {
+        use super::grouped::GroupedOp;
+        use super::grouped_rows::{GroupedCountRow, GroupedRunRow};
+
+        let mut out = Vec::with_capacity(sqls.len());
+        match push.op {
+            GroupedOp::Min | GroupedOp::Max => {
+                let results: Vec<Result<Vec<GroupedRunRow>, ReadError>> = join_all(
+                    sqls.into_iter()
+                        .map(|sql| self.fetch_sample_rows::<GroupedRunRow>(sql, budget)),
+                )
+                .await;
+                for rows in results {
+                    out.push(rows?.into_iter().map(GroupedRunRow::into_run).collect());
+                }
+            }
+            GroupedOp::Count | GroupedOp::Group => {
+                let results: Vec<Result<Vec<GroupedCountRow>, ReadError>> = join_all(
+                    sqls.into_iter()
+                        .map(|sql| self.fetch_sample_rows::<GroupedCountRow>(sql, budget)),
+                )
+                .await;
+                for rows in results {
+                    out.push(rows?.into_iter().map(GroupedCountRow::into_run).collect());
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// [`Self::fetch_rows_with`] under the standard [`metrics_read_settings`]
@@ -1688,12 +1885,30 @@ impl MetricsEngine {
 /// exactly the reason a LogQL one did, and leaving one of the three read
 /// surfaces unbounded would reproduce the carve-out shape #398 exists to
 /// remove.
+///
+/// **Issue #549 pins `max_block_size`.** A user profile can set it to `1`;
+/// a query-level setting overrides a profile one, measured both ways. The
+/// grouped instant read's result is one row per RUN, so at a block size
+/// of 1 a 964-run answer arrives as hundreds of one-row blocks — framing
+/// overhead on the metered hop, for a path whose whole purpose is to move
+/// fewer bytes over it. The value is ClickHouse's own default, so a
+/// deployment that has not touched the profile setting sends exactly what
+/// it sent before. It **bounds** the framing rather than fixing it: later
+/// transforms coalesce blocks beyond the input setting, and at the
+/// smallest setting the grouped statement was measured returning two-row
+/// blocks where a simple probe gives one-row blocks.
 fn metrics_read_settings(read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+        .set("max_block_size", CH_DEFAULT_MAX_BLOCK_SIZE)
 }
+
+/// ClickHouse 26.3's own `max_block_size` default, pinned per query by
+/// [`metrics_read_settings`] so a profile cannot shrink the grouped
+/// read's blocks (issue #549).
+const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 
 /// The `SqlFallback` sample-fetch settings (issue #136): [`metrics_read_settings`]
 /// plus, when clustered, `distributed_product_mode='local'`. The fallback
@@ -1961,6 +2176,39 @@ where
     }
 }
 
+/// Runs the grouped fold on the blocking pool behind the shared
+/// [`crate::eval_gate::EvalGate`], cancellable when this frame is dropped
+/// (code review round 1 on issue #549).
+///
+/// This is [`evaluate_offloaded`] for the pushed route, and deliberately
+/// the same shape rather than a second mechanism: the same gate bounds
+/// in-flight and queued work, the same [`CancelOnDrop`] guard fires when
+/// a disconnected or timed-out client's frame is dropped, the same
+/// `PromqlError::Cancelled` reaches the client as `503` `timeout`, and a
+/// panic is re-raised rather than turned into a domain error.
+///
+/// `push` and `chunks` are moved in because `spawn_blocking` needs
+/// `Send + 'static`; both are owned data with no lifetimes and no pooled
+/// connection lease, so nothing is held across the offload.
+async fn fold_offloaded(
+    gate: &crate::eval_gate::EvalGate,
+    push: super::grouped::GroupedPush,
+    chunks: Vec<Vec<super::grouped::Run>>,
+) -> Result<(pulsus_promql::QueryValue, pulsus_promql::Annotations), ReadError> {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let token = pulsus_promql::CancelToken::new(std::sync::Arc::clone(&flag));
+    let _guard = CancelOnDrop(flag);
+    let run = move || {
+        let mut annotations = pulsus_promql::Annotations::new();
+        super::grouped::fold(&push, chunks, &mut annotations, &token)
+            .map(|value| (value, annotations))
+    };
+    match gate.run_blocking(run).await {
+        Ok(res) => Ok(res?),
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
 /// Sets its flag on drop (issue #93) — armed in [`evaluate_offloaded`]'s
 /// async frame across the `.await`, so dropping that frame (client
 /// disconnect / request timeout) signals the still-running `spawn_blocking`
@@ -2004,6 +2252,40 @@ fn build_chunk_sqls(
             )
         })
         .collect()
+}
+
+/// Issue #549: one grouped statement per fingerprint chunk, over the
+/// SAME chunker the sample fetch uses — so a chunk boundary falls in the
+/// same place on both routes.
+///
+/// The fingerprint list is already ascending (`decide` sorted it), and
+/// `gids` is parallel to it, so each chunk's gid slice is the same
+/// window of the gid vector.
+fn build_grouped_sqls(
+    config: &MetricsConfig,
+    push: &super::grouped::GroupedPush,
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+    chunk_size: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for chunk in sample_sql::chunk_fingerprints(&push.fingerprints, chunk_size) {
+        let gids = &push.gids[start..start + chunk.len()];
+        out.push(super::grouped_sql::grouped_fetch(
+            &config.samples_table,
+            &config.hist_samples_table,
+            &push.metric_name,
+            chunk,
+            gids,
+            push.grid,
+            lower_excl_ms,
+            upper_incl_ms,
+            push.op,
+        ));
+        start += chunk.len();
+    }
+    out
 }
 
 /// [`build_chunk_sqls`]'s M7-A5a histogram counterpart — same sort, same
@@ -2395,7 +2677,7 @@ fn group_merged_multi_rows(
     Ok(out)
 }
 
-fn to_promql_labels(ls: &LabelSet) -> Labels {
+pub(super) fn to_promql_labels(ls: &LabelSet) -> Labels {
     Labels::new(ls.iter().map(|(k, v)| (k.to_string(), v.to_string())))
 }
 

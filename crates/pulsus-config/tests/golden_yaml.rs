@@ -59,6 +59,7 @@ reader:
   promql_experimental_functions: false
   promql_max_metric_fanout: 1000
   promql_max_cache_scan: 200000
+  promql_grouped_push: true
   logql_scan_budget_bytes: 50GiB
   logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000

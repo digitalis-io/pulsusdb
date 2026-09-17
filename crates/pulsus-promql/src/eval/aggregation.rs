@@ -68,23 +68,39 @@ impl GroupKey {
 /// the terminal cleanup (`name_label_dropping.test:84`'s `expect fail`).
 /// The group's own verdict is the member OR ([`Acc::drop_name`]).
 fn group_key(s: &InstantSample, grouping: Option<&Grouping>) -> GroupKey {
+    let (labels, name) = group_key_of(&s.labels, s.metric_name.as_deref(), grouping);
+    GroupKey { name, labels }
+}
+
+/// [`group_key`]'s rule, taken over a label set and a metric name rather
+/// than over an [`InstantSample`] — the same three arms in the same
+/// order, returning the key as the pair `(non-name labels, name channel)`.
+///
+/// Extracted and exported for issue #549: `pulsus-read`'s grouped instant
+/// read assigns every resolved fingerprint to a group **in our process**,
+/// before any SQL is rendered, and it must assign it to the group the
+/// evaluator would. Two implementations of one rule is how a pushed route
+/// comes to answer a different set of series from the unpushed one, so
+/// there is one function and both callers use it.
+///
+/// No behaviour change: [`group_key`] is now a wrapper over this, and
+/// every existing aggregation test runs through it.
+pub fn group_key_of(
+    labels: &Labels,
+    metric_name: Option<&str>,
+    grouping: Option<&Grouping>,
+) -> (Labels, Option<String>) {
     match grouping {
-        None => GroupKey {
-            name: None,
-            labels: Labels::default(),
-        },
-        Some(g) if g.without => GroupKey {
-            name: None,
-            labels: s.labels.without(&g.labels),
-        },
-        Some(g) => GroupKey {
-            name: if g.labels.iter().any(|l| l == "__name__") {
-                s.metric_name.clone()
+        None => (Labels::default(), None),
+        Some(g) if g.without => (labels.without(&g.labels), None),
+        Some(g) => (
+            labels.only(&g.labels),
+            if g.labels.iter().any(|l| l == "__name__") {
+                metric_name.map(str::to_string)
             } else {
                 None
             },
-            labels: s.labels.only(&g.labels),
-        },
+        ),
     }
 }
 

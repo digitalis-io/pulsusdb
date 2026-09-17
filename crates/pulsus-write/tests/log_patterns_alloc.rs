@@ -20,8 +20,8 @@
 //! pollute the process-global counters.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pulsus_model::UnixNano;
 use pulsus_write::LogRow;
@@ -30,43 +30,71 @@ use pulsus_write::patterns::{
     est_template_bound,
 };
 
-/// Bytes currently live (add on alloc, subtract on dealloc), tracked only while
-/// [`MEASURING`] is set.
-static LIVE: AtomicU64 = AtomicU64::new(0);
-/// The high-water mark of [`LIVE`] within a measured window.
-static PEAK: AtomicU64 = AtomicU64::new(0);
-/// Gate: counting is active only during the measured `aggregate_patterns` call,
-/// so the test-harness/fixture allocations outside the window never pollute it.
-static MEASURING: AtomicBool = AtomicBool::new(false);
+// The gauge, its high-water mark and the gate that opens them are **per
+// thread**, not per process. A `#[global_allocator]` serves every thread
+// in the test binary, so a single process-wide figure charges whatever
+// any other thread allocates to whichever measured window happens to be
+// open — and an allocation made elsewhere is then indistinguishable from
+// one the code under test made itself.
+//
+// The gate moves with the counters for the same reason: a process-wide
+// `MEASURING` would still admit another thread's allocations into an open
+// window even if the tallies themselves were thread-local.
+//
+// `const`-initialised, so each slot is a plain thread-local word with no
+// lazy heap box behind it and the allocator cannot re-enter itself; and
+// written through `try_with` rather than `with`, because during
+// thread-local destruction the slot is gone and `with` panics inside the
+// allocator. An allocation at that point belongs to teardown and to no
+// measured window, so dropping it is the right answer as well as the safe
+// one.
+thread_local! {
+    /// Bytes currently live on this thread (add on alloc, subtract on
+    /// dealloc), tracked only while `MEASURING` is set on this thread.
+    static LIVE: Cell<u64> = const { Cell::new(0) };
+    /// The high-water mark of `LIVE` within a measured window.
+    static PEAK: Cell<u64> = const { Cell::new(0) };
+    /// Gate: counting is active only during the measured
+    /// `aggregate_patterns` call, so the test-harness/fixture
+    /// allocations outside the window never pollute it.
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn measuring_here() -> bool {
+    MEASURING.try_with(Cell::get).unwrap_or(false)
+}
 
 struct LivePeakAlloc;
 
 fn on_alloc(size: u64) {
-    if MEASURING.load(Ordering::Relaxed) {
-        let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK.fetch_max(now, Ordering::Relaxed);
+    if !measuring_here() {
+        return;
     }
+    let _ = LIVE.try_with(|live| {
+        let now = live.get() + size;
+        live.set(now);
+        let _ = PEAK.try_with(|peak| {
+            if now > peak.get() {
+                peak.set(now);
+            }
+        });
+    });
 }
 
 fn on_dealloc(size: u64) {
-    if MEASURING.load(Ordering::Relaxed) {
-        // Saturating: a pre-window allocation freed inside the window would push
-        // `live` negative; clamping at 0 only ever over-states the peak (a
-        // conservative, never-under-counting bias for a `≤ charge` assertion).
-        let mut cur = LIVE.load(Ordering::Relaxed);
-        loop {
-            let next = cur.saturating_sub(size);
-            match LIVE.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(observed) => cur = observed,
-            }
-        }
+    if !measuring_here() {
+        return;
     }
+    // Saturating: an allocation made before the window, or on another
+    // thread, freed inside the window would push `live` negative;
+    // clamping at 0 only ever over-states the peak (a conservative,
+    // never-under-counting bias for a `<= charge` assertion).
+    let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(size)));
 }
 
 // SAFETY: delegates verbatim to the system allocator; the only side effects are
-// relaxed atomic updates (gated by `MEASURING`) which allocate nothing and
-// cannot re-enter the allocator.
+// thread-local `Cell` updates (gated by `MEASURING`) which allocate
+// nothing and cannot re-enter the allocator.
 unsafe impl GlobalAlloc for LivePeakAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         on_alloc(layout.size() as u64);
@@ -115,12 +143,12 @@ fn charge(rows: &[LogRow]) -> u64 {
 /// Measured live-peak (dealloc-aware) during `aggregate_patterns(rows)`, plus
 /// the number of rows produced (kept alive until after the window closes).
 fn measured_peak(rows: &[LogRow]) -> (u64, usize) {
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    MEASURING.store(true, Ordering::Relaxed);
+    LIVE.with(|c| c.set(0));
+    PEAK.with(|c| c.set(0));
+    MEASURING.with(|c| c.set(true));
     let agg = aggregate_patterns(rows);
-    MEASURING.store(false, Ordering::Relaxed);
-    let peak = PEAK.load(Ordering::Relaxed);
+    MEASURING.with(|c| c.set(false));
+    let peak = PEAK.with(Cell::get);
     let n = agg.rows.len();
     black_box(&agg);
     (peak, n)
