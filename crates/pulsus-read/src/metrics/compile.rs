@@ -1359,29 +1359,36 @@ mod tests {
         ]
     }
 
-    /// Issue #549 criterion 4: **the two queries that keep today's route
+    /// Issue #549 criterion 4: **the queries that keep today's route
     /// keep today's plan, byte for byte.**
     ///
     /// The shape is taken from [`crate::metrics::grouped::shape_of`],
-    /// not chosen by this test — which is what makes the two breaks the
-    /// criterion names reach it:
+    /// not chosen by this test — which is what makes each mutation below
+    /// reach it. **Every one was run** (review round 1 named one that did
+    /// not):
     ///
     /// ```text
-    ///   widening the pushed set to AggOp::Stddev
-    ///       -> shape_of answers Some for `stddev by (status) (…)`
-    ///       -> its seed becomes GroupedRuns, its plan becomes one part
-    ///       -> the first literal below no longer matches
-    ///
-    ///   lifting the "child must be PlanExpr::Selector" check
-    ///       -> shape_of answers Some for `max by (status) (rate(…[5m]))`
-    ///       -> the second literal no longer matches
+    ///   mutation                               query it turns eligible    case
+    ///   widen the pushed set to Stddev         stddev by (status) (m)     1
+    ///   accept ANY child, taking the plan's    max by (status) (abs(m))   3
+    ///     single selector
     /// ```
+    ///
+    /// **`max by (status) (rate(m[5m]))` is case 2 and no mutation of the
+    /// direct-child check reaches it.** Lifting that check alone leaves it
+    /// declined, because a range selector is refused independently a few
+    /// lines further down — measured in review round 1, where the named
+    /// break stayed green. Two protections decline it and removing one
+    /// changes nothing, so case 2 is kept for the shape it pins and case
+    /// 3 is what the child check is tested by: `abs(…)` is a non-selector
+    /// child whose selector is still a plain INSTANT one, so the child
+    /// check is the only thing declining it.
     ///
     /// The flag is ON in the configuration this test builds, so a decline
     /// here is a decline on the query's shape and not on the flag.
     #[test]
-    fn the_two_unpushed_queries_keep_todays_plan_byte_for_byte() {
-        let cases: [(&str, &str); 2] = [
+    fn every_unpushed_query_keeps_todays_plan_byte_for_byte() {
+        let cases: [(&str, &str); 3] = [
             (
                 "stddev by (status) (http_requests_total{status=\"500\"})",
                 r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"Aggregate(stddev)","how":"residual","why":"not_yet_lowered"}]}"#,
@@ -1389,6 +1396,10 @@ mod tests {
             (
                 "max by (status) (rate(http_requests_total{status=\"500\"}[5m]))",
                 r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"RangeFn(rate)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+            (
+                "max by (status) (abs(http_requests_total{status=\"500\"}))",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"MathFn(abs)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
             ),
         ];
         for (query, want) in cases {
