@@ -363,7 +363,12 @@ pub(super) struct SampleBudget {
 }
 
 impl SampleBudget {
-    fn new(cap: u64) -> Self {
+    /// `pub(super)` so `metrics::dispatch`'s hermetic drain tests can
+    /// build one (issue #549 review round 1) — the same visibility
+    /// [`Self::charge_one`] already has, and for the same reason: the
+    /// budget's guarantee lives in the drain loop, which is in that
+    /// module.
+    pub(super) fn new(cap: u64) -> Self {
         Self {
             used: std::sync::atomic::AtomicU64::new(0),
             cap,
