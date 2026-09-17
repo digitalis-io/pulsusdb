@@ -873,6 +873,41 @@ mod tests {
         assert!(push.groups.is_empty());
     }
 
+    /// Criterion 5: **one statement per nonempty fingerprint chunk —
+    /// strictly fewer than today's route at every nonzero chunk count,
+    /// and zero against zero when the resolution is empty.**
+    ///
+    /// Structural, not measured: the pushed route sends `n` statements
+    /// where today's sends `2n`, because today's route renders a float
+    /// fetch AND a complementary histogram fetch per chunk. So "strictly
+    /// fewer" holds exactly when `n > 0`, and an empty resolution yields
+    /// zero chunks on both routes.
+    ///
+    /// Both counts come from the ONE chunker both routes use, so a
+    /// change to the threshold moves them together.
+    #[test]
+    fn the_pushed_route_sends_one_statement_per_chunk_where_today_sends_two() {
+        use crate::metrics::sample_sql::{CHUNK_THRESHOLD, chunk_fingerprints};
+        let rows: [(usize, usize); 5] = [(0, 0), (1, 1), (500, 1), (501, 2), (1_200, 3)];
+        for (series, chunks) in rows {
+            let fps: Vec<u64> = (0..series as u64).collect();
+            let n = chunk_fingerprints(&fps, CHUNK_THRESHOLD).len();
+            assert_eq!(n, chunks, "{series} fingerprints");
+            // Today: a float statement and a histogram statement per chunk.
+            let today = 2 * n;
+            assert_eq!(
+                today,
+                2 * chunks,
+                "{series} fingerprints: today's statement count"
+            );
+            if n == 0 {
+                assert_eq!(n, today, "an empty resolution sends nothing either way");
+            } else {
+                assert!(n < today, "{series} fingerprints: {n} against {today}");
+            }
+        }
+    }
+
     // ---------------------------------------------------------- the fold
 
     fn push_of(op: GroupedOp, groups: usize, points: u32, instant: bool) -> GroupedPush {

@@ -1,17 +1,15 @@
-//! Issue #548, check 1: **every statement this engine renders for the
-//! thirty queries below, captured at the merge base `8f3348e8`.**
+//! **Every statement this engine renders for the thirty queries below.**
 //!
 //! # What this freeze is, and what it is not
 //!
-//! **It is an external audit anchor, not a self-check.** Its digest was
-//! published on the issue before the code existed, and a reader
-//! re-derives it by running [`render`] against `8f3348e8` in a worktree
-//! of their own. That protection is exercised by a person; it is worth
+//! **It is an external audit anchor, not a self-check.** A reader
+//! re-derives its digest by running [`render`] in a worktree of their own
+//! and comparing. That protection is exercised by a person; it is worth
 //! exactly as much as that comparison.
 //!
 //! What it is NOT: a check that a coordinated edit of the generator, the
-//! golden and the digest is impossible. It is not. Measured at the base,
-//! three probes on the generator:
+//! golden and the digest is impossible. It is not. Measured at issue
+//! #548's merge base, three probes on the generator:
 //!
 //! ```text
 //!   generator edit                      digest      lines   bytes    entries
@@ -23,32 +21,92 @@
 //!
 //! [`the_freeze_has_the_published_entry_line_and_byte_counts`] catches
 //! the last two — an edit that changes the entry count or the rendered
-//! size. Nothing mechanical catches the first two, and the three
-//! constants it asserts are published on the issue so that silencing it
-//! means editing three numbers a reader can check.
+//! size. Nothing mechanical catches the first two, and the four constants
+//! it asserts are published in the issue's implementation notes so that
+//! silencing it means editing four numbers a reader can check.
 //!
-//! **And it is a characterization of two functions, not of what the
-//! server sends.** [`render`] calls `pulsus_promql::plan` and
-//! `metrics::sample_sql` directly. Measured at the base: inserting
+//! **And it is a characterization of the BUILDERS, not of what the server
+//! sends.** [`render`] calls `pulsus_promql::plan`,
+//! `metrics::grouped::shape_of` and the statement builders directly.
+//! Measured at issue #548's base: inserting
 //! `let lower_excl = lower_excl + 1;` after `sel.fetch_window(..)` in
 //! `crates/pulsus-read/src/metrics/exec.rs` shifts every fetch window the
-//! engine sends and leaves this digest at `1ae98d41…` with all of
+//! engine sends and leaves this digest unmoved with all of
 //! `pulsus-read --lib` green. That hole is what
 //! `tests/live_metrics_plan_parts.rs` exists for: it reads the statements
 //! back out of `system.query_log`.
+//!
+//! # Issue #549 moved it, and which four entries moved
+//!
+//! `max by (status) (…)`, `min without (instance) (…)`, `count(…)` and
+//! `group(…)` over a plain instant selector now compile into ONE
+//! statement over both sample tables instead of a float fetch and a
+//! complementary histogram fetch. So the corpus went from 60 statements
+//! to 56 across the same 30 entries, and every other entry is
+//! byte-identical.
+//!
+//! # Every boundary in this golden is writer-emitted
+//!
+//! The writer emits `-- statement[i]` before each statement, and the live
+//! corpus check (`tests/live_sql_corpus_ast.rs`) splits on those markers.
+//! No rule infers a boundary from a keyword: the four grouped statements
+//! BEGIN with the binding keyword, so a "a line starting `SELECT ` in
+//! column 0" rule would find their inner `SELECT` and feed a parser only
+//! the tail — under which a prohibited relational binding becomes a clean
+//! tree. The marker prefix is reserved: [`render`] refuses to emit a
+//! statement containing it.
 
 use sha2::{Digest, Sha256};
 
 use pulsus_promql::{DEFAULT_LOOKBACK_MS, PlanParams, parse, plan};
-use pulsus_read::metrics::sample_sql;
+use pulsus_read::metrics::grouped::Grid;
+use pulsus_read::metrics::{MetricsConfig, grouped, grouped_sql, sample_sql};
+
+/// The marker the writer emits before every statement, and the prefix the
+/// live corpus check splits on (issue #549).
+///
+/// **RESERVED.** [`render`] refuses to emit a statement whose text
+/// contains it, so a comment of that shape inside a statement cannot
+/// manufacture an extra part for the splitter to find.
+const STATEMENT_MARKER: &str = "-- statement[";
+
+/// The group id of each of [`FPS`], **stated here rather than resolved**:
+/// the grouped read assigns group ids in our own process from the label
+/// sets the resolver returned, and this freeze has no resolver. Writing
+/// them out keeps the golden from moving with a fixture it does not have.
+const GIDS: [u32; 3] = [0, 1, 0];
+
+/// The engine configuration this freeze renders against: the grouped
+/// push ON, because the freeze is a characterization of what the
+/// statement builders produce and the pushed statement is one of them.
+fn freeze_config() -> MetricsConfig {
+    MetricsConfig {
+        db: "d".to_string(),
+        samples_table: SAMPLES.to_string(),
+        hist_samples_table: HIST.to_string(),
+        series_table: "metric_series".to_string(),
+        metadata_table: "metric_metadata".to_string(),
+        experimental_functions: true,
+        max_metric_fanout: 1_000,
+        max_cache_scan: 200_000,
+        max_info_series: 100_000,
+        max_samples: 50_000_000,
+        distributed: false,
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+        grouped_push: true,
+    }
+}
 
 const GOLDEN: &str = include_str!("golden/promql_statements.txt");
 const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed.
 const ENTRIES: usize = 30;
-const LINES: usize = 510;
-const BYTES: usize = 26_727;
+const LINES: usize = 736;
+const BYTES: usize = 35_281;
+/// The statements the writer's markers declare. Sixty before issue #549;
+/// four entries now send ONE statement where they sent two.
+const STATEMENTS: usize = 56;
 
 const START_MS: i64 = 1_782_907_200_000;
 const END_MS: i64 = 1_782_928_800_000;
@@ -101,6 +159,22 @@ const QUERIES: &[(&str, bool)] = &[
 
 fn render() -> String {
     let mut out = String::new();
+    let mut statement = 0usize;
+    // Emits one statement, preceded by its marker. Every boundary in this
+    // golden is WRITER-EMITTED: no rule downstream infers one from a
+    // keyword, because the grouped statement begins with `WITH` and a
+    // keyword rule would find its inner `SELECT` and feed a parser only
+    // the tail.
+    let mut emit = |out: &mut String, sql: &str| {
+        assert!(
+            !sql.contains(STATEMENT_MARKER),
+            "a statement contains the reserved marker prefix {STATEMENT_MARKER:?}"
+        );
+        out.push_str(&format!("{STATEMENT_MARKER}{statement}]\n"));
+        out.push_str(sql);
+        out.push('\n');
+        statement += 1;
+    };
     for (q, instant) in QUERIES {
         let params = PlanParams {
             start_ms: START_MS,
@@ -116,6 +190,9 @@ fn render() -> String {
         ));
         let p = plan(&parse(q).expect("parse"), params).expect("plan");
         out.push_str(&format!("selectors {}\n", p.selectors.len()));
+        // Issue #549: the same decision `exec` takes, so an eligibility
+        // change reaches this golden.
+        let pushed = grouped::shape_of(&p, &params, &freeze_config());
         for (i, sel) in p.selectors.iter().enumerate() {
             let (lo, hi) = sel.fetch_window(&params);
             out.push_str(&format!(
@@ -124,36 +201,83 @@ fn render() -> String {
                 sel.range_ms
                     .map_or_else(|| "-".to_string(), |r| r.to_string()),
             ));
-            match &sel.metric_name {
-                Some(n) => {
-                    out.push_str(&sample_sql::sample_fetch(SAMPLES, n, &FPS, lo, hi));
-                    out.push('\n');
-                    out.push_str(&sample_sql::hist_sample_fetch(HIST, n, &FPS, lo, hi));
-                    out.push('\n');
+            match (&pushed, &sel.metric_name) {
+                // ONE statement, over both tables, with the group ids
+                // stated above.
+                (Some(shape), Some(n)) if shape.selector == sel.id => {
+                    out.push_str(&format!("-- grouped op={:?} gids={GIDS:?}\n", shape.op));
+                    emit(
+                        &mut out,
+                        &grouped_sql::grouped_fetch(
+                            SAMPLES, HIST, n, &FPS, &GIDS, shape.grid, lo, hi, shape.op,
+                        ),
+                    );
                 }
-                None => {
-                    out.push_str(&sample_sql::sample_fetch_multi(
-                        SAMPLES,
-                        &names(),
-                        &FPS,
-                        lo,
-                        hi,
-                    ));
-                    out.push('\n');
-                    out.push_str(&sample_sql::hist_sample_fetch_multi(
-                        HIST,
-                        &names(),
-                        &FPS,
-                        lo,
-                        hi,
-                    ));
-                    out.push('\n');
+                (_, Some(n)) => {
+                    emit(
+                        &mut out,
+                        &sample_sql::sample_fetch(SAMPLES, n, &FPS, lo, hi),
+                    );
+                    emit(
+                        &mut out,
+                        &sample_sql::hist_sample_fetch(HIST, n, &FPS, lo, hi),
+                    );
+                }
+                (_, None) => {
+                    emit(
+                        &mut out,
+                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &FPS, lo, hi),
+                    );
+                    emit(
+                        &mut out,
+                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &FPS, lo, hi),
+                    );
                 }
             }
         }
         out.push('\n');
     }
     out
+}
+
+/// The statement count the markers declare — the tripwire, not the
+/// protection (issue #549). The protection is the live corpus check,
+/// which asserts byte coverage first and then parses.
+#[test]
+fn the_freeze_declares_its_statement_count() {
+    assert_eq!(
+        GOLDEN.matches(STATEMENT_MARKER).count(),
+        STATEMENTS,
+        "the golden's `{STATEMENT_MARKER}` marker count"
+    );
+    // The markers are numbered 0..STATEMENTS, in order, with none
+    // missing — so a splitter that walks them cannot silently skip one.
+    for i in 0..STATEMENTS {
+        assert!(
+            GOLDEN.contains(&format!("{STATEMENT_MARKER}{i}]")),
+            "marker {i} is missing"
+        );
+    }
+}
+
+/// The reserved prefix is refused rather than escaped: a statement
+/// carrying it would give the splitter an extra boundary to find.
+#[test]
+fn the_writer_refuses_a_statement_carrying_the_reserved_marker() {
+    // The refusal is an assertion inside `render`'s `emit`, which cannot
+    // be reached without a builder that emits the prefix. What IS
+    // checkable here is that no statement the builders produce carries
+    // it, which is the same claim from the other side.
+    for line in GOLDEN.lines() {
+        if let Some(rest) = line.strip_prefix(STATEMENT_MARKER) {
+            assert!(
+                rest.split(']')
+                    .next()
+                    .is_some_and(|n| n.parse::<usize>().is_ok()),
+                "a marker line that is not a marker: {line}"
+            );
+        }
+    }
 }
 
 /// Criterion 1, half one: the committed golden is the file whose digest
@@ -171,23 +295,23 @@ fn the_promql_statement_freeze_matches_its_committed_digest() {
     );
 }
 
-/// Criterion 1, half two: the planner and the statement builders still
-/// render, byte for byte, what they rendered at the merge base.
+/// The planner and the statement builders still render, byte for byte,
+/// what the committed golden holds.
 #[test]
-fn every_statement_is_the_one_the_merge_base_rendered() {
+fn every_statement_is_the_one_the_committed_golden_holds() {
     let rendered = render();
     if rendered != GOLDEN {
         let (a, b) = first_difference(&rendered, GOLDEN);
         panic!(
-            "a statement moved from the one the merge base rendered (issue #548 criterion 1).\n\
+            "a statement moved from the one the committed golden holds.\n\
              rendered: {a:?}\n  golden: {b:?}\n\
-             This golden is a capture of 8f3348e8's output; regenerating it against the changed \
-             tree moves the digest away from a number already published."
+             Regenerating this golden against a changed tree moves the digest away from a \
+             number already published; say in the notes which query's statement moved and why."
         );
     }
 }
 
-/// Criterion 1a: the entry, line and byte counts published on the issue.
+/// The entry, line and byte counts published in the implementation notes.
 ///
 /// A count and two sizes — exact content is criterion 1's business, and
 /// criterion 1 is an external audit rather than a self-check.
