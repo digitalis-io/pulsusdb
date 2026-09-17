@@ -955,62 +955,84 @@ mod tests {
         fold(push, chunks, annotations, &CancelToken::never()).expect("the token never fires")
     }
 
-    /// The fold's cancellation checkpoint is REACHED, at both of its two
-    /// positions, and answers the variant the ordinary evaluator answers.
+    /// The fold's cancellation checkpoint is REACHED **at each of its two
+    /// positions independently** — and each case fails if only its own
+    /// checkpoint is removed.
     ///
-    /// Two cases, because the two checkpoints guard different loops and a
-    /// single case would leave one of them unexercised:
+    /// The two checkpoints guard different loops, and a case that merely
+    /// sets the flag and folds something ordinary cannot tell them apart:
+    /// with the per-run check deleted the expansion finishes and the
+    /// per-GROUP check answers the same `Cancelled`, so the test stays
+    /// green while the expansion — the large half of the work, and the
+    /// whole reason for the offload — has become uncancellable. Measured:
+    /// that is exactly what happened to the first version of this test.
+    ///
+    /// So each case is shaped so the OTHER checkpoint cannot be reached:
     ///
     /// ```text
-    ///   chunks non-empty  -> the per-RUN checkpoint fires first
-    ///   chunks empty      -> no run to check, so the per-GROUP
-    ///                        checkpoint in the emit walk is the one
-    ///                        that fires
+    ///   case            groups  runs   the other loop           removing
+    ///                                                           its own check
+    ///   per-run              0     1   emit walks 0 groups      -> Ok(empty)
+    ///   per-group            1     0   no run to check          -> Ok(empty)
     /// ```
     ///
-    /// The second case is why the emit walk carries a checkpoint at all:
-    /// a query whose statements returned nothing still walks every group.
+    /// **The zero-group and zero-run shapes are chosen to isolate a
+    /// checkpoint, not because a query produces them.** A zero-run fold
+    /// does ship — it is what a statement returning nothing folds to —
+    /// while a zero-group push does not; both are legal inputs to this
+    /// function, and what the case asserts is where the check sits.
     #[test]
-    fn a_cancelled_fold_stops_at_both_of_its_checkpoints() {
-        let push = push_of(GroupedOp::Max, 1, 3, false);
+    fn each_cancellation_checkpoint_is_reached_on_its_own() {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let token = CancelToken::new(std::sync::Arc::clone(&flag));
-
-        for (what, chunks) in [
+        let cases: [(&str, usize, Vec<Vec<Run>>); 2] = [
             (
                 "the per-run checkpoint",
+                0,
                 vec![vec![run(0, 0, 2, 1.0, Some(1))]],
             ),
-            ("the per-group checkpoint", Vec::new()),
-        ] {
+            ("the per-group checkpoint", 1, Vec::new()),
+        ];
+        for (what, groups, chunks) in cases {
+            let push = push_of(GroupedOp::Max, groups, 3, false);
             let mut annos = Annotations::new();
-            let err =
-                fold(&push, chunks, &mut annos, &token).expect_err("a live flag must stop {what}");
+            match fold(&push, chunks.clone(), &mut annos, &token) {
+                Err(PromqlError::Cancelled) => {}
+                other => panic!("{what}: a live flag must stop the fold, got {other:?}"),
+            }
+            // The same input with the flag CLEAR answers normally, so the
+            // case above stopped on the token and not on its shape.
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut annos = Annotations::new();
+            let v = fold(&push, chunks, &mut annos, &token)
+                .unwrap_or_else(|e| panic!("{what}: a clear flag must answer, got {e:?}"));
             assert!(
-                matches!(err, PromqlError::Cancelled),
-                "{what}: expected the cancelled variant, got {err:?}"
+                matrix_bits(v).is_empty(),
+                "{what}: this shape answers an empty matrix when it is not cancelled"
             );
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
 
-        // And with the flag CLEAR the same inputs answer normally — so the
-        // two cases above failed on the token and not on their shape.
-        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    /// And the checkpoints do not fire when the token is clear, on an
+    /// input that really does produce an answer — so the two isolating
+    /// shapes above have not quietly become the only thing covered.
+    #[test]
+    fn a_clear_token_folds_the_whole_answer() {
+        let push = push_of(GroupedOp::Max, 1, 3, false);
         let mut annos = Annotations::new();
         let v = fold(
             &push,
             vec![vec![run(0, 0, 2, 1.0, Some(1))]],
             &mut annos,
-            &token,
+            &CancelToken::never(),
         )
-        .expect("a clear flag answers");
+        .expect("a token that never fires");
         assert_eq!(
             matrix_bits(v)[0].1.len(),
             3,
             "three points, one per grid index"
         );
-        let mut annos = Annotations::new();
-        let v = fold(&push, Vec::new(), &mut annos, &token).expect("a clear flag answers");
-        assert!(matrix_bits(v).is_empty(), "no chunk, no series");
     }
 
     // ---------------------------------------------------------- the fold
