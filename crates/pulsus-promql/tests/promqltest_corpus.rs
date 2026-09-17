@@ -1531,8 +1531,8 @@ fn corpus_expression_depths_match_their_pinned_artifact() {
         (
             "proof",
             proof.clone(),
-            vec![("eval", 450), ("eval_fail", 27), ("eval_ordered", 17)],
-            vec![(1, 68), (2, 328), (3, 58), (4, 24), (5, 6), (6, 4), (7, 1)],
+            vec![("eval", 452), ("eval_fail", 27), ("eval_ordered", 17)],
+            vec![(1, 68), (2, 330), (3, 58), (4, 24), (5, 6), (6, 4), (7, 1)],
             vec![
                 "info(n1, n1)",
                 "metric1_total offset 9.5e10",

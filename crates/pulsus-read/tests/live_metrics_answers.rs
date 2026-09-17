@@ -1421,14 +1421,26 @@ async fn min_and_max_skip_a_nan_member_when_the_group_has_a_number() {
     drop_database(&h.bootstrap, &h.db).await;
 }
 
-/// CHARACTERIZATION, NOT A REQUIREMENT. `max` over a group whose float
-/// members are all NaN must return NaN; today it returns `-Inf` (and `min`
-/// returns `+Inf`), because the accumulator's identity element leaks out
-/// when no member ever replaces it. That defect is issue #551 and is not
-/// this issue's to fix. This test pins what the code does now, so #551
-/// cannot land without deleting it and asserting NaN instead.
+/// Issue #551: `max` and `min` over a group whose float members are all
+/// NaN answer **that NaN**, bit for bit. Before the fix the accumulator's
+/// identity element leaked out instead — `-Inf` for `max`, `+Inf` for
+/// `min` — values no member carried, and an extremum must be one of the
+/// members it ranges over.
+///
+/// The comparison is on the exact bits rather than `is_nan()`. The
+/// fixture's members carry `NAN_BITS` and the answer carries that payload
+/// through, so the bits are determined by the input. `is_nan()` would
+/// also accept `STALE_NAN_BITS`, the reserved marker the lookback
+/// selection removes before any aggregation sees it.
+///
+/// **The stale check runs FIRST, and that ordering is the point.** The
+/// two constants differ, so an equality against `NAN_BITS` placed ahead
+/// of it would always trip first and the inequality could never fail on
+/// its own — a check that cannot fail is not a check. As written, an
+/// answer carrying the reserved marker is reported as the reserved
+/// marker rather than as an unexplained bit mismatch.
 #[tokio::test]
-async fn an_all_nan_group_answers_infinity_today_which_issue_551_corrects() {
+async fn an_all_nan_group_answers_the_nan_its_members_carried() {
     skip_unless_live!();
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_nan_all")).await;
     let p = h.instant();
@@ -1445,15 +1457,23 @@ async fn an_all_nan_group_answers_infinity_today_which_issue_551_corrects() {
             other => panic!("expected a vector, got {other:?}"),
         }
     };
-    assert_eq!(
-        two(&h.read_path("max by (g) (gauge_nan)", &p).await),
-        f64::NEG_INFINITY.to_bits(),
-        "today max over an all-NaN group is -Inf; the correct answer is NaN (issue #551)"
+    let max = two(&h.read_path("max by (g) (gauge_nan)", &p).await);
+    assert_ne!(
+        max, STALE_NAN_BITS,
+        "max over an all-NaN group answered the reserved stale marker (issue #551)"
     );
     assert_eq!(
-        two(&h.read_path("min by (g) (gauge_nan)", &p).await),
-        f64::INFINITY.to_bits(),
-        "today min over an all-NaN group is +Inf; the correct answer is NaN (issue #551)"
+        max, NAN_BITS,
+        "max over an all-NaN group is the NaN its members carried (issue #551)"
+    );
+    let min = two(&h.read_path("min by (g) (gauge_nan)", &p).await);
+    assert_ne!(
+        min, STALE_NAN_BITS,
+        "min over an all-NaN group answered the reserved stale marker (issue #551)"
+    );
+    assert_eq!(
+        min, NAN_BITS,
+        "min over an all-NaN group is the NaN its members carried (issue #551)"
     );
     drop_database(&h.bootstrap, &h.db).await;
 }
