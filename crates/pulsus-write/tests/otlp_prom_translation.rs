@@ -2248,6 +2248,29 @@ const LEDGER_ROWS: &[LedgerRow] = &[
         their_status: "`200`",
         required: &["bad_data", "40af9c2cdc0eda00f3622e867a27f6359f7295f3"],
     },
+    LedgerRow {
+        id: "`promql-tied-nan-extremum-member`",
+        limit: "—",
+        our_route: "`POST /api/v1/query`",
+        our_status: "`200`",
+        their_route: "`POST /api/v1/query`",
+        their_status: "`200`",
+        // `4056-4070` is the `topk` citation range. This is a PRESENCE
+        // check and nothing more: it catches a rule cell with no citation
+        // at all, or with the wrong digits. It does NOT catch a
+        // placeholder that carries the right digits, it does not read the
+        // prose around them, and nothing here compares them against the
+        // reference source, which is not vendored. Measured on issue #551:
+        // `CITATION PLACEHOLDER 4056-4070` passes, and so does the
+        // retention rule written backwards. What keeps the citation true
+        // is review re-deriving it from the pinned checkout.
+        required: &[
+            "4056-4070",
+            "i=1,0,0,2,0",
+            "lowest fingerprint",
+            "Issue #551",
+        ],
+    },
     // Issue #471 M2. The `Limit` cell is `—` deliberately: the divergence
     // has no constant. It is about which string a timeout carries, at
     // whatever deadline the operator configured, and across five
