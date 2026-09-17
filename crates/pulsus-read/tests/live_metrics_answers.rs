@@ -1431,8 +1431,14 @@ async fn min_and_max_skip_a_nan_member_when_the_group_has_a_number() {
 /// fixture's members carry `NAN_BITS` and the answer carries that payload
 /// through, so the bits are determined by the input. `is_nan()` would
 /// also accept `STALE_NAN_BITS`, the reserved marker the lookback
-/// selection removes before any aggregation sees it; the `assert_ne!`
-/// names that failure mode instead of leaving it uncovered.
+/// selection removes before any aggregation sees it.
+///
+/// **The stale check runs FIRST, and that ordering is the point.** The
+/// two constants differ, so an equality against `NAN_BITS` placed ahead
+/// of it would always trip first and the inequality could never fail on
+/// its own — a check that cannot fail is not a check. As written, an
+/// answer carrying the reserved marker is reported as the reserved
+/// marker rather than as an unexplained bit mismatch.
 #[tokio::test]
 async fn an_all_nan_group_answers_the_nan_its_members_carried() {
     skip_unless_live!();
@@ -1452,22 +1458,22 @@ async fn an_all_nan_group_answers_the_nan_its_members_carried() {
         }
     };
     let max = two(&h.read_path("max by (g) (gauge_nan)", &p).await);
-    assert_eq!(
-        max, NAN_BITS,
-        "max over an all-NaN group is the NaN its members carried (issue #551)"
-    );
     assert_ne!(
         max, STALE_NAN_BITS,
         "max over an all-NaN group answered the reserved stale marker (issue #551)"
     );
-    let min = two(&h.read_path("min by (g) (gauge_nan)", &p).await);
     assert_eq!(
-        min, NAN_BITS,
-        "min over an all-NaN group is the NaN its members carried (issue #551)"
+        max, NAN_BITS,
+        "max over an all-NaN group is the NaN its members carried (issue #551)"
     );
+    let min = two(&h.read_path("min by (g) (gauge_nan)", &p).await);
     assert_ne!(
         min, STALE_NAN_BITS,
         "min over an all-NaN group answered the reserved stale marker (issue #551)"
+    );
+    assert_eq!(
+        min, NAN_BITS,
+        "min over an all-NaN group is the NaN its members carried (issue #551)"
     );
     drop_database(&h.bootstrap, &h.db).await;
 }

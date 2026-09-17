@@ -559,13 +559,27 @@ fn aggregate_reduce(
             }
             (AggOp::Min | AggOp::Max, None) => {
                 // Issue #551: the pin's own replacement rule
-                // (engine.go:3812-3828 at 40af9c2), NOT `f64::min`/
-                // `f64::max`. A `NaN` accumulator means "no member yet",
-                // so it is replaced by whatever arrives; a `NaN` member
-                // never displaces a number. `f64::min`/`f64::max` cannot
-                // express the first half — they discard `NaN` outright,
-                // which is why the seed used to survive an all-`NaN`
-                // group and be returned as its answer.
+                // (engine.go:3812-3828 at 40af9c2). A `NaN` accumulator
+                // means "no member yet", so it is replaced by whatever
+                // arrives; a `NaN` member never displaces a number.
+                //
+                // The old wrong answer came from the SEED, not from this
+                // arm. With `+Inf`/`-Inf` seeded, an all-`NaN` group
+                // never replaced the seed and the seed was returned as
+                // the group's answer. Over a `NaN` seed, `f64::min`/
+                // `f64::max` answer every case these tests cover
+                // identically — measured: all four issue-#551 tests are
+                // green with the old helpers and the new seeds.
+                //
+                // The explicit comparisons are kept on those methods'
+                // documented contract, not on a measured difference:
+                // they return EITHER operand when the two compare equal,
+                // where strict `<`/`>` keeps the first member. No test in
+                // this tree tells the two forms apart. What IS pinned, by
+                // `min_and_max_of_a_signed_zero_tie_keep_the_first_members_bits`,
+                // is the tie behaviour itself — `-0.0` arriving before
+                // `+0.0` answers `-0.0` — which loosening these to
+                // `<=`/`>=` would break.
                 if acc.min > s.v || acc.min.is_nan() {
                     acc.min = s.v;
                 }
@@ -1497,10 +1511,16 @@ mod tests {
     /// replacement rule decides which one's bits the group answers with:
     /// strict `<`/`>` never replaces on a tie, so the FIRST member's bits
     /// survive. That is the pin's rule (engine.go:3812-3828 at 40af9c2,
-    /// `group.floatValue < f` / `>`), and it is the one thing
-    /// `f64::min`/`f64::max` are documented not to promise — for inputs
-    /// that compare equal, either may be returned. No other test here
-    /// distinguishes the two forms.
+    /// `group.floatValue < f` / `>`). Loosening the comparison to
+    /// `<=`/`>=` reddens this test and no other.
+    ///
+    /// What this test does NOT do is distinguish the explicit
+    /// comparisons from `f64::min`/`f64::max`. Measured: substituting
+    /// those methods, with the `NaN` seeds kept, leaves all four
+    /// issue-#551 tests green, this one included. The explicit form is
+    /// kept on their documented contract — for inputs that compare
+    /// equal, either may be returned — not on any difference a test in
+    /// this tree can see.
     #[test]
     fn min_and_max_of_a_signed_zero_tie_keep_the_first_members_bits() {
         for (label, members, want) in [
