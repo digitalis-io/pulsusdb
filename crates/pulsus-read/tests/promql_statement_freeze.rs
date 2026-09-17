@@ -70,6 +70,29 @@ use pulsus_read::metrics::{MetricsConfig, grouped, grouped_sql, sample_sql};
 /// manufacture an extra part for the splitter to find.
 const STATEMENT_MARKER: &str = "-- statement[";
 
+/// One marker line, rendered:
+///
+/// ```text
+/// -- statement[003] offset=00001274 len=000412
+/// ```
+///
+/// **Every field is fixed width**, so the line's own length does not
+/// depend on the numbers in it — which is what lets the writer compute
+/// the offset of the statement that follows in ONE pass: it is the
+/// output length plus [`MARKER_LEN`].
+///
+/// The offset and length are what the corpus check splits on. No rule
+/// downstream infers a boundary from the text, because the four grouped
+/// statements begin with the binding keyword and a keyword rule would
+/// find their inner `SELECT` and hand a parser only the tail.
+const MARKER_LEN: usize = "-- statement[000] offset=00000000 len=000000\n".len();
+
+fn marker_line(index: usize, offset: usize, len: usize) -> String {
+    let line = format!("{STATEMENT_MARKER}{index:03}] offset={offset:08} len={len:06}\n");
+    assert_eq!(line.len(), MARKER_LEN, "the marker line is fixed width");
+    line
+}
+
 /// The group id of each of [`FPS`], **stated here rather than resolved**:
 /// the grouped read assigns group ids in our own process from the label
 /// sets the resolver returned, and this freeze has no resolver. Writing
@@ -103,7 +126,7 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 /// The three constants published on issue #548 before the code existed.
 const ENTRIES: usize = 30;
 const LINES: usize = 736;
-const BYTES: usize = 35_281;
+const BYTES: usize = 36_859;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two.
 const STATEMENTS: usize = 56;
@@ -170,7 +193,13 @@ fn render() -> String {
             !sql.contains(STATEMENT_MARKER),
             "a statement contains the reserved marker prefix {STATEMENT_MARKER:?}"
         );
-        out.push_str(&format!("{STATEMENT_MARKER}{statement}]\n"));
+        let offset = out.len() + MARKER_LEN;
+        out.push_str(&marker_line(statement, offset, sql.len()));
+        assert_eq!(
+            out.len(),
+            offset,
+            "the declared offset is where the bytes are"
+        );
         out.push_str(sql);
         out.push('\n');
         statement += 1;
@@ -251,11 +280,31 @@ fn the_freeze_declares_its_statement_count() {
         "the golden's `{STATEMENT_MARKER}` marker count"
     );
     // The markers are numbered 0..STATEMENTS, in order, with none
-    // missing — so a splitter that walks them cannot silently skip one.
+    // missing — so a splitter that walks them cannot silently skip one —
+    // and each one's declared span holds the bytes it says it does.
     for i in 0..STATEMENTS {
+        let at = GOLDEN
+            .find(&format!("{STATEMENT_MARKER}{i:03}]"))
+            .unwrap_or_else(|| panic!("marker {i} is missing"));
+        let line = &GOLDEN[at..at + MARKER_LEN];
+        let offset: usize = line[line.find("offset=").expect("offset") + 7..][..8]
+            .parse()
+            .expect("offset digits");
+        let len: usize = line[line.find("len=").expect("len") + 4..][..6]
+            .parse()
+            .expect("len digits");
+        assert_eq!(
+            offset,
+            at + MARKER_LEN,
+            "marker {i}: the span starts after the marker"
+        );
         assert!(
-            GOLDEN.contains(&format!("{STATEMENT_MARKER}{i}]")),
-            "marker {i} is missing"
+            offset + len <= GOLDEN.len(),
+            "marker {i}: the span runs past the file"
+        );
+        assert!(
+            !GOLDEN[offset..offset + len].contains(STATEMENT_MARKER),
+            "marker {i}: the span swallows another marker"
         );
     }
 }
