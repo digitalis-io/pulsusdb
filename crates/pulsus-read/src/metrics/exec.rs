@@ -898,17 +898,27 @@ impl MetricsEngine {
         let sample_budget = SampleBudget::new(self.config.max_samples);
 
         // Issue #549: the pushed route. The statements return the answer
-        // already reduced, so there is no `SeriesData` to assemble and no
-        // evaluation to offload — the fold IS the evaluation, and it is
-        // O(the answer) with no per-sample work.
+        // already reduced, so there is no `SeriesData` to assemble — the
+        // fold IS the evaluation.
         //
         // The charge is the SAME `sample_budget`, charged per drained row
         // inside the same drain loop, over what this path materialises:
         // the per-statement partial runs.
+        //
+        // **The fold is offloaded and cancellable on exactly the same
+        // terms as the ordinary evaluator** (code review round 1). It is
+        // reduced data, but reducing it further is not free: a run is
+        // EXPANDED into the grid points it covers, one cell at a time, so
+        // the work is the sum of the run widths — bounded by (rows the
+        // budget admits) × (points the grid holds), not by the row count.
+        // Left inline it would hold a runtime worker for a client who has
+        // already gone. Every reason recorded below for the ordinary
+        // path's offload applies here unchanged, including why no pooled
+        // lease crosses it: `fetch_grouped_runs` returns owned `Vec<Run>`
+        // chunks and every `ChRowStream` is dropped before it returns.
         if let Some((push, sqls)) = grouped_plan {
             let chunks = self.fetch_grouped_runs(&push, sqls, &sample_budget).await?;
-            let mut annotations = pulsus_promql::Annotations::new();
-            let value = super::grouped::fold(&push, chunks, &mut annotations);
+            let (value, annotations) = fold_offloaded(&self.eval_gate, push, chunks).await?;
             return Ok((value_to_query_result(value), annotations));
         }
 
@@ -2156,6 +2166,39 @@ where
     let token = pulsus_promql::CancelToken::new(std::sync::Arc::clone(&flag));
     let _guard = CancelOnDrop(flag);
     match gate.run_blocking(move || eval(&plan, &data, token)).await {
+        Ok(res) => Ok(res?),
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
+/// Runs the grouped fold on the blocking pool behind the shared
+/// [`crate::eval_gate::EvalGate`], cancellable when this frame is dropped
+/// (code review round 1 on issue #549).
+///
+/// This is [`evaluate_offloaded`] for the pushed route, and deliberately
+/// the same shape rather than a second mechanism: the same gate bounds
+/// in-flight and queued work, the same [`CancelOnDrop`] guard fires when
+/// a disconnected or timed-out client's frame is dropped, the same
+/// `PromqlError::Cancelled` reaches the client as `503` `timeout`, and a
+/// panic is re-raised rather than turned into a domain error.
+///
+/// `push` and `chunks` are moved in because `spawn_blocking` needs
+/// `Send + 'static`; both are owned data with no lifetimes and no pooled
+/// connection lease, so nothing is held across the offload.
+async fn fold_offloaded(
+    gate: &crate::eval_gate::EvalGate,
+    push: super::grouped::GroupedPush,
+    chunks: Vec<Vec<super::grouped::Run>>,
+) -> Result<(pulsus_promql::QueryValue, pulsus_promql::Annotations), ReadError> {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let token = pulsus_promql::CancelToken::new(std::sync::Arc::clone(&flag));
+    let _guard = CancelOnDrop(flag);
+    let run = move || {
+        let mut annotations = pulsus_promql::Annotations::new();
+        super::grouped::fold(&push, chunks, &mut annotations, &token)
+            .map(|value| (value, annotations))
+    };
+    match gate.run_blocking(run).await {
         Ok(res) => Ok(res?),
         Err(join) => std::panic::resume_unwind(join.into_panic()),
     }

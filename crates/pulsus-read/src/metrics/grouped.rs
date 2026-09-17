@@ -59,8 +59,8 @@
 use std::collections::HashMap;
 
 use pulsus_promql::{
-    AggOp, Annotations, Grouping, InstantSample, Labels, PlanExpr, PlanParams, Point, QueryPlan,
-    QueryValue, RangeSeries, SelectorId, group_key_of,
+    AggOp, Annotations, CancelToken, Grouping, InstantSample, Labels, PlanExpr, PlanParams, Point,
+    PromqlError, QueryPlan, QueryValue, RangeSeries, SelectorId, group_key_of,
 };
 
 use super::exec::MetricsConfig;
@@ -430,17 +430,45 @@ const EMPTY_CELL: Cell = Cell {
 /// including a later NaN — so an all-NaN group answers the payload of its
 /// last member in fold order, and fold order is chunk order, which is
 /// fingerprint order.
+///
+/// # It is CPU-bound, so it is cancellable and belongs off the reactor
+///
+/// The rows arrive already reduced, but reducing them further is not
+/// free: a run covers a stretch of grid points and is EXPANDED into them
+/// one cell at a time, so the work is the sum of the run widths, not the
+/// row count. The sample budget bounds the rows and the grid bounds a
+/// single run, so the worst case is (rows the budget admits) × (points
+/// the grid holds) cell writes — large enough that a client who walks
+/// away must not leave a runtime worker finishing it.
+///
+/// So this mirrors the ordinary evaluator exactly (issue #93, hardened by
+/// issue #101): the caller runs it on the blocking pool behind the shared
+/// `EvalGate`, and passes a [`CancelToken`] that the awaiting request
+/// frame sets when it is dropped. The checkpoint is **once per run** and
+/// **once per group**, never per cell: a run's expansion and a group's
+/// emit are each O(points), so one relaxed atomic load per iteration is
+/// not measurable against them, while a per-cell check would sit in the
+/// innermost loop.
+///
+/// Cancelling answers [`PromqlError::Cancelled`], which is the same
+/// variant the ordinary path raises and reaches the client as `503`
+/// `timeout` through the existing mapping — no new error and no new knob.
 pub fn fold(
     push: &GroupedPush,
     chunks: Vec<Vec<Run>>,
     annotations: &mut Annotations,
-) -> QueryValue {
+    cancel: &CancelToken,
+) -> Result<QueryValue, PromqlError> {
     let points = push.grid.points as usize;
     let mut cells: Vec<Option<Vec<Cell>>> = vec![None; push.groups.len()];
     let mut any_histogram_member = false;
 
     for chunk in &chunks {
         for run in chunk {
+            // Once per run: the body below writes up to `points` cells.
+            if cancel.is_cancelled() {
+                return Err(PromqlError::Cancelled);
+            }
             let Some(slot) = cells.get_mut(run.gid as usize) else {
                 // Unreachable: every fingerprint the statement reads is in
                 // the `transform` source array, so the `CAST(0,'UInt32')`
@@ -475,6 +503,10 @@ pub fn fold(
 
     let mut out: Vec<FoldedSeries> = Vec::new();
     for (gid, (labels, name)) in push.groups.iter().enumerate() {
+        // Once per group: the body below walks `points` cells.
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
         let Some(row) = cells[gid].as_ref() else {
             continue;
         };
@@ -494,7 +526,7 @@ pub fn fold(
     // metric_name)`.
     out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
-    if push.instant {
+    Ok(if push.instant {
         QueryValue::Vector(
             out.into_iter()
                 .map(|(labels, metric_name, pts)| InstantSample {
@@ -524,7 +556,7 @@ pub fn fold(
                 })
                 .collect(),
         )
-    }
+    })
 }
 
 fn fold_one(op: GroupedOp, cell: &mut Cell, run: &Run) {
@@ -912,6 +944,75 @@ mod tests {
         }
     }
 
+    /// [`fold`] with a token that never fires — every test below is
+    /// about the reduction, not about cancellation, and the one test
+    /// that IS about cancellation calls `fold` directly with a live one.
+    fn folded(
+        push: &GroupedPush,
+        chunks: Vec<Vec<Run>>,
+        annotations: &mut Annotations,
+    ) -> QueryValue {
+        fold(push, chunks, annotations, &CancelToken::never()).expect("the token never fires")
+    }
+
+    /// The fold's cancellation checkpoint is REACHED, at both of its two
+    /// positions, and answers the variant the ordinary evaluator answers.
+    ///
+    /// Two cases, because the two checkpoints guard different loops and a
+    /// single case would leave one of them unexercised:
+    ///
+    /// ```text
+    ///   chunks non-empty  -> the per-RUN checkpoint fires first
+    ///   chunks empty      -> no run to check, so the per-GROUP
+    ///                        checkpoint in the emit walk is the one
+    ///                        that fires
+    /// ```
+    ///
+    /// The second case is why the emit walk carries a checkpoint at all:
+    /// a query whose statements returned nothing still walks every group.
+    #[test]
+    fn a_cancelled_fold_stops_at_both_of_its_checkpoints() {
+        let push = push_of(GroupedOp::Max, 1, 3, false);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let token = CancelToken::new(std::sync::Arc::clone(&flag));
+
+        for (what, chunks) in [
+            (
+                "the per-run checkpoint",
+                vec![vec![run(0, 0, 2, 1.0, Some(1))]],
+            ),
+            ("the per-group checkpoint", Vec::new()),
+        ] {
+            let mut annos = Annotations::new();
+            let err =
+                fold(&push, chunks, &mut annos, &token).expect_err("a live flag must stop {what}");
+            assert!(
+                matches!(err, PromqlError::Cancelled),
+                "{what}: expected the cancelled variant, got {err:?}"
+            );
+        }
+
+        // And with the flag CLEAR the same inputs answer normally — so the
+        // two cases above failed on the token and not on their shape.
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut annos = Annotations::new();
+        let v = fold(
+            &push,
+            vec![vec![run(0, 0, 2, 1.0, Some(1))]],
+            &mut annos,
+            &token,
+        )
+        .expect("a clear flag answers");
+        assert_eq!(
+            matrix_bits(v)[0].1.len(),
+            3,
+            "three points, one per grid index"
+        );
+        let mut annos = Annotations::new();
+        let v = fold(&push, Vec::new(), &mut annos, &token).expect("a clear flag answers");
+        assert!(matrix_bits(v).is_empty(), "no chunk, no series");
+    }
+
     // ---------------------------------------------------------- the fold
 
     fn push_of(op: GroupedOp, groups: usize, points: u32, instant: bool) -> GroupedPush {
@@ -1000,7 +1101,7 @@ mod tests {
     fn two_float_only_chunks_of_one_group_keep_the_group() {
         let push = push_of(GroupedOp::Max, 1, 1, false);
         let mut annos = Annotations::new();
-        let v = fold(
+        let v = folded(
             &push,
             vec![
                 vec![run(0, 0, 0, 500.0, Some(1))],
@@ -1035,7 +1136,7 @@ mod tests {
             let push = push_of(GroupedOp::Max, 1, 1, false);
             let mut annos = Annotations::new();
             assert_eq!(
-                matrix_bits(fold(&push, chunks, &mut annos))[0].1,
+                matrix_bits(folded(&push, chunks, &mut annos))[0].1,
                 vec![(1_000, 3.0f64.to_bits())]
             );
         }
@@ -1050,7 +1151,7 @@ mod tests {
         let last = f64::from_bits(0x7FF8_0000_0000_0002);
         let push = push_of(GroupedOp::Max, 1, 1, false);
         let mut annos = Annotations::new();
-        let v = fold(
+        let v = folded(
             &push,
             vec![
                 vec![run(0, 0, 0, first, Some(1))],
@@ -1068,7 +1169,7 @@ mod tests {
     fn a_histogram_only_group_is_dropped_and_annotated_once() {
         let push = push_of(GroupedOp::Max, 2, 1, false);
         let mut annos = Annotations::new();
-        let v = fold(
+        let v = folded(
             &push,
             vec![vec![
                 run(0, 0, 0, 42.0, Some(3)),
@@ -1098,7 +1199,7 @@ mod tests {
     fn count_sums_its_chunks_and_group_answers_one() {
         let push = push_of(GroupedOp::Count, 1, 1, false);
         let mut annos = Annotations::new();
-        let v = fold(
+        let v = folded(
             &push,
             vec![
                 vec![run(0, 0, 0, 500.0, None)],
@@ -1111,7 +1212,7 @@ mod tests {
 
         let push = push_of(GroupedOp::Group, 1, 1, false);
         let mut annos = Annotations::new();
-        let v = fold(&push, vec![vec![run(0, 0, 0, 1.0, None)]], &mut annos);
+        let v = folded(&push, vec![vec![run(0, 0, 0, 1.0, None)]], &mut annos);
         assert_eq!(matrix_bits(v)[0].1, vec![(1_000, 1.0f64.to_bits())]);
     }
 
@@ -1122,7 +1223,7 @@ mod tests {
     fn a_run_expands_to_its_grid_indices_and_a_gap_stays_a_gap() {
         let push = push_of(GroupedOp::Max, 1, 5, false);
         let mut annos = Annotations::new();
-        let v = fold(
+        let v = folded(
             &push,
             vec![vec![run(0, 0, 1, 7.0, Some(1)), run(0, 3, 4, 9.0, Some(1))]],
             &mut annos,
@@ -1145,7 +1246,8 @@ mod tests {
         let mut push = push_of(GroupedOp::Max, 1, 1, true);
         push.grid.step_ms = 1;
         let mut annos = Annotations::new();
-        let QueryValue::Vector(v) = fold(&push, vec![vec![run(0, 0, 0, 5.0, Some(1))]], &mut annos)
+        let QueryValue::Vector(v) =
+            folded(&push, vec![vec![run(0, 0, 0, 5.0, Some(1))]], &mut annos)
         else {
             panic!("expected a vector");
         };
@@ -1206,7 +1308,7 @@ mod tests {
             // bit 0 AND bit 1 for the extremum templates, no flags column
             // at all for the counting ones.
             let flags = matches!(op, GroupedOp::Min | GroupedOp::Max).then_some(3);
-            fold(&push, vec![vec![run(0, 0, 0, 42.0, flags)]], &mut ours);
+            folded(&push, vec![vec![run(0, 0, 0, 42.0, flags)]], &mut ours);
             assert_eq!(ours.base_messages(), reference.base_messages(), "{op:?}");
         }
     }
