@@ -506,9 +506,16 @@ impl Harness {
     /// The settings are the engine's own
     /// (`metrics::exec::metrics_read_settings`), reproduced here because
     /// that function is private: the ceiling, no external group-by
-    /// spilling, and the pinned block size. A spill would let the heavy
-    /// statement finish under a ceiling it should breach, which is why
-    /// `max_bytes_before_external_group_by = 0` is not optional.
+    /// spilling, and the pinned block size.
+    ///
+    /// **Which of the three is load-bearing here was measured, not
+    /// assumed.** Raising `max_bytes_before_external_group_by` to allow a
+    /// spill leaves every row of the sweep unchanged, so the group-by is
+    /// not what breaches the ceiling on this corpus — the window
+    /// functions and the coverage expansion are. Dropping
+    /// `max_memory_usage` reddens the sweep at its first row. The spill
+    /// setting stays because it mirrors what the engine sends, not
+    /// because it is what refuses.
     ///
     /// `true` means every row arrived; `false` means the server refused,
     /// either at dispatch or mid-stream.
