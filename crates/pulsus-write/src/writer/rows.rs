@@ -636,6 +636,35 @@ impl BackfillRow for MetricMetadataRow {
     }
 }
 
+/// One span-attribute array element's slot cost in the shape the WRITER
+/// QUEUE holds, which is [`TraceSpanRow`]'s: four `String` slots (key,
+/// scope, val, and the `val_type` spelling) plus the `Option<f64>` (issue
+/// #556). Taken from `size_of` rather than written down, so it cannot
+/// drift from the fields it prices.
+///
+/// The queue reservation must count what we HOLD, not what crossed a
+/// wire: an array element is not protobuf bytes.
+pub(crate) const ARRAY_ELEMENT_SLOT_BYTES: usize =
+    4 * std::mem::size_of::<String>() + std::mem::size_of::<Option<f64>>();
+/// The five `Vec` headers one span's attribute arrays carry (issue #556).
+pub(crate) const ARRAY_HEADER_BYTES: usize = 5 * std::mem::size_of::<Vec<String>>();
+/// The `val_type` spelling charged as a fixed term — the longest of the
+/// four is `string`, 6 bytes. The SAME constant [`TraceAttrRow::estimate`]
+/// already uses, for the same reason: a fixed term keeps `est_bytes` and
+/// `est_source_bytes` equal, which is the reserve-before-materialize
+/// invariant.
+pub(crate) const VAL_TYPE_SPELLING_BYTES: usize = 6;
+
+/// The byte cost of one span's five attribute arrays: the rendered text of
+/// the three string arrays, plus per element the slot cost and the
+/// `val_type` spelling, plus the five `Vec` headers once.
+fn attr_array_bytes(keys: &[String], scopes: &[String], vals: &[String]) -> usize {
+    let text: usize = keys.iter().map(String::len).sum::<usize>()
+        + scopes.iter().map(String::len).sum::<usize>()
+        + vals.iter().map(String::len).sum::<usize>();
+    text + keys.len() * (ARRAY_ELEMENT_SLOT_BYTES + VAL_TYPE_SPELLING_BYTES) + ARRAY_HEADER_BYTES
+}
+
 /// One `trace_spans` row (docs/schemas.md §4.1, issue #54). `[u8; N]` ↔
 /// `FixedString(N)` (serde arrays serialize as N raw bytes on the RowBinary
 /// wire — no length prefix); `payload` is a **binary** protobuf blob stored
@@ -679,6 +708,20 @@ pub struct TraceSpanRow {
     pub scope_version: String,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
+    /// The span's own attributes as five ALIGNED arrays (issue #556),
+    /// element `i` of each describing one attribute. Appended LAST on
+    /// purpose — the `val_type` precedent one type down: the derived `Row`
+    /// insert names its columns in FIELD order, and migrations 49-58
+    /// append these five at the end of `trace_spans`.
+    ///
+    /// `attr_type` is the rendered spelling (`AttrValueType::as_str`),
+    /// because the column is `Array(LowCardinality(String))`; the record
+    /// side keeps the closed enum.
+    pub attr_key: Vec<String>,
+    pub attr_scope: Vec<String>,
+    pub attr_val: Vec<String>,
+    pub attr_type: Vec<String>,
+    pub attr_num: Vec<Option<f64>>,
 }
 
 impl From<&SpanRecord> for TraceSpanRow {
@@ -699,6 +742,15 @@ impl From<&SpanRecord> for TraceSpanRow {
             scope_name: record.scope_name.clone(),
             scope_version: record.scope_version.clone(),
             payload: record.payload.clone(),
+            attr_key: record.attr_key.clone(),
+            attr_scope: record.attr_scope.clone(),
+            attr_val: record.attr_val.clone(),
+            attr_type: record
+                .attr_type
+                .iter()
+                .map(|t| t.as_str().to_string())
+                .collect(),
+            attr_num: record.attr_num.clone(),
         }
     }
 }
@@ -713,6 +765,7 @@ impl TraceSpanRow {
             self.status_message.len(),
             self.scope_name.len() + self.scope_version.len(),
             self.payload.len(),
+            attr_array_bytes(&self.attr_key, &self.attr_scope, &self.attr_val),
         )
     }
 
@@ -727,6 +780,7 @@ impl TraceSpanRow {
             record.status_message.len(),
             record.scope_name.len() + record.scope_version.len(),
             record.payload.len(),
+            attr_array_bytes(&record.attr_key, &record.attr_scope, &record.attr_val),
         )
     }
 
@@ -736,8 +790,10 @@ impl TraceSpanRow {
         status_message_len: usize,
         scope_len: usize,
         payload_len: usize,
+        attr_array_len: usize,
     ) -> u64 {
         (name.len() + service.len() + status_message_len + scope_len + payload_len
+            + attr_array_len /* the five aligned attribute arrays, issue #556 */
             + 16 /* trace_id */ + 8 /* span_id */ + 8 /* parent_id */
             + 8 /* timestamp_ns */ + 8 /* duration_ns */
             + 1 /* status_code */ + 1 /* kind */ + 1 /* payload_type */
@@ -768,6 +824,8 @@ impl SpoolEncode for TraceSpanRow {
             "scope_name": self.scope_name,
             "scope_version": self.scope_version,
             "payload_len": self.payload.len(),
+            "attr_lens": [self.attr_key.len(), self.attr_scope.len(), self.attr_val.len(),
+                          self.attr_type.len(), self.attr_num.len()],
         })
     }
 }
@@ -1351,6 +1409,13 @@ mod tests {
             scope_name: "io.otel".to_string(),
             scope_version: "2.1".to_string(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+            attr_key: Vec::new(),
+            attr_scope: Vec::new(),
+            attr_val: Vec::new(),
+            attr_type: Vec::new(),
+            attr_num: Vec::new(),
         }
     }
 
@@ -1387,6 +1452,82 @@ mod tests {
         assert_eq!(mapped.scope_name, "io.otel");
         assert_eq!(mapped.scope_version, "2.1");
         assert_eq!(mapped.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(mapped.attr_key, Vec::<String>::new());
+        assert_eq!(mapped.attr_scope, Vec::<String>::new());
+        assert_eq!(mapped.attr_val, Vec::<String>::new());
+        assert_eq!(mapped.attr_type, Vec::<String>::new());
+        assert_eq!(mapped.attr_num, Vec::<Option<f64>>::new());
+
+        // The arrays copy through element by element, and `attr_type`
+        // renders the closed enum to its stored spelling.
+        let mut record = span_record();
+        record.attr_key = vec!["http.status_code".to_string(), "spanID".to_string()];
+        record.attr_scope = vec!["span".to_string(), "link:intrinsic".to_string()];
+        record.attr_val = vec!["500".to_string(), "0000000000000001".to_string()];
+        record.attr_type = vec![AttrValueType::Int, AttrValueType::String];
+        record.attr_num = vec![Some(500.0), None];
+        let mapped = TraceSpanRow::from(&record);
+        assert_eq!(mapped.attr_key, vec!["http.status_code", "spanID"]);
+        assert_eq!(mapped.attr_scope, vec!["span", "link:intrinsic"]);
+        assert_eq!(mapped.attr_val, vec!["500", "0000000000000001"]);
+        assert_eq!(mapped.attr_type, vec!["int", "string"]);
+        assert_eq!(mapped.attr_num, vec![Some(500.0), None]);
+    }
+
+    /// The three array constants are computed from `size_of`, so nothing
+    /// otherwise binds them to the fields they claim to price. This does:
+    /// `ARRAY_ELEMENT_SLOT_BYTES` is measured against one element of each
+    /// of the ROW's five arrays, and `ARRAY_HEADER_BYTES` against its five
+    /// vector headers.
+    #[test]
+    fn the_array_slot_constant_prices_the_rows_own_element_types() {
+        let mut record = span_record();
+        record.attr_key = vec!["k".to_string()];
+        record.attr_scope = vec!["span".to_string()];
+        record.attr_val = vec!["v".to_string()];
+        record.attr_type = vec![AttrValueType::Int];
+        record.attr_num = vec![Some(1.0)];
+        let row = TraceSpanRow::from(&record);
+        let element = std::mem::size_of_val(&row.attr_key[0])
+            + std::mem::size_of_val(&row.attr_scope[0])
+            + std::mem::size_of_val(&row.attr_val[0])
+            + std::mem::size_of_val(&row.attr_type[0])
+            + std::mem::size_of_val(&row.attr_num[0]);
+        assert_eq!(
+            ARRAY_ELEMENT_SLOT_BYTES, element,
+            "the constant must price this row's element types"
+        );
+        let headers = std::mem::size_of_val(&row.attr_key)
+            + std::mem::size_of_val(&row.attr_scope)
+            + std::mem::size_of_val(&row.attr_val)
+            + std::mem::size_of_val(&row.attr_type)
+            + std::mem::size_of_val(&row.attr_num);
+        assert_eq!(
+            ARRAY_HEADER_BYTES, headers,
+            "the constant must price this row's five vector headers"
+        );
+    }
+
+    /// One more array element reserves at least its slots, on top of any
+    /// text. Asserted as a DIFFERENCE between two spans whose only
+    /// difference is one empty-string element, so the text contributes
+    /// nothing and only the slot accounting can satisfy it.
+    #[test]
+    fn one_more_array_element_reserves_at_least_its_slots() {
+        let none = span_record();
+        let mut one = span_record();
+        one.attr_key = vec![String::new()];
+        one.attr_scope = vec![String::new()];
+        one.attr_val = vec![String::new()];
+        one.attr_type = vec![AttrValueType::String];
+        one.attr_num = vec![None];
+        let delta =
+            TraceSpanRow::est_source_bytes(&one) - TraceSpanRow::est_source_bytes(&none);
+        let floor = (ARRAY_ELEMENT_SLOT_BYTES + VAL_TYPE_SPELLING_BYTES) as u64;
+        assert!(
+            delta >= floor,
+            "one array element must reserve at least its slots ({floor}); it reserved {delta}"
+        );
     }
 
     #[test]
@@ -1401,7 +1542,17 @@ mod tests {
     /// spool is a human audit artifact, never an insert replay source.
     #[test]
     fn trace_span_row_spool_encoding_renders_hex_ids_and_payload_len_only() {
-        let spooled = TraceSpanRow::from(&span_record()).to_spool_value();
+        // Two array elements, so `attr_lens` pins the five LENGTHS rather
+        // than five zeros. The arrays render as their sizes, not their
+        // content — the `payload_len` spirit: the alignment is what an
+        // auditor of a refused insert needs.
+        let mut record = span_record();
+        record.attr_key = vec!["k".to_string(), "spanID".to_string()];
+        record.attr_scope = vec!["span".to_string(), "link:intrinsic".to_string()];
+        record.attr_val = vec!["500".to_string(), "0000000000000001".to_string()];
+        record.attr_type = vec![AttrValueType::Int, AttrValueType::String];
+        record.attr_num = vec![Some(500.0), None];
+        let spooled = TraceSpanRow::from(&record).to_spool_value();
         assert_eq!(
             spooled,
             serde_json::json!({
@@ -1420,6 +1571,7 @@ mod tests {
                 "scope_name": "io.otel",
                 "scope_version": "2.1",
                 "payload_len": 4,
+                "attr_lens": [2, 2, 2, 2, 2],
             })
         );
     }

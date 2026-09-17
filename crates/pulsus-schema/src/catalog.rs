@@ -1041,6 +1041,198 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the span's own attribute arrays (issue #556, part of #537) ---
+    // Five ALIGNED arrays on `trace_spans` carrying exactly the attributes
+    // that already become `trace_attrs_idx` rows for that span, in the same
+    // order: key, scope, rendered value, declared OTLP kind, numeric value.
+    // The same additive `ADD COLUMN IF NOT EXISTS` pattern as ids 21/22,
+    // 25/26, 31/32, 35/36 and 37/38 — the frozen CREATE of id 16 is never
+    // mutated, and rows written before these migrations read back five
+    // EMPTY arrays, which satisfies id 59's alignment constraint
+    // (`0 = 0 = 0 = 0 = 0`). Nothing READS the arrays in this change; the
+    // index is still written and still answers every query.
+    //
+    // Five separate statements rather than one five-column ALTER (id 37
+    // shows one ALTER may add two columns): the cost is five checksum rows
+    // instead of one, and the benefit is that a failure part-way leaves a
+    // recorded prefix naming exactly which column did not land.
+    //
+    // These land AFTER the id 44-48 projection narrowing (issue #555) on
+    // purpose. A projection declared `SELECT *` expands its column list per
+    // part at insert time, so an `ADD COLUMN` under the old `SELECT *`
+    // `service_time` would store the five arrays a SECOND time inside the
+    // projection.
+    Migration {
+        id: 49,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 49 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id
+    // 22/26/32/36/38: the wrapper is created from a `CREATE ... AS` that
+    // does NOT inherit the base table's ALTERs, so without this twin an
+    // insert through `trace_spans_dist` fails `Code: 16
+    // NO_SUCH_COLUMN_IN_TABLE`.
+    Migration {
+        id: 50,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 51,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 51 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id
+    // 22/26/32/36/38: the wrapper is created from a `CREATE ... AS` that
+    // does NOT inherit the base table's ALTERs, so without this twin an
+    // insert through `trace_spans_dist` fails `Code: 16
+    // NO_SUCH_COLUMN_IN_TABLE`.
+    Migration {
+        id: 52,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 53,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_val Array(String);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 53 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id
+    // 22/26/32/36/38: the wrapper is created from a `CREATE ... AS` that
+    // does NOT inherit the base table's ALTERs, so without this twin an
+    // insert through `trace_spans_dist` fails `Code: 16
+    // NO_SUCH_COLUMN_IN_TABLE`.
+    Migration {
+        id: 54,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_val Array(String);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 55,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 55 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id
+    // 22/26/32/36/38: the wrapper is created from a `CREATE ... AS` that
+    // does NOT inherit the base table's ALTERs, so without this twin an
+    // insert through `trace_spans_dist` fails `Code: 16
+    // NO_SUCH_COLUMN_IN_TABLE`.
+    Migration {
+        id: 56,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 57,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 57 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id
+    // 22/26/32/36/38: the wrapper is created from a `CREATE ... AS` that
+    // does NOT inherit the base table's ALTERs, so without this twin an
+    // insert through `trace_spans_dist` fails `Code: 16
+    // NO_SUCH_COLUMN_IN_TABLE`.
+    Migration {
+        id: 58,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The alignment constraint, LAST because its CHECK names all five
+    // columns. It gets NO `_dist` twin: a Distributed table refuses one
+    // (`Code: 48 ... Alter of type 'ADD_CONSTRAINT' is not supported by
+    // storage Distributed`), and it does not need one — a misaligned row
+    // sent through the wrapper is refused by the BASE table's constraint,
+    // `Code: 469 VIOLATED_CONSTRAINT`.
+    //
+    // What it catches is a direct INSERT naming SOME array columns and not
+    // others. What it does NOT catch is an `ALTER TABLE ... UPDATE`
+    // mutation, which ClickHouse does not check constraints on: any later
+    // backfill must check alignment itself.
+    Migration {
+        id: 59,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK\n\
+             length(attr_key) = length(attr_scope)\n\
+             AND length(attr_key) = length(attr_val)\n\
+             AND length(attr_key) = length(attr_type)\n\
+             AND length(attr_key) = length(attr_num);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1150,6 +1342,141 @@ mod tests {
     /// Renders migration `id`'s `Ddl::Static` template in single-node mode.
     fn rendered_static(id: u32) -> String {
         render::render(static_tmpl(id), "", &ctx(), false)
+    }
+
+    /// Renders migration `id`'s cluster-only template in single-node mode:
+    /// `{{dist_suffix}}` becomes `_dist`, `{{on_cluster}}` nothing. The
+    /// sibling of [`rendered_static`], which panics on this variant.
+    fn rendered_cluster_only(id: u32) -> String {
+        let m = MIGRATIONS
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("no migration with id {id}"));
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration {id} is not Ddl::StaticClusterOnly");
+        };
+        render::render(tmpl, "", &ctx(), false)
+    }
+
+    /// Issue #556, criterion 12. The eleven span-attribute-array
+    /// migrations render to exactly these eleven statements, and
+    /// `docs/schemas.md` §4.1 prints the six base-table ones verbatim.
+    ///
+    /// This is what this repository means by binding documented SQL — the
+    /// `point_read_sql_is_byte_exact_to_schemas_md_4_2` convention
+    /// (`crates/pulsus-read/src/traces/sql.rs`), strengthened from a
+    /// human-maintained literal to a read of the document itself.
+    ///
+    /// What it does NOT do, said rather than left: it does not bind the
+    /// fenced `CREATE` block, and nothing in the tree does; it does not
+    /// prove any statement executes; and it cannot see a statement the
+    /// document prints that the catalogue does not contain — only the
+    /// other direction.
+    #[test]
+    fn array_migrations_render_exactly() {
+        let base: Vec<(u32, &str)> = vec![
+            (
+                49,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));",
+            ),
+            (
+                51,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));",
+            ),
+            (
+                53,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD COLUMN IF NOT EXISTS attr_val Array(String);",
+            ),
+            (
+                55,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));",
+            ),
+            (
+                57,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));",
+            ),
+            (
+                59,
+                "ALTER TABLE pulsus.trace_spans\n\
+                 ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK\n\
+                 length(attr_key) = length(attr_scope)\n\
+                 AND length(attr_key) = length(attr_val)\n\
+                 AND length(attr_key) = length(attr_type)\n\
+                 AND length(attr_key) = length(attr_num);",
+            ),
+        ];
+        let twins: Vec<(u32, &str)> = vec![
+            (
+                50,
+                "ALTER TABLE pulsus.trace_spans_dist\n\
+                 ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));",
+            ),
+            (
+                52,
+                "ALTER TABLE pulsus.trace_spans_dist\n\
+                 ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));",
+            ),
+            (
+                54,
+                "ALTER TABLE pulsus.trace_spans_dist\n\
+                 ADD COLUMN IF NOT EXISTS attr_val Array(String);",
+            ),
+            (
+                56,
+                "ALTER TABLE pulsus.trace_spans_dist\n\
+                 ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));",
+            ),
+            (
+                58,
+                "ALTER TABLE pulsus.trace_spans_dist\n\
+                 ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));",
+            ),
+        ];
+
+        let mut rendered = Vec::new();
+        for (id, expected) in &base {
+            let got = rendered_static(*id);
+            assert_eq!(&got, expected, "migration {id}");
+            rendered.push(got);
+        }
+        for (id, expected) in &twins {
+            let got = rendered_cluster_only(*id);
+            assert_eq!(&got, expected, "migration {id}");
+            rendered.push(got);
+        }
+
+        // A copy-paste that leaves two entries with the same DDL *and* the
+        // same expected literal passes every equality above and ships one
+        // column where two are intended.
+        let mut deduped = rendered.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            11,
+            "the eleven statements must all differ: {deduped:#?}"
+        );
+
+        // The six base-table statements are printed in docs/schemas.md
+        // §4.1 verbatim, with the rendered `pulsus.` database prefix
+        // removed — the same form the document prints the projection
+        // `ALTER`s in.
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/schemas.md"),
+        )
+        .expect("read docs/schemas.md");
+        for (id, expected) in &base {
+            let printed = expected.replace("pulsus.trace_spans", "trace_spans");
+            assert!(
+                doc.contains(&printed),
+                "docs/schemas.md must print migration {id}'s statement verbatim:\n{printed}"
+            );
+        }
     }
 
     #[test]

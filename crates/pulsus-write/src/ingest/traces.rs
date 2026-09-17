@@ -47,6 +47,37 @@ pub struct SpanRecord {
     pub scope_version: String,
     /// Encoded single-`ResourceSpans` `TracesData` (see above).
     pub payload: Vec<u8>,
+    /// This span's OWN attribute rows, projected element-wise into five
+    /// ALIGNED arrays (issue #556, part of #537): `trace_spans.attr_key`,
+    /// `attr_scope`, `attr_val`, `attr_type`, `attr_num`. Element `i` of
+    /// each array describes one attribute, and the five lengths are equal
+    /// — the `attr_arrays_aligned` CHECK (migration 59) refuses a row
+    /// where they are not.
+    ///
+    /// They carry exactly the attributes that also become
+    /// [`AttrRecord`]s for this span, in the same order, and the parser
+    /// DERIVES them from those records rather than recomputing them: the
+    /// two stores therefore cannot disagree about an element **within one
+    /// parsed span**. That is a property of the parser and not of the
+    /// system — a hand-built `SpanRecord` may carry empty arrays beside
+    /// real index rows, and the writer commits the two tables as
+    /// independent flush generations.
+    ///
+    /// Nothing reads these in this change; `trace_attrs_idx` still answers
+    /// every query.
+    pub attr_key: Vec<String>,
+    pub attr_scope: Vec<String>,
+    pub attr_val: Vec<String>,
+    /// The declared OTLP kind, the same closed four-variant enum
+    /// [`AttrRecord::val_type`] carries — never a `String`, which would
+    /// accept a spelling the wire has no meaning for. The row type renders
+    /// it through [`AttrValueType::as_str`].
+    pub attr_type: Vec<AttrValueType>,
+    /// The numeric value, decided by the whole of (scope, key, value) and
+    /// NOT by the value text: a link's `spanID` of `0000000000000001`
+    /// parses as `1.0` and is stored `None`, because the `AttrRecord`
+    /// that built this element stores `None`.
+    pub attr_num: Vec<Option<f64>>,
 }
 
 /// The OTLP value kind an attribute arrived as, carried to
@@ -188,6 +219,13 @@ mod tests {
             scope_name: "io.otel.http".to_string(),
             scope_version: "1.4.2".to_string(),
             payload: vec![0xDE, 0xAD],
+            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+            attr_key: Vec::new(),
+            attr_scope: Vec::new(),
+            attr_val: Vec::new(),
+            attr_type: Vec::new(),
+            attr_num: Vec::new(),
         };
         assert_eq!(span.trace_id, [1; 16]);
         assert_eq!(span.span_id, [2; 8]);
