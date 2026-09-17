@@ -376,6 +376,58 @@ fn the_freeze_has_the_published_entry_line_and_byte_counts() {
     assert_eq!(GOLDEN.len(), BYTES, "the golden's byte length");
 }
 
+/// **The statement `docs/schemas.md` §2.3 prints IS the one the builder
+/// renders** — the doc-consistency pattern the TraceQL SQL suites already
+/// use, and the reason §2.3 can say "this is what the database receives"
+/// rather than showing a transcription of it.
+///
+/// The literals are the ones §2.3 names in its own prose, so a reader can
+/// check the block against the sentence above it, and a change to any
+/// layer of the statement fails here until the document is regenerated
+/// with it.
+#[test]
+fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let schemas = std::fs::read_to_string(root.join("docs/schemas.md")).expect("read schemas.md");
+    let rendered = grouped_sql::grouped_fetch(
+        SAMPLES,
+        HIST,
+        "http_requests_total",
+        &FPS,
+        &GIDS,
+        Grid {
+            start_ms: 1_782_907_200_000,
+            step_ms: 15_000,
+            points: 241,
+            lookback_ms: 300_000,
+        },
+        1_782_906_900_000,
+        1_782_910_800_000,
+        grouped::GroupedOp::Max,
+    );
+    assert!(
+        schemas.contains(&rendered),
+        "docs/schemas.md §2.3 must print the grouped instant read the builder renders, byte for \
+         byte. It does not; regenerate the block from the builder rather than editing it by hand."
+    );
+    // And the sentences beside it, which the block alone cannot carry.
+    for needle in [
+        "the grouped instant read (issue #549)",
+        "`min`, `max`, `count` and `group`",
+        "group key never enters the SQL",
+        "`pushed_rows <= 2 * raw_rows`",
+        "series >= 2 * groups",
+    ] {
+        assert!(
+            schemas.contains(needle),
+            "docs/schemas.md §2.3 must say {needle:?} beside the block"
+        );
+    }
+}
+
 /// The first line the two texts disagree on, so a failure names the byte
 /// that moved rather than printing 26,727 of them.
 fn first_difference<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {

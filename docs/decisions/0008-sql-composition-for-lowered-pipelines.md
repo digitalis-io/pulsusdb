@@ -33,7 +33,7 @@ on how SQL is written:
 |---|---|
 | `Cut::SourceHandoff` — the next read is over a different source, keyed by this one's result | **D3.** A subquery handoff reads 12× the rows of a materialised one, so the second source is a second statement rather than a nested `SELECT` |
 | `Cut::HandoffExceedsBound` — the seed does not fit in one statement | **D3's measured ceiling.** 32,768 literal ids is 1,409,081 query bytes and is refused at `Code: 168 … AST is too big. Maximum: 50000`, so a seed larger than the ceiling is sent in chunks |
-| `Cut::DisjointSources` — an `OR` whose sides read different sources | **D2.** The common-table form is rejected on measurement, so the union is a second statement merged in our process |
+| `Cut::DisjointSources` — an `OR` whose sides read different sources | **D2.** The relational common-table form is rejected on measurement, so the union is a second statement merged in our process. One read is exempt by construction rather than by carve-out: the grouped instant read (issue #549) unions the two sample tables INSIDE one statement with `UNION ALL`, which binds nothing, and its plan names the second table through an additive `also_reads` rather than a second part |
 | `Cut::InexactLimit` — the request's `LIMIT` cannot enter the statement | not decided here; it is decided by the link's `Fidelity` (query-lowering.md §2.7.7) |
 
 `Cut::InexactLimit` is listed so the table is the whole of the four rather than the subset this ADR
@@ -99,16 +99,37 @@ reference. ClickHouse substitutes a CTE textually rather than materialising it, 
 buys nothing over the subquery it would replace and hides the cost at precisely the point a reader
 would expect it removed — a stage needing an earlier stage's output as a set rather than a stream.
 
-**This is to be enforced rather than merely preferred, and today it is neither: wave 1 writes the
-first half and wave 2 is the first wave it can fail on.** The rule is that no emitted SQL may
-contain a `WITH` clause. D2's gate has two halves — one **wave 1**, one existing — both nominated by name in
-[query-lowering.md §11.4](../query-lowering.md).
+**Amended by issue #549, because the original wording banned a keyword rather than the
+construct it measured.** The rule now reads:
 
-`the_golden_sql_corpus_contains_no_with_clause` over the committed golden corpus
-(`crates/pulsus-read/tests/golden_sql_freeze.rs`) **does not exist**: run at `2f78c53` its selector
-prints `Starting 0 tests across 1 binary (2 tests skipped)` and exits 4. **Wave 1** writes it. Even
-then it is vacuous until a wave emits lowered SQL into that corpus, because at base the corpus holds
-none of the case the rule is about.
+> No emitted SQL may bind a relational subquery through a common table expression;
+> scalar-expression and array aliases are permitted.
+
+The measurement above is about a CTE that binds a *relational* subquery — a stage's rows, consumed
+as a set. A `WITH <literal> AS name` scalar alias and a `WITH [<literals>] AS name` array alias are
+different constructs that happen to share the keyword: measured on 26.3, the array alias keeps the
+primary-key prune (12/24 granules, identical rows, bytes and marks against writing the list inline),
+and neither an expensive-array nor a sleeping-function probe multiplied its cost across three
+references. The grouped instant read (issue #549) uses both.
+
+**Do not re-add the scalar-subquery-alias form to this rule.** `WITH (SELECT …) AS x` looks like a
+binding and is not the construct measured above: the parser gives it no binding node, and it is
+evaluated **once regardless of how many times it is referenced** — measured against a ten-million-row
+source at one, two and three references, 10,000,001 rows read each time. Four successive
+specifications of this rule's check reached for that form and each was made *wrong* rather than more
+complete by doing so, which is why the list of forbidden spellings kept growing.
+
+**The check asks the parser, not the text.** `crates/pulsus-read/tests/live_sql_corpus_ast.rs` runs
+`EXPLAIN AST` over every statement in the committed corpus and asserts the tree carries no
+`WithElement` node — the node ClickHouse's own parser produces for `name AS (SELECT …)` and
+`AS MATERIALIZED (SELECT …)` and for none of the permitted forms. It covers 503 statements: 446
+across 126 `.sql` goldens, 56 across the 30 PromQL freeze entries, and one control fixture holding
+exactly one binding node, excluded from the assertion by path and carrying the opposite assertion.
+Seven earlier versions of this check asserted a property of the TEXT and each was beaten by text
+with a different property; the last was beaten by a truncation that landed on valid SQL with no
+binding node, which is why the check's FIRST assertion is now byte coverage and not a statement
+about statements. It needs a live server, so it runs in the live-gated set; the hermetic freeze
+keeps its digest and cannot see this property at all.
 
 The `system.query_log` half in `crates/pulsus-read/tests/query_log_gates.rs` **does** exist — run at
 `2f78c53` the binary prints `Starting 14 tests across 1 binary` and `14 passed`, exit 0 — but that
@@ -226,6 +247,6 @@ execution, identical to writing the subquery out twice.
 adopted. It would make the read path stateful, would need a lifecycle and a cleanup path on every
 error, and would change what a read is allowed to do to the database. If a future stage set makes
 shared subexpressions common enough to matter, that is the point to measure it — this ADR does not
-foreclose it, and D2's gates — `the_golden_sql_corpus_contains_no_with_clause`, **wave 1**, and
+foreclose it, and D2's gates — `every_committed_statement_binds_no_relational_cte`, added by issue #549, and
 `query_log_gates`, which exists and prints `Starting 14 tests` at exit 0 — would need an explicit
 carve-out recorded here.

@@ -329,7 +329,7 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 
 A part whose `cut` is `{"why": "inexact_limit"}` carries neither `source`/`key`, `sources` nor `cost`: the request's `LIMIT` could not enter the statement, so the same statement is issued once per page.
 
-**The `plans` key's shape** (issue #548): `plans` is an array of exactly the object above, one entry per selector-list position that reads, in the planner's own selector order. It is an array and not a second `plan` because `parts` is an ORDERED list while a PromQL request's selector fetches are issued concurrently: merging N chains into one part list would assert an order the executor does not have. Each entry's first link names its selector — `{"i": 0, "part": 0, "stage": "Select(0)", ...}` — which is how an entry is traced back to the selector it came from when `plans` is shorter than the query's selector list. A PromQL selector's read is **two statements**, the float read and its complementary native-histogram read, so each entry opens with two `sql` parts, the second cut `{"why": "disjoint_sources", "sources": ["metric_samples", "metric_hist_samples"]}`, and ends with one `engine` part carrying every link above the source. Today every link above the source is `residual` with `"why": "not_yet_lowered"` and the source link is `"lowered"` with `"fidelity": "wider"` — the fetch window subtracts one lookback the evaluator re-applies. `max by (status) (http_requests_total{status="500"})` renders:
+**The `plans` key's shape** (issue #548): `plans` is an array of exactly the object above, one entry per selector-list position that reads, in the planner's own selector order. It is an array and not a second `plan` because `parts` is an ORDERED list while a PromQL request's selector fetches are issued concurrently: merging N chains into one part list would assert an order the executor does not have. Each entry's first link names its selector — `{"i": 0, "part": 0, "stage": "Select(0)", ...}` — which is how an entry is traced back to the selector it came from when `plans` is shorter than the query's selector list. A PromQL selector's read is normally **two statements**, the float read and its complementary native-histogram read, so each entry opens with two `sql` parts, the second cut `{"why": "disjoint_sources", "sources": ["metric_samples", "metric_hist_samples"]}`, and ends with one `engine` part carrying every link above the source. Every link above the source is then `residual` with `"why": "not_yet_lowered"` and the source link is `"lowered"` with `"fidelity": "wider"` — the fetch window subtracts one lookback the evaluator re-applies. `stddev by (status) (http_requests_total{status="500"})` renders:
 
 ```json
 "plans": [{
@@ -344,10 +344,28 @@ A part whose `cut` is `{"why": "inexact_limit"}` carries neither `source`/`key`,
   ],
   "links": [
     {"i": 0, "part": 0, "stage": "Select(0)", "how": "lowered", "fidelity": "wider"},
-    {"i": 1, "part": 2, "stage": "Aggregate(max)", "how": "residual", "why": "not_yet_lowered"}
+    {"i": 1, "part": 2, "stage": "Aggregate(stddev)", "how": "residual", "why": "not_yet_lowered"}
   ]
 }]
 ```
+
+**One shape is different, and it is the one a dashboard sends most** (issue #549). `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name — compile into ONE statement per fingerprint chunk that reads both sample tables and returns the answer already reduced. Such an entry has **one** `sql` part, which names `metric_samples` and additively names the other table it reads inside the same statement; there is no `disjoint_sources` cut, because there is no second statement to cut from, and **no `engine` part at all**, because every link lowers. `max by (status) (http_requests_total{status="500"})` renders:
+
+```json
+"plans": [{
+  "parts": [
+    {"kind": "sql", "name": "metric_samples",
+     "also_reads": ["metric_hist_samples"], "issue": "once", "cut": null,
+     "seed": null, "yields": "candidates"}
+  ],
+  "links": [
+    {"i": 0, "part": 0, "stage": "Select(0)", "how": "lowered", "fidelity": "wider"},
+    {"i": 1, "part": 0, "stage": "Aggregate(max)", "how": "lowered", "fidelity": "wider"}
+  ]
+}]
+```
+
+**`also_reads` is additive and is omitted when empty**, so every plan whose statements each read one table renders byte-identically to one from before the key existed. It exists because a part's `name` is the one source the statement is named for, and the grouped read's single statement touches two — a plan naming only the first would describe a read the database did not perform. Which shape an entry has follows the statement and not the query text: a query that is eligible but declines — on the `series >= 2 * groups` threshold, or because the label cache is cold — renders the ordinary two-part shape above.
 
 A stage name carries the link kind and its operator, never a user literal — `Aggregate(max)`, `RangeFn(rate)`, `Binary(mul)` — except the selector index, which is not a literal. The grouping is deliberately absent from it: `docs/query-lowering.md` §13.2 records that, and what would have to change for a payload to appear.
 - **`warnings` (issue #277):** an array of strings added as the **last top-level key**, a sibling of `data` and after it — `{"status":"success","data":{...},"warnings":["..."]}`. Note the asymmetry with `explain`, which lives *inside* `data`. The key is **omitted entirely when there are no warnings**, so every response that carries none is byte-identical to one from before the field existed, and a client that ignores the key sees a normal success with fewer series rather than an error. Messages are deduplicated and rendered in byte-lexicographic order, so `…variant (10)` precedes `…variant (2)`. PulsusDB emits exactly one message today: `maximum of series (<cap>) reached for variant (<index>)`, when a `variants(...)` query's variant breaches the result-series cap — see §2.2's note. The reference's two other warning families are deliberately not emitted and are recorded, with what was measured, in `docs/benchmarks/logs-differential-ledger.md` entry `(d)`.

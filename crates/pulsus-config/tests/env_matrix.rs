@@ -442,8 +442,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        77,
-        "docs/configuration.md §§1-8 document exactly 77 variables"
+        78,
+        "docs/configuration.md §§1-8 document exactly 78 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
