@@ -1359,6 +1359,113 @@ mod tests {
         ]
     }
 
+    /// Issue #549 criterion 4: **the two queries that keep today's route
+    /// keep today's plan, byte for byte.**
+    ///
+    /// The shape is taken from [`crate::metrics::grouped::shape_of`],
+    /// not chosen by this test — which is what makes the two breaks the
+    /// criterion names reach it:
+    ///
+    /// ```text
+    ///   widening the pushed set to AggOp::Stddev
+    ///       -> shape_of answers Some for `stddev by (status) (…)`
+    ///       -> its seed becomes GroupedRuns, its plan becomes one part
+    ///       -> the first literal below no longer matches
+    ///
+    ///   lifting the "child must be PlanExpr::Selector" check
+    ///       -> shape_of answers Some for `max by (status) (rate(…[5m]))`
+    ///       -> the second literal no longer matches
+    /// ```
+    ///
+    /// The flag is ON in the configuration this test builds, so a decline
+    /// here is a decline on the query's shape and not on the flag.
+    #[test]
+    fn the_two_unpushed_queries_keep_todays_plan_byte_for_byte() {
+        let cases: [(&str, &str); 2] = [
+            (
+                "stddev by (status) (http_requests_total{status=\"500\"})",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"Aggregate(stddev)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+            (
+                "max by (status) (rate(http_requests_total{status=\"500\"}[5m]))",
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"RangeFn(rate)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+            ),
+        ];
+        for (query, want) in cases {
+            let shapes = rendered_plan(query);
+            assert_eq!(shapes.len(), 1, "{query}: one selector that reads");
+            let got = serde_json::to_string(&shapes[0]).expect("serialize");
+            assert_eq!(got, want, "{query}: the plan moved");
+        }
+    }
+
+    /// Issue #549: a PUSHED selector is ONE SQL part, named for
+    /// `metric_samples` and additively naming the histogram table it
+    /// reads inside the same statement — with no `disjoint_sources` cut,
+    /// because there is no second statement to cut from, and no engine
+    /// part, because the aggregate link lowers.
+    #[test]
+    fn a_pushed_selector_is_one_part_that_also_reads_the_histogram_table() {
+        let shapes = rendered_plan("max by (status) (http_requests_total{status=\"500\"})");
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&shapes[0]).expect("serialize"),
+            r#"{"parts":[{"kind":"sql","name":"metric_samples","also_reads":["metric_hist_samples"],"issue":"once","cut":null,"seed":null,"yields":"candidates"}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":0,"stage":"Aggregate(max)","how":"lowered","fidelity":"wider"}]}"#
+        );
+    }
+
+    /// The plan shapes for `query`, with each selector's seed shape taken
+    /// from `grouped::shape_of` — the same decision `exec` takes, so a
+    /// change to the eligibility rule reaches these literals.
+    fn rendered_plan(query: &str) -> Vec<PlanShape> {
+        let plan = planned(query);
+        let cfg = grouped_test_config();
+        let shape = crate::metrics::grouped::shape_of(&plan, &plan_params(), &cfg);
+        let mut reads = SelectorReads::empty();
+        for (i, _) in plan.selectors.iter().enumerate() {
+            let pushed = shape.as_ref().is_some_and(|s| s.selector == i);
+            reads.push(SelectorRead {
+                selector: i,
+                pred: if pushed {
+                    grouped_selector_pred(
+                        "metric_name = 'http_requests_total'",
+                        "unix_milli > 1 AND unix_milli <= 2",
+                        "fingerprint IN (7)",
+                    )
+                } else {
+                    pred("http_requests_total")
+                },
+                shape: if pushed {
+                    PqlShape::GroupedRuns
+                } else {
+                    PqlShape::Samples
+                },
+            });
+        }
+        plan_shapes(&plan, &reads, &params()).expect("plan shapes")
+    }
+
+    /// The engine configuration these tests plan against: the grouped
+    /// push ON, so a decline is a decline on the query and not on the
+    /// flag.
+    fn grouped_test_config() -> crate::metrics::MetricsConfig {
+        crate::metrics::MetricsConfig {
+            db: "d".to_string(),
+            samples_table: "metric_samples".to_string(),
+            hist_samples_table: "metric_hist_samples".to_string(),
+            series_table: "metric_series".to_string(),
+            metadata_table: "metric_metadata".to_string(),
+            experimental_functions: true,
+            max_metric_fanout: 1_000,
+            max_cache_scan: 200_000,
+            max_info_series: 100_000,
+            max_samples: 50_000_000,
+            distributed: false,
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            grouped_push: true,
+        }
+    }
+
     /// Criterion 4: **every link's residual state effect is asserted, not
     /// assumed.**
     ///

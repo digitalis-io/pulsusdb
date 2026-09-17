@@ -439,6 +439,91 @@ impl Harness {
         )
     }
 
+    /// The grouped instant read (issue #549), written out the same way:
+    /// ONE statement per fingerprint chunk, reading BOTH sample tables in
+    /// a union, returning one row per run of an unchanging answer.
+    ///
+    /// Written out here rather than rendered by `grouped_sql`, for the
+    /// reason at the top of this file: an expectation produced by the
+    /// code under test agrees with whatever that code chose.
+    fn grouped_read(&self, metric: &str, fps: &str, gids: &str, back: i64) -> String {
+        let p = self.range();
+        let lower = p.start_ms - back;
+        let upper = p.end_ms;
+        let points = (p.end_ms - p.start_ms) / p.step_ms + 1;
+        format!(
+            "WITH {} AS grid_start, {} AS grid_step, {points} AS grid_n, {back} AS lookback,\n\
+             \x20    [{fps}] AS fps,\n\
+             \x20    CAST([{gids}], 'Array(UInt32)') AS gids\n\
+             SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, \
+             any(flags) AS flags\n\
+             FROM (\n\
+             \x20 SELECT gid, gi, agg, flags,\n\
+             \x20   sum(is_new) OVER (PARTITION BY gid ORDER BY gi \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run\n\
+             \x20 FROM (\n\
+             \x20   SELECT gid, gi, agg, flags,\n\
+             \x20     toUInt8(gi != lagInFrame(gi) OVER w + 1\n\
+             \x20             OR reinterpretAsUInt64(agg) != \
+             reinterpretAsUInt64(lagInFrame(agg) OVER w)\n\
+             \x20             OR flags != lagInFrame(flags) OVER w) AS is_new\n\
+             \x20   FROM (\n\
+             \x20     SELECT gid, gi,\n\
+             \x20       if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, \
+             argMaxIf(v, fingerprint, NOT is_hist),\n\
+             \x20          maxIf(v, NOT is_hist AND NOT isNaN(v))) AS agg,\n\
+             \x20       toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + \
+             if(countIf(is_hist) > 0, 2, 0)) AS flags\n\
+             \x20     FROM (\n\
+             \x20       SELECT gid, fingerprint, v, is_hist,\n\
+             \x20         arrayJoin(range(\n\
+             \x20           toUInt32(least(toInt64(grid_n),\n\
+             \x20             if(ts <= grid_start, 0, \
+             intDiv(ts - grid_start + grid_step - 1, grid_step)))),\n\
+             \x20           toUInt32(least(toInt64(grid_n),\n\
+             \x20             if(cover_end <= grid_start, 0, \
+             intDiv(cover_end - grid_start + grid_step - 1, grid_step))))\n\
+             \x20         )) AS gi\n\
+             \x20       FROM (\n\
+             \x20         SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, \
+             fingerprint,\n\
+             \x20           ts, v, is_hist, stale,\n\
+             \x20           least(leadInFrame(ts, 1, toInt64({upper}) + lookback + 1) OVER (\n\
+             \x20                   PARTITION BY fingerprint ORDER BY ts, is_hist\n\
+             \x20                   ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),\n\
+             \x20                 ts + lookback) AS cover_end\n\
+             \x20         FROM (\n\
+             \x20           SELECT fingerprint, unix_milli AS ts, value AS v, \
+             CAST(0, 'UInt8') AS is_hist,\n\
+             \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
+             \x20           FROM metric_samples\n\
+             \x20           PREWHERE metric_name = '{metric}'\n\
+             \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
+             AND fingerprint IN fps\n\
+             \x20           UNION ALL\n\
+             \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
+             CAST(1, 'UInt8') AS is_hist,\n\
+             \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
+             \x20           FROM metric_hist_samples\n\
+             \x20           PREWHERE metric_name = '{metric}'\n\
+             \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
+             AND fingerprint IN fps\n\
+             \x20         )\n\
+             \x20       )\n\
+             \x20       WHERE NOT stale\n\
+             \x20     )\n\
+             \x20     GROUP BY gi, gid\n\
+             \x20   )\n\
+             \x20   WINDOW w AS (PARTITION BY gid ORDER BY gi \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
+             \x20 )\n\
+             )\n\
+             GROUP BY gid, run\n\
+             ORDER BY gid, gi_start",
+            p.start_ms, p.step_ms
+        )
+    }
+
     /// The complementary histogram read, written out the same way.
     fn hist_read(&self, metric: &str, fps: &str, back: i64) -> String {
         let p = self.range();
@@ -483,15 +568,27 @@ async fn harness(db: &str) -> Harness {
     }
 }
 
-/// The SQL part names of every plan, in plan order.
+/// Every source the plan says its statements read, in plan order.
+///
+/// A part's `name` is the one source it is named for; `also_reads`
+/// carries any OTHER source that same statement reads (issue #549 — the
+/// grouped instant read unions `metric_samples` with
+/// `metric_hist_samples` inside one statement). Both belong here,
+/// because what this is compared against is the set of tables the
+/// database reported reading, and the database does not care which
+/// table a plan chose to name a statement after.
 fn plan_part_names(explain: &PlanExplain) -> Vec<String> {
     explain
         .plans
         .iter()
         .flat_map(|p| p.parts.iter())
-        .filter_map(|part| match part {
-            pulsus_read::compile::plan::PartShape::Sql(s) => Some(s.name.clone()),
-            pulsus_read::compile::plan::PartShape::Engine(_) => None,
+        .flat_map(|part| match part {
+            pulsus_read::compile::plan::PartShape::Sql(s) => {
+                let mut names = vec![s.name.clone()];
+                names.extend(s.also_reads.iter().cloned());
+                names
+            }
+            pulsus_read::compile::plan::PartShape::Engine(_) => Vec::new(),
         })
         .collect()
 }
@@ -528,11 +625,18 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
             .map(|r| without_format_clause(&r.query).to_string())
             .collect(),
     );
-    let want = sorted(vec![
-        h.float_read(METRIC, "1, 2, 3, 4", LOOKBACK_MS),
-        h.hist_read(METRIC, "1, 2, 3, 4", LOOKBACK_MS),
-    ]);
-    assert_eq!(got, want, "the aggregation's two statements");
+    // Issue #549: `max by (status)` over a plain instant selector is ONE
+    // statement, not two — and it reads both sample tables inside that
+    // one statement. The gid array is the group each fingerprint was
+    // assigned in THIS process; the selector narrows to `status="500"`,
+    // so the four matched series are one group and every gid is 0.
+    let want = sorted(vec![h.grouped_read(
+        METRIC,
+        "1, 2, 3, 4",
+        "0, 0, 0, 0",
+        LOOKBACK_MS,
+    )]);
+    assert_eq!(got, want, "the aggregation's one grouped statement");
 
     // 2 — the same query WITHOUT the header sends exactly the same two
     // statements. The chain is built only under the header, and it must
@@ -672,22 +776,55 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
             received, named,
             "{query}: the tables the database read, against the plan's SQL part names"
         );
-        // And the shape of each plan: two SQL parts, the second cut on
-        // the two sources being disjoint, plus ONE engine part when there
-        // is a residual link to put in it. A bare selector has none — its
-        // whole chain is the source link, which lowers — so it is two
-        // parts and no engine part, which is what this loop asserts
-        // rather than assuming three parts everywhere.
+        // And the shape of each plan. Two shapes now (issue #549):
+        //
+        // ```text
+        //   unpushed   two SQL parts, the second cut on the two sources
+        //              being disjoint, plus ONE engine part when there is
+        //              a residual link to put in it — a bare selector has
+        //              none, its whole chain being the source link
+        //   pushed     ONE SQL part, naming `metric_samples` and
+        //              additively naming `metric_hist_samples` as read
+        //              inside the same statement; no cut, because there
+        //              is no second statement, and no engine part,
+        //              because every link lowers
+        // ```
+        //
+        // Which shape a plan has is read FROM THE PLAN, not chosen from
+        // the query text: that is the property being asserted — the
+        // explain surface changes exactly when the statement changes.
         for plan in &explain.plans {
             let json = serde_json::to_value(plan).expect("serialize");
             assert_eq!(json["parts"][0]["name"], "metric_samples", "{query}");
+            assert_eq!(json["links"][0]["how"], "lowered", "{query}");
+            assert_eq!(json["links"][0]["fidelity"], "wider", "{query}");
+            if json["parts"][0]["also_reads"].is_array() {
+                assert_eq!(
+                    json["parts"][0]["also_reads"],
+                    serde_json::json!(["metric_hist_samples"]),
+                    "{query}"
+                );
+                assert_eq!(
+                    plan.parts.len(),
+                    1,
+                    "{query}: the pushed read is one statement, so one part"
+                );
+                assert_eq!(
+                    json["parts"][0]["cut"],
+                    serde_json::Value::Null,
+                    "{query}: one statement has nothing to be cut from"
+                );
+                assert!(
+                    plan.links.iter().all(|l| l.how == "lowered"),
+                    "{query}: every link of a pushed chain lowers, so there is no engine part"
+                );
+                continue;
+            }
             assert_eq!(json["parts"][1]["name"], "metric_hist_samples", "{query}");
             assert_eq!(
                 json["parts"][1]["cut"]["why"], "disjoint_sources",
                 "{query}"
             );
-            assert_eq!(json["links"][0]["how"], "lowered", "{query}");
-            assert_eq!(json["links"][0]["fidelity"], "wider", "{query}");
             if plan.links.len() > 1 {
                 assert_eq!(json["parts"][2]["kind"], "engine", "{query}");
                 assert_eq!(plan.parts.len(), 3, "{query}");
