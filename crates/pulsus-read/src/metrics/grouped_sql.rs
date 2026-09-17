@@ -94,6 +94,19 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 /// overflow ([`super::grouped::shape_of`] owns that guard and is the only
 /// owner of it), and this function does not re-check it; it also does not
 /// re-check the feature flag.
+///
+/// **Nine parameters, four of them interchangeable by type.** Transposing
+/// `lower_excl_ms` and `upper_incl_ms`, or the two table names, compiles.
+/// The signature is the one issue #549's plan specifies and is kept, so
+/// what guards against a transposition is a test rather than the type
+/// system: `the_max_template_renders_this_statement` below compares the
+/// whole statement byte for byte, and
+/// `crates/pulsus-read/tests/live_metrics_plan_parts.rs` reads the
+/// statement back out of `system.query_log` and compares it against text
+/// that test writes out itself. Both were run against a transposition
+/// while this comment was written: swapping the two window arguments
+/// reddens both.
+#[allow(clippy::too_many_arguments)]
 pub fn grouped_fetch(
     samples_table: &str,
     hist_samples_table: &str,

@@ -394,6 +394,10 @@ pub fn decide(
     })
 }
 
+/// One output series before it is given a value type: the group's
+/// identity, and its points in ascending grid order.
+type FoldedSeries = (Labels, Option<String>, Vec<(i64, f64)>);
+
 /// One group's answer at one grid index, folded across chunks.
 #[derive(Debug, Clone, Copy)]
 struct Cell {
@@ -469,7 +473,7 @@ pub fn fold(
         );
     }
 
-    let mut out: Vec<(Labels, Option<String>, Vec<(i64, f64)>)> = Vec::new();
+    let mut out: Vec<FoldedSeries> = Vec::new();
     for (gid, (labels, name)) in push.groups.iter().enumerate() {
         let Some(row) = cells[gid].as_ref() else {
             continue;
@@ -967,7 +971,11 @@ mod tests {
         }
     }
 
-    fn matrix_bits(v: QueryValue) -> Vec<(Vec<(String, String)>, Vec<(i64, u64)>)> {
+    /// One matrix series' labels and its points, values as raw bit
+    /// patterns so NaN compares equal to NaN.
+    type MatrixBits = Vec<(Vec<(String, String)>, Vec<(i64, u64)>)>;
+
+    fn matrix_bits(v: QueryValue) -> MatrixBits {
         let QueryValue::Matrix(m) = v else {
             panic!("expected a matrix, got {v:?}");
         };

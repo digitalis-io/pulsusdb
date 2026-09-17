@@ -527,23 +527,23 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     );
 }
 
-/// ADR 0008 D2 — **the check that enforces it lives in
-/// `tests/live_sql_corpus_ast.rs`** (issue #549), not here.
-///
-/// A text scan for the word `WITH` stood in this file until then. It was
-/// the seventh such rule and, like the six before it, it asserted a
-/// property of the TEXT; the rule is about what the SQL *is*, so the
-/// check now asks ClickHouse's own parser for the AST and asserts that no
-/// statement in the committed corpus carries a `WithElement` node. That
-/// needs a server, so it moved into the live-gated set.
-///
-/// Two consequences worth stating rather than leaving implicit:
-///
-/// * **This file's digest is unchanged by the move.** The freeze still
-///   pins the corpus bytes; it simply no longer claims anything about
-///   what those bytes mean.
-/// * **The hermetic half cannot see the binding property at all.** That
-///   is a stated limit, not a gate that implies otherwise.
+// ADR 0008 D2 — **the check that enforces it lives in
+// `tests/live_sql_corpus_ast.rs`** (issue #549), not here.
+//
+// A text scan for the word `WITH` stood in this file until then. It was
+// the seventh such rule and, like the six before it, it asserted a
+// property of the TEXT; the rule is about what the SQL *is*, so the
+// check now asks ClickHouse's own parser for the AST and asserts that no
+// statement in the committed corpus carries a `WithElement` node. That
+// needs a server, so it moved into the live-gated set.
+//
+// Two consequences worth stating rather than leaving implicit:
+//
+// * **This file's digest is unchanged by the move.** The freeze still
+//   pins the corpus bytes; it simply no longer claims anything about
+//   what those bytes mean.
+// * **The hermetic half cannot see the binding property at all.** That
+//   is a stated limit, not a gate that implies otherwise.
 
 /// The root of the golden tree — every committed golden, not only the
 /// two byte-frozen corpora in [`CORPORA`].

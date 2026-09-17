@@ -259,10 +259,6 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         // per-query memory ceiling as the request path; its warn-and-serve-
         // the-last-good-snapshot failure behaviour is unchanged.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
-        // Issue #549: the grouped-instant-read flag's production carrier
-        // — `ReaderConfig -> MetricsConfig -> metrics::grouped::shape_of`.
-        // Ships `false`; see `ReaderConfig::promql_grouped_push` for why.
-        grouped_push: config.reader.promql_grouped_push,
     }
 }
 
@@ -325,6 +321,10 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // metrics::exec::metrics_read_settings` and the sealed
         // `MetricsDispatch`'s error mapper.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
+        // Issue #549: the grouped-instant-read flag's production carrier
+        // — `ReaderConfig -> MetricsConfig -> metrics::grouped::shape_of`,
+        // which is the only reader of it.
+        grouped_push: config.reader.promql_grouped_push,
     }
 }
 
