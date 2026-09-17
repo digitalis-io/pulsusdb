@@ -62,10 +62,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, STALE_NAN_BITS};
-use pulsus_promql::parser::parse;
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
+use pulsus_promql::parser::parse;
 use pulsus_read::metrics::grouped::{Grid, GroupedOp};
 use pulsus_read::metrics::{grouped_sql, sample_sql};
 use pulsus_read::{
@@ -164,6 +164,14 @@ struct SeedHistRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct CountRow {
     n: u64,
+}
+
+/// One `system.query_log` row of a statement this suite ran under a
+/// `query_id` it composed itself.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SentBytesRow {
+    query_id: String,
+    sent: u64,
 }
 
 fn hist_columns() -> pulsus_model::HistogramColumns {
@@ -344,7 +352,10 @@ fn answer_of(r: QueryResult) -> Answer {
             .map(|s| {
                 (
                     s.labels,
-                    s.points.into_iter().map(|(t, v)| (t, v.to_bits())).collect(),
+                    s.points
+                        .into_iter()
+                        .map(|(t, v)| (t, v.to_bits()))
+                        .collect(),
                 )
             })
             .collect(),
@@ -487,12 +498,73 @@ impl Harness {
             .query_stream::<CountRow>(sql, &QuerySettings::new())
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        stream
-            .next()
+        stream.next().await.expect("a row").expect("decode").n
+    }
+
+    /// Runs `sql` once under `query_id`, draining it, and discards the
+    /// rows — the point is what the server sent, not what it said.
+    async fn run_tagged<R: ChRow>(&self, sql: &str, query_id: &str) {
+        let settings = QuerySettings::new()
+            .set("query_id", query_id)
+            .set("max_block_size", 65_409u64)
+            .set("max_bytes_before_external_group_by", 0u64);
+        let mut stream = self
+            .admin
+            .query_stream::<R>(sql, &settings)
             .await
-            .expect("a row")
-            .expect("decode")
-            .n
+            .unwrap_or_else(|e| panic!("{query_id}: {e:?}"));
+        while let Some(row) = stream.next().await {
+            row.expect("decode");
+        }
+    }
+
+    /// `ProfileEvents['NetworkSendBytes']` for every `query_id` beginning
+    /// with `prefix`, read once the count has stopped moving.
+    ///
+    /// The `query_id`s are composed through `pulsus_testkit::test_ident`,
+    /// so two checkouts sharing one server cannot read each other's rows.
+    async fn sent_bytes(&self, prefix: &str, expect: usize) -> BTreeMap<String, u64> {
+        let sql = format!(
+            "SELECT query_id, toUInt64(ProfileEvents['NetworkSendBytes']) AS sent \
+             FROM system.query_log \
+             WHERE type = 'QueryFinish' AND startsWith(query_id, '{prefix}')"
+        );
+        let mut previous = 0usize;
+        for poll in 1..=30u32 {
+            self.admin
+                .execute(
+                    "SYSTEM FLUSH LOGS",
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("flush logs");
+            let mut stream = self
+                .admin
+                .query_stream::<SentBytesRow>(&sql, &QuerySettings::new())
+                .await
+                .expect("read the query log");
+            let mut rows: Vec<SentBytesRow> = Vec::new();
+            while let Some(r) = stream.next().await {
+                rows.push(r.expect("decode"));
+            }
+            if rows.len() >= expect && poll >= 2 && previous == rows.len() {
+                let mut by_id: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+                for r in rows {
+                    by_id.entry(r.query_id).or_default().push(r.sent);
+                }
+                return by_id
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        v.sort_unstable();
+                        (k, v[v.len() / 2])
+                    })
+                    .collect();
+            }
+            previous = rows.len();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        panic!("the query log never settled on {expect} rows for {prefix}");
     }
 
     async fn finish(self) {
@@ -528,44 +600,43 @@ fn wide_corpus(t: i64) -> Vec<Series> {
     let start = t - 600_000;
     let mut out = Vec::new();
     for fp in 1..=606u64 {
-        let (status, samples, hist): (String, Vec<(i64, u64)>, Vec<i64>) = if (495..=505)
-            .contains(&fp)
-        {
-            (
-                "allnan".to_string(),
-                (0..=WIDE_POINTS)
-                    .map(|k| (start + k * 60_000, nan_bits(fp)))
-                    .collect(),
-                Vec::new(),
-            )
-        } else if (601..=604).contains(&fp) {
-            (
-                "hist".to_string(),
-                Vec::new(),
-                (0..=WIDE_POINTS).map(|k| start + k * 60_000).collect(),
-            )
-        } else if (605..=606).contains(&fp) {
-            (
-                "mixed".to_string(),
-                (0..=WIDE_POINTS)
-                    .map(|k| (start + k * 60_000, (fp as f64 + k as f64 * 0.5).to_bits()))
-                    .collect(),
-                // 30 s off the grid, so the float is never shadowed at the
-                // same millisecond and both channels reach the group.
-                (0..WIDE_POINTS)
-                    .map(|k| start + k * 60_000 + 30_000)
-                    .collect(),
-            )
-        } else {
-            let last = if fp % 37 == 0 { 2 } else { WIDE_POINTS };
-            (
-                ["200", "404", "500", "503"][(fp % 4) as usize].to_string(),
-                (0..=last)
-                    .map(|k| (start + k * 60_000, (fp as f64 + k as f64 * 0.5).to_bits()))
-                    .collect(),
-                Vec::new(),
-            )
-        };
+        let (status, samples, hist): (String, Vec<(i64, u64)>, Vec<i64>) =
+            if (495..=505).contains(&fp) {
+                (
+                    "allnan".to_string(),
+                    (0..=WIDE_POINTS)
+                        .map(|k| (start + k * 60_000, nan_bits(fp)))
+                        .collect(),
+                    Vec::new(),
+                )
+            } else if (601..=604).contains(&fp) {
+                (
+                    "hist".to_string(),
+                    Vec::new(),
+                    (0..=WIDE_POINTS).map(|k| start + k * 60_000).collect(),
+                )
+            } else if (605..=606).contains(&fp) {
+                (
+                    "mixed".to_string(),
+                    (0..=WIDE_POINTS)
+                        .map(|k| (start + k * 60_000, (fp as f64 + k as f64 * 0.5).to_bits()))
+                        .collect(),
+                    // 30 s off the grid, so the float is never shadowed at the
+                    // same millisecond and both channels reach the group.
+                    (0..WIDE_POINTS)
+                        .map(|k| start + k * 60_000 + 30_000)
+                        .collect(),
+                )
+            } else {
+                let last = if fp % 37 == 0 { 2 } else { WIDE_POINTS };
+                (
+                    ["200", "404", "500", "503"][(fp % 4) as usize].to_string(),
+                    (0..=last)
+                        .map(|k| (start + k * 60_000, (fp as f64 + k as f64 * 0.5).to_bits()))
+                        .collect(),
+                    Vec::new(),
+                )
+            };
         out.push(Series {
             fp,
             metric: WIDE_METRIC.to_string(),
@@ -673,11 +744,7 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
     add(18, "four", None);
     add(19, "four", None);
 
-    let h = harness(
-        &pulsus_testkit::test_db("pulsus_read_it_grouped_nan"),
-        &fx,
-    )
-    .await;
+    let h = harness(&pulsus_testkit::test_db("pulsus_read_it_grouped_nan"), &fx).await;
     let p = h.instant();
 
     let expect = |rows: &[(&str, u64)]| -> Answer {
@@ -778,11 +845,7 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
     };
     let a = h.agree(&format!("max by (status) ({metric})"), &p).await;
     assert_eq!(a.len(), 1, "one group");
-    let present: Vec<i64> = a[0]
-        .1
-        .iter()
-        .map(|(ts, _)| (ts - start) / 15_000)
-        .collect();
+    let present: Vec<i64> = a[0].1.iter().map(|(ts, _)| (ts - start) / 15_000).collect();
     let absent: Vec<i64> = (0..=240).filter(|i| !present.contains(i)).collect();
     assert_eq!(
         absent,
@@ -840,24 +903,30 @@ fn row_cases(t: i64) -> Vec<RowCase> {
         });
     }
 
-    // Cyclic: four members per group taking turns at the maximum, read at
-    // a step finer than the scrape, so the answer changes at almost every
-    // grid point and runs barely collapse. The adversarial end.
+    // Cyclic: four members per group, each scraping every 15 s but
+    // STAGGERED 3.75 s apart, each arrival larger than the last — so the
+    // group's answer changes at every grid point of a 3.75 s step and no
+    // two neighbouring points collapse into one run. The adversarial end.
     {
         let start = t - 900_000;
         let metric = "rows_cyclic";
         let series = (0..16u64)
-            .map(|i| Series {
-                fp: i + 1,
-                metric: metric.to_string(),
-                labels: lbl(&[("status", ["200", "404", "500", "503"][(i % 4) as usize])]),
-                samples: (0..=60i64)
-                    .map(|k| {
-                        let turn = (k as u64 + i / 4) % 4;
-                        (start + k * 15_000, ((turn * 100) as f64 + k as f64).to_bits())
-                    })
-                    .collect(),
-                hist_samples: Vec::new(),
+            .map(|i| {
+                let slot = i % 4;
+                Series {
+                    fp: i + 1,
+                    metric: metric.to_string(),
+                    labels: lbl(&[("status", ["200", "404", "500", "503"][(i / 4) as usize])]),
+                    samples: (0..60i64)
+                        .map(|k| {
+                            (
+                                start + slot as i64 * 3_750 + k * 15_000,
+                                ((k * 4 + slot as i64) as f64).to_bits(),
+                            )
+                        })
+                        .collect(),
+                    hist_samples: Vec::new(),
+                }
             })
             .collect();
         cases.push(RowCase {
@@ -965,7 +1034,9 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
     )
     .await;
 
-    eprintln!("[549] corpus                                          pushed : raw    ratio");
+    eprintln!(
+        "[549] corpus                                          op      pushed : raw    ratio"
+    );
     for case in &cases {
         let fps: Vec<u64> = case.series.iter().map(|s| s.fp).collect();
         // Every series of these corpora is in one `status` group per its
@@ -992,7 +1063,63 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
                 }
             })
             .collect();
-        let sql = grouped_sql::grouped_fetch(
+        let raw = h
+            .count(&format!(
+                "SELECT toUInt64(count()) AS n FROM metric_samples \
+                 WHERE metric_name = '{}' AND unix_milli > {} AND unix_milli <= {}",
+                case.metric, case.lower_excl_ms, case.upper_incl_ms
+            ))
+            .await;
+        // Every operation, not one: `count` changes at an arrival AND at
+        // an expiry where `max` may not, so the ratio is a property of the
+        // corpus and the operation together.
+        for op in [
+            GroupedOp::Max,
+            GroupedOp::Min,
+            GroupedOp::Count,
+            GroupedOp::Group,
+        ] {
+            let sql = grouped_sql::grouped_fetch(
+                "metric_samples",
+                "metric_hist_samples",
+                case.metric,
+                &fps,
+                &gids,
+                case.grid,
+                case.lower_excl_ms,
+                case.upper_incl_ms,
+                op,
+            );
+            let pushed = h
+                .count(&format!("SELECT toUInt64(count()) AS n FROM (\n{sql}\n)"))
+                .await;
+            assert!(
+                pushed <= 2 * raw,
+                "{} / {op:?}: {pushed} pushed rows from {raw} raw rows breaks the derived bound",
+                case.name
+            );
+            eprintln!(
+                "[549] {:<48} {:<6} {pushed:>7} : {raw:<7} {:.3}",
+                case.name,
+                format!("{op:?}"),
+                pushed as f64 / raw as f64
+            );
+        }
+    }
+
+    // The byte figures, printed and asserted by nothing: they move with
+    // block framing, compression, format and corpus compressibility, none
+    // of which the row bound is about. `NetworkSendBytes` is the
+    // COORDINATOR's hop — what the server sent this client — plus the
+    // statement text this client sent it. On a single node that is the
+    // metered hop; on a cluster the shard hop carries what it carries
+    // today, unchanged by this work.
+    let tag = pulsus_testkit::test_ident("pulsus_read_it_grouped_bytes");
+    let mut ids: Vec<(String, String, usize)> = Vec::new();
+    for (n, case) in cases.iter().enumerate() {
+        let fps: Vec<u64> = case.series.iter().map(|s| s.fp).collect();
+        let gids = vec![0u32; fps.len()];
+        let pushed_sql = grouped_sql::grouped_fetch(
             "metric_samples",
             "metric_hist_samples",
             case.metric,
@@ -1003,26 +1130,44 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
             case.upper_incl_ms,
             GroupedOp::Max,
         );
-        let pushed = h
-            .count(&format!("SELECT toUInt64(count()) AS n FROM (\n{sql}\n)"))
-            .await;
-        let raw = h
-            .count(&format!(
-                "SELECT toUInt64(count()) AS n FROM metric_samples \
-                 WHERE metric_name = '{}' AND unix_milli > {} AND unix_milli <= {}",
-                case.metric, case.lower_excl_ms, case.upper_incl_ms
-            ))
-            .await;
-        assert!(
-            pushed <= 2 * raw,
-            "{}: {pushed} pushed rows from {raw} raw rows breaks the derived bound",
-            case.name
+        let raw_sql = sample_sql::sample_fetch(
+            "metric_samples",
+            case.metric,
+            &fps,
+            case.lower_excl_ms,
+            case.upper_incl_ms,
         );
-        eprintln!(
-            "[549] {:<48} {pushed:>7} : {raw:<7} {:.3}",
-            case.name,
-            pushed as f64 / raw as f64
-        );
+        let pushed_id = format!("{tag}_{n}_pushed");
+        for _ in 0..3 {
+            h.run_tagged::<pulsus_read::metrics::grouped_rows::GroupedRunRow>(
+                &pushed_sql,
+                &pushed_id,
+            )
+            .await;
+        }
+        ids.push((pushed_id, pushed_sql.len().to_string(), 0));
+        let raw_id = format!("{tag}_{n}_raw");
+        for _ in 0..3 {
+            h.run_tagged::<pulsus_read::metrics::SampleRow>(&raw_sql, &raw_id)
+                .await;
+        }
+        ids.push((raw_id, raw_sql.len().to_string(), 0));
+    }
+    let sent = h.sent_bytes(&tag, ids.len()).await;
+    eprintln!(
+        "[549] corpus                                          route   NetworkSendBytes + text"
+    );
+    for (n, case) in cases.iter().enumerate() {
+        for kind in ["pushed", "raw"] {
+            let id = format!("{tag}_{n}_{kind}");
+            let text: usize = ids
+                .iter()
+                .find(|(i, _, _)| *i == id)
+                .map(|(_, t, _)| t.parse().expect("len"))
+                .expect("recorded");
+            let bytes = sent.get(&id).copied().unwrap_or_default();
+            eprintln!("[549] {:<48} {kind:<7} {}", case.name, bytes + text as u64);
+        }
     }
     h.finish().await;
 }
@@ -1216,6 +1361,11 @@ async fn the_charge_of_a_corpus_whose_first_sample_is_stale() {
     let charge = measured_charge(&h, &db, &case).await;
     eprintln!("[549] corpus C, max   -> charge {charge}");
     assert_pair(&h, &db, &case, charge, "corpus C / max").await;
+    // Recorded on the first run of this code. The stale sample occupies
+    // grid index 0 and is then dropped, so the group is absent there and
+    // the answer is two runs: fingerprint 901's value from index 1, then
+    // 902's from index 2 onward.
+    assert_eq!(charge, 2, "corpus C's charge under max");
     // The answer is still the shipped route's.
     h.agree(&case.query, &case.params).await;
     h.finish().await;
@@ -1258,14 +1408,16 @@ async fn the_charge_depends_on_where_the_chunk_boundary_falls() {
         hist_samples: Vec::new(),
     });
     // E and F share one corpus of 501 fingerprints, all carrying samples.
-    fx.extend((1..=501u64).map(|fp| Series {
-        fp: 1000 + fp,
-        metric: "charge_ef".to_string(),
-        labels: lbl(&[("status", ["200", "404", "500", "503"][(fp % 4) as usize])]),
-        samples: (0..=240i64)
-            .map(|k| (start + k * 15_000, (fp as f64 + k as f64 * 0.5).to_bits()))
-            .collect(),
-        hist_samples: Vec::new(),
+    fx.extend((1..=501u64).map(|fp| {
+        Series {
+            fp: 1000 + fp,
+            metric: "charge_ef".to_string(),
+            labels: lbl(&[("status", ["200", "404", "500", "503"][(fp % 4) as usize])]),
+            samples: (0..=240i64)
+                .map(|k| (start + k * 15_000, (fp as f64 + k as f64 * 0.5).to_bits()))
+                .collect(),
+            hist_samples: Vec::new(),
+        }
     }));
 
     let db = pulsus_testkit::test_db("pulsus_read_it_grouped_charge_def");
@@ -1299,6 +1451,19 @@ async fn the_charge_depends_on_where_the_chunk_boundary_falls() {
     eprintln!("[549] corpus F, max, chunk 501 -> charge {charge_f}");
     assert_pair(&h, &db, &f, charge_f, "corpus F / max").await;
 
+    // Recorded on the first run of this code.
+    assert_eq!(
+        charge_d, 241,
+        "corpus D: an empty first chunk charges nothing"
+    );
+    assert_eq!(
+        charge_e, 1_205,
+        "corpus E: 964 runs from the first chunk's 500 fingerprints plus 241 from the second's one"
+    );
+    assert_eq!(
+        charge_f, 964,
+        "corpus F: one statement over the same 501 fingerprints"
+    );
     assert!(
         charge_e > charge_f,
         "one answer, two chunkings: two statements' partial runs ({charge_e}) must charge \
@@ -1326,26 +1491,36 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     skip_unless_live!();
     let t = (now_ms() / 60_000) * 60_000;
     let start = t - 3_600_000;
-    // Chunk 1 (fingerprints 1..=4): four series, few samples — a small
-    // statement. Chunk 2 (fingerprints 5..=204): two hundred series with
-    // 241 samples each — the statement the ceiling refuses.
-    let mut fx: Vec<Series> = (1..=4u64)
+    // The query sends TWO statements of four hundred fingerprints each.
+    // They are the same width and very different weight:
+    //
+    //   chunk 1   fingerprints   1..=400   ten samples each     4,000 rows
+    //   chunk 2   fingerprints 401..=800   241 samples each    96,400 rows
+    //
+    // Chunk 1's ten samples are shared across its four hundred series and
+    // strictly increasing, so its group's maximum moves at ten
+    // consecutive grid points and the statement returns exactly ten runs.
+    let mut fx: Vec<Series> = (1..=400u64)
         .map(|fp| Series {
             fp,
             metric: "charge_prec".to_string(),
             labels: lbl(&[("status", "200")]),
-            samples: vec![(start, (fp as f64).to_bits())],
+            samples: (0..10i64)
+                .map(|k| (start + k * 15_000, (k as f64).to_bits()))
+                .collect(),
             hist_samples: Vec::new(),
         })
         .collect();
-    fx.extend((5..=204u64).map(|fp| Series {
-        fp,
-        metric: "charge_prec".to_string(),
-        labels: lbl(&[("status", "200")]),
-        samples: (0..=240i64)
-            .map(|k| (start + k * 15_000, (fp as f64 + k as f64 * 0.5).to_bits()))
-            .collect(),
-        hist_samples: Vec::new(),
+    fx.extend((401..=800u64).map(|fp| {
+        Series {
+            fp,
+            metric: "charge_prec".to_string(),
+            labels: lbl(&[("status", "200")]),
+            samples: (0..=240i64)
+                .map(|k| (start + k * 15_000, (fp as f64 + k as f64 * 0.5).to_bits()))
+                .collect(),
+            hist_samples: Vec::new(),
+        }
     }));
     let db = pulsus_testkit::test_db("pulsus_read_it_grouped_precedence");
     let h = harness(&db, &fx).await;
@@ -1356,12 +1531,13 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     // The first statement's own run count, measured directly: with a
     // chunk of 4 the query still sends the heavy second statement, so it
     // cannot be read off a served/refused boundary.
+    let first_chunk: Vec<u64> = (1..=400u64).collect();
     let sql = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
         "charge_prec",
-        &[1, 2, 3, 4],
-        &[0, 0, 0, 0],
+        &first_chunk,
+        &vec![0u32; 400],
         Grid {
             start_ms: params.start_ms,
             step_ms: params.step_ms,
@@ -1375,11 +1551,29 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     let first_charge = h
         .count(&format!("SELECT toUInt64(count()) AS n FROM (\n{sql}\n)"))
         .await;
-    assert!(first_charge > 1, "the first statement must return rows");
+    assert!(
+        first_charge > 1,
+        "the first statement must return more than one run, or there is no cap below it to read"
+    );
 
-    // A ceiling the small statement clears and the heavy one does not,
-    // confirmed in both directions before the pair is read.
-    const CEILING: u64 = 4 * 1024 * 1024;
+    // A ceiling the light statement clears and the heavy one does not.
+    // Measured on this corpus at this head, each statement run alone and
+    // fully drained under the engine's own settings:
+    //
+    // ```text
+    //   ceiling    chunk 1 (4,000 rows in)   chunk 2 (96,400 rows in)
+    //    4 MiB     refused                   refused
+    //    6 MiB     10 runs                   refused
+    //    8 MiB     10 runs                   refused
+    //   10 MiB     10 runs                   241 runs
+    //   64 MiB     10 runs                   241 runs
+    // ```
+    //
+    // 6 MiB sits inside the one window where the two differ. The test
+    // does not take that on trust: the two assertions below fail if the
+    // heavy statement stops being refused OR if the light one starts
+    // being refused.
+    const CEILING: u64 = 6 * 1024 * 1024;
     let run = |cap: u64| {
         let db = db.clone();
         let expr = expr.clone();
@@ -1394,10 +1588,22 @@ async fn the_budget_answers_before_a_later_statements_failure() {
                     ..engine_config(&db, true)
                 },
             )
-            .with_grouped_chunk_size(4);
-            engine.query(&expr, &params).await.err().map(|e| format!("{e:?}"))
+            .with_grouped_chunk_size(400);
+            engine
+                .query(&expr, &params)
+                .await
+                .err()
+                .map(|e| format!("{e:?}"))
         }
     };
+
+    // The ceiling bites: with the budget effectively unbounded, the only
+    // refusal available is the heavy statement's memory ceiling.
+    let unbounded = run(50_000_000).await.expect("the heavy statement fails");
+    assert!(
+        unbounded.contains("PromqlReadMemory"),
+        "the ceiling must be the thing that refuses, got {unbounded}"
+    );
 
     let at_charge = run(first_charge).await.expect("the heavy statement fails");
     assert!(
@@ -1408,11 +1614,12 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     let below = run(first_charge - 1).await.expect("refused");
     assert!(
         below.contains("MetricSamples"),
-        "one below, the BUDGET answers first — this is what charging per row buys; got {below}"
+        "one below, the BUDGET answers first — which also shows the FIRST statement drained \
+         and charged rather than breaching the ceiling itself; got {below}"
     );
     eprintln!(
-        "[549] precedence: first statement charges {first_charge}; \
-         at {first_charge} the memory error surfaces, at {} the budget error does",
+        "[549] precedence: the first statement charges {first_charge}; at {first_charge} the \
+         memory error surfaces, at {} the budget error does",
         first_charge - 1
     );
     h.finish().await;

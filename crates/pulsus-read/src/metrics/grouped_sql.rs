@@ -399,7 +399,10 @@ mod tests {
             GroupedOp::Max,
         );
         assert_ne!(a, b);
-        assert_eq!(a.replace("[0, 1], 'Array(UInt32)'", "[0, 0], 'Array(UInt32)'"), b);
+        assert_eq!(
+            a.replace("[0, 1], 'Array(UInt32)'", "[0, 0], 'Array(UInt32)'"),
+            b
+        );
     }
 
     /// The window predicate and the metric-name literal come from

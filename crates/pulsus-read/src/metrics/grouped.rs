@@ -426,7 +426,11 @@ const EMPTY_CELL: Cell = Cell {
 /// including a later NaN — so an all-NaN group answers the payload of its
 /// last member in fold order, and fold order is chunk order, which is
 /// fingerprint order.
-pub fn fold(push: &GroupedPush, chunks: Vec<Vec<Run>>, annotations: &mut Annotations) -> QueryValue {
+pub fn fold(
+    push: &GroupedPush,
+    chunks: Vec<Vec<Run>>,
+    annotations: &mut Annotations,
+) -> QueryValue {
     let points = push.grid.points as usize;
     let mut cells: Vec<Option<Vec<Cell>>> = vec![None; push.groups.len()];
     let mut any_histogram_member = false;
@@ -458,9 +462,7 @@ pub fn fold(push: &GroupedPush, chunks: Vec<Vec<Run>>, annotations: &mut Annotat
     // The reference raises this per ignored member and its annotation set
     // de-duplicates, so once per query is the same set. `count`/`group`
     // raise none.
-    if any_histogram_member
-        && let Some(name) = push.op.ignored_in_aggregation_name()
-    {
+    if any_histogram_member && let Some(name) = push.op.ignored_in_aggregation_name() {
         annotations.info_at(
             push.expr_pos,
             pulsus_promql::annotations::messages::histogram_ignored_in_aggregation_info(name),
@@ -703,7 +705,9 @@ mod tests {
         let lookback_ms = 300_000i64;
         // The two proxies an earlier design guarded, both fitting exactly.
         assert_eq!(
-            end_ms.checked_add(lookback_ms).and_then(|x| x.checked_add(1)),
+            end_ms
+                .checked_add(lookback_ms)
+                .and_then(|x| x.checked_add(1)),
             Some(i64::MAX)
         );
         assert_eq!(
@@ -755,8 +759,14 @@ mod tests {
         assert_eq!(
             push.groups,
             vec![
-                (Labels::new([("status".to_string(), "200".to_string())]), None),
-                (Labels::new([("status".to_string(), "500".to_string())]), None),
+                (
+                    Labels::new([("status".to_string(), "200".to_string())]),
+                    None
+                ),
+                (
+                    Labels::new([("status".to_string(), "500".to_string())]),
+                    None
+                ),
             ]
         );
     }
@@ -775,8 +785,8 @@ mod tests {
         assert_eq!(bare.gids, vec![0, 0, 0, 0]);
         assert_eq!(bare.groups.len(), 1);
 
-        let without = decide(&shape_for("count without (status) (m)"), &r, range_grid())
-            .expect("pushed");
+        let without =
+            decide(&shape_for("count without (status) (m)"), &r, range_grid()).expect("pushed");
         assert_eq!(without.gids, vec![0, 0, 0, 0]);
 
         let by = decide(&shape_for("count by (status) (m)"), &r, range_grid()).expect("pushed");
@@ -791,7 +801,10 @@ mod tests {
         let s = shape_for("max by (__name__) (m)");
         let r = resolution(&[(1, &[("a", "x")]), (2, &[("a", "y")])]);
         let push = decide(&s, &r, s.grid).expect("pushed");
-        assert_eq!(push.groups, vec![(Labels::default(), Some("m".to_string()))]);
+        assert_eq!(
+            push.groups,
+            vec![(Labels::default(), Some("m".to_string()))]
+        );
     }
 
     fn range_grid() -> Grid {
@@ -927,7 +940,10 @@ mod tests {
             .map(|s| {
                 (
                     s.labels.0,
-                    s.points.into_iter().map(|p| (p.t_ms, p.v.to_bits())).collect(),
+                    s.points
+                        .into_iter()
+                        .map(|p| (p.t_ms, p.v.to_bits()))
+                        .collect(),
                 )
             })
             .collect()
@@ -1026,7 +1042,10 @@ mod tests {
         );
         let (warnings, infos) = annos.base_messages();
         assert!(warnings.is_empty());
-        assert_eq!(infos, vec!["PromQL info: ignored histogram in max aggregation"]);
+        assert_eq!(
+            infos,
+            vec!["PromQL info: ignored histogram in max aggregation"]
+        );
     }
 
     /// `count` sums its chunks' partial counts; `group` answers 1
@@ -1038,7 +1057,10 @@ mod tests {
         let mut annos = Annotations::new();
         let v = fold(
             &push,
-            vec![vec![run(0, 0, 0, 500.0, None)], vec![run(0, 0, 0, 1.0, None)]],
+            vec![
+                vec![run(0, 0, 0, 500.0, None)],
+                vec![run(0, 0, 0, 1.0, None)],
+            ],
             &mut annos,
         );
         assert_eq!(matrix_bits(v)[0].1, vec![(1_000, 501.0f64.to_bits())]);
@@ -1141,11 +1163,7 @@ mod tests {
             // bit 0 AND bit 1 for the extremum templates, no flags column
             // at all for the counting ones.
             let flags = matches!(op, GroupedOp::Min | GroupedOp::Max).then_some(3);
-            fold(
-                &push,
-                vec![vec![run(0, 0, 0, 42.0, flags)]],
-                &mut ours,
-            );
+            fold(&push, vec![vec![run(0, 0, 0, 42.0, flags)]], &mut ours);
             assert_eq!(ours.base_messages(), reference.base_messages(), "{op:?}");
         }
     }
