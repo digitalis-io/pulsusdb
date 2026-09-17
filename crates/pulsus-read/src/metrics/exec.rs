@@ -417,6 +417,20 @@ pub struct MetricsEngine {
     /// one `Option` branch per selector fetch in `execute_fetch_plan` —
     /// zero atomics, zero clock.
     fetch_probe: Option<std::sync::Arc<FetchProbe>>,
+    /// TEST SEAM (issue #549) — how many fingerprints one grouped
+    /// statement carries. Always [`sample_sql::CHUNK_THRESHOLD`] in
+    /// production; `pulsus-server` never calls
+    /// [`MetricsEngine::with_grouped_chunk_size`].
+    ///
+    /// It exists because where the chunk boundary falls is **observable
+    /// in the charge**: the budget counts per-statement partial runs, so
+    /// one answer over 501 fingerprints charges differently as two
+    /// statements than as one. `CHUNK_THRESHOLD` is a compile-time
+    /// constant, so a test cannot reach the second reading without a
+    /// seam, and a boundary property nothing can exercise is a property
+    /// nobody has checked. Read at ONE site, `build_grouped_sqls`; the
+    /// sample fetch's own chunker is untouched by it.
+    grouped_chunk_size: usize,
 }
 
 impl MetricsEngine {
@@ -433,6 +447,7 @@ impl MetricsEngine {
                 crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
             )),
             fetch_probe: None,
+            grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
         }
     }
 
@@ -453,6 +468,14 @@ impl MetricsEngine {
     /// `fetch_probe: None`.
     pub fn with_fetch_probe(mut self, probe: std::sync::Arc<FetchProbe>) -> Self {
         self.fetch_probe = Some(probe);
+        self
+    }
+
+    /// TEST SEAM (issue #549) — see [`MetricsEngine::grouped_chunk_size`].
+    /// Never called by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_grouped_chunk_size(mut self, chunk: usize) -> Self {
+        self.grouped_chunk_size = chunk;
         self
     }
 
@@ -666,11 +689,12 @@ impl MetricsEngine {
                             &push,
                             lower_excl,
                             upper_incl,
+                            self.grouped_chunk_size,
                         );
                         if explain.is_some()
                             && let Some(first_chunk) = sample_sql::chunk_fingerprints(
                                 &push.fingerprints,
-                                sample_sql::CHUNK_THRESHOLD,
+                                self.grouped_chunk_size,
                             )
                             .first()
                         {
@@ -2194,12 +2218,11 @@ fn build_grouped_sqls(
     push: &super::grouped::GroupedPush,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
+    chunk_size: usize,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0usize;
-    for chunk in
-        sample_sql::chunk_fingerprints(&push.fingerprints, sample_sql::CHUNK_THRESHOLD)
-    {
+    for chunk in sample_sql::chunk_fingerprints(&push.fingerprints, chunk_size) {
         let gids = &push.gids[start..start + chunk.len()];
         out.push(super::grouped_sql::grouped_fetch(
             &config.samples_table,
