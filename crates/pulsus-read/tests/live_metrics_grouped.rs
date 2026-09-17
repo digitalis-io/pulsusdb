@@ -1054,9 +1054,26 @@ fn row_cases(t: i64) -> Vec<RowCase> {
         });
     }
 
-    // Expiry: 100 one-sample series in one group, staggered, each run
-    // ending with no arrival behind it. The highest ratio this suite
-    // reaches.
+    // Expiry: 100 one-sample series in ONE group, arrivals evenly spaced
+    // 15 s apart under a 300 s lookback.
+    //
+    // **The layout is stated because the ratio belongs to the layout, not
+    // to the series and group counts** (review round 1). Under `count`
+    // this corpus returns 39 rows: coverage intervals overlap twenty
+    // deep, so the count climbs 1..19, sits at 20, and falls 19..1.
+    // Issue #549's plan records 199 rows for "100 one-sample series in
+    // one group" — a valid figure for a DIFFERENT layout of the same
+    // counts, with ten arrivals in each 20-point block on alternating
+    // parity, which changes the count at nearly every grid point:
+    //
+    // ```text
+    //   layout                          count rows   pushed : raw
+    //   evenly spaced 15 s apart (here)         39      0.390
+    //   alternating-parity blocks              199      1.990
+    // ```
+    //
+    // Both satisfy `pushed_rows <= 2 * raw_rows`, which is what criterion
+    // 7 asserts and what neither layout can breach.
     {
         let start = t - 300_000;
         let metric = "rows_expiry";
