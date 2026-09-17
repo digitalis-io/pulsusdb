@@ -57,7 +57,7 @@ Site	Literal	crates/pulsus-read/src/logql/predicate.rs:1995	-	-	{}	reject	reject
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:213	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:269	-	-	<__error__> <__error___extracted>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:270	-	-	<__error___extracted> <__error__>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:226	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1021	-	-	<method> <_> <status> took <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1040	-	-	level=<level> msg	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:253	-	-	<_> <method> <path> <status>	accept	accept	-	-	-
