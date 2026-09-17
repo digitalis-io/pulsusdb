@@ -298,6 +298,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.promql_max_cache_scan == 500,
     },
     Row {
+        var: "PULSUS_PROMQL_GROUPED_PUSH",
+        value: "false",
+        check: |c| !c.reader.promql_grouped_push,
+    },
+    Row {
         var: "PULSUS_PROMQL_MAX_INFO_SERIES",
         value: "750",
         check: |c| c.reader.promql_max_info_series == 750,

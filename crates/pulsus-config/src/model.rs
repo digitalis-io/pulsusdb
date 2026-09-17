@@ -351,6 +351,30 @@ pub struct ReaderConfig {
     /// narrowing of the fetch (closing the gap this cap merely
     /// backstops) routes to issue #25.
     pub promql_max_info_series: u64,
+    /// Issue #549: compile `min`/`max`/`count`/`group` over a plain
+    /// instant selector into ONE ClickHouse statement per fingerprint
+    /// chunk, returning the answer already reduced to a step function,
+    /// instead of fetching every sample and reducing in this process.
+    ///
+    /// **Ships `true`** (owner ruling, 2026-09-17). The push changes what
+    /// `promql_max_samples` counts on the queries it takes: the unpushed
+    /// route charges one fetched sample row, the pushed route charges one
+    /// materialized RUN row. The ruling is that the run is the right
+    /// thing to count — the cap exists to bound what this process holds
+    /// in memory, and the number of rows ClickHouse read off storage to
+    /// produce them is what a database of this kind is built to do in
+    /// volume. The two numbers coincide on every unpushed query and stop
+    /// coinciding here.
+    ///
+    /// So the set of requests the cap admits moves in both directions,
+    /// and that is shipped behaviour rather than an open question: a
+    /// query whose sample rows exceed the cap but whose runs do not is
+    /// served where it was refused, and a short query whose runs exceed
+    /// its sample rows — a lookback expiry ends a run with no arrival
+    /// behind it — is refused where it was served.
+    ///
+    /// Set it `false` to take the pre-#549 route for every query.
+    pub promql_grouped_push: bool,
     pub logql_scan_budget_bytes: ByteSize,
     /// Issue M6-09 / #90 (LogQL pipelines): the **first-page fetch-size
     /// hint** for fetch-until-limit paging, applied when a query pipeline
@@ -508,6 +532,7 @@ impl Default for ReaderConfig {
             promql_max_metric_fanout: 1_000,
             promql_max_cache_scan: 200_000,
             promql_max_info_series: 100_000,
+            promql_grouped_push: true,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
             template_timezone: TemplateTimezone::UTC,

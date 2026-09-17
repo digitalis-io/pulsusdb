@@ -50,6 +50,14 @@
 //!   the chain link set, the [`Lang`](crate::compile::fold::Lang) impl and
 //!   the chain builder. Built only under `X-Pulsus-Explain: 1`, and it
 //!   changes no statement.
+//! - [`grouped`] *(issue #549)* — the grouped instant read's decision,
+//!   group assignment, threshold and fold: whether `min`/`max`/`count`/
+//!   `group` over a plain instant selector is answered by ONE statement
+//!   per fingerprint chunk instead of a sample fetch plus an in-process
+//!   reduction.
+//! - [`grouped_sql`] *(issue #549)* — that statement's pure builders,
+//!   the same `data -> String` contract [`sample_sql`] holds.
+//! - [`grouped_rows`] *(issue #549)* — its two `ChRow` result shapes.
 //! - [`sample_sql`] *(issue #31)* — pure `metric_samples` fetch SQL
 //!   builders (the §2.3 fetch shape), snapshot-testable without a
 //!   database.
@@ -75,6 +83,9 @@
 pub mod compile;
 mod dispatch;
 pub mod exec;
+pub mod grouped;
+pub mod grouped_rows;
+pub mod grouped_sql;
 pub mod labels;
 pub mod matcher;
 mod re2_authority;

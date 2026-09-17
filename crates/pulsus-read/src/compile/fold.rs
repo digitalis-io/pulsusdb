@@ -885,6 +885,23 @@ pub trait Lang {
     /// database AST elements, so the core can apply its two ceilings
     /// without rendering the statement. O(1), no round trip.
     fn handoff_cost(n: u64) -> super::plan::HandoffCost;
+
+    /// Sources this statement reads **besides** the one it is named for.
+    ///
+    /// A statement normally reads one table, and the plan names it. One
+    /// does not: PromQL's grouped instant read (issue #549) unions
+    /// `metric_samples` with `metric_hist_samples` inside a single
+    /// statement, so a plan naming only the first would describe a read
+    /// the database did not perform. That is an ADDITIVE fact about one
+    /// part, not a second part — the two tables are read by one
+    /// statement, in one round trip.
+    ///
+    /// Default empty, so a language that does not union sources cannot
+    /// acquire the key by accident and every existing plan renders
+    /// byte-unchanged (the wire field is omitted when empty).
+    fn also_reads(_rel: &Relation<Self>) -> Vec<SourceRef> {
+        Vec::new()
+    }
 }
 
 /// One link's lowering rules. The stage is passed in: a dispatcher that

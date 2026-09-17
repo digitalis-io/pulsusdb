@@ -250,6 +250,9 @@ fn engine_config(db: &str) -> MetricsConfig {
         max_info_series: 100_000,
         max_samples: 50_000_000,
         distributed: false,
+        // Issue #549: the shipped default — every suite here exercises
+        // the configuration production runs.
+        grouped_push: true,
     }
 }
 

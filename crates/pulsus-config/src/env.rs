@@ -342,6 +342,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_PROMQL_MAX_INFO_SERIES") {
         cfg.reader.promql_max_info_series = parse_int("PULSUS_PROMQL_MAX_INFO_SERIES", &v)?;
     }
+    if let Some(v) = read("PULSUS_PROMQL_GROUPED_PUSH") {
+        cfg.reader.promql_grouped_push = parse_bool("PULSUS_PROMQL_GROUPED_PUSH", &v)?;
+    }
     if let Some(v) = read("PULSUS_LOGQL_SCAN_BUDGET_BYTES") {
         cfg.reader.logql_scan_budget_bytes = parse_size("PULSUS_LOGQL_SCAN_BUDGET_BYTES", &v)?;
     }

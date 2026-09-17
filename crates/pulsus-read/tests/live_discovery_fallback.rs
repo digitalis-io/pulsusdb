@@ -166,6 +166,9 @@ fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
         max_info_series: u64::MAX,
         max_samples: 50_000_000,
         distributed: false,
+        // Issue #549: the shipped default — every suite here exercises
+        // the configuration production runs.
+        grouped_push: true,
     }
 }
 
