@@ -285,6 +285,35 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     // The corpus really is split: the local table on shard 1 holds fewer
     // rows than the distributed wrapper. Without this the differential
     // could pass on a cluster that had quietly put everything on one node.
+    //
+    // **And the forwarding must settle before anything is counted.** An
+    // insert into a Distributed table returns as soon as the rows are
+    // queued — `distributed_foreground_insert` is `0` by default, so the
+    // shards receive them asynchronously. Counting straight afterwards
+    // reads a partial corpus and the failure looks like a lost row rather
+    // than a race: measured here at 1,260 rows of 2,400, on a test that
+    // had passed twice before, which is how this suite was found to be
+    // missing the wait `live_metrics_cluster_fallback.rs` already has.
+    //
+    // The deadline is generous and only ever extends a broken run; a
+    // healthy run leaves the loop on its first poll. Bound the start,
+    // never bump the deadline.
+    let want = SERIES * (POINTS as u64 + 1);
+    let dist_sql = format!(
+        "SELECT toUInt64(count()) AS n FROM metric_samples_dist WHERE metric_name = '{METRIC}'"
+    );
+    let mut total = 0u64;
+    for _ in 0..240 {
+        total = count(&client, &dist_sql).await;
+        if total >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        total, want,
+        "every seeded row must reach the distributed table before the corpus is read"
+    );
     let local = count(
         &client,
         &format!(
@@ -292,18 +321,6 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         ),
     )
     .await;
-    let total = count(
-        &client,
-        &format!(
-            "SELECT toUInt64(count()) AS n FROM metric_samples_dist WHERE metric_name = '{METRIC}'"
-        ),
-    )
-    .await;
-    assert_eq!(
-        total,
-        SERIES * (POINTS as u64 + 1),
-        "every seeded row reached the distributed table"
-    );
     assert!(
         local > 0 && local < total,
         "the corpus must straddle both shards: shard 1 holds {local} of {total}"
