@@ -113,6 +113,8 @@ Every deliberate difference from the reference on this path is recorded in [benc
 
 A batch that exhausts its insert retry budget is spooled to `./spool/{poison,uncertain}/<table>/` (relative to the process's working directory — a documented constant, not yet a `PULSUS_*` variable). In the published container image (§10), the working directory is `/var/lib/pulsusdb`, owned by the non-root `pulsus` user, so this resolves to `/var/lib/pulsusdb/spool/`; mount a volume over that path if spooled batches need to survive a container restart.
 
+A trace request is also bounded **before** any of that, by a fixed ceiling on the bytes it may expand into: 256 MiB, on `POST /v1/traces` and on the Zipkin receiver alike. It is not a knob — there is no `PULSUS_*` variable for it — and it is **not** `PULSUS_INGEST_QUEUE_BYTES` above, which is the separate queue bound that still applies after admission. The estimate is taken from wire lengths before a single row is materialized, so an over-budget request is refused without ever paying for the expansion it describes. From issue #556 on, a span's attribute arrays are charged against it too: each attribute costs one array element plus a second copy of its rendered key and value. An operator's visible consequence is that a request whose expansion is dominated by attributes and which sat just inside the ceiling before is now refused, with the whole-request `400` each receiver already returns for it ([api.md §1.1](api.md) for the native route, §8.2 for the other — they do not share an error envelope).
+
 ## 6. Reader
 
 | Variable | Default | Description |

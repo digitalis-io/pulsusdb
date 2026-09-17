@@ -139,6 +139,22 @@ pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPR
 /// `trace_id`/`span_id`/`duration_ns` ≈ 51 bytes) plus the `scope` string
 /// and container overhead, floored to a round constant.
 const ATTR_ROW_OVERHEAD: usize = 64;
+/// Estimated heap cost of one span-row ARRAY element (issue #556) beyond a
+/// second copy of its rendered key/value text. Priced in the
+/// `TraceSpanRow` shape the writer queue holds, so the admission charge
+/// and the queue reservation count the same object — a charge priced in
+/// the narrower `SpanRecord` shape stops dominating the reservation it is
+/// meant to pre-filter.
+const ATTR_ARRAY_ELEMENT_OVERHEAD: usize = crate::writer::rows::ARRAY_ELEMENT_SLOT_BYTES
+    + crate::writer::rows::VAL_TYPE_SPELLING_BYTES
+    + SCOPE_SPELLING_BYTES;
+/// The longest scope spelling the writer emits (`instrumentation` and
+/// `event:intrinsic` are both 15 bytes); a fixed term, because the scope
+/// is not a field of the `KeyValue` this allocation-free charge can read.
+const SCOPE_SPELLING_BYTES: usize = 15;
+/// The five `Vec` headers one span's attribute arrays carry, charged once
+/// per span (issue #556).
+const ATTR_ARRAY_HEADER_OVERHEAD: usize = 5 * std::mem::size_of::<Vec<String>>();
 /// Estimated fixed heap cost of one [`SpanRecord`] beyond its name/service/
 /// payload bytes (ids + fixed-width columns + container overhead).
 const SPAN_ROW_OVERHEAD: usize = 128;
@@ -484,6 +500,13 @@ fn parse_span(
             return Ok(());
         }
     };
+    // Where this span's OWN attr rows begin (issue #556). Every
+    // `out.attrs.push` in this file is inside `parse_span`, between here
+    // and the `out.spans.push` below, and every rejection path returns
+    // BEFORE the first of them — so a rejected span contributes neither a
+    // row nor an element, and `out.attrs[attrs_start..]` is exactly this
+    // span's slice.
+    let attrs_start = out.attrs.len();
     for (scope, attrs) in [
         (SCOPE_RESOURCE, resource_attrs),
         (SCOPE_SPAN, span.attributes.as_slice()),
@@ -606,6 +629,18 @@ fn parse_span(
         }
     }
 
+    // The five arrays are this span's OWN attr rows, projected. Deriving
+    // them rather than rebuilding them is what makes the two stores agree
+    // element by element, and it is what keeps the numeric rule right: a
+    // link's `spanID` of `0000000000000001` parses as 1.0 and is stored
+    // NULL, because the record that built it stores NULL.
+    let span_attrs = &out.attrs[attrs_start..];
+    let attr_key: Vec<String> = span_attrs.iter().map(|a| a.key.clone()).collect();
+    let attr_scope: Vec<String> = span_attrs.iter().map(|a| a.scope.clone()).collect();
+    let attr_val: Vec<String> = span_attrs.iter().map(|a| a.val.clone()).collect();
+    let attr_type: Vec<AttrValueType> = span_attrs.iter().map(|a| a.val_type).collect();
+    let attr_num: Vec<Option<f64>> = span_attrs.iter().map(|a| a.val_num).collect();
+
     out.spans.push(SpanRecord {
         trace_id,
         span_id,
@@ -621,6 +656,11 @@ fn parse_span(
         scope_name,
         scope_version,
         payload: build_payload(span, ctx.resource, ctx.resource_spans, ctx.scope_spans),
+        attr_key,
+        attr_scope,
+        attr_val,
+        attr_type,
+        attr_num,
     });
     Ok(())
 }
@@ -783,7 +823,11 @@ fn span_expansion_charge(
     // promoted `scope_name`/`scope_version` (issue #192) are the same shape.
     let status_message_len = span.status.as_ref().map(|s| s.message.len()).unwrap_or(0);
     let scope_name_len = scope.map(|s| s.name.len() + s.version.len()).unwrap_or(0);
+    // The five `Vec` headers this span's attribute arrays carry, once per
+    // span (issue #556); the per-element terms are charged in lockstep
+    // with the emission loops below.
     let mut charge = SPAN_ROW_OVERHEAD
+        + ATTR_ARRAY_HEADER_OVERHEAD
         + span.name.len()
         + service_len
         + payload_base
@@ -793,12 +837,15 @@ fn span_expansion_charge(
     // Every resource ⊕ span ⊕ instrumentation-scope attribute becomes one
     // indexed row per span (issue #192 adds the scope arm) — charged BEFORE
     // materialization, in lockstep with the emission loop above.
+    // Each also becomes one ARRAY element on the span's own row (issue
+    // #556): the element's slot cost plus a SECOND copy of its rendered
+    // key/value text.
     for kv in resource_attrs
         .iter()
         .chain(&span.attributes)
         .chain(scope_attrs)
     {
-        charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
     }
     // Every span event (issue #192 PR-B) fans out into indexed rows: two
     // intrinsic rows (`event:intrinsic` name/timeSinceStart — the name's
@@ -808,9 +855,12 @@ fn span_expansion_charge(
     // loop above. `span.encoded_len()` already covers the events' wire
     // bytes (they nest inside the span); this is the extra index-row cost.
     for event in &span.events {
-        charge += ATTR_ROW_OVERHEAD + event.name.len() + ATTR_ROW_OVERHEAD;
+        // Both intrinsics also become array elements on the span's own row
+        // (issue #556), and the event name is then STORED TWICE — once in
+        // the index row's `val`, once in `attr_val[i]`.
+        charge += 2 * ATTR_ROW_OVERHEAD + 2 * ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * event.name.len();
         for kv in &event.attributes {
-            charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+            charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
         }
     }
     // Every span link (issue #192 PR-C) fans out identically: two intrinsic
@@ -819,10 +869,14 @@ fn span_expansion_charge(
     // charged BEFORE materialization, in lockstep with the link emission loop
     // above. `span.encoded_len()` already covers the links' wire bytes.
     for link in &span.links {
-        charge += ATTR_ROW_OVERHEAD + link.span_id.len() * 2;
-        charge += ATTR_ROW_OVERHEAD + link.trace_id.len() * 2;
+        // Each intrinsic also becomes an array element (issue #556). The
+        // hex rendering is twice the referenced id's byte length and it is
+        // now stored twice, hence `4 *` where the index row alone was
+        // `2 *`.
+        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 4 * link.span_id.len();
+        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 4 * link.trace_id.len();
         for kv in &link.attributes {
-            charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+            charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
         }
     }
     charge
@@ -2444,6 +2498,125 @@ mod tests {
                 ("link:intrinsic", "spanID", "string"),
                 ("link:intrinsic", "traceID", "string"),
             ]
+        );
+    }
+
+    // -- the admission charge counts the span-row arrays (issue #556) ----
+
+    /// The request the byte figures on issue #556 are taken on. Fully
+    /// determined by this text: no helper supplies an attribute.
+    fn metered_request(long_renderings: bool) -> ExportTraceServiceRequest {
+        let mut sp = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "op-a".to_string(),
+            kind: SpanKind::Server as i32,
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_001_000_000_000,
+            ..Default::default()
+        };
+        sp.attributes = vec![
+            kv("http.status_code", Value::IntValue(500)),
+            kv("http.method", Value::StringValue("GET".into())),
+        ];
+        if long_renderings {
+            sp.attributes.push(kv("d", Value::DoubleValue(f64::MIN)));
+            sp.attributes.push(kv("i", Value::IntValue(i64::MIN)));
+            sp.attributes.push(kv("b", Value::BoolValue(true)));
+        }
+        sp.events = vec![Event {
+            time_unix_nano: 1_700_000_000_003_000_000,
+            name: "exception".into(),
+            attributes: vec![kv("exception.type", Value::StringValue("IOError".into()))],
+            dropped_attributes_count: 0,
+        }];
+        sp.links = vec![Link {
+            trace_id: vec![9; 16],
+            span_id: vec![8; 8],
+            attributes: vec![kv("rel", Value::StringValue("child_of".into()))],
+            ..Default::default()
+        }];
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", Value::StringValue("checkout".into()))],
+                    dropped_attributes_count: 0,
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![sp],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn admission_charge(req: &ExportTraceServiceRequest) -> usize {
+        req.resource_spans
+            .iter()
+            .map(resource_spans_expansion_charge)
+            .sum()
+    }
+
+    fn queue_reservation(req: &ExportTraceServiceRequest) -> u64 {
+        let out = parse(req, 0).expect("within the expansion budget");
+        out.spans
+            .iter()
+            .map(crate::writer::rows::TraceSpanRow::est_source_bytes)
+            .sum::<u64>()
+            + out
+                .attrs
+                .iter()
+                .map(crate::writer::rows::TraceAttrRow::est_source_bytes)
+                .sum::<u64>()
+    }
+
+    /// One more attribute costs the admission charge at least one more
+    /// array element (issue #556). The charge is compared with ITSELF over
+    /// two requests, so the figure it must clear is not one this test
+    /// computes.
+    #[test]
+    fn one_more_attribute_charges_at_least_one_more_array_element() {
+        let mut three = metered_request(false);
+        let mut four = metered_request(false);
+        three.resource_spans[0].scope_spans[0].spans[0]
+            .attributes
+            .push(kv("a", Value::StringValue("x".into())));
+        four.resource_spans[0].scope_spans[0].spans[0]
+            .attributes
+            .push(kv("a", Value::StringValue("x".into())));
+        four.resource_spans[0].scope_spans[0].spans[0]
+            .attributes
+            .push(kv("b", Value::StringValue("y".into())));
+        let delta = admission_charge(&four) - admission_charge(&three);
+        assert!(
+            delta >= ATTR_ARRAY_ELEMENT_OVERHEAD,
+            "one more attribute must charge at least one array element \
+             ({ATTR_ARRAY_ELEMENT_OVERHEAD}); it charged {delta}"
+        );
+    }
+
+    /// On an ordinary span the coarse admission charge covers the exact
+    /// queue reservation — two numbers from two functions over two shapes,
+    /// so neither produces the other.
+    ///
+    /// Asserted on `metered_request(false)` only. It does NOT hold in
+    /// general: on values whose rendering is far longer than their wire
+    /// bytes it fails at the BASE, before these arrays exist, because
+    /// `attr_budget_charge` measures the protobuf length while the queue
+    /// reserves the RENDERED string. That gap predates issue #556 and is
+    /// not closed by it, so asserting the relation generally would pin a
+    /// defect that is not this change's.
+    #[test]
+    fn the_admission_charge_covers_the_queue_reservation_on_an_ordinary_span() {
+        let req = metered_request(false);
+        let charge = admission_charge(&req) as u64;
+        let reservation = queue_reservation(&req);
+        assert!(
+            charge >= reservation,
+            "the admission charge ({charge}) must cover the queue reservation ({reservation})"
         );
     }
 }

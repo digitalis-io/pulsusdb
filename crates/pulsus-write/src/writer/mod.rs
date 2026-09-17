@@ -83,7 +83,7 @@ mod error;
 mod metric;
 mod metrics;
 mod registration;
-mod rows;
+pub(crate) mod rows;
 mod spool;
 mod table;
 mod trace;

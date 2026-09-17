@@ -27,7 +27,7 @@ docs/query-lowering.md	ast.rs:977	crates/pulsus-logql/src/ast.rs	977		prose	Bina
 docs/query-lowering.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
 docs/query-lowering.md	ast.rs:992	crates/pulsus-logql/src/ast.rs	992		prose	Variants
 docs/query-lowering.md	ast.rs:994	crates/pulsus-traceql/src/ast.rs	994		prose	Aggregate
-docs/query-lowering.md	catalog.rs:1773	crates/pulsus-schema/src/catalog.rs	1773		line	!static_tmpl(16).contains("status_message"),
+docs/query-lowering.md	catalog.rs:2100	crates/pulsus-schema/src/catalog.rs	2100		line	!static_tmpl(16).contains("status_message"),
 docs/query-lowering.md	catalog.rs:382	crates/pulsus-schema/src/catalog.rs	382		line	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	compile/fold.rs:242	crates/pulsus-read/src/compile/fold.rs	242		prose	set_provenance
 docs/query-lowering.md	compile/fold.rs:623	crates/pulsus-read/src/compile/fold.rs	623		line	pub struct Relation<L: Lang + ?Sized> {
@@ -95,7 +95,7 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:712	crates/pulsus-write/src/protocols/otlp_traces.rs	712		prose	numeric_val_num
+docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:752	crates/pulsus-write/src/protocols/otlp_traces.rs	752		prose	numeric_val_num
 docs/query-lowering.md	exec.rs:2830-2836	crates/pulsus-read/src/traces/exec.rs	2830	2836	prose	read_overflow_mode
 docs/query-lowering.md	exec.rs:2869	crates/pulsus-read/src/traces/exec.rs	2869		prose	generator_settings
 docs/query-lowering.md	exec.rs:701	crates/pulsus-read/src/traces/exec.rs	701		prose	map_trace_generator_error
