@@ -41,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
@@ -295,24 +295,49 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     // had passed twice before, which is how this suite was found to be
     // missing the wait `live_metrics_cluster_fallback.rs` already has.
     //
-    // The deadline is generous and only ever extends a broken run; a
-    // healthy run leaves the loop on its first poll. Bound the start,
-    // never bump the deadline.
+    // **One deadline, taken before the loop, capping every poll and every
+    // sleep by what is left of it** (review round 2). A poll count alone
+    // did not bound the wait: each of the 240 requests carried the
+    // client's own timeout, so a cluster that accepted connections and
+    // never answered could hold this test for hours and still call it a
+    // failed run.
+    //
+    // **A healthy run can need more than one poll**: a passing run was
+    // measured taking two. The poll count is not a fault signal — only
+    // the row count at the end is — so it is printed rather than
+    // asserted, and a second poll is nothing to chase.
+    const FORWARDING_DEADLINE: Duration = Duration::from_secs(60);
     let want = SERIES * (POINTS as u64 + 1);
     let dist_sql = format!(
         "SELECT toUInt64(count()) AS n FROM metric_samples_dist WHERE metric_name = '{METRIC}'"
     );
+    let deadline = Instant::now() + FORWARDING_DEADLINE;
     let mut total = 0u64;
-    for _ in 0..240 {
-        total = count(&client, &dist_sql).await;
+    let mut polls = 0u32;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        polls += 1;
+        match tokio::time::timeout(left, count(&client, &dist_sql)).await {
+            Ok(n) => total = n,
+            // The deadline expired inside the request. Leave the loop
+            // with whatever the last completed poll returned; the
+            // assertion below is what reports it.
+            Err(_) => break,
+        }
         if total >= want {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let left = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(left.min(Duration::from_millis(250))).await;
     }
+    eprintln!("[549] forwarding settled after {polls} poll(s): {total} of {want} rows");
     assert_eq!(
         total, want,
-        "every seeded row must reach the distributed table before the corpus is read"
+        "every seeded row must reach the distributed table before the corpus is read \
+         ({polls} polls within {FORWARDING_DEADLINE:?})"
     );
     let local = count(
         &client,

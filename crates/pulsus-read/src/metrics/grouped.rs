@@ -52,11 +52,18 @@
 //! ```
 //!
 //! The transition count is not knowable before the statement runs, so the
-//! threshold uses what the resolver's answer alone supplies. What it
-//! rules out is the case with no reduction to do — as many groups as
-//! series, where the push cannot return fewer rows than the raw read and
-//! would pay the extra database time for nothing. It claims nothing about
-//! the queries it admits.
+//! threshold uses what the resolver's answer alone supplies: it declines
+//! where the query has as many groups as series, the shape with no
+//! grouping work to do.
+//!
+//! **That is a proxy for the shape, and not a bound on rows on either
+//! side of it.** Measured on a corpus the rule declines — three constant
+//! series, one group each, 241 samples apiece — the push returns **3 rows
+//! against the raw read's 723**, under every one of the four operations
+//! (`crates/pulsus-read/tests/live_metrics_grouped.rs`, the corpus named
+//! "one group per series, constant values (declined)"). So the threshold
+//! turns away queries the push would have helped, and it claims nothing
+//! about the ones it admits either.
 //!
 //! Rows ARE bounded either way: every run boundary is a sample's coverage
 //! opening or closing, so a sample can begin at most two runs and
@@ -132,8 +139,10 @@ pub enum DeclineReason {
     /// The resolver answered `SqlFallback` — a degraded or cold cache, so
     /// there is no fingerprint list to assign group ids over.
     ResolutionNotFingerprints,
-    /// `series < 2 * groups`: the push would return at least half as many
-    /// rows as the raw read and pay the extra database time for it.
+    /// `series < 2 * groups` — as many groups as series, the shape with
+    /// no grouping work to do. A proxy for that shape and not a row
+    /// bound: see this module's header for a declined corpus that would
+    /// have returned 3 rows against 723.
     TooFewSeriesPerGroup,
 }
 

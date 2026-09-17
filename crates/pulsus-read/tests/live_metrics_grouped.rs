@@ -1129,6 +1129,43 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             upper_incl_ms: start + 240 * 15_000,
         });
     }
+
+    // One group per series — the shape `series >= 2 * groups` DECLINES.
+    // It is measured here because the threshold's documentation used to
+    // say the push could not return fewer rows than the raw read on this
+    // shape, and it can: three constant series, each its own group, each
+    // collapsing to a single run.
+    {
+        let start = t - 3_600_000;
+        let metric = "rows_one_group_per_series";
+        let series = (0..3u64)
+            .map(|i| Series {
+                fp: i + 1,
+                metric: metric.to_string(),
+                labels: lbl(&[("status", &format!("s{i}"))]),
+                // A constant value, so the group's answer never changes
+                // and the whole series is one run however many samples
+                // feed it.
+                samples: (0..=240i64)
+                    .map(|k| (start + k * 15_000, ((i + 1) as f64).to_bits()))
+                    .collect(),
+                hist_samples: Vec::new(),
+            })
+            .collect();
+        cases.push(RowCase {
+            name: "one group per series, constant values (declined)",
+            metric,
+            series,
+            grid: Grid {
+                start_ms: start,
+                step_ms: 15_000,
+                points: 241,
+                lookback_ms: 300_000,
+            },
+            lower_excl_ms: start - 300_000,
+            upper_incl_ms: start + 240 * 15_000,
+        });
+    }
     cases
 }
 

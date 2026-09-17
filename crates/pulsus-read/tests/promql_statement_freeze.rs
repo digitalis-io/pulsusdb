@@ -427,15 +427,25 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
         );
     }
 
-    // **And the three claims the route retired must not come back**
-    // (review round 1, finding 4). Each shipped for a while beside a
-    // route that contradicted it, and each is a plain string, so absence
-    // is checkable where the claim itself is not:
+    // **And every claim the route retired must not come back** (review
+    // round 1 finding 4; round 2 findings 1 and 2). Each shipped for a
+    // while beside a route that contradicted it, and each is a plain
+    // string, so absence is checkable where the claim itself is not:
     //
-    //   "never in ClickHouse SQL"               four aggregations now are
+    //   "never in ClickHouse SQL"                four aggregations now are
     //   "answered entirely from the label cache" withdrawn by issue #33
     //   "The factor is series divided by groups" the run count is a
     //                                            transition count
+    //   "generated-SQL example in this document  no suite executes one;
+    //    is executable"                          several carry placeholders
+    //   "at least half as many rows as the raw   a declined corpus returns
+    //    read"                                   3 rows against 723
+    //   "cannot return fewer rows than the raw   the same claim, in the
+    //    read"                                   wording the code carried
+    //
+    // The last two are the same claim in two wordings, and it has already
+    // survived one correction — it was fixed in two places while it stood
+    // in four. A string gate is what stops the third recurrence.
     //
     // The issue #33 erratum in architecture.md is not caught by the
     // second: it says "originally answered from the label cache", in the
@@ -450,6 +460,9 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
             "never in ClickHouse SQL",
             "answered entirely from the label cache",
             "The factor is series divided by groups",
+            "generated-SQL example in this document is executable",
+            "at least half as many rows as the raw read",
+            "cannot return fewer rows than the raw read",
         ] {
             assert!(
                 !text.contains(retired),
