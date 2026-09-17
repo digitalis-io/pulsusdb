@@ -501,6 +501,38 @@ impl Harness {
         stream.next().await.expect("a row").expect("decode").n
     }
 
+    /// Does `sql` drain fully under a `max_memory_usage` of `ceiling`?
+    ///
+    /// The settings are the engine's own
+    /// (`metrics::exec::metrics_read_settings`), reproduced here because
+    /// that function is private: the ceiling, no external group-by
+    /// spilling, and the pinned block size. A spill would let the heavy
+    /// statement finish under a ceiling it should breach, which is why
+    /// `max_bytes_before_external_group_by = 0` is not optional.
+    ///
+    /// `true` means every row arrived; `false` means the server refused,
+    /// either at dispatch or mid-stream.
+    async fn drains_under_ceiling(&self, sql: &str, ceiling: u64) -> bool {
+        let settings = QuerySettings::new()
+            .set("max_memory_usage", ceiling)
+            .set("max_bytes_before_external_group_by", 0u64)
+            .set("max_block_size", 65_409u64);
+        let mut stream = match self
+            .admin
+            .query_stream::<pulsus_read::metrics::grouped_rows::GroupedRunRow>(sql, &settings)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        while let Some(row) = stream.next().await {
+            if row.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Runs `sql` once under `query_id`, draining it, and discards the
     /// rows — the point is what the server sent, not what it said.
     async fn run_tagged<R: ChRow>(&self, sql: &str, query_id: &str) {
@@ -1472,8 +1504,8 @@ async fn the_charge_depends_on_where_the_chunk_boundary_falls() {
     h.finish().await;
 }
 
-/// Criterion 10, the precedence pair that CAN be built here: **the budget
-/// answers before a later statement's failure.**
+/// Criterion 10, across TWO statements: **a completed earlier statement's
+/// charge answers before a later statement's failure.**
 ///
 /// The query sends two statements. The second is made to fail by a memory
 /// ceiling it alone breaches; the first drains and charges.
@@ -1483,9 +1515,52 @@ async fn the_charge_depends_on_where_the_chunk_boundary_falls() {
 ///   max_samples = that charge - 1                     -> the BUDGET error
 /// ```
 ///
-/// The second reading is the one that depends on charging PER ROW: a
-/// post-drain total would let the first statement finish, and the memory
-/// error would surface in both runs.
+/// # What this does NOT prove, and where that is proved instead
+///
+/// It does not require the charge to be taken PER ROW AS ROWS ARRIVE.
+/// Measured in review round 1: moving `charge_one` out of the drain loop
+/// and charging the drained length after each statement finishes leaves
+/// this test green, because a statement that COMPLETED is charged the
+/// same either way. Two statements cannot separate them.
+///
+/// The per-row property is separated by exactly one input — a single
+/// statement's stream that yields rows and then fails — and is asserted
+/// by `metrics::dispatch::tests`:
+///
+/// ```text
+///   the_budget_refuses_mid_statement_before_a_later_row_fails
+///   a_cap_equal_to_the_rows_admits_them_and_the_streams_error_surfaces
+///   a_failed_row_is_not_charged
+/// ```
+///
+/// Both belong: those three pin the ordering inside one drain loop; this
+/// one pins that the budget is ONE object spanning the statement set,
+/// against a real server, which a stand-in stream cannot show.
+///
+/// # The grid-cap pair is a DECISION not to test, with its reason
+///
+/// Criterion 10's other pair asks what answers first when a request
+/// breaches both the range-grid point cap and the sample budget. There is
+/// no test for it here, and that is a decision rather than an
+/// impossibility:
+///
+/// * The point cap is enforced in the HTTP layer, before a
+///   `MetricsEngine` is constructed, so on a real request nothing has
+///   been charged when it fires. `pulsus-server`'s
+///   `query_range_rejects_one_interval_past_the_cap_before_any_pool_check`
+///   asserts the `400 bad_data` arrives before even a pool check — which
+///   is the production ordering, asserted closer to the client than a
+///   read-path test could.
+/// * A test CAN be built that makes the budget's answer observable
+///   underneath: a live engine with a tiny budget, driven past the cap
+///   with the range validation removed. What it would assert is the
+///   behaviour of a server that does not exist — with the validation in
+///   place the budget is never reached — so it would pin an ordering no
+///   request can observe, and it would go green if the cap moved behind
+///   the engine, which is the change it ought to catch.
+///
+/// So: not built, because the pair it would assert cannot arise, and the
+/// production ordering is already asserted one layer up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_budget_answers_before_a_later_statements_failure() {
     skip_unless_live!();
@@ -1557,23 +1632,58 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     );
 
     // A ceiling the light statement clears and the heavy one does not.
-    // Measured on this corpus at this head, each statement run alone and
-    // fully drained under the engine's own settings:
+    // **The sweep RUNS** (review round 1): it was a comment, and a table
+    // nobody executes is a claim about a tree nobody checked. Each of the
+    // two statements is executed alone and fully drained under the
+    // engine's own settings at each ceiling, and the window the test
+    // depends on is asserted rather than described.
     //
     // ```text
     //   ceiling    chunk 1 (4,000 rows in)   chunk 2 (96,400 rows in)
     //    4 MiB     refused                   refused
-    //    6 MiB     10 runs                   refused
-    //    8 MiB     10 runs                   refused
-    //   10 MiB     10 runs                   241 runs
-    //   64 MiB     10 runs                   241 runs
+    //    6 MiB     ran                       refused      <- the test runs here
+    //   64 MiB     ran                       ran
     // ```
     //
-    // 6 MiB sits inside the one window where the two differ. The test
-    // does not take that on trust: the two assertions below fail if the
-    // heavy statement stops being refused OR if the light one starts
-    // being refused.
+    // The 8 and 10 MiB rows are dropped rather than kept as prose: they
+    // are inside the same window and add a minute of live time to say
+    // what 6 and 64 already say. What matters is that a window EXISTS and
+    // that 6 MiB is inside it — the two rows above and below it are what
+    // establish that, and they are the two that run.
     const CEILING: u64 = 6 * 1024 * 1024;
+    let heavy_chunk: Vec<u64> = (401..=800u64).collect();
+    let heavy_sql = grouped_sql::grouped_fetch(
+        "metric_samples",
+        "metric_hist_samples",
+        "charge_prec",
+        &heavy_chunk,
+        &vec![0u32; 400],
+        Grid {
+            start_ms: params.start_ms,
+            step_ms: params.step_ms,
+            points: 241,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+        },
+        params.start_ms - DEFAULT_LOOKBACK_MS,
+        params.end_ms,
+        GroupedOp::Max,
+    );
+    for (ceiling, light_ok, heavy_ok) in [
+        (4 * 1024 * 1024u64, false, false),
+        (CEILING, true, false),
+        (64 * 1024 * 1024u64, true, true),
+    ] {
+        for (which, stmt, want_ok) in [("light", &sql, light_ok), ("heavy", &heavy_sql, heavy_ok)] {
+            let got = h.drains_under_ceiling(stmt, ceiling).await;
+            assert_eq!(
+                got,
+                want_ok,
+                "at a {} MiB ceiling the {which} statement must {}",
+                ceiling / (1024 * 1024),
+                if want_ok { "drain" } else { "be refused" }
+            );
+        }
+    }
     let run = |cap: u64| {
         let db = db.clone();
         let expr = expr.clone();
