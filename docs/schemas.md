@@ -574,6 +574,15 @@ CREATE TABLE trace_spans (
     PROJECTION service_time (
         SELECT * ORDER BY (service, timestamp_ns)
     )
+    -- Narrowed by migrations 44/45/46 (issue #555), not part of the frozen
+    -- CREATE: the projection above is dropped and re-added over the 14
+    -- non-payload columns. The final list cannot be printed inside this
+    -- block -- four of its columns (shared, status_message, scope_name,
+    -- scope_version) arrive by later ALTERs and are not declared here, so
+    -- the block would stop parsing. It is printed under the table instead.
+    -- Added by migrations 47/48 (issue #555), not part of the frozen
+    -- CREATE: PROJECTION name_time, the same 14 columns ORDER BY
+    -- (name, timestamp_ns). Also printed under the table.
     -- Added by migrations 42/43 (issue #478), not part of the frozen
     -- CREATE: PROJECTION span_name_day (
     --     SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count()
@@ -586,7 +595,34 @@ TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 ```
 
-- **One table, three physical orders** (finding #5, extended by issue #478). The base order makes trace-by-ID a point read; the `service_time` projection is a full physically re-sorted copy that ClickHouse's optimizer selects automatically for service + time predicates; and the `span_name_day` **aggregate** projection (migrations 42/43, `SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() GROUP BY d, name`) holds one row per `(UTC day, span name)` so the §4.3 Span Name dropdown reads the distinct names instead of the spans. Neither the base order nor `service_time` leads with `name`, so without it that read scans every granule in the window. It is selected by the DAY expression the table is partitioned by — the same predicate `tags_sql::span_name_values_sql` emits — and a `timestamp_ns` predicate defeats it, which is why that builder carries no sub-day bound. Being an aggregate projection it is tiny (one row per distinct day-and-name pair); the two projections' write amplification is an explicit trade for the read shapes. The `idx_duration` minmax works *within* the projection because slow spans cluster weakly by time — it prunes granules for `duration > X` searches; it is deliberately **not** relied on in the base order (finding: minmax on unclustered data is useless — here the projection provides the clustering context).
+**The two re-sorted projections as they finally stand** (issue #555, migrations 44-48 —
+`crates/pulsus-schema/src/catalog.rs`, ids 44 to 48). These are `ALTER`s and not part of the
+frozen `CREATE` above, which is why they are printed here: their column list includes `shared`,
+`status_message`, `scope_name` and `scope_version`, which migrations 31, 35 and 37 add, so the
+list cannot appear inside a `CREATE` that does not declare them — ClickHouse answers
+`Code: 47 UNKNOWN_IDENTIFIER`.
+
+```sql
+ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time;
+
+ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (
+    SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,
+           scope_version, service, shared, span_id, status_code,
+           status_message, timestamp_ns, trace_id
+    ORDER BY (service, timestamp_ns)
+);
+ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time;
+
+ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time (
+    SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,
+           scope_version, service, shared, span_id, status_code,
+           status_message, timestamp_ns, trace_id
+    ORDER BY (name, timestamp_ns)
+);
+ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time;
+```
+
+- **One table, four physical orders** (finding #5, extended by issues #478 and #555). The base order makes trace-by-ID a point read; the `service_time` projection is a physically re-sorted copy of the 14 non-payload columns that ClickHouse's optimizer selects automatically for service + time predicates; the `name_time` projection (migrations 47/48) is the same 14 columns sorted `(name, timestamp_ns)`, which is what gives a span-name search a sorted path — neither the base order nor `service_time` leads with `name`; and the `span_name_day` **aggregate** projection (migrations 42/43, `SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() GROUP BY d, name`) holds one row per `(UTC day, span name)` so the §4.3 Span Name dropdown reads the distinct names instead of the spans. `name_time` does not replace it: that one is sorted by `name` but still holds a row per span, where the aggregate holds one per `(UTC day, span name)`. It is selected by the DAY expression the table is partitioned by — the same predicate `tags_sql::span_name_values_sql` emits — and a `timestamp_ns` predicate defeats it, which is why that builder carries no sub-day bound. Being an aggregate projection it is tiny (one row per distinct day-and-name pair); the three projections' write amplification is an explicit trade for the read shapes. **Neither re-sorted copy stores the `payload`** (migrations 44-48, issue #555): the only statement that selects it is the §4.2 trace-by-ID point read, which filters on `trace_id` — the base table's first sort key — so the optimizer never reaches a projection for it. What dropping that second copy costs and saves, on a named corpus with the settings it was taken at, is docs/traceql-schema-migration.md §4-§5; no figure is repeated here, because a number away from its instrument cannot be checked. The `idx_duration` minmax works *within* the projection because slow spans cluster weakly by time — it prunes granules for `duration > X` searches; it is deliberately **not** relied on in the base order (finding: minmax on unclustered data is useless — here the projection provides the clustering context).
 
 ```sql
 CREATE TABLE trace_attrs_idx (

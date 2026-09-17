@@ -193,6 +193,38 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
     out
 }
 
+/// Appends `SETTINGS optimize_use_projections = 0` to an already-complete
+/// statement.
+///
+/// The compare base scan carries no `service` predicate, so with two
+/// narrow projections over the same columns (issue #555's `service_time`
+/// and `name_time`) the optimiser may serve it from `name_time`, and the
+/// plan block is then named after the projection, not the table. These
+/// assertions are about the BASE table's pruning staying window-dependent
+/// across the roots LEFT JOIN, so the base table is what they explain. Do
+/// not delete this as noise.
+///
+/// Applied at all three `table_primary_key_granules(…, "trace_spans")`
+/// call sites. Only two of the three are load-bearing today: measured one
+/// removal at a time against a seeded corpus, taking the wrapper off
+/// `base_narrow` or off `base_windowed` reddens this suite, and taking it
+/// off `base_full` leaves it green — the full-window statement reads the
+/// base table under default settings anyway, so with only that one bare
+/// BOTH readings of the `full`/`narrow` pair still come from the base
+/// table.
+///
+/// `base_full` is wrapped all the same, and the reason is not about
+/// today's plans. Which physical copy the optimiser picks for a
+/// predicate-free full-window scan is a property of the corpus and of the
+/// cost model, neither of which this suite controls. With the setting on
+/// every site, the three readings are pinned to the base table by the
+/// statement rather than by a coincidence, and a future corpus or
+/// optimiser cannot silently turn one of them into a projection reading
+/// while the assertions still pass.
+fn with_projections_off(sql: &str) -> String {
+    format!("{sql}\nSETTINGS optimize_use_projections = 0")
+}
+
 /// The `PrimaryKey` `Granules: k/N` ratio of the `ReadFromMergeTree`
 /// block reading `table` — the metrics EXPLAIN carries two read blocks
 /// (the outer `trace_spans` scan and the semi-join's `trace_attrs_idx`
@@ -761,10 +793,14 @@ async fn metrics_explain_and_budget_gates() {
         .expect("narrow compare range SQL");
     let base_full = extract_compare_base_scan(cross);
     let base_narrow = extract_compare_base_scan(narrow_cross);
-    let (full_sel, full_total) =
-        table_primary_key_granules(&explain_raw(&client, &base_full).await, "trace_spans");
-    let (narrow_sel, narrow_total) =
-        table_primary_key_granules(&explain_raw(&client, &base_narrow).await, "trace_spans");
+    let (full_sel, full_total) = table_primary_key_granules(
+        &explain_raw(&client, &with_projections_off(&base_full)).await,
+        "trace_spans",
+    );
+    let (narrow_sel, narrow_total) = table_primary_key_granules(
+        &explain_raw(&client, &with_projections_off(&base_narrow)).await,
+        "trace_spans",
+    );
     assert!(
         full_sel > 0 && full_sel <= full_total,
         "the compare base trace_spans scan must engage the primary key \
@@ -839,8 +875,10 @@ async fn metrics_explain_and_budget_gates() {
              population, never filter it:\n{line}"
         );
     }
-    let (windowed_sel, windowed_total) =
-        table_primary_key_granules(&explain_raw(&client, &base_windowed).await, "trace_spans");
+    let (windowed_sel, windowed_total) = table_primary_key_granules(
+        &explain_raw(&client, &with_projections_off(&base_windowed)).await,
+        "trace_spans",
+    );
     assert_eq!(
         (windowed_sel, windowed_total),
         (narrow_sel, narrow_total),

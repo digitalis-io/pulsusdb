@@ -2471,8 +2471,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1657` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1708` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1773` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1824` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -3340,6 +3340,14 @@ SELECT toFixedString(concat('T',leftPad(toString(n),15,'0')),16) FROM numbers(32
 
 #### The corpus, as the text that builds it
 
+**This recipe and every counter below it record the span table as it was before issue #555 (2026-09-17),
+which narrowed `service_time` to the 14 non-payload columns and added `name_time` sorted
+`(name, timestamp_ns)`.** The `CREATE TABLE` below is left as it was taken, because the counters in
+this section were measured on the table it builds: editing the DDL alone would leave a recipe that
+builds a fourteen-column projection beside counters taken on a fifteen-column one. Anyone re-taking
+these counters gets a different physical layout and should say so; re-measuring them is a
+measurement on a corpus this section does not own.
+
 Run this through `clickhouse-client --multiquery --queries-file`. It is not runnable over HTTP: a
 multi-statement body answers `SYNTAX_ERROR`.
 
@@ -3451,8 +3459,10 @@ statement projects that column (`hydration_sql`,
 `crates/pulsus-read/src/traces/search_sql.rs:230`, and any `== phase2 hydration ==` section in the
 committed goldens), so a reduced span shape fails with `UNKNOWN_IDENTIFIER` before the query starts
 rather than returning a wrong number. That is the good failure, but only if the recipe carries the
-column — which is why it carries the full shipped span shape: migration 16 plus `shared`,
-`status_message`, `scope_name`/`scope_version` and the `span_name_day` projection.
+column — which is why it carries the shipped span shape **as it was when these counters were
+taken**: migration 16 plus `shared`, `status_message`, `scope_name`/`scope_version` and the
+`span_name_day` projection. Issue #555 has since narrowed `service_time` and added `name_time`; see
+the dated note above the recipe.
 
 **What that recipe produced here.** The physical layout:
 
@@ -5452,12 +5462,12 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | citation occurrences in the five artefacts | 688 |
 | of those, citing a bare basename | 536 |
 | of those, written as a continuation of a citation earlier on the line | 43 |
-| `(document, token)` pairs the rule resolves | 386 |
+| `(document, token)` pairs the rule resolves | 385 |
 | occurrences those resolved pairs cover | 577 |
 | `(document, token)` pairs it cannot resolve | 78 |
 | occurrences those frozen pairs cover | 111 |
 | resolved rows anchored on a token the citing prose prints | 195 |
-| resolved rows anchored on a snapshot of the cited line | 191 |
+| resolved rows anchored on a snapshot of the cited line | 190 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5477,7 +5487,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 386 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 191 on a snapshot of the cited line.
+Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 385 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

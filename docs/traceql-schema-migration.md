@@ -410,7 +410,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:720` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:756` already names the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the
@@ -2306,7 +2306,7 @@ What remains unmeasured:
 | the byte cost of the `event_set_sql` read after it moves to an `ARRAY JOIN` over `trace_spans` | it is the one phase-2 read that stays a separate statement. §4 Q1 |
 | the scalar value read (`arrayFirstIndex` + element extraction) against today's `attr_values_sql` | the shape is bounded by construction; the byte cost is not measured |
 | whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`crates/pulsus-schema/src/catalog.rs:492-498`, `crates/pulsus-write/src/writer/rows.rs:437, 443`); the low-cardinality and nullable element types have no precedent in this repository |
-| the cost of the drop/add/materialise interval on `service_time` (§8 ids 55–57) on a populated table | during it, a `resource.service.name` search falls back to a base-table scan. Empty on a fresh database |
+| the cost of the drop/add/materialise interval on `service_time` (§8 ids 44–46) on a populated table | during it, a `resource.service.name` search falls back to a base-table scan. Empty on a fresh database |
 | the clustered path beyond column presence | §8's twins were measured on a single-node `Distributed('default', …)`: the column appears and the insert lands. Multi-shard routing, `cityHash64(trace_id)` co-sharding of the four new wrappers, and a clustered read were not measured |
 | storage at Appendix A's `Z_p` = 4 | §5's measured storage row was taken at `Z_p` = 15.91 and carries its payload component so the figure can be re-derived at another `Z_p`; it was not re-run at 4 |
 | concurrency, and ClickHouse's mark, uncompressed and query-condition caches | every figure here is one request on an idle server; a repeated query is cheaper than this says |
@@ -2353,7 +2353,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:897`
+> — `docs/schemas.md:933`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -2369,37 +2369,45 @@ and populated with 50,000 rows. Every statement returned HTTP 200 with an empty 
 and the row count was 50,000 before and after:
 
 ```
-  id  scope              statement
-  --  -----------------  --------------------------------------------------------------
-  44  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
-  45  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
-  46  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
-  47  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
-  48  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_val    Array(String)
-  49  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_val    Array(String)
-  50  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
-  51  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
-  52  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
-  53  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
-  54  PerShard           ALTER TABLE trace_spans ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK …
-                         (no _dist twin — see below)
-  55  PerShard           ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time
-  56  PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (<14 named columns> ORDER BY (service, timestamp_ns))
-  57  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time
-  58  PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time    (<the same 14>  ORDER BY (name, timestamp_ns))
-  59  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time
-  60  Global             DROP TABLE IF EXISTS trace_tag_catalog        <- see the note below
-  61  Global             CREATE TABLE trace_tag_catalog (<the new shape>)
-  62  PerShard, CLUSTER  DROP TABLE IF EXISTS trace_attrs_idx_dist
-  63  PerShard           DROP TABLE IF EXISTS trace_attrs_idx
-  64  PerShard           CREATE TABLE trace_attr_traces   (AggregatingMergeTree)
-  65  PerShard, Dist     CREATE TABLE trace_attr_traces_dist   AS trace_attr_traces
-                         ENGINE = Distributed('{cluster}', {db}, trace_attr_traces, cityHash64(trace_id))
-  66  PerShard           CREATE TABLE trace_error_spans   (ReplacingMergeTree)
-  67  PerShard, Dist     CREATE TABLE trace_error_spans_dist   … cityHash64(trace_id)
-  68  PerShard           CREATE TABLE trace_recent        (AggregatingMergeTree)
-  69  PerShard, Dist     CREATE TABLE trace_recent_dist        … cityHash64(trace_id)
+  id    scope              statement
+  ----  -----------------  --------------------------------------------------------------
+  next  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
+  next  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
+  next  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
+  next  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
+  next  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_val    Array(String)
+  next  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_val    Array(String)
+  next  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
+  next  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
+  next  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
+  next  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
+  next  PerShard           ALTER TABLE trace_spans ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK …
+                           (no _dist twin — see below)
+  44    PerShard           ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time
+  45    PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (<14 named columns> ORDER BY (service, timestamp_ns))
+  46    PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time
+  47    PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time    (<the same 14>  ORDER BY (name, timestamp_ns))
+  48    PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time
+  next  Global             DROP TABLE IF EXISTS trace_tag_catalog        <- see the note below
+  next  Global             CREATE TABLE trace_tag_catalog (<the new shape>)
+  next  PerShard, CLUSTER  DROP TABLE IF EXISTS trace_attrs_idx_dist
+  next  PerShard           DROP TABLE IF EXISTS trace_attrs_idx
+  next  PerShard           CREATE TABLE trace_attr_traces   (AggregatingMergeTree)
+  next  PerShard, Dist     CREATE TABLE trace_attr_traces_dist   AS trace_attr_traces
+                           ENGINE = Distributed('{cluster}', {db}, trace_attr_traces, cityHash64(trace_id))
+  next  PerShard           CREATE TABLE trace_error_spans   (ReplacingMergeTree)
+  next  PerShard, Dist     CREATE TABLE trace_error_spans_dist   … cityHash64(trace_id)
+  next  PerShard           CREATE TABLE trace_recent        (AggregatingMergeTree)
+  next  PerShard, Dist     CREATE TABLE trace_recent_dist        … cityHash64(trace_id)
 ```
+
+**The five projection statements have shipped, as ids 44–48** (issue #555, the first part of this
+record to land). Every other row reads `next`: it takes the next free id when its own part lands,
+and which id that is cannot be decided here. An earlier version of this table numbered all
+twenty-six in one run, 44–69, which reads as a commitment the build order has already broken once —
+the projections shipped before the arrays. Renumbering the remaining twenty-one to 49–69 would be a
+second guess at the same thing, so they say `next` instead. The ids are identity, not sequence;
+nothing reads 44 as `attr_key`.
 
 `PerShard, CLUSTER` is `Ddl::StaticClusterOnly`: skipped and unrecorded on a single node,
 applied the first time clustering is enabled. `PerShard, Dist` is `Ddl::Dist`, rendered
@@ -2407,7 +2415,7 @@ by `render::dist_ddl_template` from `Family::Traces`'s single sharding expressio
 four trace wrappers co-shard on `cityHash64(trace_id)` and every read joins shard-locally
 (§7). `Global` is the catalogue's one cluster-wide replica set, no wrapper.
 
-**Why ids 60/61 drop and recreate rather than alter.** The catalogue's new shape changes
+**Why the tag catalogue is dropped and recreated rather than altered.** The catalogue's new shape changes
 both `PARTITION BY` and the leading columns of `ORDER BY`. Neither is reachable by an
 `ALTER`, and that is established by enumerating every place a capability can live rather
 than by trying one statement. Measured on 26.3.29.7:
@@ -2500,8 +2508,8 @@ constraint fires on a wrapper insert anyway — a misaligned row sent to
 Projections likewise exist only on the base table.
 
 `ADD PROJECTION` followed by `MATERIALIZE PROJECTION` is the pattern migrations 42/43
-already use — **but 42/43 add a projection that did not exist, where 55–57 first drop one
-that is serving reads.** Between 55 and 57 a `resource.service.name` search falls back to
+already use — **but 42/43 add a projection that did not exist, where 44–46 first drop one
+that is serving reads.** Between 44 and 46 a `resource.service.name` search falls back to
 a base-table scan: a correct answer, a slower one, for as long as the materialise takes.
 On a fresh database that interval is empty. The named-column `service_time` requires
 `shared`, `status_message`, `scope_name` and `scope_version` to exist, which they do by
@@ -2509,15 +2517,15 @@ the time a new id runs — 31/35/37 have already applied.
 
 **Three of these statements destroy data, and the policy does not stop them.** The
 append-only rule constrains mutation of an already-listed migration entry; it says nothing
-about what a *new* entry may contain. So ids 60, 62 and 63 are formally allowed and would
-drop a populated catalogue and a populated attribute index. **"There is no data to keep"
+about what a *new* entry may contain. So the catalogue drop and the two attribute-index drops
+are formally allowed and would drop a populated catalogue and a populated attribute index. **"There is no data to keep"
 is the issue's premise, not a property the sequence checks.**
 
 ### 8.1 What happens to rows that already exist
 
 Measured, and it is not a migration. Starting from a database reconciled by the
 repository's own initialiser (migrations 16/31/35/37/42/43) and populated with 50,000
-spans, then running ids 44–69:
+spans, then running the remaining statements of §8:
 
     SELECT count(), countIf(all five array lengths = 0) FROM trace_spans
       -> 50000, 50000
@@ -2552,7 +2560,7 @@ dropdown**. **Two shapes change character** — `{}` and `{ status = error }` bo
 `trace_spans` today and both move to a derived table, so both go from answering to
 returning nothing. The rest of the "return nothing" column never read `trace_spans`
 directly in the first place. Their attributes were
-in `trace_attrs_idx`, which id 63 drops.
+in `trace_attrs_idx`, which the index drop removes.
 
 **Two ways to fix it exist, and both were run.** An earlier version of this section said
 there is none; that was false.
@@ -2667,8 +2675,8 @@ proposed that refusal — a non-empty check beside `run_init`'s existing version
 and worked out that the count would have to be cluster-wide rather than local. That
 proposal is withdrawn; the readings above and below it stay, because they are readings.
 
-What they are worth, now that nothing is built on them: the split of what survives ids
-44–69 and what does not is what a developer sees before dropping the database; the two
+What they are worth, now that nothing is built on them: the split of what survives the
+remaining statements of §8 and what does not is what a developer sees before dropping the database; the two
 backfill mechanisms are recorded as having been tried and found to work, for whoever
 faces this question after there is data to keep; and the finding that a `CHECK`
 constraint does not run during a mutation is a fact about the engine that outlives this
@@ -2734,7 +2742,7 @@ The MV list and `TTL_STMTS` change either way:
 | the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `crates/pulsus-write/src/protocols/otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
 | the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
 | the duplicate-key rule is left to `arrayFirstIndex` without being stated | `avg`, `select` and `by` change answer on a span that repeats a key, silently | §4 Q1 states the rule and why it is the right one; it is a change of answer and needs a ledger row |
-| ids 44–69 run against a database that already holds trace rows | those spans stay reachable by service, name, duration and id, and unreachable by the empty search, every attribute condition, `status = error` and the tag dropdown | **not a risk this design carries.** §8.1: there is no deployment and no data to keep, so the answer is to drop the database. Nothing refuses, nothing backfills |
+| the remaining statements of §8 run against a database that already holds trace rows | those spans stay reachable by service, name, duration and id, and unreachable by the empty search, every attribute condition, `status = error` and the tag dropdown | **not a risk this design carries.** §8.1: there is no deployment and no data to keep, so the answer is to drop the database. Nothing refuses, nothing backfills |
 | a backfill is written as a mutation and trusted to be checked | `CHECK` constraints do not run during `ALTER … UPDATE`; a mutation can leave arrays of unequal length that an `INSERT` would reject | §8.1. Measured `HTTP 200` with `length(attr_key)=2`, `length(attr_num)=1`, and `Code: 469` for the same row inserted |
 | five materialized views instead of two make ingest slower than the measurements suggest | insert wall time rises rather than falls | the nine write takes in §5 already measured the two-view case against the one-INSERT case; two of the three new views are a narrow filter and a narrow group. `trace_attr_traces_mv` is the one that expands and groups `A` rows per span, and it is the one to measure on its own. Measure insert wall time with each view added in turn |
 | the metrics range query stays the slowest shape and someone adds a rollup later without re-checking §3.5 | `rate()` starts under-counting or over-counting after a client resends spans | §3.5 states the property the rollup must have and shows one form that has it — a distinct-span state, measured duplicate-safe at 16.30 B/span. Any future rollup is checked against the duplicate table in §3.4 before it is built |
