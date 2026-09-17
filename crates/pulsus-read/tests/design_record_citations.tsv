@@ -172,7 +172,6 @@ docs/query-to-sql.md	catalog.rs:244-257	crates/pulsus-schema/src/catalog.rs	244	
 docs/query-to-sql.md	catalog.rs:340-384	crates/pulsus-schema/src/catalog.rs	340	384	prose	trace_attrs_idx
 docs/query-to-sql.md	catalog.rs:343	crates/pulsus-schema/src/catalog.rs	343		line	parent_id FixedString(8),\n\
 docs/query-to-sql.md	catalog.rs:352	crates/pulsus-schema/src/catalog.rs	352		prose	idx_duration
-docs/query-to-sql.md	catalog.rs:353-354	crates/pulsus-schema/src/catalog.rs	353	354	line	PROJECTION service_time (\n\ SELECT * ORDER BY (service, timestamp_ns)\n\
 docs/query-to-sql.md	catalog.rs:370-384	crates/pulsus-schema/src/catalog.rs	370	384	line	"CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}} (\n\ date Date,\n\ key LowCardinality(String),\n\ val S
 docs/query-to-sql.md	catalog.rs:376	crates/pulsus-schema/src/catalog.rs	376		line	timestamp_ns Int64,\n\
 docs/query-to-sql.md	catalog.rs:379	crates/pulsus-schema/src/catalog.rs	379		prose	duration

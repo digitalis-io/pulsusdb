@@ -1754,7 +1754,7 @@ LIMIT 20
 Ran, returning 20 rows; read 131,072 rows and 4.78 MiB.
 
 **What it avoids.** `service` is the first column of the `service_time` projection
-(`catalog.rs:353-354`), so the span side is a prefix read rather than a scan of the window. The
+(`catalog.rs:980-986`), so the span side is a prefix read rather than a scan of the window. The
 attribute side prunes on `key`, the first column of that table's ordering key. Today this query
 produces one statement per branch and then two to five statements for every batch of 32 candidate
 traces (`exec.rs:116`); at the 100,000-candidate ceiling that is 3,125 rounds.

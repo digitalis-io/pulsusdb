@@ -5462,12 +5462,12 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | citation occurrences in the five artefacts | 688 |
 | of those, citing a bare basename | 536 |
 | of those, written as a continuation of a citation earlier on the line | 43 |
-| `(document, token)` pairs the rule resolves | 386 |
+| `(document, token)` pairs the rule resolves | 385 |
 | occurrences those resolved pairs cover | 577 |
 | `(document, token)` pairs it cannot resolve | 78 |
 | occurrences those frozen pairs cover | 111 |
 | resolved rows anchored on a token the citing prose prints | 195 |
-| resolved rows anchored on a snapshot of the cited line | 191 |
+| resolved rows anchored on a snapshot of the cited line | 190 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5487,7 +5487,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 386 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 191 on a snapshot of the cited line.
+Of the 688 citation occurrences the five artefacts make, 536 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 385 `(document, token)` pairs covering 577 occurrences, and cannot resolve 78 covering 111. Of the resolved rows, 195 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
