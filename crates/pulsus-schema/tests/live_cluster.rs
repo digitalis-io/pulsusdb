@@ -805,12 +805,31 @@ async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
     );
 
     // A misaligned row through the wrapper is refused by the BASE table's
-    // constraint. Asserted on the code and the constraint name only — the
-    // server appends the table's UUID and a wait-phase clause.
+    // constraint, and the refusal reaches the client. Asserted on the code
+    // and the constraint name only — the server appends the table's UUID
+    // and, on some insert paths, a wait-phase clause.
+    //
+    // `distributed_foreground_insert = 1` is load-bearing and is not a
+    // convenience. A `Distributed` insert forwards asynchronously by
+    // default, so whether the refusal reaches the client depends on WHICH
+    // shard the row is destined for, measured on this fixture at
+    // ClickHouse 26.3.29.7 with one misaligned row per sharding slot:
+    //
+    //     cityHash64(trace_id) % 2   destination    result at the client
+    //     0                          shard 1, local  HTTP 500, Code: 469
+    //     1                          shard 2, remote HTTP 200; the block is
+    //                                                queued and shard 2
+    //                                                refuses it later
+    //
+    // This row's `trace_id` is in the second class — deliberately, because
+    // the read-back above must cross a shard boundary to be worth making.
+    // Forwarding it in the foreground makes the base table's constraint run
+    // before the client is answered, so the assertion is about the
+    // constraint rather than about where the row happened to land.
     let err = shard1
         .execute(
             &insert("['a','b'], ['span','span'], ['1','2'], ['int','int'], [1]"),
-            &QuerySettings::new(),
+            &QuerySettings::new().set("distributed_foreground_insert", 1),
             Idempotency::NonIdempotent,
         )
         .await
@@ -825,4 +844,20 @@ async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
         }
         other => panic!("expected a server error, got: {other}"),
     }
+
+    // And nothing of it landed: the aligned row is still the only one.
+    let sql = format!(
+        "SELECT name FROM {TEST_DB_SPAN_ARRAYS}.trace_spans_dist \
+         WHERE trace_id = unhex('{trace_hex}')"
+    );
+    let mut stream = shard1
+        .query_stream::<NameRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("count the rows under this trace id");
+    let mut rows = 0usize;
+    while let Some(row) = stream.next().await {
+        row.expect("decode");
+        rows += 1;
+    }
+    assert_eq!(rows, 1, "the refused row must not be stored");
 }
