@@ -782,6 +782,14 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
     add(17, "three", Some(3.0f64.to_bits()));
     add(18, "four", None);
     add(19, "four", None);
+    // Criterion 3's MIXED groups (review round 1: these passed only as a
+    // throwaway measurement and were not in the suite). `five` is the
+    // case the flags fold exists for — one float member and one
+    // histogram member in ONE group — and `six` is a group with a single
+    // histogram member and nothing else.
+    add(20, "five", Some(42.0f64.to_bits()));
+    add(21, "five", None);
+    add(22, "six", None);
 
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_grouped_nan"), &fx).await;
     let p = h.instant();
@@ -807,9 +815,11 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
             ("one", 3.0f64.to_bits()),
             ("two", nan_bits(14)),
             ("three", 3.0f64.to_bits()),
+            ("five", 42.0f64.to_bits()),
         ]),
-        "max: `four` has no float member and is dropped; `two` answers its \
-         highest fingerprint's NaN payload"
+        "max: `four` and `six` have no float member and are dropped; `five` \
+         answers its ONE float member across a histogram member; `two` answers \
+         its highest fingerprint's NaN payload"
     );
 
     let min = h.agree(&format!("min by (g) ({metric})"), &p).await;
@@ -819,9 +829,10 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
             ("one", 1.0f64.to_bits()),
             ("two", nan_bits(14)),
             ("three", 1.0f64.to_bits()),
+            ("five", 42.0f64.to_bits()),
         ]),
         "min: the NaN payload rule selects the LAST member in fold order for \
-         min too, never the smallest"
+         min too, never the smallest; `five` answers its one float either way"
     );
 
     // `count` counts a histogram member rather than ignoring it, so
@@ -834,7 +845,11 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
             ("two", 2.0f64.to_bits()),
             ("three", 3.0f64.to_bits()),
             ("four", 2.0f64.to_bits()),
-        ])
+            ("five", 2.0f64.to_bits()),
+            ("six", 1.0f64.to_bits()),
+        ]),
+        "count counts a histogram member: the mixed group is 2 and the \
+         histogram-only single-member group is 1"
     );
 
     let group = h.agree(&format!("group by (g) ({metric})"), &p).await;
@@ -845,7 +860,11 @@ async fn the_nan_cases_answer_the_members_own_payloads() {
             ("two", 1.0f64.to_bits()),
             ("three", 1.0f64.to_bits()),
             ("four", 1.0f64.to_bits()),
-        ])
+            ("five", 1.0f64.to_bits()),
+            ("six", 1.0f64.to_bits()),
+        ]),
+        "group is 1 for every group that has a member at all, whatever the \
+         member's channel"
     );
     h.finish().await;
 }
@@ -863,7 +882,7 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
     // same 40-sample run (10 minutes, longer than the 5-minute lookback),
     // so the GROUP is absent for grid points 119..=139 — 21 of 241.
     let missing = 100..=139i64;
-    let fx: Vec<Series> = [60u64, 61]
+    let mut fx: Vec<Series> = [60u64, 61]
         .iter()
         .map(|fp| Series {
             fp: *fp,
@@ -876,6 +895,24 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
             hist_samples: Vec::new(),
         })
         .collect();
+    // A second metric where only ONE of the two members is silent
+    // (review round 1: criterion 2's count sequence was measured but not
+    // committed). The group is never empty, so `max` answers at every
+    // grid point while `count` drops to one over the same window — which
+    // is what shows coverage is tracked per MEMBER and not per group.
+    let partial = "grouped_gap_partial";
+    fx.extend([70u64, 71].iter().map(|fp| {
+        Series {
+            fp: *fp,
+            metric: partial.to_string(),
+            labels: lbl(&[("status", "404"), ("replica", &format!("r{fp}"))]),
+            samples: (0..=240i64)
+                .filter(|i| *fp == 71 || !missing.contains(i))
+                .map(|i| (start + i * 15_000, (i as f64).to_bits()))
+                .collect(),
+            hist_samples: Vec::new(),
+        }
+    }));
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_grouped_gap"), &fx).await;
     let p = MetricQueryParams {
         start_ms: start,
@@ -890,6 +927,40 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
         absent,
         (119..=139).collect::<Vec<i64>>(),
         "exactly 21 of the 241 grid points"
+    );
+
+    // The partial gap, as a count sequence. One member is silent for the
+    // same window; the other is not.
+    //
+    // ```text
+    //   grid point   0..=118   119..=139   140..=240
+    //   count              2           1           2
+    //   max          present     present     present
+    // ```
+    let c = h.agree(&format!("count by (status) ({partial})"), &p).await;
+    assert_eq!(c.len(), 1, "one group");
+    let counts: Vec<(i64, f64)> = c[0]
+        .1
+        .iter()
+        .map(|(ts, bits)| ((ts - start) / 15_000, f64::from_bits(*bits)))
+        .collect();
+    assert_eq!(
+        counts.len(),
+        241,
+        "the group is never empty, so every point"
+    );
+    for (i, n) in &counts {
+        let want = if (119..=139).contains(i) { 1.0 } else { 2.0 };
+        assert_eq!(
+            *n, want,
+            "grid point {i}: one member is silent over 119..=139 and the other is not"
+        );
+    }
+    let m = h.agree(&format!("max by (status) ({partial})"), &p).await;
+    assert_eq!(
+        m[0].1.len(),
+        241,
+        "max answers at every point, because the group always has a member"
     );
     h.finish().await;
 }
