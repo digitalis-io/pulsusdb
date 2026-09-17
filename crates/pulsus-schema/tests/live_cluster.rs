@@ -40,6 +40,8 @@ static TEST_DB_DIST: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dist");
 static TEST_DB_BOOKKEEPING: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_bookkeeping");
+static TEST_DB_SPAN_ARRAYS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_span_arrays");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -650,4 +652,177 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
         tags1, tags2,
         "trace_tag_catalog rows must be identical on every shard"
     );
+}
+
+/// The five span-attribute array columns and `attr_num` re-read as BITS.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct SpanArrayRow {
+    attr_key: Vec<String>,
+    attr_scope: Vec<String>,
+    attr_val: Vec<String>,
+    attr_type: Vec<String>,
+    attr_num_bits: Vec<Option<u64>>,
+}
+
+/// Issue #556 criterion 3, and this is the ONLY place it can be checked.
+/// Migrations 49-58's `_dist` twins run `ON CLUSTER` against the wrapper,
+/// which a single local ClickHouse never creates.
+///
+/// A `_dist` wrapper is created from a `CREATE ... AS` that does NOT
+/// inherit the base table's `ALTER`s, so without the five cluster-only
+/// twins the wrapper's attr columns are `[]` and an insert through it is
+/// `Code: 16 NO_SUCH_COLUMN_IN_TABLE`.
+///
+/// The read back is **polled**, 40 times at 250 ms, exactly as the
+/// `log_samples_dist` read-back above polls the same asynchronous
+/// forwarding. Not a precaution: a `Distributed` insert forwards
+/// asynchronously (`distributed_foreground_insert = 0`), so the read that
+/// follows it can legitimately see nothing.
+#[tokio::test]
+async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+
+    shard1
+        .execute(
+            &format!(
+                "DROP DATABASE IF EXISTS {TEST_DB_SPAN_ARRAYS} ON CLUSTER '{CLUSTER_NAME}' SYNC"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database on cluster");
+    run_init(&shard1, &cluster_ctx(&TEST_DB_SPAN_ARRAYS))
+        .await
+        .expect("run_init (clustered)");
+
+    // The wrapper carries all five columns on BOTH shards.
+    let expected = vec![
+        "attr_key".to_string(),
+        "attr_num".to_string(),
+        "attr_scope".to_string(),
+        "attr_type".to_string(),
+        "attr_val".to_string(),
+    ];
+    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
+        for table in ["trace_spans", "trace_spans_dist"] {
+            let sql = format!(
+                "SELECT name FROM system.columns WHERE database = '{TEST_DB_SPAN_ARRAYS}' \
+                 AND table = '{table}' AND name LIKE 'attr\\\\_%' ORDER BY name"
+            );
+            let mut stream = shard
+                .query_stream::<NameRow>(&sql, &QuerySettings::new())
+                .await
+                .expect("query system.columns");
+            let mut got = Vec::new();
+            while let Some(row) = stream.next().await {
+                got.push(row.expect("decode NameRow").name);
+            }
+            assert_eq!(
+                got, expected,
+                "{label}: {table} must carry the five array columns after migrations 49-58"
+            );
+        }
+    }
+
+    // The constraint lives on the BASE table only: a Distributed table
+    // refuses `ADD_CONSTRAINT`, and does not need one.
+    let base_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans").await;
+    let dist_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans_dist").await;
+    assert!(
+        base_ddl.contains("attr_arrays_aligned"),
+        "the base table must carry the constraint: {base_ddl}"
+    );
+    assert!(
+        !dist_ddl.contains("CONSTRAINT"),
+        "the wrapper must carry no constraint: {dist_ddl}"
+    );
+
+    let now_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits i64");
+    let trace_hex = "0102030405060708090a0b0c0d0e0f10";
+    let insert = |arrays: &str| {
+        format!(
+            "INSERT INTO {TEST_DB_SPAN_ARRAYS}.trace_spans_dist \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
+             VALUES (unhex('{trace_hex}'), unhex('0102030405060708'), \
+             unhex('0000000000000000'), 'n', 's', {now_ns}, 1, 0, 2, 1, '', {arrays})"
+        )
+    };
+
+    shard1
+        .execute(
+            &insert("['a','b'], ['span','link:intrinsic'], ['1','2'], ['int','string'], [1, NULL]"),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("an aligned row must insert through the wrapper");
+
+    // Read back through the wrapper from the OTHER shard, polled.
+    let sql = format!(
+        "SELECT attr_key, attr_scope, attr_val, attr_type, \
+         arrayMap(x -> if(isNull(x), NULL, reinterpretAsUInt64(assumeNotNull(x))), attr_num) \
+         AS attr_num_bits \
+         FROM {TEST_DB_SPAN_ARRAYS}.trace_spans_dist WHERE trace_id = unhex('{trace_hex}')"
+    );
+    let mut got = None;
+    for _ in 0..40 {
+        let mut stream = shard2
+            .query_stream::<SpanArrayRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("select the arrays via _dist from the other shard");
+        if let Some(row) = stream.next().await {
+            got = Some(row.expect("decode"));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        got,
+        Some(SpanArrayRow {
+            attr_key: vec!["a".to_string(), "b".to_string()],
+            attr_scope: vec!["span".to_string(), "link:intrinsic".to_string()],
+            attr_val: vec!["1".to_string(), "2".to_string()],
+            attr_type: vec!["int".to_string(), "string".to_string()],
+            // The NULL stays at its OWN position; nothing is dropped.
+            attr_num_bits: vec![Some(1.0f64.to_bits()), None],
+        }),
+        "the arrays inserted via _dist must read back cluster-wide through _dist"
+    );
+
+    // A misaligned row through the wrapper is refused by the BASE table's
+    // constraint. Asserted on the code and the constraint name only — the
+    // server appends the table's UUID and a wait-phase clause.
+    let err = shard1
+        .execute(
+            &insert("['a','b'], ['span','span'], ['1','2'], ['int','int'], [1]"),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect_err("a misaligned row must be refused through the wrapper");
+    match err {
+        pulsus_clickhouse::ChError::Server { code, ref message } => {
+            assert_eq!(code, 469, "VIOLATED_CONSTRAINT; got: {err}");
+            assert!(
+                message.contains("attr_arrays_aligned"),
+                "the refusal must name the constraint; got: {message}"
+            );
+        }
+        other => panic!("expected a server error, got: {other}"),
+    }
 }

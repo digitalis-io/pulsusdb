@@ -2539,10 +2539,7 @@ mod tests {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
-                    attributes: vec![kv(
-                        "service.name",
-                        Value::StringValue("checkout".into()),
-                    )],
+                    attributes: vec![kv("service.name", Value::StringValue("checkout".into()))],
                     dropped_attributes_count: 0,
                     ..Default::default()
                 }),

@@ -2471,8 +2471,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1773` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1824` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2100` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2151` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -2755,7 +2755,7 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 drops any of them answers differently from the evaluator.
 
 - **Compare `val_num`, not `val`, and gate on `isNotNull(val_num)`.** The `f64` rounding happens at
-  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:712`) is
+  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:752`) is
   `val.parse::<f64>().filter(is_finite)` — so both sides of the comparison already read the rounded
   number and there is no unrounded side to disagree with. But the `val` String still holds the
   original text:

@@ -156,19 +156,19 @@ worked parameter is 20 (Appendix A) — but four fits on the page.
 ```
 
 Resource attributes belong to a whole batch of spans, but the writer copies them
-onto **every** span it produces (`crates/pulsus-write/src/protocols/otlp_traces.rs:487-503`, the loop over
+onto **every** span it produces (`crates/pulsus-write/src/protocols/otlp_traces.rs:510-526`, the loop over
 `[(resource, …), (span, …), (instrumentation, …)]`).
 
-**That loop is not the whole of what the writer emits.** `crates/pulsus-write/src/protocols/otlp_traces.rs:505-607` emits,
+**That loop is not the whole of what the writer emits.** `crates/pulsus-write/src/protocols/otlp_traces.rs:528-630` emits,
 per span, two more families of index row:
 
 ```
-   per span EVENT   (crates/pulsus-write/src/protocols/otlp_traces.rs:505-556)
+   per span EVENT   (crates/pulsus-write/src/protocols/otlp_traces.rs:528-579)
      event:name           scope event:intrinsic   val = the event name
      event:timeSinceStart scope event:intrinsic   val_num = event.time - span.start, ns
      one row per event attribute, scope `event`, verbatim key
 
-   per span LINK    (crates/pulsus-write/src/protocols/otlp_traces.rs:558-607)
+   per span LINK    (crates/pulsus-write/src/protocols/otlp_traces.rs:581-630)
      link:spanID          scope link:intrinsic    val = lowercase hex
      link:traceID         scope link:intrinsic    val = lowercase hex
      one row per link attribute, scope `link`, verbatim key
@@ -230,7 +230,7 @@ undercounts: the `span_name_day` aggregate row was left out of the first, and
 the edge row out of the second.
 
 `val_num` is `val.parse::<f64>()` when the result is finite, else NULL
-(`crates/pulsus-write/src/protocols/otlp_traces.rs:712-714`). It is set from the **text**, whatever OTLP type the
+(`crates/pulsus-write/src/protocols/otlp_traces.rs:752-754`). It is set from the **text**, whatever OTLP type the
 sender declared, which is why the string `"500"` under a different key would also
 carry `val_num = 500`.
 
@@ -410,7 +410,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:756` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:790` already names the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the
@@ -670,7 +670,7 @@ per sample (`crates/pulsus-schema/src/catalog.rs:227-234`).
    attr_num   [NULL,         NULL,                    500,               NULL]
 
    A span carrying one event and one link appends, to the SAME five arrays and in
-   the writer's existing emission order (crates/pulsus-write/src/protocols/otlp_traces.rs:505-607):
+   the writer's existing emission order (crates/pulsus-write/src/protocols/otlp_traces.rs:528-630):
 
    attr_key   [... , 'name',            'timeSinceStart',  'db.system', 'spanID',        'traceID',       'rel']
    attr_scope [... , 'event:intrinsic', 'event:intrinsic', 'event',     'link:intrinsic','link:intrinsic','link']
@@ -731,7 +731,7 @@ fraction is `trace_duration / B` — about 0.3% for one-second traces at
 
 The bucket column is `UInt32`, and it cannot overflow: ingest rejects any span
 whose UTC day falls before 1970-01-01 or after 2106-02-06
-(`crates/pulsus-write/src/protocols/otlp_traces.rs:465-486`), so `intDiv(timestamp_ns, 3·10¹¹)` lies in
+(`crates/pulsus-write/src/protocols/otlp_traces.rs:481-502`), so `intDiv(timestamp_ns, 3·10¹¹)` lies in
 `[0, 1.43·10⁷]` against a `UInt32` ceiling of 4.29·10⁹.
 
 ### 3.4 Every new table is safe against a duplicated span row, and one would not have been
@@ -2093,9 +2093,9 @@ from names.
 | the PROBE's result, as the reader sees it | a row present or absent in the membership set | `(i0 != 0) AND ifNull(<test on the located element>, 0)`, printed `UInt8` | **the row set moves on one class and only on it**: a span that carries the probed key more than once, or carries it at two scopes under an unscoped condition. There the membership set answers "some entry matched" and the column answers "the entry this span resolves to matched". Measured on the eight-span fixture in §4 Q1: three of eight differ. Everywhere else they agree, and `ifNull(…, 0)` keeps a NULL element reading as 0 exactly where the membership form returned no row | **differs, deliberately — the duplicate-key ledger row covers it** |
 | the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside the array function differs on an absent key and on a multi-valued key — §4 Q1's six-case table. The inversion itself is unchanged; the positive column it inverts is the locate-then-test one, so `['y','x']` under `!= "x"` moves from 0 to 1 | **agree on five of six; the sixth is the duplicate-key change** |
 | the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | **locate on `(key, scope)` only, then read that element**; scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7. On `['bad','5']`: today's numeric read returns 5, the new form returns NULL, because the FIRST match is not numeric | **CHANGED, deliberately.** The rule is **the first stored element within the highest-precedence scope that is present** — first-in-stored-order is the scoped half of it only — derived in §4 Q1 from what the alternatives cost a user and then checked against the reference, whose value path does the same: `tempodb/encoding/vparquet4/block_traceql.go:128-151` and `:249-280 @ v3.0.2`, quoted there. Its condition path does not, which is the divergence recorded in `docs/api.md` and in `docs/benchmarks/traces-differential-ledger.md`. Today's behaviour has no contract |
-| `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`crates/pulsus-write/src/protocols/otlp_traces.rs:558-607` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
+| `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`crates/pulsus-write/src/protocols/otlp_traces.rs:581-630` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
 | `timestamp_ns`, `duration_ns` | `Int64` nanoseconds | `Int64` nanoseconds | none | **agree** |
-| the bucket | — | `UInt32` | ingest bounds `timestamp_ns` to `[0, 4.29·10¹⁸]` (`crates/pulsus-write/src/protocols/otlp_traces.rs:465-486`), so the bucket is `≤ 1.43·10⁷` against a ceiling of 4.29·10⁹ | **cannot overflow** |
+| the bucket | — | `UInt32` | ingest bounds `timestamp_ns` to `[0, 4.29·10¹⁸]` (`crates/pulsus-write/src/protocols/otlp_traces.rs:481-502`), so the bucket is `≤ 1.43·10⁷` against a ceiling of 4.29·10⁹ | **cannot overflow** |
 
 **Measured, not argued**: on a 2,000,000-span corpus, all 6,000,000 non-NULL
 numeric attribute values compared bitwise equal between the two layouts —
@@ -2103,7 +2103,7 @@ numeric attribute values compared bitwise equal between the two layouts —
 `reinterpretAsUInt64`.
 
 **The 2⁵³ boundary is exactly where it is today.** `val.parse::<f64>()`
-(`crates/pulsus-write/src/protocols/otlp_traces.rs:712-714`) already rounds `9007199254740993` to
+(`crates/pulsus-write/src/protocols/otlp_traces.rs:752-754`) already rounds `9007199254740993` to
 `9007199254740992` before anything is stored, and the new layout parses the same
 text with the same function into the same `Float64`. This design neither improves
 nor worsens that, **and that is why there are five arrays and not six**: adding
@@ -2353,7 +2353,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:933`
+> — `docs/schemas.md:967`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -2589,7 +2589,7 @@ there is none; that was false.
    it and that table has no element-position column (`crates/pulsus-schema/src/catalog.rs:370-384`). That premise
    was wrong. `trace_spans.payload` holds a self-contained `TracesData` — this span with
    its own resource and scope, prost-encoded, both schema URLs kept — built by
-   `build_payload` at `crates/pulsus-write/src/protocols/otlp_traces.rs:654-674`. **The sender's attribute order is inside
+   `build_payload` at `crates/pulsus-write/src/protocols/otlp_traces.rs:694-714`. **The sender's attribute order is inside
    it, for every stored span, on the table this change keeps.**
 
    So there are two backfills, not one, and they differ in exactly this:
@@ -2658,8 +2658,8 @@ there is none; that was false.
        demonstrated route.
 
    Condition (1) is constructible today: the writer builds the self-contained payload at
-   `crates/pulsus-write/src/protocols/otlp_traces.rs:657` and a live test already decodes the stored column
-   (`crates/pulsus-write/tests/trace_ingest_roundtrip.rs:281`). Condition (2) has not been
+   `crates/pulsus-write/src/protocols/otlp_traces.rs:697` and a live test already decodes the stored column
+   (`crates/pulsus-write/tests/trace_ingest_roundtrip.rs:291`). Condition (2) has not been
    attempted.
 
    **Under the issue's premise neither backfill runs.** If one ever does, choosing the
@@ -2739,7 +2739,7 @@ The MV list and `TTL_STMTS` change either way:
 | a materialized view throws and leaves the span stored with **some** derived rows and not others | a trace answers some search shapes and not others, and which ones varies between runs of the identical write | **read: this happens, non-deterministically.** §6.3's twenty trials. No remedy is chosen here |
 | a probe's negation is rendered inside the array function rather than left to the reader | `{ span.k != "x" }` starts matching spans that carry `k = "x"` and stops matching spans with no `k` | §4 Q1's six-case negation table is the test |
 | a leaf's predicate column is built as `arrayExists` rather than as locate-then-test | a span whose resolved value does not satisfy the query is returned, and then rendered with the value that does not match it | §4 Q1's eight-span fixture is the test: three of its eight rows separate the two forms. §8 says which column to build |
-| the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `crates/pulsus-write/src/protocols/otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
+| the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `crates/pulsus-write/src/protocols/otlp_traces.rs:528-630` is a second and third emission site with the same row shape |
 | the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
 | the duplicate-key rule is left to `arrayFirstIndex` without being stated | `avg`, `select` and `by` change answer on a span that repeats a key, silently | §4 Q1 states the rule and why it is the right one; it is a change of answer and needs a ledger row |
 | the remaining statements of §8 run against a database that already holds trace rows | those spans stay reachable by service, name, duration and id, and unreachable by the empty search, every attribute condition, `status = error` and the tag dropdown | **not a risk this design carries.** §8.1: there is no deployment and no data to keep, so the answer is to drop the database. Nothing refuses, nothing backfills |
@@ -2873,7 +2873,7 @@ ZSTD(3)-to-LZ4 cost ratio. Every worked byte figure moves with them.
   at position 4. **ClickHouse is not checked out on this machine**, so its key
   condition code was not read. P2 is the same gap seen from the other side.
 - *That the five arrays can carry every scope the writer emits* rests on all seven scopes
-  having the same row shape — key, scope, val, val_type, val_num (`crates/pulsus-write/src/protocols/otlp_traces.rs:487-607`).
+  having the same row shape — key, scope, val, val_type, val_num (`crates/pulsus-write/src/protocols/otlp_traces.rs:510-630`).
   It would be wrong if any scope needed a field the others do not have. Read, not run:
   no ingest path has been exercised end to end into the arrays.
 - *That the scalar value read can replace `attr_values_sql`* rests on the read being

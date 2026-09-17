@@ -41,6 +41,13 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp-traces")
 }
 
+/// A `Nullable(Float64)`'s comparable form: its BITS, never its value.
+/// `-0.0 == 0.0` is `true`, so a value comparison passes a stored `-0.0`
+/// mutated to `+0.0`; a bit comparison catches it.
+fn bits(n: &Option<f64>) -> Option<u64> {
+    n.map(f64::to_bits)
+}
+
 fn read_fixture(name: &str) -> Vec<u8> {
     std::fs::read(fixtures_dir().join(name))
         .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
@@ -373,6 +380,63 @@ fn parse_produces_the_hand_derived_golden_rows() {
             ),
         ]
     );
+    // Issue #556: each span's five arrays are the projection of ITS OWN
+    // attr rows, in the same order — 12 elements for span A, 3 for span B,
+    // which is the 15-row total split by owning span. Taken from
+    // `out.attrs` filtered by `span_id`, so a slice that took the whole
+    // batch, dropped the NULLs, or re-ordered anything cannot pass.
+    for (record, span_id) in out.spans.iter().zip([SPAN_A_ID, SPAN_B_ID]) {
+        let own: Vec<&pulsus_write::AttrRecord> =
+            out.attrs.iter().filter(|r| r.span_id == span_id).collect();
+        assert_eq!(
+            record.attr_key,
+            own.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            record.attr_scope,
+            own.iter().map(|r| r.scope.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            record.attr_val,
+            own.iter().map(|r| r.val.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            record.attr_type,
+            own.iter().map(|r| r.val_type).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            record.attr_num.iter().map(bits).collect::<Vec<_>>(),
+            own.iter().map(|r| bits(&r.val_num)).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(out.spans[0].attr_key.len(), 12, "span A's own attributes");
+    assert_eq!(out.spans[1].attr_key.len(), 3, "span B's own attributes");
+    // The three intrinsic elements a value-text rule would get wrong: the
+    // event's timeSinceStart IS numeric, the two link hex ids are NOT,
+    // even though `0123456789abcdef` and `aabb...` are not numeric text
+    // while a link id of all-zeros-then-one would be.
+    assert_eq!(
+        out.spans[0]
+            .attr_num
+            .iter()
+            .map(|n| n.map(f64::to_bits))
+            .collect::<Vec<_>>(),
+        vec![
+            None,
+            None,
+            Some(500.0f64.to_bits()),
+            None,
+            None,
+            None,
+            None,
+            Some((SPAN_A_EVENT_TIME_SINCE_START_NS as f64).to_bits()),
+            None,
+            None,
+            None,
+            None,
+        ]
+    );
+
     for attr in &out.attrs {
         assert_eq!(attr.date, GOLDEN_DAY, "per-day floor of the span timestamp");
         assert_eq!(attr.trace_id, TRACE_ID);
@@ -475,4 +539,190 @@ fn committed_fixture_matches_the_builder() {
         "run `cargo test -p pulsus-write --test trace_ingest_fidelity -- --ignored \
          regenerate_fixtures` and commit the diff"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #556 criterion 4: the number is decided by (scope, key, value),
+// never by the value text.
+// ---------------------------------------------------------------------
+
+/// The four `timeSinceStart` values this test pins, straddling the point
+/// where `i64` and `f64` part company. A span whose `start_time_unix_nano`
+/// is `0` makes the delta the event's own time, which is what puts these
+/// magnitudes within reach.
+const TSS_VALUES: [i64; 4] = [
+    9_007_199_254_740_991, // 2^53 - 1
+    9_007_199_254_740_992, // 2^53
+    9_007_199_254_740_993, // 2^53 + 1
+    i64::MAX,
+];
+
+/// Issue #556 criterion 4. The five arrays on a span's row are the
+/// projection of that span's own `AttrRecord`s, so the numeric value is
+/// decided by the whole of (scope, key, value) and NOT by the value text.
+///
+/// Three things it pins that a text rule gets wrong:
+///
+///   - a link's `spanID` of `0000000000000001` and `traceID` of
+///     `00000000000000000000000000000001` both `parse::<f64>()` as
+///     `Some(1.0)`, and both must store NULL;
+///   - `timeSinceStart` agrees with `val_val.parse::<i64>() as f64` bit
+///     for bit at `2^53 - 1`, `2^53`, `2^53 + 1` and `i64::MAX` —
+///     including where the `f64` ROUNDS, which is what `trace_attrs_idx`
+///     has stored since the intrinsic was added and what this must
+///     reproduce rather than improve;
+///   - a stored `-0.0` keeps its sign bit.
+///
+/// The `i64` comparison is deliberately NOT written as a round trip
+/// through `as i64`: `i64::MAX as f64 as i64` saturates back to
+/// `i64::MAX`, so a round-trip comparison reports agreement at the very
+/// value where the loss is largest.
+#[test]
+fn the_span_arrays_are_the_spans_own_attr_rows_element_by_element() {
+    let sp = Span {
+        trace_id: TRACE_ID.to_vec(),
+        span_id: SPAN_A_ID.to_vec(),
+        // `0`, so each event's `timeSinceStart` is its own absolute time.
+        start_time_unix_nano: 0,
+        end_time_unix_nano: 1_000_000_000,
+        name: "numeric-rules".to_string(),
+        kind: SpanKind::Server as i32,
+        attributes: vec![kv("neg", Value::DoubleValue(-0.0))],
+        events: TSS_VALUES
+            .iter()
+            .enumerate()
+            .map(|(i, tss)| Event {
+                time_unix_nano: *tss as u64,
+                name: format!("e{i}"),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            })
+            .collect(),
+        links: vec![Link {
+            // Hex that PARSES as a number and must still store NULL.
+            trace_id: {
+                let mut t = [0u8; 16];
+                t[15] = 1;
+                t.to_vec()
+            },
+            span_id: {
+                let mut s = [0u8; 8];
+                s[7] = 1;
+                s.to_vec()
+            },
+            trace_state: String::new(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }],
+        status: None,
+        ..Default::default()
+    };
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![sp],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let out = parse_traces(&req, 0).expect("within the expansion budget");
+    assert_eq!(out.spans.len(), 1);
+    let record = &out.spans[0];
+
+    // The arrays ARE the projections of this span's own attr rows.
+    assert_eq!(
+        record.attr_key,
+        out.attrs.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        record.attr_scope,
+        out.attrs
+            .iter()
+            .map(|r| r.scope.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        record.attr_val,
+        out.attrs.iter().map(|r| r.val.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        record.attr_type,
+        out.attrs.iter().map(|r| r.val_type).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        record.attr_num.iter().map(bits).collect::<Vec<_>>(),
+        out.attrs
+            .iter()
+            .map(|r| bits(&r.val_num))
+            .collect::<Vec<_>>()
+    );
+
+    // The eleven elements, in emission order, with every text pinned.
+    assert_eq!(
+        record
+            .attr_scope
+            .iter()
+            .zip(&record.attr_key)
+            .zip(&record.attr_val)
+            .map(|((s, k), v)| (s.as_str(), k.as_str(), v.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("span", "neg", "-0"),
+            ("event:intrinsic", "name", "e0"),
+            ("event:intrinsic", "timeSinceStart", "9007199254740991"),
+            ("event:intrinsic", "name", "e1"),
+            ("event:intrinsic", "timeSinceStart", "9007199254740992"),
+            ("event:intrinsic", "name", "e2"),
+            ("event:intrinsic", "timeSinceStart", "9007199254740993"),
+            ("event:intrinsic", "name", "e3"),
+            ("event:intrinsic", "timeSinceStart", "9223372036854775807"),
+            ("link:intrinsic", "spanID", "0000000000000001"),
+            (
+                "link:intrinsic",
+                "traceID",
+                "00000000000000000000000000000001"
+            ),
+        ]
+    );
+
+    // The two link hex ids parse as a number and must still be NULL.
+    for i in [9, 10] {
+        assert_eq!(
+            record.attr_val[i].parse::<f64>(),
+            Ok(1.0),
+            "the value TEXT at {i} does parse as a number"
+        );
+        assert_eq!(
+            bits(&record.attr_num[i]),
+            None,
+            "a link's hex id must still store NULL at {i}"
+        );
+    }
+
+    // `timeSinceStart` agrees with its integer's `as f64`, bit for bit,
+    // including where that rounds.
+    for (i, tss) in [(2usize, 0usize), (4, 1), (6, 2), (8, 3)] {
+        let text: i64 = record.attr_val[i].parse().expect("the text is an integer");
+        assert_eq!(text, TSS_VALUES[tss]);
+        assert_eq!(
+            bits(&record.attr_num[i]),
+            Some((text as f64).to_bits()),
+            "element {i}: the stored number must be the integer's `as f64`"
+        );
+    }
+    // And it ROUNDS from 2^53 + 1 on: the stored number for `2^53 + 1` is
+    // the same f64 as for `2^53`, which is why no exact comparison above
+    // that magnitude can be served from this column.
+    assert_eq!(bits(&record.attr_num[6]), bits(&record.attr_num[4]));
+    assert_ne!(record.attr_val[6], record.attr_val[4]);
+
+    // The stored `-0.0` keeps its sign bit. `-0.0 == 0.0` is true, so a
+    // value comparison cannot see this.
+    assert_eq!(bits(&record.attr_num[0]), Some((-0.0f64).to_bits()));
+    assert_eq!(bits(&record.attr_num[0]), Some(9_223_372_036_854_775_808));
+    assert_eq!(record.attr_type[0], pulsus_write::AttrValueType::Float);
 }

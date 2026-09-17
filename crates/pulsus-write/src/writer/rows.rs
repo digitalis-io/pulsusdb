@@ -1521,8 +1521,7 @@ mod tests {
         one.attr_val = vec![String::new()];
         one.attr_type = vec![AttrValueType::String];
         one.attr_num = vec![None];
-        let delta =
-            TraceSpanRow::est_source_bytes(&one) - TraceSpanRow::est_source_bytes(&none);
+        let delta = TraceSpanRow::est_source_bytes(&one) - TraceSpanRow::est_source_bytes(&none);
         let floor = (ARRAY_ELEMENT_SLOT_BYTES + VAL_TYPE_SPELLING_BYTES) as u64;
         assert!(
             delta >= floor,
