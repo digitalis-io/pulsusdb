@@ -287,7 +287,7 @@ rows respectively — not one shard holding everything).
 > discovery query fans out with only deduplicated results crossing the
 > network.
 >
-> **A re-capture needs**: the four-shard fixture at
+> **The re-capture has not been done.** It needs: the four-shard fixture at
 > `ci/bench-cluster/compose.yaml`, the same CI-scale corpus loaded through
 > the `_dist` wrappers, and a rerun of `xtask bench --dist`, which
 > regenerates [`data/logs-read-dist.json`](data/logs-read-dist.json) and
@@ -308,9 +308,38 @@ rather than merely absent (round 3 [high] finding):
 
 **The roster, placement and `read_rows` columns below were measured under
 the previous sharding key and do not evidence current placement** (issue
-#498 — see the note above). The `stage` column, and the fact that a
-fingerprint-scoped stage reaches an owning subset rather than the whole
-cluster, are unaffected.
+#498 — see the note above). Only the `Query` and `stage` columns carry
+over unchanged.
+
+**Whether a fingerprint-scoped stage reaches a subset at all is
+selector-dependent too**, which is not obvious and was got wrong once in
+this issue's own review. Both selectors computed over the
+three fingerprint lists this capture recorded, against a live server:
+
+```text
+  SELECT arraySort(arrayDistinct(arrayMap(x -> toUInt64(x % 4), [<the list>]))),
+         arraySort(arrayDistinct(arrayMap(x -> toUInt64(cityHash64(toUInt128(x)) % 4),
+                                          [<the list>])))
+
+  list    slots, previous key   slots, current key    shards, current key
+  -----   -------------------   -------------------   -------------------
+    4     [0, 1, 2]             [2, 3]                3, 4
+   10     [0, 1, 2]             [0, 1, 2, 3]          ALL FOUR
+  167     [0, 1, 2, 3]          [0, 1, 2, 3]          all four
+```
+
+The lists are the ones in this capture's own `fingerprint IN (...)`
+statements; `total_weight = 4` is the value its `pruned_reason` strings
+record, one weight per shard, and the slot→shard map it recorded resolves
+slot `i` to shard `i + 1`. Measured on ClickHouse 26.3.29.7.
+
+**The ten-fingerprint stage reaches every shard under the current key**,
+so "an owning subset rather than the whole cluster" is a superseded
+figure, not a surviving one. The four-fingerprint stage still reaches a
+subset, and a different one. What survives is weaker and still worth
+having: a stage is confined to the shards that own its fingerprints, and
+which shards those are — and therefore whether they are all of them — is a
+property of the selector.
 
 | Query | stage | roster (previous key) | participating (shard: `read_rows`, previous key) | expected-pruned (previous key) |
 |---|---|---|---|---|
