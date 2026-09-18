@@ -278,14 +278,20 @@ rows respectively — not one shard holding everything).
 >                                   table below, which follows the placement
 > ```
 >
-> **What does still hold** is the shape, which is what this page was
-> written to establish and does not depend on the selector: each stage
-> executes shard-locally; a fingerprint-scoped stage participates on the
-> owning subset rather than the whole cluster; a shard excluded by
-> `optimize_skip_unused_shards` is proven pruned against a roster computed
-> before the query ran, rather than assumed from its absence; and the
-> discovery query fans out with only deduplicated results crossing the
-> network.
+> **What does still hold** is the shape and the method, neither of which
+> depends on the selector: each stage executes shard-locally; a
+> fingerprint-scoped stage is confined to the shards that own its
+> fingerprints; a shard excluded by `optimize_skip_unused_shards` is proven
+> pruned against a roster computed before the query ran, rather than
+> assumed from its absence; and the discovery query fans out with only
+> deduplicated results crossing the network.
+>
+> **"Confined to the owning shards" is not "fewer than all of them".**
+> Which shards own a stage's fingerprints is selector-dependent, and so is
+> whether that set happens to be the whole cluster — measured below, the
+> ten-fingerprint stage that reached three of four shards under the
+> previous key reaches all four under the current one. Wherever this page
+> says a stage participates on a *subset*, that is a superseded figure.
 >
 > **The re-capture has not been done.** It needs: the four-shard fixture at
 > `ci/bench-cluster/compose.yaml`, the same CI-scale corpus loaded through
@@ -405,17 +411,28 @@ exactly (100 / 26 / 4 / 2,171).
 
 ### §7 fan-out table walk (logs family)
 
-| `docs/schemas.md` §7 row | Verdict | Evidence |
+**The verdicts below are for the SHAPE each row states — which stages run
+shard-locally and what crosses the network — and not for any shard count**
+(issue #498). Every roster, count and derivation quoted in the Evidence
+column was measured under the previous sharding key and is superseded; the
+`fingerprint % total_weight` derivation quoted in the first row names that
+key. The same marking is on `docs/schemas.md` §7's own status paragraph.
+
+| `docs/schemas.md` §7 row | Verdict (shape only) | Evidence (rosters and counts superseded) |
 |---|---|---|
-| LogQL stream resolution + read: "all, but every stage completes shard-locally … matched log lines only [cross the network]" | **Confirmed, all three stages, exact roster verified** | `label_scoped_stream_read_6h`/`body_search_24h`: **resolution** participates on the full 4-shard roster (no `fingerprint` predicate to prune by); **hydration**/**samples** participate on *exactly* the computed 3-shard owning subset of the canonical stream's fingerprints, with the 4th shard's absence *proven* — not merely observed — by an `expected-pruned` entry carrying the `fingerprint % total_weight` derivation, matched against the harness's own pre-computed expectation before the query ran; each participating shard's `read_rows` reflects its own local partition, not the full corpus; the initiator returned exactly the matched rows (100 / 26), not the shards' combined local row counts |
-| Label/tag discovery: "all [shards]; deduplicated key/value sets [cross]" | **Confirmed, full 4-shard roster** | `label_series_discovery_7d`'s `discovery` stage: all 4 shards (coordinator-local + 3 remote) participate — no `fingerprint` predicate, so the expected roster is unconditionally the full cluster and was verified as such — contributing local `log_streams_idx` rows, none anywhere near a full corpus scan; the initiator returned only the 4 deduplicated label names |
-| (supplementary, not a named §7 row) rollup/tier partial aggregation | **Confirmed for `log_metrics_5s`, full 4-shard roster verified, not assumed** | `count_rate_rollup_over_corpus_window`'s `rollup_range` stage: its 167-fingerprint owning set was computed and checked, not presumed from the shape of the query, and reaches all 4 shards; `EXPLAIN PIPELINE`: `GroupingAggregatedTransform` + `MergingAggregatedBucketTransform` — per-shard partial aggregation across all 4 shards, consistent with the co-sharding argument `docs/schemas.md` §7 makes for `log_metrics_5s` |
+| LogQL stream resolution + read: "all, but every stage completes shard-locally … matched log lines only [cross the network]" | **Confirmed for the shape, all three stages; the roster figures are superseded** | `label_scoped_stream_read_6h`/`body_search_24h`: **resolution** participates on the full 4-shard roster (no `fingerprint` predicate to prune by); **hydration**/**samples** participate on *exactly* the computed 3-shard owning subset of the canonical stream's fingerprints, with the 4th shard's absence *proven* — not merely observed — by an `expected-pruned` entry carrying the `fingerprint % total_weight` derivation, matched against the harness's own pre-computed expectation before the query ran; each participating shard's `read_rows` reflects its own local partition, not the full corpus; the initiator returned exactly the matched rows (100 / 26), not the shards' combined local row counts |
+| Label/tag discovery: "all [shards]; deduplicated key/value sets [cross]" | **Confirmed for the shape; the roster is unconditional here — no `fingerprint` predicate to prune by, so this one does not depend on the selector** | `label_series_discovery_7d`'s `discovery` stage: all 4 shards (coordinator-local + 3 remote) participate — no `fingerprint` predicate, so the expected roster is unconditionally the full cluster and was verified as such — contributing local `log_streams_idx` rows, none anywhere near a full corpus scan; the initiator returned only the 4 deduplicated label names |
+| (supplementary, not a named §7 row) rollup/tier partial aggregation | **Confirmed for the shape — per-shard partial aggregation; its full-roster figure is superseded, because which slots a 167-fingerprint set spans is selector-dependent** | `count_rate_rollup_over_corpus_window`'s `rollup_range` stage: its 167-fingerprint owning set was computed and checked, not presumed from the shape of the query, and reaches all 4 shards; `EXPLAIN PIPELINE`: `GroupingAggregatedTransform` + `MergingAggregatedBucketTransform` — per-shard partial aggregation across all 4 shards, consistent with the co-sharding argument `docs/schemas.md` §7 makes for `log_metrics_5s` |
 
 Every row above has direct, per-stage evidence from this run against an
 **exact, pre-computed expected shard roster** — participating shards
 verified as observed, non-participating shards verified as *legitimately
 pruned* (never merely "absent, presumed fine"). No row here graduates
-ahead of its own captured evidence. This corrects three prior versions of
+ahead of its own captured evidence. **The roster that was pre-computed
+was the previous key's** (issue #498); what the method establishes — that
+the expectation was derived before the query ran and then checked against
+the observed rows — carries over, and the particular rosters it named do
+not. This corrects three prior versions of
 this report: the first graduated the LogQL row on terminal-stage-only
 evidence and left discovery unevaluated; the second added per-stage
 evidence but silently omitted the coordinator's own shard from every row
