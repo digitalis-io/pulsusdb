@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
 
-use crate::ingest::{Backpressure, FlushWait};
+use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 
 /// One `metric_samples` row's source data (docs/schemas.md §2.1), produced
 /// by a metrics receiver. No label data on this hot path — a fingerprint's
@@ -148,11 +148,21 @@ pub trait MetricSink: Send + Sync {
     /// Admits `batch` for async-mode requests: the caller responds
     /// immediately once this returns `Ok`, without waiting for the batch to
     /// be flushed.
-    fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure>;
+    ///
+    /// `push` carries the request's `Idempotency-Key`/`Retry-Attempt`
+    /// headers (issue #494); `Ok(())` does not promise rows were buffered,
+    /// because a content-identical push inside the suppression window
+    /// stores nothing.
+    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal>;
 
     /// Admits `batch` for sync-mode requests: the caller `.await`s the
-    /// returned [`FlushWait`] before responding.
-    fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure>;
+    /// returned [`FlushWait`] before responding. For a suppressed push that
+    /// wait resolves to **the original push's** outcome.
+    fn admit_flush(
+        &self,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal>;
 }
 
 #[cfg(test)]

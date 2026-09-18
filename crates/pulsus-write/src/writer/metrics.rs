@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::writer::push_dedup::DedupMetricsSnapshot;
 use crate::writer::spool::SpoolCounters;
 
 /// Per-table counters (one instance each for `log_samples`/`log_streams`).
@@ -179,6 +180,10 @@ pub struct WriterMetricsSnapshot {
     pub backfill_healed_total: u64,
     pub backfill_abandoned_total: u64,
     pub backfill_pending: u64,
+    /// Issue #494's push-suppression counters. All zero — and the two
+    /// gauges zero with them — while `PULSUS_INGEST_DEDUP` is off, because
+    /// no index exists to report.
+    pub dedup: DedupMetricsSnapshot,
 }
 
 impl SpoolCounters for WriterMetrics {
@@ -192,8 +197,13 @@ impl SpoolCounters for WriterMetrics {
 }
 
 impl WriterMetrics {
-    pub fn snapshot(&self, queue_bytes: u64) -> WriterMetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        queue_bytes: u64,
+        dedup: DedupMetricsSnapshot,
+    ) -> WriterMetricsSnapshot {
         WriterMetricsSnapshot {
+            dedup,
             samples: self.samples.snapshot(),
             streams: self.streams.snapshot(),
             patterns: self.patterns.snapshot(),
@@ -275,6 +285,9 @@ pub struct MetricWriterMetricsSnapshot {
     pub series_backfill: BackfillMetricsSnapshot,
     /// `metric_metadata` registration-backfill counters (issue #139).
     pub metadata_backfill: BackfillMetricsSnapshot,
+    /// Issue #494's push-suppression counters, all zero while
+    /// `PULSUS_INGEST_DEDUP` is off.
+    pub dedup: DedupMetricsSnapshot,
 }
 
 impl SpoolCounters for MetricWriterMetrics {
@@ -288,8 +301,13 @@ impl SpoolCounters for MetricWriterMetrics {
 }
 
 impl MetricWriterMetrics {
-    pub fn snapshot(&self, queue_bytes: u64) -> MetricWriterMetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        queue_bytes: u64,
+        dedup: DedupMetricsSnapshot,
+    ) -> MetricWriterMetricsSnapshot {
         MetricWriterMetricsSnapshot {
+            dedup,
             samples: self.samples.snapshot(),
             series: self.series.snapshot(),
             metadata: self.metadata.snapshot(),

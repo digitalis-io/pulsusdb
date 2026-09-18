@@ -7,26 +7,39 @@
 //! settlement is the taker's exclusive responsibility (architect plan
 //! amendment 2's "single settle path").
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
 use crate::writer::error::WriteError;
+use crate::writer::push_dedup::{ClaimTicket, PushDedup, PushDigest};
 
 /// One flush cycle's accumulated rows plus every waiter awaiting this
 /// generation's outcome.
 pub(crate) struct Generation<R> {
     pub rows: Vec<R>,
     pub bytes: u64,
+    /// Monotonic per-buffer identity, so a test can say which generation a
+    /// row landed in (issue #494).
+    pub id: u64,
+    /// The claims whose rows are in this generation (issue #494). Pushed
+    /// under this buffer's lock by `append`, so it cannot race `swap_out`,
+    /// and carried by the generation itself rather than by an index-side
+    /// map written afterwards. It is a [`ClaimTicket`], not a bare `Vec`:
+    /// a disposal path cannot take the rows without taking the obligation,
+    /// and a ticket dropped unsettled reports an unknown fate.
+    pub claims: ClaimTicket,
     waiters: Vec<oneshot::Sender<Result<(), WriteError>>>,
 }
 
 impl<R> Generation<R> {
-    fn new() -> Self {
+    fn new(id: u64, dedup: Option<Arc<PushDedup>>, counts_for_ack: bool) -> Self {
         Generation {
             rows: Vec::new(),
             bytes: 0,
+            id,
+            claims: ClaimTicket::new(dedup, counts_for_ack),
             waiters: Vec::new(),
         }
     }
@@ -58,19 +71,36 @@ struct Inner<R> {
     /// When the current generation's first row was appended — `None`
     /// while the generation is empty. Reset on every `swap_out`.
     oldest: Option<Instant>,
+    next_id: u64,
 }
 
 pub(crate) struct TableBuffer<R> {
     inner: Mutex<Inner<R>>,
+    /// The suppression index this table's generations report to (issue
+    /// #494). `None` on a table with no index behind it — every trace
+    /// table, and every table while `PULSUS_INGEST_DEDUP` is off.
+    dedup: Option<Arc<PushDedup>>,
+    /// Whether settling this table counts toward what the ORIGINAL sync
+    /// caller was told. `false` for `log_patterns`, which never joins the
+    /// `admit_flush` durability ack (`writer/mod.rs:566-568`).
+    counts_for_ack: bool,
 }
 
 impl<R> TableBuffer<R> {
+    /// A buffer with no suppression index behind it.
     pub(crate) fn new() -> Self {
+        Self::with_dedup(None, true)
+    }
+
+    pub(crate) fn with_dedup(dedup: Option<Arc<PushDedup>>, counts_for_ack: bool) -> Self {
         TableBuffer {
             inner: Mutex::new(Inner {
-                current: Generation::new(),
+                current: Generation::new(0, dedup.clone(), counts_for_ack),
                 oldest: None,
+                next_id: 1,
             }),
+            dedup,
+            counts_for_ack,
         }
     }
 
@@ -83,10 +113,18 @@ impl<R> TableBuffer<R> {
     /// which does not need to observe this generation's outcome. Returns
     /// `true` if this append just reached or crossed `max_bytes`; the
     /// caller should `Notify` the flush task on `true`.
-    pub(crate) fn append(&self, rows: Vec<R>, bytes: u64, max_bytes: u64) -> bool {
+    /// Returns `(should_notify, generation_id)`: `should_notify` is `true`
+    /// if this append just reached or crossed `max_bytes`.
+    pub(crate) fn append(
+        &self,
+        rows: Vec<R>,
+        bytes: u64,
+        max_bytes: u64,
+        claim: Option<PushDigest>,
+    ) -> (bool, u64) {
         let mut inner = self.lock();
-        Self::append_locked(&mut inner, rows, bytes);
-        inner.current.bytes >= max_bytes
+        Self::append_locked(&mut inner, rows, bytes, claim);
+        (inner.current.bytes >= max_bytes, inner.current.id)
     }
 
     /// As [`Self::append`], but also registers a waiter for this
@@ -97,20 +135,31 @@ impl<R> TableBuffer<R> {
         rows: Vec<R>,
         bytes: u64,
         max_bytes: u64,
-    ) -> (bool, oneshot::Receiver<Result<(), WriteError>>) {
+        claim: Option<PushDigest>,
+    ) -> (bool, u64, oneshot::Receiver<Result<(), WriteError>>) {
         let mut inner = self.lock();
-        Self::append_locked(&mut inner, rows, bytes);
+        Self::append_locked(&mut inner, rows, bytes, claim);
         let (tx, rx) = oneshot::channel();
         inner.current.waiters.push(tx);
-        (inner.current.bytes >= max_bytes, rx)
+        (
+            inner.current.bytes >= max_bytes,
+            inner.current.id,
+            rx,
+        )
     }
 
-    fn append_locked(inner: &mut Inner<R>, rows: Vec<R>, bytes: u64) {
+    /// Issue #494: the claim key is pushed onto THIS generation's ticket
+    /// while the buffer lock is still held, so `swap_out` cannot take and
+    /// settle the generation between the append and the registration.
+    fn append_locked(inner: &mut Inner<R>, rows: Vec<R>, bytes: u64, claim: Option<PushDigest>) {
         if inner.current.is_empty() && inner.oldest.is_none() {
             inner.oldest = Some(Instant::now());
         }
         inner.current.rows.extend(rows);
         inner.current.bytes += bytes;
+        if let Some(key) = claim {
+            inner.current.claims.push(key);
+        }
     }
 
     /// `true` when the current generation should flush: at/over
@@ -131,7 +180,10 @@ impl<R> TableBuffer<R> {
             return None;
         }
         inner.oldest = None;
-        Some(std::mem::replace(&mut inner.current, Generation::new()))
+        let id = inner.next_id;
+        inner.next_id += 1;
+        let fresh = Generation::new(id, self.dedup.clone(), self.counts_for_ack);
+        Some(std::mem::replace(&mut inner.current, fresh))
     }
 }
 
@@ -144,8 +196,8 @@ mod tests {
     #[test]
     fn append_accumulates_rows_and_bytes() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1, 2], 10, 1_000);
-        buf.append(vec![3], 5, 1_000);
+        buf.append(vec![1, 2], 10, 1_000, None);
+        buf.append(vec![3], 5, 1_000, None);
         let generation = buf.swap_out().expect("non-empty generation");
         assert_eq!(generation.rows, vec![1, 2, 3]);
         assert_eq!(generation.bytes, 15);
@@ -154,8 +206,8 @@ mod tests {
     #[test]
     fn append_reports_crossing_the_size_threshold() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        assert!(!buf.append(vec![1], 5, 10));
-        assert!(buf.append(vec![2], 5, 10));
+        assert!(!buf.append(vec![1], 5, 10, None).0);
+        assert!(buf.append(vec![2], 5, 10, None).0);
     }
 
     #[test]
@@ -167,14 +219,14 @@ mod tests {
     #[test]
     fn should_flush_is_true_once_bytes_reach_the_threshold() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1], 100, 100);
+        buf.append(vec![1], 100, 100, None);
         assert!(buf.should_flush(100, Duration::from_secs(3600)));
     }
 
     #[test]
     fn should_flush_is_true_once_the_generation_is_older_than_max_age() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1], 1, u64::MAX);
+        buf.append(vec![1], 1, u64::MAX, None);
         assert!(buf.should_flush(u64::MAX, Duration::from_millis(0)));
     }
 
@@ -188,12 +240,12 @@ mod tests {
         let cap = pulsus_config::BATCH_BYTES_CEILING;
         let no_age = Duration::from_secs(3600);
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1], cap - 1, u64::MAX);
+        buf.append(vec![1], cap - 1, u64::MAX, None);
         assert!(
             !buf.should_flush(cap, no_age),
             "one byte under the ceiling must hold"
         );
-        buf.append(vec![2], 1, u64::MAX);
+        buf.append(vec![2], 1, u64::MAX, None);
         assert!(
             buf.should_flush(cap, no_age),
             "the flush decision must fire at the accepted maximum"
@@ -210,7 +262,7 @@ mod tests {
     fn age_flush_still_fires_at_the_max_accepted_batch_ms() {
         let max_age = Duration::from_millis(pulsus_config::BATCH_MS_CEILING);
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1], 1, u64::MAX);
+        buf.append(vec![1], 1, u64::MAX, None);
 
         // Monotonic history is measured from boot on Linux; the build
         // preceding this test run is already far longer than 200 s.
@@ -240,7 +292,7 @@ mod tests {
     #[test]
     fn swap_out_leaves_a_fresh_empty_generation_behind() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        buf.append(vec![1], 1, 1_000);
+        buf.append(vec![1], 1, 1_000, None);
         assert!(buf.swap_out().is_some());
         assert!(buf.swap_out().is_none());
     }
@@ -248,8 +300,8 @@ mod tests {
     #[tokio::test]
     async fn settle_resolves_every_joined_waiter_with_the_same_result() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        let (_, rx1) = buf.append_and_wait(vec![1], 1, 1_000);
-        let (_, rx2) = buf.append_and_wait(vec![2], 1, 1_000);
+        let (_, _, rx1) = buf.append_and_wait(vec![1], 1, 1_000, None);
+        let (_, _, rx2) = buf.append_and_wait(vec![2], 1, 1_000, None);
         let generation = buf.swap_out().expect("non-empty generation");
         generation.settle(Ok(()));
         assert_eq!(rx1.await.unwrap(), Ok(()));
@@ -259,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn settle_with_an_error_resolves_every_waiter_to_that_error() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        let (_, rx) = buf.append_and_wait(vec![1], 1, 1_000);
+        let (_, _, rx) = buf.append_and_wait(vec![1], 1, 1_000, None);
         let generation = buf.swap_out().expect("non-empty generation");
         generation.settle(Err(WriteError::ShuttingDown));
         assert_eq!(rx.await.unwrap(), Err(WriteError::ShuttingDown));
@@ -268,7 +320,7 @@ mod tests {
     #[test]
     fn dropping_a_waiters_receiver_does_not_panic_on_settle() {
         let buf: TableBuffer<u32> = TableBuffer::new();
-        let (_, rx) = buf.append_and_wait(vec![1], 1, 1_000);
+        let (_, _, rx) = buf.append_and_wait(vec![1], 1, 1_000, None);
         drop(rx);
         let generation = buf.swap_out().expect("non-empty generation");
         generation.settle(Ok(()));

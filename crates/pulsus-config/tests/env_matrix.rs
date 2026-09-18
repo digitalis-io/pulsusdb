@@ -233,6 +233,21 @@ const ROWS: &[Row] = &[
         check: |c| !c.writer.log_patterns,
     },
     Row {
+        var: "PULSUS_INGEST_DEDUP",
+        value: "false",
+        check: |c| !c.writer.ingest_dedup,
+    },
+    Row {
+        var: "PULSUS_INGEST_DEDUP_WINDOW",
+        value: "90s",
+        check: |c| c.writer.ingest_dedup_window.0 == Duration::from_secs(90),
+    },
+    Row {
+        var: "PULSUS_INGEST_DEDUP_MAX_BYTES",
+        value: "32MiB",
+        check: |c| c.writer.ingest_dedup_max_bytes == ByteSize(32 * 1024 * 1024),
+    },
+    Row {
         var: "PULSUS_DISCOVER_LOG_LEVELS",
         value: "false",
         check: |c| !c.writer.discover_log_levels,
@@ -442,8 +457,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        78,
-        "docs/configuration.md §§1-8 document exactly 78 variables"
+        81,
+        "docs/configuration.md §§1-8 document exactly 81 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

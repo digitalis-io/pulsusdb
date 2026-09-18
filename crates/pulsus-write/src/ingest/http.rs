@@ -57,7 +57,7 @@ use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
-use crate::ingest::{Backpressure, LogSink};
+use crate::ingest::{AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders};
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
 use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
@@ -69,6 +69,16 @@ use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_w
 /// flush confirmation beyond reading `X-Pulsus-Async`"), so sync is the
 /// hardcoded default for a missing header.
 const ASYNC_HEADER: &str = "x-pulsus-async";
+
+/// `Idempotency-Key` (issue #494): a client that must have two identical
+/// bodies stored separately says so with two different values here. Absent,
+/// a push is identified by its own content.
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// `Retry-Attempt` (issue #494): the attempt number, `1` upward. It is
+/// never a suppression key — it only labels the duplicate counter with
+/// whether the client declared the retry.
+const RETRY_ATTEMPT_HEADER: &str = "retry-attempt";
 
 const PROTOBUF_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/x-protobuf");
 
@@ -120,7 +130,7 @@ pub async fn ingest(
     // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
     // reject, the same classification a decode failure gets. `ingest` returns
     // `Response` (not `Result`), so this matches rather than `?`-propagates.
-    let mut parsed = match otlp_logs::parse(&request, now_ns, settings) {
+    let parsed = match otlp_logs::parse(&request, now_ns, settings) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
@@ -132,7 +142,10 @@ pub async fn ingest(
     // `push.OTLPError` writer turns the accumulated `400` into a
     // `google.rpc.Status` (`pkg/distributor/http.go:28-33 @ v3.7.4`) — and the
     // streams that passed are written first, as on the Loki-push path.
-    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // Cloned, not taken (issue #494): the writer needs to see that this
+    // parse carried stream-local failures, because a request whose admitted
+    // subset is not the whole request is never claimed.
+    let stream_errors = parsed.stream_errors.clone();
     // "Return early if none of the streams contained entries"
     // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`).
     if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
@@ -142,9 +155,10 @@ pub async fn ingest(
             group_stream_errors(stream_errors),
         );
     }
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, push) {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::ACCEPTED, rejected, rejected_message)
             }
@@ -153,11 +167,11 @@ pub async fn ingest(
                 3,
                 group_stream_errors(stream_errors),
             ),
-            Err(Backpressure) => backpressure_response(),
+            Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::OK, rejected, rejected_message)
@@ -169,7 +183,7 @@ pub async fn ingest(
             ),
             Err(err) => error_response(err),
         },
-        Err(Backpressure) => backpressure_response(),
+        Err(refusal) => otlp_refusal_response(refusal),
     }
 }
 
@@ -226,19 +240,21 @@ pub async fn ingest_metrics(
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
 
+    let push = push_headers(&headers);
+
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, push) {
             Ok(()) => export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
-            Err(Backpressure) => backpressure_response(),
+            Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_metrics_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
         },
-        Err(Backpressure) => backpressure_response(),
+        Err(refusal) => otlp_refusal_response(refusal),
     }
 }
 
@@ -360,19 +376,21 @@ pub async fn ingest_remote_write(
         Err(err) => return remote_write_error_response(&err),
     };
 
+    let push = push_headers(&headers);
+
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
-            Err(Backpressure) => remote_write_backpressure_response(),
+            Err(refusal) => remote_write_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
             Err(err) => remote_write_error_response(&err),
         },
-        Err(Backpressure) => remote_write_backpressure_response(),
+        Err(refusal) => remote_write_refusal_response(refusal),
     }
 }
 
@@ -421,14 +439,16 @@ pub async fn ingest_loki_push(
         Err(err) => return loki_error_response(&err),
     };
 
-    let mut parsed = match decode_loki_push(&headers, &body, now_ns, settings) {
+    let parsed = match decode_loki_push(&headers, &body, now_ns, settings) {
         Ok(parsed) => parsed,
         Err(err) => return loki_error_response(&err),
     };
     // Stream-local label-bound failures (issue #374): the streams that passed
     // are still admitted, and the `400` is answered after they are — see
     // [`group_stream_errors`].
-    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // Cloned, not taken (issue #494) — see [`ingest`] for why the writer
+    // must still see them.
+    let stream_errors = parsed.stream_errors.clone();
     // "Return early if none of the streams contained entries"
     // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`): when every stream
     // in the request failed there is nothing to write, so the sink is not
@@ -436,22 +456,23 @@ pub async fn ingest_loki_push(
     if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
         return loki_stream_errors_response(stream_errors);
     }
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, push) {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
             Ok(()) => loki_stream_errors_response(stream_errors),
-            Err(Backpressure) => loki_backpressure_response(),
+            Err(refusal) => loki_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
             Ok(()) => loki_stream_errors_response(stream_errors),
             Err(err) => loki_error_response(&err),
         },
-        Err(Backpressure) => loki_backpressure_response(),
+        Err(refusal) => loki_refusal_response(refusal),
     }
 }
 
@@ -712,6 +733,13 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
 }
 
+/// Reads issue #494's two push-identity headers. Header reads only — every
+/// decision about what they mean lives in the writer.
+fn push_headers(headers: &HeaderMap) -> PushHeaders {
+    let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    PushHeaders::from_values(value(IDEMPOTENCY_KEY_HEADER), value(RETRY_ATTEMPT_HEADER))
+}
+
 /// `true` when `X-Pulsus-Async: 1` selects async-mode admission.
 fn is_async(headers: &HeaderMap) -> bool {
     headers
@@ -884,6 +912,48 @@ fn error_response(err: LogsIngestError) -> Response {
 /// plan amendment 2). Not routed through [`classify`]: `Backpressure`
 /// originates from the sink seam, not from parsing the request, so it is
 /// not a variant of `LogsIngestError`.
+/// Issue #494: the three refusals the suppression index adds, answered in
+/// the OTLP receivers' own error container. Two are the same `429` the
+/// queue's backpressure gets — nothing was stored either way, and the
+/// client's retry is answered normally; the third is a client error.
+fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            backpressure_response()
+        }
+        AdmitRefusal::KeyReused => {
+            status_response(StatusCode::BAD_REQUEST, 3, KEY_REUSED_MESSAGE.to_string())
+        }
+    }
+}
+
+/// The remote-write receiver's form of [`otlp_refusal_response`] — one
+/// plain-text error writer at every status, never a protobuf body.
+fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            remote_write_backpressure_response()
+        }
+        AdmitRefusal::KeyReused => go_http_error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{KEY_REUSED_MESSAGE}\n"),
+        ),
+    }
+}
+
+/// The Loki push receiver's form of [`otlp_refusal_response`].
+fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            loki_backpressure_response()
+        }
+        AdmitRefusal::KeyReused => loki_plain_text_response(
+            StatusCode::BAD_REQUEST,
+            format!("{KEY_REUSED_MESSAGE}\n"),
+        ),
+    }
+}
+
 fn backpressure_response() -> Response {
     status_response(
         StatusCode::TOO_MANY_REQUESTS,

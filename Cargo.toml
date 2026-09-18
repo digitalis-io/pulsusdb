@@ -75,7 +75,9 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # immediately), and `naive-cityhash`/`cityhash-102-rs` panic on integer
 # overflow under debug-assertions despite matching in release. No vendored
 # port was needed.
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# `xxh3` (issue #494): the 128-bit streaming digest the push-suppression
+# index keys on. Same crate, one more feature — no new dependency.
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 ch_cityhash102 = "0.1"
 # `raw_value` is a feature of serde_json itself and pulls in no further
 # dependency. The Loki JSON push decoder uses it to capture a value it discards
