@@ -35,10 +35,16 @@ pub struct UnixNano(pub i64);
 /// silently matches the row holding `18446744073709551616`, and
 /// `fingerprint IN (<bare list>)` prunes every granule and returns nothing.
 /// Measured on ClickHouse 26.3.29.7. The only exact form is
-/// `toUInt128('<decimal>')`, so the only way to spell a fingerprint in SQL
-/// is [`FpLiteral`], minted by [`Fingerprint::sql_literal`]. `Fingerprint`
-/// itself implements neither `Display` nor `ToString`, so the wrong form is
-/// a compile error rather than a wrong answer.
+/// `toUInt128('<decimal>')`, and [`FpLiteral`] — minted by
+/// [`Fingerprint::sql_literal`] — is **the only type in the tree whose
+/// `Display` converts a typed fingerprint value into text**. The scope of
+/// that sentence is every tracked Rust file, searched; two other `Display`
+/// impls do emit fingerprint SQL — `SqlExpr`
+/// (`crates/pulsus-read/src/compile/fold.rs:83`) and `Pred` (`:532`) — and
+/// both `write_str` a `String` rendered earlier, so they carry text rather
+/// than converting a value. `Fingerprint` itself implements neither
+/// `Display` nor `ToString`, so writing one straight into SQL is a compile
+/// error rather than a wrong answer.
 ///
 /// This is `MonthLiteral`'s mechanism
 /// (`crates/pulsus-read/src/logql/predicate.rs:363`): the
@@ -111,7 +117,9 @@ impl Fingerprint {
     }
 
     /// The mint. The whole public surface besides [`Fingerprint::from_raw`],
-    /// and the only way a fingerprint reaches SQL.
+    /// and the one conversion from a fingerprint value into SQL text.
+    /// Text it has already produced can be carried on in a `String`, which
+    /// is what the two `Display` impls named above do.
     pub const fn sql_literal(self) -> FpLiteral {
         FpLiteral(self)
     }
