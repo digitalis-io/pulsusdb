@@ -45,9 +45,11 @@
 //! that *should* exist but was lost (a genuine evidence-capture bug). This
 //! module closes that ambiguity by computing the **expected** participating
 //! shard set client-side, the same way ClickHouse's Distributed engine
-//! would: `fingerprint % total_weight` against a cumulative-weight
-//! slot→shard map built from `system.clusters` (docs/schemas.md §7's
-//! sharding key is the bare `fingerprint` column, no hash wrapper), then
+//! would: `cityHash64(fingerprint) % total_weight` against a
+//! cumulative-weight slot→shard map built from `system.clusters`
+//! (docs/schemas.md §7's logs sharding key, issue #498 — the column is
+//! `UInt128`, and a `Distributed` sharding key must evaluate to an
+//! integer type ClickHouse accepts, so the key hashes the column), then
 //! asserts the **observed** participating set (shards that did nonzero
 //! storage work) is *exactly* `expected` — neither a missing owner (FAIL:
 //! a lost row) nor an unexpected participant (FAIL: a pruning/mapping
@@ -57,7 +59,8 @@
 //! [`StageEvidence::shards`] — participating shards carry their real
 //! `system.query_log` row; shards correctly excluded by pruning carry a
 //! synthesized `role = "expected-pruned"` entry with `pruned_reason`
-//! spelling out the `fp % total_weight` derivation. The full roster is
+//! spelling out the `cityHash64(fp) % total_weight` derivation. The full
+//! roster is
 //! therefore always **accounted for** (participating + expected-pruned),
 //! even though it is not always **participating**.
 
@@ -70,6 +73,16 @@ use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 use super::dataset::DatasetSummary;
+use pulsus_model::{Fingerprint, FpLiteral};
+
+/// Mints raw identities read back from the database into the literal form
+/// the product's builders take (issue #498).
+fn sql_literals(fps: &[u128]) -> Vec<FpLiteral> {
+    fps.iter()
+        .map(|v| Fingerprint::from_raw(*v).sql_literal())
+        .collect()
+}
+
 use super::query_log::{
     QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log, tagged_settings,
 };
@@ -83,7 +96,8 @@ use super::query_log::{
 /// (`is_initial_query = 0`, a participating non-initiator shard), or
 /// `"expected-pruned"` (a shard `optimize_skip_unused_shards` correctly
 /// excluded — `read_rows`/`read_bytes`/`selected_marks` are `0` and
-/// `pruned_reason` explains the `fp % total_weight` derivation). See the
+/// `pruned_reason` explains the `cityHash64(fp) % total_weight`
+/// derivation). See the
 /// module doc comment's evidence-schema note for the totals-overlap
 /// caveat: the `coordinator-local` row is the *same* row a stage's
 /// top-level `read_rows`/etc. come from, so summing this vec's
@@ -146,12 +160,18 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct FingerprintRow {
-    fingerprint: u64,
+    /// The raw 128-bit identity, decoded as the integer rather than as a
+    /// `Fingerprint` (issue #498): this scenario models the `Distributed`
+    /// sharding expression, which is `cityHash64(fingerprint) %
+    /// total_weight` over the stored value's bytes. The seal is about
+    /// rendering, and every statement this file builds still goes through
+    /// the mint below.
+    fingerprint: u128,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct StreamMetaRow {
-    fingerprint: u64,
+    fingerprint: u128,
     service: String,
     #[allow(dead_code)]
     labels: String,
@@ -160,7 +180,7 @@ struct StreamMetaRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SampleRow {
     #[allow(dead_code)]
-    fingerprint: u64,
+    fingerprint: u128,
     #[allow(dead_code)]
     timestamp_ns: i64,
     #[allow(dead_code)]
@@ -174,7 +194,7 @@ struct SampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MetricRow {
     #[allow(dead_code)]
-    fingerprint: u64,
+    fingerprint: u128,
     #[allow(dead_code)]
     step: i64,
     #[allow(dead_code)]
@@ -270,13 +290,58 @@ pub(crate) struct ClusterTopology {
     shard_to_hostname: std::collections::HashMap<u32, String>,
 }
 
+/// The logs family's sharding key, computed client-side: the 16
+/// little-endian bytes of the `UInt128` fingerprint through ClickHouse's
+/// `cityHash64` (docs/schemas.md §7, issue #498).
+///
+/// **The byte rule was measured, not assumed.** ClickHouse's `cityHash64`
+/// over a numeric argument and over that number's `reinterpretAsFixedString`
+/// are the same value at every vector tried, which is what makes hashing
+/// `to_le_bytes()` the right client-side model:
+///
+/// ```text
+///   SELECT v,
+///          cityHash64(toUInt128(v)),
+///          cityHash64(reinterpretAsFixedString(toUInt128(v)))
+///   FROM (SELECT arrayJoin(['0', '1', '18446744073709551616',
+///                           '18446744073709551617',
+///                           '340282366920938463463374607431768211455',
+///                           '324875417358418231230721791952787510312']) AS v)
+///
+///   0                                         18251889321102256092  (both)
+///   1                                           201160255169616649  (both)
+///   18446744073709551616                      17769502560057329073  (both)
+///   18446744073709551617                       3873931437475153908  (both)
+///   340282366920938463463374607431768211455   11156510505809607899  (both)
+///   324875417358418231230721791952787510312   17369390617107867318  (both)
+/// ```
+///
+/// Measured on ClickHouse 26.3.29.7. The same six vectors are pinned in
+/// this module's unit tests, so a drifting client-side hash fails the
+/// build rather than silently deriving the wrong owner.
+pub(crate) fn logs_shard_key(fingerprint: u128) -> u64 {
+    pulsus_model::raw_cityhash64(&fingerprint.to_le_bytes())
+}
+
 impl ClusterTopology {
-    /// ClickHouse's Distributed engine shard selection for a
-    /// non-negative-integer sharding-key expression (our bare
-    /// `fingerprint` column, docs/schemas.md §7 — no hash wrapper):
-    /// `slots[value % total_weight]`.
-    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u64) -> u32 {
-        let slot = (fingerprint % self.total_weight) as usize;
+    /// The shard the logs family's `Distributed` engine places a
+    /// fingerprint on: `slots[cityHash64(fingerprint) % total_weight]`.
+    ///
+    /// The hash is not decoration. `fingerprint` is `UInt128` since issue
+    /// #498, and a `Distributed` sharding key must evaluate to an integer
+    /// type ClickHouse accepts — the bare column creates and then refuses
+    /// every insert with `Code: 53 … Sharding key expression does not
+    /// evaluate to an integer type`. A roster derived from the bare value
+    /// would name a different shard from the one the server writes to.
+    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u128) -> u32 {
+        self.shard_for_key_value(logs_shard_key(fingerprint))
+    }
+
+    /// The slot step alone, for a key that has already been hashed — the
+    /// traces family's `cityHash64(trace_id)`, which hashes a
+    /// `FixedString(16)` rather than an integer column.
+    pub(crate) fn shard_for_key_value(&self, value: u64) -> u32 {
+        let slot = (value % self.total_weight) as usize;
         self.slots[slot]
     }
 
@@ -431,8 +496,69 @@ pub(crate) async fn load_cluster_topology(
 
 #[cfg(test)]
 mod cluster_topology_tests {
-    use super::build_shard_maps;
+    use super::{build_shard_maps, logs_shard_key};
     use std::collections::BTreeSet;
+
+    /// **The client-side logs sharding key is the server's, at six
+    /// vectors.** A drifting hash here does not fail loudly on its own —
+    /// it derives a different owner from the one ClickHouse writes to, and
+    /// the roster assertion then reports a missing owner or an unexpected
+    /// participant that has nothing to do with evidence capture.
+    ///
+    /// The right-hand values came from the server, not from this code:
+    ///
+    /// ```text
+    ///   SELECT v, cityHash64(toUInt128(v))
+    ///   FROM (SELECT arrayJoin([...the six below...]) AS v)
+    /// ```
+    ///
+    /// run against ClickHouse 26.3.29.7. Boundary values are deliberate:
+    /// zero, one, `2^64` and `2^64 + 1` (where the low word wraps into the
+    /// high one), the 128-bit maximum, and one composed fingerprint from
+    /// the issue's own fixture.
+    #[test]
+    fn the_client_side_logs_shard_key_matches_the_server_at_six_vectors() {
+        let vectors: [(u128, u64); 6] = [
+            (0, 18_251_889_321_102_256_092),
+            (1, 201_160_255_169_616_649),
+            (18_446_744_073_709_551_616, 17_769_502_560_057_329_073),
+            (18_446_744_073_709_551_617, 3_873_931_437_475_153_908),
+            (u128::MAX, 11_156_510_505_809_607_899),
+            (
+                324_875_417_358_418_231_230_721_791_952_787_510_312,
+                17_369_390_617_107_867_318,
+            ),
+        ];
+        for (fp, want) in vectors {
+            assert_eq!(
+                logs_shard_key(fp),
+                want,
+                "cityHash64 drift at {fp}: the client would derive a different owner from the \
+                 shard the server writes to"
+            );
+        }
+    }
+
+    /// **The hash is what separates the two words**, which is the whole
+    /// reason the key is not the column. Two fingerprints differing only
+    /// in the high word are the same value modulo any power of two, so the
+    /// withdrawn bare-column rule placed them on one shard; the hashed key
+    /// separates them.
+    #[test]
+    fn two_fingerprints_differing_only_above_the_low_word_hash_apart() {
+        let low = 7u128;
+        let high = (1u128 << 64) | 7u128;
+        assert_eq!(
+            low % 2,
+            high % 2,
+            "the withdrawn rule cannot tell these two apart"
+        );
+        assert_ne!(
+            logs_shard_key(low),
+            logs_shard_key(high),
+            "the hashed key must read the high word"
+        );
+    }
 
     fn shards(nums: &[u32]) -> BTreeSet<u32> {
         nums.iter().copied().collect()
@@ -541,7 +667,7 @@ enum StageRoster {
     /// predicate — the expected participants are exactly the shards
     /// owning one or more of these fingerprints under
     /// [`ClusterTopology::shard_for_fingerprint`].
-    Fingerprints(Vec<u64>),
+    Fingerprints(Vec<u128>),
 }
 
 /// One executed stage of a shape's read: its logical name
@@ -562,7 +688,8 @@ struct StageRef {
 }
 
 /// Builds the `expected-pruned` derivation string for `shard_num` — the
-/// exact `fp % total_weight` reasoning `optimize_skip_unused_shards` uses
+/// exact `cityHash64(fp) % total_weight` reasoning
+/// `optimize_skip_unused_shards` uses
 /// to exclude it, so a reviewer can verify the pruning by hand rather than
 /// take the harness's word for it.
 fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u32) -> String {
@@ -573,20 +700,20 @@ fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u3
             format!("shard {shard_num} unexpectedly excluded from a Full-roster stage")
         }
         StageRoster::Fingerprints(fingerprints) => {
-            let slots: Vec<u64> = fingerprints
-                .iter()
-                .map(|fp| fp % topology.total_weight)
-                .collect();
+            let hashes: Vec<u64> = fingerprints.iter().map(|fp| logs_shard_key(*fp)).collect();
+            let slots: Vec<u64> = hashes.iter().map(|h| h % topology.total_weight).collect();
             let owning_shards: std::collections::BTreeSet<u32> = slots
                 .iter()
                 .map(|slot| topology.slots[*slot as usize])
                 .collect();
             format!(
                 "optimize_skip_unused_shards pruned shard {shard_num}: none of the {} queried \
-                 fingerprints map to it (fingerprint % total_weight={} over slots {:?} resolves \
-                 to owning shards {:?} — shard {shard_num} is not among them)",
+                 fingerprints map to it (cityHash64(fingerprint) % total_weight={} over hashes \
+                 {:?} and slots {:?} resolves to owning shards {:?} — shard {shard_num} is not \
+                 among them)",
                 fingerprints.len(),
                 topology.total_weight,
+                hashes,
                 slots,
                 owning_shards
             )
@@ -624,6 +751,42 @@ fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u3
 /// disproportionately larger than any remote row would mean a
 /// cluster-wide total row was captured instead of the coordinator's own
 /// local-only read).
+/// Cross-checks the client-side logs sharding key against the live server
+/// for every fingerprint a roster is derived from.
+///
+/// The client model and the server's `Distributed` engine must agree on
+/// one number per fingerprint. If they do not, the roster assertion still
+/// fires — but it reports a missing owner or an unexpected participant,
+/// which is the same message a genuinely lost `system.query_log` row
+/// produces. This separates the two causes before the roster is built.
+async fn cross_check_logs_shard_key(
+    client: &ChClient,
+    fingerprints: &[u128],
+) -> anyhow::Result<()> {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct HashRow {
+        h: u64,
+    }
+    for fp in fingerprints {
+        let sql = format!("SELECT cityHash64(toUInt128('{fp}')) AS h");
+        let mut stream = client
+            .query_stream::<HashRow>(&sql, &QuerySettings::new())
+            .await?;
+        let server = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no cityHash64 row for fingerprint {fp}"))??
+            .h;
+        let client_side = logs_shard_key(*fp);
+        anyhow::ensure!(
+            server == client_side,
+            "logs sharding-key drift for fingerprint {fp}: client {client_side} != server \
+             {server}; every shard roster derived from this value would name the wrong shard"
+        );
+    }
+    Ok(())
+}
+
 async fn capture_stage_evidence(
     client: &ChClient,
     cluster: &str,
@@ -668,10 +831,18 @@ async fn capture_stage_evidence(
 
     let expected: std::collections::BTreeSet<u32> = match &stage.roster {
         StageRoster::Full => topology.all_shards(),
-        StageRoster::Fingerprints(fingerprints) => fingerprints
-            .iter()
-            .map(|fp| topology.shard_for_fingerprint(*fp))
-            .collect(),
+        StageRoster::Fingerprints(fingerprints) => {
+            // The roster is only as good as the client's copy of the
+            // server's sharding key. Ask the server for the same hash over
+            // the same values before deriving anything from it: a drift
+            // fails here, naming both numbers, rather than surfacing as a
+            // missing owner that reads like a lost `system.query_log` row.
+            cross_check_logs_shard_key(client, fingerprints).await?;
+            fingerprints
+                .iter()
+                .map(|fp| topology.shard_for_fingerprint(*fp))
+                .collect()
+        }
     };
     let observed: std::collections::BTreeSet<u32> = by_shard
         .iter()
@@ -944,7 +1115,7 @@ async fn resolve_fingerprints(
     stage1_sql: &str,
     query_id: &str,
     dist: bool,
-) -> anyhow::Result<Vec<u64>> {
+) -> anyhow::Result<Vec<u128>> {
     let settings = reader_settings(dist, query_id, ProductMode::Flat);
     let mut stream = client
         .query_stream::<FingerprintRow>(stage1_sql, &settings)
@@ -1053,7 +1224,7 @@ async fn run_streams_once(
     }
 
     let s2_id = format!("{base_id}-s2");
-    let stage2_sql = sql::stage2(&tables.streams, &fingerprints);
+    let stage2_sql = sql::stage2(&tables.streams, &sql_literals(&fingerprints));
     let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
     stages.push(StageRef {
         stage: "hydration",
@@ -1075,7 +1246,7 @@ async fn run_streams_once(
     let sql3 = sql::stage3(
         &tables.samples,
         &escaped,
-        &fingerprints,
+        &sql_literals(&fingerprints),
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -1499,7 +1670,7 @@ async fn run_metric_shape(
         }
 
         let s2_id = format!("{query_id}-s2");
-        let stage2_sql = sql::stage2(&mp.streams_table, &fingerprints);
+        let stage2_sql = sql::stage2(&mp.streams_table, &sql_literals(&fingerprints));
         let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
         stages.push(StageRef {
             stage: "hydration",
@@ -1528,7 +1699,7 @@ async fn run_metric_shape(
         let sql3 = sql::metric_range(
             source,
             &services,
-            &fingerprints,
+            &sql_literals(&fingerprints),
             TimeWindow {
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,

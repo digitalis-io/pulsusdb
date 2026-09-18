@@ -45,7 +45,7 @@ The schema's PromQL obligation is **fetch shapes, plus one reduction**: full Pro
 ```sql
 CREATE TABLE metric_samples (
     metric_name  LowCardinality(String),
-    fingerprint  UInt64   CODEC(Delta(8), ZSTD(1)),
+    fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),
     unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
     value        Float64  CODEC(Gorilla, ZSTD(1))
 ) ENGINE = MergeTree
@@ -65,7 +65,7 @@ SETTINGS ttl_only_drop_parts = 1;
 ```sql
 CREATE TABLE metric_series (
     metric_name  LowCardinality(String),
-    fingerprint  UInt64  CODEC(Delta(8), ZSTD(1)),
+    fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),
     unix_milli   Int64   CODEC(Delta(8), ZSTD(1)),   -- hour-bucketed "last active"
     labels       String  CODEC(ZSTD(5))              -- canonical JSON, sorted keys
 ) ENGINE = MergeTree
@@ -90,7 +90,7 @@ At the design-target cardinality (millions of active series), **label resolution
        metric_name  LowCardinality(String),
        key          LowCardinality(String),
        val          String,
-       fingerprint  UInt64
+       fingerprint  UInt128
    ) ENGINE = ReplacingMergeTree
    PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(bucket))
    ORDER BY (metric_name, key, val, bucket, fingerprint);
@@ -138,7 +138,7 @@ Downsampling happens **entirely inside ClickHouse** with classic insert-triggere
 ```sql
 CREATE TABLE metric_samples_5m (
     metric_name   LowCardinality(String),
-    fingerprint   UInt64                                 CODEC(Delta(8), ZSTD(1)),
+    fingerprint   UInt128                                 CODEC(Delta(8), ZSTD(1)),
     ts            DateTime                               CODEC(DoubleDelta, ZSTD(1)),
     val_min       SimpleAggregateFunction(min, Float64)  CODEC(Gorilla, ZSTD(1)),
     val_max       SimpleAggregateFunction(max, Float64)  CODEC(Gorilla, ZSTD(1)),
@@ -209,7 +209,7 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
 
 ```sql
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS lookback,
-     [101, 205, 990] AS fps,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, any(flags) AS flags
 FROM (
@@ -300,7 +300,7 @@ The M7 extension foreshadowed in §2 lands as a **separate, dedicated samples ta
 ```sql
 CREATE TABLE metric_hist_samples (
     metric_name        LowCardinality(String),
-    fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),
+    fingerprint        UInt128   CODEC(Delta(8), ZSTD(1)),
     unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),
     schema             Int8     CODEC(ZSTD(1)),   -- exponential schema (−4..8); −53 = NHCB
     zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),
@@ -355,7 +355,7 @@ ALTER TABLE metric_series ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;
 ```sql
 CREATE TABLE log_streams (
     month        Date,                          -- toStartOfMonth(first write in month)
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     service      LowCardinality(String),        -- resource service.name ('' if absent)
     labels       String  CODEC(ZSTD(5)),        -- canonical JSON, sorted keys
     updated_ns   Int64
@@ -367,7 +367,7 @@ CREATE TABLE log_streams_idx (
     month        Date,
     key          LowCardinality(String),
     val          String,
-    fingerprint  UInt64
+    fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
 ORDER BY (key, val, fingerprint);
@@ -378,7 +378,7 @@ ORDER BY (key, val, fingerprint);
 ```sql
 CREATE TABLE log_samples (
     service       LowCardinality(String),
-    fingerprint   UInt64,
+    fingerprint   UInt128,
     timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
     severity      Int8    DEFAULT 0,             -- OTel SeverityNumber (0 = unset)
     body          String  CODEC(ZSTD(1)),
@@ -398,7 +398,7 @@ SETTINGS ttl_only_drop_parts = 1;
 -- (default 5s) sets the bucket size; the table is named for it (log_metrics_5s
 -- by default) and the MV bucket expression is rendered from it.
 CREATE TABLE log_metrics_5s (
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, {res_ns}) * {res_ns}
     count        SimpleAggregateFunction(sum, UInt64),
     bytes        SimpleAggregateFunction(sum, UInt64)
@@ -417,7 +417,7 @@ ORDER BY (fingerprint, bucket_ns);
 -- function of the line, so counts sum correctly across batches, shards,
 -- replicas, and retries. Kill-switch: PULSUS_LOG_PATTERNS (default true).
 CREATE TABLE log_patterns (
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, 10s) * 10s
     pattern      String  CODEC(ZSTD(1)),
     count        SimpleAggregateFunction(sum, UInt64)
@@ -952,7 +952,7 @@ LIMIT {SERVICE_GRAPH_MAX_EDGES + 1}
 CREATE TABLE profile_samples (
     type_id        LowCardinality(String),        -- e.g. process_cpu:cpu:nanoseconds:cpu:nanoseconds
     service        LowCardinality(String),
-    fingerprint    UInt64,
+    fingerprint    UInt128,
     timestamp_ns   Int64  CODEC(DoubleDelta, ZSTD(1)),
     duration_ns    Int64,
     payload_type   Int8,
@@ -969,7 +969,7 @@ SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE profile_series (
     month        Date,
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     type_id      LowCardinality(String),
     service      LowCardinality(String),
     labels       String CODEC(ZSTD(5)),
@@ -982,7 +982,7 @@ CREATE TABLE profile_series_idx (
     month        Date,
     key          LowCardinality(String),
     val          String,
-    fingerprint  UInt64
+    fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
 ORDER BY (key, val, fingerprint);
@@ -1030,7 +1030,7 @@ CREATE TABLE mv_checksums (
 ORDER BY mv_name;
 ```
 
-**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
+**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration is permitted only while the condition that allows it holds — no tagged release, no persistent deployments, databases created fresh; the `fingerprint` widening to `UInt128` (issue #498, migrations 4, 5, 6, 7, 8, 9, 23 and 29) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
 
 ---
 
@@ -1041,9 +1041,9 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 | Table | Sharding key | Why |
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
-| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in) |
+| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in)  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
 | `trace_spans`, `trace_attrs_idx`, `trace_edges` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
-| `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
+| `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
 Fan-out analysis for the canonical operations:
@@ -1062,7 +1062,7 @@ Every local table gets a Distributed wrapper of this shape (the schema controlle
 
 ```sql
 CREATE TABLE log_samples_dist AS log_samples
-ENGINE = Distributed('{cluster}', pulsus, log_samples, fingerprint);
+ENGINE = Distributed('{cluster}', pulsus, log_samples, cityHash64(fingerprint));
 
 CREATE TABLE metric_samples_dist AS metric_samples
 ENGINE = Distributed('{cluster}', pulsus, metric_samples, cityHash64(metric_name, fingerprint));
@@ -1074,7 +1074,7 @@ Reader-issued settings in clustered mode: `optimize_skip_unused_shards = 1`, `op
 
 **TraceQL search reader-settings contract** (issue #57). Precondition: `trace_spans` and `trace_attrs_idx` co-shard on the byte-identical `cityHash64(trace_id)` expression, so a trace's spans and index rows always co-reside — every Phase-1 `GROUP BY trace_id` completes on whole groups per shard, and every Phase-2 `trace_id IN (batch)` read (batches are ≤ 32 explicit ids, never a large coordinator-built set) prunes to the owning shards under `optimize_skip_unused_shards`. Every search query — generators and hydration/value batches alike — additionally carries server-side budgets with throw semantics: `max_rows_to_read = PULSUS_TRACEQL_SCAN_BUDGET_ROWS` + `read_overflow_mode = 'throw'` (non-indexable generators are budget-limited → `422 query_too_broad`, never silently slow), `max_bytes_to_read` + the same throw mode, `max_result_bytes` + `result_overflow_mode = 'throw'`, and `max_block_size = TRACE_SEARCH_MAX_BLOCK_ROWS` (4096 rows). Enforcement of the byte ceilings is **block-granular**, but (issue #57 re-audit) the transient is now HARD-bounded, not merely accepted-and-documented: every string value the search response returns (`name`/`service`, and `select()`-projected attribute values) is truncated at the SOURCE with a hard **byte** ceiling — `if(length(col) <= 8192, col, substringUTF8(col, 1, 2048)) AS col` (`TRACE_STR_COL_CAP` = 8192 bytes; the fallback branch cuts at 2048 UTF-8 code points, each ≤ 4 bytes, so it too never exceeds the byte ceiling) — so the driver's one transiently-buffered result block is bounded at ≤ `TRACE_SEARCH_MAX_BLOCK_ROWS` rows × (2 × `TRACE_STR_COL_CAP` string bytes + fixed-width columns) ≈ ≤ ~67 MB, never a-priori row-unbounded. **Live-verified on 24.8:** the result-side budget (`max_result_bytes` + `result_overflow_mode = 'throw'`) does not throw on **unwrapped passthrough columns** in streamed `SELECT` shapes; the source-truncation projection above makes its accounting **effective** on the hydration/root/value reads — a **deliberate hardening**. Layer 1 (64 MiB `max_result_bytes` per query) is therefore the practical **per-batch** byte bound on the search's Phase-2 reads, firing server-side before the driver materializes anything; Layer 2 — the engine's request-scoped 256 MiB retention counter (charged per row/entry as results stream) — remains the binding bound on **cross-batch retained accumulation** (merge tuples, the membership sets the hydration statement's predicate columns fill, heap-held response summaries, root summaries), which survives each batch's charge release and which no per-query server setting can see. A breach of either layer is a `422`, never an OOM. The engine's bounded-consumption guarantee is Rust-side (bounded generator transfer + the retention counter); ClickHouse's own generator-aggregation memory is additionally bounded (issue #57 re-audit, sub-problem B) by a dedicated generator-only ceiling — `max_memory_usage = PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` (512 MiB default) + `max_bytes_before_external_group_by = 0` (throw-not-spill) — so a dense common-value prefix's `GROUP BY trace_id` aggregation state is hard-bounded too: a breach is server code 241 (`MEMORY_LIMIT_EXCEEDED`) → `422 query_too_broad`, never an OOM (read-cost, as opposed to memory, is bounded by prefix confinement + the per-query server budgets; a read-bounded common-value generator SQL shape is tracked in issue #63). The "TraceQL search" and "Trace by ID" fan-out rows above are confirmed by Tier-1 per-stage/per-shard evidence on the 2-shard fixture (`docs/benchmarks/m4-traces-read-path.md` — coordinator-inclusive `system.query_log` rows verdicted against a client-computed `cityHash64(trace_id) % total_weight` roster, the same methodology that graduated the logs family); one caveat noted there: the trace-by-ID single-shard confinement is proven under the §7 reader-issued settings, which the search engine injects in clustered mode but the fetch handler does not yet — wiring them through the fetch path is a follow-up.
 
-**Status: logs family graduated (M1, issue #16) and the traces read-path rows confirmed (M4, issue #57 — `docs/benchmarks/m4-traces-read-path.md`, 2-shard fixture, same methodology, wired into `schema-it-cluster` as hard verdicts); metrics/profiles remain design intent, not observed behavior.** Co-sharding is necessary but not sufficient — Distributed plans can still merge at the initiator or ship large sets if the generated SQL doesn't cooperate, which is why graduation requires *per-stage, exact-shard-roster* evidence, not just a terminal-query spot check (three rounds of CODE review on issue #16 caught successively narrower gaps: the first draft graduated on terminal-stage-only evidence with the discovery row uncovered; the second added per-stage evidence but silently excluded the coordinator's own shard from every row — under `prefer_localhost_replica = 1` the initiator's local-shard read is logged as its own `is_initial_query = 1` row, not a separate `is_initial_query = 0` sub-query row, and a filter that keeps only `is_initial_query = 0` misses it entirely; the third accepted any shard count for fingerprint-pruned stages without deriving which shards were *expected*, so a genuinely lost `system.query_log` row was indistinguishable from correct `optimize_skip_unused_shards` pruning). The `log_samples`/`log_streams`/`log_streams_idx`/`log_metrics_5s` sharding row above, and both logs-relevant rows of the Fan-out analysis table ("LogQL stream resolution + read" and "Label/tag discovery"), are confirmed by Tier-1 evidence (docs/schemas.md §9's two-tier model): per-shard `system.query_log` + `EXPLAIN PIPELINE`, captured separately for **every** stage each shape executes (resolution, hydration, samples/rollup read, and the discovery query in its own right) and **every** shard including the coordinator's own, verified against a **client-computed expected shard roster** (a cumulative-weight slot→shard map from `system.clusters`/`system.macros`, `fingerprint % total_weight` per queried fingerprint for pruned stages) on the 4-shard fixture (`docs/benchmarks/m1-logs-read-path.md`) — showing stage-1 stream resolution executing shard-locally (reaching the full 4-shard roster), hydration/samples joining and reading shard-locally (narrowing to *exactly* the computed owning subset for narrow fingerprint predicates, with the excluded shard's absence proven, not assumed), and the label/tag discovery query itself fanning out across the full roster with only deduplicated results crossing the network. This is topology mechanics a 4-shard cluster demonstrates at any corpus scale. **Latency at Tier-2 scale (1 TB/7d) is separately tracked and unvalidated (issue #25)**; it does not gate this graduation, which is about which node does the work, not how fast. The traces rows ("Trace by ID" and "TraceQL search") were confirmed the same way in M4 — per-stage, coordinator-inclusive, roster-verdicted evidence on the 2-shard fixture (`docs/benchmarks/m4-traces-read-path.md`, `cityHash64(trace_id) % total_weight` client-side derivation, run as hard CI verdicts by `cargo xtask bench traces-read`), with the trace-by-ID caveat noted there (proven under the §7 reader-issued settings; the fetch handler does not yet inject them). The metrics/profiles rows above remain design intent until the M3/M5 multi-shard benchmarks confirm them the same way; those snapshots then join the CI regression set.
+**Status: logs family graduated (M1, issue #16) and the traces read-path rows confirmed (M4, issue #57 — `docs/benchmarks/m4-traces-read-path.md`, 2-shard fixture, same methodology, wired into `schema-it-cluster` as hard verdicts); metrics/profiles remain design intent, not observed behavior.** Co-sharding is necessary but not sufficient — Distributed plans can still merge at the initiator or ship large sets if the generated SQL doesn't cooperate, which is why graduation requires *per-stage, exact-shard-roster* evidence, not just a terminal-query spot check (three rounds of CODE review on issue #16 caught successively narrower gaps: the first draft graduated on terminal-stage-only evidence with the discovery row uncovered; the second added per-stage evidence but silently excluded the coordinator's own shard from every row — under `prefer_localhost_replica = 1` the initiator's local-shard read is logged as its own `is_initial_query = 1` row, not a separate `is_initial_query = 0` sub-query row, and a filter that keeps only `is_initial_query = 0` misses it entirely; the third accepted any shard count for fingerprint-pruned stages without deriving which shards were *expected*, so a genuinely lost `system.query_log` row was indistinguishable from correct `optimize_skip_unused_shards` pruning). The `log_samples`/`log_streams`/`log_streams_idx`/`log_metrics_5s` sharding row above, and both logs-relevant rows of the Fan-out analysis table ("LogQL stream resolution + read" and "Label/tag discovery"), are confirmed by Tier-1 evidence for the SHAPE they state — which stages run shard-locally and what crosses the network — and, where a stage prunes by `fingerprint`, not for any shard count, which is selector-dependent (issue #498, below). **A stage with no `fingerprint` condition is not affected**: its expected roster is unconditionally the whole cluster, derived from no fingerprint, so no sharding key moves it — which is the case for label/tag discovery and for stream resolution (docs/schemas.md §9's two-tier model): per-shard `system.query_log` + `EXPLAIN PIPELINE`, captured separately for **every** stage each shape executes (resolution, hydration, samples/rollup read, and the discovery query in its own right) and **every** shard including the coordinator's own, verified against a **client-computed expected shard roster** (a cumulative-weight slot→shard map from `system.clusters`/`system.macros`, the sharding key modulo `total_weight` per queried fingerprint for pruned stages — `fingerprint % total_weight` when this evidence was captured, `cityHash64(fingerprint) % total_weight` since issue #498 widened the column). **Which shard owns which fingerprint moved with that key, so the capture's roster, placement and per-shard row counts are superseded and are marked as such where they appear — and so is whether a fingerprint-scoped stage participates on a subset at all: measured against a live server, the ten-fingerprint stage that reached three of four shards under the previous key reaches all four under the current one. The execution shape and the capture method are not superseded.** **The re-capture has not been done.** It needs the four-shard fixture, the same corpus through the `_dist` wrappers and a rerun of `xtask bench --dist` on the 4-shard fixture (`docs/benchmarks/m1-logs-read-path.md`) — showing stage-1 stream resolution executing shard-locally (reaching the full 4-shard roster), hydration/samples joining and reading shard-locally (narrowing to *exactly* the computed owning subset for narrow fingerprint predicates, with the excluded shard's absence proven, not assumed), and the label/tag discovery query itself fanning out across the full roster with only deduplicated results crossing the network. This is topology mechanics a 4-shard cluster demonstrates at any corpus scale. **Latency at Tier-2 scale (1 TB/7d) is separately tracked and unvalidated (issue #25)**; it does not gate this graduation, which is about which node does the work, not how fast. The traces rows ("Trace by ID" and "TraceQL search") were confirmed the same way in M4 — per-stage, coordinator-inclusive, roster-verdicted evidence on the 2-shard fixture (`docs/benchmarks/m4-traces-read-path.md`, `cityHash64(trace_id) % total_weight` client-side derivation, run as hard CI verdicts by `cargo xtask bench traces-read`), with the trace-by-ID caveat noted there (proven under the §7 reader-issued settings; the fetch handler does not yet inject them). The metrics/profiles rows above remain design intent until the M3/M5 multi-shard benchmarks confirm them the same way; those snapshots then join the CI regression set.
 
 ---
 

@@ -19,7 +19,7 @@
     "service": "from_dot",
     "labels_json": "{\"service_name\":\"from_dot\"}",
     "structured_metadata_json": "{\"dup_key\":\"v_us\",\"scope_name\":\"collide-scope\",\"scope_version\":\"1.0.0\",\"service_name\":\"from_underscore\"}",
-    "fingerprint": 18200076898363330321,
+    "fingerprint": "335732160665941880978665940584432746176",
     "body": "duplicate key collision",
     "severity": 3,
     "timestamp_source": "time_unix_nano",

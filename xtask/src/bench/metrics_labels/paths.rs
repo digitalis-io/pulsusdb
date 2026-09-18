@@ -56,7 +56,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::floor_to_activity_bucket;
+use pulsus_model::{Fingerprint, floor_to_activity_bucket};
 use pulsus_read::logql::escape::ch_string;
 use pulsus_read::metrics::{
     DEFAULT_STALENESS_MULTIPLIER, DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
@@ -251,10 +251,10 @@ async fn fetch_fingerprints(
     sql: &str,
     query_id: &str,
     dist: bool,
-) -> anyhow::Result<Vec<u64>> {
+) -> anyhow::Result<Vec<Fingerprint>> {
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct FpRow {
-        fingerprint: u64,
+        fingerprint: Fingerprint,
     }
     let settings = reader_settings(dist, query_id);
     let escaped = escape_query_placeholders(sql);
@@ -351,7 +351,7 @@ async fn run_sql_path(
     kind: SelectorKind,
     sql: &str,
     source_table: &str,
-) -> anyhow::Result<(PathEvidence, Vec<u64>)> {
+) -> anyhow::Result<(PathEvidence, Vec<Fingerprint>)> {
     let base_id = format!(
         "bench-metrics-{path_name}-{}-{:?}-{}",
         tier.metric_name,
@@ -361,7 +361,7 @@ async fn run_sql_path(
     fetch_fingerprints(cfg.client, sql, &format!("{base_id}-warmup"), cfg.dist).await?;
 
     let mut wall_ms = Vec::with_capacity(cfg.reps);
-    let mut first: Option<(Vec<u64>, String)> = None;
+    let mut first: Option<(Vec<Fingerprint>, String)> = None;
     for rep in 0..cfg.reps {
         let id = format!("{base_id}-r{rep}");
         let t0 = Instant::now();
@@ -425,7 +425,7 @@ fn run_cache_path(
     kind: SelectorKind,
     matchers: &[LabelMatcher],
     window: DataWindow,
-) -> anyhow::Result<(PathEvidence, Vec<u64>)> {
+) -> anyhow::Result<(PathEvidence, Vec<Fingerprint>)> {
     let resolution = cache.resolve(&tier.metric_name, matchers, window);
     let fps = match resolution {
         Resolution::Fingerprints(fps) => fps,
@@ -1072,8 +1072,8 @@ mod tests {
     /// every series carrying every key (the corpus's original shape),
     /// there was never a fingerprint for `countIf`'s absence path to get
     /// wrong.
-    fn tiny_corpus() -> Vec<(u64, Vec<(&'static str, String)>)> {
-        (0u64..8)
+    fn tiny_corpus() -> Vec<(Fingerprint, Vec<(&'static str, String)>)> {
+        (0u128..8)
             .map(|i| {
                 let status = if i % 4 == 0 { "500" } else { "200" }.to_string();
                 let pod = format!("pod-{i}");
@@ -1081,7 +1081,7 @@ mod tests {
                 if i != 0 && i != 4 {
                     labels.push(("job", format!("j{}", i % 2)));
                 }
-                (i, labels)
+                (Fingerprint::from_raw(i), labels)
             })
             .collect()
     }
@@ -1120,10 +1120,10 @@ mod tests {
     }
 
     fn reference_resolve(
-        corpus: &[(u64, Vec<(&'static str, String)>)],
+        corpus: &[(Fingerprint, Vec<(&'static str, String)>)],
         matchers: &[LabelMatcher],
-    ) -> Vec<u64> {
-        let mut out: Vec<u64> = corpus
+    ) -> Vec<Fingerprint> {
+        let mut out: Vec<Fingerprint> = corpus
             .iter()
             .filter(|(_, labels)| matchers.iter().all(|m| eval_matcher(labels, m)))
             .map(|(fp, _)| *fp)
@@ -1165,9 +1165,9 @@ mod tests {
     /// agreement with [`reference_resolve`] is a genuine cross-check of the
     /// *algorithm*, not just of string rendering.
     fn simulated_idx_resolve(
-        corpus: &[(u64, Vec<(&'static str, String)>)],
+        corpus: &[(Fingerprint, Vec<(&'static str, String)>)],
         matchers: &[LabelMatcher],
-    ) -> Vec<u64> {
+    ) -> Vec<Fingerprint> {
         let n_positive_keys = matchers
             .iter()
             .filter(|m| matches!(m.op, MatchOp::Eq | MatchOp::Re))

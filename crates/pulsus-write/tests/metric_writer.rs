@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow};
 use pulsus_config::{Config, WriterConfig};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, LabelSet, NativeHistogram, Span};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{BlockInserter, MetricWriter};
 use pulsus_write::{
     HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
@@ -157,11 +157,11 @@ fn hist_writer_with(
     MetricWriter::with_inserters(samples, series, metadata, hist_samples, &cfg, BUCKET_MS)
 }
 
-fn series_ref(metric_name: &str, fingerprint: u64) -> SeriesRef {
+fn series_ref(metric_name: &str, fingerprint: u128) -> SeriesRef {
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     SeriesRef {
         metric_name: Arc::from(metric_name),
-        fingerprint,
+        fingerprint: Fingerprint::from_raw(fingerprint),
         labels,
     }
 }
@@ -170,14 +170,14 @@ fn series_ref(metric_name: &str, fingerprint: u64) -> SeriesRef {
 /// request's first point for a series the writer has never registered.
 fn batch_for(
     metric_name: &str,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     new_series: bool,
 ) -> ParsedMetrics {
     let mut out = ParsedMetrics {
         samples: vec![MetricPoint {
             metric_name: Arc::from(metric_name),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             unix_milli,
             value: 1.0,
         }],
@@ -432,7 +432,7 @@ async fn shutdown_settles_inflight_waiters_across_all_three_tables() {
     let batch = ParsedMetrics {
         samples: vec![MetricPoint {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: 1.0,
         }],
@@ -964,7 +964,7 @@ async fn poisoned_sample_and_hist_flushes_never_touch_any_backfill_backlog() {
 
 /// A single-histogram fixture (schema 0, absolute buckets [1,2,1] ->
 /// deltas [1,1,-1], count 4).
-fn native_hist(metric_name: &str, fingerprint: u64, unix_milli: i64, sum: f64) -> NativeHistogram {
+fn native_hist(metric_name: &str, fingerprint: u128, unix_milli: i64, sum: f64) -> NativeHistogram {
     NativeHistogram {
         counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
         schema: 0,
@@ -987,24 +987,24 @@ fn native_hist(metric_name: &str, fingerprint: u64, unix_milli: i64, sum: f64) -
 // Tiny helper trait so the fixture reads top-to-bottom (the ident fields
 // live on `HistogramPoint`, not `NativeHistogram`).
 trait AlsoIdent {
-    fn also_ident(self, _n: &str, _f: u64, _u: i64) -> NativeHistogram;
+    fn also_ident(self, _n: &str, _f: u128, _u: i64) -> NativeHistogram;
 }
 impl AlsoIdent for NativeHistogram {
-    fn also_ident(self, _n: &str, _f: u64, _u: i64) -> NativeHistogram {
+    fn also_ident(self, _n: &str, _f: u128, _u: i64) -> NativeHistogram {
         self
     }
 }
 
 fn hist_batch_for(
     metric_name: &str,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     new_series: bool,
 ) -> ParsedMetrics {
     let mut out = ParsedMetrics {
         hist_samples: vec![HistogramPoint {
             metric_name: Arc::from(metric_name),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             unix_milli,
             histogram: native_hist(metric_name, fingerprint, unix_milli, 5.0),
         }],

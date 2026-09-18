@@ -1681,22 +1681,15 @@ enum ReviewedVerdict {
 // `sql.rs:489` case left the table: no occurrence of that token remains, each
 // now reads `sql.rs:761`, `stage2`'s own line, where the two rules agree. And
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
-// candidate files and recorded with its reasoning below; the count of cases
-// is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 6] = [
+// candidate files and recorded with its reasoning below. For the counts,
+// read the assertion at the end of this file's fallback test.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2933",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
-    ),
-    (
-        "docs/query-lowering.md",
-        "exec.rs:2933",
-        1,
-        ReviewedVerdict::FallbackWrong,
-        "the same citation a third time. Issue #557's dated §9.2 paragraph moved the          census block, which is where this occurrence sits; the reading is the one above",
     ),
     (
         "docs/query-lowering.md",
@@ -1719,13 +1712,6 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
     ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:318",
-        0,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
-    ),
 ];
 
 /// **Where the language fallback and the anchor rule disagree, and what a
@@ -1744,16 +1730,19 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// one that was measured against itself.** It called `resolve_citation`
 /// the truth and counted how often the fallback differed from it, which
 /// measures disagreement between two rules rather than error in either.
-/// Read one at a time, two of the six divergences are cases where the
-/// **resolver** points at the wrong file.
+/// Read one at a time, some divergences are cases where the **resolver**
+/// points at the wrong file, not the fallback.
 ///
-/// What this test asserts instead: the divergence set is exactly the
-/// six reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
-/// cannot appear without a person reading it; and four of the six are
-/// citations where the fallback answers a file the citing prose does not
-/// describe. **Four wrong answers out of six disagreements is why the
-/// fallback is not applied** — not a percentage, four cases anyone can
-/// read.
+/// What this test asserts instead: the divergence set is exactly the one
+/// reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new divergence
+/// cannot appear without a person reading it, and every member's verdict
+/// is the one a person recorded. **No count is written in this comment**,
+/// because a count written in prose beside a table goes stale the moment
+/// the table moves — which it did, twice, when two branches each edited
+/// the array. The counts are the assertion at the end of this function,
+/// and they are also the array's own declared length and §12.3's census
+/// of it in `docs/query-lowering.md`; all three are derived from the
+/// array rather than typed beside it.
 #[test]
 fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
     let tracked = tracked_rust_files();
@@ -1851,12 +1840,21 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // declaration it names, and at its new line the two rules agree,
         // so there is no divergence left to hold a judgement about.
         //
-        // Issue #557 adds one `FallbackWrong` row and no new judgement:
-        // `exec.rs:2933` is cited a THIRD time, from §12.3's own
-        // generated census block, because the dated §9.2 paragraph moved
-        // the block's line. The reading is the one the other two
-        // occurrences carry.
-        (5, 1, 0),
+        // Two rows left #557's six when the two branches met, and the
+        // gate named both rather than anyone deciding them.
+        //
+        // `labels.rs:318` named `merge_labels_with_structured_metadata`,
+        // which moved to `:328` when the identity widened; at `:328` the
+        // anchor rule answers `logql/labels.rs`, the file the citing prose
+        // describes and the one the fallback already gave, so there is no
+        // divergence left to hold a judgement about.
+        //
+        // `exec.rs:2933` at occurrence 1 sat in §12.3's own generated
+        // census block. Regenerating that block against the merged tree
+        // changed which citations it prints, so the occurrence is gone and
+        // the two rules agree at every occurrence that remains. The other
+        // two occurrences of that citation keep their reading.
+        (4, 0, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }
@@ -2673,3 +2671,75 @@ fn names_label(haystack: &[String], label: &[String]) -> bool {
 /// [`CENSUS_BLOCK_END`]; the sweep keys on the shared prefix so a new
 /// region does not need a third constant.
 const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
+
+/// **Every document-to-document line citation names the line it quotes.**
+///
+/// The citation dataset above enumerates `<file>.rs:<line>` references and
+/// nothing else, so a citation from one design record into another
+/// document was covered by no check at all. One of them drifted twice in a
+/// single issue: it was recomputed across a merge, landed on a blank line,
+/// and nothing said so.
+///
+/// The check is the same shape as the dataset's: each entry names the
+/// citing document, the text it cites, **how many times it cites it**, and
+/// the phrase the cited line must carry. A citation that moves stops
+/// containing its phrase and this names the row.
+///
+/// ```text
+///   citing document        cites                 times   the cited line must carry
+///   --------------------   -------------------   -----   -------------------------
+///   docs/query-to-sql.md   docs/schemas.md:835       2   never a `UNION ALL`
+/// ```
+///
+/// **The count is not decoration, and leaving it out was the same defect
+/// this test exists to catch.** The first version asked whether the
+/// citation appeared at all. `docs/query-to-sql.md` names that line twice;
+/// with one of the two moved back to the superseded number, a
+/// greater-than-zero check reported the document correct while it said two
+/// different things about where the rule lives — which is exactly how the
+/// stale citation survived a merge in the first place.
+///
+/// It is deliberately a hand-written list rather than a parse of every
+/// `.md:<line>` occurrence: the records quote line references inside
+/// historical block quotes, where the number records what a document said
+/// at the time and updating it would rewrite the quotation.
+#[test]
+fn every_cross_document_line_citation_names_the_line_it_quotes() {
+    const CROSS_DOC_CITATIONS: &[(&str, &str, usize, &str)] = &[(
+        "docs/query-to-sql.md",
+        "docs/schemas.md:835",
+        2,
+        "never a `UNION ALL`",
+    )];
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (citing, citation, times, phrase) in CROSS_DOC_CITATIONS {
+        let citing_text = read(citing);
+        let occurrences = citing_text.matches(citation).count();
+        if occurrences != *times {
+            wrong.push(format!(
+                "{citing} cites {citation} {occurrences} time(s), expected {times}"
+            ));
+            continue;
+        }
+        let (path, line) = citation
+            .rsplit_once(':')
+            .expect("a cross-document citation is <path>:<line>");
+        let line: usize = line.parse().expect("a citation's line is a number");
+        let cited = read(path);
+        let lines: Vec<&str> = cited.lines().collect();
+        match lines.get(line - 1) {
+            None => wrong.push(format!("{citation} is past the end of {path}")),
+            Some(text) if !text.contains(phrase) => wrong.push(format!(
+                "{citing} cites {citation} for {phrase:?}, but that line reads {:?}",
+                text.chars().take(60).collect::<String>()
+            )),
+            Some(_) => {}
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "cross-document line citations that no longer name what they quote:\n  {}",
+        wrong.join("\n  ")
+    );
+}

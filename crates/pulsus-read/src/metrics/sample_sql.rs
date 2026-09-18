@@ -10,9 +10,13 @@
 //! (`tests/metrics_sql_snapshots.rs`).
 //!
 //! **`metric_name` is the only string literal here** ([`ch_string`]);
-//! fingerprints are `u64` numeric literals (no escaping surface — they
-//! come from [`super::labels::Resolution::Fingerprints`] or a resolved
-//! `SqlFallback`, never from unescaped user text). The `SqlFallback`
+//! fingerprints enter as [`FpLiteral`]s and render as
+//! `toUInt128('<decimal>')` (no escaping surface — they come from
+//! [`super::labels::Resolution::Fingerprints`] or a resolved
+//! `SqlFallback`, never from unescaped user text). No function in this
+//! module takes a `Fingerprint`: the mint is upstream, which is what makes
+//! "every fingerprint in this module's SQL is exact" a property of the
+//! signatures rather than of the bodies (issue #498). The `SqlFallback`
 //! variant ([`sample_fetch_subquery`]) inlines #30's already-injection-safe
 //! sub-query verbatim as `fingerprint IN ( <subquery> )` — the sub-query's
 //! own escaping (including the `?`→`??` placeholder-doubling contract for
@@ -20,6 +24,8 @@
 //! re-applied here; issue #31's `MetricsEngine` applies the doubling once,
 //! at the execution boundary, exactly as `logql::exec` does for its own
 //! regex SQL.
+
+use pulsus_model::FpLiteral;
 
 use crate::logql::escape::ch_string;
 
@@ -58,8 +64,9 @@ pub fn window_predicate(lower_excl_ms: i64, upper_incl_ms: i64) -> String {
     format!("unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}")
 }
 
-/// `fingerprint IN (101, 205, 990)` — the resolved fingerprint set.
-pub fn fingerprints_predicate(fps: &[u64]) -> String {
+/// `fingerprint IN (toUInt128('101'), toUInt128('205'))` — the resolved
+/// fingerprint set.
+pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
     format!("fingerprint IN ({})", render_fingerprint_list(fps))
 }
 
@@ -77,7 +84,7 @@ pub fn subquery_predicate(subquery: &str) -> String {
 pub fn sample_fetch(
     table: &str,
     metric_name: &str,
-    fps: &[u64],
+    fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
@@ -123,7 +130,7 @@ pub fn sample_fetch_subquery(
 pub fn sample_fetch_multi(
     table: &str,
     metric_names: &[String],
-    fps: &[u64],
+    fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
@@ -155,7 +162,7 @@ const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum
 pub fn hist_sample_fetch(
     table: &str,
     metric_name: &str,
-    fps: &[u64],
+    fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
@@ -194,7 +201,7 @@ pub fn hist_sample_fetch_subquery(
 pub fn hist_sample_fetch_multi(
     table: &str,
     metric_names: &[String],
-    fps: &[u64],
+    fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
@@ -206,13 +213,18 @@ pub fn hist_sample_fetch_multi(
     )
 }
 
-/// The bare comma-separated `u64` list an `IN (...)` carries. `pub`
-/// because `super::compile`'s `handoff_cost` bound is asserted against
-/// what this renders (issue #548 criterion 7), and a bound asserted
-/// against a second renderer would bound the wrong text.
-pub fn render_fingerprint_list(fps: &[u64]) -> String {
+/// The comma-separated `toUInt128('<decimal>')` list an `IN (...)`
+/// carries. `pub` because `super::compile`'s `handoff_cost` bound is
+/// asserted against what this renders (issue #548 criterion 7), and a
+/// bound asserted against a second renderer would bound the wrong text.
+///
+/// The call form is not optional above `2^64`: ClickHouse reads a bare
+/// decimal literal there as `Float64`, exact only to `2^53`, so
+/// `fingerprint IN (<bare list>)` prunes every granule and returns nothing
+/// (issue #498, measured on ClickHouse 26.3.29.7).
+pub fn render_fingerprint_list(fps: &[FpLiteral]) -> String {
     fps.iter()
-        .map(u64::to_string)
+        .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -228,9 +240,17 @@ pub const CHUNK_THRESHOLD: usize = 500;
 /// invariant, which the caller re-establishes by merging chunk results
 /// back into `SeriesData` keyed by fingerprint, not by chunk-arrival
 /// order). A non-empty set smaller than the threshold yields exactly one
-/// chunk; an empty set yields zero chunks (`[u64]::chunks`'s own
+/// chunk; an empty set yields zero chunks (`[FpLiteral]::chunks`'s own
 /// contract).
-pub fn chunk_fingerprints(fps: &[u64], chunk_size: usize) -> Vec<&[u64]> {
+///
+/// Chunks minted literals rather than fingerprints: this module's
+/// signatures may not mention `Fingerprint` (issue #498 criterion 4b), so
+/// callers mint before chunking. The cost is one `Vec<FpLiteral>` per
+/// query, 16 bytes per resolved fingerprint — 800 KB at the
+/// `PULSUS_CACHE_MAX_SERIES` default of 50,000 and 800 MB at the accepted
+/// ceiling of 50,000,000 (`crates/pulsus-config/src/validate.rs`,
+/// `CACHE_MAX_SERIES_CEILING`).
+pub fn chunk_fingerprints(fps: &[FpLiteral], chunk_size: usize) -> Vec<&[FpLiteral]> {
     if chunk_size == 0 {
         return vec![fps];
     }
@@ -239,14 +259,49 @@ pub fn chunk_fingerprints(fps: &[u64], chunk_size: usize) -> Vec<&[u64]> {
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
+
     use super::*;
+
+    /// A minted literal from a small decimal, so these tests keep reading
+    /// as `&[fp(101), fp(205)]` after the identity widened (issue #498).
+    fn fp(v: u128) -> FpLiteral {
+        Fingerprint::from_raw(v).sql_literal()
+    }
+
+    /// The four values where a bare decimal and the exact call form first
+    /// disagree: `2^64-1` (the last value a bare literal reads exactly),
+    /// `2^64` (the first `Float64`, and what `2^64+1` rounds onto),
+    /// `2^64+1` (the value a bare literal loses) and its neighbour.
+    const BOUNDARY: [u128; 4] = [
+        18_446_744_073_709_551_615,
+        18_446_744_073_709_551_616,
+        18_446_744_073_709_551_617,
+        18_446_744_073_709_551_618,
+    ];
+
+    /// The exact call form at the four values where a bare decimal and
+    /// `toUInt128('<decimal>')` first disagree (issue #498).
+    #[test]
+    fn render_fingerprint_list_renders_the_exact_call_form_at_the_2_64_boundary() {
+        let fps: Vec<FpLiteral> = BOUNDARY.iter().copied().map(fp).collect();
+        assert_eq!(
+            render_fingerprint_list(&fps),
+            "toUInt128('18446744073709551615'), toUInt128('18446744073709551616'), \
+             toUInt128('18446744073709551617'), toUInt128('18446744073709551618')"
+        );
+    }
 
     #[test]
     fn sample_fetch_renders_the_schemas_md_2_3_shape() {
         let sql = sample_fetch(
             "metric_samples",
             "http_requests_total",
-            &[101, 205, 990],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
             1_000,
             2_000,
         );
@@ -256,14 +311,20 @@ mod tests {
              FROM metric_samples\n\
              PREWHERE metric_name = 'http_requests_total'\n\
              WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (101, 205, 990)\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
              ORDER BY fingerprint, unix_milli"
         );
     }
 
     #[test]
     fn sample_fetch_window_is_left_open_right_closed() {
-        let sql = sample_fetch("metric_samples", "up", &[1], 0, 100);
+        let sql = sample_fetch(
+            "metric_samples",
+            "up",
+            &[Fingerprint::from_raw(1).sql_literal()],
+            0,
+            100,
+        );
         assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
         // Never `>=` on the lower bound — that would include the excluded
         // edge sample (AC: left-open right-closed window boundaries).
@@ -295,13 +356,19 @@ mod tests {
     #[test]
     fn metric_name_injection_stays_inside_one_literal() {
         let payload = "up'; DROP TABLE metric_samples; --";
-        let sql = sample_fetch("metric_samples", payload, &[1], 0, 100);
+        let sql = sample_fetch(
+            "metric_samples",
+            payload,
+            &[Fingerprint::from_raw(1).sql_literal()],
+            0,
+            100,
+        );
         assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
     }
 
     #[test]
     fn chunk_fingerprints_splits_at_the_threshold() {
-        let fps: Vec<u64> = (0..1_200).collect();
+        let fps: Vec<FpLiteral> = (0..1_200).map(fp).collect();
         let chunks = chunk_fingerprints(&fps, 500);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].len(), 500);
@@ -311,15 +378,15 @@ mod tests {
 
     #[test]
     fn chunk_fingerprints_preserves_order() {
-        let fps: Vec<u64> = (0..1_000).collect();
+        let fps: Vec<FpLiteral> = (0..1_000).map(fp).collect();
         let chunks = chunk_fingerprints(&fps, 500);
-        let flattened: Vec<u64> = chunks.into_iter().flatten().copied().collect();
+        let flattened: Vec<FpLiteral> = chunks.into_iter().flatten().copied().collect();
         assert_eq!(flattened, fps);
     }
 
     #[test]
     fn chunk_fingerprints_of_a_set_under_the_threshold_is_one_chunk() {
-        let fps: Vec<u64> = (0..10).collect();
+        let fps: Vec<FpLiteral> = (0..10).map(fp).collect();
         let chunks = chunk_fingerprints(&fps, 500);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 10);
@@ -343,7 +410,10 @@ mod tests {
         let sql = sample_fetch_multi(
             "metric_samples",
             &["foo_total".to_string(), "bar_total".to_string()],
-            &[101, 205],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+            ],
             1_000,
             2_000,
         );
@@ -353,14 +423,20 @@ mod tests {
              FROM metric_samples\n\
              PREWHERE metric_name IN ('foo_total', 'bar_total')\n\
              WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (101, 205)\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              ORDER BY metric_name, fingerprint, unix_milli"
         );
     }
 
     #[test]
     fn sample_fetch_multi_window_is_left_open_right_closed() {
-        let sql = sample_fetch_multi("metric_samples", &["up".to_string()], &[1], 0, 100);
+        let sql = sample_fetch_multi(
+            "metric_samples",
+            &["up".to_string()],
+            &[Fingerprint::from_raw(1).sql_literal()],
+            0,
+            100,
+        );
         assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
         assert!(!sql.contains("unix_milli >= 0"));
     }
@@ -371,7 +447,7 @@ mod tests {
         let sql = sample_fetch_multi(
             "metric_samples",
             std::slice::from_ref(&payload),
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             0,
             100,
         );
@@ -383,14 +459,23 @@ mod tests {
     /// the single-metric fast path (the EXPLAIN-gated PK prune).
     #[test]
     fn sample_fetch_single_name_shape_is_untouched_by_the_multi_builder() {
-        let sql = sample_fetch("metric_samples", "up", &[1, 2], 0, 100);
+        let sql = sample_fetch(
+            "metric_samples",
+            "up",
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
+            0,
+            100,
+        );
         assert_eq!(
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              PREWHERE metric_name = 'up'\n\
              WHERE unix_milli > 0 AND unix_milli <= 100\n\
-             \x20 AND fingerprint IN (1, 2)\n\
+             \x20 AND fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
              ORDER BY fingerprint, unix_milli"
         );
     }
@@ -410,7 +495,11 @@ mod tests {
         let sql = hist_sample_fetch(
             "metric_hist_samples",
             "http_request_duration_seconds",
-            &[101, 205, 990],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
             1_000,
             2_000,
         );
@@ -421,7 +510,7 @@ mod tests {
                  FROM metric_hist_samples\n\
                  PREWHERE metric_name = 'http_request_duration_seconds'\n\
                  WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (101, 205, 990)\n\
+                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
                  ORDER BY fingerprint, unix_milli"
             )
         );
@@ -429,7 +518,13 @@ mod tests {
 
     #[test]
     fn hist_sample_fetch_window_is_left_open_right_closed() {
-        let sql = hist_sample_fetch("metric_hist_samples", "up", &[1], 0, 100);
+        let sql = hist_sample_fetch(
+            "metric_hist_samples",
+            "up",
+            &[Fingerprint::from_raw(1).sql_literal()],
+            0,
+            100,
+        );
         assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
         assert!(!sql.contains("unix_milli >= 0"));
     }
@@ -447,7 +542,10 @@ mod tests {
         let sql = hist_sample_fetch_multi(
             "metric_hist_samples",
             &["foo_seconds".to_string(), "bar_seconds".to_string()],
-            &[101, 205],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+            ],
             1_000,
             2_000,
         );
@@ -458,7 +556,7 @@ mod tests {
                  FROM metric_hist_samples\n\
                  PREWHERE metric_name IN ('foo_seconds', 'bar_seconds')\n\
                  WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (101, 205)\n\
+                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
                  ORDER BY metric_name, fingerprint, unix_milli"
             )
         );
@@ -478,11 +576,29 @@ mod tests {
     /// predicate, and ORDER BY — only the SELECT list and table differ.
     #[test]
     fn ac7a_chunks_float_and_hist_predicates_are_identical() {
-        let float = sample_fetch("metric_samples", "up", &[7, 9], 1_000, 2_000);
-        let hist = hist_sample_fetch("metric_hist_samples", "up", &[7, 9], 1_000, 2_000);
+        let float = sample_fetch(
+            "metric_samples",
+            "up",
+            &[
+                Fingerprint::from_raw(7).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ],
+            1_000,
+            2_000,
+        );
+        let hist = hist_sample_fetch(
+            "metric_hist_samples",
+            "up",
+            &[
+                Fingerprint::from_raw(7).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ],
+            1_000,
+            2_000,
+        );
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
         assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
-        assert!(predicate_tail(&float).contains("fingerprint IN (7, 9)"));
+        assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
         assert!(predicate_tail(&float).contains("PREWHERE metric_name = 'up'"));
     }
 
@@ -501,8 +617,26 @@ mod tests {
     #[test]
     fn ac7a_multi_float_and_hist_predicates_are_identical() {
         let names = vec!["a_seconds".to_string(), "b_seconds".to_string()];
-        let float = sample_fetch_multi("metric_samples", &names, &[7, 9], 1_000, 2_000);
-        let hist = hist_sample_fetch_multi("metric_hist_samples", &names, &[7, 9], 1_000, 2_000);
+        let float = sample_fetch_multi(
+            "metric_samples",
+            &names,
+            &[
+                Fingerprint::from_raw(7).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ],
+            1_000,
+            2_000,
+        );
+        let hist = hist_sample_fetch_multi(
+            "metric_hist_samples",
+            &names,
+            &[
+                Fingerprint::from_raw(7).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ],
+            1_000,
+            2_000,
+        );
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
     }
 }

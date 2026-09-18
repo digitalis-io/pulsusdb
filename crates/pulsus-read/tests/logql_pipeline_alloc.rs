@@ -72,6 +72,7 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 use std::borrow::Cow;
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::exec::{StreamAccumulator, run_pipeline_rows};
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::rows::{MetricScanRow, SampleRow, StreamMetaRow};
@@ -117,7 +118,7 @@ fn count_run_into(query: &str, bodies: &[String], base: &[(String, String)]) -> 
 fn count_assembly(
     query: &str,
     rows: &[SampleRow],
-    meta: &std::collections::HashMap<u64, StreamMetaRow>,
+    meta: &std::collections::HashMap<Fingerprint, StreamMetaRow>,
 ) -> u64 {
     let pipeline = compiled(query);
     // Warm-up run (also proves the path is exercised).
@@ -139,7 +140,7 @@ fn count_assembly(
 fn count_streamed_assembly(
     query: &str,
     rows: &[SampleRow],
-    meta: &std::collections::HashMap<u64, StreamMetaRow>,
+    meta: &std::collections::HashMap<Fingerprint, StreamMetaRow>,
 ) -> u64 {
     let pipeline = compiled(query);
     let drive = |rows: Vec<SampleRow>| -> Vec<pulsus_read::logql::StreamResult> {
@@ -410,16 +411,16 @@ fn per_row_allocation_bounds_hold() {
     // --- materialization is inherent (owned `StreamResult`s), so these
     // --- pin small per-surviving-row constants, not zero.
     let meta = std::collections::HashMap::from([(
-        1u64,
+        Fingerprint::from_raw(1),
         StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "checkout".to_string(),
             labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
         },
     )]);
     let assembly_rows: Vec<SampleRow> = (0..4096)
         .map(|i| SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: String::new(),
@@ -461,7 +462,7 @@ fn per_row_allocation_bounds_hold() {
     // `e.key().clone()` shape measures ~5.0/row and fails this.
     let high_card_rows: Vec<SampleRow> = (0..4096)
         .map(|i| SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: i as i64,
             body: format!("id=r{i} level=info"),
             structured_metadata: String::new(),
@@ -553,7 +554,7 @@ fn per_row_allocation_bounds_hold() {
     //     growth) — the same profile as before #97.
     let sm_absent_rows: Vec<SampleRow> = (0..4096)
         .map(|i| SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: String::new(),
@@ -578,7 +579,7 @@ fn per_row_allocation_bounds_hold() {
     //     would blow past a linear bound by orders of magnitude.
     let sm_present_rows: Vec<SampleRow> = (0..4096)
         .map(|i| SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: format!(r#"{{"trace_id":"t{i}","user_id":"u{}"}}"#, i % 97),
@@ -623,7 +624,7 @@ fn per_row_allocation_bounds_hold() {
     };
     let agg_rows: Vec<MetricScanRow> = (0..20_000)
         .map(|i| MetricScanRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: (i as i64) * 1_000_000, // 20s of 1ms-spaced rows
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             // The SM-FREE leg: issue #249's merge must leave this budget
@@ -734,19 +735,19 @@ fn per_row_allocation_bounds_hold() {
     // Raw totals are printed, not a rounded per-row figure: the initial
     // cached key, the group entry, the `coll` buffer and the output series
     // all land inside the measured window and are counted in them.
-    let withheld_meta: std::collections::HashMap<u64, StreamMetaRow> = [
+    let withheld_meta: std::collections::HashMap<Fingerprint, StreamMetaRow> = [
         (
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "checkout".to_string(),
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
         ),
         (
-            2u64,
+            Fingerprint::from_raw(2),
             StreamMetaRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "checkout".to_string(),
                 // One label LONGER, so the minimum-length rule withholds
                 // the slider from this fingerprint — which is the whole
@@ -762,7 +763,7 @@ fn per_row_allocation_bounds_hold() {
     let withheld_rows = |n: usize| -> Vec<MetricScanRow> {
         (0..n)
             .map(|i| MetricScanRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 // The same 20s SPAN whatever `n` is, so the grid and the
                 // output series do not move with density.
                 timestamp_ns: (i as i64) * (20_000_000_000 / n as i64),
@@ -873,7 +874,7 @@ fn per_row_allocation_bounds_hold() {
     const SM_METRIC_PER_ROW: u64 = 20;
     let sm_metric_rows: Vec<MetricScanRow> = (0..SM_METRIC_ROWS)
         .map(|i| MetricScanRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: (i as i64) * 1_000_000,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             // DISTINCT per row: one output group per row, so the merge and

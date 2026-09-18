@@ -97,7 +97,7 @@ fn create_table_sql(db: &str, dist: bool, cluster: &str) -> String {
              metric_name  LowCardinality(String),\n\
              key          LowCardinality(String),\n\
              val          String,\n\
-             fingerprint  UInt64\n\
+             fingerprint  UInt128\n\
          ) ENGINE = ReplacingMergeTree\n\
          PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(bucket))\n\
          ORDER BY (metric_name, key, val, bucket, fingerprint);"

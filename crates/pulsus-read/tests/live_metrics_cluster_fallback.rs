@@ -159,7 +159,7 @@ fn historical_bucket() -> i64 {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -167,7 +167,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -186,7 +186,7 @@ async fn seed_dist(db: &str, metric_name: &str, fps: &[u64], unix_milli: i64) {
         .iter()
         .map(|&fp| SeedSeriesRow {
             metric_name: metric_name.to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             unix_milli,
             labels: r#"{"job":"api"}"#.to_string(),
         })
@@ -195,7 +195,7 @@ async fn seed_dist(db: &str, metric_name: &str, fps: &[u64], unix_milli: i64) {
         .iter()
         .map(|&fp| SeedSampleRow {
             metric_name: metric_name.to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             unix_milli,
             value: 1.0,
         })

@@ -3,7 +3,7 @@
 //! off `ChClient::query_stream`.
 
 use pulsus_clickhouse::Row;
-use pulsus_model::HistogramColumns;
+use pulsus_model::{Fingerprint, HistogramColumns};
 use serde::{Deserialize, Serialize};
 
 /// One `metric_samples` row from [`super::sample_sql::sample_fetch`] /
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// metric_name = ... WHERE ... ORDER BY fingerprint, unix_milli`.
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
 pub struct SampleRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub value: f64,
 }
@@ -26,7 +26,7 @@ pub struct SampleRow {
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MultiSampleRow {
     pub metric_name: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub value: f64,
 }
@@ -45,7 +45,7 @@ pub struct MultiSampleRow {
 /// is `i8` — the physical `Int8` column width, widened on decode.
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct HistSampleRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub schema: i8,
     pub zero_threshold: f64,
@@ -97,7 +97,7 @@ impl HistSampleRow {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MultiHistSampleRow {
     pub metric_name: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub schema: i8,
     pub zero_threshold: f64,
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn sample_row_derives_are_usable() {
         let a = SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 1_000,
             value: 1.5,
         };

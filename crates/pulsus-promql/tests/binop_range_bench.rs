@@ -27,6 +27,7 @@
 //!      measuring whatever tree it is built against (the doc records a
 //!      pre-fix and a post-fix run).
 
+use pulsus_model::Fingerprint;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -276,7 +277,7 @@ fn range_params() -> PlanParams {
 
 fn fs(fp: u64, name: &str, labels: Labels, base: f64) -> FetchedSeries {
     FetchedSeries {
-        fingerprint: fp,
+        fingerprint: Fingerprint::from_raw(u128::from(fp)),
         metric_name: Some(name.to_string()),
         labels,
         samples: (0..STEPS)

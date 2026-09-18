@@ -38,7 +38,7 @@ use std::future::Future;
 
 use futures::future::{join, join_all};
 use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
-use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
+use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
     DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, PromqlError, QueryValue,
@@ -56,6 +56,15 @@ use crate::logql::exec::{
     HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, QueryResult, VectorSample,
 };
 use crate::logql::explain::PlanExplain;
+
+/// Mints a resolved fingerprint set into the only form that may enter SQL
+/// (issue #498). Every `super::sample_sql` builder takes `&[FpLiteral]`, so a raw
+/// identity cannot reach a statement: above `2^64` a bare decimal literal
+/// is read by ClickHouse as `Float64` and silently matches the wrong row.
+/// One allocation per statement built, 16 bytes per fingerprint.
+fn sql_literals(fps: &[Fingerprint]) -> Vec<FpLiteral> {
+    fps.iter().copied().map(Fingerprint::sql_literal).collect()
+}
 
 /// Owned table configuration a [`MetricsEngine`] plans every query
 /// against — mirrors [`crate::logql::EngineConfig`]'s "owned `String`s, no
@@ -170,22 +179,30 @@ pub struct MetricsConfig {
 /// carries `metric_name` (that sweep query's own third column; this
 /// hydration query never selects it, so reusing the 3-field row here would
 /// be a column-count mismatch against the 2-column result set).
+/// **`pub` for one reason (issue #498):** the round-trip suite
+/// `crates/pulsus-read/tests/live_fingerprint_rowbinary.rs` reads a
+/// `UInt128` column through every `Row` struct that carries a fingerprint,
+/// and the client validates a row type per STATEMENT — a struct left at
+/// `u64` fails on the first row of its own statement and on no other. A
+/// struct it cannot name is a struct nothing checks, which is why this one
+/// and [`FingerprintOnlyRow`] are reachable from outside the crate.
 #[derive(
     Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
 )]
-struct HydratedLabelsRow {
-    fingerprint: u64,
-    labels: String,
+pub struct HydratedLabelsRow {
+    pub fingerprint: Fingerprint,
+    pub labels: String,
 }
 
 /// Issue #82 (retroactive re-review, Finding 1): the info() degraded-path
 /// cardinality probe's result row
 /// ([`super::sql::info_series_cardinality_probe`]'s `SELECT fingerprint`).
+/// `pub` for the same reason as [`HydratedLabelsRow`].
 #[derive(
     Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
 )]
-struct FingerprintOnlyRow {
-    fingerprint: u64,
+pub struct FingerprintOnlyRow {
+    pub fingerprint: Fingerprint,
 }
 
 /// [`MetricsEngine::metadata`]'s `metric_metadata` result row
@@ -698,7 +715,7 @@ impl MetricsEngine {
                         );
                         if explain.is_some()
                             && let Some(first_chunk) = sample_sql::chunk_fingerprints(
-                                &push.fingerprints,
+                                &sql_literals(&push.fingerprints),
                                 self.grouped_chunk_size,
                             )
                             .first()
@@ -777,9 +794,11 @@ impl MetricsEngine {
                     if explain.is_some() {
                         let mut sorted = fps.clone();
                         sorted.sort_unstable();
-                        if let Some(first_chunk) =
-                            sample_sql::chunk_fingerprints(&sorted, sample_sql::CHUNK_THRESHOLD)
-                                .first()
+                        if let Some(first_chunk) = sample_sql::chunk_fingerprints(
+                            &sql_literals(&sorted),
+                            sample_sql::CHUNK_THRESHOLD,
+                        )
+                        .first()
                         {
                             reads.push(compile::SelectorRead {
                                 selector: selector_id,
@@ -1116,14 +1135,14 @@ impl MetricsEngine {
         let sql = sample_sql::sample_fetch_multi(
             &self.config.samples_table,
             &names,
-            &fps,
+            &sql_literals(&fps),
             lower_excl,
             upper_incl,
         );
         let hist_sql = sample_sql::hist_sample_fetch_multi(
             &self.config.hist_samples_table,
             &names,
-            &fps,
+            &sql_literals(&fps),
             lower_excl,
             upper_incl,
         );
@@ -1137,7 +1156,7 @@ impl MetricsEngine {
             compile::selector_pred(
                 &sample_sql::names_predicate(&names),
                 &sample_sql::window_predicate(lower_excl, upper_incl),
-                &sample_sql::fingerprints_predicate(&fps),
+                &sample_sql::fingerprints_predicate(&sql_literals(&fps)),
             )
         });
         Ok((
@@ -1258,7 +1277,7 @@ impl MetricsEngine {
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
                     &self.config.series_table,
                     metric_name,
-                    &fps,
+                    &sql_literals(&fps),
                 );
                 let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
                 let labels_by_fp: HashMap<Fingerprint, LabelSet> = series_rows
@@ -1631,7 +1650,7 @@ impl MetricsEngine {
             super::sql::discovery_fetch_multi(
                 &self.config.series_table,
                 &names,
-                &fps,
+                &sql_literals(&fps),
                 window,
                 bucket_ms,
             ),
@@ -2240,7 +2259,7 @@ fn build_chunk_sqls(
     upper_incl_ms: i64,
 ) -> Vec<String> {
     fps.sort_unstable();
-    sample_sql::chunk_fingerprints(&fps, sample_sql::CHUNK_THRESHOLD)
+    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
         .map(|chunk| {
             sample_sql::sample_fetch(
@@ -2270,7 +2289,7 @@ fn build_grouped_sqls(
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0usize;
-    for chunk in sample_sql::chunk_fingerprints(&push.fingerprints, chunk_size) {
+    for chunk in sample_sql::chunk_fingerprints(&sql_literals(&push.fingerprints), chunk_size) {
         let gids = &push.gids[start..start + chunk.len()];
         out.push(super::grouped_sql::grouped_fetch(
             &config.samples_table,
@@ -2302,7 +2321,7 @@ fn build_hist_chunk_sqls(
     upper_incl_ms: i64,
 ) -> Vec<String> {
     fps.sort_unstable();
-    sample_sql::chunk_fingerprints(&fps, sample_sql::CHUNK_THRESHOLD)
+    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
         .map(|chunk| {
             sample_sql::hist_sample_fetch(
@@ -2983,7 +3002,8 @@ mod tests {
     #[test]
     fn metrics_default_envelope_fits_the_query_text_cap_and_exceeds_the_ch_default() {
         let names: Vec<String> = (0..1_000u32).map(|i| format!("{i:0254}")).collect();
-        let fps: Vec<Fingerprint> = std::iter::repeat_n(u64::MAX, 50_000).collect();
+        let fps: Vec<FpLiteral> =
+            std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
         let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &fps, 0, i64::MAX);
         let bytes = sql.len() as u64;
         assert!(
@@ -3045,14 +3065,28 @@ mod tests {
         // Unsorted input: chunk_size large enough for one chunk, so the
         // single resulting SQL's `IN (...)` list must read ascending
         // regardless of input order.
-        let sqls = build_chunk_sqls("metric_samples", "up", vec![3, 1, 2], 0, 100);
+        let sqls = build_chunk_sqls(
+            "metric_samples",
+            "up",
+            vec![
+                Fingerprint::from_raw(3),
+                Fingerprint::from_raw(1),
+                Fingerprint::from_raw(2),
+            ],
+            0,
+            100,
+        );
         assert_eq!(sqls.len(), 1);
-        assert!(sqls[0].contains("IN (1, 2, 3)"), "got: {}", sqls[0]);
+        assert!(
+            sqls[0].contains("IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))"),
+            "got: {}",
+            sqls[0]
+        );
     }
 
     #[test]
     fn build_chunk_sqls_splits_at_the_chunk_threshold() {
-        let fps: Vec<Fingerprint> = (0..1_200).collect();
+        let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
         let sqls = build_chunk_sqls("metric_samples", "up", fps, 0, 100);
         assert_eq!(sqls.len(), 3);
     }
@@ -3069,17 +3103,18 @@ mod tests {
             let fps: Vec<Fingerprint> = if sql.starts_with("chunk_a") {
                 // Dispatched first, but finishes last.
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                vec![1, 2]
+                vec![Fingerprint::from_raw(1), Fingerprint::from_raw(2)]
             } else {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                vec![3, 4]
+                vec![Fingerprint::from_raw(3), Fingerprint::from_raw(4)]
             };
             Ok(fps
                 .into_iter()
-                .map(|fp| SampleRow {
+                .enumerate()
+                .map(|(i, fp)| SampleRow {
                     fingerprint: fp,
                     unix_milli: 0,
-                    value: fp as f64,
+                    value: i as f64,
                 })
                 .collect())
         })
@@ -3089,7 +3124,7 @@ mod tests {
         let fingerprints: Vec<Fingerprint> = rows.iter().map(|r| r.fingerprint).collect();
         assert_eq!(
             fingerprints,
-            vec![1, 2, 3, 4],
+            [1, 2, 3, 4].map(Fingerprint::from_raw),
             "merged rows must stay in dispatch order even though chunk_a completed after chunk_b"
         );
     }
@@ -3103,6 +3138,7 @@ mod tests {
     async fn fetch_all_concurrently_result_matches_a_single_chunk_reference_bit_for_bit() {
         let values: HashMap<Fingerprint, f64> = [(1, 1e100), (2, 1.0), (3, 2.0), (4, -1e100)]
             .into_iter()
+            .map(|(fp, v)| (Fingerprint::from_raw(fp), v))
             .collect();
         let make_rows = |fps: &[Fingerprint]| -> Vec<SampleRow> {
             fps.iter()
@@ -3120,10 +3156,16 @@ mod tests {
         let chunked_rows = fetch_all_concurrently(chunked_sqls, |sql| async move {
             if sql.starts_with("chunk_a") {
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                Ok(make_rows(&[1, 2]))
+                Ok(make_rows(&[
+                    Fingerprint::from_raw(1),
+                    Fingerprint::from_raw(2),
+                ]))
             } else {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                Ok(make_rows(&[3, 4]))
+                Ok(make_rows(&[
+                    Fingerprint::from_raw(3),
+                    Fingerprint::from_raw(4),
+                ]))
             }
         })
         .await
@@ -3133,7 +3175,12 @@ mod tests {
         // concurrency, no reordering possible.
         let reference_sqls = vec!["single_chunk(1,2,3,4)".to_string()];
         let reference_rows = fetch_all_concurrently(reference_sqls, |_sql| async move {
-            Ok(make_rows(&[1, 2, 3, 4]))
+            Ok(make_rows(&[
+                Fingerprint::from_raw(1),
+                Fingerprint::from_raw(2),
+                Fingerprint::from_raw(3),
+                Fingerprint::from_raw(4),
+            ]))
         })
         .await
         .unwrap();
@@ -3219,7 +3266,7 @@ mod tests {
             if name == "foo" {
                 for g in 0..GROUPS {
                     series.push(FetchedSeries {
-                        fingerprint: g as u64,
+                        fingerprint: Fingerprint::from_raw(u128::from(g as u64)),
                         metric_name: Some("foo".to_string()),
                         labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                         samples: samples(1.0),
@@ -3231,7 +3278,7 @@ mod tests {
                 for g in 0..GROUPS {
                     for m in 0..MANY {
                         series.push(FetchedSeries {
-                            fingerprint: fp,
+                            fingerprint: Fingerprint::from_raw(u128::from(fp)),
                             metric_name: Some("bar".to_string()),
                             labels: Labels::new([
                                 ("g".to_string(), format!("g{g}")),
@@ -3610,29 +3657,29 @@ mod tests {
     fn group_rows_groups_contiguous_same_fingerprint_rows() {
         let rows = vec![
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 unix_milli: 0,
                 value: 1.0,
             },
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 unix_milli: 1000,
                 value: 2.0,
             },
             SampleRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 unix_milli: 0,
                 value: 5.0,
             },
         ];
         let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(1, ls(&[("job", "a")]));
-        labels_by_fp.insert(2, ls(&[("job", "b")]));
+        labels_by_fp.insert(Fingerprint::from_raw(1), ls(&[("job", "a")]));
+        labels_by_fp.insert(Fingerprint::from_raw(2), ls(&[("job", "b")]));
         let series = group_rows(rows, &labels_by_fp, "up");
         assert_eq!(series.len(), 2);
-        assert_eq!(series[0].fingerprint, 1);
+        assert_eq!(series[0].fingerprint, Fingerprint::from_raw(1));
         assert_eq!(series[0].samples.len(), 2);
-        assert_eq!(series[1].fingerprint, 2);
+        assert_eq!(series[1].fingerprint, Fingerprint::from_raw(2));
         assert_eq!(series[1].samples.len(), 1);
     }
 
@@ -3644,7 +3691,7 @@ mod tests {
     #[test]
     fn group_rows_defaults_to_empty_labels_for_an_unhydrated_fingerprint() {
         let rows = vec![SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: 1.0,
         }];
@@ -3662,28 +3709,34 @@ mod tests {
         let rows = vec![
             MultiSampleRow {
                 metric_name: "aaa".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 0,
                 value: 1.0,
             },
             MultiSampleRow {
                 metric_name: "aaa".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 1_000,
                 value: 2.0,
             },
             MultiSampleRow {
                 metric_name: "bbb".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 0,
                 value: 9.0,
             },
         ];
         let mut labels_by = HashMap::new();
-        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
-        labels_by.insert(("bbb".to_string(), 7), ls(&[("job", "a")]));
+        labels_by.insert(
+            ("aaa".to_string(), Fingerprint::from_raw(7)),
+            ls(&[("job", "a")]),
+        );
+        labels_by.insert(
+            ("bbb".to_string(), Fingerprint::from_raw(7)),
+            ls(&[("job", "a")]),
+        );
         let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
         let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
@@ -3706,21 +3759,24 @@ mod tests {
         let rows = vec![
             MultiSampleRow {
                 metric_name: "aaa".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 0,
                 value: 1.0,
             },
             MultiSampleRow {
                 metric_name: "bbb".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 0,
                 value: 2.0,
             },
         ];
         let mut labels_by = HashMap::new();
-        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
+        labels_by.insert(
+            ("aaa".to_string(), Fingerprint::from_raw(7)),
+            ls(&[("job", "a")]),
+        );
         let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
         let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
         assert_eq!(series.len(), 2);
         assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
@@ -3740,27 +3796,30 @@ mod tests {
         let rows = vec![
             MultiSampleRow {
                 metric_name: "aaa".to_string(),
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 unix_milli: 0,
                 value: 1.0,
             },
             MultiSampleRow {
                 metric_name: "bbb".to_string(),
-                fingerprint: 9, // unknown to both maps
+                fingerprint: Fingerprint::from_raw(9), // unknown to both maps
                 unix_milli: 0,
                 value: 2.0,
             },
             MultiSampleRow {
                 metric_name: "bbb".to_string(),
-                fingerprint: 9,
+                fingerprint: Fingerprint::from_raw(9),
                 unix_milli: 1_000,
                 value: 3.0,
             },
         ];
         let mut labels_by = HashMap::new();
-        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
+        labels_by.insert(
+            ("aaa".to_string(), Fingerprint::from_raw(7)),
+            ls(&[("job", "a")]),
+        );
         let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
         let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
         assert_eq!(series.len(), 1, "unknown pair never surfaces: {series:?}");
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
@@ -3774,7 +3833,7 @@ mod tests {
     #[test]
     fn group_rows_stamps_the_concrete_metric_name_on_every_series() {
         let rows = vec![SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: 1.0,
         }];
@@ -3955,7 +4014,7 @@ mod tests {
         }
     }
 
-    fn float_row(fp: u64, t: i64, v: f64) -> SampleRow {
+    fn float_row(fp: Fingerprint, t: i64, v: f64) -> SampleRow {
         SampleRow {
             fingerprint: fp,
             unix_milli: t,
@@ -3963,7 +4022,7 @@ mod tests {
         }
     }
 
-    fn hist_row(fp: u64, t: i64, h: &NativeHistogram) -> HistSampleRow {
+    fn hist_row(fp: Fingerprint, t: i64, h: &NativeHistogram) -> HistSampleRow {
         let c = h.to_columns().expect("to_columns");
         HistSampleRow {
             fingerprint: fp,
@@ -3989,7 +4048,7 @@ mod tests {
     #[test]
     fn decode_hist_round_trips_a_hist_row_bit_for_bit() {
         for h in [single_histogram(), custom_buckets_histogram()] {
-            let row = hist_row(1, 0, &h);
+            let row = hist_row(Fingerprint::from_raw(1), 0, &h);
             let back = decode_hist(&row.to_columns()).expect("decode");
             assert!(
                 back.bits_eq(&h.to_float()),
@@ -4002,8 +4061,11 @@ mod tests {
     fn merge_series_interleaves_float_and_histogram_by_unix_milli() {
         // float at 0,20; hist at 10 — merged ascending 0(f),10(h),20(f).
         let hist = single_histogram();
-        let float = [float_row(1, 0, 1.0), float_row(1, 20, 2.0)];
-        let h = [hist_row(1, 10, &hist)];
+        let float = [
+            float_row(Fingerprint::from_raw(1), 0, 1.0),
+            float_row(Fingerprint::from_raw(1), 20, 2.0),
+        ];
+        let h = [hist_row(Fingerprint::from_raw(1), 10, &hist)];
         let merged = merge_series(&float, &h).unwrap();
         assert_eq!(merged.len(), 3);
         assert_eq!((merged[0].t_ms, merged[0].h.is_none()), (0, true));
@@ -4018,8 +4080,8 @@ mod tests {
         // Same unix_milli in both streams: the histogram is emitted, the
         // float dropped, and BOTH cursors advance (one value per timestamp).
         let hist = single_histogram();
-        let float = [float_row(1, 10, 99.0)];
-        let h = [hist_row(1, 10, &hist)];
+        let float = [float_row(Fingerprint::from_raw(1), 10, 99.0)];
+        let h = [hist_row(Fingerprint::from_raw(1), 10, &hist)];
         let merged = merge_series(&float, &h).unwrap();
         assert_eq!(merged.len(), 1, "the float at the collision is dropped");
         assert_eq!(merged[0].t_ms, 10);
@@ -4032,7 +4094,9 @@ mod tests {
         // must NOT drop it (staleness is owned at the eval layer).
         let mut stale = single_histogram();
         stale.sum = f64::from_bits(STALE_NAN_BITS);
-        let merged = merge_series::<SampleRow, _>(&[], &[hist_row(1, 5, &stale)]).unwrap();
+        let merged =
+            merge_series::<SampleRow, _>(&[], &[hist_row(Fingerprint::from_raw(1), 5, &stale)])
+                .unwrap();
         assert_eq!(merged.len(), 1);
         assert!(merged[0].is_stale());
         assert_eq!(
@@ -4045,16 +4109,19 @@ mod tests {
     fn group_merged_rows_builds_float_and_histogram_series() {
         // fp 1: float-only; fp 2: histogram-only. Ascending-fp order kept.
         let hist = single_histogram();
-        let float = vec![float_row(1, 0, 1.0), float_row(1, 10, 2.0)];
-        let h = vec![hist_row(2, 0, &hist)];
+        let float = vec![
+            float_row(Fingerprint::from_raw(1), 0, 1.0),
+            float_row(Fingerprint::from_raw(1), 10, 2.0),
+        ];
+        let h = vec![hist_row(Fingerprint::from_raw(2), 0, &hist)];
         let mut labels = HashMap::new();
-        labels.insert(1u64, ls(&[("job", "a")]));
-        labels.insert(2u64, ls(&[("job", "b")]));
+        labels.insert(Fingerprint::from_raw(1), ls(&[("job", "a")]));
+        labels.insert(Fingerprint::from_raw(2), ls(&[("job", "b")]));
         let series = group_merged_rows(float, h, &labels, "m").unwrap();
         assert_eq!(series.len(), 2);
-        assert_eq!(series[0].fingerprint, 1);
+        assert_eq!(series[0].fingerprint, Fingerprint::from_raw(1));
         assert!(series[0].samples.iter().all(|s| s.h.is_none()));
-        assert_eq!(series[1].fingerprint, 2);
+        assert_eq!(series[1].fingerprint, Fingerprint::from_raw(2));
         assert_eq!(series[1].samples.len(), 1);
         assert!(
             series[1].samples[0]
@@ -4068,7 +4135,10 @@ mod tests {
     #[test]
     fn group_merged_rows_with_empty_hist_is_the_float_only_fast_path() {
         // Byte-identical to group_rows (the pure-float dual-read case).
-        let float = vec![float_row(1, 0, 1.0), float_row(2, 0, 5.0)];
+        let float = vec![
+            float_row(Fingerprint::from_raw(1), 0, 1.0),
+            float_row(Fingerprint::from_raw(2), 0, 5.0),
+        ];
         let labels = HashMap::new();
         let merged = group_merged_rows(float.clone(), Vec::new(), &labels, "m").unwrap();
         let plain = group_rows(float, &labels, "m");
@@ -4091,7 +4161,7 @@ mod tests {
             let b = bf.clone();
             async move {
                 b.wait().await;
-                Ok(vec![float_row(1, 0, 1.0)])
+                Ok(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
             }
         });
         let hist_fut = fetch_all_concurrently(vec!["h".to_string()], move |_| {
@@ -4121,11 +4191,15 @@ mod tests {
         let (bf, bh) = (barrier.clone(), barrier.clone());
         let float_fut = async move {
             bf.wait().await;
-            Ok::<_, ReadError>(vec![float_row(1, 0, 1.0)])
+            Ok::<_, ReadError>(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
         };
         let hist_fut = async move {
             bh.wait().await;
-            Ok::<_, ReadError>(vec![hist_row(1, 5, &single_histogram())])
+            Ok::<_, ReadError>(vec![hist_row(
+                Fingerprint::from_raw(1),
+                5,
+                &single_histogram(),
+            )])
         };
         let out = tokio::time::timeout(
             Duration::from_secs(5),

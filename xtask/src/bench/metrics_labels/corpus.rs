@@ -95,7 +95,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::{LabelSet, floor_to_activity_bucket, metric_fingerprint};
+use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket, metric_fingerprint};
 
 use crate::bench::Profile;
 
@@ -143,7 +143,7 @@ pub struct TierInfo {
     pub series_rows: u64,
     /// `metric_fingerprint` of series `0` (`pod="pod-0"`) — the fixed
     /// narrow-selector target every path resolves against.
-    pub narrow_fp: u64,
+    pub narrow_fp: Fingerprint,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -163,7 +163,7 @@ pub struct MetricsCorpusSummary {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MetricSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     unix_milli: i64,
     labels: String,
 }
@@ -331,7 +331,7 @@ pub async fn load(
     for &cardinality in &spec.cardinalities {
         anyhow::ensure!(cardinality >= 1, "every cardinality must be >= 1");
         let metric_name = format!("metric_{cardinality}");
-        let mut narrow_fp = 0u64;
+        let mut narrow_fp = Fingerprint::from_raw(0);
 
         for i in 0..cardinality {
             let labels = series_labels(i);

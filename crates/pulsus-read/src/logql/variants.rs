@@ -26,6 +26,7 @@ use super::exec::{MatrixSeries, QueryResult, VectorSample};
 use super::post_agg::apply_vector_aggs;
 use super::warnings::{Warnings, variant_series_warning};
 use super::window::{ClientWindow, grid_point_count};
+use pulsus_model::Fingerprint;
 
 /// The reference's variant-index label (`__variant__`), set to the plain
 /// decimal `index.to_string()` — no padding.
@@ -266,7 +267,7 @@ pub(crate) fn variant_pipeline_entry_bytes(common: &[Stage], tail: &[Stage]) -> 
 /// Walked over the FIRST sub-state's ALREADY-BUILT maps, so the sizing
 /// pass is one O(streams) traversal with no re-parse and no allocation,
 /// and runs only when a query declares ≥ 2 variants.
-fn variant_meta_snapshot_bytes(base_labels: &HashMap<u64, LabelSet>) -> u64 {
+fn variant_meta_snapshot_bytes(base_labels: &HashMap<Fingerprint, LabelSet>) -> u64 {
     let mut bytes: u64 = 0;
     for labels in base_labels.values() {
         bytes = bytes
@@ -594,7 +595,7 @@ impl<'q> VariantsAggState<'q> {
     pub fn new(
         arena: &'q VariantArena,
         variants: &'q [plan::VariantSpec],
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         cap: u64,
     ) -> Result<Self, ReadError> {
         let n = variants.len() as u64;
@@ -889,7 +890,7 @@ pub fn append_variant_label(labels: &mut Vec<(String, String)>, index: usize) {
 /// every scanned body N times (issue #221 member Δ6.2.4).
 pub fn run_variants_rows(
     rows: &[MetricScanRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     common: &[Stage],
     variants: &[plan::VariantSpec],
     warnings: &mut Warnings,
@@ -1070,13 +1071,13 @@ mod tests {
         assert_eq!(sub_charges(3) - sub_charges(2), expected);
     }
 
-    fn k_stream_meta(k: u64) -> HashMap<u64, StreamMetaRow> {
+    fn k_stream_meta(k: u64) -> HashMap<Fingerprint, StreamMetaRow> {
         (0..k)
             .map(|i| {
                 (
-                    i + 1,
+                    Fingerprint::from_raw(u128::from(i + 1)),
                     StreamMetaRow {
-                        fingerprint: i + 1,
+                        fingerprint: Fingerprint::from_raw(u128::from(i + 1)),
                         service: format!("svc{i}"),
                         labels: format!(r#"{{"env":"prod","idx":"{i}"}}"#),
                     },
@@ -1088,7 +1089,7 @@ mod tests {
     /// The I4/I5 expected meta term, built INDEPENDENTLY of
     /// `variant_meta_snapshot_bytes` (same inputs, formula spelled out) so
     /// deleting the runtime charge fails the equality.
-    fn expected_meta_term(meta: &HashMap<u64, StreamMetaRow>) -> u64 {
+    fn expected_meta_term(meta: &HashMap<Fingerprint, StreamMetaRow>) -> u64 {
         let mut bytes = 0u64;
         for m in meta.values() {
             let labels = series_labels(m);
@@ -1186,7 +1187,7 @@ mod tests {
     /// INSTANT kind (state type and constructor fixed), meta K = 4 vs 0.
     #[test]
     fn i4_meta_base_labels_term_is_charged() {
-        let sub_charges = |meta: &HashMap<u64, StreamMetaRow>| {
+        let sub_charges = |meta: &HashMap<Fingerprint, StreamMetaRow>| {
             let (scan, variants, _) = variants_fixture(
                 &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
                 QuerySpec::Instant { at_ns: 60 * VSEC },
@@ -1225,7 +1226,7 @@ mod tests {
     /// condition on it, fails here.
     #[test]
     fn i5_meta_hashes_table_share_is_charged_for_both_sub_state_kinds() {
-        let sub_charges = |spec: QuerySpec, meta: &HashMap<u64, StreamMetaRow>| {
+        let sub_charges = |spec: QuerySpec, meta: &HashMap<Fingerprint, StreamMetaRow>| {
             let (scan, variants, _) = variants_fixture(
                 &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
                 spec,
@@ -1476,7 +1477,7 @@ mod tests {
     fn cap_rows(n: usize) -> Vec<MetricScanRow> {
         (0..n)
             .map(|i| MetricScanRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 // 100 ms apart inside the (0, 60s] window, like b21.
                 timestamp_ns: (i as i64 + 1) * 100 * 1_000_000,
                 body: format!("id={i}"),
@@ -1485,12 +1486,12 @@ mod tests {
             .collect()
     }
 
-    fn cap_meta() -> HashMap<u64, StreamMetaRow> {
+    fn cap_meta() -> HashMap<Fingerprint, StreamMetaRow> {
         let mut m = HashMap::new();
         m.insert(
-            1,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "v277".to_string(),
                 labels: r#"{"app":"v277"}"#.to_string(),
             },

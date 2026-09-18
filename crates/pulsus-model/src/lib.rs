@@ -31,7 +31,8 @@ pub use labels::{LabelError, LabelSet, resolve_structured_metadata, retain_non_e
 pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use time::{
-    DEFAULT_ACTIVITY_BUCKET_MS, Date, Fingerprint, UnixMilli, UnixNano, floor_to_activity_bucket,
+    DEFAULT_ACTIVITY_BUCKET_MS, Date, Fingerprint, FpLiteral, UnixMilli, UnixNano,
+    floor_to_activity_bucket,
 };
 
 #[cfg(test)]

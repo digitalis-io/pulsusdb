@@ -48,6 +48,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_read::logql::predicate::literal;
 use pulsus_read::logql::sql::{self, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
@@ -856,7 +857,10 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
     let client = setup(db, ts_ns).await;
 
     let table = format!("{db}.log_streams");
-    let sql = sql::stage2(&table, &[FP_PROD]);
+    let sql = sql::stage2(
+        &table,
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
+    );
 
     let usage = explain(&client, &sql).await;
     assert_eq!(
@@ -906,7 +910,7 @@ async fn stage3_sql(db: &str, ts_ns: i64, query: &str) -> String {
     sql::stage3(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -1207,13 +1211,17 @@ async fn keyset_page_usage(
     let sql = sql::stage3_keyset(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: ts_ns - 6 * 3_600_000_000_000,
             end_ns: ts_ns + 3_600_000_000_000,
         },
         sql::KeysetLower::After {
-            tuple: (ts_ns, FP_PROD, 42),
+            tuple: (
+                ts_ns,
+                Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal(),
+                42,
+            ),
             offset: 1,
         },
         direction,
@@ -1304,7 +1312,7 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
     let sql = sql::metric_raw_samples_sliding(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -1339,7 +1347,7 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
     let table = format!("{db}.log_metrics_5s");
     let sql = sql::log_volume_rollup(
         &table,
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: ts_ns - 6 * 3_600_000_000_000,
             end_ns: ts_ns + 3_600_000_000_000,
@@ -1491,7 +1499,12 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
 
     // Scoped: the caller's fingerprint list is pushed inside, so the
     // primary key's LEADING column joins the condition too.
-    let scoped = sql::active_fingerprints(&table, Some(&[FP_PROD]), window, ROLLUP_RES_NS);
+    let scoped = sql::active_fingerprints(
+        &table,
+        Some(&[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]),
+        window,
+        ROLLUP_RES_NS,
+    );
     assert_eq!(
         explain(&client, &scoped).await,
         v(&[
@@ -1586,7 +1599,14 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
     // `log_streams`' `ORDER BY fingerprint` primary key.
     let streams = format!("{db}.log_streams");
     assert_eq!(
-        explain(&client, &sql::stage2(&streams, &[FP_PROD])).await,
+        explain(
+            &client,
+            &sql::stage2(
+                &streams,
+                &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]
+            )
+        )
+        .await,
         v(&[
             "MinMax",
             "Condition: true",
@@ -1663,7 +1683,10 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     let scoped_names_sql = sql::label_names(
         &idx,
         &months,
-        Some(&[7, 11]),
+        Some(&[
+            Fingerprint::from_raw(7).sql_literal(),
+            Fingerprint::from_raw(11).sql_literal(),
+        ]),
         &rollup,
         window,
         ROLLUP_RES_NS,
@@ -1704,7 +1727,10 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &idx,
         &months,
         &literal("env"),
-        Some(&[7, 11]),
+        Some(&[
+            Fingerprint::from_raw(7).sql_literal(),
+            Fingerprint::from_raw(11).sql_literal(),
+        ]),
         &rollup,
         window,
         ROLLUP_RES_NS,
@@ -1779,7 +1805,7 @@ async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_time
                 .expect("plan::metric_plan writes both columns out of MetricShape"),
         ),
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -1885,7 +1911,7 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
             .metric_name
             .as_deref()
             .expect("these cases use concrete-name selectors"),
-        &[MFP],
+        &[Fingerprint::from_raw(u128::from(MFP)).sql_literal()],
         lower_excl,
         upper_incl,
     )
@@ -2018,7 +2044,10 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         &table,
         &["mq".to_string(), "mq2".to_string()],
-        &[MFP, MFP2],
+        &[
+            Fingerprint::from_raw(u128::from(MFP)).sql_literal(),
+            Fingerprint::from_raw(u128::from(MFP2)).sql_literal(),
+        ],
         lower_excl,
         upper_incl,
     );
@@ -2115,7 +2144,7 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
         &samples_table,
         "target_info",
-        &[INFO_FP],
+        &[Fingerprint::from_raw(u128::from(INFO_FP)).sql_literal()],
         lower_excl,
         upper_incl,
     );
@@ -2244,7 +2273,10 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
     let sql = pulsus_read::metrics::sql::discovery_fetch_multi(
         &table,
         &["sv".to_string(), "sv2".to_string()],
-        &[SFP1, SFP2],
+        &[
+            Fingerprint::from_raw(u128::from(SFP1)).sql_literal(),
+            Fingerprint::from_raw(u128::from(SFP2)).sql_literal(),
+        ],
         window,
         1,
     );
@@ -2609,7 +2641,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
     let sql = sql::metric_raw_samples_sliding(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -2645,7 +2677,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
     let sql = sql::metric_raw_samples(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -2692,7 +2724,7 @@ async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungro
         let sql = sql::metric_raw_samples(
             &table,
             &[literal("checkout")],
-            &[FP_PROD],
+            &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
             TimeWindow {
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,
@@ -2754,7 +2786,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     let sql = sql::metric_raw_samples_sliding(
         &table,
         &[literal("checkout")],
-        &[FP_PROD],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -2843,7 +2875,9 @@ async fn the_group_key_read_selects_the_raw_scans_granules() {
     let sql::MetricValue::Unwrapped(u) = &mp.value else {
         panic!("the plan is the group key read");
     };
-    let fps: Vec<u64> = (1000..1018).collect();
+    let fps: Vec<FpLiteral> = (1000..1018u128)
+        .map(|v| Fingerprint::from_raw(v).sql_literal())
+        .collect();
     let table = format!("{db}.log_samples");
     let columns = sql::GroupKeyColumns {
         keys: u.keys.iter().map(|k| (k.clone(), Vec::new())).collect(),
@@ -2905,4 +2939,239 @@ async fn the_group_key_read_selects_the_raw_scans_granules() {
         assert_eq!(got, raw_granules, "{what} selects the raw scan's granules");
     }
     drop_database(&client, db).await;
+}
+
+// =====================================================================
+// Issue #498 — the `UInt128` fingerprint still prunes
+// =====================================================================
+
+/// **Criterion 8: a `fingerprint IN (toUInt128(…), …)` read is a point
+/// read of the primary key, it prunes, and the control it is measured
+/// against means something.**
+///
+/// The column widened from `UInt64` to `UInt128` and it still leads the
+/// order key, so the claim is that the exact call form reaches the index
+/// rather than being read as a `Float64` expression the index cannot use.
+///
+/// **The fixture is 300 rows at `index_granularity = 10` — thirty
+/// granules — written as three inserts that each span the whole key
+/// domain.** Both halves of that sentence are load-bearing:
+///
+/// ```text
+///   three inserts, each spanning the domain   Parts: 3/3   Granules:  9/30   <- 9 > 2*3
+///   OPTIMIZE TABLE … FINAL, then the same     Parts: 1/1   Granules:  5/30   <- 5 <= 2*3
+/// ```
+///
+/// The `selected <= 2 * fps.len()` bound is **per active part**: three
+/// overlapping parts each carry a granule for each point, so the bound
+/// does not hold before the merge. That is why `Parts: 1/1` is asserted
+/// first — the order is the difference between a bound and a flake.
+///
+/// **The key domain deliberately straddles two ranges**, and each is there
+/// for one break:
+///
+/// ```text
+///   60 rows at 0 .. 59                the control break has granules to prune:
+///                                       `fingerprint >= toUInt128('50')` reads 26 of 30,
+///                                       where `>= toUInt128('0')` reads 30 of 30
+///   240 rows at 2^64 + i*7919         the point literals are values a bare decimal
+///                                       cannot carry: exact reads [60, 180, 299],
+///                                       bare reads [60]
+/// ```
+///
+/// A fixture wholly above `2^64` passes the control break — every stored
+/// value is `>= 50` either way — and a fixture wholly below `2^53` passes
+/// the bare-literal break. Neither break can be dropped, so neither range
+/// can be.
+///
+/// **The control is a WIDE fingerprint predicate, not the term removed.**
+/// With no `WHERE` at all ClickHouse answers from
+/// `ReadFromPreparedSource (Optimized trivial count)` and prints no
+/// `Indexes` block, so a control built that way has nothing to compare and
+/// the test would panic looking for a missing line.
+#[tokio::test]
+async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_fp128_prune");
+    let bootstrap = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&bootstrap, db).await;
+    bootstrap
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create database");
+
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    let client = ChClient::new(cfg).await.expect("connect (data client)");
+
+    /// Thirty granules of ten rows each, pinned here rather than
+    /// inherited, so the totals below are the fixture's own.
+    const GRANULARITY: u64 = 10;
+    const ROWS: u64 = 300;
+    const GRANULES: u64 = ROWS / GRANULARITY;
+    /// `2^64` — the first value a bare decimal literal cannot carry.
+    const WIDE_BASE: u128 = 18_446_744_073_709_551_616;
+    /// The low end of the domain, present so the control break prunes.
+    const NARROW_ROWS: u128 = 60;
+
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE fp128_prune (fingerprint UInt128, n UInt64) \
+                 ENGINE = MergeTree ORDER BY fingerprint \
+                 SETTINGS index_granularity = {GRANULARITY}"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create fixture table");
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct FpRow {
+        fingerprint: u128,
+        n: u64,
+    }
+
+    let rows: Vec<FpRow> = (0..NARROW_ROWS)
+        .map(|i| FpRow {
+            fingerprint: i,
+            n: i as u64,
+        })
+        .chain((0..(ROWS as u128 - NARROW_ROWS)).map(|i| FpRow {
+            fingerprint: WIDE_BASE + i * 7_919,
+            n: (NARROW_ROWS + i) as u64,
+        }))
+        .collect();
+    assert_eq!(rows.len() as u64, ROWS, "the fixture is 300 rows");
+
+    // Three inserts, each spanning the whole key domain — the shape that
+    // produced the counterexample to the per-part bound. Every third row,
+    // so no part is a sub-range of the key space.
+    for offset in 0..3usize {
+        let part: Vec<FpRow> = rows.iter().skip(offset).step_by(3).cloned().collect();
+        client
+            .insert_block("fp128_prune", &part)
+            .await
+            .expect("insert fixture rows");
+    }
+
+    // Three points, all in the wide half, so a bare decimal is a
+    // different value at every one of them.
+    let points: [u128; 3] = [WIDE_BASE, WIDE_BASE + 120 * 7_919, WIDE_BASE + 239 * 7_919];
+    let fps = points
+        .iter()
+        .map(|v| format!("toUInt128('{v}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let read = format!("SELECT n FROM fp128_prune WHERE fingerprint IN ({fps})");
+
+    // Before the merge: three active parts, and the per-part bound does
+    // NOT hold. Asserted rather than described, so the reason the optimize
+    // is here is a measurement in the test instead of a sentence about one.
+    let before = explain_raw(&client, &read).await;
+    let (parts_before, _) = parts_selected(&before).expect("a Parts: line before the merge");
+    assert_eq!(parts_before, 3, "the fixture must start with three parts");
+    let (selected_before, total_before) =
+        primary_key_granules(&before).expect("a PrimaryKey Granules: line before the merge");
+    assert_eq!(total_before, GRANULES, "the fixture is thirty granules");
+    assert!(
+        selected_before > 2 * points.len() as u64,
+        "over three parts the per-part bound must NOT hold, or asserting Parts: 1/1 first \
+         proves nothing; got {selected_before}/{total_before}"
+    );
+
+    client
+        .execute(
+            "OPTIMIZE TABLE fp128_prune FINAL",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("optimize");
+
+    let raw = explain_raw(&client, &read).await;
+    let (parts_sel, parts_total) = parts_selected(&raw).expect("a Parts: line");
+    assert_eq!(parts_sel, 1, "the optimize did not take effect: {raw}");
+    assert_eq!(parts_total, 1, "a part appeared under the merge: {raw}");
+
+    let (selected, total) = primary_key_granules(&raw)
+        .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in:\n{raw}"));
+    assert_eq!(total, GRANULES, "the fixture is thirty granules: {raw}");
+    assert!(selected >= 1, "the read selected nothing: {raw}");
+    assert!(
+        selected <= 2 * points.len() as u64,
+        "the point read selected {selected} granules over one active part, past the \
+         two-per-point bound: {raw}"
+    );
+    assert!(selected < total, "nothing was pruned: {selected}/{total}");
+    assert!(
+        raw.contains("fingerprint in 3-element set"),
+        "the EXPLAIN does not show the fingerprint set reaching the index:\n{raw}"
+    );
+
+    // **And the read answers with the three rows it names.** Pruning alone
+    // does not separate the exact call form from a bare decimal — measured
+    // on this fixture the two differ by two granules — so the answer is
+    // what separates them: bare returns one row of three, because `2^64`
+    // is exactly representable as an `f64` and the other two points round
+    // away from any stored value.
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct NRow {
+        n: u64,
+    }
+    let mut stream = client
+        .query_stream::<NRow>(&read, &QuerySettings::new())
+        .await
+        .expect("the point read dispatches");
+    let mut got: Vec<u64> = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("decode").n);
+    }
+    drop(stream);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![60, 180, 299],
+        "the point read answered {got:?} rather than the three rows its three fingerprints name"
+    );
+
+    // **The control, and what makes it one.** A predicate on the same
+    // column that admits every granule — `>= toUInt128('0')` reads 30 of
+    // 30. Raising the threshold into the domain prunes: `>= toUInt128('50')`
+    // reads 26 of 30. Asserting both is what says the control's 30/30 is a
+    // property of the predicate rather than of the fixture.
+    let control_sql = "SELECT n FROM fp128_prune WHERE fingerprint >= toUInt128('0')";
+    let control = explain_raw(&client, control_sql).await;
+    let (control_selected, control_total) = primary_key_granules(&control)
+        .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in the control:\n{control}"));
+    assert_eq!(
+        control_selected, control_total,
+        "the control does not read every granule ({control_selected}/{control_total}), so the \
+         gated read's ratio says nothing:\n{control}"
+    );
+    assert_eq!(
+        control_total, GRANULES,
+        "the control reads a different fixture: {control}"
+    );
+
+    let raised = explain_raw(
+        &client,
+        "SELECT n FROM fp128_prune WHERE fingerprint >= toUInt128('50')",
+    )
+    .await;
+    let (raised_selected, raised_total) = primary_key_granules(&raised)
+        .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in the raised control:\n{raised}"));
+    assert!(
+        raised_selected < raised_total,
+        "raising the control's threshold into the key domain must prune ({raised_selected}/\
+         {raised_total}); if it does not, the fixture has nothing below it and the control's \
+         own 30/30 is an artefact:\n{raised}"
+    );
+
+    drop_database(&bootstrap, db).await;
 }

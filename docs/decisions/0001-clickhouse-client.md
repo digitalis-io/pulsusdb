@@ -32,7 +32,49 @@ logical CPUs), Linux 5.15 (WSL2), `rustc`/`cargo` 1.93.0. ClickHouse
 (shares the host with other processes — see the row-count deviation below).
 
 **Row shapes and codecs are byte-identical to the authoritative DDL**
-(architect amendment, issue #3 Codex re-review finding 1):
+(architect amendment, issue #3 re-review finding 1):
+
+> **Re-measured 2026-09-18 (issue #498).** The `fingerprint` column is
+> `UInt128` since the widening, and the benchmark's DDL, row generators and
+> byte accounting moved with it. The shapes named below are the ones this
+> spike measured, at 64 bits; the figures are left as they were taken. What
+> was re-run is the aggregate-state gate, on ClickHouse 26.3.29.7 with the
+> widened column, and both crates still round-trip the value bit-exactly:
+>
+> ```text
+>   xtask ch-bench --scenario aggstate
+>   clickhouse (HTTP)        ok=true  fingerprint 340282366920938463205120190399834488818
+>   klickhouse (native TCP)  ok=true  fingerprint 340282366920938463205120190399834488818
+> ```
+>
+> That value sets the top bit of **both** 64-bit words, so a signed read of
+> either half would come back negative.
+>
+> **Both transports, checked from outside the benchmark.** The two crates
+> agreeing with each other would also be satisfied by both truncating the
+> same way, so the tables each wrote were read back over a third
+> connection:
+>
+> ```text
+>   SELECT count(), countIf(bitShiftRight(fingerprint, 64) = 0), max(fingerprint)
+>
+>   written over HTTP         200000 rows   0 with an empty high word
+>   written over native TCP   200000 rows   0 with an empty high word
+>   max on both               340282366920938463205120190399834488818
+>
+>   uniqExact(fingerprint)              200000 on both
+>   groupBitXor(cityHash64(fingerprint))  10965705347694212856 on both
+> ```
+>
+> The two transports hold the identical set of 128-bit values, and neither
+> dropped the high word. The streaming-fetch scenario reads the same rows
+> back through each crate and folds **both** words of every fingerprint
+> into its checksum; over 400 rows both crates returned
+> `11437175760153119632`.
+>
+> The `ddl` scenario — `CREATE TABLE`, the materialized view and the chunked
+> backfill over the widened column with `CODEC(Delta(8), ZSTD(1))` —
+> reported `reliable=true` for both crates on the same server.
 
 - Metric-shaped rows/table: `docs/schemas.md §2.1` `metric_samples` —
   `metric_name LowCardinality(String)`, `fingerprint UInt64 CODEC(Delta(8),
@@ -111,7 +153,10 @@ inserted, aggregated by the real `metric_samples_5m_mv`, and read back via
 | `clickhouse` | `18446744073709551601` (exact) | `1000` | `1.0` | `1000.0` |
 | `klickhouse` | `18446744073709551601` (exact) | `1000` | `1.0` | `1000.0` |
 
-Both bit-exact. Neither crate is disqualified by this gate.
+Both bit-exact. Neither crate is disqualified by this gate. Re-run on the
+widened column (issue #498, ClickHouse 26.3.29.7) both crates round-trip
+`340282366920938463205120190399834488818` exactly, with the same
+`val_count`, `first_value` and `last_value`.
 
 ### 2. Insert throughput (highest weight)
 

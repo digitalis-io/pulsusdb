@@ -193,6 +193,7 @@ pub fn render_markdown(report: &MetricsLabelsReport) -> String {
 mod tests {
     use super::*;
     use crate::bench::metrics_labels::corpus::TierInfo;
+    use pulsus_model::Fingerprint;
 
     fn sample_report() -> MetricsLabelsReport {
         MetricsLabelsReport {
@@ -208,7 +209,7 @@ mod tests {
                         metric_name: "metric_1000".to_string(),
                         cardinality: 1_000,
                         series_rows: 1_000,
-                        narrow_fp: 42,
+                        narrow_fp: Fingerprint::from_raw(42),
                     }],
                     total_series_rows: 24_000,
                     bucket_ms: 3_600_000,

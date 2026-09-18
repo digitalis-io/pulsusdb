@@ -108,7 +108,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -116,7 +116,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -126,7 +126,7 @@ struct SeedSampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     schema: i8,
     zero_threshold: f64,
@@ -964,14 +964,14 @@ async fn binary_expression_fetches_both_sides_concurrently() {
             let fp = if metric == "foo" { s } else { 100_000 + s };
             series_rows.push(SeedSeriesRow {
                 metric_name: metric.to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 unix_milli: recent_bucket,
                 labels: format!(r#"{{"series":"{s}"}}"#),
             });
             for t in 0..SAMPLES_PER_SERIES {
                 sample_rows.push(SeedSampleRow {
                     metric_name: metric.to_string(),
-                    fingerprint: fp,
+                    fingerprint: u128::from(fp),
                     unix_milli: recent_bucket - t * 1_000,
                     value: t as f64,
                 });
@@ -1293,7 +1293,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let info_series: Vec<SeedSeriesRow> = (0..3u64)
         .map(|i| SeedSeriesRow {
             metric_name: "target_info".to_string(),
-            fingerprint: 900_000_000_000_000_000 + i,
+            fingerprint: u128::from(900_000_000_000_000_000 + i),
             unix_milli: now,
             labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
         })
@@ -1403,7 +1403,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let info_series: Vec<SeedSeriesRow> = (0..3u64)
         .map(|i| SeedSeriesRow {
             metric_name: "target_info".to_string(),
-            fingerprint: 900_000_000_000_001_000 + i,
+            fingerprint: u128::from(900_000_000_000_001_000 + i),
             unix_milli: last_week_bucket,
             labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
         })
@@ -1658,13 +1658,13 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
         for &t in &buckets {
             info_series.push(SeedSeriesRow {
                 metric_name: "target_info".to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 unix_milli: t,
                 labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
             });
             samples.push(SeedSampleRow {
                 metric_name: "target_info".to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 unix_milli: t,
                 value: 1.0,
             });
@@ -3058,7 +3058,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
         "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
     );
-    assert!(sql.contains("fingerprint IN (1)"), "{sql}");
+    assert!(sql.contains("fingerprint IN (toUInt128('1'))"), "{sql}");
     assert!(!sql.contains("other_metric"), "{sql}");
 
     match result {
@@ -3732,7 +3732,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .enumerate()
         .map(|(i, (lbl, _))| SeedSeriesRow {
             metric_name: "p278".to_string(),
-            fingerprint: i as u64 + 1,
+            fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             // Built through serde_json, not a hand-written literal: the
             // fixture carries a control character and two non-ASCII
@@ -3746,7 +3746,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .enumerate()
         .map(|(i, (_, v))| SeedSampleRow {
             metric_name: "p278".to_string(),
-            fingerprint: i as u64 + 1,
+            fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             value: *v,
         })
@@ -3982,7 +3982,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
             .iter()
             .map(|(name, fp, labels)| SeedSeriesRow {
                 metric_name: (*name).to_string(),
-                fingerprint: *fp,
+                fingerprint: u128::from(*fp),
                 unix_milli: recent_bucket,
                 labels: (*labels).to_string(),
             })

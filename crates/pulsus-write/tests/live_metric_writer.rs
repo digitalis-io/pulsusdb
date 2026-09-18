@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, LabelSet};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::{
     MetricMetadata, MetricPoint, MetricSink, MetricWriter, MetricWriterTables, ParsedMetrics,
@@ -289,20 +289,20 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
     let metric_name: Arc<str> = Arc::from("http_requests_total");
     let series = SeriesRef {
         metric_name: metric_name.clone(),
-        fingerprint: 42,
+        fingerprint: Fingerprint::from_raw(42),
         labels,
     };
     let batch = ParsedMetrics {
         samples: vec![
             MetricPoint {
                 metric_name: metric_name.clone(),
-                fingerprint: 42,
+                fingerprint: Fingerprint::from_raw(42),
                 unix_milli: 0,
                 value: 1.0,
             },
             MetricPoint {
                 metric_name: metric_name.clone(),
-                fingerprint: 42,
+                fingerprint: Fingerprint::from_raw(42),
                 unix_milli: 60_000, // same 1h bucket as unix_milli=0
                 value: 2.0,
             },
@@ -389,7 +389,7 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
     let metric_name: Arc<str> = Arc::from("http_requests_total");
     let series = SeriesRef {
         metric_name: metric_name.clone(),
-        fingerprint: 4242,
+        fingerprint: Fingerprint::from_raw(4242),
         labels,
     };
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
@@ -397,13 +397,13 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
         samples: vec![
             MetricPoint {
                 metric_name: metric_name.clone(),
-                fingerprint: 4242,
+                fingerprint: Fingerprint::from_raw(4242),
                 unix_milli: 0,
                 value: 1.0,
             },
             MetricPoint {
                 metric_name: metric_name.clone(),
-                fingerprint: 4242,
+                fingerprint: Fingerprint::from_raw(4242),
                 unix_milli: bucket * 5, // a distinct activity bucket
                 value: 2.0,
             },

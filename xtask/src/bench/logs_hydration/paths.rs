@@ -47,6 +47,7 @@ use super::report::{Dist, PathEvidence, StageDist, Variant};
 use crate::bench::dataset::BroadDatasetSummary;
 use crate::bench::queries::month_literals;
 use crate::bench::query_log::{flush_logs, tagged_settings};
+use pulsus_model::{Fingerprint, FpLiteral};
 
 /// Table names this scenario reads/writes — always bare (single-node only;
 /// `--dist` per-shard roster capture is explicitly out of scope for this
@@ -95,7 +96,7 @@ impl Default for Tables {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct FingerprintRow {
-    fingerprint: u64,
+    fingerprint: Fingerprint,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -106,7 +107,11 @@ struct ServiceRow {
 /// Derives the stage-3 `service` set from `log_streams_idx` **without**
 /// hydrating labels (variant `late_idx`) — `service_name` is a queryable
 /// key in `log_streams_idx` (docs/schemas.md §3.1).
-fn service_set_from_idx(streams_idx_table: &str, months: &[MonthLiteral], fps: &[u64]) -> String {
+fn service_set_from_idx(
+    streams_idx_table: &str,
+    months: &[MonthLiteral],
+    fps: &[FpLiteral],
+) -> String {
     format!(
         "SELECT DISTINCT val AS service\nFROM {streams_idx_table}\nWHERE {} AND key = 'service_name' AND fingerprint IN ({})",
         month_clause(months),
@@ -116,7 +121,7 @@ fn service_set_from_idx(streams_idx_table: &str, months: &[MonthLiteral], fps: &
 
 /// Derives the stage-3 `service` set from a narrow `log_streams` projection
 /// (variant `late_proj`) — never reads the `labels` column.
-fn service_set_from_streams(streams_table: &str, fps: &[u64]) -> String {
+fn service_set_from_streams(streams_table: &str, fps: &[FpLiteral]) -> String {
     format!(
         "SELECT DISTINCT service\nFROM {streams_table}\nWHERE fingerprint IN ({})",
         fp_list(fps)
@@ -138,11 +143,19 @@ fn month_clause(months: &[MonthLiteral]) -> String {
     }
 }
 
-fn fp_list(fps: &[u64]) -> String {
+/// The same `toUInt128('<decimal>')` list the product's own builders
+/// render (issue #498): the column is `UInt128`, and a bare decimal above
+/// `2^64` is read by ClickHouse as `Float64`.
+fn fp_list(fps: &[FpLiteral]) -> String {
     fps.iter()
-        .map(u64::to_string)
+        .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Mints a resolved fingerprint set for the builders, which take literals.
+fn sql_literals(fps: &[Fingerprint]) -> Vec<FpLiteral> {
+    fps.iter().copied().map(Fingerprint::sql_literal).collect()
 }
 
 fn log_comment(variant: Variant, breadth: u32, stage: &str) -> String {
@@ -315,7 +328,7 @@ async fn read_stage_totals(
 pub struct VariantRunOutcome {
     pub resolved_fps: u64,
     pub returned_rows: u64,
-    pub result_fps: Vec<u64>,
+    pub result_fps: Vec<Fingerprint>,
     pub client_wall_ms: f64,
     /// `(stage_name, query_id)` in execution order.
     pub stage_ids: Vec<(&'static str, String)>,
@@ -343,7 +356,7 @@ pub async fn run_variant_once(
     // to reflect a real client's own round trip, not a shared shortcut).
     let s1_id = format!("{base_id}-resolution");
     let s1_settings = settings(&s1_id, &log_comment(variant, breadth, "resolution"));
-    let fps: Vec<u64> = fetch_rows::<FingerprintRow>(client, &sp.stage1_sql, &s1_settings)
+    let fps: Vec<Fingerprint> = fetch_rows::<FingerprintRow>(client, &sp.stage1_sql, &s1_settings)
         .await?
         .into_iter()
         .map(|r| r.fingerprint)
@@ -359,7 +372,7 @@ pub async fn run_variant_once(
     let services: Vec<String> = match variant {
         Variant::Eager => {
             let s2_id = format!("{base_id}-hydration_full");
-            let sql2 = sql::stage2(&tables.streams, &fps);
+            let sql2 = sql::stage2(&tables.streams, &sql_literals(&fps));
             let s2_settings = settings(&s2_id, &log_comment(variant, breadth, "hydration_full"));
             let mut svcs: Vec<String> = fetch_rows::<StreamMetaRow>(client, &sql2, &s2_settings)
                 .await?
@@ -373,7 +386,7 @@ pub async fn run_variant_once(
         }
         Variant::LateIdx => {
             let svc_id = format!("{base_id}-service_idx");
-            let sql_svc = service_set_from_idx(&tables.streams_idx, months, &fps);
+            let sql_svc = service_set_from_idx(&tables.streams_idx, months, &sql_literals(&fps));
             let svc_settings = settings(&svc_id, &log_comment(variant, breadth, "service_idx"));
             let mut svcs: Vec<String> = fetch_rows::<ServiceRow>(client, &sql_svc, &svc_settings)
                 .await?
@@ -387,7 +400,7 @@ pub async fn run_variant_once(
         }
         Variant::LateProj => {
             let svc_id = format!("{base_id}-service_proj");
-            let sql_svc = service_set_from_streams(&tables.streams, &fps);
+            let sql_svc = service_set_from_streams(&tables.streams, &sql_literals(&fps));
             let svc_settings = settings(&svc_id, &log_comment(variant, breadth, "service_proj"));
             let mut svcs: Vec<String> = fetch_rows::<ServiceRow>(client, &sql_svc, &svc_settings)
                 .await?
@@ -409,7 +422,7 @@ pub async fn run_variant_once(
     let sql3 = sql::stage3(
         &tables.samples,
         &escaped,
-        &fps,
+        &sql_literals(&fps),
         window,
         &sp.line_filters,
         sp.direction,
@@ -418,14 +431,14 @@ pub async fn run_variant_once(
     let s3_settings = settings(&s3_id, &log_comment(variant, breadth, "samples"));
     let sample_rows = fetch_rows::<SampleRow>(client, &sql3, &s3_settings).await?;
     let returned_rows = sample_rows.len() as u64;
-    let mut result_fps: Vec<u64> = sample_rows.into_iter().map(|r| r.fingerprint).collect();
+    let mut result_fps: Vec<Fingerprint> = sample_rows.into_iter().map(|r| r.fingerprint).collect();
     stage_ids.push(("samples", s3_id));
     result_fps.sort_unstable();
     result_fps.dedup();
 
     if matches!(variant, Variant::LateIdx | Variant::LateProj) {
         let s2_id = format!("{base_id}-hydration_late");
-        let sql2 = sql::stage2(&tables.streams, &result_fps);
+        let sql2 = sql::stage2(&tables.streams, &sql_literals(&result_fps));
         let s2_settings = settings(&s2_id, &log_comment(variant, breadth, "hydration_late"));
         fetch_rows::<StreamMetaRow>(client, &sql2, &s2_settings).await?;
         stage_ids.push(("hydration_late", s2_id));
@@ -452,7 +465,7 @@ pub async fn run_variant_once(
 /// envelope stayed identical *across breadths* — only unit tests on the
 /// corpus generator's construction covered that property, not the live
 /// gate).
-pub type ResultEnvelope = Vec<(u64, i64, String, String)>;
+pub type ResultEnvelope = Vec<(Fingerprint, i64, String, String)>;
 
 /// Asserts `actual` is **exactly** `expected` — set identity, not
 /// cardinality (code review finding, issue #35 [medium]: a
@@ -465,8 +478,8 @@ pub type ResultEnvelope = Vec<(u64, i64, String, String)>;
 /// gate that calls it.
 fn assert_result_set_identity(
     context: &str,
-    actual: &std::collections::BTreeSet<u64>,
-    expected: &std::collections::BTreeSet<u64>,
+    actual: &std::collections::BTreeSet<Fingerprint>,
+    expected: &std::collections::BTreeSet<Fingerprint>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         actual == expected,
@@ -530,18 +543,19 @@ pub async fn correctness_gate(
     summary: &BroadDatasetSummary,
     sp: &StreamsPlan,
     months: &[MonthLiteral],
-    fps: &[u64],
+    fps: &[Fingerprint],
     reference_envelope: &mut Option<ResultEnvelope>,
-) -> anyhow::Result<(Vec<u64>, u64)> {
+) -> anyhow::Result<(Vec<Fingerprint>, u64)> {
     let eager_id = format!("gate-services-eager-{}", summary.breadth);
-    let sql_eager = sql::stage2(&tables.streams, fps);
+    let sql_eager = sql::stage2(&tables.streams, &sql_literals(fps));
     let eager_rows = fetch_rows::<StreamMetaRow>(
         client,
         &sql_eager,
         &settings(&eager_id, "pulsus-bench:logs-hydration:gate:services"),
     )
     .await?;
-    let mut eager_meta: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let mut eager_meta: std::collections::BTreeMap<Fingerprint, String> =
+        std::collections::BTreeMap::new();
     let mut eager_services = Vec::new();
     for row in eager_rows {
         eager_services.push(row.service.clone());
@@ -551,7 +565,7 @@ pub async fn correctness_gate(
     eager_services.dedup();
 
     let idx_id = format!("gate-services-idx-{}", summary.breadth);
-    let sql_idx = service_set_from_idx(&tables.streams_idx, months, fps);
+    let sql_idx = service_set_from_idx(&tables.streams_idx, months, &sql_literals(fps));
     let mut idx_services: Vec<String> = fetch_rows::<ServiceRow>(
         client,
         &sql_idx,
@@ -565,7 +579,7 @@ pub async fn correctness_gate(
     idx_services.dedup();
 
     let proj_id = format!("gate-services-proj-{}", summary.breadth);
-    let sql_proj = service_set_from_streams(&tables.streams, fps);
+    let sql_proj = service_set_from_streams(&tables.streams, &sql_literals(fps));
     let mut proj_services: Vec<String> = fetch_rows::<ServiceRow>(
         client,
         &sql_proj,
@@ -589,7 +603,7 @@ pub async fn correctness_gate(
         start_ns: sp.start_ns,
         end_ns: sp.end_ns,
     };
-    let expected_result_fps: std::collections::BTreeSet<u64> =
+    let expected_result_fps: std::collections::BTreeSet<Fingerprint> =
         summary.result_fingerprints.iter().copied().collect();
     anyhow::ensure!(
         expected_result_fps.len() == summary.result_streams as usize,
@@ -616,7 +630,7 @@ pub async fn correctness_gate(
         let sql3 = sql::stage3(
             &tables.samples,
             &escaped,
-            fps,
+            &sql_literals(fps),
             window,
             &sp.line_filters,
             sp.direction,
@@ -629,15 +643,16 @@ pub async fn correctness_gate(
             &settings(&id, "pulsus-bench:logs-hydration:gate:samples"),
         )
         .await?;
-        let got: std::collections::BTreeSet<u64> = rows.iter().map(|r| r.fingerprint).collect();
+        let got: std::collections::BTreeSet<Fingerprint> =
+            rows.iter().map(|r| r.fingerprint).collect();
         assert_result_set_identity(
             &format!("breadth {} path {path_name}", summary.breadth),
             &got,
             &expected_result_fps,
         )?;
 
-        let path_result_fps: Vec<u64> = got.into_iter().collect();
-        let hyd_sql = sql::stage2(&tables.streams, &path_result_fps);
+        let path_result_fps: Vec<Fingerprint> = got.into_iter().collect();
+        let hyd_sql = sql::stage2(&tables.streams, &sql_literals(&path_result_fps));
         let hyd_id = format!("gate-envelope-hydrate-{path_name}-{}", summary.breadth);
         let hyd_rows = fetch_rows::<StreamMetaRow>(
             client,
@@ -645,7 +660,7 @@ pub async fn correctness_gate(
             &settings(&hyd_id, "pulsus-bench:logs-hydration:gate:envelope"),
         )
         .await?;
-        let labels: std::collections::BTreeMap<u64, String> = hyd_rows
+        let labels: std::collections::BTreeMap<Fingerprint, String> = hyd_rows
             .into_iter()
             .map(|r| (r.fingerprint, r.labels))
             .collect();
@@ -654,7 +669,7 @@ pub async fn correctness_gate(
         for row in rows {
             let label = labels.get(&row.fingerprint).cloned().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "breadth {}: path {path_name}: fingerprint {} in the samples envelope has \
+                    "breadth {}: path {path_name}: fingerprint {:?} in the samples envelope has \
                      no hydrated labels",
                     summary.breadth,
                     row.fingerprint
@@ -702,7 +717,7 @@ pub async fn correctness_gate(
         }
     }
 
-    let result_fps: Vec<u64> = first_envelope.iter().map(|(fp, ..)| *fp).collect();
+    let result_fps: Vec<Fingerprint> = first_envelope.iter().map(|(fp, ..)| *fp).collect();
     let body_bytes: usize = first_envelope
         .iter()
         .map(|(_, _, body, _)| body.len())
@@ -715,11 +730,11 @@ pub async fn correctness_gate(
     // hydrating ALL N fingerprints, as eager's own production path does,
     // returns the same label content for the overlapping fingerprints as
     // a ≤limit-scoped hydration.
-    let eager_restricted: std::collections::BTreeMap<u64, String> = eager_meta
+    let eager_restricted: std::collections::BTreeMap<Fingerprint, String> = eager_meta
         .into_iter()
         .filter(|(fp, _)| result_fps.contains(fp))
         .collect();
-    let late_envelope_labels: std::collections::BTreeMap<u64, String> = first_envelope
+    let late_envelope_labels: std::collections::BTreeMap<Fingerprint, String> = first_envelope
         .iter()
         .map(|(fp, _, _, labels)| (*fp, labels.clone()))
         .collect();
@@ -882,11 +897,12 @@ pub async fn run_breadth(
         "gate-resolution",
         "pulsus-bench:logs-hydration:gate:resolution",
     );
-    let fps: Vec<u64> = fetch_rows::<FingerprintRow>(client, &sp.stage1_sql, &gate_settings)
-        .await?
-        .into_iter()
-        .map(|r| r.fingerprint)
-        .collect();
+    let fps: Vec<Fingerprint> =
+        fetch_rows::<FingerprintRow>(client, &sp.stage1_sql, &gate_settings)
+            .await?
+            .into_iter()
+            .map(|r| r.fingerprint)
+            .collect();
     anyhow::ensure!(
         fps.len() as u32 == summary.breadth,
         "breadth {}: stage-1 resolved {} fingerprints, expected exactly {} — the corpus/selector \
@@ -1031,8 +1047,8 @@ pub async fn run_breadth(
 mod tests {
     use super::*;
 
-    fn set(vals: &[u64]) -> std::collections::BTreeSet<u64> {
-        vals.iter().copied().collect()
+    fn set(vals: &[u128]) -> std::collections::BTreeSet<Fingerprint> {
+        vals.iter().copied().map(Fingerprint::from_raw).collect()
     }
 
     /// Issue #35 drift guard: this bench's own settings must carry
@@ -1099,9 +1115,16 @@ mod tests {
         assert!(assert_result_set_identity("ctx", &set(&[1, 2, 3, 4]), &set(&[1, 2, 3])).is_err());
     }
 
-    fn envelope(rows: &[(u64, i64, &str, &str)]) -> ResultEnvelope {
+    fn envelope(rows: &[(u128, i64, &str, &str)]) -> ResultEnvelope {
         rows.iter()
-            .map(|(fp, ts, body, labels)| (*fp, *ts, body.to_string(), labels.to_string()))
+            .map(|(fp, ts, body, labels)| {
+                (
+                    Fingerprint::from_raw(*fp),
+                    *ts,
+                    body.to_string(),
+                    labels.to_string(),
+                )
+            })
             .collect()
     }
 
@@ -1118,9 +1141,9 @@ mod tests {
     fn assert_envelope_identity_fails_on_a_timestamp_divergence_with_identical_fingerprints() {
         let actual = envelope(&[(1, 999, "body-a", "{}")]);
         let expected = envelope(&[(1, 100, "body-a", "{}")]);
-        let fps_actual: std::collections::BTreeSet<u64> =
+        let fps_actual: std::collections::BTreeSet<Fingerprint> =
             actual.iter().map(|(fp, ..)| *fp).collect();
-        let fps_expected: std::collections::BTreeSet<u64> =
+        let fps_expected: std::collections::BTreeSet<Fingerprint> =
             expected.iter().map(|(fp, ..)| *fp).collect();
         assert_eq!(
             fps_actual, fps_expected,

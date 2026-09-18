@@ -26,7 +26,7 @@ pub fn metric_table_ddl(table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             metric_name  LowCardinality(String),
-            fingerprint  UInt64   CODEC(Delta(8), ZSTD(1)),
+            fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),
             unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
             value        Float64  CODEC(Gorilla, ZSTD(1))
         ) ENGINE = MergeTree
@@ -42,7 +42,7 @@ pub fn log_table_ddl(table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             service       LowCardinality(String),
-            fingerprint   UInt64,
+            fingerprint   UInt128,
             timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
             severity      Int8    DEFAULT 0,
             body          String  CODEC(ZSTD(1))

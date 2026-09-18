@@ -155,6 +155,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::StructuredMetadataCtx;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use serde::{Deserialize, Serialize};
@@ -688,9 +689,18 @@ fn the_detected_fields_probe_sees_the_same_names() {
         "k01 must derive at least one field, or this test asserts nothing"
     );
     let mut probe = DetectedFieldsProbe::new(10, 100);
-    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "a".to_string())],
+    );
     probe
-        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, sp.line, "")
+        .feed_row(
+            &compiled(r#"{app="a"}"#),
+            Fingerprint::from_raw(1),
+            0,
+            sp.line,
+            "",
+        )
         .expect("no budget breach");
     let (fields, _capped) = probe.finish();
     let mut fields: Vec<String> = fields

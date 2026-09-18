@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::{Date, LabelSet, stream_fingerprint};
+use pulsus_model::{Date, Fingerprint, LabelSet, stream_fingerprint};
 
 use super::Profile;
 
@@ -54,7 +54,7 @@ pub struct DatasetSpec {
     /// putting the entire corpus on one shard. `docs/schemas.md §7`'s
     /// documented pattern (also `crates/pulsus-schema/tests/
     /// live_cluster.rs`): insert into `<table>_dist` and let the
-    /// Distributed engine's `fingerprint` sharding key place each row.
+    /// Distributed engine's sharding key place each row.
     pub dist: bool,
 }
 
@@ -70,7 +70,7 @@ pub struct DatasetSummary {
     /// The canonical stream (index 0) every canonical query shape targets.
     pub canonical_service: String,
     pub canonical_env: String,
-    pub canonical_fingerprint: u64,
+    pub canonical_fingerprint: Fingerprint,
 }
 
 /// A cheap, deterministic 64-bit mix (splitmix64 — matches
@@ -121,7 +121,7 @@ const LABELS_PER_STREAM: u64 = 4;
 struct Stream {
     service: String,
     env: String,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     labels_json: String,
 }
 
@@ -152,7 +152,7 @@ fn build_streams(spec: &DatasetSpec) -> Vec<Stream> {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedStreamRow {
     month: u16,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     service: String,
     labels: String,
     updated_ns: i64,
@@ -161,7 +161,7 @@ struct SeedStreamRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -446,7 +446,7 @@ pub struct BroadDatasetSummary {
     pub filler_streams: u32,
     /// The `HYDRATION_RESULT_STREAMS` fixed fingerprints, in stream-ordinal
     /// order (`0..HYDRATION_RESULT_STREAMS`) — identical across breadths.
-    pub result_fingerprints: Vec<u64>,
+    pub result_fingerprints: Vec<Fingerprint>,
     pub start_ns: i64,
     pub end_ns: i64,
     /// The result/filler timestamp-band boundary (architect plan R6):
@@ -755,7 +755,7 @@ mod tests {
             dist: false,
         };
         let streams = build_streams(&spec);
-        let mut fps: Vec<u64> = streams.iter().map(|s| s.fingerprint).collect();
+        let mut fps: Vec<Fingerprint> = streams.iter().map(|s| s.fingerprint).collect();
         fps.sort_unstable();
         fps.dedup();
         assert_eq!(
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn build_broad_streams_fingerprints_are_distinct() {
         let streams = build_broad_streams(200);
-        let mut fps: Vec<u64> = streams.iter().map(|s| s.fingerprint).collect();
+        let mut fps: Vec<Fingerprint> = streams.iter().map(|s| s.fingerprint).collect();
         fps.sort_unstable();
         fps.dedup();
         assert_eq!(fps.len(), 200);

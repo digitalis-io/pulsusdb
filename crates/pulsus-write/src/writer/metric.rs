@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::ChClient;
 use pulsus_config::WriterConfig;
-use pulsus_model::floor_to_activity_bucket;
+use pulsus_model::{Fingerprint, floor_to_activity_bucket};
 use tokio::sync::{Notify, oneshot};
 use tracing::warn;
 
@@ -522,7 +522,7 @@ impl MetricWriter {
         // once per admission and consulted per touched bucket (architect
         // plan, "Data flow"). One `SeriesRef` serves whichever of the float
         // and histogram samples reference that `(metric_name, fingerprint)`.
-        let series_by_key: HashMap<(&str, u64), &SeriesRef> = batch
+        let series_by_key: HashMap<(&str, Fingerprint), &SeriesRef> = batch
             .series
             .iter()
             .map(|s| ((s.metric_name.as_ref(), s.fingerprint), s))

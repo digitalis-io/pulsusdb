@@ -135,7 +135,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_model::{
-    CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, FloatHistogram, STALE_NAN_BITS, Span,
+    CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, FloatHistogram, STALE_NAN_BITS, Span,
 };
 use pulsus_promql::parser::parse;
 use pulsus_promql::{FetchedSeries, Labels, QueryValue, Sample, SelectorSpec, SeriesData};
@@ -200,7 +200,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -208,7 +208,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -275,7 +275,7 @@ struct FixtureSeries {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     schema: i8,
     zero_threshold: f64,
@@ -615,7 +615,7 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
                 .collect();
             SeedSeriesRow {
                 metric_name: s.metric.to_string(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: bucket,
                 labels: serde_json::to_string(&map).expect("labels json"),
             }
@@ -626,7 +626,7 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
                 metric_name: s.metric.to_string(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
             })
@@ -647,7 +647,7 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
             let cols = cols.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
                 metric_name: s.metric.to_string(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
                 zero_threshold: cols.zero_threshold,
@@ -884,7 +884,7 @@ fn in_memory_answer(query: &str, fx: &[FixtureSeries], p: &MetricQueryParams) ->
         let series: Vec<FetchedSeries> = chosen
             .into_iter()
             .map(|s| FetchedSeries {
-                fingerprint: s.fp,
+                fingerprint: Fingerprint::from_raw(u128::from(s.fp)),
                 metric_name: Some(s.metric.to_string()),
                 labels: Labels::new(s.labels.iter().cloned()),
                 samples: {

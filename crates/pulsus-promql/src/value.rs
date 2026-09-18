@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use pulsus_model::{FloatHistogram, STALE_NAN_BITS};
+use pulsus_model::{Fingerprint, FloatHistogram, STALE_NAN_BITS};
 
 use crate::plan::SelectorId;
 
@@ -227,7 +227,7 @@ impl Labels {
 /// series (never the case for `metric_samples`-backed fetches).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchedSeries {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub metric_name: Option<String>,
     pub labels: Labels,
     pub samples: Vec<Sample>,
@@ -559,7 +559,7 @@ mod tests {
     fn series_data_insert_then_get_round_trips() {
         let mut data = SeriesData::new();
         let series = vec![FetchedSeries {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             metric_name: Some("up".to_string()),
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             samples: vec![Sample::float(0, 1.0)],

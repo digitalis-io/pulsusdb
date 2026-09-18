@@ -65,6 +65,7 @@
 use std::collections::HashMap;
 
 use pulsus_logql::{Expr, Stage, parse};
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
@@ -1032,7 +1033,7 @@ fn fmt_err(file: &str, idx: usize, msg: String) -> String {
 
 #[derive(Debug, Clone)]
 struct StoredStream {
-    fingerprint: u64,
+    fingerprint: u128,
     base: Vec<(String, String)>,
     /// `(timestamp_ns, structured metadata JSON, body)` — see
     /// [`StreamSpec::samples`].
@@ -1041,7 +1042,7 @@ struct StoredStream {
 
 #[derive(Debug, Default)]
 pub struct Store {
-    meta: HashMap<u64, StreamMetaRow>,
+    meta: HashMap<Fingerprint, StreamMetaRow>,
     rows: Vec<MetricScanRow>,
     streams: Vec<StoredStream>,
     next_fp: u64,
@@ -1063,23 +1064,23 @@ impl Store {
             let mut base = spec.labels.clone();
             base.sort();
             self.meta.insert(
-                fp,
+                Fingerprint::from_raw(u128::from(fp)),
                 StreamMetaRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     service: spec.service.clone(),
                     labels: labels_to_json(&spec.labels),
                 },
             );
             for (ts, sm, body) in &spec.samples {
                 self.rows.push(MetricScanRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     timestamp_ns: *ts,
                     body: body.clone(),
                     structured_metadata: sm.clone(),
                 });
             }
             self.streams.push(StoredStream {
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 base,
                 samples: spec.samples.clone(),
             });
@@ -1175,7 +1176,7 @@ fn evaluate_detected(
     };
     let compiled = compile_for_corpus(&sp.pipeline)?;
     // (c) flatten EVERY loaded stream's samples (no matcher filtering).
-    let mut rows: Vec<(u64, i64, &str)> = Vec::new();
+    let mut rows: Vec<(u128, i64, &str)> = Vec::new();
     for stream in &store.streams {
         for (ts, _sm, body) in &stream.samples {
             rows.push((stream.fingerprint, *ts, body.as_str()));
@@ -1188,11 +1189,11 @@ fn evaluate_detected(
     // PRODUCTION `MAX_DETECTED_FIELD_BYTES`.
     let mut probe = DetectedFieldsProbe::new(de.line_limit, de.field_limit);
     for stream in &store.streams {
-        probe.add_stream(stream.fingerprint, &stream.base);
+        probe.add_stream(Fingerprint::from_raw(stream.fingerprint), &stream.base);
     }
     for (fp, ts, body) in rows {
         probe
-            .feed_row(&compiled, fp, ts, body, "")
+            .feed_row(&compiled, Fingerprint::from_raw(fp), ts, body, "")
             .map_err(|e| e.to_string())?;
     }
     // (h) a budget-capped case is a case failure — no corpus expectation

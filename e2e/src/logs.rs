@@ -2763,6 +2763,7 @@ async fn run_sm_case(
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
     use std::ops::ControlFlow;
 
     use super::*;
@@ -4396,9 +4397,9 @@ mod tests {
         let compiled =
             pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).expect("compile");
         let meta = std::collections::HashMap::from([(
-            1u64,
+            Fingerprint::from_raw(1),
             pulsus_read::logql::rows::StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: service.clone(),
                 labels: format!(
                     r#"{{"run_id":"{}","service_name":"{service}"}}"#,
@@ -4411,7 +4412,7 @@ mod tests {
             .iter()
             .filter(|r| r.service == service)
             .map(|r| pulsus_read::logql::rows::MetricScanRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
                 // The shared logs corpus carries no per-entry structured
@@ -4573,9 +4574,9 @@ mod tests {
         let compiled =
             pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).expect("compile");
         let meta = std::collections::HashMap::from([(
-            1u64,
+            Fingerprint::from_raw(1),
             pulsus_read::logql::rows::StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: service.to_string(),
                 labels: format!(
                     r#"{{"run_id":"{}","service_name":"{service}"}}"#,
@@ -4588,7 +4589,7 @@ mod tests {
             .iter()
             .filter(|r| r.service == service)
             .map(|r| pulsus_read::logql::rows::MetricScanRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
                 // The shared logs corpus carries no per-entry structured

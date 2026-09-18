@@ -1,5 +1,5 @@
 === s1_bare_by_status
-SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -20,13 +20,13 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
 SETTINGS precise_float_parsing = 1
 === s1_bare_by_status_counting_undecided
-SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -47,12 +47,12 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
 SETTINGS precise_float_parsing = 1
 === l_bare_by_status
-SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, decided, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint, if(decided = 1, '', structured_metadata) AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, decided, [(toUInt8(if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint, if(decided = 1, '', structured_metadata) AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -74,7 +74,7 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE NOT (decided = 0 AND uw_missing = 1)
 SETTINGS precise_float_parsing = 1
@@ -94,7 +94,7 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * depth_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
@@ -115,7 +115,7 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * depth_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
@@ -146,7 +146,7 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
@@ -178,12 +178,12 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE NOT (decided = 0 AND uw_missing = 1)
 SETTINGS precise_float_parsing = 1
 === s1_bare_no_key
-SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, CAST([], 'Array(Tuple(UInt8, String))') AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, CAST([], 'Array(Tuple(UInt8, String))') AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -199,13 +199,13 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
 SETTINGS precise_float_parsing = 1
 === s1_bare_several_classes
-SELECT transform(fingerprint, [18374, 99120], [0, 1], toUInt64(0)) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if((fingerprint IN (99120) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if((fingerprint IN (99120) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(transform(fingerprint, [toUInt128('18374'), toUInt128('99120')], [0, 1], toUInt64(0))) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if((fingerprint IN (toUInt128('99120')) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), 0, decided * (l0_str + l0_int))), if((fingerprint IN (toUInt128('99120')) OR (position(structured_metadata, '"status":') > 0 AND has(JSONExtractKeys(structured_metadata), 'status'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"__error__":', '"__error_details__":', '"latency":', '"status":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency'), '1', x.2)), arrayFilter(x -> x.1 IN ('__error__', '__error_details__', 'latency', 'status'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -226,13 +226,13 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept
 SETTINGS precise_float_parsing = 1
 === s1_bare_underscore_names
-SELECT toUInt64(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), ''))), (toUInt8(if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), 0, decided * (l1_str + l1_int))), if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), '', if(decided = 1, if(l1_str = 1, substring(l1_r, 2, length(l1_r) - 2), if(l1_int = 1, l1_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"_":', '"__error__":', '"__error_details__":', '"a_b":', '"latency_ms":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency_ms'), '1', x.2)), arrayFilter(x -> x.1 IN ('_', '__error__', '__error_details__', 'a_b', 'latency_ms'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
+SELECT toUInt128(0) AS class, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, [(toUInt8(if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), 0, decided * (l0_str + l0_int))), if(((position(structured_metadata, '"_":') > 0 AND has(JSONExtractKeys(structured_metadata), '_'))), '', if(decided = 1, if(l0_str = 1, substring(l0_r, 2, length(l0_r) - 2), if(l0_int = 1, l0_r, '')), ''))), (toUInt8(if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), 0, decided * (l1_str + l1_int))), if(((position(structured_metadata, '"a_b":') > 0 AND has(JSONExtractKeys(structured_metadata), 'a_b'))), '', if(decided = 1, if(l1_str = 1, substring(l1_r, 2, length(l1_r) - 2), if(l1_int = 1, l1_r, '')), '')))] AS keys, sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value, countIf(decided = 0 AND uw_missing = 1) AS n_missing, countIf(decided = 0 AND uw_missing = 0) AS n_undecided, '' AS sm_text, if(multiSearchAny(structured_metadata, ['"_":', '"__error__":', '"__error_details__":', '"a_b":', '"latency_ms":']), arrayMap(x -> (x.1, if(x.1 IN ('__error__', '__error_details__', 'latency_ms'), '1', x.2)), arrayFilter(x -> x.1 IN ('_', '__error__', '__error_details__', 'a_b', 'latency_ms'), JSONExtractKeysAndValues(structured_metadata, 'String'))), CAST([], 'Array(Tuple(String, String))')) AS sm_kept
 FROM (
   SELECT fingerprint,
     timestamp_ns,
@@ -258,7 +258,7 @@ FROM (
     toUInt8(uw_q * (1 - uw_amb) * toUInt8((l0_str + l0_int + l0_absent) > 0) * toUInt8((l1_str + l1_int + l1_absent) > 0) * depth_ok * keybudget_ok) AS decided
   FROM log_samples
   PREWHERE service = 'checkout'
-  WHERE fingerprint IN (18374, 99120) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
+  WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000
 )
 WHERE throwIf(decided = 0 AND uw_missing = 0) = 0
 GROUP BY class, bucket_ns, keys, sm_text, sm_kept

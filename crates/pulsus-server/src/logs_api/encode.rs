@@ -1622,6 +1622,7 @@ pub(crate) fn json_array_response(items: Vec<String>, explain: Option<PlanExplai
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     use std::io::Read;
 
@@ -1641,7 +1642,7 @@ mod tests {
 
     fn stream(fp: u64, labels_json: &str, entries: Vec<(i64, &str)>) -> StreamResult {
         StreamResult {
-            fingerprint: fp,
+            fingerprint: Fingerprint::from_raw(u128::from(fp)),
             service: "checkout".to_string(),
             labels_json: labels_json.to_string(),
             entries: entries
@@ -1656,7 +1657,7 @@ mod tests {
         let ch = if ctrl { '\u{1}' } else { 'a' };
         let line: String = std::iter::repeat_n(ch, line_len).collect();
         StreamResult {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "svc".to_string(),
             labels_json: r#"{"service_name":"svc"}"#.to_string(),
             entries: (0..n)
@@ -1743,9 +1744,9 @@ mod tests {
         use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
 
         let meta = std::collections::HashMap::from([(
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "svc".to_string(),
                 labels: r#"{"service_name":"svc"}"#.to_string(),
             },
@@ -1758,7 +1759,7 @@ mod tests {
         for (i, body) in bodies.iter().enumerate() {
             acc.push_row(
                 SampleRow {
-                    fingerprint: 1,
+                    fingerprint: Fingerprint::from_raw(1),
                     timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
                     body: body.clone(),
                     structured_metadata: String::new(),
@@ -2700,7 +2701,7 @@ mod tests {
                     })
                     .collect();
                 StreamResult {
-                    fingerprint: i as u64,
+                    fingerprint: Fingerprint::from_raw(u128::from(i as u64)),
                     service: "checkout".to_string(),
                     labels_json,
                     entries,
@@ -3124,7 +3125,7 @@ mod tests {
             parsed: parsed.iter().map(|(k, v)| cat_pair(k, v)).collect(),
         };
         let mut a = StreamResult {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             service: "checkout".to_string(),
             labels_json: r#"{"app":"checkout","service_name":"checkout"}"#.to_string(),
             entries: vec![
@@ -3136,7 +3137,7 @@ mod tests {
             categories: Vec::new(),
         };
         let mut b = StreamResult {
-            fingerprint: 9,
+            fingerprint: Fingerprint::from_raw(9),
             service: "billing".to_string(),
             labels_json: r#"{"app":"billing","service_name":"billing"}"#.to_string(),
             entries: vec![(1_700_000_000_000_000_005, "plain".to_string())],
@@ -3475,7 +3476,7 @@ mod tests {
     fn c463_tail_items(n: usize, categorize: bool) -> Vec<StreamResult> {
         (0..n)
             .map(|i| StreamResult {
-                fingerprint: i as u64,
+                fingerprint: Fingerprint::from_raw(u128::from(i as u64)),
                 service: "svc".to_string(),
                 labels_json: format!(r#"{{"app":"a{i:04}","service_name":"svc"}}"#),
                 entries: vec![(1_700_000_000_000_000_000i64 + i as i64, "line".to_string())],
@@ -3671,9 +3672,9 @@ mod tests {
 
         let ctrl: String = std::iter::repeat_n('\u{1}', 512).collect();
         let meta = std::collections::HashMap::from([(
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "svc".to_string(),
                 labels: r#"{"service_name":"svc"}"#.to_string(),
             },
@@ -3694,7 +3695,7 @@ mod tests {
             probe
                 .push_row(
                     SampleRow {
-                        fingerprint: 1,
+                        fingerprint: Fingerprint::from_raw(1),
                         timestamp_ns: 1_700_000_000_000_000_000i64 + i,
                         body: ctrl.clone(),
                         structured_metadata: sm.clone(),
@@ -4131,14 +4132,14 @@ mod tests {
         };
         vec![
             StreamResult {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "checkout".to_string(),
                 labels_json: C469_PROD.to_string(),
                 entries: entries(0),
                 categories: Vec::new(),
             },
             StreamResult {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "checkout".to_string(),
                 labels_json: C469_STAGING.to_string(),
                 entries: entries(1),
@@ -4299,7 +4300,7 @@ mod tests {
             parsed: Vec::new(),
         };
         let items = vec![StreamResult {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "checkout".to_string(),
             labels_json: C469_PROD.to_string(),
             entries: vec![

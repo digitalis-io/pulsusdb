@@ -151,7 +151,7 @@ impl Drop for ChildGuard {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -159,7 +159,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -908,7 +908,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
                 .iter()
                 .map(|(name, fp, labels)| SeedSeriesRow {
                     metric_name: (*name).to_string(),
-                    fingerprint: *fp,
+                    fingerprint: u128::from(*fp),
                     unix_milli: recent_bucket,
                     labels: (*labels).to_string(),
                 })
@@ -923,7 +923,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
                 .iter()
                 .map(|(name, fp, _)| SeedSampleRow {
                     metric_name: (*name).to_string(),
-                    fingerprint: *fp,
+                    fingerprint: u128::from(*fp),
                     unix_milli: now,
                     value: 1.0,
                 })
@@ -1443,7 +1443,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
                 .iter()
                 .map(|(name, fp, labels)| SeedSeriesRow {
                     metric_name: (*name).to_string(),
-                    fingerprint: *fp,
+                    fingerprint: u128::from(*fp),
                     unix_milli: h,
                     labels: (*labels).to_string(),
                 })

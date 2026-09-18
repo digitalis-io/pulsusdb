@@ -224,6 +224,7 @@ fn now_unix_nanos() -> i128 {
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
     use serde::Serialize;
 
     use pulsus_model::STALE_NAN_BITS;
@@ -330,7 +331,7 @@ mod tests {
 
         let row = MetricSampleRow {
             metric_name: "up".to_string(),
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: f64::from_bits(STALE_NAN_BITS),
         };

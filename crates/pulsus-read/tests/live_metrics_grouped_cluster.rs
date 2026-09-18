@@ -143,7 +143,7 @@ async fn init_clustered_db(db: &str) -> ChClient {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -151,7 +151,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -260,14 +260,14 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         ]);
         series.push(SeedSeriesRow {
             metric_name: METRIC.to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             unix_milli: bucket,
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         for k in 0..=POINTS {
             samples.push(SeedSampleRow {
                 metric_name: METRIC.to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 unix_milli: start + k * 60_000,
                 value: fp as f64 + k as f64 * 0.5,
             });

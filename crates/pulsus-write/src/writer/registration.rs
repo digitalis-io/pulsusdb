@@ -29,9 +29,11 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use pulsus_model::Fingerprint;
+
 /// `(fingerprint, month-as-days-since-epoch)` — the same key
 /// `docs/schemas.md §3.1`'s monthly `log_streams` partitions dedup on.
-pub type StreamKey = (u64, u16);
+pub type StreamKey = (Fingerprint, u16);
 /// `LruSet<StreamKey>` — unchanged behavior/name from before issue #26's
 /// generalization; every existing `log_streams` callsite keeps compiling
 /// against this alias.
@@ -53,7 +55,7 @@ pub type StreamLru = LruSet<StreamKey>;
 /// and a histogram sample in the same activity bucket registers **both**
 /// `metric_series` rows (the per-series float/histogram discriminator) —
 /// they are distinct keys, not a false LRU hit that would suppress one.
-pub type SeriesKey = (Arc<str>, u64, i64, u8);
+pub type SeriesKey = (Arc<str>, Fingerprint, i64, u8);
 pub type SeriesLru = LruSet<SeriesKey>;
 
 struct Slot<K> {
@@ -291,44 +293,44 @@ mod tests {
     #[test]
     fn miss_on_an_empty_cache() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        assert!(!lru.contains(&(1, 1)));
+        assert!(!lru.contains(&(Fingerprint::from_raw(1), 1)));
     }
 
     #[test]
     fn hit_after_insert() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1));
-        assert!(lru.contains(&(1, 1)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 1);
     }
 
     #[test]
     fn distinct_months_for_the_same_fingerprint_are_distinct_keys() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1));
-        assert!(lru.contains(&(1, 1)));
-        assert!(!lru.contains(&(1, 2)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
+        assert!(!lru.contains(&(Fingerprint::from_raw(1), 2)));
     }
 
     #[test]
     fn re_inserting_a_known_key_does_not_grow_the_cache() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1));
-        lru.insert((1, 1));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        lru.insert((Fingerprint::from_raw(1), 1));
         assert_eq!(lru.len(), 1);
     }
 
     #[test]
     fn evicts_the_least_recently_used_entry_at_capacity() {
         let mut lru: LruSet<StreamKey> = LruSet::new(2);
-        lru.insert((1, 1));
-        lru.insert((2, 1));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        lru.insert((Fingerprint::from_raw(2), 1));
         // Touch (1,1) so (2,1) becomes the LRU victim.
-        assert!(lru.contains(&(1, 1)));
-        lru.insert((3, 1));
-        assert!(lru.contains(&(1, 1)));
-        assert!(lru.contains(&(3, 1)));
-        assert!(!lru.contains(&(2, 1)));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
+        lru.insert((Fingerprint::from_raw(3), 1));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
+        assert!(lru.contains(&(Fingerprint::from_raw(3), 1)));
+        assert!(!lru.contains(&(Fingerprint::from_raw(2), 1)));
         assert_eq!(lru.len(), 2);
     }
 
@@ -336,7 +338,7 @@ mod tests {
     fn capacity_never_exceeded_across_many_inserts() {
         let mut lru: LruSet<StreamKey> = LruSet::new(100);
         for i in 0..1_000u64 {
-            lru.insert((i, 0));
+            lru.insert((Fingerprint::from_raw(u128::from(i)), 0));
         }
         assert_eq!(lru.len(), 100);
     }
@@ -344,8 +346,8 @@ mod tests {
     #[test]
     fn zero_capacity_is_floored_to_one() {
         let mut lru: LruSet<StreamKey> = LruSet::new(0);
-        lru.insert((1, 1));
-        assert!(lru.contains(&(1, 1)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 1);
     }
 
@@ -357,9 +359,9 @@ mod tests {
         let mut lru: SeriesLru = LruSet::new(10);
         let a: Arc<str> = Arc::from("http_requests_total");
         let b: Arc<str> = Arc::from("http_errors_total");
-        lru.insert((a.clone(), 42, 0, 0));
-        assert!(lru.contains(&(a, 42, 0, 0)));
-        assert!(!lru.contains(&(b, 42, 0, 0)));
+        lru.insert((a.clone(), Fingerprint::from_raw(42), 0, 0));
+        assert!(lru.contains(&(a, Fingerprint::from_raw(42), 0, 0)));
+        assert!(!lru.contains(&(b, Fingerprint::from_raw(42), 0, 0)));
     }
 
     #[test]
@@ -369,22 +371,25 @@ mod tests {
         // register, never one suppressing the other.
         let mut lru: SeriesLru = LruSet::new(10);
         let name: Arc<str> = Arc::from("http_request_duration");
-        lru.insert((name.clone(), 7, 0, 0));
-        assert!(lru.contains(&(name.clone(), 7, 0, 0)));
-        assert!(!lru.contains(&(name, 7, 0, 1)));
+        lru.insert((name.clone(), Fingerprint::from_raw(7), 0, 0));
+        assert!(lru.contains(&(name.clone(), Fingerprint::from_raw(7), 0, 0)));
+        assert!(!lru.contains(&(name, Fingerprint::from_raw(7), 0, 1)));
     }
 
     #[test]
     fn insert_evicting_reports_no_eviction_under_capacity() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        assert_eq!(lru.insert_evicting((1, 1)), None);
+        assert_eq!(lru.insert_evicting((Fingerprint::from_raw(1), 1)), None);
     }
 
     #[test]
     fn insert_evicting_reports_the_evicted_key_at_capacity() {
         let mut lru: LruSet<StreamKey> = LruSet::new(1);
-        assert_eq!(lru.insert_evicting((1, 1)), None);
-        assert_eq!(lru.insert_evicting((2, 1)), Some((1, 1)));
+        assert_eq!(lru.insert_evicting((Fingerprint::from_raw(1), 1)), None);
+        assert_eq!(
+            lru.insert_evicting((Fingerprint::from_raw(2), 1)),
+            Some((Fingerprint::from_raw(1), 1))
+        );
     }
 
     #[test]
@@ -444,18 +449,18 @@ mod tests {
     #[test]
     fn lru_remove_of_a_present_key_reports_true_and_forgets_it() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1));
-        assert!(lru.remove(&(1, 1)));
-        assert!(!lru.contains(&(1, 1)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        assert!(lru.remove(&(Fingerprint::from_raw(1), 1)));
+        assert!(!lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 0);
     }
 
     #[test]
     fn lru_remove_of_an_absent_key_reports_false_and_changes_nothing() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1));
-        assert!(!lru.remove(&(2, 2)));
-        assert!(lru.contains(&(1, 1)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        assert!(!lru.remove(&(Fingerprint::from_raw(2), 2)));
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 1);
     }
 
@@ -464,34 +469,40 @@ mod tests {
     #[test]
     fn lru_reinsert_after_remove_works_and_capacity_is_not_shrunk_by_ghosts() {
         let mut lru: LruSet<StreamKey> = LruSet::new(2);
-        lru.insert((1, 1));
-        lru.insert((2, 1));
-        assert!(lru.remove(&(1, 1)));
+        lru.insert((Fingerprint::from_raw(1), 1));
+        lru.insert((Fingerprint::from_raw(2), 1));
+        assert!(lru.remove(&(Fingerprint::from_raw(1), 1)));
 
         // Re-insert the removed key, then fill to capacity again: both
         // survivors fit — the freed slot was genuinely reclaimed.
-        lru.insert((1, 1));
+        lru.insert((Fingerprint::from_raw(1), 1));
         assert_eq!(lru.len(), 2);
-        lru.insert((3, 1));
+        lru.insert((Fingerprint::from_raw(3), 1));
         assert_eq!(lru.len(), 2, "capacity 2 holds exactly 2 entries");
-        assert!(lru.contains(&(1, 1)));
-        assert!(lru.contains(&(3, 1)));
-        assert!(!lru.contains(&(2, 1)), "(2,1) was the LRU victim");
+        assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
+        assert!(lru.contains(&(Fingerprint::from_raw(3), 1)));
+        assert!(
+            !lru.contains(&(Fingerprint::from_raw(2), 1)),
+            "(2,1) was the LRU victim"
+        );
     }
 
     #[test]
     fn lru_remove_of_head_middle_and_tail_keeps_the_list_consistent() {
         let mut lru: LruSet<StreamKey> = LruSet::new(10);
-        lru.insert((1, 1)); // tail after the next two inserts
-        lru.insert((2, 1)); // middle
-        lru.insert((3, 1)); // head
-        assert!(lru.remove(&(2, 1)), "middle");
-        assert!(lru.remove(&(3, 1)), "head");
-        assert!(lru.remove(&(1, 1)), "tail (now the only entry)");
+        lru.insert((Fingerprint::from_raw(1), 1)); // tail after the next two inserts
+        lru.insert((Fingerprint::from_raw(2), 1)); // middle
+        lru.insert((Fingerprint::from_raw(3), 1)); // head
+        assert!(lru.remove(&(Fingerprint::from_raw(2), 1)), "middle");
+        assert!(lru.remove(&(Fingerprint::from_raw(3), 1)), "head");
+        assert!(
+            lru.remove(&(Fingerprint::from_raw(1), 1)),
+            "tail (now the only entry)"
+        );
         assert!(lru.is_empty());
         // The structure is still usable afterwards.
-        lru.insert((4, 1));
-        assert!(lru.contains(&(4, 1)));
+        lru.insert((Fingerprint::from_raw(4), 1));
+        assert!(lru.contains(&(Fingerprint::from_raw(4), 1)));
     }
 
     #[test]

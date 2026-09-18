@@ -16,7 +16,7 @@
     "service": "billing",
     "labels_json": "{\"region\":\"eu-west-1\",\"service_name\":\"billing\"}",
     "structured_metadata_json": "{\"scope_name\":\"billing-scope\",\"scope_version\":\"1.0.0\",\"team\":\"payments\"}",
-    "fingerprint": 10897525590642675206,
+    "fingerprint": "201023865607285950018577485204526764736",
     "body": "invoice generated",
     "severity": 5,
     "timestamp_source": "time_unix_nano",

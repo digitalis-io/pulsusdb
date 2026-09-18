@@ -4241,6 +4241,7 @@ mod recursive_control;
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
 
     /// Issue #507, criterion 23 (R9): a key statement over the query-text cap
     /// is not sent, and the query takes today's route.
@@ -4269,13 +4270,13 @@ mod tests {
         let sql::MetricValue::Unwrapped(u) = &mp.value else {
             panic!("{query}: expected the group key read");
         };
-        let meta: HashMap<u64, StreamMetaRow> = (0..100_000u64)
+        let meta: HashMap<Fingerprint, StreamMetaRow> = (0..100_000u64)
             .map(|i| {
                 let fp = 18_000_000_000_000_000_000 + i * 7_919;
                 (
-                    fp,
+                    Fingerprint::from_raw(u128::from(fp)),
                     StreamMetaRow {
-                        fingerprint: fp,
+                        fingerprint: Fingerprint::from_raw(u128::from(fp)),
                         service: "checkout".to_string(),
                         labels: if i == 0 {
                             format!(r#"{{"zone":"z{}"}}"#, i % 3)
@@ -4308,7 +4309,12 @@ mod tests {
             u,
             &resolved.columns,
             &[literal("checkout")],
-            &resolved.fingerprints,
+            &resolved
+                .fingerprints
+                .iter()
+                .copied()
+                .map(Fingerprint::sql_literal)
+                .collect::<Vec<_>>(),
             sql::BucketedScan {
                 window: sql::TimeWindow {
                     start_ns: mp.start_ns,
@@ -7438,7 +7444,10 @@ mod tests {
         super::super::sql::metric_raw_samples_sliding(
             &mp.table,
             &[super::super::predicate::literal("checkout")],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             super::super::sql::TimeWindow {
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,

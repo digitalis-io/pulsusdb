@@ -603,6 +603,29 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-schema --test live_traces
 
+      # Issue #498: every `Row` struct that carries a fingerprint, read back
+      # through the `UInt128` column it reads. The client validates a row
+      # type per STATEMENT, so one row per table proves nothing about the
+      # other structs reading the same table — this suite drives one
+      # statement per struct at the four 2^64 boundary values. Reuses this
+      # job's 26.3 container.
+      - name: Live fingerprint RowBinary round-trip (every fingerprint Row struct)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_fingerprint_rowbinary
+
+      # Issue #498: the end-to-end answers with the two recorded colliding
+      # label-set pairs ingested through the shipped push routes. The defect
+      # this issue removes is invisible in any SQL text — it is a `200` with
+      # the wrong series' data — so the check is the answer. Reuses this
+      # job's 26.3 container.
+      - name: Live fingerprint collision answers (logs + metrics, end to end)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test fingerprint_collision_live
+
       # Issue #11: docs/schemas.md §9's "EXPLAIN indexes = 1 output for the
       # canonical queries is snapshot-tested" gate for the LogQL read path —
       # reuses this job's ClickHouse 26.3 container verbatim.

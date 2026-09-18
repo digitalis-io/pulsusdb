@@ -45,6 +45,7 @@ use super::sql::{
     ClassNames, GroupKeyColumns, MetadataSent, UnwrapForm, UnwrapKeyLabel, UnwrapReducer,
     UnwrappedValue,
 };
+use pulsus_model::{Fingerprint, FpLiteral};
 
 /// One answer series as the fold emits it: sorted labels, ascending points.
 pub(in crate::logql) type FoldedSeries = (LabelSet, Vec<(i64, f64)>);
@@ -55,12 +56,12 @@ pub(in crate::logql) struct ResolvedGroupKey {
     pub columns: GroupKeyColumns,
     /// Class id -> the stream labels every fingerprint of that class shares
     /// on the names that can reach the answer.
-    pub class_labels: HashMap<u64, LabelSet>,
+    pub class_labels: HashMap<Fingerprint, LabelSet>,
     /// Fingerprint -> its full stream labels, for L's undecided rows.
-    pub stream_labels: HashMap<u64, LabelSet>,
+    pub stream_labels: HashMap<Fingerprint, LabelSet>,
     /// The hydrated fingerprints, ascending: the statements read these only,
     /// so a row's class is always one of `class_labels`.
-    pub fingerprints: Vec<u64>,
+    pub fingerprints: Vec<Fingerprint>,
 }
 
 /// Groups the hydrated streams into classes and decides which key labels
@@ -72,19 +73,19 @@ pub(in crate::logql) struct ResolvedGroupKey {
 /// and blanked on those streams.
 pub(in crate::logql) fn resolve(
     value: &UnwrappedValue,
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> ResolvedGroupKey {
-    let mut fingerprints: Vec<u64> = meta.keys().copied().collect();
+    let mut fingerprints: Vec<Fingerprint> = meta.keys().copied().collect();
     fingerprints.sort_unstable();
-    let stream_labels: HashMap<u64, LabelSet> =
+    let stream_labels: HashMap<Fingerprint, LabelSet> =
         meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect();
-    let keys: Vec<(UnwrapKeyLabel, Vec<u64>)> = value
+    let keys: Vec<(UnwrapKeyLabel, Vec<FpLiteral>)> = value
         .keys
         .iter()
         .filter_map(|key| match value.form {
             UnwrapForm::Targeted => Some((key.clone(), Vec::new())),
             UnwrapForm::Bare => {
-                let blank: Vec<u64> = fingerprints
+                let blank: Vec<FpLiteral> = fingerprints
                     .iter()
                     .copied()
                     .filter(|fp| {
@@ -92,6 +93,7 @@ pub(in crate::logql) fn resolve(
                             .iter()
                             .any(|(k, _)| k.as_str() == key.label)
                     })
+                    .map(Fingerprint::sql_literal)
                     .collect();
                 if !fingerprints.is_empty() && blank.len() == fingerprints.len() {
                     None
@@ -118,15 +120,15 @@ pub(in crate::logql) fn resolve(
     }
 }
 
-type Classes = (Option<Vec<Vec<u64>>>, HashMap<u64, LabelSet>);
+type Classes = (Option<Vec<Vec<FpLiteral>>>, HashMap<Fingerprint, LabelSet>);
 
 fn group_into_classes(
-    fingerprints: &[u64],
-    stream_labels: &HashMap<u64, LabelSet>,
+    fingerprints: &[Fingerprint],
+    stream_labels: &HashMap<Fingerprint, LabelSet>,
     keeps: impl Fn(&str) -> bool,
 ) -> Classes {
     // Ordered by the projected labels, so a class id is stable run to run.
-    let mut by_labels: BTreeMap<LabelSet, Vec<u64>> = BTreeMap::new();
+    let mut by_labels: BTreeMap<LabelSet, Vec<Fingerprint>> = BTreeMap::new();
     for fp in fingerprints {
         let projected: LabelSet = stream_labels[fp]
             .iter()
@@ -138,8 +140,14 @@ fn group_into_classes(
     let mut classes = Vec::with_capacity(by_labels.len());
     let mut labels = HashMap::with_capacity(by_labels.len());
     for (id, (projected, fps)) in by_labels.into_iter().enumerate() {
-        labels.insert(id as u64, projected);
-        classes.push(fps);
+        // A class id and a fingerprint share one column: the statement
+        // renders `fingerprint` itself when there is no grouping, and a
+        // `transform(...)` into small ids when there is (issue #507's
+        // `unwrapped_class_expr`). They are therefore one key space, which
+        // is why an id is carried as a `Fingerprint` rather than beside
+        // one.
+        labels.insert(Fingerprint::from_raw(id as u128), projected);
+        classes.push(fps.iter().copied().map(Fingerprint::sql_literal).collect());
     }
     (Some(classes), labels)
 }
@@ -149,7 +157,7 @@ fn group_into_classes(
 /// path holding the placeholder `0`. A blanked or absent key is omitted.
 pub(in crate::logql) fn group_document(
     value: &UnwrappedValue,
-    keys: &[(UnwrapKeyLabel, Vec<u64>)],
+    keys: &[(UnwrapKeyLabel, Vec<FpLiteral>)],
     row_keys: &[(u8, String)],
 ) -> String {
     let mut doc = String::from("{");
@@ -349,7 +357,7 @@ impl<'q> KeyRouteFold<'q> {
     /// unwrapped label among them is today's route.
     fn group_base(
         &mut self,
-        class: u64,
+        class: Fingerprint,
         sm_text: &str,
         sm_kept: &[(String, String)],
     ) -> Result<bool, FoldStop> {
@@ -427,7 +435,7 @@ impl<'q> KeyRouteFold<'q> {
     #[allow(clippy::too_many_arguments)]
     fn push_decided(
         &mut self,
-        class: u64,
+        class: Fingerprint,
         bucket_ns: i64,
         keys: &[(u8, String)],
         sm_text: &str,
@@ -604,6 +612,7 @@ fn merged_value(reducer: UnwrapReducer, p: Partial) -> f64 {
 /// exactly as the reader does, one row at a time. Production never uses it.
 #[doc(hidden)]
 pub mod probe {
+    use pulsus_model::Fingerprint;
     use std::collections::HashMap;
 
     use super::{FoldStop, KeyRouteFold, ResolvedGroupKey, resolve};
@@ -641,7 +650,7 @@ pub mod probe {
 
     impl GroupKeyProbe {
         /// `None` when the plan is not the group key read.
-        pub fn new(mp: &MetricPlan, meta: &HashMap<u64, StreamMetaRow>) -> Option<Self> {
+        pub fn new(mp: &MetricPlan, meta: &HashMap<Fingerprint, StreamMetaRow>) -> Option<Self> {
             let MetricValue::Unwrapped(u) = &mp.value else {
                 return None;
             };
@@ -662,7 +671,7 @@ pub mod probe {
         }
 
         /// The fingerprints the statements read, ascending.
-        pub fn fingerprints(&self) -> &[u64] {
+        pub fn fingerprints(&self) -> &[Fingerprint] {
             &self.resolved.fingerprints
         }
 
@@ -699,6 +708,7 @@ mod tests {
     use crate::logql::params::{Direction, PlanCtx, QueryParams, QuerySpec};
     use crate::logql::plan::{Plan, plan};
     use crate::logql::sql::MetricValue;
+    use pulsus_model::Fingerprint;
 
     /// The group key read a range query plans to, with a one-minute step.
     fn value_of(query: &str) -> UnwrappedValue {
@@ -732,7 +742,13 @@ mod tests {
         }
     }
 
-    fn stream(fp: u64, labels: &str) -> (u64, StreamMetaRow) {
+    /// A minted literal from a small decimal, for the rendered key and
+    /// class columns.
+    fn lit(v: u128) -> FpLiteral {
+        Fingerprint::from_raw(v).sql_literal()
+    }
+
+    fn stream(fp: Fingerprint, labels: &str) -> (Fingerprint, StreamMetaRow) {
         (
             fp,
             StreamMetaRow {
@@ -751,7 +767,10 @@ mod tests {
         let v = value_of(
             r#"sum_over_time({a="b"} | json c="code", lat="latency", m="missing" | unwrap lat [1m])"#,
         );
-        let resolved = resolve(&v, &HashMap::from([stream(1, r#"{"a":"b"}"#)]));
+        let resolved = resolve(
+            &v,
+            &HashMap::from([stream(Fingerprint::from_raw(1), r#"{"a":"b"}"#)]),
+        );
         let doc = group_document(
             &v,
             &resolved.columns.keys,
@@ -776,18 +795,30 @@ mod tests {
     fn classes_split_streams_only_on_the_class_names() {
         let v = value_of(r#"sum by (pod) (sum_over_time({a="b"} | json | unwrap latency [1m]))"#);
         let meta = HashMap::from([
-            stream(1, r#"{"a":"b","pod":"p1","zone":"z1"}"#),
-            stream(2, r#"{"a":"b","pod":"p1","zone":"z2"}"#),
-            stream(3, r#"{"a":"b","pod":"p2","zone":"z1"}"#),
+            stream(
+                Fingerprint::from_raw(1),
+                r#"{"a":"b","pod":"p1","zone":"z1"}"#,
+            ),
+            stream(
+                Fingerprint::from_raw(2),
+                r#"{"a":"b","pod":"p1","zone":"z2"}"#,
+            ),
+            stream(
+                Fingerprint::from_raw(3),
+                r#"{"a":"b","pod":"p2","zone":"z1"}"#,
+            ),
         ]);
         let resolved = resolve(&v, &meta);
-        assert_eq!(resolved.columns.classes, Some(vec![vec![1, 2], vec![3]]));
         assert_eq!(
-            resolved.class_labels[&0],
+            resolved.columns.classes,
+            Some(vec![vec![lit(1), lit(2)], vec![lit(3)]])
+        );
+        assert_eq!(
+            resolved.class_labels[&Fingerprint::from_raw(0)],
             vec![("pod".to_string(), "p1".to_string())]
         );
         assert_eq!(
-            resolved.class_labels[&1],
+            resolved.class_labels[&Fingerprint::from_raw(1)],
             vec![("pod".to_string(), "p2".to_string())]
         );
     }
@@ -801,12 +832,12 @@ mod tests {
         let some = resolve(
             &v,
             &HashMap::from([
-                stream(1, r#"{"a":"b","code":"s"}"#),
-                stream(2, r#"{"a":"b"}"#),
+                stream(Fingerprint::from_raw(1), r#"{"a":"b","code":"s"}"#),
+                stream(Fingerprint::from_raw(2), r#"{"a":"b"}"#),
             ]),
         );
         assert_eq!(some.columns.keys.len(), 1);
-        assert_eq!(some.columns.keys[0].1, vec![1]);
+        assert_eq!(some.columns.keys[0].1, vec![lit(1)]);
         assert_eq!(
             group_document(&v, &some.columns.keys, &[(0, String::new())]),
             r#"{"latency":0}"#
@@ -814,8 +845,8 @@ mod tests {
         let all = resolve(
             &v,
             &HashMap::from([
-                stream(1, r#"{"a":"b","code":"s"}"#),
-                stream(2, r#"{"a":"b","code":"t"}"#),
+                stream(Fingerprint::from_raw(1), r#"{"a":"b","code":"s"}"#),
+                stream(Fingerprint::from_raw(2), r#"{"a":"b","code":"t"}"#),
             ]),
         );
         assert!(all.columns.keys.is_empty(), "{:?}", all.columns.keys);

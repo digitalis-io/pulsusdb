@@ -3,13 +3,14 @@
 //! crate's RowBinary convention).
 
 use pulsus_clickhouse::Row;
+use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
 /// Stage 1 — stream resolution (`log_streams_idx`): one fingerprint per
 /// matching stream.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StreamRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
 }
 
 /// Stage 2 — hydration (`log_streams`): response labels plus the `service`
@@ -19,7 +20,7 @@ pub struct StreamRow {
 /// any one row is safe — docs/schemas.md §3.2 edge cases).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StreamMetaRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub service: String,
     /// Canonical JSON, sorted keys (docs/schemas.md §3.1).
     pub labels: String,
@@ -32,7 +33,7 @@ pub struct StreamMetaRow {
 /// pre-#97 rows read back via the column's `DEFAULT ''`).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SampleRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub timestamp_ns: i64,
     pub body: String,
     pub structured_metadata: String,
@@ -46,7 +47,7 @@ pub struct SampleRow {
 /// body_hash)` only — structured metadata never enters it.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TailSampleRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub timestamp_ns: i64,
     pub body: String,
     pub body_hash: u64,
@@ -78,7 +79,7 @@ pub struct TailSampleRow {
 /// [`super::sql::ScanProjection`].
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricScanRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub timestamp_ns: i64,
     pub body: String,
     pub structured_metadata: String,
@@ -100,7 +101,7 @@ pub struct LogStatsRow {
 /// (rollup-only — the volume endpoint has no raw fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct VolumeRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub bytes: u64,
 }
 
@@ -152,7 +153,7 @@ pub struct ProbeRow {
 /// (docs/schemas.md §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricBucketRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub step: i64,
     pub n: u64,
 }
@@ -176,7 +177,7 @@ pub struct MetricBucketRow {
 /// precedent). Empty string = none.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricInstantRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub n: u64,
     pub structured_metadata: String,
 }
@@ -207,7 +208,7 @@ pub struct MetricInstantRow {
 /// already carries.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricRangeBucketRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub bucket_ns: i64,
     pub n: u64,
     pub structured_metadata: String,
@@ -224,7 +225,9 @@ pub struct MetricRangeBucketRow {
 /// decide (zero whenever the statement throws on them).
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MetricRangeUnwrappedRow {
-    pub class: u64,
+    /// The class id, or the fingerprint itself when the plan groups per
+    /// fingerprint — one `UInt128` column either way (issue #498).
+    pub class: Fingerprint,
     pub bucket_ns: i64,
     pub keys: Vec<(u8, String)>,
     pub v: f64,
@@ -242,13 +245,15 @@ pub struct MetricRangeUnwrappedRow {
 /// never sent.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct UnwrappedLaneRow {
-    pub class: u64,
+    /// The class id, or the fingerprint itself when the plan groups per
+    /// fingerprint — one `UInt128` column either way (issue #498).
+    pub class: Fingerprint,
     pub bucket_ns: i64,
     pub decided: u8,
     pub keys: Vec<(u8, String)>,
     pub v: f64,
     pub body: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub sm_text: String,
     pub sm_kept: Vec<(String, String)>,
 }
@@ -259,7 +264,9 @@ mod tests {
 
     #[test]
     fn stream_row_derives_are_usable() {
-        let a = StreamRow { fingerprint: 1 };
+        let a = StreamRow {
+            fingerprint: Fingerprint::from_raw(1),
+        };
         let b = a.clone();
         assert_eq!(a, b);
     }
@@ -283,7 +290,7 @@ mod tests {
     #[test]
     fn metric_bucket_row_derives_are_usable() {
         let a = MetricBucketRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             step: 0,
             n: 5,
         };

@@ -650,11 +650,12 @@ pub(in crate::logql) const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>
 pub(in crate::logql) const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BucketAcc))>();
 
 /// The map-entry slot the non-mutating instant path's group charge sizes
-/// (`fp_groups`) — issue #236 P1. The key is a `u64` fingerprint, not a
-/// rendered string, so the charge passes an empty key to
+/// (`fp_groups`) — issue #236 P1. The key is a [`pulsus_model::Fingerprint`],
+/// not a rendered string, so the charge passes an empty key to
 /// [`group_entry_bytes`] and the `LabelSet` term prices the hydrated
 /// `base_labels` value the group stands for.
-pub(in crate::logql) const FP_GROUP_SLOT: usize = size_of::<(u64, BucketAcc)>();
+pub(in crate::logql) const FP_GROUP_SLOT: usize =
+    size_of::<(pulsus_model::Fingerprint, BucketAcc)>();
 
 /// The map-entry slot a FOLD group occupies. Both fold maps are keyed by
 /// the `LabelSet` the grouping projects; the value differs per fold, so
@@ -1241,20 +1242,25 @@ const fn leaf_retained_bytes() -> u64 {
 /// peak — staged rows AND the assembled result (issue #312).
 ///
 /// **Derived under PEAK accounting**, with `STREAM_ENTRY_SLOT` = 32,
-/// [`STREAM_GROUP_SLOT`] = 112, [`STAGED_ROW_SLOT`] = 64,
-/// [`map_entry_bytes`]`(112)` = 1 032 and
+/// [`STREAM_GROUP_SLOT`] = 128, [`STAGED_ROW_SLOT`] = 64,
+/// [`map_entry_bytes`]`(128)` = 1 160 and
 /// [`super::exec::STREAM_FEED_CHUNK_BYTES`] = 8 388 608:
 ///
 /// ```text
 /// #  shape                                            entries        groups   staging peak         total   vs 1 GiB
 /// A  5 000 entries, 64 KiB lines, 5 000 streams,
-///    1 KiB labels_json                            655 520 000    36 040 000      8 519 776   700 079 776   admitted (65.2%)
+///    1 KiB labels_json                            655 520 000    36 680 000      8 519 776   700 719 776   admitted (65.3%)
 /// B  5 000 entries, 100 KiB lines, 1 stream,
-///    64 B labels_json                           1 024 160 000         1 448      8 593 504 1 032 754 952   admitted (96.2%)
-/// C  ONE maximal ingestible line (64 MiB body)    134 217 760         1 448    134 217 824   268 437 032   admitted (25.0%)
+///    64 B labels_json                           1 024 160 000         1 576      8 593 504 1 032 755 080   admitted (96.2%)
+/// C  ONE maximal ingestible line (64 MiB body)    134 217 760         1 576    134 217 824   268 437 160   admitted (25.0%)
 /// D  5 000 entries, 100 KiB lines, 5 000 streams,
-///    2 KiB labels_json                          1 024 160 000    66 760 000      8 593 504 1 099 513 504   REFUSED  (102.4%)
+///    2 KiB labels_json                          1 024 160 000    67 400 000      8 593 504 1 100 153 504   REFUSED  (102.5%)
 /// ```
+///
+/// The group column moved with issue #498: the identity is 16 bytes, so
+/// [`STREAM_GROUP_SLOT`] went 112 -> 128 and each group costs 128 bytes
+/// more. The entry and staging columns are untouched — the widening is
+/// per STREAM, not per row.
 ///
 /// Row C is the property that matters most: no single stored row is ever
 /// unreturnable. Row B's wire size is 512 000 000 B — about 125x the
@@ -1329,7 +1335,7 @@ pub(in crate::logql) fn entry_category_bytes(cats: &super::exec::EntryCategories
 /// so the LARGER of the two shapes is charged — the [`FOLD_GROUP_SLOT`]
 /// precedent (one constant, over-charge the smaller shape).
 pub(in crate::logql) const STREAM_GROUP_SLOT: usize = {
-    let by_fp = size_of::<(u64, super::exec::StreamResult)>();
+    let by_fp = size_of::<(pulsus_model::Fingerprint, super::exec::StreamResult)>();
     let by_labels = size_of::<(String, super::detected_probe::FanOutGroup)>();
     if by_fp > by_labels { by_fp } else { by_labels }
 };

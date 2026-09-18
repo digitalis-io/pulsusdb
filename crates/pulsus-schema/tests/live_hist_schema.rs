@@ -155,7 +155,10 @@ struct ExplainRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct HistSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    /// `UInt128` since issue #498, read as the bare integer: this suite
+    /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
+    /// of this crate.
+    fingerprint: u128,
     unix_milli: i64,
     schema: i8,
     zero_threshold: f64,
@@ -374,7 +377,7 @@ async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, count, sum \
                  FROM {db}.metric_hist_samples \
                  WHERE metric_name = 'http_request_duration_seconds' \
-                 AND fingerprint IN (18374588331335825905)"
+                 AND fingerprint IN (toUInt128('18374588331335825905'))"
             ),
             &QuerySettings::new(),
         )
@@ -452,7 +455,7 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     // Seed ONE histogram granule under `mixed_metric` at fingerprint BIG, so
     // the hist table is non-empty (an empty MergeTree trims to a NullSource
     // read and would make the prune trivially/meaninglessly pass).
-    const HIST_FP: u64 = 18374588331335825905;
+    const HIST_FP: u128 = 18374588331335825905;
     let seed = HistSampleRow {
         metric_name: "mixed_metric".to_string(),
         fingerprint: HIST_FP,
@@ -483,7 +486,7 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     let float_only = format!(
         "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
          PREWHERE metric_name = 'pure_float_metric' \
-         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN ({HIST_FP}) \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('{HIST_FP}')) \
          ORDER BY fingerprint, unix_milli"
     );
     let plan_i = explain_lines(&client, &float_only).await;
@@ -494,12 +497,12 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     );
 
     // (ii) Float-only fingerprint inside a histogram-bearing metric: the
-    // `fingerprint IN (1)` prunes the only hist granule (fingerprint range
+    // `fingerprint IN (toUInt128('1'))` prunes the only hist granule (fingerprint range
     // [BIG, BIG] excludes 1).
     let float_fp = format!(
         "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
          PREWHERE metric_name = 'mixed_metric' \
-         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (1) \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('1')) \
          ORDER BY fingerprint, unix_milli"
     );
     let plan_ii = explain_lines(&client, &float_fp).await;
@@ -514,7 +517,7 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     let matching = format!(
         "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
          PREWHERE metric_name = 'mixed_metric' \
-         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN ({HIST_FP}) \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('{HIST_FP}')) \
          ORDER BY fingerprint, unix_milli"
     );
     let plan_hit = explain_lines(&client, &matching).await;

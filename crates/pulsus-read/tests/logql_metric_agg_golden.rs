@@ -75,23 +75,23 @@ fn metric_plan_of(query: &str, params: &QueryParams) -> MetricPlan {
     }
 }
 
-fn meta_one() -> HashMap<u64, StreamMetaRow> {
+fn meta_one() -> HashMap<Fingerprint, StreamMetaRow> {
     HashMap::from([(
-        1u64,
+        Fingerprint::from_raw(1),
         StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "checkout".to_string(),
             labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
         },
     )])
 }
 
-fn meta_two() -> HashMap<u64, StreamMetaRow> {
+fn meta_two() -> HashMap<Fingerprint, StreamMetaRow> {
     let mut m = meta_one();
     m.insert(
-        2u64,
+        Fingerprint::from_raw(2),
         StreamMetaRow {
-            fingerprint: 2,
+            fingerprint: Fingerprint::from_raw(2),
             service: "billing".to_string(),
             labels: r#"{"env":"prod","service_name":"billing"}"#.to_string(),
         },
@@ -101,7 +101,7 @@ fn meta_two() -> HashMap<u64, StreamMetaRow> {
 
 fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
     MetricScanRow {
-        fingerprint: fp,
+        fingerprint: Fingerprint::from_raw(u128::from(fp)),
         timestamp_ns: ts_ns,
         body: body.to_string(),
         // Issue #249 added the column; every fixture in THIS file is
@@ -167,7 +167,7 @@ fn run_client(
     query: &str,
     params: &QueryParams,
     rows: &[MetricScanRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> Result<QueryResult, ReadError> {
     let mp = metric_plan_of(query, params);
     let client = mp.client.as_ref().expect("client-aggregated plan");
@@ -400,7 +400,7 @@ fn first_and_last_take_the_endpoints_of_lokis_delivery_order() {
     let value = |op: &str,
                  group: &str,
                  rows: &[MetricScanRow],
-                 meta: &HashMap<u64, StreamMetaRow>|
+                 meta: &HashMap<Fingerprint, StreamMetaRow>|
      -> f64 {
         single_vector_value(
             run_client(
@@ -1070,13 +1070,13 @@ fn a_surviving_parser_error_also_fails_a_metric_query() {
 // cap+1, succeed at exactly the cap.
 // ---------------------------------------------------------------------
 
-fn meta_n(n: usize) -> HashMap<u64, StreamMetaRow> {
+fn meta_n(n: usize) -> HashMap<Fingerprint, StreamMetaRow> {
     (1..=n as u64)
         .map(|fp| {
             (
-                fp,
+                Fingerprint::from_raw(u128::from(fp)),
                 StreamMetaRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     service: "checkout".to_string(),
                     labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
                 },
@@ -1219,12 +1219,12 @@ fn a_range_chain_whose_inner_grouping_is_wide_and_result_is_one_series_is_served
 /// materialised answers agree over all five.
 #[test]
 fn a_range_aggregation_merging_several_streams_into_one_group_accumulates() {
-    let meta: HashMap<u64, StreamMetaRow> = (1u64..=3)
+    let meta: HashMap<Fingerprint, StreamMetaRow> = (1u64..=3)
         .map(|fp| {
             (
-                fp,
+                Fingerprint::from_raw(u128::from(fp)),
                 StreamMetaRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     service: format!("svc{fp}"),
                     labels: format!(r#"{{"env":"prod","service_name":"svc{fp}"}}"#),
                 },
@@ -2055,6 +2055,7 @@ fn set_operations_against_a_scalar_are_a_named_rejection() {
 // ---------------------------------------------------------------------
 
 use pulsus_logql::{MatchGroup, VectorMatching};
+use pulsus_model::Fingerprint;
 
 fn sample(labels: &[(&str, &str)], value: f64) -> VectorSample {
     VectorSample {
@@ -2853,7 +2854,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
     let sql = pulsus_read::logql::sql::metric_raw_samples(
         &mp.table,
         &[pulsus_read::logql::predicate::literal("checkout")],
-        &[1],
+        &[Fingerprint::from_raw(1).sql_literal()],
         pulsus_read::logql::sql::TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -3032,7 +3033,7 @@ fn metric_node_of(query: &str, params: &QueryParams) -> MetricNode {
 fn eval_node(
     node: &MetricNode,
     rows: &[MetricScanRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> Result<QueryResult, ReadError> {
     let mut nodes = Vec::new();
     pulsus_logql::walk::postorder_into::<MetricNodeScc>(node, &mut nodes);
@@ -3308,14 +3309,14 @@ fn sort_with_a_grouping_is_rejected() {
 // `variants_wrapped_variant_runs_its_own_pipeline` below.
 // ---------------------------------------------------------------------
 
-fn meta_env(entries: &[(u64, &str, &str)]) -> HashMap<u64, StreamMetaRow> {
+fn meta_env(entries: &[(u64, &str, &str)]) -> HashMap<Fingerprint, StreamMetaRow> {
     entries
         .iter()
         .map(|(fp, service, env)| {
             (
-                *fp,
+                Fingerprint::from_raw(u128::from(*fp)),
                 StreamMetaRow {
-                    fingerprint: *fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(*fp)),
                     service: service.to_string(),
                     labels: format!(r#"{{"env":"{env}","service_name":"{service}"}}"#),
                 },
@@ -4222,7 +4223,7 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
 fn eval_instant_metric_query(
     query: &str,
     rows: &[MetricScanRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> QueryResult {
     let expr = parse(query).expect("parse");
     match plan(&expr, &instant_params(60 * NS), &ctx()).expect("plan") {
@@ -4264,27 +4265,27 @@ fn eval_instant_metric_query(
 /// gate is hermetic, so no recapture can touch it.
 #[test]
 fn avg_by_duplicate_grouping_equals_the_deduped_form() {
-    let meta: HashMap<u64, StreamMetaRow> = HashMap::from([
+    let meta: HashMap<Fingerprint, StreamMetaRow> = HashMap::from([
         (
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "gd".to_string(),
                 labels: r#"{"env":"e1","fp":"a","service_name":"gd"}"#.to_string(),
             },
         ),
         (
-            2u64,
+            Fingerprint::from_raw(2),
             StreamMetaRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "gd".to_string(),
                 labels: r#"{"env":"e2","fp":"b","service_name":"gd"}"#.to_string(),
             },
         ),
         (
-            3u64,
+            Fingerprint::from_raw(3),
             StreamMetaRow {
-                fingerprint: 3,
+                fingerprint: Fingerprint::from_raw(3),
                 service: "gd".to_string(),
                 labels: r#"{"env":"e3","fp":"b","service_name":"gd"}"#.to_string(),
             },

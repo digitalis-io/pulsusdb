@@ -4271,6 +4271,7 @@ fn eval_step(
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
     use pulsus_model::{NativeHistogram, STALE_NAN_BITS, Span};
 
     use super::*;
@@ -4491,7 +4492,7 @@ mod tests {
     /// exercising the #85 per-series channel use [`named_series`].
     fn series(fp: u64, labels: &[(&str, &str)], samples: Vec<Sample>) -> FetchedSeries {
         FetchedSeries {
-            fingerprint: fp,
+            fingerprint: Fingerprint::from_raw(u128::from(fp)),
             metric_name: None,
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             samples,

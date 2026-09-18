@@ -1,11 +1,14 @@
 //! Aggregate-state correctness gate (blocking, issue #3 amendment): a
-//! deterministic dataset with a known `fingerprint > 2^63` is inserted, the
+//! deterministic dataset with a known fingerprint whose **both** 64-bit
+//! words have their top bit set is inserted (issue #498: the column is
+//! `UInt128`), the
 //! MV populates `metric_samples_5m` (docs/schemas.md §2.2), and the exact
 //! §2.3 read shape (`finalizeAggregation(argMinMergeState(...))`, plain
 //! `SimpleAggregateFunction(sum, UInt64)`) is asserted bit-correct.
 
 use super::CrateUnderTest;
 use super::rows::{AggRow, HIGH_BIT_FINGERPRINT};
+use pulsus_model::Fingerprint;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct AggstateReport {
@@ -18,7 +21,7 @@ pub struct AggstateReport {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ExpectedAgg {
-    pub fingerprint: u64,
+    pub fingerprint: u128,
     pub val_count: u64,
     pub first_value: f64,
     pub last_value: f64,
@@ -26,7 +29,7 @@ pub struct ExpectedAgg {
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]
 pub struct AggRowOwned {
-    pub fingerprint: u64,
+    pub fingerprint: u128,
     pub val_count: u64,
     pub first_value: f64,
     pub last_value: f64,
@@ -123,13 +126,18 @@ pub async fn bench_aggstate<C: CrateUnderTest>(
     // docs/schemas.md §2.3 exact read shape: SimpleAggregateFunction(sum, UInt64)
     // combined with sum(), AggregateFunction states combined with
     // finalizeAggregation(argMin/argMaxMergeState(...)).
+    // The predicate value is minted, never written as a bare decimal: the
+    // column is `UInt128` and ClickHouse reads a bare decimal above 2^64 as
+    // `Float64`, exact only to 2^53, so a bare literal would match a
+    // neighbouring fingerprint or none at all (issue #498).
+    let fp = Fingerprint::from_raw(HIGH_BIT_FINGERPRINT).sql_literal();
     let sql = format!(
         "SELECT fingerprint,
                 sum(val_count) AS val_count,
                 finalizeAggregation(argMinMergeState(first_value)) AS first_value,
                 finalizeAggregation(argMaxMergeState(last_value)) AS last_value
          FROM {tier_table}
-         WHERE fingerprint = {HIGH_BIT_FINGERPRINT}
+         WHERE fingerprint = {fp}
          GROUP BY fingerprint"
     );
     let rows = match c.select_agg_rows(&sql).await {

@@ -17,8 +17,9 @@
 //! docs/architecture.md §2.2/§2.3's documented canonicalization rules
 //! (character-class substitution, key sorting, greatest-key/greatest-value
 //! collision tie-break, timestamp fallback order). `fingerprint` is a
-//! 64-bit `cityHash64` — infeasible to hand-compute — so it is derived from
-//! an **independent oracle: ClickHouse's own `cityHash64`**, not
+//! 128-bit composition of `cityHash64` and `xxHash64` — infeasible to
+//! hand-compute — so it is derived from an **independent oracle:
+//! ClickHouse's own `cityHash64` and `xxHash64`**, not
 //! `pulsus_model::stream_fingerprint` (issue #16 CODE review [medium]
 //! finding: a golden produced by calling the same Rust implementation under
 //! test makes the fingerprint assertion tautological — `A`, `B`, and the
@@ -31,13 +32,19 @@
 //! produced once, offline, by running:
 //!
 //! ```sql
-//! SELECT cityHash64(concat(
+//! WITH concat(
 //!     '<key1>', unhex('FF'), '<value1>', unhex('FF'),
 //!     '<key2>', unhex('FF'), '<value2>', unhex('FF'),
 //!     -- ... one ('<key>', unhex('FF'), '<value>', unhex('FF')) group per
 //!     -- label, in the same sorted-key order as golden.labels_json --
-//! ))
+//! ) AS b
+//! SELECT toString(bitShiftLeft(toUInt128(cityHash64(b)), 64) + toUInt128(xxHash64(b)))
 //! ```
+//!
+//! The leading 64 bits of every one of these is the value the fixture
+//! carried before issue #498 — the `cityHash64` half is unchanged over the
+//! same buffer, so re-deriving them widened the goldens without moving
+//! what they pin.
 //!
 //! against a live ClickHouse 26.3 server, substituting that fixture's own
 //! `golden.labels_json` keys/values in sorted order — e.g. case 1's
@@ -99,7 +106,7 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet, log_label_name};
+use pulsus_model::{Date, Fingerprint, LabelSet, log_label_name};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 use pulsus_write::writer::{LogSampleRow, LogStreamRow};
 use pulsus_write::{LogWriter, WriterTables};
@@ -219,7 +226,9 @@ struct GoldenFile {
     /// scope attributes under sanitized keys, with Loki's last-write-wins
     /// collision resolution applied. `""` when the scope is absent/empty.
     structured_metadata_json: String,
-    fingerprint: u64,
+    /// A decimal **string**: the identity is 128 bits since issue #498 and
+    /// a JSON number of that width is not read exactly by every parser.
+    fingerprint: String,
     body: String,
     severity: i8,
     /// Which offset field resolves to `timestamp_ns` under the documented
@@ -409,7 +418,7 @@ async fn run_path_a(db: &str, f: &Fixture) {
 /// derived from would make the assertion tautological even after fixing
 /// the golden. `unhex('FF')` avoids any ambiguity from client-side
 /// string-escaping rules for the separator byte.
-async fn ch_stream_fingerprint(client: &ChClient, labels: &LabelSet) -> u64 {
+async fn ch_stream_fingerprint(client: &ChClient, labels: &LabelSet) -> u128 {
     let mut parts = Vec::new();
     for (k, v) in labels.iter() {
         parts.push(format!("'{}'", sql_escape(k)));
@@ -417,11 +426,16 @@ async fn ch_stream_fingerprint(client: &ChClient, labels: &LabelSet) -> u64 {
         parts.push(format!("'{}'", sql_escape(v)));
         parts.push("unhex('FF')".to_string());
     }
-    let sql = format!("SELECT cityHash64(concat({})) AS fp", parts.join(", "));
+    // The 128-bit composition, derived server-side (issue #498): the
+    // `cityHash64` half leads, the `xxHash64` half trails.
+    let buf = format!("concat({})", parts.join(", "));
+    let sql = format!(
+        "SELECT bitShiftLeft(toUInt128(cityHash64({buf})), 64) + toUInt128(xxHash64({buf})) AS fp"
+    );
 
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct FpRow {
-        fp: u64,
+        fp: u128,
     }
     let mut stream = client
         .query_stream::<FpRow>(&sql, &QuerySettings::new())
@@ -541,7 +555,7 @@ async fn run_path_b(db: &str, f: &Fixture) {
 
     let sample = LogSampleRow {
         service: service.clone(),
-        fingerprint,
+        fingerprint: Fingerprint::from_raw(fingerprint),
         timestamp_ns,
         severity,
         body: f.file.body.clone(),
@@ -551,7 +565,7 @@ async fn run_path_b(db: &str, f: &Fixture) {
         month: Date::start_of_month_utc(timestamp_ns)
             .unwrap()
             .days_since_epoch(),
-        fingerprint,
+        fingerprint: Fingerprint::from_raw(fingerprint),
         service,
         labels: labels.to_canonical_json(),
         updated_ns: now_ns(),
@@ -574,7 +588,7 @@ async fn run_path_b(db: &str, f: &Fixture) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SampleReadRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -583,7 +597,7 @@ struct SampleReadRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct StreamReadRow {
-    fingerprint: u64,
+    fingerprint: u128,
     labels: String,
 }
 
@@ -593,11 +607,11 @@ struct IdxReadRow {
     val: String,
 }
 
-async fn fetch_sample(client: &ChClient, db: &str, fingerprint: u64) -> Option<SampleReadRow> {
+async fn fetch_sample(client: &ChClient, db: &str, fingerprint: u128) -> Option<SampleReadRow> {
     let sql = format!(
         "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
          FROM {db}.log_samples \
-         WHERE fingerprint = {fingerprint} ORDER BY timestamp_ns LIMIT 1"
+         WHERE fingerprint = toUInt128('{fingerprint}') ORDER BY timestamp_ns LIMIT 1"
     );
     let mut stream = client
         .query_stream::<SampleReadRow>(&sql, &QuerySettings::new())
@@ -606,9 +620,9 @@ async fn fetch_sample(client: &ChClient, db: &str, fingerprint: u64) -> Option<S
     stream.next().await.and_then(|r| r.ok())
 }
 
-async fn fetch_stream(client: &ChClient, db: &str, fingerprint: u64) -> Option<StreamReadRow> {
+async fn fetch_stream(client: &ChClient, db: &str, fingerprint: u128) -> Option<StreamReadRow> {
     let sql = format!(
-        "SELECT fingerprint, labels FROM {db}.log_streams WHERE fingerprint = {fingerprint} \
+        "SELECT fingerprint, labels FROM {db}.log_streams WHERE fingerprint = toUInt128('{fingerprint}') \
          LIMIT 1 BY fingerprint"
     );
     let mut stream = client
@@ -618,12 +632,12 @@ async fn fetch_stream(client: &ChClient, db: &str, fingerprint: u64) -> Option<S
     stream.next().await.and_then(|r| r.ok())
 }
 
-async fn fetch_idx_pairs(client: &ChClient, db: &str, fingerprint: u64) -> Vec<(String, String)> {
+async fn fetch_idx_pairs(client: &ChClient, db: &str, fingerprint: u128) -> Vec<(String, String)> {
     // `GROUP BY` rather than `FINAL` — query-time dedup, docs/architecture.md
     // §3.2's documented convention for `log_streams_idx`'s
     // `ReplacingMergeTree`.
     let sql = format!(
-        "SELECT key, val FROM {db}.log_streams_idx WHERE fingerprint = {fingerprint} \
+        "SELECT key, val FROM {db}.log_streams_idx WHERE fingerprint = toUInt128('{fingerprint}') \
          GROUP BY key, val ORDER BY key"
     );
     let mut out = Vec::new();
@@ -646,7 +660,7 @@ async fn fetch_idx_pairs(client: &ChClient, db: &str, fingerprint: u64) -> Vec<(
 async fn poll_until_idx_settled(
     client: &ChClient,
     db: &str,
-    fingerprint: u64,
+    fingerprint: u128,
     expected: usize,
 ) -> Vec<(String, String)> {
     let mut last = Vec::new();
@@ -676,7 +690,12 @@ async fn assert_fidelity(case: &str) {
     let read_client_a = ChClient::new(db_config(&db_a)).await.expect("connect a");
     let read_client_b = ChClient::new(db_config(&db_b)).await.expect("connect b");
 
-    let fp = fixture.file.golden.fingerprint;
+    let fp: u128 = fixture
+        .file
+        .golden
+        .fingerprint
+        .parse()
+        .expect("golden.fingerprint is a decimal string");
 
     // --- log_samples ---
     let sample_a = fetch_sample(&read_client_a, &db_a, fp)
@@ -691,10 +710,7 @@ async fn assert_fidelity(case: &str) {
             sample.service, fixture.file.golden.service,
             "{case} path {label}: service"
         );
-        assert_eq!(
-            sample.fingerprint, fixture.file.golden.fingerprint,
-            "{case} path {label}: fingerprint"
-        );
+        assert_eq!(sample.fingerprint, fp, "{case} path {label}: fingerprint");
         assert_eq!(
             sample.timestamp_ns, fixture.expected_timestamp_ns,
             "{case} path {label}: timestamp_ns"

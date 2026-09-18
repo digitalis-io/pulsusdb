@@ -27,6 +27,7 @@
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
+use pulsus_model::{Fingerprint, LabelSet, metric_fingerprint, stream_fingerprint};
 use serde_json::Value;
 
 const FIXTURES: &str = include_str!("fixtures/fingerprints.json");
@@ -72,6 +73,11 @@ struct CityHashRow {
     fingerprint: u64,
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct Compose128Row {
+    fingerprint: u128,
+}
+
 fn hex(buf: &[u8]) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -81,6 +87,23 @@ async fn live_cityhash64(client: &ChClient, buf: &[u8]) -> u64 {
     use futures::StreamExt;
     let mut stream = client
         .query_stream::<CityHashRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query_stream");
+    let row = stream.next().await.expect("one row").expect("row decode");
+    row.fingerprint
+}
+
+/// The composed 128-bit identity as the server derives it — the expression
+/// pinned in `crates/pulsus-model/src/fingerprint.rs`'s module doc.
+async fn live_compose128(client: &ChClient, buf: &[u8]) -> u128 {
+    let h = hex(buf);
+    let sql = format!(
+        "SELECT bitShiftLeft(toUInt128(cityHash64(unhex('{h}'))), 64) \
+         + toUInt128(xxHash64(unhex('{h}'))) AS fingerprint"
+    );
+    use futures::StreamExt;
+    let mut stream = client
+        .query_stream::<Compose128Row>(&sql, &QuerySettings::new())
         .await
         .expect("query_stream");
     let row = stream.next().await.expect("one row").expect("row decode");
@@ -141,5 +164,70 @@ async fn stream_fingerprint_vectors_match_a_live_server() {
             .expect("u64");
         let got = live_cityhash64(&client, &buf).await;
         assert_eq!(got, expected, "{name}: live ClickHouse mismatch");
+    }
+}
+
+/// The 128-bit composition, cross-checked against the server (issue #498).
+///
+/// The widening is only sound if ClickHouse can still derive the identity
+/// itself — the writer is the fingerprint authority, but an independent
+/// server-side derivation is what makes the label index checkable. Until
+/// this test existed the claim rested on one hand-run `SELECT`.
+///
+/// For every committed `stream_fingerprints` and `metric_fingerprints`
+/// buffer it asserts three things agree: the server's
+/// `bitShiftLeft(toUInt128(cityHash64(buf)), 64) + toUInt128(xxHash64(buf))`,
+/// the committed `fingerprint128` vector, and the value this crate's own
+/// function returns for the case's labels. The row is read through a
+/// `u128` field against a `UInt128` expression, so a client that could not
+/// carry the width would fail here rather than silently truncate.
+#[tokio::test]
+async fn the_composed_fingerprint_matches_a_live_server() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let fx = fixtures();
+    for (key, is_stream) in [
+        ("stream_fingerprints", true),
+        ("metric_fingerprints", false),
+    ] {
+        let cases = fx[key].as_array().expect("array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let buf = decode_hex(case["buffer_hex"].as_str().expect("buffer_hex"));
+            let committed: u128 = case["fingerprint128"]
+                .as_str()
+                .expect("fingerprint128")
+                .parse()
+                .expect("u128");
+
+            let got = live_compose128(&client, &buf).await;
+            assert_eq!(got, committed, "{key}/{name}: live ClickHouse mismatch");
+
+            let labels = LabelSet::from_verbatim(
+                case["labels"]
+                    .as_array()
+                    .expect("labels")
+                    .iter()
+                    .map(|pair| {
+                        let pair = pair.as_array().expect("label pair is a 2-array");
+                        (
+                            pair[0].as_str().expect("key").to_string(),
+                            pair[1].as_str().expect("value").to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let ours = if is_stream {
+                stream_fingerprint(&labels)
+            } else {
+                metric_fingerprint(&labels)
+            };
+            assert_eq!(
+                ours,
+                Fingerprint::from_raw(got),
+                "{key}/{name}: this crate disagrees with the server"
+            );
+        }
     }
 }

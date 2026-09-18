@@ -26,12 +26,12 @@ WHERE month IN ('2029-12-01', '2030-01-01')
 GROUP BY fingerprint
 HAVING uniqExact(key, val) = 1
 --- statement 2 stage2_hydration
-SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006)
+SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006'))
 --- statement 3 metric_read
 SELECT fingerprint, 1893455940000000000 + intDiv(timestamp_ns - 1893455940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata
 FROM log_samples
 PREWHERE service IN ('c545a', 'c545b', 'c545c', 'c545d', 'c545e', 'c545f')
-WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006)
+WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006'))
   AND timestamp_ns > 1893455940000000000 AND timestamp_ns <= 1893456000000000000
 GROUP BY fingerprint, bucket_ns, structured_metadata
 
@@ -48,12 +48,12 @@ WHERE month IN ('2029-12-01', '2030-01-01')
 GROUP BY fingerprint
 HAVING uniqExact(key, val) = 1
 --- statement 2 stage2_hydration
-SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006)
+SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006'))
 --- statement 3 metric_read
 SELECT fingerprint, timestamp_ns, body, structured_metadata
 FROM log_samples
 PREWHERE service IN ('c545a', 'c545b', 'c545c', 'c545d', 'c545e', 'c545f')
-WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006)
+WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006'))
   AND timestamp_ns > 1893455940000000000 AND timestamp_ns <= 1893456000000000000
 ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 
@@ -70,10 +70,10 @@ WHERE month IN ('2029-12-01', '2030-01-01')
 GROUP BY fingerprint
 HAVING uniqExact(key, val) = 1
 --- statement 2 stage2_hydration
-SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006)
+SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006'))
 --- statement 3 metric_read
 SELECT fingerprint, count() AS n, structured_metadata
 FROM log_samples
 PREWHERE service IN ('c545a', 'c545b', 'c545c', 'c545d', 'c545e', 'c545f')
-WHERE fingerprint IN (545001, 545002, 545003, 545004, 545005, 545006) AND timestamp_ns > 1893455940000000000 AND timestamp_ns <= 1893456000000000000
+WHERE fingerprint IN (toUInt128('545001'), toUInt128('545002'), toUInt128('545003'), toUInt128('545004'), toUInt128('545005'), toUInt128('545006')) AND timestamp_ns > 1893455940000000000 AND timestamp_ns <= 1893456000000000000
 GROUP BY fingerprint, structured_metadata

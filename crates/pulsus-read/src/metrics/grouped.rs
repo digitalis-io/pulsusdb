@@ -88,6 +88,7 @@ use pulsus_promql::{
 
 use super::exec::MetricsConfig;
 use super::labels::LabelledResolution;
+use pulsus_model::Fingerprint;
 
 /// The four aggregations that are exactly reproducible in a statement
 /// with no runtime condition.
@@ -202,7 +203,7 @@ pub struct GroupedPush {
     pub selector: SelectorId,
     pub metric_name: String,
     /// Ascending, the order `build_chunk_sqls` sorts into.
-    pub fingerprints: Vec<u64>,
+    pub fingerprints: Vec<Fingerprint>,
     /// Parallel to `fingerprints`: `gids[i]` is the group id of
     /// `fingerprints[i]`.
     pub gids: Vec<u32>,
@@ -371,7 +372,7 @@ pub fn decide(
     // Ascending fingerprint order, the order `build_chunk_sqls` sorts
     // into — so a chunk boundary falls in the same place on both routes
     // and the fold's chunk order IS fingerprint order.
-    let mut by_fp: Vec<(u64, &pulsus_model::LabelSet)> =
+    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
         pairs.iter().map(|(fp, ls)| (*fp, ls)).collect();
     by_fp.sort_unstable_by_key(|(fp, _)| *fp);
 
@@ -631,6 +632,7 @@ fn emits(op: GroupedOp, cell: &Cell) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::FpLiteral;
 
     use pulsus_promql::{DEFAULT_LOOKBACK_MS, parse};
 
@@ -796,8 +798,13 @@ mod tests {
         )
     }
 
-    fn resolution(pairs: &[(u64, &[(&str, &str)])]) -> LabelledResolution {
-        LabelledResolution::Series(pairs.iter().map(|(fp, l)| (*fp, ls(l))).collect())
+    fn resolution(pairs: &[(u128, &[(&str, &str)])]) -> LabelledResolution {
+        LabelledResolution::Series(
+            pairs
+                .iter()
+                .map(|(fp, l)| (Fingerprint::from_raw(*fp), ls(l)))
+                .collect(),
+        )
     }
 
     fn shape_for(q: &str) -> GroupedShape {
@@ -815,7 +822,7 @@ mod tests {
         ]);
         let push = decide(&s, &r, s.grid).expect("pushed");
         // Ascending fingerprints, gids assigned in that order.
-        assert_eq!(push.fingerprints, vec![1, 2, 3, 4]);
+        assert_eq!(push.fingerprints, [1, 2, 3, 4].map(Fingerprint::from_raw));
         assert_eq!(push.gids, vec![0, 0, 1, 1]);
         assert_eq!(
             push.groups,
@@ -951,7 +958,9 @@ mod tests {
         use crate::metrics::sample_sql::{CHUNK_THRESHOLD, chunk_fingerprints};
         let rows: [(usize, usize); 5] = [(0, 0), (1, 1), (500, 1), (501, 2), (1_200, 3)];
         for (series, chunks) in rows {
-            let fps: Vec<u64> = (0..series as u64).collect();
+            let fps: Vec<FpLiteral> = (0..series as u128)
+                .map(|v| Fingerprint::from_raw(v).sql_literal())
+                .collect();
             let n = chunk_fingerprints(&fps, CHUNK_THRESHOLD).len();
             assert_eq!(n, chunks, "{series} fingerprints");
             // Today: a float statement and a histogram statement per chunk.

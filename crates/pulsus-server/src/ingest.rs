@@ -344,6 +344,7 @@ pub(crate) fn zipkin_compat_router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     use pulsus_model::UnixNano;
     use pulsus_write::LogRow;
@@ -352,7 +353,7 @@ mod tests {
         ParsedLogs {
             rows: vec![LogRow {
                 service: "svc".to_string(),
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: UnixNano(1),
                 severity: 0,
                 body: "hello".to_string(),
@@ -378,7 +379,7 @@ mod tests {
         ParsedMetrics {
             samples: vec![pulsus_write::MetricPoint {
                 metric_name: Arc::from("up"),
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 unix_milli: 1,
                 value: 1.0,
             }],

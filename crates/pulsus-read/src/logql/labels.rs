@@ -118,6 +118,16 @@ pub(in crate::logql) fn push_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// The fan-out path's deterministic label-set identity, widened into the
+/// stored identity's type (issue #498). The value is the 64-bit FNV-1a
+/// hash in the low half and zero in the high half — it is **not** a
+/// write-path fingerprint and never meets one, so the composition of
+/// `stream_fingerprint` does not apply to it; it is a stable response
+/// identity for a derived stream and nothing else.
+pub(in crate::logql) fn derived_stream_fingerprint(bytes: &[u8]) -> pulsus_model::Fingerprint {
+    pulsus_model::Fingerprint::from_raw(u128::from(fnv1a64(bytes)))
+}
+
 /// FNV-1a 64 — the fan-out path's deterministic label-set fingerprint
 /// (`fingerprint = hash(final labels)`, plan v1). Not a stored/write-path
 /// fingerprint: purely a stable response identity for derived streams.
@@ -402,6 +412,7 @@ fn merge_metadata_pairs(
 mod tests {
     use super::*;
     use crate::logql::testkit::*;
+    use pulsus_model::Fingerprint;
     use std::borrow::Cow;
 
     /// AC2: `stream_hash` == Loki's `labels.StableHash`, pinned against
@@ -491,7 +502,7 @@ mod tests {
     #[test]
     fn series_labels_injects_service_name_from_the_physical_column() {
         let meta = StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "checkout".to_string(),
             labels: r#"{"env":"prod"}"#.to_string(),
         };

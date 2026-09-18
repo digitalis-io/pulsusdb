@@ -423,8 +423,9 @@ mod tests {
     use super::*;
     use crate::writer::registration::StreamKey;
     use crate::writer::rows::{LogStreamRow, MetricSeriesRow};
+    use pulsus_model::Fingerprint;
 
-    fn row(fingerprint: u64, month: u16, updated_ns: i64) -> LogStreamRow {
+    fn row(fingerprint: Fingerprint, month: u16, updated_ns: i64) -> LogStreamRow {
         LogStreamRow {
             month,
             fingerprint,
@@ -441,17 +442,17 @@ mod tests {
     #[test]
     fn keyed_dedup_keeps_the_larger_updated_ns() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let (accepted, dropped) = backlog.enqueue(&[row(1, 10, 100)]);
+        let (accepted, dropped) = backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 100)]);
         assert_eq!((accepted, dropped), (1, 0));
 
         // A newer row for the same key replaces it (accepted, not dropped).
-        let (accepted, dropped) = backlog.enqueue(&[row(1, 10, 200)]);
+        let (accepted, dropped) = backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 200)]);
         assert_eq!((accepted, dropped), (1, 0));
         assert_eq!(backlog.len(), 1);
         assert_eq!(backlog.pending_rows()[0].updated_ns, 200);
 
         // A stale row for the same key is left in place (still accepted).
-        let (accepted, dropped) = backlog.enqueue(&[row(1, 10, 150)]);
+        let (accepted, dropped) = backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 150)]);
         assert_eq!((accepted, dropped), (1, 0));
         assert_eq!(backlog.len(), 1);
         assert_eq!(backlog.pending_rows()[0].updated_ns, 200);
@@ -460,44 +461,56 @@ mod tests {
     #[test]
     fn distinct_months_for_the_same_fingerprint_are_distinct_entries() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        backlog.enqueue(&[row(1, 10, 100), row(1, 11, 100)]);
+        backlog.enqueue(&[
+            row(Fingerprint::from_raw(1), 10, 100),
+            row(Fingerprint::from_raw(1), 11, 100),
+        ]);
         assert_eq!(backlog.len(), 2);
     }
 
     #[test]
     fn byte_cap_rejects_new_keys_and_reports_the_dropped_count() {
-        let one_row_bytes = row(1, 10, 100).est_bytes();
+        let one_row_bytes = row(Fingerprint::from_raw(1), 10, 100).est_bytes();
         // Room for exactly one entry.
         let mut backlog = RegistrationBacklog::new(one_row_bytes);
-        let (accepted, dropped) = backlog.enqueue(&[row(1, 10, 100), row(2, 10, 100)]);
+        let (accepted, dropped) = backlog.enqueue(&[
+            row(Fingerprint::from_raw(1), 10, 100),
+            row(Fingerprint::from_raw(2), 10, 100),
+        ]);
         assert_eq!((accepted, dropped), (1, 1));
         assert_eq!(backlog.len(), 1);
 
         // The cap keeps rejecting new keys while full...
-        let (accepted, dropped) = backlog.enqueue(&[row(3, 10, 100)]);
+        let (accepted, dropped) = backlog.enqueue(&[row(Fingerprint::from_raw(3), 10, 100)]);
         assert_eq!((accepted, dropped), (0, 1));
 
         // ...but a replacement of the existing key is never cap-dropped.
-        let (accepted, dropped) = backlog.enqueue(&[row(1, 10, 200)]);
+        let (accepted, dropped) = backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 200)]);
         assert_eq!((accepted, dropped), (1, 0));
         assert_eq!(backlog.pending_rows()[0].updated_ns, 200);
     }
 
     #[test]
     fn remove_if_version_restores_byte_accounting_on_a_matched_version() {
-        let one_row_bytes = row(1, 10, 100).est_bytes();
+        let one_row_bytes = row(Fingerprint::from_raw(1), 10, 100).est_bytes();
         let mut backlog = RegistrationBacklog::new(one_row_bytes);
-        backlog.enqueue(&[row(1, 10, 100)]);
+        backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 100)]);
         // Full: a second key is rejected.
-        assert_eq!(backlog.enqueue(&[row(2, 10, 100)]), (0, 1));
+        assert_eq!(
+            backlog.enqueue(&[row(Fingerprint::from_raw(2), 10, 100)]),
+            (0, 1)
+        );
 
         assert_eq!(
-            keys_of(&backlog.remove_if_version(&[row(1, 10, 100)])),
-            vec![(1, 10)]
+            keys_of(&backlog.remove_if_version(&[row(Fingerprint::from_raw(1), 10, 100)])),
+            vec![(Fingerprint::from_raw(1), 10)]
         );
         assert_eq!(backlog.len(), 0);
         // Bytes restored: the previously rejected key now fits.
-        assert_eq!(backlog.enqueue(&[row(2, 10, 100)]), (1, 0));
+        assert_eq!(
+            backlog.enqueue(&[row(Fingerprint::from_raw(2), 10, 100)]),
+            (1, 0)
+        );
         assert_eq!(backlog.len(), 1);
     }
 
@@ -510,11 +523,14 @@ mod tests {
     #[test]
     fn remove_if_version_leaves_a_newer_entry_enqueued_mid_attempt() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let attempted = vec![row(1, 10, 100)];
+        let attempted = vec![row(Fingerprint::from_raw(1), 10, 100)];
         backlog.enqueue(&attempted);
         // A newer Poisoned flush replaces the entry while the attempt is
         // in flight.
-        assert_eq!(backlog.enqueue(&[row(1, 10, 200)]), (1, 0));
+        assert_eq!(
+            backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 200)]),
+            (1, 0)
+        );
 
         assert!(backlog.remove_if_version(&attempted).is_empty());
         assert_eq!(backlog.len(), 1, "the newer entry must survive");
@@ -522,8 +538,8 @@ mod tests {
 
         // The newer version's own attempt removes it.
         assert_eq!(
-            keys_of(&backlog.remove_if_version(&[row(1, 10, 200)])),
-            vec![(1, 10)]
+            keys_of(&backlog.remove_if_version(&[row(Fingerprint::from_raw(1), 10, 200)])),
+            vec![(Fingerprint::from_raw(1), 10)]
         );
         assert_eq!(backlog.len(), 0);
     }
@@ -531,8 +547,12 @@ mod tests {
     #[test]
     fn remove_if_version_of_an_absent_key_is_a_no_op() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        backlog.enqueue(&[row(1, 10, 100)]);
-        assert!(backlog.remove_if_version(&[row(9, 9, 100)]).is_empty());
+        backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 100)]);
+        assert!(
+            backlog
+                .remove_if_version(&[row(Fingerprint::from_raw(9), 9, 100)])
+                .is_empty()
+        );
         assert_eq!(backlog.len(), 1);
     }
 
@@ -541,8 +561,8 @@ mod tests {
         // Issue #139: callers (the metadata heal hook) need the removed
         // ROW VALUES, not just keys.
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        backlog.enqueue(&[row(1, 10, 100)]);
-        let removed = backlog.remove_if_version(&[row(1, 10, 100)]);
+        backlog.enqueue(&[row(Fingerprint::from_raw(1), 10, 100)]);
+        let removed = backlog.remove_if_version(&[row(Fingerprint::from_raw(1), 10, 100)]);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].service, "svc");
         assert_eq!(removed[0].updated_ns, 100);
@@ -552,28 +572,38 @@ mod tests {
     fn len_tracks_enqueue_and_remove_mutations() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
         assert_eq!(backlog.len(), 0);
-        backlog.enqueue(&[row(1, 10, 100), row(2, 10, 100)]);
+        backlog.enqueue(&[
+            row(Fingerprint::from_raw(1), 10, 100),
+            row(Fingerprint::from_raw(2), 10, 100),
+        ]);
         assert_eq!(backlog.len(), 2);
-        backlog.remove_if_version(&[row(1, 10, 100)]);
+        backlog.remove_if_version(&[row(Fingerprint::from_raw(1), 10, 100)]);
         assert_eq!(backlog.len(), 1);
-        backlog.remove_if_version(&[row(2, 10, 100)]);
+        backlog.remove_if_version(&[row(Fingerprint::from_raw(2), 10, 100)]);
         assert_eq!(backlog.len(), 0);
     }
 
     #[test]
     fn enqueue_failed_bumps_totals_and_the_pending_gauge() {
-        let one_row_bytes = row(1, 10, 100).est_bytes();
+        let one_row_bytes = row(Fingerprint::from_raw(1), 10, 100).est_bytes();
         let backlog = Mutex::new(RegistrationBacklog::new(one_row_bytes));
         let metrics = BackfillMetrics::default();
 
-        enqueue_failed(&backlog, &metrics, &[row(1, 10, 100), row(2, 10, 100)]);
+        enqueue_failed(
+            &backlog,
+            &metrics,
+            &[
+                row(Fingerprint::from_raw(1), 10, 100),
+                row(Fingerprint::from_raw(2), 10, 100),
+            ],
+        );
 
         assert_eq!(metrics.enqueued_total.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.dropped_total.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.pending.load(Ordering::Relaxed), 1);
     }
 
-    fn series_row(metric_name: &str, fingerprint: u64, bucket: i64) -> MetricSeriesRow {
+    fn series_row(metric_name: &str, fingerprint: Fingerprint, bucket: i64) -> MetricSeriesRow {
         MetricSeriesRow {
             metric_name: metric_name.to_string(),
             fingerprint,
@@ -590,11 +620,14 @@ mod tests {
     #[test]
     fn versionless_family_removal_degenerates_to_always_remove() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let attempted = vec![series_row("up", 1, 0)];
+        let attempted = vec![series_row("up", Fingerprint::from_raw(1), 0)];
         backlog.enqueue(&attempted);
         // A re-enqueue mid-attempt for the same key is byte-identical
         // content ("accepted" but nothing to replace: version 0 == 0).
-        assert_eq!(backlog.enqueue(&[series_row("up", 1, 0)]), (1, 0));
+        assert_eq!(
+            backlog.enqueue(&[series_row("up", Fingerprint::from_raw(1), 0)]),
+            (1, 0)
+        );
         assert_eq!(backlog.len(), 1);
 
         let removed = backlog.remove_if_version(&attempted);
@@ -608,9 +641,13 @@ mod tests {
     #[test]
     fn versionless_series_keys_distinguish_bucket_and_value_type() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let mut hist = series_row("up", 1, 0);
+        let mut hist = series_row("up", Fingerprint::from_raw(1), 0);
         hist.value_type = 1;
-        backlog.enqueue(&[series_row("up", 1, 0), series_row("up", 1, 3_600_000), hist]);
+        backlog.enqueue(&[
+            series_row("up", Fingerprint::from_raw(1), 0),
+            series_row("up", Fingerprint::from_raw(1), 3_600_000),
+            hist,
+        ]);
         assert_eq!(backlog.len(), 3);
     }
 }

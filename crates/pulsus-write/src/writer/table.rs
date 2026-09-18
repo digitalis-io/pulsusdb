@@ -479,6 +479,7 @@ fn backoff_delay(base: Duration, max: Duration, attempt: u32, rng: &mut XorShift
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -508,7 +509,7 @@ mod tests {
     fn stream_row() -> LogStreamRow {
         LogStreamRow {
             month: 19662,
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             service: "svc".to_string(),
             labels: "{\"service_name\":\"svc\"}".to_string(),
             updated_ns: 1,

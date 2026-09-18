@@ -145,7 +145,10 @@ async fn drop_database(client: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    /// `UInt128` since issue #498, read as the bare integer: this suite
+    /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
+    /// of this crate.
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -153,7 +156,7 @@ struct MetricSampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LogSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -175,7 +178,7 @@ struct DescribeRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LegacyLogSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -324,7 +327,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
         .query_stream::<ExplainRow>(
             &format!(
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, value FROM {db}.metric_samples \
-                 WHERE metric_name = 'http_requests_total' AND fingerprint IN (18374588331335825905)"
+                 WHERE metric_name = 'http_requests_total' AND fingerprint IN (toUInt128('18374588331335825905'))"
             ),
             &QuerySettings::new(),
         )
@@ -608,7 +611,7 @@ fn family_sharding_expr_is_the_single_source_of_truth() {
         Family::Metrics.sharding_expr(),
         "cityHash64(metric_name, fingerprint)"
     );
-    assert_eq!(Family::Logs.sharding_expr(), "fingerprint");
+    assert_eq!(Family::Logs.sharding_expr(), "cityHash64(fingerprint)");
 }
 
 /// Issue #5 fix plan F1: `PULSUS_RETENTION_DAYS` is mutable operational
@@ -974,6 +977,164 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
              the defect the saturating expression closes"
         );
     }
+
+    drop_database(&client, db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ColumnTypeRow {
+    table: String,
+    name: String,
+    r#type: String,
+}
+
+/// Issue #498 criterion 9: **a fresh database creates every fingerprint
+/// column as `UInt128`, and nothing was altered to get there.**
+///
+/// The `CREATE`s were edited in place rather than followed by `ALTER`s,
+/// which is only sound while the condition the amendment policy names
+/// holds. The two halves of that are checked together: the shape a fresh
+/// `--mode init` produces, and the absence of any mutation — a column
+/// widened by `ALTER ... MODIFY COLUMN` would rewrite every part in the
+/// background and would show up in `system.mutations`, so an empty
+/// mutation list is what says the widening came from the `CREATE`.
+///
+/// The census is the ten places a fingerprint is stored or projected: the
+/// eight base tables, and the two materialized views, whose target columns
+/// are the same ones read back here through the tables they write into.
+#[tokio::test]
+async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_fp128");
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    // The eight `CREATE`s that carry the column (issue #498 names them as
+    // migration ids 4, 5, 6, 7, 8, 9, 23 and 29), with `log_metrics_5s`
+    // standing for the resolution-suffixed rollup this context renders.
+    let expected_tables = [
+        "log_metrics_5s",
+        "log_patterns",
+        "log_samples",
+        "log_streams",
+        "log_streams_idx",
+        "metric_hist_samples",
+        "metric_samples",
+        "metric_series",
+    ];
+
+    let sql = format!(
+        "SELECT table, name, type FROM system.columns \
+         WHERE database = '{db}' AND name = 'fingerprint' ORDER BY table"
+    );
+    let mut stream = client
+        .query_stream::<ColumnTypeRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut seen: Vec<(String, String)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode ColumnTypeRow");
+        seen.push((row.table, row.r#type));
+    }
+    drop(stream);
+
+    let tables: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
+    for want in expected_tables {
+        assert!(
+            tables.contains(&want),
+            "{want} has no `fingerprint` column in a freshly initialised database; \
+             system.columns returned {tables:?}"
+        );
+    }
+    for (table, ty) in &seen {
+        assert_eq!(
+            ty, "UInt128",
+            "{table}.fingerprint is {ty}, not UInt128 — a bare decimal literal above 2^64 would \
+             be read as Float64 against it (issue #498)"
+        );
+    }
+
+    // The two materialized views project the column into the two tables
+    // above, so their SELECT list must carry it and the target column is
+    // already asserted. Reading the view's own `fingerprint` column type
+    // says the projection did not narrow on the way through.
+    for (view, target) in [
+        ("log_streams_idx_mv", "log_streams_idx"),
+        ("log_metrics_5s_mv", "log_metrics_5s"),
+    ] {
+        let create = create_table_query(&client, db, view).await;
+        assert!(
+            create.contains("fingerprint"),
+            "{view} no longer projects `fingerprint` into {target}:\n{create}"
+        );
+    }
+
+    // **No column was altered.** `system.mutations` is the record of every
+    // `ALTER` a database has run in the background, and a column widened
+    // after the fact — `ALTER TABLE … MODIFY COLUMN fingerprint UInt128` —
+    // would appear here and would rewrite every part.
+    //
+    // Issue #498's plan says the list is empty. It is not: `run_init`
+    // issues mutations of its own on a fresh database, measured on
+    // ClickHouse 26.3.29.7, none of them touching a column. So the
+    // assertion is the **set** the initialisation is allowed to issue,
+    // with its cardinality — not merely the absence of one kind. Excluding
+    // `MODIFY COLUMN` alone would admit `MATERIALIZE COLUMN fingerprint`,
+    // which is exactly the shape the criterion exists to rule out.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct MutationRow {
+        command: String,
+    }
+    let sql =
+        format!("SELECT command FROM system.mutations WHERE database = '{db}' ORDER BY command");
+    let mut stream = client
+        .query_stream::<MutationRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.mutations");
+    let mut commands: Vec<String> = Vec::new();
+    while let Some(row) = stream.next().await {
+        commands.push(row.expect("decode MutationRow").command);
+    }
+    drop(stream);
+
+    // The kinds `run_init` may issue, and nothing else. `MATERIALIZE TTL`
+    // comes from the delete-TTL on the sample tables; the four
+    // `PROJECTION` commands come from the span projections — three
+    // materialise and one drop, which is why the allowed list carries two
+    // projection prefixes. A command outside this list is a schema change
+    // nobody reviewed, whatever it says about columns.
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "(MATERIALIZE TTL)",
+        "(MATERIALIZE PROJECTION ",
+        "(DROP PROJECTION IF EXISTS ",
+    ];
+    let unexpected: Vec<&String> = commands
+        .iter()
+        .filter(|c| !ALLOWED_PREFIXES.iter().any(|p| c.starts_with(p)))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a fresh database issued a mutation outside the reviewed set: {unexpected:?}\n\
+         all commands: {commands:?}"
+    );
+
+    // And the cardinality, so a NEW mutation of an allowed kind is a
+    // decision somebody makes rather than a line nobody reads. The split
+    // measured on this base is seven `MATERIALIZE TTL` and four
+    // `PROJECTION` commands.
+    let ttl = commands
+        .iter()
+        .filter(|c| *c == "(MATERIALIZE TTL)")
+        .count();
+    let projection = commands.len() - ttl;
+    assert_eq!(
+        (commands.len(), ttl, projection),
+        (11, 7, 4),
+        "the mutations a fresh database issues moved; read each one before repinning: \
+         {commands:?}"
+    );
 
     drop_database(&client, db).await;
 }

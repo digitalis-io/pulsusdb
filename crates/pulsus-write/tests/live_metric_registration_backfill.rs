@@ -28,7 +28,7 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, ChRow, Idempotency, QuerySettings, Row,
 };
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, LabelSet, floor_to_activity_bucket};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, floor_to_activity_bucket};
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, MetricWriter};
 use pulsus_write::{
@@ -214,17 +214,17 @@ fn labels() -> LabelSet {
 
 /// One float sample plus its `SeriesRef` — a series the writer has never
 /// registered.
-fn series_batch(metric_name: &str, fingerprint: u64, unix_milli: i64) -> ParsedMetrics {
+fn series_batch(metric_name: &str, fingerprint: u128, unix_milli: i64) -> ParsedMetrics {
     ParsedMetrics {
         samples: vec![MetricPoint {
             metric_name: Arc::from(metric_name),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             unix_milli,
             value: 1.5,
         }],
         series: vec![SeriesRef {
             metric_name: Arc::from(metric_name),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             labels: labels(),
         }],
         ..Default::default()
@@ -246,7 +246,7 @@ fn metadata_batch(metric_name: &str, metric_type: &str, updated_ns: i64) -> Pars
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct SeriesLookupRow {
-    fingerprint: u64,
+    fingerprint: u128,
     labels: String,
 }
 
@@ -356,7 +356,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
     let fingerprint = 77u64;
     let ts_ms = now_ms();
     let wait = writer
-        .admit_flush(series_batch(metric_name, fingerprint, ts_ms))
+        .admit_flush(series_batch(metric_name, u128::from(fingerprint), ts_ms))
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -383,7 +383,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
     );
     let samples_count_sql = format!(
         "SELECT count() AS n FROM {db}.metric_samples \
-         WHERE metric_name = '{metric_name}' AND fingerprint = {fingerprint}"
+         WHERE metric_name = '{metric_name}' AND fingerprint = toUInt128('{fingerprint}')"
     );
     let mut sample_committed = false;
     for _ in 0..150 {
@@ -412,7 +412,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
 
     let healed = series_limit1_lookup(&client, db, metric_name).await;
     assert_eq!(healed.len(), 1, "exactly one (fingerprint, labels) row");
-    assert_eq!(healed[0].fingerprint, fingerprint);
+    assert_eq!(healed[0].fingerprint, u128::from(fingerprint));
     assert_eq!(healed[0].labels, r#"{"job":"checkout"}"#);
 
     // Forced duplicate re-insert: physically insert the same logical row
@@ -420,7 +420,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
     // be 2, the documented bounded duplication).
     let duplicate = MetricSeriesRow {
         metric_name: metric_name.to_string(),
-        fingerprint,
+        fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
         unix_milli: floor_to_activity_bucket(ts_ms, BUCKET_MS),
         labels: r#"{"job":"checkout"}"#.to_string(),
         value_type: 0,
@@ -434,7 +434,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
         &client,
         &format!(
             "SELECT count() AS n FROM {db}.metric_series \
-             WHERE metric_name = '{metric_name}' AND fingerprint = {fingerprint}"
+             WHERE metric_name = '{metric_name}' AND fingerprint = toUInt128('{fingerprint}')"
         ),
     )
     .await;

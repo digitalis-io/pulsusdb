@@ -127,6 +127,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pulsus_logql::RangeAggOp;
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::plan::VectorAggSpec;
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
@@ -517,7 +518,7 @@ fn instant_params() -> QueryParams {
     }
 }
 
-fn build_meta(fx: &Fixture) -> HashMap<u64, StreamMetaRow> {
+fn build_meta(fx: &Fixture) -> HashMap<Fingerprint, StreamMetaRow> {
     let pad = "x".repeat(fx.value_bytes);
     (0..fx.streams as u64)
         .map(|fp| {
@@ -527,9 +528,9 @@ fn build_meta(fx: &Fixture) -> HashMap<u64, StreamMetaRow> {
             }
             labels.push('}');
             (
-                fp,
+                Fingerprint::from_raw(u128::from(fp)),
                 StreamMetaRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     service: format!("svc{fp:03}"),
                     labels,
                 },
@@ -549,7 +550,7 @@ fn build_rows(fx: &Fixture) -> Vec<MetricScanRow> {
                 START_NS - 1_000_000 - (i as i64) * 1_000
             };
             rows.push(MetricScanRow {
-                fingerprint: fp,
+                fingerprint: Fingerprint::from_raw(u128::from(fp)),
                 timestamp_ns: ts,
                 body: format!("v={} env=prod w={pad}{fp} tag=t{i:03}", i + 1),
                 structured_metadata: String::new(),
@@ -564,7 +565,7 @@ fn build_rows(fx: &Fixture) -> Vec<MetricScanRow> {
 struct Driven {
     fx: Fixture,
     rows: Vec<MetricScanRow>,
-    meta: HashMap<u64, StreamMetaRow>,
+    meta: HashMap<Fingerprint, StreamMetaRow>,
     compiled: CompiledPipeline,
     client: pulsus_read::logql::ClientAgg,
     window: ClientWindow,

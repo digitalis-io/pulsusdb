@@ -1179,8 +1179,11 @@ impl CacheSnapshot {
         let mut by_fingerprint = HashMap::with_capacity(n);
         let mut by_metric = HashMap::with_capacity(n);
         for i in 0..n {
-            by_fingerprint.insert(i as Fingerprint, LabelSet::from_verbatim(Vec::new()));
-            by_metric.insert(format!("m{i:06}"), vec![i as Fingerprint]);
+            by_fingerprint.insert(
+                Fingerprint::from_raw(i as u128),
+                LabelSet::from_verbatim(Vec::new()),
+            );
+            by_metric.insert(format!("m{i:06}"), vec![Fingerprint::from_raw(i as u128)]);
         }
         CacheSnapshot {
             by_fingerprint,
@@ -1391,13 +1394,16 @@ mod tests {
     #[test]
     fn a_warm_in_window_query_with_no_matchers_returns_sorted_fingerprints() {
         let snap = snapshot(
-            vec![("up", 20, &[("job", "api")]), ("up", 10, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(20), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(10), &[("job", "web")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
         );
         match resolve(&snap, &config(), "up", &[], window(0, 1_000)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![10, 20]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [10, 20].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
@@ -1414,7 +1420,10 @@ mod tests {
     #[test]
     fn eq_matcher_filters_to_the_matching_series() {
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "web")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1425,7 +1434,7 @@ mod tests {
             value: "api".to_string(),
         };
         match resolve(&snap, &config(), "up", &[m], window(0, 1_000)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![1]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [1].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
@@ -1436,7 +1445,10 @@ mod tests {
     #[test]
     fn neq_matcher_includes_series_missing_the_label_entirely() {
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1447,7 +1459,7 @@ mod tests {
             value: "api".to_string(),
         };
         match resolve(&snap, &config(), "up", &[m], window(0, 1_000)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![2]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [2].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
@@ -1456,9 +1468,21 @@ mod tests {
     fn re_matcher_evaluates_in_process_and_returns_sorted_fingerprints() {
         let snap = snapshot(
             vec![
-                ("http_requests_total", 30, &[("status", "500")]),
-                ("http_requests_total", 10, &[("status", "503")]),
-                ("http_requests_total", 20, &[("status", "200")]),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(30),
+                    &[("status", "500")],
+                ),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(10),
+                    &[("status", "503")],
+                ),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(20),
+                    &[("status", "200")],
+                ),
             ],
             0,
             BASE_SWEEP_MS,
@@ -1476,7 +1500,7 @@ mod tests {
             &[m],
             window(0, 1_000),
         ) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![10, 30]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [10, 30].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
@@ -1485,8 +1509,16 @@ mod tests {
     fn nre_matcher_negates_the_regex_result() {
         let snap = snapshot(
             vec![
-                ("http_requests_total", 1, &[("status", "500")]),
-                ("http_requests_total", 2, &[("status", "200")]),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(1),
+                    &[("status", "500")],
+                ),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(2),
+                    &[("status", "200")],
+                ),
             ],
             0,
             BASE_SWEEP_MS,
@@ -1504,14 +1536,19 @@ mod tests {
             &[m],
             window(0, 1_000),
         ) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![2]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [2].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
 
     #[test]
     fn an_uncompilable_regex_degrades_to_sql_fallback_with_the_matcher_key() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 0, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
         let m = LabelMatcher {
             key: "job".to_string(),
             op: MatchOp::Re,
@@ -1558,7 +1595,12 @@ mod tests {
             key: "job".to_string(),
         };
 
-        let resident = snapshot(vec![("up", 1, &[("job", "api")])], 0, BASE_SWEEP_MS, 1);
+        let resident = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
         let absent = snapshot(vec![], 0, BASE_SWEEP_MS, 1);
 
         for (label, snap) in [("resident metric", &resident), ("absent metric", &absent)] {
@@ -1645,7 +1687,10 @@ mod tests {
     #[test]
     fn a_portable_regex_is_still_answered_from_the_warm_cache() {
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "web")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1657,7 +1702,9 @@ mod tests {
                 value: pattern.to_string(),
             };
             match resolve(&snap, &config(), "up", &[m], window(0, 1_000)) {
-                Resolution::Fingerprints(fps) => assert_eq!(fps, vec![1], "{pattern}"),
+                Resolution::Fingerprints(fps) => {
+                    assert_eq!(fps, [1].map(Fingerprint::from_raw), "{pattern}")
+                }
                 other => panic!("{pattern}: expected in-process Fingerprints, got {other:?}"),
             }
         }
@@ -1686,9 +1733,14 @@ mod tests {
             op: MatchOp::Re,
             value: "a{bbb}c".to_string(),
         };
-        let literal = snapshot(vec![("up", 7, &[("job", "a{bbb}c")])], 0, BASE_SWEEP_MS, 1);
+        let literal = snapshot(
+            vec![("up", Fingerprint::from_raw(7), &[("job", "a{bbb}c")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
         match resolve(&literal, &config(), "up", &[m], window(0, 1_000)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![7]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [7].map(Fingerprint::from_raw)),
             other => panic!("expected in-process Fingerprints, got {other:?}"),
         }
     }
@@ -1724,7 +1776,12 @@ mod tests {
 
     #[test]
     fn recency_gate_end_equal_to_sweep_time_is_cache_authoritative() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 0, 1_000, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            1_000,
+            1,
+        );
         assert!(matches!(
             resolve(&snap, &recency_config(), "up", &[], window(0, 1_000)),
             Resolution::Fingerprints(_)
@@ -1733,7 +1790,12 @@ mod tests {
 
     #[test]
     fn recency_gate_end_equal_to_sweep_time_plus_ttl_is_cache_authoritative() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 0, 1_000, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            1_000,
+            1,
+        );
         // sweep_time_ms(1000) + ttl(100) = 1100.
         assert!(matches!(
             resolve(&snap, &recency_config(), "up", &[], window(0, 1_100)),
@@ -1743,7 +1805,12 @@ mod tests {
 
     #[test]
     fn recency_gate_end_equal_to_the_staleness_threshold_is_cache_authoritative_inclusive() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 0, 1_000, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            1_000,
+            1,
+        );
         // sweep_time_ms(1000) + staleness_threshold_ms(300) = 1300, inclusive.
         assert!(matches!(
             resolve(&snap, &recency_config(), "up", &[], window(0, 1_300)),
@@ -1753,7 +1820,12 @@ mod tests {
 
     #[test]
     fn recency_gate_end_past_the_staleness_threshold_falls_back_to_sql() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 0, 1_000, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            1_000,
+            1,
+        );
         match resolve(&snap, &recency_config(), "up", &[], window(0, 1_301)) {
             Resolution::SqlFallback { reason, .. } => {
                 assert_eq!(reason, FallbackReason::StaleCache { age_ms: 301 });
@@ -1775,12 +1847,17 @@ mod tests {
         let cfg = recency_config();
         // Snapshot A: swept at sweep_time_ms = 1_000, before the new series
         // (fingerprint 2) was ever registered — it simply isn't there.
-        let snap_a = snapshot(vec![("up", 1, &[("job", "api")])], 0, 1_000, 1);
+        let snap_a = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            0,
+            1_000,
+            1,
+        );
 
         // (within the recency window) the cache answers, but of course
         // cannot know about a series it never swept.
         match resolve(&snap_a, &cfg, "up", &[], window(0, 1_100)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![1]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [1].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
 
@@ -1798,13 +1875,16 @@ mod tests {
         // (a) after the next refresh sweeps the new series in, the
         // snapshot answers it in-process again — no permanent gap.
         let snap_b = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "web")]),
+            ],
             0,
             1_100,
             2,
         );
         match resolve(&snap_b, &cfg, "up", &[], window(0, 1_150)) {
-            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![1, 2]),
+            Resolution::Fingerprints(fps) => assert_eq!(fps, [1, 2].map(Fingerprint::from_raw)),
             other => panic!("expected Fingerprints, got {other:?}"),
         }
     }
@@ -1815,7 +1895,12 @@ mod tests {
     /// is warm and fresh.
     #[test]
     fn a_query_starting_before_the_covered_window_falls_back_out_of_window() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 10_000, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            10_000,
+            BASE_SWEEP_MS,
+            1,
+        );
         match resolve(&snap, &config(), "up", &[], window(0, 20_000)) {
             Resolution::SqlFallback { reason, .. } => {
                 assert_eq!(reason, FallbackReason::OutOfWindow)
@@ -1826,7 +1911,12 @@ mod tests {
 
     #[test]
     fn a_query_fully_inside_the_covered_window_is_never_out_of_window() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 10_000, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            10_000,
+            BASE_SWEEP_MS,
+            1,
+        );
         assert!(matches!(
             resolve(&snap, &config(), "up", &[], window(10_000, 20_000)),
             Resolution::Fingerprints(_)
@@ -1838,7 +1928,10 @@ mod tests {
         let mut cfg = config();
         cfg.cache_max_series = 1;
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "api")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "api")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1912,7 +2005,10 @@ mod tests {
     #[test]
     fn resolve_labelled_returns_fingerprints_paired_with_their_labels() {
         let snap = snapshot(
-            vec![("up", 20, &[("job", "api")]), ("up", 10, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(20), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(10), &[("job", "web")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1921,9 +2017,9 @@ mod tests {
             LabelledResolution::Series(series) => {
                 assert_eq!(series.len(), 2);
                 // Sorted by fingerprint (10, 20).
-                assert_eq!(series[0].0, 10);
+                assert_eq!(series[0].0, Fingerprint::from_raw(10));
                 assert_eq!(series[0].1.get("job"), Some("web"));
-                assert_eq!(series[1].0, 20);
+                assert_eq!(series[1].0, Fingerprint::from_raw(20));
                 assert_eq!(series[1].1.get("job"), Some("api"));
             }
             other => panic!("expected Series, got {other:?}"),
@@ -1933,7 +2029,10 @@ mod tests {
     #[test]
     fn resolve_labelled_applies_matchers_identically_to_resolve() {
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "web")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -1945,7 +2044,10 @@ mod tests {
         };
         match resolve_labelled(&snap, &config(), "up", &[m], window(0, 1_000)) {
             LabelledResolution::Series(series) => {
-                assert_eq!(series, vec![(1, labels(&[("job", "api")]))]);
+                assert_eq!(
+                    series,
+                    vec![(Fingerprint::from_raw(1), labels(&[("job", "api")]))]
+                );
             }
             other => panic!("expected Series, got {other:?}"),
         }
@@ -1964,7 +2066,12 @@ mod tests {
 
     #[test]
     fn resolve_labelled_out_of_window_falls_back_to_the_same_sql_metric_series_routes_through() {
-        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 10_000, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[("job", "api")])],
+            10_000,
+            BASE_SWEEP_MS,
+            1,
+        );
         match resolve_labelled(&snap, &config(), "up", &[], window(0, 20_000)) {
             LabelledResolution::SqlFallback { reason, sql } => {
                 assert_eq!(reason, FallbackReason::OutOfWindow);
@@ -1988,7 +2095,10 @@ mod tests {
         let mut cfg = config();
         cfg.cache_max_series = 1;
         let snap = snapshot(
-            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "api")])],
+            vec![
+                ("up", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("up", Fingerprint::from_raw(2), &[("job", "api")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -2016,9 +2126,21 @@ mod tests {
         // fingerprints, only on whether labels are carried alongside.
         let snap = snapshot(
             vec![
-                ("http_requests_total", 30, &[("status", "500")]),
-                ("http_requests_total", 10, &[("status", "503")]),
-                ("http_requests_total", 20, &[("status", "200")]),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(30),
+                    &[("status", "500")],
+                ),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(10),
+                    &[("status", "503")],
+                ),
+                (
+                    "http_requests_total",
+                    Fingerprint::from_raw(20),
+                    &[("status", "200")],
+                ),
             ],
             0,
             BASE_SWEEP_MS,
@@ -2060,9 +2182,9 @@ mod tests {
     fn tsdb_snapshot_over_counts_series_and_sorts_by_metric_descending() {
         let snap = snapshot(
             vec![
-                ("up", 1, &[]),
-                ("up", 2, &[]),
-                ("http_requests_total", 3, &[]),
+                ("up", Fingerprint::from_raw(1), &[]),
+                ("up", Fingerprint::from_raw(2), &[]),
+                ("http_requests_total", Fingerprint::from_raw(3), &[]),
             ],
             0,
             BASE_SWEEP_MS,
@@ -2082,7 +2204,10 @@ mod tests {
     #[test]
     fn tsdb_snapshot_over_ties_break_ascending_by_name() {
         let snap = snapshot(
-            vec![("zeta", 1, &[]), ("alpha", 2, &[])],
+            vec![
+                ("zeta", Fingerprint::from_raw(1), &[]),
+                ("alpha", Fingerprint::from_raw(2), &[]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -2132,9 +2257,9 @@ mod tests {
     fn multi_metric_matcher_only_groups_every_metric_with_matching_series() {
         let snap = snapshot(
             vec![
-                ("bbb", 2, &[("job", "api")]),
-                ("aaa", 1, &[("job", "api")]),
-                ("ccc", 3, &[("job", "web")]),
+                ("bbb", Fingerprint::from_raw(2), &[("job", "api")]),
+                ("aaa", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("ccc", Fingerprint::from_raw(3), &[("job", "web")]),
             ],
             0,
             BASE_SWEEP_MS,
@@ -2158,8 +2283,8 @@ mod tests {
                 // Sorted by name; `ccc` (no matching series) is absent.
                 let names: Vec<&str> = groups.iter().map(|g| g.metric_name.as_str()).collect();
                 assert_eq!(names, vec!["aaa", "bbb"]);
-                assert_eq!(groups[0].series[0].0, 1);
-                assert_eq!(groups[1].series[0].0, 2);
+                assert_eq!(groups[0].series[0].0, Fingerprint::from_raw(1));
+                assert_eq!(groups[1].series[0].0, Fingerprint::from_raw(2));
             }
             other => panic!("expected Groups, got {other:?}"),
         }
@@ -2169,9 +2294,9 @@ mod tests {
     fn multi_metric_name_regex_prunes_the_key_set_first() {
         let snap = snapshot(
             vec![
-                ("http_total", 1, &[]),
-                ("http_errors", 2, &[]),
-                ("grpc_total", 3, &[]),
+                ("http_total", Fingerprint::from_raw(1), &[]),
+                ("http_errors", Fingerprint::from_raw(2), &[]),
+                ("grpc_total", Fingerprint::from_raw(3), &[]),
             ],
             0,
             BASE_SWEEP_MS,
@@ -2197,7 +2322,10 @@ mod tests {
     #[test]
     fn multi_metric_negative_name_matcher_excludes_the_named_metric() {
         let snap = snapshot(
-            vec![("keep", 1, &[]), ("drop", 2, &[])],
+            vec![
+                ("keep", Fingerprint::from_raw(1), &[]),
+                ("drop", Fingerprint::from_raw(2), &[]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -2230,8 +2358,8 @@ mod tests {
         let mut by_fingerprint = HashMap::new();
         let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
         for i in 0..n {
-            by_fingerprint.insert(i as Fingerprint, labels(&[]));
-            by_metric.insert(format!("m{i:04}"), vec![i as Fingerprint]);
+            by_fingerprint.insert(Fingerprint::from_raw(i as u128), labels(&[]));
+            by_metric.insert(format!("m{i:04}"), vec![Fingerprint::from_raw(i as u128)]);
         }
         CacheSnapshot {
             by_fingerprint,
@@ -2311,7 +2439,12 @@ mod tests {
             }
         ));
         // Out of window.
-        let snap = snapshot(vec![("up", 1, &[])], 10_000, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[])],
+            10_000,
+            BASE_SWEEP_MS,
+            1,
+        );
         assert!(matches!(
             resolve_multi(&snap, &cfg, &[], &[], window(0, 20_000), 1_000, u64::MAX),
             MultiMetricResolution::Unresolvable {
@@ -2322,7 +2455,7 @@ mod tests {
         let mut stale_cfg = config();
         stale_cfg.ttl = Duration::from_millis(1);
         stale_cfg.staleness_multiplier = 1;
-        let snap = snapshot(vec![("up", 1, &[])], 0, 0, 1);
+        let snap = snapshot(vec![("up", Fingerprint::from_raw(1), &[])], 0, 0, 1);
         assert!(matches!(
             resolve_multi(
                 &snap,
@@ -2343,7 +2476,15 @@ mod tests {
     fn multi_metric_total_series_over_cache_max_series_is_unresolvable() {
         let mut cfg = config();
         cfg.cache_max_series = 1;
-        let snap = snapshot(vec![("a", 1, &[]), ("b", 2, &[])], 0, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![
+                ("a", Fingerprint::from_raw(1), &[]),
+                ("b", Fingerprint::from_raw(2), &[]),
+            ],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
         assert!(matches!(
             resolve_multi(&snap, &cfg, &[], &[], window(0, 1_000), 1_000, u64::MAX),
             MultiMetricResolution::Unresolvable {
@@ -2354,7 +2495,12 @@ mod tests {
 
     #[test]
     fn multi_metric_uncompilable_name_regex_is_unresolvable() {
-        let snap = snapshot(vec![("up", 1, &[])], 0, BASE_SWEEP_MS, 1);
+        let snap = snapshot(
+            vec![("up", Fingerprint::from_raw(1), &[])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
         assert!(matches!(
             resolve_multi(
                 &snap,
@@ -2379,8 +2525,8 @@ mod tests {
         let mut by_fingerprint = HashMap::new();
         let mut fps = Vec::with_capacity(n);
         for i in 0..n {
-            by_fingerprint.insert(i as Fingerprint, labels(&[]));
-            fps.push(i as Fingerprint);
+            by_fingerprint.insert(Fingerprint::from_raw(i as u128), labels(&[]));
+            fps.push(Fingerprint::from_raw(i as u128));
         }
         let mut by_metric = HashMap::new();
         by_metric.insert(name.to_string(), fps);
@@ -2431,7 +2577,10 @@ mod tests {
     #[test]
     fn multi_metric_selective_query_under_scan_budget_still_groups() {
         let snap = snapshot(
-            vec![("aaa", 1, &[("job", "api")]), ("bbb", 2, &[("job", "api")])],
+            vec![
+                ("aaa", Fingerprint::from_raw(1), &[("job", "api")]),
+                ("bbb", Fingerprint::from_raw(2), &[("job", "api")]),
+            ],
             0,
             BASE_SWEEP_MS,
             1,
@@ -2537,7 +2686,9 @@ mod tests {
         let entries: Vec<SnapshotEntry<'_>> = NAMES
             .iter()
             .enumerate()
-            .map(|(i, name)| -> SnapshotEntry<'_> { (name, i as Fingerprint, &[][..]) })
+            .map(|(i, name)| -> SnapshotEntry<'_> {
+                (name, Fingerprint::from_raw(i as u128), &[][..])
+            })
             .collect();
         let snap = snapshot(entries, 0, BASE_SWEEP_MS, 1);
         let summary = tsdb_snapshot_over(&snap);

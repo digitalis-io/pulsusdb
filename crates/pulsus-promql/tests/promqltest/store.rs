@@ -55,7 +55,7 @@
 
 use std::collections::BTreeMap;
 
-use pulsus_model::{CounterResetHint, FloatHistogram, MatchOp, STALE_NAN_BITS};
+use pulsus_model::{CounterResetHint, Fingerprint, FloatHistogram, MatchOp, STALE_NAN_BITS};
 use pulsus_promql::{FetchedSeries, Labels, QueryPlan, Sample, SeriesData};
 
 use super::grammar::LoadSeries;
@@ -286,7 +286,7 @@ impl TestStorage {
                     sts.push(*st);
                 }
                 fetched.push(FetchedSeries {
-                    fingerprint: idx as u64,
+                    fingerprint: Fingerprint::from_raw(u128::from(idx as u64)),
                     metric_name: name.map(str::to_string),
                     // `Labels::new` drops `__name__` itself.
                     labels: Labels::new(stored.labels.iter().map(|(k, v)| (k.clone(), v.clone()))),

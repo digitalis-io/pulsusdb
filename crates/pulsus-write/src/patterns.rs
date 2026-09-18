@@ -32,6 +32,7 @@ use std::collections::HashMap;
 
 use crate::protocols::otlp_logs::LogRow;
 use crate::writer::LogPatternRow;
+use pulsus_model::Fingerprint;
 
 /// Only the first 1 KiB of a log body is examined (D1 rule 1). A documented
 /// constant, not a config knob (the #115 ingest-cap precedent).
@@ -285,7 +286,7 @@ pub fn est_template_bound(row: &LogRow) -> u64 {
 /// unseen template is dropped from pattern accounting only (counted in
 /// `dropped`), in the batch's deterministic parse order.
 pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
-    let mut map: HashMap<(u64, i64, String), u64> = HashMap::new();
+    let mut map: HashMap<(Fingerprint, i64, String), u64> = HashMap::new();
     let mut dropped = 0u64;
 
     for row in rows {
@@ -333,10 +334,16 @@ mod tests {
 
     use super::*;
 
-    fn log_row(fingerprint: u64, ts_ns: i64, body: &str) -> LogRow {
+    /// A `Fingerprint` from a small decimal, so these tests keep reading as
+    /// `log_row(7, ...)` after the identity widened (issue #498).
+    fn fp(v: u128) -> Fingerprint {
+        Fingerprint::from_raw(v)
+    }
+
+    fn log_row(fingerprint: u128, ts_ns: i64, body: &str) -> LogRow {
         LogRow {
             service: "svc".to_string(),
-            fingerprint,
+            fingerprint: fp(fingerprint),
             timestamp_ns: UnixNano(ts_ns),
             severity: 0,
             body: body.to_string(),
@@ -655,7 +662,7 @@ mod tests {
         let agg = aggregate_patterns(&rows);
         assert_eq!(agg.dropped, 0);
         assert_eq!(agg.rows.len(), 1);
-        assert_eq!(agg.rows[0].fingerprint, 7);
+        assert_eq!(agg.rows[0].fingerprint, fp(7));
         assert_eq!(agg.rows[0].bucket_ns, 0);
         assert_eq!(agg.rows[0].pattern, "user <_> login");
         assert_eq!(agg.rows[0].count, 3);
@@ -676,7 +683,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.fingerprint, r.bucket_ns))
                 .collect::<Vec<_>>(),
-            vec![(7, 0), (7, 10_000_000_000), (9, 0)]
+            vec![(fp(7), 0), (fp(7), 10_000_000_000), (fp(9), 0)]
         );
     }
 

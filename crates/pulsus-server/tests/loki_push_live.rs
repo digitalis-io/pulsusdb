@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings};
+use pulsus_model::Fingerprint;
 use pulsus_write::protocols::loki_push::{
     EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
 };
@@ -809,13 +810,13 @@ async fn structured_metadata_double_collision_overwrites_the_extracted_slot_once
 struct StoredSample {
     body: String,
     structured_metadata: String,
-    fingerprint: u64,
+    fingerprint: u128,
 }
 
 /// One `log_streams` row's stored canonical label JSON.
 #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct StoredStream {
-    fingerprint: u64,
+    fingerprint: u128,
     labels: String,
 }
 
@@ -3881,7 +3882,7 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
                 month: pulsus_model::Date::start_of_month_utc(base_ns)
                     .expect("a month for now")
                     .days_since_epoch(),
-                fingerprint,
+                fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
                 service: "s539v".to_string(),
                 labels: labels.to_canonical_json(),
                 updated_ns: base_ns,
@@ -3894,7 +3895,7 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
             "log_samples",
             &[pulsus_write::writer::LogSampleRow {
                 service: "s539v".to_string(),
-                fingerprint,
+                fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
                 timestamp_ns: base_ns,
                 severity: 0,
                 body: "verbatim vs re-rendered".to_string(),

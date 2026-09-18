@@ -163,12 +163,12 @@ mod tests {
     fn metric_point_stores_fields_verbatim() {
         let point = MetricPoint {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             unix_milli: 1_700_000_000_000,
             value: 1.5,
         };
         assert_eq!(&*point.metric_name, "http_requests_total");
-        assert_eq!(point.fingerprint, 42);
+        assert_eq!(point.fingerprint, Fingerprint::from_raw(42));
         assert_eq!(point.unix_milli, 1_700_000_000_000);
         assert_eq!(point.value, 1.5);
     }

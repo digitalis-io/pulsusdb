@@ -6,6 +6,7 @@
 //! regex value flows through escape.rs").
 
 use pulsus_logql::{LineFilter, LineFilterOp, MatchOp, Matcher, StreamSelector};
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::escape::{ch_ident, ch_like_contains, ch_string};
 use pulsus_read::logql::plan;
 use pulsus_read::logql::predicate::{CheckedFragment, literal};
@@ -249,7 +250,7 @@ fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_
     let sql = sql::stage3(
         "log_samples",
         &[literal("checkout")],
-        &[1],
+        &[Fingerprint::from_raw(1).sql_literal()],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,

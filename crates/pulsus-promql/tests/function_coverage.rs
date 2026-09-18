@@ -27,6 +27,7 @@ use pulsus_promql::{FetchedSeries, Labels, PlanParams, Sample, SeriesData, plan}
 
 use driver::runner::collect_constructs;
 use driver::{CoverageManifest, RegistryFunction, Status, Witness, load_registry_verified};
+use pulsus_model::Fingerprint;
 
 // ---------------------------------------------------------------------------
 // 1–3: integrity + identity + experimental parity
@@ -334,7 +335,7 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
         data.insert(
             spec.id,
             vec![FetchedSeries {
-                fingerprint: spec.id as u64,
+                fingerprint: Fingerprint::from_raw(u128::from(spec.id as u64)),
                 // The per-series name channel (issue #85): the selector's
                 // own concrete name when it has one, else a fixed
                 // synthetic name (name-less probes still evaluate).

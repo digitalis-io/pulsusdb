@@ -89,6 +89,11 @@ macro_rules! skip_unless_live {
 const METRIC: &str = "http_requests_total";
 const ERRORS: &str = "http_errors_total";
 const FPS: [u64; 4] = [1, 2, 3, 4];
+/// The same four, spelled the one exact way a statement may carry them
+/// (issue #498): above 2^64 a bare decimal is read as `Float64`, so every
+/// builder renders `toUInt128('<decimal>')` and this expectation does too.
+const FPS_SQL: &str = "toUInt128('1'), toUInt128('2'), toUInt128('3'), toUInt128('4')";
+const ERROR_FPS_SQL: &str = "toUInt128('5'), toUInt128('6')";
 const ERROR_FPS: [u64; 2] = [5, 6];
 /// One lookback, written out rather than computed.
 const LOOKBACK_MS: i64 = 300_000;
@@ -153,7 +158,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -161,7 +166,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -169,7 +174,7 @@ struct SeedSampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     schema: i8,
     zero_threshold: f64,
@@ -247,13 +252,13 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             BTreeMap::from([("status", "500".to_string()), ("instance", format!("i{i}"))]);
         series.push(SeedSeriesRow {
             metric_name: METRIC.to_string(),
-            fingerprint: *fp,
+            fingerprint: u128::from(*fp),
             unix_milli: bucket,
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
             metric_name: METRIC.to_string(),
-            fingerprint: *fp,
+            fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
         });
@@ -263,13 +268,13 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             BTreeMap::from([("status", "500".to_string()), ("instance", format!("i{i}"))]);
         series.push(SeedSeriesRow {
             metric_name: ERRORS.to_string(),
-            fingerprint: *fp,
+            fingerprint: u128::from(*fp),
             unix_milli: bucket,
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
             metric_name: ERRORS.to_string(),
-            fingerprint: *fp,
+            fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
         });
@@ -287,7 +292,7 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
     // gains a member.
     let hist = vec![SeedHistRow {
         metric_name: METRIC.to_string(),
-        fingerprint: FPS[1],
+        fingerprint: u128::from(FPS[1]),
         unix_milli: t,
         schema: 0,
         zero_threshold: 0.0,
@@ -632,7 +637,7 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     // so the four matched series are one group and every gid is 0.
     let want = sorted(vec![h.grouped_read(
         METRIC,
-        "1, 2, 3, 4",
+        FPS_SQL,
         "0, 0, 0, 0",
         LOOKBACK_MS,
     )]);
@@ -667,10 +672,10 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     let back = LOOKBACK_MS + RANGE_MS;
     let want_two = sorted(vec![
-        h.float_read(METRIC, "1, 2, 3, 4", back),
-        h.hist_read(METRIC, "1, 2, 3, 4", back),
-        h.float_read(ERRORS, "5, 6", back),
-        h.hist_read(ERRORS, "5, 6", back),
+        h.float_read(METRIC, FPS_SQL, back),
+        h.hist_read(METRIC, FPS_SQL, back),
+        h.float_read(ERRORS, ERROR_FPS_SQL, back),
+        h.hist_read(ERRORS, ERROR_FPS_SQL, back),
     ]);
     assert_eq!(got.len(), 4, "two selectors, two statements each");
     assert_eq!(got, want_two, "the two chains' four statements");

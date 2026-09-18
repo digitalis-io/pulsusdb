@@ -204,6 +204,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use pulsus_logql::{Grouping, GroupingKind, VectorAggOp, parse};
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     Direction, MAX_VARIANT_FANOUT_STATE_BYTES, MetricNode, MetricPlan, Plan, PlanCtx, QueryParams,
@@ -769,17 +770,17 @@ struct ExecFixture {
     scan: MetricPlan,
     variants: Vec<VariantSpec>,
     spec_bytes: u64,
-    meta: HashMap<u64, StreamMetaRow>,
+    meta: HashMap<Fingerprint, StreamMetaRow>,
 }
 
 fn exec_fixture(query: &str, params: &QueryParams, meta_streams: u64) -> ExecFixture {
     let (scan, variants, spec_bytes) = plan_variants(query, params);
-    let meta: HashMap<u64, StreamMetaRow> = (0..meta_streams)
+    let meta: HashMap<Fingerprint, StreamMetaRow> = (0..meta_streams)
         .map(|i| {
             (
-                i + 1,
+                Fingerprint::from_raw(u128::from(i + 1)),
                 StreamMetaRow {
-                    fingerprint: i + 1,
+                    fingerprint: Fingerprint::from_raw(u128::from(i + 1)),
                     service: format!("svc{i}"),
                     labels: format!(r#"{{"env":"prod","idx":"{i}"}}"#),
                 },
@@ -1322,7 +1323,7 @@ fn variants_allocation_gates() {
         let mk_rows = |shuffled: bool| -> Vec<MetricScanRow> {
             let mut rows: Vec<MetricScanRow> = (0..32)
                 .map(|i| MetricScanRow {
-                    fingerprint: 1 + (i % 2),
+                    fingerprint: Fingerprint::from_raw(1 + (i % 2)),
                     timestamp_ns: (i as i64 % 50) * NS,
                     body: fat.clone(),
                     structured_metadata: String::new(),
@@ -2196,7 +2197,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs RangeSlideState::new 6 19 :: .as_deref .as_u64 .clone .get .insert .is_some .metric_mutates_labels Ok ensure_grid_resolution matches! max? new reducer_class retention_points_per_sample series_labels slider_safe_fingerprints stream_hash unreachable! vec!
+        // FRAME client_agg.rs RangeSlideState::new 6 20 :: .as_deref .as_u64 .clone .get .insert .is_some .metric_mutates_labels Ok ensure_grid_resolution from_raw matches! max? new reducer_class retention_points_per_sample series_labels slider_safe_fingerprints stream_hash unreachable! vec!
         branches: 6,
         callees: &[
             ".as_deref",
@@ -2208,6 +2209,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".metric_mutates_labels",
             "Ok",
             "ensure_grid_resolution",
+            // NIL: `Fingerprint::from_raw` on the collision-memo sentinel
+            // (issue #498). A `const fn` over a 128-bit integer, no
+            // branch and no allocation.
+            "from_raw",
             "matches!",
             "max?",
             "new",
@@ -2457,13 +2462,17 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs ClientAggState::push_rows_inner 6 10 :: .get .is_empty .push_one_row Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        // FRAME client_agg.rs ClientAggState::push_rows_inner 6 11 :: .get .is_empty .push_one_row Ok Some default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
         branches: 6,
         callees: &[
             ".get",
             ".is_empty",
             ".push_one_row",
             "Ok",
+            // NIL: the slider-safety memo became an `Option<Fingerprint>`
+            // rather than a `u64::MAX` sentinel (issue #498), so the
+            // memo hit writes `Some(fp)`. No branch and no allocation.
+            "Some",
             "default",
             "merge_labels_with_structured_metadata",
             "new",
@@ -2615,7 +2624,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs RangeSlideState::push_rows 7 12 :: .flush_collision .get .is_empty .push_one_row Err Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        // FRAME client_agg.rs RangeSlideState::push_rows 7 13 :: .flush_collision .get .is_empty .push_one_row Err Ok Some default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
         branches: 7,
         // `.into` joined with issue #230: the render-budget breach
         // (`TemplateBudgetExceeded`) converts into `ReadError` on the
@@ -2627,6 +2636,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".push_one_row",
             "Err",
             "Ok",
+            // NIL: the slider-safety memo became an `Option<Fingerprint>`
+            // rather than a `u64::MAX` sentinel (issue #498), so the
+            // memo hit writes `Some(fp)`. No branch and no allocation.
+            "Some",
             "default",
             "merge_labels_with_structured_metadata",
             "new",

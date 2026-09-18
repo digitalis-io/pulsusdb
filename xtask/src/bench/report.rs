@@ -68,7 +68,8 @@ pub fn render_markdown(report: &BenchReport) -> String {
              (`is_initial_query = 0`, a participating non-initiator shard), or `expected-pruned` \
              (a shard `optimize_skip_unused_shards` correctly excluded — `read_rows`/\
              `read_bytes`/`selected_marks` are `0`, and `pruned_reason` spells out the \
-             `fingerprint % total_weight` derivation). **Unpruned stages** (`resolution`, \
+             `cityHash64(fingerprint) % total_weight` derivation). **Unpruned stages** \
+             (`resolution`, \
              `discovery` — no `fingerprint` predicate to prune by) show every shard \
              **participating**. **Fingerprint-scoped stages** (`hydration`, `samples`, \
              `rollup_range`) show exactly the *computed owning subset* participating, with every \
@@ -109,6 +110,7 @@ pub fn render_markdown(report: &BenchReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     fn sample_report() -> BenchReport {
         BenchReport {
@@ -126,7 +128,7 @@ mod tests {
                 load_elapsed_ms: 5,
                 canonical_service: "svc-000".to_string(),
                 canonical_env: "prod".to_string(),
-                canonical_fingerprint: 1,
+                canonical_fingerprint: Fingerprint::from_raw(1),
             },
             queries: vec![QueryEvidence {
                 name: "example".to_string(),

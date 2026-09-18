@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet, UnixNano};
+use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_write::writer::{BlockInserter, LogSampleRow, LogWriter};
 use pulsus_write::{Backpressure, LogRow, LogSink, ParsedLogs, StreamRow};
 
@@ -173,11 +173,11 @@ fn labels_with_service(service: &str) -> LabelSet {
 /// One `log_samples` row plus, if `new_stream` is set, its `StreamRow`
 /// (fresh `(fingerprint, month)` — a real request's first record for a
 /// stream `parse()` has never seen before).
-fn batch_for(fingerprint: u64, service: &str, timestamp_ns: i64, new_stream: bool) -> ParsedLogs {
+fn batch_for(fingerprint: u128, service: &str, timestamp_ns: i64, new_stream: bool) -> ParsedLogs {
     let mut out = ParsedLogs {
         rows: vec![LogRow {
             service: service.to_string(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             timestamp_ns: UnixNano(timestamp_ns),
             severity: 0,
             body: "hello".to_string(),
@@ -188,7 +188,7 @@ fn batch_for(fingerprint: u64, service: &str, timestamp_ns: i64, new_stream: boo
     if new_stream {
         out.streams.push(StreamRow {
             month: Date::start_of_month_utc(timestamp_ns).unwrap(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             service: service.to_string(),
             labels: labels_with_service(service),
             updated_ns: timestamp_ns,
@@ -237,7 +237,7 @@ fn writer_with_patterns(
 async fn concurrent_admit_never_exceeds_the_queue_bytes_limit() {
     let one_row_bytes = LogSampleRow {
         service: "svc".to_string(),
-        fingerprint: 0,
+        fingerprint: Fingerprint::from_raw(0),
         timestamp_ns: 0,
         severity: 0,
         body: "hello".to_string(),
@@ -258,7 +258,7 @@ async fn concurrent_admit_never_exceeds_the_queue_bytes_limit() {
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..admits {
         let writer = writer.clone();
-        tasks.spawn(async move { writer.admit(batch_for(i, "svc", 0, false)) });
+        tasks.spawn(async move { writer.admit(batch_for(u128::from(i), "svc", 0, false)) });
     }
     let results: Vec<Result<(), Backpressure>> = tasks.join_all().await;
 
@@ -593,7 +593,7 @@ async fn age_trigger_flushes_both_tables_after_batch_ms_even_below_the_size_thre
 async fn retryable_pre_send_failure_resends_the_whole_multi_row_batch_before_succeeding() {
     let one_row_bytes = LogSampleRow {
         service: "svc".to_string(),
-        fingerprint: 0,
+        fingerprint: Fingerprint::from_raw(0),
         timestamp_ns: 0,
         severity: 0,
         body: "hello".to_string(),
@@ -1215,7 +1215,7 @@ async fn shutdown_completes_with_a_hanging_backfill_insert_in_flight() {
 /// A batch of log rows for one `(fingerprint, month)`, one row per body, all
 /// at `timestamp_ns` (same 10s pattern bucket). Registers the stream once.
 fn pattern_batch(
-    fingerprint: u64,
+    fingerprint: u128,
     service: &str,
     timestamp_ns: i64,
     bodies: &[&str],
@@ -1224,7 +1224,7 @@ fn pattern_batch(
         .iter()
         .map(|body| LogRow {
             service: service.to_string(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             timestamp_ns: UnixNano(timestamp_ns),
             severity: 0,
             body: (*body).to_string(),
@@ -1235,7 +1235,7 @@ fn pattern_batch(
         rows,
         streams: vec![StreamRow {
             month: Date::start_of_month_utc(timestamp_ns).unwrap(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             service: service.to_string(),
             labels: labels_with_service(service),
             updated_ns: timestamp_ns,
