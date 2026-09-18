@@ -23,7 +23,7 @@
 //! three of them.
 //!
 //! **It keys on TEXT, never on a line number.** The fourth passage quotes
-//! `docs/schemas.md:933` for a paragraph that now sits at `:999`, so a
+//! `docs/schemas.md:967` for a paragraph that now sits at `:1033`, so a
 //! line-keyed check would have to be corrected by hand every time a
 //! document above it grew.
 //!
