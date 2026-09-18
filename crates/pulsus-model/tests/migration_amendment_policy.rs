@@ -42,21 +42,32 @@ const CURRENT_WINDOW: &str = "#498";
 const SUPERSEDED_WINDOW: &str = "#54";
 
 /// The sentence fragment that carries the claim, in each artefact's own
-/// wording. The window marker must appear in the same passage, not merely
-/// somewhere in the file.
-const POLICY_PASSAGES: &[(&str, &str)] = &[
-    ("docs/schemas.md", "**Migration amendment policy:**"),
+/// wording, and **how many times that passage names the current window**.
+///
+/// The count is the point. Two of these passages name `#498` twice — the
+/// catalog's module doc in its statement and again in its attribution, the
+/// design record's note in its first sentence and again in its last — and
+/// a `contains` check passes when only one of the two is changed. Measured:
+/// with the catalog's first occurrence alone rewritten, a presence test
+/// reports every file agreeing while the passage says two different things
+/// about which window is current. The cardinality is what makes each
+/// single-occurrence edit a failure.
+const POLICY_PASSAGES: &[(&str, &str, usize)] = &[
+    ("docs/schemas.md", "**Migration amendment policy:**", 1),
     (
         "docs/architecture.md",
         "Migrations are idempotent, and append-only from the first tagged release onward",
+        1,
     ),
     (
         "crates/pulsus-schema/src/catalog.rs",
         "**Amendment policy:** migrations are append-only",
+        2,
     ),
     (
         "docs/traceql-schema-migration.md",
         "> **Historical, 2026-09-17.** The window was reopened by a ruling on issue",
+        2,
     ),
 ];
 
@@ -86,18 +97,29 @@ fn passage(rel: &str, opener: &str) -> String {
     }
 }
 
-/// **All four name the current window.**
+/// **All four name the current window, as many times as they are written
+/// to.**
+///
+/// Presence is not enough: a passage that names the window once and the
+/// superseded one once is a passage saying two things, and a `contains`
+/// check reads it as agreement.
 #[test]
 fn the_four_amendment_policy_statements_name_one_window() {
-    let missing: Vec<&str> = POLICY_PASSAGES
-        .iter()
-        .filter(|(rel, opener)| !passage(rel, opener).contains(CURRENT_WINDOW))
-        .map(|(rel, _)| *rel)
-        .collect();
+    let mut wrong: Vec<String> = Vec::new();
+    for (rel, opener, expected) in POLICY_PASSAGES {
+        let p = passage(rel, opener);
+        let got = p.matches(CURRENT_WINDOW).count();
+        if got != *expected {
+            wrong.push(format!(
+                "{rel}: names {CURRENT_WINDOW} {got} time(s), expected {expected}"
+            ));
+        }
+    }
     assert!(
-        missing.is_empty(),
-        "the amendment-policy passage must name the same window in all four places; these do \
-         not name {CURRENT_WINDOW}: {missing:?}"
+        wrong.is_empty(),
+        "the amendment-policy passage must name the same window in all four places, everywhere \
+         it states one:\n  {}",
+        wrong.join("\n  ")
     );
 }
 
@@ -108,7 +130,7 @@ fn the_four_amendment_policy_statements_name_one_window() {
 fn no_amendment_policy_statement_still_calls_the_superseded_window_the_last_one() {
     let stale: Vec<&str> = POLICY_PASSAGES
         .iter()
-        .filter(|(rel, opener)| {
+        .filter(|(rel, opener, _)| {
             let p = passage(rel, opener);
             // The design record's dated note names the superseded window
             // deliberately, as the thing that was superseded, so what is
@@ -120,7 +142,7 @@ fn no_amendment_policy_statement_still_calls_the_superseded_window_the_last_one(
             let after = &p[at..];
             after.contains("was the last such") || after.contains("was the last window")
         })
-        .map(|(rel, _)| *rel)
+        .map(|(rel, _, _)| *rel)
         .collect();
     assert!(
         stale.is_empty(),
