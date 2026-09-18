@@ -1100,10 +1100,11 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     drop(stream);
 
     // The kinds `run_init` may issue, and nothing else. `MATERIALIZE TTL`
-    // comes from the delete-TTL on the sample tables; the three
-    // `PROJECTION` commands come from the span projections. A command
-    // outside this list is a schema change nobody reviewed, whatever it
-    // says about columns.
+    // comes from the delete-TTL on the sample tables; the four
+    // `PROJECTION` commands come from the span projections — three
+    // materialise and one drop, which is why the allowed list carries two
+    // projection prefixes. A command outside this list is a schema change
+    // nobody reviewed, whatever it says about columns.
     const ALLOWED_PREFIXES: &[&str] = &[
         "(MATERIALIZE TTL)",
         "(MATERIALIZE PROJECTION ",

@@ -2660,3 +2660,64 @@ fn names_label(haystack: &[String], label: &[String]) -> bool {
 /// [`CENSUS_BLOCK_END`]; the sweep keys on the shared prefix so a new
 /// region does not need a third constant.
 const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
+
+/// **Every document-to-document line citation names the line it quotes.**
+///
+/// The citation dataset above enumerates `<file>.rs:<line>` references and
+/// nothing else, so a citation from one design record into another
+/// document was covered by no check at all. One of them drifted twice in a
+/// single issue: it was recomputed across a merge, landed on a blank line,
+/// and nothing said so.
+///
+/// The check is the same shape as the dataset's: each entry names the
+/// citing document, the text it cites, and the phrase the cited line must
+/// carry. A citation that moves stops containing its phrase and this
+/// names the row.
+///
+/// ```text
+///   citing document          cites                      the cited line must carry
+///   ----------------------   ------------------------   -------------------------------
+///   docs/query-to-sql.md     docs/schemas.md:835        never a `UNION ALL`
+/// ```
+///
+/// It is deliberately a hand-written list rather than a parse of every
+/// `.md:<line>` occurrence: the records quote line references inside
+/// historical block quotes, where the number records what a document said
+/// at the time and updating it would rewrite the quotation.
+#[test]
+fn every_cross_document_line_citation_names_the_line_it_quotes() {
+    const CROSS_DOC_CITATIONS: &[(&str, &str, &str)] = &[(
+        "docs/query-to-sql.md",
+        "docs/schemas.md:835",
+        "never a `UNION ALL`",
+    )];
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (citing, citation, phrase) in CROSS_DOC_CITATIONS {
+        let citing_text = read(citing);
+        let occurrences = citing_text.matches(citation).count();
+        if occurrences == 0 {
+            wrong.push(format!("{citing} no longer cites {citation}"));
+            continue;
+        }
+        let (path, line) = citation
+            .rsplit_once(':')
+            .expect("a cross-document citation is <path>:<line>");
+        let line: usize = line.parse().expect("a citation's line is a number");
+        let cited = read(path);
+        let lines: Vec<&str> = cited.lines().collect();
+        match lines.get(line - 1) {
+            None => wrong.push(format!("{citation} is past the end of {path}")),
+            Some(text) if !text.contains(phrase) => wrong.push(format!(
+                "{citing} cites {citation} for {phrase:?}, but that line reads {:?}",
+                text.chars().take(60).collect::<String>()
+            )),
+            Some(_) => {}
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "cross-document line citations that no longer name what they quote:\n  {}",
+        wrong.join("\n  ")
+    );
+}

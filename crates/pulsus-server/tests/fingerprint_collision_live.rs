@@ -555,6 +555,25 @@ fn range_series(port: u16, query: &str, at_ns: i64) -> Vec<Series<Vec<(i64, Stri
 ///   one stream row     1 line, f47…   1 line, 1d9…   2       1 and 1    f47…, 1d9…
 ///   both stream rows   1 line, f47…   2 lines, 1d9…  2       1 and 2    f47…, 1d9…
 /// ```
+///
+/// **The second row corrects the approved plan for issue #498, which
+/// states one `B` line and `sum by()` value `1` there.** That answer is
+/// not reachable from the fixture the same plan specifies. `log_samples`
+/// is a plain `MergeTree` (`crates/pulsus-schema/src/catalog.rs`,
+/// migration 8) — it does not deduplicate, and ClickHouse's insert
+/// deduplication is a `Replicated*` feature — so pushing `B`'s entry a
+/// second time writes a second row, and `count_over_time` counts two.
+/// Measured against a running server: `{service_name="1d9…"}` answers
+///
+/// ```text
+///   "values": [["<T0>", "line from stream B"],
+///              ["<T0>", "line from stream B"]]
+/// ```
+///
+/// with `"entries": 2`, and the aggregation answers `1` for `A` and `2`
+/// for `B`. What the state is for is unaffected and is asserted above:
+/// `A`'s answer must not grow when `B` is written again, which is exactly
+/// what a shared identity used to make it do.
 fn assert_logs_answers(port: u16, t0_ns: i64, b_lines: usize, state: &str) {
     // Each selector names ONE stream and gets that stream's own lines,
     // labelled with its own label set. Before the widening, `{…="f47…"}`
