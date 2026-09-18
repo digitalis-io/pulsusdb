@@ -257,9 +257,43 @@ shard-local fan-out under `fingerprint` sharding, and replication
 correctness is already covered by the 2-shard fixture.
 
 Same CI-scale corpus (720,000 rows / 500 streams / 50 services), loaded
-through the `_dist` Distributed wrappers so the `fingerprint` sharding key
-actually places rows across all four shards (182,880 / 138,240 / 192,960 /
-205,920 rows respectively — not one shard holding everything). Full
+through the `_dist` Distributed wrappers so the sharding key actually
+places rows across all four shards (182,880 / 138,240 / 192,960 / 205,920
+rows respectively — not one shard holding everything).
+
+> **Superseded figures, issue #498.** The sharding key in force when this
+> capture was taken was the bare `fingerprint` column. It is
+> `cityHash64(fingerprint)` since the column widened to `UInt128`, because
+> a `Distributed` sharding key must evaluate to an integer type ClickHouse
+> accepts and the bare column refuses every insert. **Every number on this
+> page that depends on which shard owns which fingerprint no longer
+> follows from this capture**, and the four marked below are not
+> reproducible under the current key:
+>
+> ```text
+>   the per-shard placement       182,880 / 138,240 / 192,960 / 205,920
+>   the owning-subset roster      3 of 4, on the hydration and samples stages
+>   the pruned shard              4, and its recorded slots [0, 0, 1, 2]
+>   the per-shard read_rows       every participating-shard count in the
+>                                   table below, which follows the placement
+> ```
+>
+> **What does still hold** is the shape, which is what this page was
+> written to establish and does not depend on the selector: each stage
+> executes shard-locally; a fingerprint-scoped stage participates on the
+> owning subset rather than the whole cluster; a shard excluded by
+> `optimize_skip_unused_shards` is proven pruned against a roster computed
+> before the query ran, rather than assumed from its absence; and the
+> discovery query fans out with only deduplicated results crossing the
+> network.
+>
+> **A re-capture needs**: the four-shard fixture at
+> `ci/bench-cluster/compose.yaml`, the same CI-scale corpus loaded through
+> the `_dist` wrappers, and a rerun of `xtask bench --dist`, which
+> regenerates [`data/logs-read-dist.json`](data/logs-read-dist.json) and
+> the table below. The benchmark's own client-side roster model already
+> computes the current key and cross-checks it against the running server
+> (`xtask/src/bench/queries.rs`), so a rerun needs no further change. Full
 machine-readable evidence, including **every stage's own** `EXPLAIN
 PIPELINE` capture:
 [`data/logs-read-dist.json`](data/logs-read-dist.json).
@@ -272,7 +306,13 @@ including the coordinator's own local-shard read (round 2 [high] finding);
 and, for fingerprint-scoped stages, the pruned shard(s) *proven* pruned
 rather than merely absent (round 3 [high] finding):
 
-| Query | stage | roster | participating (shard: `read_rows`) | expected-pruned |
+**The roster, placement and `read_rows` columns below were measured under
+the previous sharding key and do not evidence current placement** (issue
+#498 — see the note above). The `stage` column, and the fact that a
+fingerprint-scoped stage reaches an owning subset rather than the whole
+cluster, are unaffected.
+
+| Query | stage | roster (previous key) | participating (shard: `read_rows`, previous key) | expected-pruned (previous key) |
 |---|---|---|---|---|
 | `label_scoped_stream_read_6h` | resolution | full (4/4) | 1:2,000(coord) 2:384 3:536 4:572 | — |
 | `label_scoped_stream_read_6h` | hydration | owning subset (3/4) | 1:357(coord) 2:96 3:134 | 4 |
@@ -290,14 +330,26 @@ in the committed JSON, e.g. for `label_scoped_stream_read_6h`'s
 `hydration` stage: *"optimize_skip_unused_shards pruned shard 4: none of
 the 4 queried fingerprints map to it (fingerprint % total_weight=4 over
 slots [0, 0, 1, 2] resolves to owning shards {1, 2, 3} — shard 4 is not
-among them)"* — computed client-side from `system.clusters`'
+among them)"*. **That derivation names the superseded key** (issue #498):
+which shard is pruned, and the slots that put it there, would be different
+numbers under `cityHash64(fingerprint)`. What the entry establishes — that
+the excluded shard was derived before the query ran and then checked
+against the observed rows — is the part that carries forward. The
+derivation string the benchmark emits today prints the hash beside the
+slot.
+
+Either way the derivation was computed client-side from `system.clusters`'
 cumulative-weight slot map, **before** the query ran, then verified
-against the observed `system.query_log` rows (not a comment tacked onto an
-absence). `count_rate_rollup_over_corpus_window`'s `rollup_range` stage —
-whose owning set the plan amendment explicitly required verifying, not
-assuming — reaches the **full 4-shard roster** because its 167-fingerprint
-`env=prod` set is broad enough to span every shard's slots; this is
-reported as observed, not presumed from the shape of the query. Every row
+against the observed `system.query_log` rows — not a comment tacked onto
+an absence. `count_rate_rollup_over_corpus_window`'s `rollup_range` stage
+— whose owning set the plan amendment explicitly required verifying, not
+assuming — reached the **full 4-shard roster** because its
+167-fingerprint `env=prod` set spanned every shard's slots; that was
+reported as observed, not presumed from the shape of the query.
+**Which slots those fingerprints span is selector-dependent** (issue
+#498), so the "full roster" cell for that stage is one of the superseded
+figures; that a broad fingerprint set reaches more shards than a narrow
+one is not. Every row
 above passed the harness's exact-roster assertion (`observed == expected`)
 — it would have aborted the run on any missing owner or unexpected
 participant. Full machine-readable evidence, including per-shard `EXPLAIN

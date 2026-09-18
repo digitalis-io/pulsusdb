@@ -43,15 +43,38 @@ logical CPUs), Linux 5.15 (WSL2), `rustc`/`cargo` 1.93.0. ClickHouse
 >
 > ```text
 >   xtask ch-bench --scenario aggstate
->   clickhouse  ok=true  fingerprint 340282366920938463205120190399834488818
->   klickhouse  ok=true  fingerprint 340282366920938463205120190399834488818
+>   clickhouse (HTTP)        ok=true  fingerprint 340282366920938463205120190399834488818
+>   klickhouse (native TCP)  ok=true  fingerprint 340282366920938463205120190399834488818
 > ```
 >
 > That value sets the top bit of **both** 64-bit words, so a signed read of
-> either half would come back negative. The `ddl` scenario — `CREATE TABLE`,
-> the materialized view and the chunked backfill over the widened column
-> with `CODEC(Delta(8), ZSTD(1))` — reported `reliable=true` for both
-> crates on the same server.
+> either half would come back negative.
+>
+> **Both transports, checked from outside the benchmark.** The two crates
+> agreeing with each other would also be satisfied by both truncating the
+> same way, so the tables each wrote were read back over a third
+> connection:
+>
+> ```text
+>   SELECT count(), countIf(bitShiftRight(fingerprint, 64) = 0), max(fingerprint)
+>
+>   written over HTTP         200000 rows   0 with an empty high word
+>   written over native TCP   200000 rows   0 with an empty high word
+>   max on both               340282366920938463205120190399834488818
+>
+>   uniqExact(fingerprint)              200000 on both
+>   groupBitXor(cityHash64(fingerprint))  10965705347694212856 on both
+> ```
+>
+> The two transports hold the identical set of 128-bit values, and neither
+> dropped the high word. The streaming-fetch scenario reads the same rows
+> back through each crate and folds **both** words of every fingerprint
+> into its checksum; over 400 rows both crates returned
+> `11437175760153119632`.
+>
+> The `ddl` scenario — `CREATE TABLE`, the materialized view and the chunked
+> backfill over the widened column with `CODEC(Delta(8), ZSTD(1))` —
+> reported `reliable=true` for both crates on the same server.
 
 - Metric-shaped rows/table: `docs/schemas.md §2.1` `metric_samples` —
   `metric_name LowCardinality(String)`, `fingerprint UInt64 CODEC(Delta(8),
