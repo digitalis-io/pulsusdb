@@ -1106,15 +1106,11 @@ async fn two_phase_search_explain_and_budget_gates() {
     // Issue #558: phase 1 generates candidates from the attribute index
     // and phase 2 reads the value from the span row, so a fixture whose
     // two stores disagree produces a candidate that matches nothing, or a
-    // kind the response renders wrong. Ten of the corpus's trace ids are
-    // enough to catch a seeding expression that writes one side — every
-    // row comes from one `INSERT … SELECT FROM numbers()` per store, so a
-    // disagreement is systematic rather than per-trace.
-    let corpus_ids: Vec<String> = (0..10u32).map(|n| format!("{n:032x}")).collect();
-    pulsus_testkit::assert_stores_agree(
-        &DB,
-        &corpus_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    // kind the response renders wrong. Called here for fast feedback on
+    // the AC2 corpus, and AGAIN as this target's last statement, because
+    // the fixtures below seed more data into the same database and the
+    // check reads the whole store rather than a list of ids.
+    pulsus_testkit::assert_stores_agree(&DB);
 
     let engine = TraceEngine::new(data_client().await, engine_config());
 
@@ -3867,6 +3863,23 @@ async fn two_phase_search_explain_and_budget_gates() {
 
     // ---- issue #557 criterion 4(b): the probe column's type ------------
     the_probe_column_types_are_what_the_row_structs_decode(&client, &engine, base, now).await;
+
+    // ---- issue #558 criterion 13, and it is the LAST statement ---------
+    //
+    // **This target seeds eight fixtures into one database, in one test
+    // function, and a check placed beside any of them covers only what
+    // was written before it.** The AC2 corpus is checked above for fast
+    // feedback; the structural T1/T2 spans, the AC6 matrix, the
+    // field-comparison spans and the event spans are all seeded AFTER
+    // that point, and a check there would have left them out — which is
+    // exactly what round 2 found.
+    //
+    // `assert_stores_agree` takes no trace-id list: it reads the whole
+    // database, so it covers every fixture this function seeded and any
+    // fixture a later change adds, without the author having to remember
+    // to name it. Placed last, so the only way past it is to write more
+    // data after it, and there is nothing after it.
+    pulsus_testkit::assert_stores_agree(&DB);
 }
 
 /// Issue #492 part 5 criterion 14 — **the granule-identity gate for the

@@ -458,13 +458,7 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     // row with a different kind or number would still make the search
     // answer, because the candidate only needs `(key, val, scope)`, and
     // would then render the wrong kind from the span row.
-    pulsus_testkit::assert_stores_agree(
-        db,
-        &[&TRACE_ID
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()],
-    );
+    pulsus_testkit::assert_stores_agree(db);
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, db).await;

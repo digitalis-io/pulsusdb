@@ -3631,16 +3631,7 @@ async fn a_repeated_attribute_key_resolves_to_one_element_value_and_kind() {
         "k-R-and-S",
     );
 
-    pulsus_testkit::assert_stores_agree(
-        db,
-        &[
-            &hex(&tid(1)),
-            &hex(&tid(2)),
-            &hex(&tid(3)),
-            &hex(&tid(4)),
-            &hex(&tid(5)),
-        ],
-    );
+    pulsus_testkit::assert_stores_agree(db);
 
     // ---- criterion 1 ---------------------------------------------------
     let ctx = "dup-select";
@@ -3782,7 +3773,7 @@ async fn an_unscoped_value_read_skips_the_reserved_intrinsic_scopes() {
     }];
     ingest(port, vec![s], checkout_resource(), "only-an-event");
 
-    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1))]);
+    pulsus_testkit::assert_stores_agree(db);
 
     let ctx = "unscoped-name-value";
     let res = search(port, r#"{ } | select(.name)"#, w0, w1, "", ctx);
@@ -3861,7 +3852,7 @@ async fn a_mixed_projection_reads_every_field_from_its_own_element() {
         "mixed",
     );
 
-    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1))]);
+    pulsus_testkit::assert_stores_agree(db);
 
     let ctx = "mixed-projection";
     let q = r#"{ } | select(span.a) | select(.c) | avg(span.b) > 1 | avg(span.d) > 1"#;
@@ -3878,8 +3869,43 @@ async fn a_mixed_projection_reads_every_field_from_its_own_element() {
             ("a".to_string(), "stringValue=x2".to_string()),
             ("c".to_string(), "stringValue=y".to_string()),
         ],
-        "{ctx}: four slots, four distinct located elements — `a` takes the FIRST of two \
+        "{ctx}: two select slots, two distinct located elements — `a` takes the FIRST of two \
          same-scope elements and `c` takes the SPAN scope over the resource one: {json}"
+    );
+
+    // **The two AGGREGATE slots, which are the other half of the mixed
+    // projection and the half a trace-membership assertion cannot see.**
+    // `span.b` is stored twice — `9` then `2` — so `avg(span.b)` is the
+    // discriminating value here: a slot reading the LAST element would
+    // answer `2`, and the query's own `> 1` passes either way. `span.d`
+    // is the fourth stored kind, one element, and pins that a `double`
+    // survives the located read.
+    //
+    // Both render in the `doubleValue` arm whatever the stored kind is —
+    // `avg(.attr)` is always a double (docs/api.md §4.2) — so the arm is
+    // asserted as well as the number: a build that rendered `b`'s `int`
+    // arm here would be wrong about the aggregate's own type.
+    let sets = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no traces in {json}"))
+        .iter()
+        .find(|t| t["traceID"].as_str() == Some(&hex(&tid(1))))
+        .unwrap_or_else(|| panic!("{ctx}: trace 1 must be returned: {json}"))["spanSets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(sets.len(), 1, "{ctx}: one spanSet: {json}");
+    let mut aggs = tagged_attrs(&sets[0]);
+    aggs.sort();
+    assert_eq!(
+        aggs,
+        vec![
+            ("avg(span.b)".to_string(), "doubleValue=9.0".to_string()),
+            ("avg(span.d)".to_string(), "doubleValue=4.5".to_string()),
+        ],
+        "{ctx}: the aggregate slots read their OWN located elements — `b` is the first of \
+         two, so `9` and not `2` — and an attribute average renders in the double arm \
+         whatever the element's stored kind is: {json}"
     );
 
     drop_db(db).await;
@@ -3938,7 +3964,7 @@ async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more(
         ingest(port, vec![sp], checkout_resource(), "boundary span");
     }
 
-    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1)), &hex(&tid(2))]);
+    pulsus_testkit::assert_stores_agree(db);
 
     // Exactly the budget: served. The window is narrowed to the one
     // trace, because the bound is over the whole BATCH's widths and both

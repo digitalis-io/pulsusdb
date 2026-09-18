@@ -1851,7 +1851,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     // two stores disagree produces a candidate that matches nothing, or a
     // kind the response renders wrong — and either reads as a defect in
     // the code rather than in the seed.
-    pulsus_testkit::assert_stores_agree(&run_db, &[trace_hex]);
+    pulsus_testkit::assert_stores_agree(&run_db);
 
     let config = pulsus_read::TraceReadConfig {
         spans_table: "trace_spans".to_string(),

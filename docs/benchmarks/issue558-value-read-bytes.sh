@@ -2,7 +2,8 @@
 # The corpus and the three statements behind issue #558's row/byte
 # figures, committed so anyone can re-take them.
 #
-# **Run-once by a human, never from CI.** It writes 240,000 rows into a
+# **Run-once by a human, and it REFUSES to run from CI** — the check is
+# below, not just this sentence. It writes 240,000 rows into a
 # database it creates, and every figure it prints is corpus- and
 # setting-sensitive: `read_bytes` moves with `max_block_size`, with the
 # stored string lengths and with the server's own defaults. A wall-time or
@@ -29,6 +30,24 @@
 # `BLOCK` is `max_block_size`; run it at more than one value, because
 # `read_bytes` moves with it and a single figure says less than a pair.
 set -euo pipefail
+
+# The CI refusal, before anything is created. `CI` is set by GitHub
+# Actions and by every other runner this project has met; `GITHUB_ACTIONS`
+# and `GITHUB_JOB` are that runner's own. Fail-closed: any of the three
+# being set, to anything non-empty, stops the script — a run that should
+# not have happened is louder than a run that quietly did.
+#
+# Set `PULSUS_BENCH_ALLOW_CI=1` to override, which exists so that a person
+# who genuinely wants this inside a container that happens to export `CI`
+# can say so deliberately.
+for ci_var in CI GITHUB_ACTIONS GITHUB_JOB; do
+  if [ -n "${!ci_var:-}" ] && [ -z "${PULSUS_BENCH_ALLOW_CI:-}" ]; then
+    echo "refusing to run: $ci_var is set, and this script is run-once by a human." >&2
+    echo "It writes 240,000 rows and every figure it prints is corpus- and" >&2
+    echo "setting-sensitive, so it is not a gate. Set PULSUS_BENCH_ALLOW_CI=1 to override." >&2
+    exit 2
+  fi
+done
 
 : "${CH_URL:?set CH_URL to the ClickHouse HTTP endpoint, e.g. http://<host>:<port>/}"
 : "${DB:?set DB to a database name this script may create and drop}"

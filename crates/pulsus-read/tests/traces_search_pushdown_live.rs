@@ -273,8 +273,6 @@ fn corpus_q(base_ns: i64) -> Vec<Seeded> {
 /// merge is the state a read without `FINAL` can genuinely observe, and
 /// stopping merges holds the corpus in it.
 async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize) {
-    let seeded_trace_ids: std::collections::BTreeSet<[u8; 16]> =
-        rows.iter().map(|r| trace_id(r.trace)).collect();
     if attr_repeats > 1 {
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_attrs_idx")).await;
     }
@@ -394,8 +392,7 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
     // lets the replay pass above be covered too: that pass writes the
     // index rows twice on purpose, and a multiset comparison would report
     // the deliberate duplicate.
-    let ids: Vec<String> = seeded_trace_ids.iter().map(hex32).collect();
-    pulsus_testkit::assert_stores_agree(db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
+    pulsus_testkit::assert_stores_agree(db);
 }
 
 /// One TraceQL query, the fragment it must compile to, and the predicate
@@ -1675,8 +1672,6 @@ fn corpus_u() -> Vec<URow> {
 /// two identical rows on the ordering key and would delete the very
 /// thing the test is about.
 async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeats: usize) {
-    let seeded_trace_ids: std::collections::BTreeSet<[u8; 16]> =
-        rows.iter().map(|r| trace_id(r.trace)).collect();
     if repeats > 1 {
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_attrs_idx")).await;
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_spans")).await;
@@ -1745,8 +1740,7 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
     // lets the replay pass above be covered too: that pass writes the
     // index rows twice on purpose, and a multiset comparison would report
     // the deliberate duplicate.
-    let ids: Vec<String> = seeded_trace_ids.iter().map(hex32).collect();
-    pulsus_testkit::assert_stores_agree(db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
+    pulsus_testkit::assert_stores_agree(db);
 }
 
 /// The eighteen (aggregate, operator) cells, and which six the six-cell
@@ -2018,7 +2012,7 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
     .await;
     // Issue #558 criterion 13: this corpus is seeded by hand rather than
     // through `seed`, so the store-agreement check is called here.
-    pulsus_testkit::assert_stores_agree(db, &[&hex32(&trace_id(1))]);
+    pulsus_testkit::assert_stores_agree(db);
 
     let engine = TraceEngine::new(
         ChClient::new(conn(db)).await.expect("connect (engine)"),
@@ -2162,7 +2156,7 @@ async fn the_event_set_statement_returns_exactly_the_retained_rows() {
         ),
     )
     .await;
-    pulsus_testkit::assert_stores_agree(db, &[&tid]);
+    pulsus_testkit::assert_stores_agree(db);
 
     let engine = TraceEngine::new(
         ChClient::new(conn(db)).await.expect("connect (engine)"),
