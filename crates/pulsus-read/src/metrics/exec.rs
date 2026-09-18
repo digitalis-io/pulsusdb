@@ -2397,9 +2397,43 @@ trait FloatPoint {
 
 /// The histogram half of a mergeable sample row
 /// (`HistSampleRow`/`MultiHistSampleRow`).
+/// Compares two histogram rows column by column, floats by `to_bits()`.
+/// A macro rather than a generic function because the two row types share
+/// no trait carrying their columns, and cloning them through
+/// `to_columns()` to compare would allocate seven vectors per comparison
+/// on a read path.
+macro_rules! same_stored_histogram {
+    ($a:expr, $b:expr) => {
+        $a.schema == $b.schema
+            && $a.zero_threshold.to_bits() == $b.zero_threshold.to_bits()
+            && $a.zero_count == $b.zero_count
+            && $a.count == $b.count
+            && $a.sum.to_bits() == $b.sum.to_bits()
+            && $a.counter_reset_hint == $b.counter_reset_hint
+            && $a.pos_span_offsets == $b.pos_span_offsets
+            && $a.pos_span_lengths == $b.pos_span_lengths
+            && $a.pos_bucket_deltas == $b.pos_bucket_deltas
+            && $a.neg_span_offsets == $b.neg_span_offsets
+            && $a.neg_span_lengths == $b.neg_span_lengths
+            && $a.neg_bucket_deltas == $b.neg_bucket_deltas
+            && $a.custom_values.len() == $b.custom_values.len()
+            && $a
+                .custom_values
+                .iter()
+                .zip(&$b.custom_values)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+}
+
 trait HistPoint {
     fn unix_milli(&self) -> i64;
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError>;
+    /// Whether two rows at one `(series, millisecond)` carry the same
+    /// stored histogram, compared bitwise on every value column — issue
+    /// #494 §7's identity for the histogram half. Never a decode: two rows
+    /// that decode to equal histograms from different stored columns are
+    /// two samples.
+    fn same_stored_value(&self, other: &Self) -> bool;
 }
 
 impl FloatPoint for SampleRow {
@@ -2427,6 +2461,9 @@ impl HistPoint for HistSampleRow {
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
+    fn same_stored_value(&self, other: &Self) -> bool {
+        same_stored_histogram!(self, other)
+    }
 }
 
 impl HistPoint for MultiHistSampleRow {
@@ -2436,44 +2473,101 @@ impl HistPoint for MultiHistSampleRow {
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
+    fn same_stored_value(&self, other: &Self) -> bool {
+        same_stored_histogram!(self, other)
+    }
 }
 
-/// Per-series 2-way merge by `unix_milli` with the histogram-wins tie-break
-/// (M7-A5a). Both inputs are ascending by `unix_milli` (the fetch `ORDER
-/// BY` contract). At `f < h` emit the float; at `f > h` emit the (decoded)
-/// histogram; at `f == h` emit the HISTOGRAM and advance BOTH cursors — a
-/// same-`(name, fp, unix_milli)` collision is a data error (one value type
-/// per timestamp is the A1 v5 invariant), resolved deterministically in
-/// the histogram's favour. Stale markers are PRESERVED here (not filtered)
-/// so `windowed_non_stale`/`staleness` own staleness exactly as the float
-/// path does today — keeping float output byte-identical.
+/// Issue #494 §7, the rule this read path implements at one
+/// `(series, millisecond)`:
+///
+/// > **If any histogram is present the answer is a histogram and no float
+/// > survives; otherwise the answer is each distinct float value-bit
+/// > identity, in arrival order.**
+///
+/// The comparison is over the whole timestamp RUN, not the previous row.
+/// Rows arrive ordered by `(fingerprint, unix_milli)` (the fetch `ORDER BY`
+/// contract), so a run is contiguous, and in the ordinary case a run is one
+/// row long and the loops below do one comparison each.
+///
+/// Two floats and one histogram at one millisecond used to leave a stray
+/// float behind — the tie-break consumed ONE float and one histogram, and
+/// the tail loop then emitted the second float, so `count_over_time`
+/// answered `"2"` where the histogram alone is the answer.
+///
+/// Identity is bits, never `==`: `0.0` and `-0.0` are equal under `==` and
+/// are two different samples the client sent, while `NaN != NaN` would make
+/// a repeated stale marker two samples. Histogram identity is likewise the
+/// stored columns compared bitwise.
+fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
+    out: &mut Vec<Sample>,
+    t_ms: i64,
+    floats: &[F],
+    hists: &[H],
+) -> Result<(), ReadError> {
+    if !hists.is_empty() {
+        for (k, h) in hists.iter().enumerate() {
+            if hists[..k].iter().any(|prev| prev.same_stored_value(h)) {
+                continue;
+            }
+            out.push(Sample::hist(t_ms, h.decode()?));
+        }
+        return Ok(());
+    }
+    for (k, f) in floats.iter().enumerate() {
+        let bits = f.value().to_bits();
+        if floats[..k].iter().any(|prev| prev.value().to_bits() == bits) {
+            continue;
+        }
+        out.push(Sample::float(t_ms, f.value()));
+    }
+    Ok(())
+}
+
+/// Appends one float to a series' samples under [`emit_timestamp_run`]'s
+/// rule, for the float-only read paths that have no histogram stream to
+/// merge. The scan walks back only over the run already at the tail, which
+/// is one element in the ordinary case.
+fn push_float_in_run(samples: &mut Vec<Sample>, t_ms: i64, value: f64) {
+    let bits = value.to_bits();
+    for existing in samples.iter().rev() {
+        if existing.t_ms != t_ms {
+            break;
+        }
+        if existing.h.is_none() && existing.v.to_bits() == bits {
+            return;
+        }
+    }
+    samples.push(Sample::float(t_ms, value));
+}
+
+/// Per-series merge by `unix_milli` under [`emit_timestamp_run`]'s rule.
+/// Both inputs are ascending by `unix_milli` (the fetch `ORDER BY`
+/// contract). Stale markers are PRESERVED here (not filtered) so
+/// `windowed_non_stale`/`staleness` own staleness exactly as the float path
+/// does today.
 fn merge_series<F: FloatPoint, H: HistPoint>(
     float: &[F],
     hist: &[H],
 ) -> Result<Vec<Sample>, ReadError> {
     let mut out = Vec::with_capacity(float.len() + hist.len());
     let (mut i, mut j) = (0usize, 0usize);
-    while i < float.len() && j < hist.len() {
-        let (ft, ht) = (float[i].unix_milli(), hist[j].unix_milli());
-        if ft < ht {
-            out.push(Sample::float(ft, float[i].value()));
+    while i < float.len() || j < hist.len() {
+        let t_ms = match (float.get(i), hist.get(j)) {
+            (Some(f), Some(h)) => f.unix_milli().min(h.unix_milli()),
+            (Some(f), None) => f.unix_milli(),
+            (None, Some(h)) => h.unix_milli(),
+            (None, None) => break,
+        };
+        let f_start = i;
+        while i < float.len() && float[i].unix_milli() == t_ms {
             i += 1;
-        } else if ft > ht {
-            out.push(Sample::hist(ht, hist[j].decode()?));
-            j += 1;
-        } else {
-            out.push(Sample::hist(ht, hist[j].decode()?));
-            i += 1;
+        }
+        let h_start = j;
+        while j < hist.len() && hist[j].unix_milli() == t_ms {
             j += 1;
         }
-    }
-    while i < float.len() {
-        out.push(Sample::float(float[i].unix_milli(), float[i].value()));
-        i += 1;
-    }
-    while j < hist.len() {
-        out.push(Sample::hist(hist[j].unix_milli(), hist[j].decode()?));
-        j += 1;
+        emit_timestamp_run(&mut out, t_ms, &float[f_start..i], &hist[h_start..j])?;
     }
     Ok(out)
 }
@@ -2493,10 +2587,11 @@ fn group_rows(
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     for row in rows {
-        let sample = Sample::float(row.unix_milli, row.value);
         match out.last_mut() {
+            // Issue #494 §7: two rows identical in
+            // `(fingerprint, unix_milli, value bits)` are one sample.
             Some(last) if last.fingerprint == row.fingerprint => {
-                last.samples.push(sample);
+                push_float_in_run(&mut last.samples, row.unix_milli, row.value);
             }
             _ => {
                 let labels = labels_by_fp
@@ -2507,7 +2602,7 @@ fn group_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(metric_name.to_string()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![sample],
+                    samples: vec![Sample::float(row.unix_milli, row.value)],
                     start_ts: None,
                 });
             }
@@ -2547,13 +2642,13 @@ fn group_multi_rows(
     // which belongs to an earlier pair).
     let mut current_kept = false;
     for row in rows {
-        let sample = Sample::float(row.unix_milli, row.value);
         let same = current
             .as_ref()
             .is_some_and(|(name, fp)| *name == row.metric_name && *fp == row.fingerprint);
         if same {
+            // Issue #494 §7, as in `group_rows`.
             if current_kept && let Some(last) = out.last_mut() {
-                last.samples.push(sample);
+                push_float_in_run(&mut last.samples, row.unix_milli, row.value);
             }
             continue;
         }
@@ -2568,7 +2663,7 @@ fn group_multi_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(key.0.clone()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![sample],
+                    samples: vec![Sample::float(row.unix_milli, row.value)],
                     start_ts: None,
                 });
                 true
@@ -4022,6 +4117,15 @@ mod tests {
         }
     }
 
+    fn multi_float_row(name: &str, fp: Fingerprint, t: i64, v: f64) -> MultiSampleRow {
+        MultiSampleRow {
+            metric_name: name.to_string(),
+            fingerprint: fp,
+            unix_milli: t,
+            value: v,
+        }
+    }
+
     fn hist_row(fp: Fingerprint, t: i64, h: &NativeHistogram) -> HistSampleRow {
         let c = h.to_columns().expect("to_columns");
         HistSampleRow {
@@ -4103,6 +4207,124 @@ mod tests {
             merged[0].h.as_deref().unwrap().sum.to_bits(),
             STALE_NAN_BITS
         );
+    }
+
+    // -- Issue #494 §7: one answer per `(series, millisecond)` --
+
+    /// `5.0, 7.0, 5.0` at one millisecond is two samples, `5.0` and `7.0`:
+    /// the identity is the value's bits, and the comparison is over the
+    /// whole run rather than the previous row, so the repeat two places
+    /// later is still the repeat.
+    #[test]
+    fn group_rows_keeps_one_sample_per_distinct_value_at_one_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            float_row(fp, 1, 5.0),
+            float_row(fp, 1, 7.0),
+            float_row(fp, 1, 5.0),
+        ];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        assert_eq!(series.len(), 1);
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![5.0, 7.0], "arrival order, one per identity");
+    }
+
+    #[test]
+    fn group_rows_collapses_a_repeat_and_keeps_the_next_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            float_row(fp, 1, 5.0),
+            float_row(fp, 1, 5.0),
+            float_row(fp, 2, 7.0),
+        ];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let got: Vec<(i64, f64)> = series[0].samples.iter().map(|s| (s.t_ms, s.v)).collect();
+        assert_eq!(got, vec![(1, 5.0), (2, 7.0)]);
+    }
+
+    /// Two different values at one millisecond are left exactly as stored —
+    /// the read path does not resolve a contradiction it cannot resolve.
+    #[test]
+    fn group_rows_leaves_two_different_values_at_one_millisecond_alone() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![float_row(fp, 1, 1.0), float_row(fp, 1, 2.0)];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![1.0, 2.0]);
+    }
+
+    /// `0.0` and `-0.0` are equal under `==` and are two samples the client
+    /// sent. An `==`-keyed collapse would drop one of them.
+    #[test]
+    fn group_rows_keeps_negative_zero_beside_zero() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![float_row(fp, 1, -0.0), float_row(fp, 1, 0.0)];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let bits: Vec<u64> = series[0].samples.iter().map(|s| s.v.to_bits()).collect();
+        assert_eq!(bits, vec![0x8000_0000_0000_0000, 0x0000_0000_0000_0000]);
+    }
+
+    #[test]
+    fn group_multi_rows_keeps_one_sample_per_distinct_value_at_one_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            multi_float_row("m", fp, 1, 5.0),
+            multi_float_row("m", fp, 1, 7.0),
+            multi_float_row("m", fp, 1, 5.0),
+        ];
+        let mut by_fp = HashMap::new();
+        by_fp.insert(fp, ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &HashMap::new(), &by_fp);
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![5.0, 7.0]);
+    }
+
+    /// The defect this replaces: the old tie-break consumed ONE float and
+    /// one histogram, and the tail loop then emitted the second float. The
+    /// histogram consumes the WHOLE float run.
+    #[test]
+    fn two_floats_and_one_histogram_at_one_millisecond_leave_the_histogram_alone() {
+        let fp = Fingerprint::from_raw(1);
+        let hist = single_histogram();
+        let float = [float_row(fp, 1, 5.0), float_row(fp, 1, 7.0)];
+        let h = [hist_row(fp, 1, &hist)];
+        let merged = merge_series(&float, &h).unwrap();
+        assert_eq!(merged.len(), 1, "no float survives the histogram");
+        assert!(merged[0].h.as_deref().unwrap().bits_eq(&hist.to_float()));
+    }
+
+    #[test]
+    fn two_bit_identical_histograms_at_one_millisecond_are_one_sample() {
+        let fp = Fingerprint::from_raw(1);
+        let hist = single_histogram();
+        let h = [hist_row(fp, 1, &hist), hist_row(fp, 1, &hist)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn two_differing_histograms_at_one_millisecond_are_two_samples() {
+        let fp = Fingerprint::from_raw(1);
+        let a = single_histogram();
+        let mut b = single_histogram();
+        b.count += 1;
+        let h = [hist_row(fp, 1, &a), hist_row(fp, 1, &b)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 2, "different stored columns are two samples");
+    }
+
+    /// Bits, not a decode: two rows whose `sum` carries a different NaN
+    /// payload decode to histograms a value comparison would call equal.
+    #[test]
+    fn two_histograms_differing_only_in_a_nan_payload_are_two_samples() {
+        let fp = Fingerprint::from_raw(1);
+        let mut a = single_histogram();
+        a.sum = f64::from_bits(0x7ff8_0000_0000_0001);
+        let mut b = single_histogram();
+        b.sum = f64::from_bits(0x7ff8_0000_0000_0002);
+        let h = [hist_row(fp, 1, &a), hist_row(fp, 1, &b)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
