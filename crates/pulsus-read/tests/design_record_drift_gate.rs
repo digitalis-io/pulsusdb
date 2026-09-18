@@ -1681,8 +1681,8 @@ enum ReviewedVerdict {
 // `sql.rs:489` case left the table: no occurrence of that token remains, each
 // now reads `sql.rs:761`, `stage2`'s own line, where the two rules agree. And
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
-// candidate files and recorded with its reasoning below. The counts are in
-// the assertion at the end of this file's fallback test and nowhere else.
+// candidate files and recorded with its reasoning below. For the counts,
+// read the assertion at the end of this file's fallback test.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
@@ -1736,11 +1736,13 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// What this test asserts instead: the divergence set is exactly the one
 /// reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new divergence
 /// cannot appear without a person reading it, and every member's verdict
-/// is the one a person recorded. **The counts live in the assertion at
-/// the end of this function and nowhere else**, because a count written
-/// in prose beside a table goes stale the moment the table moves — which
-/// it did, twice, when two branches each edited the array. Read them
-/// there.
+/// is the one a person recorded. **No count is written in this comment**,
+/// because a count written in prose beside a table goes stale the moment
+/// the table moves — which it did, twice, when two branches each edited
+/// the array. The counts are the assertion at the end of this function,
+/// and they are also the array's own declared length and §12.3's census
+/// of it in `docs/query-lowering.md`; all three are derived from the
+/// array rather than typed beside it.
 #[test]
 fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
     let tracked = tracked_rust_files();

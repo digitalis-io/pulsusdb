@@ -429,11 +429,11 @@ stage before any query runs, in `xtask/src/bench/queries.rs`:
 ```text
   stage          roster                        where
   ------------   ---------------------------   ---------------------------
-  resolution     StageRoster::Full             queries.rs:1211, :1657
-  discovery      StageRoster::Full             queries.rs:1553
-  hydration      StageRoster::Fingerprints     queries.rs:1230, :1676
-  samples        StageRoster::Fingerprints     queries.rs:1269
-  rollup_range   StageRoster::Fingerprints     queries.rs:1719
+  resolution     StageRoster::Full             queries.rs:1214, :1660
+  discovery      StageRoster::Full             queries.rs:1556
+  hydration      StageRoster::Fingerprints     queries.rs:1233, :1679
+  samples        StageRoster::Fingerprints     queries.rs:1272
+  rollup_range   StageRoster::Fingerprints     queries.rs:1722
 ```
 
 A `Full` roster is the whole cluster and is derived from no fingerprint,
