@@ -149,9 +149,12 @@ const CONTROL: &str = "with_binding_control.txt";
 /// The same change puts a `WITH` clause on 45 of those goldens'
 /// hydration statements, which is the first `WITH` in the `traces_search`
 /// corpus. Every one of them is a scalar/array alias
-/// (`arrayFirstIndex(…) AS pi0`), so the parse below still reports ZERO
+/// (`arrayFirstIndex(…) AS pi0`), so the parse still reports ZERO
 /// `WithElement` binding nodes for them — which is what ADR 0008 D2 asks
-/// and what the loop above measures rather than assumes.
+/// and what section 2 of the test below
+/// (`every_committed_statement_binds_no_relational_cte`) measures rather
+/// than assumes. That loop runs before the count assertions in the same
+/// test.
 const SQL_FILES: usize = 126;
 const SQL_STATEMENTS: usize = 396;
 const PROMQL_ENTRIES: usize = 30;

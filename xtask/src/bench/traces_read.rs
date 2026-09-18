@@ -592,8 +592,13 @@ fn now_ns() -> i64 {
 /// `_dist` wrapper carries all five columns with the local tables'
 /// types; what was missing was the data, not the schema.
 ///
-/// The arrays mirror, element for element, the index row the next
-/// statement inserts.
+/// The arrays mirror the index row the next statement inserts, field for
+/// field: `attr_key`/`key`, `attr_scope`/`scope`, `attr_val`/`val`,
+/// `attr_type`/`val_type`, `attr_num`/`val_num`. `val_type` is named
+/// explicitly because it defaults to the empty string when omitted
+/// (migration 39), which is the value the read path treats as
+/// type-unknown — a silent mismatch with the `'int'` the span row
+/// carries.
 async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Result<()> {
     let spread = WINDOW_NS / TRACES as i64;
     exec(
@@ -622,11 +627,12 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Resul
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx_dist \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
                'http.status_code', \
-               if(number % {CHECKOUT_EVERY} = 0, '500', '200'), 'span', \
+               if(number % {CHECKOUT_EVERY} = 0, '500', '200'), 'span', 'int', \
                if(number % {CHECKOUT_EVERY} = 0, 500.0, 200.0), \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
