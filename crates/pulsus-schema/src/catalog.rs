@@ -1935,7 +1935,7 @@ mod tests {
         let tmpl = render::dist_ddl_template("log_patterns", Family::Logs);
         let out = render::render(&tmpl, "log_patterns", &ctx(), false);
         assert!(out.contains("pulsus.log_patterns_dist"));
-        assert!(out.contains("Distributed('', pulsus, log_patterns, fingerprint)"));
+        assert!(out.contains("Distributed('', pulsus, log_patterns, cityHash64(fingerprint))"));
     }
 
     /// Issue #173 (M7-E1) Fix 1: the Zipkin `shared` signal is added to

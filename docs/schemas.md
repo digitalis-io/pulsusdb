@@ -1041,9 +1041,9 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 | Table | Sharding key | Why |
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
-| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in) |
+| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in)  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
 | `trace_spans`, `trace_attrs_idx`, `trace_edges` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
-| `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
+| `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
 Fan-out analysis for the canonical operations:
@@ -1062,7 +1062,7 @@ Every local table gets a Distributed wrapper of this shape (the schema controlle
 
 ```sql
 CREATE TABLE log_samples_dist AS log_samples
-ENGINE = Distributed('{cluster}', pulsus, log_samples, fingerprint);
+ENGINE = Distributed('{cluster}', pulsus, log_samples, cityHash64(fingerprint));
 
 CREATE TABLE metric_samples_dist AS metric_samples
 ENGINE = Distributed('{cluster}', pulsus, metric_samples, cityHash64(metric_name, fingerprint));

@@ -54,7 +54,7 @@ pub struct DatasetSpec {
     /// putting the entire corpus on one shard. `docs/schemas.md §7`'s
     /// documented pattern (also `crates/pulsus-schema/tests/
     /// live_cluster.rs`): insert into `<table>_dist` and let the
-    /// Distributed engine's `fingerprint` sharding key place each row.
+    /// Distributed engine's sharding key place each row.
     pub dist: bool,
 }
 

@@ -611,7 +611,7 @@ fn family_sharding_expr_is_the_single_source_of_truth() {
         Family::Metrics.sharding_expr(),
         "cityHash64(metric_name, fingerprint)"
     );
-    assert_eq!(Family::Logs.sharding_expr(), "fingerprint");
+    assert_eq!(Family::Logs.sharding_expr(), "cityHash64(fingerprint)");
 }
 
 /// Issue #5 fix plan F1: `PULSUS_RETENTION_DAYS` is mutable operational

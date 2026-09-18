@@ -50,10 +50,33 @@ impl Family {
     /// The single source of truth for a family's sharding expression
     /// (docs/schemas.md §7). Every `_dist` wrapper in a family renders this
     /// exact string — never a per-table copy.
+    ///
+    /// **The logs key hashes the column rather than being the column**
+    /// (issue #498). A `Distributed` sharding key must evaluate to an
+    /// integer type ClickHouse accepts, and `UInt128` is not one: with
+    /// `fingerprint` now 128 bits, the bare column creates without
+    /// complaint and then refuses every insert. Measured on ClickHouse
+    /// 26.3.29.7 against a two-shard fixture:
+    ///
+    /// ```text
+    ///   Distributed(..., fingerprint)              CREATE ok
+    ///                                              INSERT Code: 53,
+    ///                                                "Sharding key expression does not
+    ///                                                 evaluate to an integer type"
+    ///                                              SELECT count() = 0
+    ///   Distributed(..., cityHash64(fingerprint))  CREATE ok, INSERT ok,
+    ///                                              SELECT returns the row with the
+    ///                                                128-bit value intact
+    /// ```
+    ///
+    /// The co-sharding property the family needs is unchanged: one
+    /// fingerprint still maps to one shard, and it now maps through both
+    /// 64-bit halves rather than through the low one. `cityHash64` is the
+    /// same function the other two families' keys already use.
     pub const fn sharding_expr(self) -> &'static str {
         match self {
             Family::Metrics => "cityHash64(metric_name, fingerprint)",
-            Family::Logs => "fingerprint",
+            Family::Logs => "cityHash64(fingerprint)",
             Family::Traces => "cityHash64(trace_id)",
         }
     }
@@ -489,7 +512,7 @@ mod tests {
             Family::Metrics.sharding_expr(),
             "cityHash64(metric_name, fingerprint)"
         );
-        assert_eq!(Family::Logs.sharding_expr(), "fingerprint");
+        assert_eq!(Family::Logs.sharding_expr(), "cityHash64(fingerprint)");
         assert_eq!(Family::Traces.sharding_expr(), "cityHash64(trace_id)");
     }
 }
