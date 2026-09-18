@@ -52,7 +52,7 @@ impl ChCandidate {
 #[derive(clickhouse::Row, serde::Serialize)]
 struct ChMetricRow<'a> {
     metric_name: &'a str,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -60,7 +60,7 @@ struct ChMetricRow<'a> {
 #[derive(clickhouse::Row, serde::Serialize)]
 struct ChLogRow<'a> {
     service: &'a str,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: &'a str,
@@ -68,7 +68,7 @@ struct ChLogRow<'a> {
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ChMetricProj {
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -80,7 +80,7 @@ struct ChPartCount {
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ChAggRow {
-    fingerprint: u64,
+    fingerprint: u128,
     val_count: u64,
     first_value: f64,
     last_value: f64,
@@ -143,7 +143,13 @@ impl CrateUnderTest for ChCandidate {
         let mut checksum = 0u64;
         while let Some(row) = cursor.next().await? {
             count += 1;
-            checksum ^= row.fingerprint ^ (row.unix_milli as u64) ^ row.value.to_bits();
+            // The fingerprint is 16 bytes since issue #498; both words
+            // enter the fold, so a transport that dropped either one
+            // would change the checksum.
+            checksum ^= (row.fingerprint as u64)
+                ^ ((row.fingerprint >> 64) as u64)
+                ^ (row.unix_milli as u64)
+                ^ row.value.to_bits();
         }
         Ok((count, checksum))
     }
@@ -199,7 +205,7 @@ impl KlCandidate {
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlMetricRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -207,7 +213,7 @@ struct KlMetricRow {
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlLogRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -215,7 +221,7 @@ struct KlLogRow {
 
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlMetricProj {
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -227,7 +233,7 @@ struct KlPartCount {
 
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlAggRow {
-    fingerprint: u64,
+    fingerprint: u128,
     val_count: u64,
     first_value: f64,
     last_value: f64,
@@ -303,7 +309,13 @@ impl CrateUnderTest for KlCandidate {
         while let Some(row) = stream.next().await {
             let row = row?;
             count += 1;
-            checksum ^= row.fingerprint ^ (row.unix_milli as u64) ^ row.value.to_bits();
+            // The fingerprint is 16 bytes since issue #498; both words
+            // enter the fold, so a transport that dropped either one
+            // would change the checksum.
+            checksum ^= (row.fingerprint as u64)
+                ^ ((row.fingerprint >> 64) as u64)
+                ^ (row.unix_milli as u64)
+                ^ row.value.to_bits();
         }
         Ok((count, checksum))
     }

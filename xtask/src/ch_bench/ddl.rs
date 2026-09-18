@@ -31,7 +31,7 @@ pub fn tier_table_ddl(tier_table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {tier_table} (
             metric_name   LowCardinality(String),
-            fingerprint   UInt64                                 CODEC(Delta(8), ZSTD(1)),
+            fingerprint   UInt128                                 CODEC(Delta(8), ZSTD(1)),
             ts            DateTime                               CODEC(DoubleDelta, ZSTD(1)),
             val_min       SimpleAggregateFunction(min, Float64)  CODEC(Gorilla, ZSTD(1)),
             val_max       SimpleAggregateFunction(max, Float64)  CODEC(Gorilla, ZSTD(1)),
