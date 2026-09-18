@@ -75,10 +75,71 @@ pub struct HydrationRow {
 }
 
 /// One attribute-membership row (`search_sql::membership_sql`).
+///
+/// **No production caller since issue #557** — the attribute condition is
+/// answered by a predicate column on the batch hydration statement, so
+/// that read is no longer issued. It is kept, with
+/// `search_sql::membership_sql` and `SearchPlan::membership_sql_for`, as
+/// the reproduction path for the frozen issue #492 lowering evidence:
+/// `docs/benchmarks/data/traces-lowering-92.json` carries a `membership`
+/// stage row and `xtask/src/bench/traces_lowering.rs` is what rebuilds
+/// it, so deleting any of the three makes that artefact unrebuildable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MembershipRow {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
+}
+
+/// [`HydrationRow`] plus the per-condition probe results (issue #557).
+///
+/// Positional: `attr_probe` is LAST and index-aligned with
+/// `SearchPlan::probes`. The element is `1` when the span's located
+/// element satisfies that condition's positive value test.
+///
+/// The twelve-column prefix is duplicated from [`HydrationRow`] — the
+/// `Row` derive cannot express a shared prefix — and the duplication is
+/// pinned by `tests/traces_search_sql.rs` rather than by a type.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct HydrationProbeRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub service: String,
+    pub name: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+    pub status_code: i8,
+    pub status_message: String,
+    pub kind: i8,
+    pub scope_name: String,
+    pub scope_version: String,
+    pub attr_probe: Vec<u8>,
+}
+
+/// [`HydrationProbeRow`] plus the fused matched value and its stored
+/// kind, both indexed BY PROBE (issue #557, carrying issue #479's fused
+/// value onto the span row).
+///
+/// A probe no projection reads a value from carries the literal `''` in
+/// both arrays, so the three arrays share one index space and there is no
+/// second mapping to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct HydrationProbeValueRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub service: String,
+    pub name: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+    pub status_code: i8,
+    pub status_message: String,
+    pub kind: i8,
+    pub scope_name: String,
+    pub scope_version: String,
+    pub attr_probe: Vec<u8>,
+    pub attr_probe_val: Vec<String>,
+    pub attr_probe_type: Vec<String>,
 }
 
 /// One numeric attribute value row (`search_sql::attr_values_sql` with

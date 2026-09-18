@@ -3,8 +3,9 @@
 //! Deterministic, no I/O: classifies every leaf via
 //! [`super::filter::compile_span_filter`], renders the per-generator
 //! Phase-1 candidate SQL (deduped, order-preserving), registers the
-//! distinct attribute membership probes / aggregate / `select()` value
-//! reads Phase 2 needs, and validates the pipeline stages — every
+//! distinct attribute probes (each a predicate column on the batch
+//! hydration statement since issue #557) and the aggregate / `select()`
+//! value reads Phase 2 needs, and validates the pipeline stages — every
 //! rejection here is a caller error ([`PlanError`] → `400 bad_data`).
 
 use pulsus_traceql::{
@@ -23,7 +24,7 @@ use super::filter::{
     SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_eval::StoredType;
-use super::search_sql;
+use super::search_sql::{self, ProbeColumn};
 use crate::compile::fold::{Fidelity, LowerCx, Pred, RequestBounds, lower_chain};
 use crate::compile::plan::{PlanConfig, PlanCx, PlanShape, QueryPlan, SourceRef, plan_of};
 
@@ -153,7 +154,9 @@ pub(crate) enum ProjectionValue {
         text: String,
         literal_type: StoredType,
     },
-    /// The value fused into `probes[probe_idx]`'s membership read.
+    /// The value fused into `probes[probe_idx]`'s predicate column —
+    /// the element the condition matched (issue #479, moved onto the
+    /// span row by issue #557).
     ProbeValue {
         probe_idx: usize,
     },
@@ -367,6 +370,11 @@ pub(crate) enum PlannedLeafEval {
     Physical(PhysicalEval),
     /// Membership in `probes[probe_idx]`'s batch result set; `negated`
     /// applies the ratified `!=`/`!~` absent-key rule.
+    ///
+    /// Issue #557 changed where the set comes from and nothing else: it
+    /// is filled from the hydration statement's predicate column for
+    /// that probe. The planned leaf still indexes
+    /// `BatchAttrs.membership`.
     Attr {
         probe_idx: usize,
         negated: bool,
@@ -650,21 +658,29 @@ pub struct SearchPlan {
     /// (`span:childCount`, issue #184) — gates the per-batch trace-wide
     /// `child_count_sql` read.
     pub(crate) child_count: bool,
-    /// Distinct attribute membership probes (batch reads).
+    /// Distinct attribute probes. Each is ONE PREDICATE COLUMN on the
+    /// batch hydration statement (issue #557), not a read of its own.
     pub(crate) probes: Vec<AttrProbe>,
     /// Each probe's pre-escaped positive predicate, index-aligned with
     /// [`Self::probes`] and rendered AT PLAN TIME (issue #282). Rendering
     /// is what validates a probe's regex, so it has to happen where a
-    /// rejection is still a `400`; caching the result keeps
-    /// [`Self::membership_sql_for`] — a per-batch, mid-execution call —
-    /// infallible.
+    /// rejection is still a `400`; caching the result keeps the
+    /// per-batch, mid-execution callers infallible. Read by
+    /// [`generator_exactness`], which compares it with the generator's
+    /// fragment byte for byte, and by [`Self::membership_sql_for`],
+    /// which has no production caller since issue #557.
     pub(crate) probe_predicates: Vec<String>,
-    /// Whether each probe's membership read must also FUSE the matched
-    /// `val` into its projection (issue #479), index-aligned with
-    /// [`Self::probes`]. `false` for every probe no projection needs a
-    /// value from — and for `ValuePred::StringEq`/`ValuePred::BoolEq`,
-    /// whose value is the query's own literal — so the read shape is
-    /// unchanged for those.
+    /// Each probe's span-row predicate column (issue #557), index-aligned
+    /// with [`Self::probes`] and rendered AT PLAN TIME for the same reason
+    /// [`Self::probe_predicates`] is: rendering a regex is what validates
+    /// it, so it has to happen where a rejection is still a `400`.
+    pub(crate) probe_columns: Vec<ProbeColumn>,
+    /// Whether each probe's predicate column must also carry the matched
+    /// `val` and its stored kind (issue #479, moved onto the hydration
+    /// statement by issue #557), index-aligned with [`Self::probes`].
+    /// `false` for every probe no projection needs a value from — and for
+    /// `ValuePred::StringEq`/`ValuePred::BoolEq`, whose value is the
+    /// query's own literal — so those read no value array at all.
     pub(crate) probe_values: Vec<bool>,
     /// The matched-span projection groups (issue #479), in
     /// first-appearance order: filter order, leaf pre-order, then
@@ -712,8 +728,10 @@ pub struct SearchPlan {
     pub(crate) by_probe_sql: Option<String>,
     /// The compiled chain (issue #492 part 3), in the order the executor
     /// issues its statements. `exec::batch_attrs` walks this instead of
-    /// six hand-written index loops, so the per-batch reads and the
-    /// `BatchAttrs` vectors they fill cannot drift out of alignment.
+    /// six hand-written index loops, so the per-batch links and the
+    /// `BatchAttrs` vectors they fill cannot drift out of alignment —
+    /// including `Membership`, which since issue #557 issues no statement
+    /// and whose set the hydration read already filled.
     pub(crate) chain: Vec<TqlLink>,
     /// Each chain link's own name, in chain order — what
     /// `QueryPlan::shape` renders for the explain surface.
@@ -883,8 +901,17 @@ impl SearchPlan {
         self.aggregates.iter().map(|a| a.threshold).collect()
     }
 
-    /// One membership read's SQL for a candidate batch (exposed for the
-    /// golden suite; `exec` drives the same builder).
+    /// One membership read's SQL for a candidate batch.
+    ///
+    /// **No production caller since issue #557** — the attribute
+    /// condition is a predicate column on the hydration statement. Kept,
+    /// with `search_sql::membership_sql` and
+    /// `super::rows::MembershipRow`, as the reproduction path for the
+    /// frozen issue #492 lowering evidence: `xtask` renders this
+    /// statement to rebuild
+    /// `docs/benchmarks/data/traces-lowering-92.json`'s `membership`
+    /// stage row, and deleting any of the three makes that artefact
+    /// unrebuildable.
     pub fn membership_sql_for(&self, probe_idx: usize, trace_ids: &[[u8; 16]]) -> String {
         search_sql::membership_sql(
             &self.attrs_table,
@@ -895,42 +922,12 @@ impl SearchPlan {
         )
     }
 
-    /// Whether probe `probe_idx`'s membership read fuses the matched value
-    /// (issue #479) — exposed for the explain/pushdown gates, which render
-    /// the same probe both ways and compare granule counts.
+    /// Whether probe `probe_idx`'s predicate column also carries the
+    /// matched value (issue #479, moved onto the span row by issue #557)
+    /// — exposed for the explain gates and read by the executor to decide
+    /// which container each probe's memberships go into.
     pub fn probe_fuses_value(&self, probe_idx: usize) -> bool {
         self.probe_values[probe_idx]
-    }
-
-    /// The same membership read with the fused-value projection forced
-    /// off (issue #479) — the control side of the granule-neutrality and
-    /// no-added-statement gates.
-    pub fn membership_sql_without_value_for(
-        &self,
-        probe_idx: usize,
-        trace_ids: &[[u8; 16]],
-    ) -> String {
-        search_sql::membership_sql(
-            &self.attrs_table,
-            &self.probe_predicates[probe_idx],
-            trace_ids,
-            self.window,
-            false,
-        )
-    }
-
-    /// The SAME plan with the fused-value projection forced OFF on every
-    /// probe (issue #479) — the control side of the no-added-statement and
-    /// granule-neutrality gates.
-    ///
-    /// It is the same query, the same corpus, the same window and the same
-    /// evaluation: only the projection is removed, so a difference between
-    /// the two runs is attributable to the projection and to nothing else.
-    /// Nothing production calls it.
-    pub fn without_fused_probe_values(&self) -> SearchPlan {
-        let mut clone = self.clone();
-        clone.probe_values = vec![false; clone.probes.len()];
-        clone
     }
 
     /// The number of projection groups whose target is an `attributes`
@@ -942,13 +939,50 @@ impl SearchPlan {
             .count()
     }
 
-    /// The batch hydration SQL (exposed for the golden suite).
+    /// Which of the three hydration row shapes this plan decodes
+    /// (issue #557) — the ONE producer of a [`HydrationShape`]. The SQL
+    /// renderer takes the value as a parameter and the executor's decoder
+    /// calls this same method on this same plan, so the statement and the
+    /// row type cannot disagree about what is projected.
+    pub fn hydration_shape(&self) -> HydrationShape {
+        if self.probe_columns.is_empty() {
+            HydrationShape::Plain
+        } else if self.probe_columns.iter().any(|p| p.value.is_some()) {
+            HydrationShape::ProbesAndValues
+        } else {
+            HydrationShape::Probes
+        }
+    }
+
+    /// The batch hydration SQL (exposed for the golden suite), carrying
+    /// one predicate column per attribute condition (issue #557).
     pub fn hydration_sql_for(&self, trace_ids: &[[u8; 16]]) -> String {
         search_sql::hydration_sql(
             &self.spans_table,
             trace_ids,
             self.window,
             super::exec::MAX_SPANS_PER_TRACE,
+            self.hydration_shape(),
+            &self.probe_columns,
+        )
+    }
+
+    /// The SAME statement with every probe column removed (issue #557) —
+    /// the control side of the granule-neutrality gate, and the render
+    /// every query with no attribute condition sends.
+    ///
+    /// It is the same query, the same corpus, the same window and the same
+    /// `WHERE` clause: only the projection is removed, so a difference
+    /// between the two runs is attributable to the projection and to
+    /// nothing else. Nothing production calls it.
+    pub fn hydration_sql_without_probes_for(&self, trace_ids: &[[u8; 16]]) -> String {
+        search_sql::hydration_sql(
+            &self.spans_table,
+            trace_ids,
+            self.window,
+            super::exec::MAX_SPANS_PER_TRACE,
+            HydrationShape::Plain,
+            &[],
         )
     }
 
@@ -1081,6 +1115,188 @@ fn membership_predicate(probe: &AttrProbe) -> Result<String, PlanError> {
         parts.push(format!("scope = {}", escape::ch_string(scope)));
     }
     Ok(parts.join(" AND "))
+}
+
+/// Which of the three hydration row shapes a plan decodes (issue #557) —
+/// read by the SQL renderer AND by the executor's decoder, so a
+/// positional mismatch is not expressible.
+///
+/// [`SearchPlan::hydration_shape`] is its only producer: the renderer
+/// takes the value as a parameter and never derives one, and the decoder
+/// calls the same method on the same plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationShape {
+    /// No attribute condition: the pre-#557 statement and row.
+    Plain,
+    /// One `Array(UInt8)` column, `attr_probe`.
+    Probes,
+    /// `attr_probe` plus `attr_probe_val` and `attr_probe_type`, both
+    /// `Array(String)` and both indexed BY PROBE, carrying the literal
+    /// `''` for a probe no projection needs a value from — so no probe's
+    /// column is read for a probe that does not need it, and no second
+    /// index mapping exists to get wrong.
+    ProbesAndValues,
+}
+
+/// The span row's own attribute arrays, subscripted at one located
+/// element (issue #557).
+///
+/// `null_is_false` is `true` here and nowhere else: this fragment is a
+/// PROJECTED column, and an unwrapped `NULL` numeric comparison makes it
+/// `Nullable(UInt8)`, which does not decode into `Vec<u8>`.
+fn span_row_cols<'a>(text: &'a str, num: &'a str) -> filter::ValueCols<'a> {
+    filter::ValueCols {
+        text,
+        num,
+        null_is_false: true,
+    }
+}
+
+/// The lambda parameter names [`search_sql::locate_matching_item`]
+/// binds (issue #557). Inside `arrayFirstIndex` a `NULL` lambda result is
+/// false and the function still returns `UInt32`, so no `ifNull` wrapper
+/// belongs there.
+const LAMBDA_COLS: filter::ValueCols<'static> = filter::ValueCols {
+    text: "v",
+    num: "n",
+    null_is_false: false,
+};
+
+/// The unscoped chain's per-scope alias suffixes, index-aligned with
+/// [`filter::UNSCOPED_SCOPE_CHAIN`] (issue #557).
+const UNSCOPED_ALIAS_SUFFIX: [&str; 5] = ["s", "r", "e", "l", "i"];
+
+/// Assembles one attribute condition's span-row predicate column
+/// (issue #557).
+///
+/// **The SHAPE primitives live in `search_sql`; the assembly lives here**,
+/// because rendering a regex is what validates it and a rejection must
+/// stay a `400`. `search_sql` has never been fallible and does not become
+/// so.
+///
+/// Three forms, and the difference is the scope's ARITY:
+///
+/// * a single-valued scope (`span`, `resource`, `instrumentation`) locates
+///   the one element the attribute resolves to and applies the value test
+///   to THAT element;
+/// * a multi-valued scope (`event`, `link`, and their reserved intrinsic
+///   discriminators) locates the first element that MATCHES, which keeps
+///   the any-element rule the tree already applies there and makes the
+///   same alias serve the fused value;
+/// * the unscoped form walks the five attribute scopes in precedence
+///   order and applies each scope's own rule, resolving to the first
+///   scope PRESENT.
+fn probe_column(probe: &AttrProbe, idx: usize) -> Result<ProbeColumn, PlanError> {
+    let key_lit = escape::ch_string(&probe.key);
+    match probe.scope {
+        Some(scope) => {
+            let scope_lit = escape::ch_string(scope);
+            match filter::scope_arity(scope) {
+                filter::ScopeArity::Single => {
+                    let alias = format!("pi{idx}");
+                    let (text, num) = (format!("attr_val[{alias}]"), format!("attr_num[{alias}]"));
+                    let frag = filter::value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?;
+                    let test = if probe.pred.matches_any_value() {
+                        // Key existence IS `<alias> != 0`; rendering
+                        // `AND 1` beside it says the same thing twice.
+                        search_sql::probe_test(&alias, None)
+                    } else {
+                        search_sql::probe_test(&alias, Some(&frag))
+                    };
+                    Ok(ProbeColumn {
+                        with_items: vec![search_sql::locate_item(&alias, &key_lit, &scope_lit)],
+                        test,
+                        value: Some(search_sql::probe_value_exprs(&alias)),
+                    })
+                }
+                filter::ScopeArity::Multi => {
+                    let alias = format!("pm{idx}");
+                    let item = if probe.pred.matches_any_value() {
+                        // "Some element carries this key" is what the
+                        // two-array locate already answers, so the
+                        // matching form would read a third array to
+                        // decide something it has already decided.
+                        search_sql::locate_item(&alias, &key_lit, &scope_lit)
+                    } else {
+                        let frag = filter::value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
+                        search_sql::locate_matching_item(
+                            &alias,
+                            &key_lit,
+                            &scope_lit,
+                            &frag,
+                            probe.pred.reads_numeric_column(),
+                        )
+                    };
+                    Ok(ProbeColumn {
+                        with_items: vec![item],
+                        test: search_sql::probe_test(&alias, None),
+                        value: Some(search_sql::probe_value_exprs(&alias)),
+                    })
+                }
+            }
+        }
+        None => {
+            let mut presence = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut matching = Vec::new();
+            let mut test_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut value_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut kind_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            for (scope, suffix) in filter::UNSCOPED_SCOPE_CHAIN
+                .iter()
+                .zip(UNSCOPED_ALIAS_SUFFIX)
+            {
+                let scope_lit = escape::ch_string(scope);
+                let present = format!("pi{idx}{suffix}");
+                presence.push(search_sql::locate_item(&present, &key_lit, &scope_lit));
+                // The element the fused value and the stored kind are
+                // read at — the same one the arm's test resolved to.
+                let at = match filter::scope_arity(scope) {
+                    filter::ScopeArity::Single => {
+                        let (text, num) = (
+                            format!("attr_val[{present}]"),
+                            format!("attr_num[{present}]"),
+                        );
+                        test_arms.push((
+                            format!("{present} != 0"),
+                            filter::value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?,
+                        ));
+                        present.clone()
+                    }
+                    filter::ScopeArity::Multi if probe.pred.matches_any_value() => {
+                        // Present at this scope means matched, so the arm
+                        // is the constant the value test renders to.
+                        test_arms.push((format!("{present} != 0"), "1".to_string()));
+                        present.clone()
+                    }
+                    filter::ScopeArity::Multi => {
+                        let matched = format!("pm{idx}{suffix}");
+                        let frag = filter::value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
+                        matching.push(search_sql::locate_matching_item(
+                            &matched,
+                            &key_lit,
+                            &scope_lit,
+                            &frag,
+                            probe.pred.reads_numeric_column(),
+                        ));
+                        test_arms.push((format!("{present} != 0"), format!("{matched} != 0")));
+                        matched
+                    }
+                };
+                let (value, kind) = search_sql::probe_value_exprs(&at);
+                value_arms.push((format!("{present} != 0"), value));
+                kind_arms.push((format!("{present} != 0"), kind));
+            }
+            presence.append(&mut matching);
+            Ok(ProbeColumn {
+                with_items: presence,
+                test: search_sql::probe_chain(&test_arms, "0"),
+                value: Some((
+                    search_sql::probe_chain(&value_arms, "''"),
+                    search_sql::probe_chain(&kind_arms, "''"),
+                )),
+            })
+        }
+    }
 }
 
 use eval_compile::planned_str_op;
@@ -1246,10 +1462,15 @@ fn intern_probe(
     probe: &AttrProbe,
     probes: &mut Vec<AttrProbe>,
     predicates: &mut Vec<String>,
+    columns: &mut Vec<ProbeColumn>,
 ) -> Result<usize, PlanError> {
     let idx = intern(probes, probe);
     if predicates.len() < probes.len() {
         predicates.push(membership_predicate(probe)?);
+        // Issue #557: the span-row form of the SAME probe, rendered at
+        // the same moment and through the same checked escaper, so a
+        // pattern either both forms carry or neither does.
+        columns.push(probe_column(probe, idx)?);
     }
     Ok(idx)
 }
@@ -1623,6 +1844,7 @@ struct PlannedPipeline {
 struct PipelineSinks<'a> {
     probes: &'a mut Vec<AttrProbe>,
     probe_predicates: &'a mut Vec<String>,
+    probe_columns: &'a mut Vec<ProbeColumn>,
     agg_fields: &'a mut Vec<AttrFieldRef>,
     select_attrs: &'a mut Vec<AttrFieldRef>,
     event_sets: &'a mut Vec<EventSetField>,
@@ -1639,6 +1861,7 @@ impl PipelineSinks<'_> {
         LeafPlanSink {
             probes: self.probes,
             probe_predicates: self.probe_predicates,
+            probe_columns: self.probe_columns,
             agg_fields: self.agg_fields,
             select_attrs: self.select_attrs,
             event_sets: self.event_sets,
@@ -2102,6 +2325,10 @@ fn plan_group_key(
 struct LeafPlanSink<'a> {
     probes: &'a mut Vec<AttrProbe>,
     probe_predicates: &'a mut Vec<String>,
+    /// Each probe's span-row predicate column (issue #557), interned
+    /// beside its index-form predicate so the two cannot disagree about
+    /// how many probes there are.
+    probe_columns: &'a mut Vec<ProbeColumn>,
     agg_fields: &'a mut Vec<AttrFieldRef>,
     select_attrs: &'a mut Vec<AttrFieldRef>,
     /// The distinct event/link SET reads (issue #351).
@@ -2121,7 +2348,12 @@ fn plan_leaf_eval(
     Ok(match eval {
         LeafEval::Physical(p) => PlannedLeafEval::Physical(plan_physical(p)?),
         LeafEval::Attr { probe, negated } => PlannedLeafEval::Attr {
-            probe_idx: intern_probe(probe, sink.probes, sink.probe_predicates)?,
+            probe_idx: intern_probe(
+                probe,
+                sink.probes,
+                sink.probe_predicates,
+                sink.probe_columns,
+            )?,
             negated: *negated,
         },
         LeafEval::NestedSet { field, op, value } => {
@@ -2325,8 +2557,11 @@ fn projection_value(
             // exhaustive over `PhysicalEval`.
             PhysicalEval::Duration { .. } | PhysicalEval::SpanIdHex { .. } => None,
         },
-        // Wave 2: a negated attribute leaf (`!=`/`!~`) knows only that the
-        // span is NOT in the probe's set, so it has no value to project.
+        // A negated attribute leaf (`!=`/`!~`) knows only that the span
+        // is NOT in the probe's set — since issue #557 that is the set
+        // the hydration column filled — so it has no value to project.
+        // A false bit supplies no value either way: the decoder inserts
+        // nothing for a span whose `attr_probe[i]` is 0.
         PlannedLeafEval::Attr { negated: true, .. } => None,
         PlannedLeafEval::Attr {
             probe_idx,
@@ -2561,7 +2796,7 @@ pub enum NotExact {
     /// `trace_attrs_idx` read (a `TimeRange` fallback reads every span in
     /// the window).
     GeneratorIsNotASingleAttrIndexRead,
-    /// The generator's `WHERE` fragment and the membership read's
+    /// The generator's `WHERE` fragment and the probe's index-form
     /// predicate are not the same bytes.
     PredicatesDiffer,
     /// Not exactly one generator, or the one generator is not the
@@ -2600,7 +2835,7 @@ pub enum NotExact {
 /// ```
 ///
 /// **The attribute-index family** ([`attr_generator_exactness`]) needs
-/// the membership read's predicate ([`membership_predicate`]) and the
+/// the probe's index-form predicate ([`membership_predicate`]) and the
 /// generator's (`filter::attr_generator_predicate`) — two functions with
 /// the same body in two modules — to have produced the same bytes.
 ///
@@ -2659,7 +2894,8 @@ pub(crate) fn generator_exactness(
 }
 
 /// The attribute-index exact family: one bare `trace_attrs_idx` read
-/// whose `WHERE` fragment is byte-identical to the membership read's.
+/// whose `WHERE` fragment is byte-identical to the probe's index-form
+/// predicate.
 fn attr_generator_exactness(
     probe_idx: usize,
     probes: &[AttrProbe],
@@ -2794,6 +3030,9 @@ pub fn plan_search(
 
     let mut probes: Vec<AttrProbe> = Vec::new();
     let mut probe_predicates: Vec<String> = Vec::new();
+    // Issue #557: each probe's span-row predicate column, interned in
+    // lockstep with the probe itself.
+    let mut probe_columns: Vec<ProbeColumn> = Vec::new();
     let mut filters = Vec::new();
     // Issue #492 item 9: the SELECTOR's generator sets, accumulated
     // unrendered. Rendering moved below the pipeline, because a
@@ -2823,6 +3062,7 @@ pub fn plan_search(
             let mut sink = LeafPlanSink {
                 probes: &mut probes,
                 probe_predicates: &mut probe_predicates,
+                probe_columns: &mut probe_columns,
                 agg_fields: &mut agg_fields,
                 select_attrs: &mut select_attrs,
                 event_sets: &mut event_sets,
@@ -2856,6 +3096,7 @@ pub fn plan_search(
         let mut sinks = PipelineSinks {
             probes: &mut probes,
             probe_predicates: &mut probe_predicates,
+            probe_columns: &mut probe_columns,
             agg_fields: &mut agg_fields,
             select_attrs: &mut select_attrs,
             event_sets: &mut event_sets,
@@ -2949,6 +3190,18 @@ pub fn plan_search(
                 value: select.value.clone(),
             },
         );
+    }
+
+    // Issue #557: a probe no projection reads a value from carries no
+    // value expression, so `HydrationShape::ProbesAndValues` is issued
+    // only for a plan that has one. `probe_values` is what decides, and
+    // it is not settled until the projection groups above are built —
+    // which is why the columns are interned with their value expressions
+    // and the unused ones are dropped here rather than rebuilt.
+    for (column, fuses) in probe_columns.iter_mut().zip(probe_values.iter()) {
+        if !fuses {
+            column.value = None;
+        }
     }
 
     // A trailing `with(most_recent=true)` search hint (issue #185): keeps
@@ -3116,6 +3369,7 @@ pub fn plan_search(
         child_count,
         probes,
         probe_predicates,
+        probe_columns,
         probe_values,
         projections,
         agg_fields,
@@ -4197,7 +4451,8 @@ mod tests {
 
     /// Issue #479 — the fused-value flag is set for exactly the probe
     /// classes whose matched value is not already the query's own
-    /// literal, and the SQL follows it.
+    /// literal, and the SQL follows it. Issue #557 reads the SQL off the
+    /// HYDRATION statement, which is where the value now rides.
     #[test]
     fn only_a_non_equality_probe_fuses_its_value() {
         for (q, want) in [
@@ -4210,18 +4465,32 @@ mod tests {
             let p = plan(q);
             assert_eq!(p.probes.len(), 1, "{q}");
             assert_eq!(p.probe_fuses_value(0), want, "{q}");
-            let sql = p.membership_sql_for(0, &[[0u8; 16]]);
-            assert_eq!(sql.contains(" AS v"), want, "{q}:\n{sql}");
-            // A probe that fuses nothing renders the SAME statement it
-            // rendered before this issue — the zero-read-cost claim for
+            assert_eq!(
+                p.hydration_shape(),
+                if want {
+                    HydrationShape::ProbesAndValues
+                } else {
+                    HydrationShape::Probes
+                },
+                "{q}"
+            );
+            let sql = p.hydration_sql_for(&[[0u8; 16]]);
+            assert_eq!(sql.contains("AS attr_probe_val"), want, "{q}:\n{sql}");
+            // Every one of the five carries its predicate column, so the
+            // value assertion above is not a statement about a statement
+            // with no probe at all. The alias is matched with the
+            // delimiter that follows it, because `attr_probe` is a prefix
+            // of `attr_probe_val`.
+            assert!(
+                sql.contains("] AS attr_probe,\n") || sql.contains("] AS attr_probe\n"),
+                "{q}:\n{sql}"
+            );
+            // A probe that fuses nothing costs the pre-#557 statement
+            // plus ONE `UInt8` element — the zero-value-read claim for
             // the string-equality class is an SQL IDENTITY, not a granule
             // measurement.
             if !want {
-                assert_eq!(
-                    sql,
-                    p.membership_sql_without_value_for(0, &[[0u8; 16]]),
-                    "{q}"
-                );
+                assert!(!sql.contains("attr_probe_type"), "{q}:\n{sql}");
             }
         }
     }

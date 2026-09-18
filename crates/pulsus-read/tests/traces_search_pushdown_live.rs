@@ -279,9 +279,45 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
         let values: Vec<String> = chunk
             .iter()
             .map(|r| {
+                // Issue #557: the SAME attributes the index rows below
+                // carry, on the span's own arrays. The phase-2 attribute
+                // condition is a predicate column over `attr_key` /
+                // `attr_scope` / `attr_val`, so a span whose arrays are
+                // empty is generated as a candidate and then matches
+                // nothing. The writer derives both from one list, and so
+                // does this seed.
+                let mut keys: Vec<&str> = Vec::new();
+                let mut scopes: Vec<&str> = Vec::new();
+                let mut vals: Vec<&str> = Vec::new();
+                if r.method_attr {
+                    keys.push("'http.method'");
+                    scopes.push("'span'");
+                    vals.push("'GET'");
+                }
+                if r.k_attr {
+                    keys.push("'k'");
+                    scopes.push("'resource'");
+                    vals.push("'v'");
+                }
+                let arr = |items: &[&str]| -> String {
+                    if items.is_empty() {
+                        "[]::Array(String)".to_string()
+                    } else {
+                        format!("[{}]", items.join(", "))
+                    }
+                };
+                let types = arr(&vec!["'string'"; keys.len()]);
+                let nums = if keys.is_empty() {
+                    "[]::Array(Nullable(Float64))".to_string()
+                } else {
+                    format!(
+                        "[{}]::Array(Nullable(Float64))",
+                        vec!["NULL"; keys.len()].join(", ")
+                    )
+                };
                 format!(
                     "(unhex('{}'), unhex('{}'), unhex('0000000000000000'), 'op', 'svc', {}, {}, \
-                     0, 1, 1, '')",
+                     0, 1, 1, '', {}, {}, {}, {}, {})",
                     hex32(&trace_id(r.trace)),
                     span_id(r.trace, r.span)
                         .iter()
@@ -289,6 +325,11 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
                         .collect::<String>(),
                     r.ts_ns,
                     r.duration_ns,
+                    arr(&keys),
+                    arr(&scopes),
+                    arr(&vals),
+                    types,
+                    nums,
                 )
             })
             .collect();
@@ -296,7 +337,8 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
             client,
             &format!(
                 "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
-                 timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+                 timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
+                 attr_key, attr_scope, attr_val, attr_type, attr_num) VALUES {}",
                 values.join(", ")
             ),
         )
@@ -1051,13 +1093,16 @@ async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
-             timestamp_ns, duration_ns, status_code, kind, payload_type, payload) SELECT \
+             timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
+             attr_key, attr_scope, attr_val, attr_type, attr_num) SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), \
                'op', 'svc', \
                {base_ns} + toInt64(number) * {M1_STEP_NS}, \
-               1500000000, 0, 1, 1, '' \
+               1500000000, 0, 1, 1, '', \
+               ['http.method'], ['span'], ['GET'], ['string'], \
+               [NULL]::Array(Nullable(Float64)) \
              FROM numbers({}, {M1_SPANS})",
             M1_ROWS - M1_SPANS
         ),
@@ -1611,9 +1656,13 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
+        // Issue #557: every span carries `http.method = GET` in its own
+        // arrays as well as in the index row below — the condition is a
+        // predicate column over those arrays.
         spans.push(format!(
             "(unhex('{tid}'), unhex('{sid}'), unhex('0000000000000000'), '{}', '{}', {ts}, {}, \
-             0, 1, 1, '')",
+             0, 1, 1, '', ['http.method'], ['span'], ['GET'], ['string'], \
+             [NULL]::Array(Nullable(Float64)))",
             r.name, r.service, r.duration_ns
         ));
         attrs.push(format!(
@@ -1628,8 +1677,8 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
                 client,
                 &format!(
                     "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
-                     timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES \
-                     {}",
+                     timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
+                     attr_key, attr_scope, attr_val, attr_type, attr_num) VALUES {}",
                     chunk.join(", ")
                 ),
             )
@@ -1888,11 +1937,14 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
         &client,
         &format!(
             "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
-             timestamp_ns, duration_ns, status_code, kind, payload_type, payload) SELECT \
+             timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
+             attr_key, attr_scope, attr_val, attr_type, attr_num) SELECT \
                toFixedString(unhex('{tid}'), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), 'op', 'svc', \
-               {base} + toInt64(number) * 1000, 1000000000, 0, 1, 1, '' \
+               {base} + toInt64(number) * 1000, 1000000000, 0, 1, 1, '', \
+               ['http.method'], ['span'], ['GET'], ['string'], \
+               [NULL]::Array(Nullable(Float64)) \
              FROM numbers({CAP_SPANS})",
             tid = hex32(&trace_id(1)),
         ),

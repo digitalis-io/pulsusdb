@@ -1049,8 +1049,13 @@ pub const MIGRATIONS: &[Migration] = &[
     // 25/26, 31/32, 35/36 and 37/38 — the frozen CREATE of id 16 is never
     // mutated, and rows written before these migrations read back five
     // EMPTY arrays, which satisfies id 59's alignment constraint
-    // (`0 = 0 = 0 = 0 = 0`). Nothing READS the arrays in this change; the
-    // index is still written and still answers every query.
+    // (`0 = 0 = 0 = 0 = 0`). Issue #557 made the phase-2 attribute
+    // CONDITION read these arrays: the batch hydration statement carries
+    // one predicate column per condition, `arrayFirstIndex` over
+    // `(attr_key, attr_scope)` and then the value test applied to the
+    // element it lands on. The index is still written, still generates
+    // the phase-1 candidates, and still answers the `select()` and
+    // aggregate value reads.
     //
     // Five separate statements rather than one five-column ALTER (id 37
     // shows one ALTER may add two columns): the cost is five checksum rows

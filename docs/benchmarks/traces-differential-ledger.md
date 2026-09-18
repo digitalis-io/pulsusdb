@@ -287,11 +287,50 @@ re-decide from the evidence rather than re-derive it.
   all three, because in each of them SOME event matches. Two independent
   confirmations of the same divergence, in opposite directions.
 
-  **One edge the reference and PulsusDB already agree on:** its `!=`
-  also returns spans with NO events at all (measured — the link-only
-  spans in the same fixture come back), which is the empty-set rule we
-  implement. So the disagreement is confined to spans that HAVE events
-  and where the matching one is not the first.
+  **One edge the reference and PulsusDB already agree on, and the scope of
+  that reading:** its `!=` also returns spans with NO events at all
+  (measured — the link-only spans in the same fixture come back), which is
+  the empty-set rule we implement. **That was measured for the
+  FIELD-VS-FIELD form only** (`{ .a != event:name }`). For the
+  attribute-versus-literal form the reference does NOT return the
+  no-events span — see the two rows below — so this sentence must not be
+  read wider than the form it was taken on. Within the field-vs-field
+  form the disagreement is confined to spans that HAVE events and where
+  the matching one is not the first.
+
+- **Two readings recorded by issue #557, which are measurements and not
+  changes.** The attribute-versus-literal negation over an event
+  collection differs from the reference in two directions at once, and
+  for two different reasons. Our answers are frozen live by
+  `an_event_or_link_condition_matches_any_element_in_both_directions`
+  (`crates/pulsus-server/tests/traces_search_live.rs`); the reference
+  column is the round-1 and round-2 reviews' runs against the pinned
+  container. The fixture is three spans: one whose three events carry
+  `code = c1 / c2 / c3`, one whose three events are named `evX / evY /
+  evZ` and carry no `code`, and one with no events at all.
+
+  | query | PulsusDB | the reference | why they differ |
+  |---|---|---|---|
+  | `{ event.code = "c1" }`, `= "c2"`, `= "c3"` | the three-event span each time | the same | agree |
+  | `{ event.code != "c3" }` | the evX/evY/evZ span and the no-`code` span | the c1/c2/c3 span | ALL-match against any-differs |
+  | `{ event.code != "zz" }` | all three spans | the c1/c2/c3 span | our absent-key rule (`2026-07-16-negation-matches-missing-key`), reaching the event scope |
+
+  **Both rows are pending the issue
+  [#558](https://github.com/digitalis-io/pulsusdb/issues/558) ruling**, and
+  say so in the assertion's own message. #558's criterion 4 asks for the
+  opposite answer on the first of them and calls it the rule already in
+  the tree, which the shipped
+  `regex-all-match-excludes-the-span-with-a-matching-event` contradicts.
+  A later change there is an application of that ruling, not a regression
+  here.
+
+- **One reading withdrawn.** An earlier revision recorded that the
+  reference answers `{ event:timeSinceStart > 0 }` with nothing on this
+  route. It was the FIXTURE, not the route: the corpus carried default
+  event timestamps, and the same spans re-pushed with event times after
+  the span's start bring back the four event-bearing spans. Every
+  event-bearing fixture this repository adds now sets `time_unix_nano`
+  after the span's start.
 
 - **The reference's own behaviour VARIES BY ROUTE, which is why this is
   not a contract to copy.** Three readers of the same span disagree, and
@@ -961,7 +1000,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   exit 0. It fires the moment a step in a live job runs the suite without
   its `env:` block.
 
-### `traceql-attribute-resolves-to-one-element` (issue #537) — **a decision recorded before the change it describes; the reference disagrees with itself here**
+### `traceql-attribute-resolves-to-one-element` (issue #537) — **shipped for the condition and the fused value; the reference disagrees with itself here**
 
 - **What.** A span may carry the same attribute key more than once, and may
   carry it at more than one scope. TraceQL has to say which value the span
@@ -971,13 +1010,37 @@ when we are asking it to slow down, so we keep `429`; recorded as
   instrumentation. One value per span per attribute, and **every** operation
   uses it — the filter, the negation, `select()`, `avg()` and a `by()` key.
 
+- **Status, by operation.** Issue #557 shipped the rule for the phase-2
+  CONDITION and for the value a matching condition projects (issue #479's
+  fused value): both read the element `arrayFirstIndex` over the span row's
+  `(attr_key, attr_scope)` arrays lands on. The independent value reads —
+  `select()`, `avg()`, and a `by()` key — still go to `trace_attrs_idx` and
+  still take whichever row the aggregate reaches; issue
+  [#558](https://github.com/digitalis-io/pulsusdb/issues/558) is the part that
+  moves them. Until it lands, `select(span.k)` on a span that repeats `k` may
+  render a different element from the one the condition matched.
+
+- **The arity carve-out, which the rule above does not state on its own.**
+  `span`, `resource` and `instrumentation` are maps: one entry per key per
+  span, and a repeat is a sender bug we resolve deterministically. `event` and
+  `link` are not — a span carries one `exception.type` per EVENT and one
+  `spanID` per LINK — so a condition on those two scopes matches when **any**
+  element matches, and the reader's single inversion turns that into the
+  all-match rule the owner's 2026-08-05 ruling already settled for the
+  field-vs-field form (`traceql-event-link-operand-any-match` below). The
+  answers are frozen live by
+  `an_event_or_link_condition_matches_any_element_in_both_directions` and the
+  shipped `event_and_link_comparisons_match_any_event_over_real_clickhouse`
+  (`crates/pulsus-server/tests/traces_search_live.rs`), the latter including
+  `regex-all-match-excludes-the-span-with-a-matching-event`.
+
 - **Why that rule, before looking at the reference.** Four alternatives were
-  eliminated on what they cost a reader: an arbitrary choice (today's `any()`
-  over a `GROUP BY`) cannot be reproduced twice; refusing the query lets one
-  malformed span empty a dashboard; returning every value changes the type of
-  every attribute read from one value to a set; and "last" would make the
-  search answer disagree with what the stored payload shows first. Of the two
-  deterministic candidates, first-within-the-resolved-scope is the one that
+  eliminated on what they cost a reader: an arbitrary choice (the pre-#557
+  `any()` over a `GROUP BY`) cannot be reproduced twice; refusing the query
+  lets one malformed span empty a dashboard; returning every value changes the
+  type of every attribute read from one value to a set; and "last" would make
+  the search answer disagree with what the stored payload shows first. Of the
+  two deterministic candidates, first-within-the-resolved-scope is the one that
   makes the search answer, the projected value and the rendered payload name
   the same value.
 
@@ -992,19 +1055,22 @@ when we are asking it to slow down, so we keep `429`; recorded as
   duplicate matched. On a span that repeats a key the reference therefore
   filters by one rule and renders by another. **We do not copy that.**
 
-- **What changes here, and it is a change against our own shipped answer.**
-  Today PulsusDB's phase-2 membership read is a set: a span is in it if any of
+- **What changed, and it is a change against our own shipped answer.** Before
+  #557 PulsusDB's phase-2 membership read was a set: a span was in it if any of
   its attribute rows matched. Measured on an eight-span fixture (26.3.29.7),
   three rows move, of two kinds:
 
-  | the span's stored attributes | the query | today | after |
+  | the span's stored attributes | the query | before #557 | after |
   |---|---|---|---|
   | `span.k = 'y'` then `span.k = 'x'` | `{ span.k = "x" }` | matches | does not match — the span's `k` is `y` |
   | the same span | `{ span.k != "x" }` | does not match | matches |
   | `resource.k = 'x'`, `span.k = 'y'` | `{ .k = "x" }` | matches | does not match — `.k` resolves to `y` |
 
   Counted as fixture rows the answer moves on, three; counted as kinds of
-  shape, two, the third being the first kind seen through a negation.
+  shape, two, the third being the first kind seen through a negation. All three
+  are frozen live by
+  `an_attribute_condition_tests_the_element_the_span_resolves_to`
+  (`crates/pulsus-server/tests/traces_search_live.rs`).
 
 - **Which differential cases this affects: none, and here is why.** The corpus
   in `e2e/src/traces_corpus.rs` attaches `run_id`, `env` and `region` at
@@ -1015,22 +1081,69 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`{ resource.run_id = "{R}" && .tier = "gold" }` and its spanset variant),
   and **no case needs an exemption or a mode change**.
 
-- **What must move if a case is ever added that can separate them.** The
-  corpus's own expectation helper resolves an unscoped key **resource first,
-  then span** (`unscoped_str` in `e2e/src/traces_corpus.rs`), which is the
-  opposite of the precedence above. It is invisible today because the key sets
-  are disjoint; a span carrying one key at both scopes would make the oracle
-  disagree with both the reference and with us. Adding such a span means
-  changing that helper in the same commit.
+- **The corpus's own oracle moved with the engine.** `unscoped_str`
+  (`e2e/src/traces_corpus.rs`) resolved an unscoped key **resource first, then
+  span**, which is the opposite of the precedence above; issue #557 makes it
+  span-first and adds
+  `an_unscoped_key_resolves_to_the_span_scope_when_both_scopes_carry_it`, which
+  builds the one span that can separate the two rules. No committed case
+  expectation moves, because the key sets are disjoint — adding a span that
+  carries one key at two scopes is what would make the order observable.
 
-- **How it is recorded while it is unbuilt.** The rule is a decision taken in
-  the design record; the code still does the old thing, and
+- **The correction this entry used to carry, made.**
   `crates/pulsus-read/src/traces/search_eval.rs`'s
-  `dual_scope_membership_satisfies_an_unscoped_negation_correctly` still
-  asserts the old cross-scope answer. That test now carries a doc comment
-  naming this entry and saying which assertion the change will move. When the
-  change lands, the assertion moves with it and a differential case covering
-  both kinds is added.
+  `dual_scope_membership_satisfies_an_unscoped_negation_correctly` builds its
+  `BatchAttrs` BY HAND, so it tests the evaluator and not how the set is
+  computed. **Its assertion does not move**; its doc comment does, and says the
+  unscoped chain resolves to one element, span scope first.
+
+### `traceql-unscoped-attribute-scope-reach` (issue #557) — **we are wider than the reference, deliberately**
+
+- **What an unscoped condition reaches.** `{ .k = "x" }` resolves through the
+  five attribute scopes in precedence order — span, resource, event, link,
+  instrumentation — and takes the first one PRESENT. The reference's filter
+  reaches **two**: `categorizeConditions` routes an `AttributeScopeNone`
+  condition onto the span list and the resource list and onto no other
+  (`tempodb/encoding/vparquet4/block_traceql.go:1643-1646 @ v3.0.2`). Its VALUE
+  reader takes all five (`:249-280`), so the reference is inconsistent with
+  itself across its own two paths, in the same way the entry above records for
+  duplicate keys.
+
+- **Never a writer-reserved intrinsic scope.** `event:name`,
+  `event:timeSinceStart`, `link:spanID` and `link:traceID` are stored under the
+  dedicated `event:intrinsic` / `link:intrinsic` discriminators, and the
+  unscoped chain names the five ATTRIBUTE scopes only. So a span whose one
+  event is named `evQ` does not match `{ .name = "evQ" }`, and does match
+  `{ event:name = "evQ" }`. **This is a change of ours against our own
+  pre-#557 answer**: the unscoped probe had no scope clause at all, so it
+  reached every scope the writer emits, reserved ones included.
+
+- **The evidence, measured on our side.** One span carrying one key at each of
+  the five attribute scopes, plus one event named `evQ`, ingested through
+  `POST /v1/traces` and queried through `GET /api/traces/v1/search` —
+  `an_unscoped_condition_reaches_five_attribute_scopes_and_no_intrinsic_one`
+  (`crates/pulsus-server/tests/traces_search_live.rs`):
+
+  | query | PulsusDB | the reference |
+  |---|---|---|
+  | `{ .ronly = "r" }` (resource scope only) | **the span** | the span — resource is one of its two |
+  | `{ .code = "c3" }` (event scope only) | **the span** | nothing — the condition never reaches the event list |
+  | `{ .lk = "l2" }` (link scope only) | **the span** | nothing — same reason |
+  | `{ .ionly = "i" }` (instrumentation scope only) | **the span** | nothing — same reason |
+  | `{ instrumentation.ionly = "i" }` (the scoped form) | **the span** | the span — a SCOPED condition is routed to its own list |
+  | `{ .name = "evQ" }` (the event's own name) | **nothing** | nothing |
+
+  The PulsusDB column is measured by the test named above. **The reference
+  column is read from its source, not measured by me**: the routing at
+  `:1643-1646` is what decides it, and nothing downstream can add a scope the
+  condition was never routed to.
+
+- **The two reasons we are wider.** First, what an unscoped attribute MEANS:
+  `.k` asks for "the attribute `k`, wherever this span carries it", and a span
+  whose only `k` sits at instrumentation scope has a `k`. Second, our own tag
+  route already advertises five scopes (`docs/api.md:1010`), so a user who
+  discovers a key through the tag API and then filters on it unscoped would
+  otherwise find nothing.
 
 ### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
 

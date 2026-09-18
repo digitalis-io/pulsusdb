@@ -57,6 +57,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_rows_to_read",
     "max_threads",
     "optimize_distributed_group_by_sharding_key",
+    "optimize_move_to_prewhere",
     "optimize_read_in_order",
     "optimize_skip_unused_shards",
     "prefer_localhost_replica",

@@ -439,8 +439,8 @@ pub struct ReaderConfig {
     /// bounds a dense common-value prefix's `GROUP BY trace_id`
     /// aggregation state; exceeding it is a `422 query_too_broad`
     /// (server code 241 `MEMORY_LIMIT_EXCEEDED`), never an OOM. Applied
-    /// only to the generator read, never phase-2 hydration/membership/
-    /// value/root reads. Default 512 MiB — well above the ~21 MB
+    /// only to the generator read, never phase-2 hydration/value/root
+    /// reads. Default 512 MiB — well above the ~21 MB
     /// measured for a 500k-row/500k-key aggregation, well below the
     /// server's 10 GiB default.
     pub traceql_generator_max_memory_bytes: u64,

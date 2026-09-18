@@ -290,7 +290,135 @@ const HOPS_SVG: &str = "docs/diagrams/query-lowering-hops.svg";
 
 /// The sentence both markers open with, so the record and the drawing
 /// cannot drift apart silently.
+///
+/// Issue #557: this is the SUPERSEDED form of the count sentence,
+/// compared only against the drawing; the record's own live count is
+/// [`LOWERED_COUNT_SENTENCE`].
 const MARKER_SENTENCE: &str = "The same answer lowered is four statements, not one: 4 round trips.";
+
+/// Issue #557. The sentence in `docs/query-lowering.md` that states the
+/// CURRENT lowered statement count. [`MARKER_SENTENCE`] is its superseded
+/// form: that constant is compared only against the drawing, and the
+/// drawing has been redrawn, so nothing compared it with the record.
+const LOWERED_COUNT_SENTENCE: &str =
+    "The same answer lowered is three statements, not one: 3 round trips.";
+
+/// Issue #557. Collapse whitespace so a sentence a Markdown rewrap has
+/// broken across lines reads as one string, and so a NO-BREAK SPACE, or
+/// any other Unicode space standing between two words, reads as an
+/// ordinary space.
+///
+/// Paragraph boundaries are KEPT: a whitespace run carrying two or more
+/// line feeds renders as a blank line, so no needle can match text
+/// assembled from the end of one paragraph and the start of the next.
+/// Every other run renders as one ASCII space.
+///
+/// Without the collapse the negative half below is blind — a superseded
+/// sentence reintroduced hard-wrapped is invisible to a plain
+/// `str::contains`. Without the Unicode half it is blind one character
+/// further on: a U+00A0 between two of that sentence's words hides it
+/// from an ASCII-only collapse, which is a green check over stale prose.
+fn unwrapped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    let mut line_feeds = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !in_run {
+                in_run = true;
+                line_feeds = 0;
+            }
+            if ch == '\n' {
+                line_feeds += 1;
+            }
+        } else {
+            if in_run && !out.is_empty() {
+                out.push_str(if line_feeds >= 2 { "\n\n" } else { " " });
+            }
+            in_run = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Issue #557 criterion 12 — **the two documents say what ships.**
+///
+/// The condition and the fused value follow the one-element rule now, the
+/// `select()`/`avg()`/`by()` value reads still do not, an unscoped
+/// condition reaches five attribute scopes and no reserved intrinsic one,
+/// and the event/link carve-out keeps any-element matching. A needle
+/// test, not a prose review: each string below is a claim the two
+/// documents have to carry, and each is the spelling a reader would
+/// search for.
+///
+/// *RED when:* either document loses one of them — which is what a
+/// rewrite that quietly drops the unscoped-reach entry, or the two
+/// negated event rows, looks like.
+#[test]
+fn the_documents_say_what_the_attribute_condition_ships() {
+    const LEDGER: &str = "docs/benchmarks/traces-differential-ledger.md";
+    const API: &str = "docs/api.md";
+    let ledger = repo_file(LEDGER);
+    for needle in [
+        "traceql-attribute-resolves-to-one-element",
+        "traceql-unscoped-attribute-scope-reach",
+        r#"{ .ronly = "r" }"#,
+        r#"{ .ionly = "i" }"#,
+        r#"{ instrumentation.ionly = "i" }"#,
+        r#"{ .code = "c3" }"#,
+        r#"{ .lk = "l2" }"#,
+        r#"{ .name = "evQ" }"#,
+        r#"{ event.code != "c3" }"#,
+        "{ event:timeSinceStart > 0 }",
+    ] {
+        assert!(
+            ledger.contains(needle),
+            "{LEDGER} must carry {needle:?}: it is the evidence a reader checks the entry \
+             against"
+        );
+    }
+    let api = repo_file(API);
+    for needle in [
+        "traceql-attribute-resolves-to-one-element",
+        "traceql-unscoped-attribute-scope-reach",
+    ] {
+        assert!(
+            api.contains(needle),
+            "{API} must name the ledger entry {needle:?} the behaviour is recorded in"
+        );
+    }
+    // The paragraph that called the one-element rule unbuilt is gone: it
+    // is shipped for the condition, and a document that still says
+    // otherwise sends a reader to the wrong answer.
+    assert!(
+        !api.contains("This paragraph describes a decision, not shipped behaviour"),
+        "{API} still calls the one-element rule a decision rather than shipped behaviour"
+    );
+}
+
+/// Issue #557. **The record states the lowered statement count the code
+/// produces.** Criterion 5 counts the finished statements against a live
+/// database; this pins the number the document prints, which nothing did
+/// before: changing the sentence left all 22 tests here green.
+///
+/// *RED when:* the document states a count this change did not leave it
+/// at, or still carries the superseded four-statement sentence —
+/// **however that sentence is wrapped, and whatever kind of space stands
+/// between its words**.
+#[test]
+fn the_record_states_the_lowered_statement_count_this_change_left_it_at() {
+    let md = unwrapped(&repo_file(QUERY_LOWERING));
+    assert!(
+        md.contains(&unwrapped(LOWERED_COUNT_SENTENCE)),
+        "{QUERY_LOWERING} does not carry {LOWERED_COUNT_SENTENCE:?}: the record must state the \
+         lowered statement count the code produces"
+    );
+    assert!(
+        !md.contains(&unwrapped(MARKER_SENTENCE)),
+        "{QUERY_LOWERING} still carries the superseded count sentence {MARKER_SENTENCE:?}"
+    );
+}
 /// The tag the superseded figure used to carry while it was still the
 /// document's live lowered total.
 const MARKER_TAG: &str = "seed + root only";
@@ -418,8 +546,8 @@ fn no_superseded_lowered_cost_figure_survives_the_re_measurement() {
         for wording in SUPERSEDED_WORDING {
             assert!(
                 !text.contains(wording),
-                "{rel} still carries the superseded wording {wording:?}: the lowered form is four \
-                 statements, not two"
+                "{rel} still carries the superseded wording {wording:?}: the two-statement \
+                 model left out the window-bounded hydration read"
             );
         }
     }
