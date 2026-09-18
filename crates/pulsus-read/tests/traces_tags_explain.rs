@@ -31,7 +31,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
@@ -251,23 +251,54 @@ async fn catalog_count(client: &ChClient) -> u64 {
     n
 }
 
-/// The `QueryFinish` `read_rows` for an exact `query_id`.
+/// How long a `system.query_log` reader here waits for a row that has
+/// not landed yet, and how often it re-flushes while waiting.
+///
+/// **`SYSTEM FLUSH LOGS` is not a barrier.** It writes the buffer as it
+/// stands; a query that finished microseconds earlier can still be
+/// outside it, and the row then appears on a later flush. Measured on
+/// 26.3.29.7 against the four-call fixture below: read with no flush at
+/// all, `system.query_log` held **0** of the four rows 33 ms after the
+/// last call returned; one flush later it held all four. On a loaded
+/// runner the same gap lands between two rows and not before the first —
+/// which is how this suite's four-row assertion saw three, the missing
+/// one being the LAST call's.
+///
+/// The wait does not weaken any assertion: every reader below still
+/// asserts exactly what it asserted before, and a row that never arrives
+/// fails at the deadline instead of on the first read.
+const QUERY_LOG_SETTLE: Duration = Duration::from_secs(30);
+const QUERY_LOG_POLL: Duration = Duration::from_millis(100);
+
+/// The `QueryFinish` `read_rows` for an exact `query_id`, waited for
+/// rather than read once ([`QUERY_LOG_SETTLE`]).
 async fn read_rows_by_id(client: &ChClient, query_id: &str) -> u64 {
     let sql = format!(
         "SELECT read_rows FROM system.query_log \
          WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
          ORDER BY event_time_microseconds DESC LIMIT 1"
     );
-    let mut stream = client
-        .query_stream::<QueryLogRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("query_log read");
-    let mut row = None;
-    while let Some(r) = stream.next().await {
-        row = Some(r.expect("decode query_log row"));
+    let deadline = Instant::now() + QUERY_LOG_SETTLE;
+    loop {
+        let mut stream = client
+            .query_stream::<QueryLogRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log read");
+        let mut row = None;
+        while let Some(r) = stream.next().await {
+            row = Some(r.expect("decode query_log row"));
+        }
+        if let Some(row) = row {
+            return row.read_rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no QueryFinish row for query_id {query_id} after waiting {QUERY_LOG_SETTLE:?} \
+             and re-flushing throughout — the statement was never issued, or it did not finish"
+        );
+        tokio::time::sleep(QUERY_LOG_POLL).await;
+        exec(client, "SYSTEM FLUSH LOGS").await;
     }
-    row.unwrap_or_else(|| panic!("no QueryFinish row for query_id {query_id}"))
-        .read_rows
 }
 
 #[tokio::test]
@@ -549,12 +580,35 @@ struct BudgetQueryLogRow {
     exception_code: i32,
 }
 
+/// [`budget_query_log_rows`], waited for until `want` rows are present
+/// or [`QUERY_LOG_SETTLE`] elapses, re-flushing on every pass.
+///
+/// Returns whatever the last read saw, so the caller's assertion decides
+/// what a short reading means.
+async fn budget_query_log_rows_settled(
+    admin: &ChClient,
+    flusher: &ChClient,
+    db: &str,
+    want: usize,
+) -> Vec<BudgetQueryLogRow> {
+    let deadline = Instant::now() + QUERY_LOG_SETTLE;
+    loop {
+        exec(flusher, "SYSTEM FLUSH LOGS").await;
+        let rows = budget_query_log_rows(admin, db).await;
+        if rows.len() >= want || Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(QUERY_LOG_POLL).await;
+    }
+}
+
 /// The exact `system.query_log` rows the four `TraceEngine` calls below
 /// produced, in call order — matched by the byte-frozen `SELECT
 /// DISTINCT` prefix (both `tags_sql` builders emit only that shape) and
 /// this run's dedicated database, EXCLUDING the fixture's `INSERT`
-/// statements (they don't match the `SELECT DISTINCT` prefix). Asserts
-/// the row count is exactly 4 — no ambiguity about which row is which.
+/// statements (they don't match the `SELECT DISTINCT` prefix). The
+/// caller asserts the row count is exactly 4 — no ambiguity about which
+/// row is which.
 async fn budget_query_log_rows(admin: &ChClient, db: &str) -> Vec<BudgetQueryLogRow> {
     let sql = format!(
         "SELECT toString(type) AS kind, read_rows, exception_code FROM system.query_log \
@@ -654,8 +708,10 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
     // full scan, for the two aborted shapes (closes the re-review's TEST
     // GAP). Exactly 4 rows in call order: [unscoped-names,
     // unscoped-values, scoped-names, scoped-values]. -----------------------
-    exec(&seed_client, "SYSTEM FLUSH LOGS").await;
-    let rows = budget_query_log_rows(&admin, budget_db).await;
+    // Waited for, not read once — see [`QUERY_LOG_SETTLE`]. The
+    // assertion below is unchanged: a call that stops issuing a statement
+    // still fails it, at the deadline rather than on the first read.
+    let rows = budget_query_log_rows_settled(&admin, &seed_client, budget_db, 4).await;
     assert_eq!(
         rows.len(),
         4,
