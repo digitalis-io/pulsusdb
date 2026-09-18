@@ -1681,8 +1681,8 @@ enum ReviewedVerdict {
 // `sql.rs:489` case left the table: no occurrence of that token remains, each
 // now reads `sql.rs:761`, `stage2`'s own line, where the two rules agree. And
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
-// candidate files and recorded with its reasoning below; the count of cases
-// is unchanged at eight and so are the counted verdicts.
+// candidate files and recorded with its reasoning below. The counts are in
+// the assertion at the end of this file's fallback test and nowhere else.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",

@@ -423,40 +423,37 @@ stays current — the `resolution` and `discovery` stages have no
 unconditionally the full cluster whatever the key is. That is why the
 second row's full-roster figure below is current rather than superseded.
 
-**Where that split is evidenced, since it is not where a reader would
-first look.** The capture carries no per-stage SQL: each
-`stage_evidence` entry holds only `stage`, `explain_pipeline` and
-`shards`, and the single `sql` field on a query is its terminal
-statement. What distinguishes the stages is the **presence of a
-fingerprint-derived `pruned_reason`** on a shard entry, counted over
-[`data/logs-read-dist.json`](data/logs-read-dist.json):
+**What determines the split.** It is the roster the harness assigns to a
+stage before any query runs, in `xtask/src/bench/queries.rs`:
 
 ```text
-  query                                  stage          pruned   fingerprint-derived
-  ------------------------------------   ------------   ------   -------------------
-  label_scoped_stream_read_6h            resolution          0                     0
-  label_scoped_stream_read_6h            hydration           1                     1
-  label_scoped_stream_read_6h            samples             1                     1
-  body_search_24h                        resolution          0                     0
-  body_search_24h                        hydration           1                     1
-  body_search_24h                        samples             1                     1
-  label_series_discovery_7d              discovery           0                     0
-  count_rate_rollup_over_corpus_window   resolution          0                     0
-  count_rate_rollup_over_corpus_window   hydration           0                     0
-  count_rate_rollup_over_corpus_window   rollup_range        0                     0
+  stage          roster                        where
+  ------------   ---------------------------   ---------------------------
+  resolution     StageRoster::Full             queries.rs:1211, :1657
+  discovery      StageRoster::Full             queries.rs:1553
+  hydration      StageRoster::Fingerprints     queries.rs:1230, :1676
+  samples        StageRoster::Fingerprints     queries.rs:1269
+  rollup_range   StageRoster::Fingerprints     queries.rs:1719
 ```
 
-The harness side of the same split is `StageRoster::Full` against
-`StageRoster::Fingerprints` in `xtask/src/bench/queries.rs`, which is
-what decides the expected set before a query runs.
+A `Full` roster is the whole cluster and is derived from no fingerprint,
+so no sharding key moves it. A `Fingerprints` roster is derived by
+applying the key to the stage's fingerprint set, so it moves with the
+key.
 
-Two of those rows need reading rather than counting.
-`count_rate_rollup_over_corpus_window`'s `hydration` and `rollup_range`
-**are** fingerprint-scoped; they show no pruned shard because their
-fingerprint set reached every shard, so there was nothing to prune. A
-zero in the last column means "no shard was pruned here", not "this stage
-has no fingerprint condition" — the two coincide for `resolution` and
-`discovery` and come apart for those two.
+**A pruning reason is not a substitute for this, and an earlier revision
+of this page used one.** A `pruned_reason` records that a shard was
+omitted; its absence means nothing was omitted, which happens both when a
+stage has no fingerprint condition and when a fingerprint-scoped stage's
+set reaches every shard. `count_rate_rollup_over_corpus_window`'s
+`hydration` and `rollup_range` are the second case: `Fingerprints`
+rosters with no pruned shard. Counting pruning reasons would put them on
+the wrong side of the split.
+
+The capture itself carries no per-stage SQL — each `stage_evidence` entry
+holds only `stage`, `explain_pipeline` and `shards`, and a query's single
+`sql` field is its terminal statement — which is why the harness source,
+not the capture, is what this rests on.
 
 `docs/schemas.md` §7's status paragraph states the same rule in the same
 shape.
