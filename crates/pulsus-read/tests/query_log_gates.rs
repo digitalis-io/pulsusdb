@@ -1807,15 +1807,24 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     // catalog entry and one service-graph edge pair — enough that every
     // read below returns rows rather than short-circuiting on an empty
     // phase-1 result.
+    //
+    // **Issue #557: the attribute is written into BOTH stores.** The
+    // index row still generates the phase-1 candidate; the span row's
+    // arrays are what the phase-2 condition now tests, so a span with
+    // empty arrays would be hydrated and then dropped, and the search
+    // below would return nothing.
     for sql in [
         format!(
             "INSERT INTO {run_db}.trace_spans \
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT unhex('{trace_hex}'), \
                     reinterpretAsFixedString(toUInt64(number + 1)), \
                     reinterpretAsFixedString(toUInt64(0)), \
-                    'op', 'checkout', {ts_ns} + number, 1000000, 0, 2, 0, '' \
+                    'op', 'checkout', {ts_ns} + number, 1000000, 0, 2, 0, '', \
+                    ['http.status_code'], ['span'], ['500'], ['int'], \
+                    [500.]::Array(Nullable(Float64)) \
              FROM numbers(64)"
         ),
         format!(
@@ -1862,7 +1871,8 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     let engine = pulsus_read::TraceEngine::new(engine_client, config);
 
     // 1. Search — `search_settings` + `generator_settings` (phase 1) and
-    //    the phase-2 hydration/membership reads.
+    //    the phase-2 hydration read, which since issue #557 carries the
+    //    attribute condition as a predicate column of its own.
     let query = pulsus_traceql::parse(r#"{ span.http.status_code = "500" }"#).expect("parses");
     let plan = pulsus_read::traces::search_plan::plan_search(
         &query,

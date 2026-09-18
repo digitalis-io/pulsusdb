@@ -11,13 +11,16 @@
 //! `UNION ALL` — plan v7 delta 1): an index-served top-K
 //! `GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT gen_cap+1`
 //! confined to the leaf's pruned prefix. Phase 2 renders the batched
-//! hydration / membership / value reads over explicit candidate
-//! `trace_id` lists.
+//! hydration and value reads over explicit candidate `trace_id` lists;
+//! since issue #557 the hydration statement also carries one predicate
+//! column per attribute condition, so a condition sends no read of its
+//! own.
 
 use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{GenTable, LeafGenerator, ZERO_PARENT_SQL};
+use super::search_plan::HydrationShape;
 use super::window_sql::WindowSql;
 
 /// Hard **byte** ceiling on every string value the search response
@@ -221,21 +224,171 @@ pub fn generator_sql(
     sql
 }
 
-/// Phase 2 — one batch's span hydration by primary-key prefix. The
+/// One condition's span-row predicate column (issue #557).
+///
+/// The parts are already-rendered fragments: this module assembles them
+/// into a statement and never decides what a value test says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeColumn {
+    /// `WITH` items, each already `<expr> AS <alias>`, in render order.
+    pub with_items: Vec<String>,
+    /// The positive `UInt8` test. Never negated — the reader inverts.
+    pub test: String,
+    /// `(value, kind)` when a projection needs this probe's matched value
+    /// (issue #479), both read from the element `test` landed on.
+    pub value: Option<(String, String)>,
+}
+
+/// `arrayFirstIndex((k, s) -> k = <key> AND s = <scope>, attr_key, attr_scope) AS <alias>`
+/// (issue #557) — the position of the element a span's attribute
+/// RESOLVES to at one scope, or `0` when the span carries no such
+/// element.
+///
+/// `0` is not an error on a computed subscript: ClickHouse returns the
+/// element type's default (`''` for `String`, `NULL` for
+/// `Nullable(Float64)`), measured on 26.3.29.7. It IS an error as a
+/// constant subscript (`Code: 135 ZERO_ARRAY_OR_TUPLE_INDEX`), which is
+/// why every subscript this module renders is an alias.
+pub fn locate_item(alias: &str, key_literal: &str, scope_literal: &str) -> String {
+    format!(
+        "arrayFirstIndex((k, s) -> k = {key_literal} AND s = {scope_literal}, \
+         attr_key, attr_scope) AS {alias}"
+    )
+}
+
+/// The same locate with a pre-rendered value test folded into the lambda
+/// — the multi-valued arm (issue #557). It yields the first MATCHING
+/// element, so the same alias serves the fused value.
+///
+/// `test` must have been rendered against the lambda's own parameter
+/// names, which are `v` (text) and `n` (numeric); `numeric` says which of
+/// the two arrays the lambda takes.
+///
+/// Inside the lambda a `NULL` result is false and the function still
+/// returns `UInt32`, so no `ifNull` wrapper belongs here — the wrapper is
+/// the PROJECTED single-valued arm's (measured on 26.3.29.7).
+pub fn locate_matching_item(
+    alias: &str,
+    key_literal: &str,
+    scope_literal: &str,
+    test: &str,
+    numeric: bool,
+) -> String {
+    let (param, array) = if numeric {
+        ("n", "attr_num")
+    } else {
+        ("v", "attr_val")
+    };
+    format!(
+        "arrayFirstIndex((k, s, {param}) -> k = {key_literal} AND s = {scope_literal} AND {test}, \
+         attr_key, attr_scope, {array}) AS {alias}"
+    )
+}
+
+/// `(<alias> != 0) AND <test>` for a single-valued scope; `<alias> != 0`
+/// for a multi-valued one, whose locate already carries the test
+/// (issue #557).
+///
+/// **The `!= 0` conjunct is required for correctness, not to avoid an
+/// error.** Element `0` of a `String` array reads `''`, so without it
+/// `{ span.k = "" }` would match every span that carries no `k` at all.
+pub fn probe_test(alias: &str, test: Option<&str>) -> String {
+    match test {
+        Some(test) => format!("({alias} != 0) AND {test}"),
+        None => format!("{alias} != 0"),
+    }
+}
+
+/// The nested `if` over `(present, expr)` pairs in chain order, ending in
+/// `fallback` — the unscoped form (issue #557).
+///
+/// Used three times over the SAME arms — the test (fallback `0`), the
+/// fused value (fallback `''`) and the stored kind (fallback `''`) — so a
+/// value can never be read from a scope the test did not resolve to.
+pub fn probe_chain(arms: &[(String, String)], fallback: &str) -> String {
+    match arms.split_first() {
+        None => fallback.to_string(),
+        Some(((present, expr), rest)) => {
+            format!("if({present}, {expr}, {})", probe_chain(rest, fallback))
+        }
+    }
+}
+
+/// The byte-capped fused value and the stored kind, both read at `alias`
+/// (issue #557). The cap is [`byte_cap_expr`], the same one
+/// [`hydration_sql`] applies to `service`/`name`, so a projected
+/// attribute value obeys the same 8192-byte source truncation as every
+/// other projected string.
+pub fn probe_value_exprs(alias: &str) -> (String, String) {
+    (
+        byte_cap_expr(&format!("attr_val[{alias}]")),
+        format!("attr_type[{alias}]"),
+    )
+}
+
+/// Phase 2 — one batch's span hydration by primary-key prefix, with one
+/// predicate column per attribute condition (issue #557). The
 /// `LIMIT {max_spans_per_trace + 1} BY trace_id` probe distinguishes
 /// exactly-`max` from overflow (plan v5 delta 3); ordering by
 /// `timestamp_ns` keeps the earliest spans under truncation. Reads only
-/// physical summary columns — never span payloads (`pulsus-read` stays
-/// OTLP-agnostic).
+/// physical summary columns and the span's own attribute arrays — never
+/// span payloads (`pulsus-read` stays OTLP-agnostic).
+///
+/// **`probes` empty renders byte-for-byte what this builder rendered
+/// before issue #557**, which is checkable rather than asserted: 27 of
+/// the 72 committed goldens plan no probe.
+///
+/// `shape` is NOT derived here. It is produced by
+/// `SearchPlan::hydration_shape()` and passed in, because the decoder
+/// calls the same method on the same plan and the two must be one value.
+///
+/// The probe expressions are PROJECTIONS, never predicates: the `WHERE`
+/// clause does not move, so part and granule selection cannot change —
+/// gated by `tests/traces_search_explain.rs` against
+/// `SearchPlan::hydration_sql_without_probes_for`.
 pub fn hydration_sql(
     spans_table: &str,
     trace_ids: &[[u8; 16]],
     window: TimeWindow,
     max_spans_per_trace: usize,
+    shape: HydrationShape,
+    probes: &[ProbeColumn],
 ) -> String {
+    let mut with_clause = String::new();
+    let mut probe_cols = String::new();
+    if shape != HydrationShape::Plain {
+        let items: Vec<&str> = probes
+            .iter()
+            .flat_map(|p| p.with_items.iter().map(String::as_str))
+            .collect();
+        if !items.is_empty() {
+            with_clause = format!("WITH {}\n", items.join(",\n     "));
+        }
+        let tests: Vec<&str> = probes.iter().map(|p| p.test.as_str()).collect();
+        probe_cols = format!(",\n       [{}] AS attr_probe", tests.join(", "));
+        if shape == HydrationShape::ProbesAndValues {
+            // Every array carries exactly `probes.len()` elements and a
+            // probe no projection reads a value from carries the literal
+            // `''` — so no second index mapping exists to get wrong.
+            let values: Vec<&str> = probes
+                .iter()
+                .map(|p| p.value.as_ref().map_or("''", |(v, _)| v.as_str()))
+                .collect();
+            let kinds: Vec<&str> = probes
+                .iter()
+                .map(|p| p.value.as_ref().map_or("''", |(_, t)| t.as_str()))
+                .collect();
+            probe_cols.push_str(&format!(
+                ",\n       [{}] AS attr_probe_val,\n       [{}] AS attr_probe_type",
+                values.join(", "),
+                kinds.join(", ")
+            ));
+        }
+    }
     format!(
-        "SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns, \
-         status_code, {}, kind, {}, {}\n\
+        "{with_clause}\
+         SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns, \
+         status_code, {}, kind, {}, {}{probe_cols}\n\
          FROM {spans_table}\n\
          WHERE {}\n  AND {}\n\
          ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
@@ -251,10 +404,21 @@ pub fn hydration_sql(
     )
 }
 
-/// Phase 2 — one attribute leaf's membership read over one batch:
+/// One attribute leaf's membership read over one batch:
 /// `SELECT DISTINCT` dedups the `ReplacingMergeTree`/at-least-once
 /// duplicates, the `(key[, val][, scope])` prefix + date/time pruning
 /// keep it index-served, and the candidate restriction bounds it.
+///
+/// **No production caller since issue #557**, which answers the phase-2
+/// attribute condition from a predicate column on [`hydration_sql`]'s
+/// own statement. This builder, `SearchPlan::membership_sql_for` and
+/// `super::rows::MembershipRow` are kept as the reproduction path for
+/// the frozen issue #492 lowering evidence
+/// (`docs/benchmarks/data/traces-lowering-92.json` carries a
+/// `membership` stage row, and `xtask/src/bench/traces_lowering.rs`
+/// rebuilds it); deleting any of the three makes that artefact
+/// unrebuildable. Everything below describes the statement as it was
+/// issued, which is what the frozen rows measured.
 /// **`with_value` FUSES the matched value into the same read** (issue
 /// #479): a probe whose matched value a projection needs adds
 /// `<byte-capped val> AS v` to the SAME statement rather than issuing a
@@ -487,8 +651,8 @@ pub fn trace_ctx_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 /// time predicate, no row cap), so `span:childCount` is full-trace-exact.
 /// `count(DISTINCT span_id)` — not a bare `count()` — dedups
 /// at-least-once ingest replays, mirroring the read-time dedup every
-/// other Phase-2 read performs (`SELECT DISTINCT` membership,
-/// `any() GROUP BY` values, the hydration span-id dedup).
+/// other Phase-2 read performs (`any() GROUP BY` values, the hydration
+/// span-id dedup).
 pub fn child_count_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
     format!(
         "SELECT trace_id, parent_id, count(DISTINCT span_id) AS child_count\n\
@@ -698,7 +862,14 @@ mod tests {
     #[test]
     fn hydration_sql_carries_the_overflow_probe_limit_by() {
         // (root_sql, by contrast, is deliberately uncapped — see below.)
-        let sql = hydration_sql("trace_spans", &[[7u8; 16]], W, 10_000);
+        let sql = hydration_sql(
+            "trace_spans",
+            &[[7u8; 16]],
+            W,
+            10_000,
+            HydrationShape::Plain,
+            &[],
+        );
         assert!(sql.contains("LIMIT 10001 BY trace_id"));
         assert!(sql.contains("ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC"));
         assert!(!sql.contains("payload"), "hydration never reads payloads");
@@ -741,7 +912,14 @@ mod tests {
             "if(length(service) <= {TRACE_STR_COL_CAP}, service, \
              substringUTF8(service, 1, {TRACE_STR_COL_CP_FALLBACK})) AS service"
         );
-        let hydration = hydration_sql("trace_spans", &[[7u8; 16]], W, 10_000);
+        let hydration = hydration_sql(
+            "trace_spans",
+            &[[7u8; 16]],
+            W,
+            10_000,
+            HydrationShape::Plain,
+            &[],
+        );
         assert!(hydration.contains(&needle), "{hydration}");
         let status_needle = format!(
             "if(length(status_message) <= {TRACE_STR_COL_CAP}, status_message, \

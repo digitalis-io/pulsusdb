@@ -643,24 +643,28 @@ fn attr_bool(span: &GeneratedSpan, key: &str) -> Option<bool> {
     }
 }
 
-/// Unscoped attribute lookup (`.key`): resource scope then span scope,
+/// Unscoped attribute lookup (`.key`): SPAN scope then resource scope,
 /// string values only (the one unscoped case is a string attr).
 #[cfg(test)]
-/// **Resolves resource-first, which is the opposite of TraceQL's precedence,
-/// and is safe only because this corpus never puts one key at two scopes**
-/// (resource carries `run_id`/`env`/`region`, span carries
-/// `http.status_code`/`cache_hit`/`sample_ratio`/`tier` — disjoint sets).
-/// TraceQL resolves an unscoped attribute span-first: span, resource, event,
-/// link, instrumentation, taking the first stored element within the scope it
-/// lands in. If a span carrying one key at both scopes is ever added to this
-/// corpus, this helper must change with it, or the expectation will disagree
-/// with both engines. See `docs/benchmarks/traces-differential-ledger.md`,
+/// **Resolves span-first, which is TraceQL's precedence** (issue #557):
+/// an unscoped attribute resolves through span, resource, event, link,
+/// instrumentation, in that order, taking the first stored element within
+/// the scope it lands in.
+///
+/// **The order is observable only when ONE KEY is carried at TWO SCOPES
+/// on one span**, and this corpus never does that — resource carries
+/// `run_id`/`env`/`region`, span carries
+/// `http.status_code`/`cache_hit`/`sample_ratio`/`tier`, disjoint sets —
+/// so no committed case expectation moves with this change. A span
+/// carrying one key at both scopes is the shape that would make it
+/// matter, and adding one is what would put this helper and the engine
+/// back in disagreement. See `docs/benchmarks/traces-differential-ledger.md`,
 /// entry `traceql-attribute-resolves-to-one-element` (issue #537).
 fn unscoped_str<'a>(span: &'a GeneratedSpan, key: &str) -> Option<&'a str> {
-    res_str(span, key).or(match attr_val(span, key) {
+    match attr_val(span, key) {
         Some(AnyVal::Str(s)) => Some(s.as_str()),
-        _ => None,
-    })
+        _ => res_str(span, key),
+    }
 }
 
 #[cfg(test)]
@@ -765,6 +769,43 @@ mod tests {
             base_ns: 1_700_000_000_000_000_000,
             run_id: "e2e-traces-test-run".to_string(),
         }
+    }
+
+    /// Issue #557 criterion 13 — **the oracle resolves an unscoped key
+    /// SPAN-FIRST**, which is TraceQL's precedence and what the engine
+    /// does after this change.
+    ///
+    /// The committed corpus cannot separate the two rules: its resource
+    /// and span key sets are disjoint, so every shipped case answers the
+    /// same either way. This test builds the one span that CAN separate
+    /// them — one key at both scopes — and it is the only thing in the
+    /// tree that does.
+    ///
+    /// *RED when:* the helper resolves resource-first, which answers
+    /// `Some("R")`.
+    #[test]
+    fn an_unscoped_key_resolves_to_the_span_scope_when_both_scopes_carry_it() {
+        let span = GeneratedSpan {
+            span_id: [1u8; 8],
+            parent_id: [0u8; 8],
+            name: "op".to_string(),
+            kind: 1,
+            status_code: 0,
+            service: "svc".to_string(),
+            start_ns: 1_700_000_000_000_000_000,
+            duration_ns: 1_000,
+            resource_attrs: vec![("k".to_string(), AnyVal::Str("R".to_string()))],
+            attrs: vec![("k".to_string(), AnyVal::Str("S".to_string()))],
+        };
+        assert_eq!(unscoped_str(&span, "k"), Some("S"));
+        // And the helper still finds a key only ONE scope carries, in
+        // either direction.
+        assert_eq!(unscoped_str(&span, "absent"), None);
+        let resource_only = GeneratedSpan {
+            attrs: vec![],
+            ..span.clone()
+        };
+        assert_eq!(unscoped_str(&resource_only, "k"), Some("R"));
     }
 
     /// AC5: byte-reproducibility — the corpus is a pure function of its

@@ -3,7 +3,9 @@
 //! leaf comparison into its Phase-1 **candidate generator** class (the
 //! bounded, index-served ranked top-K query `search_sql::generator_sql`
 //! renders) and its Phase-2 **exact-evaluation** shape (a physical-column
-//! predicate over hydrated spans, or an attribute-index membership probe).
+//! predicate over hydrated spans, or a predicate column over the hydrated
+//! span's own attribute arrays, whose bit fills the probe's membership
+//! set — issue #557).
 //!
 //! Field → column lowering (docs/schemas.md §4.1/§4.2, architecture.md
 //! §5.4, verified against the writer's `protocols/otlp_traces.rs`):
@@ -134,8 +136,9 @@ impl LeafGenerator {
 }
 
 /// The positive value predicate of one attribute membership probe —
-/// rendered against `trace_attrs_idx` by
-/// [`crate::traces::search_sql::membership_sql`].
+/// rendered against `trace_attrs_idx` by the phase-1 generator, and
+/// against the span row's own arrays by [`value_pred_sql_on`] (issue
+/// #557). One renderer, two bindings, so the two forms cannot drift.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValuePred {
     /// `val = '<v>'` — STRING equality (prefix-served).
@@ -160,18 +163,52 @@ pub enum ValuePred {
     /// `existence.*`). Renders as the no-op `1` predicate so a matching
     /// span is any span carrying the key (key-only `(key)` prefix scan).
     KeyExists,
-    /// A pre-rendered boolean arithmetic predicate over `val_num` (issue
-    /// #185 `arith.*`): single-attribute arithmetic with literal
-    /// coefficients (e.g. `.duration_ms * 1000 > 5000` renders as
+    /// A boolean arithmetic comparison over the attribute's numeric
+    /// column (issue #185 `arith.*`): single-attribute arithmetic with
+    /// literal coefficients (e.g. `.duration_ms * 1000 > 5000` renders as
     /// `(val_num * 1000) > 5000`) pushed column-side onto the numeric attr
     /// column, like the metric path — not post-hydration. Built only from
-    /// `val_num`, numeric literals, and total operators (`+ - *`), so it
-    /// carries no user text and cannot diverge from the Rust evaluator.
-    NumExpr(String),
+    /// the attribute operand, numeric literals, and total operators
+    /// (`+ - *`), so it carries no user text and cannot diverge from the
+    /// Rust evaluator.
+    ///
+    /// Issue #557 holds the TREE rather than the rendered string, because
+    /// the same comparison is now rendered twice against two different
+    /// numeric columns — `val_num` on the index and
+    /// `attr_num[<located index>]` on the span row.
+    NumExpr(NumArith),
 }
 
-/// One distinct attribute-index membership read: the positive `(key
-/// [, scope], value-predicate)` probe Phase 2 evaluates spans against.
+impl ValuePred {
+    /// Whether this predicate reads the NUMERIC column (issue #557) —
+    /// which decides, for a multi-valued scope, which array the locate's
+    /// lambda takes beside `attr_key`/`attr_scope`.
+    ///
+    /// [`Self::KeyExists`] reads neither column; the multi-valued arm
+    /// never renders a lambda for it, because "some element carries this
+    /// key" is what the two-array locate already answers.
+    pub(crate) fn reads_numeric_column(&self) -> bool {
+        matches!(self, ValuePred::Num { .. } | ValuePred::NumExpr(_))
+    }
+
+    /// Whether ANY stored value satisfies this predicate (issue #557) —
+    /// true only for [`Self::KeyExists`], whose rendered test is the
+    /// no-op `1`.
+    pub(crate) fn matches_any_value(&self) -> bool {
+        matches!(self, ValuePred::KeyExists)
+    }
+}
+
+/// One distinct attribute condition: the positive `(key [, scope],
+/// value-predicate)` probe Phase 2 evaluates spans against.
+///
+/// Since issue #557 it is answered by ONE PREDICATE COLUMN on the batch
+/// hydration statement — `arrayFirstIndex` over the span row's
+/// `(attr_key, attr_scope)` arrays, then the value test applied to the
+/// element it lands on — and no longer by a read of its own against
+/// `trace_attrs_idx`. Phase 1 still generates its candidates from the
+/// index.
+///
 /// Negated leaves (`!=`/`!~`) share the probe of their positive form —
 /// the evaluator inverts membership (the ratified negation rule).
 #[derive(Debug, Clone, PartialEq)]
@@ -376,6 +413,49 @@ pub enum ArithNode {
     },
 }
 
+/// A single-attribute arithmetic comparison with literal coefficients
+/// (issue #185), kept as TREES rather than as rendered SQL (issue #557)
+/// so one renderer can bind it to the attribute index's `val_num` and to
+/// the span row's `attr_num[<located index>]`.
+///
+/// Holding the rendered string, as the pre-#557 shape did, meant the
+/// column name was baked in at compile time and a second rendering had to
+/// rewrite text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumArith {
+    lhs: ArithNode,
+    op: ComparisonOp,
+    rhs: ArithNode,
+}
+
+impl NumArith {
+    /// `None` when either side does not render against a numeric column.
+    ///
+    /// Construction is what makes [`Self::render`] total; it proves the
+    /// expression can be written, and nothing more. Whether an operand
+    /// renders does not depend on the column NAME — [`num_col_of`]
+    /// answers for the operand kind — so a tree that renders against one
+    /// numeric column renders against every one.
+    pub(crate) fn new(lhs: ArithNode, op: ComparisonOp, rhs: ArithNode) -> Option<Self> {
+        let col = |operand: &CompareOperand| num_col_of(operand, "val_num");
+        render_arith_sql(&lhs, &col)?;
+        render_arith_sql(&rhs, &col)?;
+        sql_op(op)?;
+        Some(Self { lhs, op, rhs })
+    }
+
+    /// The comparison rendered against `num_col`.
+    pub(crate) fn render(&self, num_col: &str) -> String {
+        let col = |operand: &CompareOperand| num_col_of(operand, num_col);
+        let lhs = render_arith_sql(&self.lhs, &col)
+            .expect("NumArith::new proved the left side renders against a numeric column");
+        let rhs = render_arith_sql(&self.rhs, &col)
+            .expect("NumArith::new proved the right side renders against a numeric column");
+        let sym = sql_op(self.op).expect("NumArith::new proved the operator has a SQL spelling");
+        format!("{lhs} {sym} {rhs}")
+    }
+}
+
 /// How Phase 2 evaluates one leaf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeafEval {
@@ -385,6 +465,11 @@ pub enum LeafEval {
     TraceCtx(TraceCtxPred),
     /// Membership in `probe`'s result set; `negated` inverts it (the
     /// ratified `!=`/`!~` absent-key rule).
+    ///
+    /// **Issue #557 moved where the set comes from, not what it means.**
+    /// `exec::group_hydrated_rows` fills it from the hydration
+    /// statement's predicate column for this probe, instead of decoding
+    /// it from a read of its own. The evaluator still asks the SET.
     Attr {
         probe: AttrProbe,
         negated: bool,
@@ -813,29 +898,119 @@ fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> Result<Stri
     })
 }
 
-/// Renders an attribute probe's value predicate as its pre-escaped SQL
-/// fragment. Fallible for the same reason as [`physical_sql`] (issue
-/// #282): the regex arm validates as it renders.
-pub(crate) fn value_pred_sql(pred: &ValuePred) -> Result<String, PlanError> {
+/// The column expressions one value predicate is rendered against
+/// (issue #557).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ValueCols<'a> {
+    pub text: &'a str,
+    pub num: &'a str,
+    /// Wrap a numeric comparison in `ifNull(…, 0)`.
+    ///
+    /// `false` for the index binding, where the fragment lands in a
+    /// `WHERE` clause and a `NULL` is already falsy, and for a lambda
+    /// body, where `arrayExists`/`arrayFirstIndex` treat `NULL` as false
+    /// and still return `UInt8` (measured). `true` for the span row's
+    /// single-valued binding, where the fragment is a PROJECTED column
+    /// and an unwrapped `NULL` makes it `Nullable(UInt8)` — which does
+    /// not decode into `Vec<u8>`.
+    pub null_is_false: bool,
+}
+
+/// The attribute index's own columns — the binding that renders the
+/// bytes every caller had before issue #557.
+pub(crate) const INDEX_COLS: ValueCols<'static> = ValueCols {
+    text: "val",
+    num: "val_num",
+    null_is_false: false,
+};
+
+/// Renders an attribute probe's value predicate against `cols` as its
+/// pre-escaped SQL fragment (issue #557). Fallible for the same reason as
+/// [`physical_sql`] (issue #282): the regex arm validates as it renders.
+///
+/// Every predicate shape the parser accepts is rendered HERE, so the
+/// index form and the span-row form cannot drift: there is no shape that
+/// can be written against `val`/`val_num` and not against
+/// `attr_val[i]`/`attr_num[i]`.
+pub(crate) fn value_pred_sql_on(
+    pred: &ValuePred,
+    cols: ValueCols<'_>,
+) -> Result<String, PlanError> {
+    let text = cols.text;
+    let numeric = |frag: String| {
+        if cols.null_is_false {
+            format!("ifNull({frag}, 0)")
+        } else {
+            frag
+        }
+    };
     Ok(match pred {
-        ValuePred::StringEq(v) => format!("val = {}", escape::ch_string(v)),
+        ValuePred::StringEq(v) => format!("{text} = {}", escape::ch_string(v)),
         // Byte-identical to the `StringEq` render of the same text: a
         // boolean attribute is stored as `'true'`/`'false'` and the
         // variant exists to carry the literal's TYPE to the projection,
         // never to change the SQL.
-        ValuePred::BoolEq(b) => format!("val = {}", escape::ch_string(&b.to_string())),
-        ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
+        ValuePred::BoolEq(b) => format!("{text} = {}", escape::ch_string(&b.to_string())),
+        ValuePred::Regex(pat) => format!("match({text}, {})", anchored_regex_sql(pat)?),
         ValuePred::Num { op, value } => {
             let sym = sql_op(*op).expect("numeric ops are ordering/equality by construction");
-            format!("val_num {sym} {}", render_num(*value))
+            numeric(format!("{} {sym} {}", cols.num, render_num(*value)))
         }
         // Key existence: any value satisfies it — the no-op `1` predicate
         // leaves a pure `(key)` prefix scan (issue #185).
         ValuePred::KeyExists => "1".to_string(),
-        // A pre-rendered `val_num` arithmetic predicate (issue #185).
-        ValuePred::NumExpr(sql) => sql.clone(),
+        // The arithmetic comparison, rendered against this binding's
+        // numeric column (issue #185, re-bound by issue #557).
+        ValuePred::NumExpr(arith) => numeric(arith.render(cols.num)),
     })
 }
+
+/// Unchanged bytes for every caller that had one: the [`INDEX_COLS`]
+/// binding of [`value_pred_sql_on`].
+pub(crate) fn value_pred_sql(pred: &ValuePred) -> Result<String, PlanError> {
+    value_pred_sql_on(pred, INDEX_COLS)
+}
+
+/// Whether a scope holds at most ONE value per key per span (issue #557).
+///
+/// `span`, `resource` and `instrumentation` are maps: one entry per key,
+/// and a repeat is a sender bug we resolve deterministically. `event` and
+/// `link` are not — a span carries one `exception.type` per EVENT and one
+/// `spanID` per LINK — so a condition on them is ANY-match, which the
+/// reader's negation turns into the ALL-match rule the tree already
+/// applies to the field-vs-field form (owner ruling 2026-08-05,
+/// `search_eval::eval_event_set_compare`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeArity {
+    Single,
+    Multi,
+}
+
+/// The arity of one stored scope discriminator.
+///
+/// The two reserved intrinsic scopes are multi-valued for the same
+/// reason their attribute scopes are: the writer emits one row per event
+/// and one per link.
+pub(crate) fn scope_arity(scope: &str) -> ScopeArity {
+    match scope {
+        SCOPE_EVENT | SCOPE_LINK | SCOPE_EVENT_INTRINSIC | SCOPE_LINK_INTRINSIC => {
+            ScopeArity::Multi
+        }
+        _ => ScopeArity::Single,
+    }
+}
+
+/// The five attribute scopes an unscoped condition resolves through, in
+/// precedence order (issue #557). Never the writer-reserved intrinsic
+/// scopes, which is what `docs/api.md` already says of the tag route and
+/// what the search route did not do.
+pub(crate) const UNSCOPED_SCOPE_CHAIN: [&str; 5] = [
+    "span",
+    "resource",
+    SCOPE_EVENT,
+    SCOPE_LINK,
+    "instrumentation",
+];
 
 fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
     match scope {
@@ -1466,9 +1641,14 @@ pub fn compile_leaf(
         // -- issue #192 PR-B: the span-event intrinsics — reserved-key
         // probes on the dedicated `event:intrinsic` index scope. `event:name`
         // is a string leaf (AttrEq on `(key, val, scope)`); `event:timeSinceStart`
-        // is a numeric leaf (key-only `val_num` scan) — index-served exactly
-        // like any attribute, so the "span matches iff ≥1 event row satisfies
-        // the leaf" membership semantics come for free.
+        // is a numeric leaf (key-only `val_num` scan). Phase 1 stays
+        // index-backed exactly like any attribute; the "span matches iff
+        // ≥1 event row satisfies the leaf" rule is applied in phase 2 by
+        // the hydration statement's MULTI-VALUED arm over the span's own
+        // arrays (issue #557's arity carve-out: a span carries one value
+        // per EVENT, so the condition locates the first MATCHING element
+        // rather than the first element). Criterion 8's live assertions
+        // freeze those answers.
         Field::Intrinsic(Intrinsic::EventName) => {
             compile_attr_probe_leaf(Some(SCOPE_EVENT_INTRINSIC), EVENT_NAME_KEY, op, value)
         }
@@ -2054,26 +2234,24 @@ fn compile_field_arith(
     // Single-attribute arithmetic with literal coefficients → a column-side
     // `val_num` predicate (the query-performance mandate): index-served,
     // no per-row client work — like the metric path.
+    // `!=` keeps the ratified absent-key rule: the positive (`=`) probe
+    // negated over the time-range superset (absent-key spans match).
+    let (positive_op, negated) = if op == ComparisonOp::Neq {
+        (ComparisonOp::Eq, true)
+    } else {
+        (op, false)
+    };
     if total
         && !has_string
         && !has_physical
         && attrs.len() == 1
-        && let Some(lhs_sql) = render_arith_sql(&lhs_node, &val_num_col)
-        && let Some(rhs_sql) = render_arith_sql(&rhs_node, &val_num_col)
+        && let Some(arith) = NumArith::new(lhs_node.clone(), positive_op, rhs_node.clone())
     {
         let (key, scope) = attrs[0].clone();
-        // `!=` keeps the ratified absent-key rule: the positive (`=`) probe
-        // negated over the time-range superset (absent-key spans match).
-        let (pred_sql, negated) = if op == ComparisonOp::Neq {
-            (format!("{lhs_sql} = {rhs_sql}"), true)
-        } else {
-            let sym = sql_op(op).expect("arith comparison ops are the six by construction");
-            (format!("{lhs_sql} {sym} {rhs_sql}"), false)
-        };
         let probe = AttrProbe {
             key,
             scope,
-            pred: ValuePred::NumExpr(pred_sql),
+            pred: ValuePred::NumExpr(arith),
         };
         let generator = if negated {
             LeafGenerator::time_range()
@@ -2135,12 +2313,17 @@ fn compile_field_arith(
     })
 }
 
-/// The `val_num` column for an attribute operand (single-attribute
+/// The numeric column for an attribute operand (single-attribute
 /// arithmetic pushdown, issue #185); non-attribute operands are not
 /// pushable to the attr index.
-fn val_num_col(operand: &CompareOperand) -> Option<&'static str> {
+///
+/// Issue #557 makes the column a PARAMETER rather than the literal
+/// `val_num`: the same tree is rendered against the index's `val_num` and
+/// against the span row's `attr_num[<located index>]`, and one renderer
+/// binding both is what keeps the two forms from drifting.
+fn num_col_of(operand: &CompareOperand, num_col: &str) -> Option<String> {
     match operand {
-        CompareOperand::Attr { .. } => Some("val_num"),
+        CompareOperand::Attr { .. } => Some(num_col.to_string()),
         _ => None,
     }
 }
@@ -2148,11 +2331,11 @@ fn val_num_col(operand: &CompareOperand) -> Option<&'static str> {
 /// The physical numeric column for an intrinsic operand (single-physical
 /// arithmetic pushdown, issue #185); attributes and string intrinsics are
 /// not pushable to the spans table.
-fn physical_col(operand: &CompareOperand) -> Option<&'static str> {
+fn physical_col(operand: &CompareOperand) -> Option<String> {
     match operand {
-        CompareOperand::Duration => Some("duration_ns"),
-        CompareOperand::Status => Some("status_code"),
-        CompareOperand::Kind => Some("kind"),
+        CompareOperand::Duration => Some("duration_ns".to_string()),
+        CompareOperand::Status => Some("status_code".to_string()),
+        CompareOperand::Kind => Some("kind".to_string()),
         // Issue #351: the intrinsics added for field-vs-field comparison
         // resolve per span in Phase 2, not from a spans-table column the
         // arithmetic pushdown can name. `status_message`, `scope_name`
@@ -2182,11 +2365,11 @@ fn physical_col(operand: &CompareOperand) -> Option<&'static str> {
 /// if any operand is not mappable (falls back to the Rust evaluator).
 fn render_arith_sql(
     node: &ArithNode,
-    col: &impl Fn(&CompareOperand) -> Option<&'static str>,
+    col: &impl Fn(&CompareOperand) -> Option<String>,
 ) -> Option<String> {
     match node {
         ArithNode::Value(v) => Some(render_num(*v)),
-        ArithNode::Operand(operand) => col(operand).map(str::to_string),
+        ArithNode::Operand(operand) => col(operand),
         ArithNode::Neg(inner) => render_arith_sql(inner, col).map(|s| format!("-({s})")),
         ArithNode::Bin { op, lhs, rhs } => {
             let sym = match op {
@@ -2352,8 +2535,10 @@ fn collect(
         // Equality against a boolean literal does not match a string;
         // only the `!` OPERATOR demands a boolean. Routing this through
         // `BoolTruth` would fail the query where the reference serves it —
-        // and it costs an index-served membership probe, since `= true`
-        // is exactly what the attribute index answers.
+        // and it costs no statement of its own: `= true` is still what
+        // the index's `(key, val, scope)` prefix generates phase-1
+        // candidates from, and the phase-2 test rides the hydration
+        // statement's predicate column (issue #557).
         FieldExpr::Field(field) => {
             let leaf = compile_leaf(field, ComparisonOp::Eq, &Value::Bool(true))?;
             let generator = leaf.generator.clone();
@@ -3539,9 +3724,26 @@ mod tests {
         );
         match &compiled.leaves[0].eval {
             LeafEval::Attr { probe, negated } => {
+                // Issue #557 holds the TREE, so the assertion is on what
+                // it RENDERS — the same two literals this test pinned
+                // when the variant carried a `String`. The second
+                // binding is the one the span row reads, and it is here
+                // so the two renderings are pinned together.
                 assert_eq!(
-                    probe.pred,
-                    ValuePred::NumExpr("(val_num * 1000) > 5000".to_string())
+                    value_pred_sql(&probe.pred).unwrap(),
+                    "(val_num * 1000) > 5000"
+                );
+                assert_eq!(
+                    value_pred_sql_on(
+                        &probe.pred,
+                        ValueCols {
+                            text: "attr_val[pi0]",
+                            num: "attr_num[pi0]",
+                            null_is_false: true,
+                        }
+                    )
+                    .unwrap(),
+                    "ifNull((attr_num[pi0] * 1000) > 5000, 0)"
                 );
                 assert!(!negated);
             }
@@ -3554,8 +3756,8 @@ mod tests {
         match &neq.leaves[0].eval {
             LeafEval::Attr { probe, negated } => {
                 assert_eq!(
-                    probe.pred,
-                    ValuePred::NumExpr("(val_num * 1000) = 5000".to_string())
+                    value_pred_sql(&probe.pred).unwrap(),
+                    "(val_num * 1000) = 5000"
                 );
                 assert!(*negated);
             }

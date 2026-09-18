@@ -12,20 +12,16 @@ ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 
 == phase2 hydration (sample batch) ==
-SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version
+WITH arrayFirstIndex((k, s, n) -> k = 'timeSinceStart' AND s = 'event:intrinsic' AND n > 1000000, attr_key, attr_scope, attr_num) AS pm0
+SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version,
+       [pm0 != 0] AS attr_probe,
+       [if(length(attr_val[pm0]) <= 8192, attr_val[pm0], substringUTF8(attr_val[pm0], 1, 2048))] AS attr_probe_val,
+       [attr_type[pm0]] AS attr_probe_type
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
-
-== phase2 membership[0] ==
-SELECT DISTINCT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v, val_type AS t
-FROM trace_attrs_idx
-WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND (key = 'timeSinceStart' AND val_num > 1000000 AND scope = 'event:intrinsic')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
-  AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
 
 == root hydration (sample winners) ==
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns

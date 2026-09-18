@@ -14,8 +14,11 @@
 //! - **Phase 2:** candidates are consumed newest-bound-first in batches
 //!   of [`BATCH_TRACES`]; each batch is hydrated by primary key
 //!   (`LIMIT MAX_SPANS_PER_TRACE + 1 BY trace_id` — the `+1` is the
-//!   per-trace overflow probe), deduped by `span_id`, joined with its
-//!   attribute membership/value reads, and evaluated **exactly**
+//!   per-trace overflow probe), deduped by `span_id`, and evaluated
+//!   **exactly**. Since issue #557 each attribute condition arrives as
+//!   ONE PREDICATE COLUMN on that same hydration statement and fills its
+//!   probe's membership set there; only the attribute VALUE reads are
+//!   still joined from statements of their own
 //!   (`search_eval`). Matches enter a `limit`-size heap of response
 //!   summaries only; consumption stops at the threshold rule (heap full
 //!   AND next `bound_ts` strictly below the k-th held sort key — sound
@@ -92,20 +95,20 @@ use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 use super::rows::{
-    CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
-    MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
-    MetricBucketRow, MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow,
-    MetricGroupCountInstantRow, MetricGroupCountRow, MetricGroupExemplarRow,
-    MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricLog2ExemplarRow,
-    MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow,
-    SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
-    TypedNumValueRow, TypedStrValueRow,
+    CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow,
+    HydrationProbeRow, HydrationProbeValueRow, HydrationRow, MetricAggGroupInstantRow,
+    MetricAggGroupRow, MetricAggInstantRow, MetricAggRow, MetricBucketRow,
+    MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
+    MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
+    MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
+    NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
+    TagValueRow, TraceCtxRow, TypedNumValueRow, TypedStrValueRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
     SpanSetGroup, SpanSummary, StoredType, TraceCtxInfo, TraceMatch, TraceSpans,
 };
-use super::search_plan::{SearchCtx, SearchPlan};
+use super::search_plan::{HydrationShape, SearchCtx, SearchPlan};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
 use super::tags_sql::DaySpan;
 use crate::compile::plan::{Cut, LinkShape, Part, PartShape};
@@ -232,6 +235,19 @@ const MEMBERSHIP_ENTRY_BYTES: usize =
 /// Retention charge for one numeric attribute value entry.
 const NUM_VALUE_ENTRY_BYTES: usize =
     std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
+/// The request's byte budget and the running total THIS BATCH has
+/// charged against it — one datum in two halves, which never travel
+/// apart.
+///
+/// Bundled so [`TraceEngine::batch_attrs`] can take the probe
+/// memberships issue #557 fills on the hydration row without growing an
+/// eighth parameter. It is destructured on entry, so the body reads the
+/// same two bindings it always did.
+struct BatchCharge<'a> {
+    budget: &'a mut ByteBudget,
+    charged: &'a mut usize,
+}
+
 /// A destination for streamed rows that can PRICE a row before accepting
 /// it (issue #351 review 2).
 ///
@@ -305,8 +321,10 @@ pub struct TraceReadConfig {
     /// `trace_spans` (or `trace_spans_dist` when clustered — the caller
     /// applies the same `_dist` rule as every other read engine's config).
     pub spans_table: String,
-    /// `trace_attrs_idx{_dist}` — the attribute index the search
-    /// generators/membership reads target.
+    /// `trace_attrs_idx{_dist}` — the index the phase-1 search
+    /// generators and the retained aggregate / `select()` value reads
+    /// target. The phase-2 attribute CONDITION stopped reading it in
+    /// issue #557.
     pub attrs_table: String,
     /// `trace_edges{_dist}` — the service-graph half-row ledger the
     /// `service_graph` read targets (issue #173). `_dist`-suffixed when
@@ -329,8 +347,8 @@ pub struct TraceReadConfig {
     /// re-audit, sub-problem B): bounds a dense common-value prefix's
     /// `GROUP BY trace_id` aggregation state; breach → 422 (code 241 →
     /// [`TooBroadReason::TraceGeneratorMemory`]). Never applied to
-    /// phase-2 reads (hydration/membership/value/root), which set no
-    /// memory limit of their own.
+    /// phase-2 reads (hydration/value/root), which set no memory limit
+    /// of their own.
     pub generator_max_memory_bytes: u64,
     /// Issue #398: `reader.traceql_read_max_memory_bytes` — the
     /// `max_memory_usage` ceiling (throw-not-spill) carried by EVERY trace
@@ -1979,7 +1997,7 @@ impl TraceEngine {
     /// caller must release when it discards the rows.
     ///
     /// **Issue #35: the single choke point for every search-phase
-    /// CHARGE.** Every phase-1 generator, phase-2 hydration/membership/
+    /// CHARGE.** Every phase-1 generator, phase-2 hydration and
     /// attribute-value batch, and the root-hydration read route through
     /// this one function, so the byte budget is priced, charged and
     /// accepted in one place rather than at each of the half-dozen call
@@ -2272,7 +2290,7 @@ impl TraceEngine {
             batch_charged += id_list_charge;
             let batch_ids: Vec<[u8; 16]> =
                 candidates[idx..idx + take].iter().map(|c| c.0).collect();
-            let (traces, overflowed) = self
+            let (traces, overflowed, mut membership) = self
                 .hydrate_batch(
                     plan,
                     &batch_ids,
@@ -2290,8 +2308,11 @@ impl TraceEngine {
                     plan,
                     &batch_ids,
                     &settings,
-                    &mut budget,
-                    &mut batch_charged,
+                    &mut membership,
+                    BatchCharge {
+                        budget: &mut budget,
+                        charged: &mut batch_charged,
+                    },
                     &mut explain,
                 )
                 .await?;
@@ -2313,6 +2334,10 @@ impl TraceEngine {
             }
             // The batch's hydrated rows / membership sets are discarded
             // here — only the heap summaries survive (plan v6 delta 2).
+            // The sets are still here to discard: since issue #557
+            // `group_hydrated_rows` FILLS them from the hydration rows
+            // rather than decoding them from a read of their own, and
+            // `drop(attrs)` below is what releases them.
             budget.release(batch_charged);
             drop(traces);
             drop(attrs);
@@ -2430,7 +2455,13 @@ impl TraceEngine {
     }
 
     /// Hydrates one batch's spans, groups them per trace, dedups by
-    /// `span_id`, and detects per-trace overflow via the `+1` probe.
+    /// `span_id`, detects per-trace overflow via the `+1` probe, and
+    /// fills the probe memberships from the statement's own predicate
+    /// columns (issue #557).
+    ///
+    /// The statement's shape comes from `SearchPlan::hydration_shape()`,
+    /// which is also what rendered it, so the row type this decodes into
+    /// and the SELECT list are one decision.
     async fn hydrate_batch(
         &self,
         plan: &SearchPlan,
@@ -2439,51 +2470,122 @@ impl TraceEngine {
         budget: &mut ByteBudget,
         batch_charged: &mut usize,
         explain: &mut Option<&mut PlanExplain>,
-    ) -> Result<(Vec<TraceSpans>, bool), ReadError> {
+    ) -> Result<(Vec<TraceSpans>, bool, Vec<ProbeMembership>), ReadError> {
         let sql = plan.hydration_sql_for(batch_ids);
         charge_explain(explain, budget, "phase2_hydration", &sql, None)?;
+        // Issue #479's two shapes, decided by the plan and not here: a
+        // probe whose matched value a projection needs collects a map,
+        // every other probe a bare key set. Both are filled below from
+        // the SAME rows.
+        let fuses: Vec<bool> = (0..plan.probes_len())
+            .map(|i| plan.probe_fuses_value(i))
+            .collect();
+        let mut membership: Vec<ProbeMembership> = fuses
+            .iter()
+            .map(|&f| {
+                if f {
+                    ProbeMembership::Values(HashMap::new())
+                } else {
+                    ProbeMembership::Keys(HashSet::new())
+                }
+            })
+            .collect();
         // Charged per row DURING streaming (unbounded String columns are
         // exactly what the Layer-2 counter must bind — `max_result_bytes`
         // does not throw on streamed SELECT shapes).
-        let rows: Vec<HydrationRow> = self
-            .collect_rows_charged(
-                &sql,
-                settings,
-                budget,
-                batch_charged,
-                map_trace_read_error,
-                |row: &HydrationRow| {
-                    std::mem::size_of::<HydrationRow>()
-                        + RETAINED_ENTRY_OVERHEAD
-                        + row.service.len()
-                        + row.name.len()
-                },
-            )
-            .await?;
-        group_hydrated_rows(rows, budget, batch_charged)
+        let (traces, overflowed) = match plan.hydration_shape() {
+            HydrationShape::Plain => {
+                let rows: Vec<HydrationRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &HydrationRow| {
+                            std::mem::size_of::<HydrationRow>()
+                                + RETAINED_ENTRY_OVERHEAD
+                                + row.service.len()
+                                + row.name.len()
+                        },
+                    )
+                    .await?;
+                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+            }
+            HydrationShape::Probes => {
+                let rows: Vec<HydrationProbeRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &HydrationProbeRow| {
+                            std::mem::size_of::<HydrationProbeRow>()
+                                + RETAINED_ENTRY_OVERHEAD
+                                + row.service.len()
+                                + row.name.len()
+                                + row.attr_probe.len()
+                        },
+                    )
+                    .await?;
+                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+            }
+            HydrationShape::ProbesAndValues => {
+                let rows: Vec<HydrationProbeValueRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &HydrationProbeValueRow| {
+                            std::mem::size_of::<HydrationProbeValueRow>()
+                                + RETAINED_ENTRY_OVERHEAD
+                                + row.service.len()
+                                + row.name.len()
+                                + row.attr_probe.len()
+                                + row.attr_probe_val.iter().map(String::len).sum::<usize>()
+                                + row.attr_probe_type.iter().map(String::len).sum::<usize>()
+                        },
+                    )
+                    .await?;
+                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+            }
+        };
+        Ok((traces, overflowed, membership))
     }
 
-    /// Runs the batch's attribute membership / aggregate / `select()`
-    /// value reads.
+    /// Runs the batch's attribute aggregate / `select()` / event-set
+    /// value reads, and places the probe memberships the hydration
+    /// statement already answered (issue #557).
     async fn batch_attrs(
         &self,
         plan: &SearchPlan,
         batch_ids: &[[u8; 16]],
         settings: &QuerySettings,
-        budget: &mut ByteBudget,
-        batch_charged: &mut usize,
+        membership: &mut [ProbeMembership],
+        charge: BatchCharge<'_>,
         explain: &mut Option<&mut PlanExplain>,
     ) -> Result<BatchAttrs, ReadError> {
+        let BatchCharge {
+            budget,
+            charged: batch_charged,
+        } = charge;
         let mut attrs = BatchAttrs::default();
         // Issue #492 part 3: ONE walk over the compiled chain, in the
         // order the plan says the statements are issued, replacing six
         // hand-written index loops.
         //
         // **The alignment is the reason, not the tidiness.** Every
-        // `BatchAttrs` vector is index-aligned with the plan vector its
-        // reads came from — `attrs.membership[i]` answers
-        // `plan.probes[i]` — and six `for i in 0..n` loops guaranteed
-        // that by construction. The chain guarantees it now: it carries
+        // `BatchAttrs` vector is index-aligned with the plan vector it
+        // came from — `attrs.membership[i]` answers `plan.probes[i]` —
+        // and six `for i in 0..n` loops guaranteed that by construction.
+        // For the memberships the alignment now comes from the hydration
+        // statement's rendered column order, which
+        // `group_hydrated_rows` walks (issue #557); for the value reads
+        // it still comes from one statement per entry. The chain
+        // guarantees the walk either way: it carries
         // `Membership(0..probes)`, `AggValues(0..agg_fields)` and so on
         // in exactly that order, and each arm pushes in walk order. A
         // chain that dropped one link would misalign the vectors and
@@ -2504,58 +2606,19 @@ impl TraceEngine {
                  SQL part"
             );
             match link {
+                // Issue #557: the probe's answer arrived on the
+                // hydration row, so this link issues NO statement. The
+                // set `group_hydrated_rows` filled is MOVED into place
+                // here, in the same walk order the reads used to be
+                // issued in, which is what keeps
+                // `attrs.membership[i]` answering `plan.probes[i]`.
                 TqlLink::Membership(probe_idx) => {
-                    let probe_idx = *probe_idx;
-                    let sql = plan.membership_sql_for(probe_idx, batch_ids);
-                    charge_explain(
-                        explain,
-                        budget,
-                        "phase2_attr_membership",
-                        &sql,
-                        Some(("probe = ", &plan.probes[probe_idx].key)),
-                    )?;
-                    // Issue #479: a probe whose matched VALUE a projection needs
-                    // decodes the SAME read's fused `v` column. RowBinary is
-                    // positional, so `StrValueRow` reads the three-column
-                    // projection with no new row type and no second statement —
-                    // the pattern the `select()` value read already uses.
-                    if plan.probe_fuses_value(probe_idx) {
-                        let rows: Vec<TypedStrValueRow> = self
-                            .collect_rows_charged(
-                                &sql,
-                                settings,
-                                budget,
-                                batch_charged,
-                                map_trace_read_error,
-                                |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
-                            )
-                            .await?;
-                        let mut map = HashMap::with_capacity(rows.len());
-                        for row in rows {
-                            // `SELECT DISTINCT trace_id, span_id, v, t` can return
-                            // several rows for one span under a range / regex /
-                            // existence predicate. The FIRST wins; the reference
-                            // also keeps one arbitrary value (its collector is a
-                            // map).
-                            map.entry((row.trace_id, row.span_id))
-                                .or_insert_with(|| (row.v, StoredType::from_stored(&row.t)));
-                        }
-                        attrs.membership.push(ProbeMembership::Values(map));
-                    } else {
-                        let rows: Vec<MembershipRow> = self
-                            .collect_rows_charged(
-                                &sql,
-                                settings,
-                                budget,
-                                batch_charged,
-                                map_trace_read_error,
-                                |_| MEMBERSHIP_ENTRY_BYTES,
-                            )
-                            .await?;
-                        attrs.membership.push(ProbeMembership::Keys(
-                            rows.into_iter().map(|r| (r.trace_id, r.span_id)).collect(),
-                        ));
-                    }
+                    let empty = ProbeMembership::Keys(HashSet::new());
+                    let filled = match membership.get_mut(*probe_idx) {
+                        Some(slot) => std::mem::replace(slot, empty),
+                        None => empty,
+                    };
+                    attrs.membership.push(filled);
                 }
                 TqlLink::AggValues(field_idx) => {
                     let field_idx = *field_idx;
@@ -2835,14 +2898,15 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("result_overflow_mode", "throw")
         .set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
         // Issue #35: the raised `max_query_size` parse-buffer cap — every
-        // search-phase read (generators, hydration/membership/attribute
+        // search-phase read (generators, hydration, attribute-value
         // batches, root hydration) routes through `collect_rows_charged`,
         // which carries this settings object.
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         // Issue #398: the surface-wide per-query memory ceiling
         // (`reader.traceql_read_max_memory_bytes`), throw-not-spill. Every
-        // phase-2 read (hydration/membership/value/root) previously set no
-        // memory limit at all, so a memory breach there was a `500`.
+        // phase-2 read as they then were (hydration/membership/value/root)
+        // previously set no memory limit at all, so a memory breach there
+        // was a `500`.
         // Phase-1 generator reads override this with their own tighter
         // ceiling in `generator_settings`.
         .set("max_memory_usage", config.read_max_memory_bytes)
@@ -3475,10 +3539,124 @@ fn apply_series_reduce(reduce: super::metrics_plan::SeriesReduce, result: &mut T
 /// about to make its first push (code review round 5).
 const VEC_INITIAL_RESERVATION_SLOTS: usize = 4;
 
+/// The parts [`group_hydrated_rows`] consumes from one decoded hydration
+/// row, whichever of the three shapes it is (issue #557).
+///
+/// One function over three row types rather than three copies of the
+/// grouping: the dedupe, the overflow probe and the charge model are the
+/// same whatever the statement projected, and the only thing that varies
+/// is whether the row carries probe bits and a fused value.
+pub(super) trait HydrationRowParts {
+    fn trace_id(&self) -> [u8; 16];
+    fn span_id(&self) -> [u8; 8];
+    /// `&[]` for `HydrationShape::Plain`.
+    fn probe_bits(&self) -> &[u8];
+    /// Moved out, never copied — the `select_values` precedent.
+    fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)>;
+    fn into_span(self) -> HydratedSpan;
+}
+
+impl HydrationRowParts for HydrationRow {
+    fn trace_id(&self) -> [u8; 16] {
+        self.trace_id
+    }
+    fn span_id(&self) -> [u8; 8] {
+        self.span_id
+    }
+    fn probe_bits(&self) -> &[u8] {
+        &[]
+    }
+    fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
+        None
+    }
+    fn into_span(self) -> HydratedSpan {
+        HydratedSpan {
+            span_id: self.span_id,
+            parent_id: self.parent_id,
+            service: self.service,
+            name: self.name,
+            timestamp_ns: self.timestamp_ns,
+            duration_ns: self.duration_ns,
+            status_code: self.status_code,
+            status_message: self.status_message,
+            kind: self.kind,
+            scope_name: self.scope_name,
+            scope_version: self.scope_version,
+        }
+    }
+}
+
+impl HydrationRowParts for HydrationProbeRow {
+    fn trace_id(&self) -> [u8; 16] {
+        self.trace_id
+    }
+    fn span_id(&self) -> [u8; 8] {
+        self.span_id
+    }
+    fn probe_bits(&self) -> &[u8] {
+        &self.attr_probe
+    }
+    fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
+        None
+    }
+    fn into_span(self) -> HydratedSpan {
+        HydratedSpan {
+            span_id: self.span_id,
+            parent_id: self.parent_id,
+            service: self.service,
+            name: self.name,
+            timestamp_ns: self.timestamp_ns,
+            duration_ns: self.duration_ns,
+            status_code: self.status_code,
+            status_message: self.status_message,
+            kind: self.kind,
+            scope_name: self.scope_name,
+            scope_version: self.scope_version,
+        }
+    }
+}
+
+impl HydrationRowParts for HydrationProbeValueRow {
+    fn trace_id(&self) -> [u8; 16] {
+        self.trace_id
+    }
+    fn span_id(&self) -> [u8; 8] {
+        self.span_id
+    }
+    fn probe_bits(&self) -> &[u8] {
+        &self.attr_probe
+    }
+    fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)> {
+        let value = std::mem::take(self.attr_probe_val.get_mut(i)?);
+        let kind = self
+            .attr_probe_type
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or("");
+        Some((value, StoredType::from_stored(kind)))
+    }
+    fn into_span(self) -> HydratedSpan {
+        HydratedSpan {
+            span_id: self.span_id,
+            parent_id: self.parent_id,
+            service: self.service,
+            name: self.name,
+            timestamp_ns: self.timestamp_ns,
+            duration_ns: self.duration_ns,
+            status_code: self.status_code,
+            status_message: self.status_message,
+            kind: self.kind,
+            scope_name: self.scope_name,
+            scope_version: self.scope_version,
+        }
+    }
+}
+
 /// Groups a batch's (already per-row-charged) hydration rows into
-/// per-trace span lists, deduping `span_id` replays and detecting the
-/// per-trace overflow probe — pure, so the accounting is unit-testable
-/// (code review round 5).
+/// per-trace span lists, deduping `span_id` replays, detecting the
+/// per-trace overflow probe, AND filling the probe memberships
+/// (issue #557) — pure, so the accounting is unit-testable (code review
+/// round 5).
 ///
 /// Charge model (all BEFORE the allocation they cover):
 /// - first group: the outer Vec's initial reservation
@@ -3492,7 +3670,18 @@ const VEC_INITIAL_RESERVATION_SLOTS: usize = 4;
 ///   every other set/map site; it also covers the set's own initial
 ///   bucket group). Replayed rows are checked with `contains` FIRST and
 ///   are accounting no-ops (round-5 medium: duplicates allocate nothing,
-///   so they charge nothing).
+///   so they charge nothing);
+/// - per MEMBERSHIP ENTRY: [`MEMBERSHIP_ENTRY_BYTES`] (+ the fused
+///   value's length), charged before the insert — the same bytes the
+///   membership read charged before issue #557 moved the test onto this
+///   statement, so the Layer-2 counter sees what it saw before.
+///
+/// **Only a span whose `attr_probe[i]` is 1 enters `membership[i]`.** The
+/// projected columns carry a value for EVERY span, including one the
+/// probe did not match; inserting that span would make the attribute leaf
+/// match it, because the evaluator asks the set (`search_eval`'s
+/// `PlannedLeafEval::Attr` arm calls `contains`, and
+/// `ProbeMembership::Values::contains` is `map.contains_key`).
 ///
 /// `pub(super)` so the sibling evaluator's
 /// `count_matches_the_deduped_span_set` (issue #492 item 2) can prove the
@@ -3500,8 +3689,10 @@ const VEC_INITIAL_RESERVATION_SLOTS: usize = 4;
 /// fixture — `count()` now counts a spanset's members, and that equals
 /// the old matched-id-set size only because the rows arriving here are
 /// deduped by `span_id`.
-pub(super) fn group_hydrated_rows(
-    rows: Vec<HydrationRow>,
+pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
+    rows: Vec<R>,
+    probe_fuses_value: &[bool],
+    membership: &mut [ProbeMembership],
     budget: &mut ByteBudget,
     batch_charged: &mut usize,
 ) -> Result<(Vec<TraceSpans>, bool), ReadError> {
@@ -3509,8 +3700,9 @@ pub(super) fn group_hydrated_rows(
     let mut traces: Vec<TraceSpans> = Vec::new();
     let mut raw_count = 0usize;
     let mut seen: HashSet<[u8; 8]> = HashSet::new();
-    for row in rows {
-        let start_new = traces.last().is_none_or(|t| t.trace_id != row.trace_id);
+    for mut row in rows {
+        let (trace_id, span_id) = (row.trace_id(), row.span_id());
+        let start_new = traces.last().is_none_or(|t| t.trace_id != trace_id);
         if start_new {
             let mut outer_charge = 2 * std::mem::size_of::<TraceSpans>()
                 + RETAINED_ENTRY_OVERHEAD
@@ -3521,7 +3713,7 @@ pub(super) fn group_hydrated_rows(
             budget.charge(outer_charge)?;
             *batch_charged += outer_charge;
             traces.push(TraceSpans {
-                trace_id: row.trace_id,
+                trace_id,
                 spans: Vec::new(),
             });
             raw_count = 0;
@@ -3534,7 +3726,7 @@ pub(super) fn group_hydrated_rows(
             overflowed = true;
             continue;
         }
-        if seen.contains(&row.span_id) {
+        if seen.contains(&span_id) {
             continue; // at-least-once replay — no allocation, no charge
         }
         let group_charge = 2 * std::mem::size_of::<HydratedSpan>()
@@ -3542,24 +3734,39 @@ pub(super) fn group_hydrated_rows(
             + RETAINED_ENTRY_OVERHEAD;
         budget.charge(group_charge)?;
         *batch_charged += group_charge;
-        seen.insert(row.span_id);
+        seen.insert(span_id);
+        // The probe bits, before the row is consumed. A `0` bit inserts
+        // nothing at all — not the key, and not the value the column
+        // carries for it.
+        for (i, slot) in membership.iter_mut().enumerate() {
+            if row.probe_bits().get(i).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let value = if probe_fuses_value.get(i).copied().unwrap_or(false) {
+                row.take_probe_value(i)
+            } else {
+                None
+            };
+            let charge = MEMBERSHIP_ENTRY_BYTES + value.as_ref().map_or(0, |(v, _)| v.len());
+            budget.charge(charge)?;
+            *batch_charged += charge;
+            match (slot, value) {
+                (ProbeMembership::Keys(set), _) => {
+                    set.insert((trace_id, span_id));
+                }
+                (ProbeMembership::Values(map), Some(value)) => {
+                    map.insert((trace_id, span_id), value);
+                }
+                (ProbeMembership::Values(map), None) => {
+                    map.insert((trace_id, span_id), (String::new(), StoredType::Unknown));
+                }
+            }
+        }
         traces
             .last_mut()
             .expect("a trace group was just pushed")
             .spans
-            .push(HydratedSpan {
-                span_id: row.span_id,
-                parent_id: row.parent_id,
-                service: row.service,
-                name: row.name,
-                timestamp_ns: row.timestamp_ns,
-                duration_ns: row.duration_ns,
-                status_code: row.status_code,
-                status_message: row.status_message,
-                kind: row.kind,
-                scope_name: row.scope_name,
-                scope_version: row.scope_version,
-            });
+            .push(row.into_span());
     }
     Ok((traces, overflowed))
 }
@@ -3568,11 +3775,14 @@ pub(super) fn group_hydrated_rows(
 /// statements [`TraceEngine::batch_attrs`] sends (issue #492 part 3).
 /// The seed statement, the hydration read and the winners' root read are
 /// issued elsewhere, and the engine links issue nothing.
+///
+/// Issue #557 removed `Membership` from this set: the attribute
+/// condition is a predicate column on the hydration statement, so the
+/// link stays in the chain and sends nothing of its own.
 fn is_phase_two_read(link: &TqlLink) -> bool {
     matches!(
         link,
-        TqlLink::Membership(_)
-            | TqlLink::AggValues(_)
+        TqlLink::AggValues(_)
             | TqlLink::SelectValues(_)
             | TqlLink::EventSet(_)
             | TqlLink::TraceCtx
@@ -5194,7 +5404,7 @@ mod tests {
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
         let (traces, overflowed) =
-            group_hydrated_rows(rows, &mut budget, &mut charged).expect("in budget");
+            group_hydrated_rows(rows, &[], &mut [], &mut budget, &mut charged).expect("in budget");
         assert!(!overflowed);
         assert_eq!(traces.len(), 3);
         assert!(traces.iter().all(|t| t.spans.len() == 5), "deduped");
@@ -5218,7 +5428,8 @@ mod tests {
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
         let (traces, _) =
-            group_hydrated_rows(vec![hyd_row(1, 1)], &mut budget, &mut charged).expect("fits");
+            group_hydrated_rows(vec![hyd_row(1, 1)], &[], &mut [], &mut budget, &mut charged)
+                .expect("fits");
         assert_eq!(charged, expected_group_cost(1, 1));
         // The charge covers what was actually reserved.
         assert!(
@@ -5235,7 +5446,8 @@ mod tests {
         let rows: Vec<HydrationRow> = (0..200u8).map(|n| hyd_row(1, n)).collect();
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
-        let (traces, _) = group_hydrated_rows(rows, &mut budget, &mut charged).expect("fits");
+        let (traces, _) =
+            group_hydrated_rows(rows, &[], &mut [], &mut budget, &mut charged).expect("fits");
         assert_eq!(charged, expected_group_cost(1, 200));
         assert!(
             charged
@@ -5420,6 +5632,8 @@ mod tests {
                 end_ns: i64::MAX,
             },
             MAX_SPANS_PER_TRACE,
+            crate::traces::search_plan::HydrationShape::Plain,
+            &[],
         );
         assert!(
             sql.len() < 4096,

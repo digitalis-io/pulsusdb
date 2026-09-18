@@ -63,8 +63,10 @@ pub struct SpanRecord {
     /// real index rows, and the writer commits the two tables as
     /// independent flush generations.
     ///
-    /// Nothing reads these in this change; `trace_attrs_idx` still answers
-    /// every query.
+    /// The phase-2 attribute CONDITION reads these (issue #557), through
+    /// one predicate column per condition on the batch hydration
+    /// statement; `trace_attrs_idx` still serves phase 1 and the
+    /// `select()` / aggregate value reads.
     pub attr_key: Vec<String>,
     pub attr_scope: Vec<String>,
     pub attr_val: Vec<String>,

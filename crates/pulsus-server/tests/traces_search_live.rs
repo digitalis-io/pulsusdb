@@ -2664,11 +2664,11 @@ async fn the_traces_search_route_answers_the_explain_header() {
             "trace_spans",
             "trace_attrs_idx",
             "trace_spans:hydration",
-            "trace_attrs_idx:membership",
             "engine",
             "trace_spans:root",
         ],
-        "two sources open the plan, and the attribute leaf adds its membership read: {or_body}"
+        "two sources open the plan, and the attribute leaf adds NO statement — since issue \
+         #557 its condition is a predicate column on the hydration read: {or_body}"
     );
     assert_eq!(
         or_parts[1]["cut"],
@@ -2689,6 +2689,685 @@ async fn the_traces_search_route_answers_the_explain_header() {
         serde_json::json!([0, 1]),
         "the hydration read is seeded by the MERGE of both generators, and names both: {or_body}"
     );
+
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// Spawn G: issue #557 — the attribute condition resolves to ONE element
+// ---------------------------------------------------------------------
+
+/// Issue #557 criteria 1 and 14 — **an attribute condition tests the
+/// element the span's attribute RESOLVES to, not any element that
+/// happens to match.**
+///
+/// Six traces, one span each, and a seventh for the projection case:
+///
+/// ```text
+/// 1  other = "z"                     (no k)
+/// 2  span.k = "x"
+/// 3  span.k = "x", span.k = "y"
+/// 4  span.k = "y", span.k = "x"      <- the discriminating trace
+/// 5  span.j = "x"
+/// 6  resource.k = "x"
+/// 7  span.k = "y", span.j = "x"      <- criterion 14
+/// ```
+///
+/// **Trace 4 is what separates this change from what shipped.** Its `k`
+/// is `y` — the first element the sender wrote — so it does not match
+/// `= "x"` and does match `!= "x"`. Before this change it did the
+/// opposite, because the condition asked the attribute index whether SOME
+/// row for that span matched.
+///
+/// *RED when:* the condition is rendered as `arrayExists`, which returns
+/// trace 4 for `{ span.k = "x" }` and drops it from `{ span.k != "x" }`.
+///
+/// **Nothing in the tree ingested a span carrying one key twice before
+/// this test**, which is why no existing fixture could observe the rule.
+#[tokio::test]
+async fn an_attribute_condition_tests_the_element_the_span_resolves_to() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_236;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_g");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // Traces 1-5 and 7 carry the `checkout` resource; trace 6 carries the
+    // `k` at RESOURCE scope, which is the only way to put it there.
+    for (n, name, attrs) in [
+        (1u8, "no-k", vec![kv_str("other", "z")]),
+        (2u8, "k-x", vec![kv_str("k", "x")]),
+        (3u8, "k-x-then-y", vec![kv_str("k", "x"), kv_str("k", "y")]),
+        (4u8, "k-y-then-x", vec![kv_str("k", "y"), kv_str("k", "x")]),
+        (5u8, "j-x", vec![kv_str("j", "x")]),
+        (7u8, "k-y-j-x", vec![kv_str("k", "y"), kv_str("j", "x")]),
+    ] {
+        let s = span(tid(n), sid(1), None, name, ts(base, n as i64), MS, attrs);
+        ingest(port, vec![s], checkout_resource(), name);
+    }
+    let s6 = span(tid(6), sid(1), None, "res-k-x", ts(base, 6), MS, vec![]);
+    ingest(
+        port,
+        vec![s6],
+        vec![kv_str("service.name", "checkout"), kv_str("k", "x")],
+        "res-k-x",
+    );
+
+    for (q, expected, ctx) in [
+        (r#"{ span.k = "x" }"#, ids(&[2, 3]), "span-k-eq-x"),
+        (
+            r#"{ span.k != "x" }"#,
+            ids(&[1, 4, 5, 6, 7]),
+            "span-k-neq-x",
+        ),
+        (r#"{ .k = "x" }"#, ids(&[2, 3, 6]), "unscoped-k-eq-x"),
+        (r#"{ span.k = "" }"#, BTreeSet::new(), "span-k-eq-empty"),
+        (r#"{ span.k =~ "x.*" }"#, ids(&[2, 3]), "span-k-re-x"),
+        (
+            r#"{ span.k =~ "x.*" || span.j = "x" }"#,
+            ids(&[2, 3, 5, 7]),
+            "span-k-re-x-or-j-eq-x",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
+
+    // Criterion 14 — **a span the probe did not match contributes no
+    // value and no membership.** Trace 7's `k` is `y`, so the `k` probe's
+    // bit is 0 for it; its projected `attr_probe_val` slot still carries
+    // `"y"`, and a decoder that inserted it would render a second
+    // attribute entry AND make `{ span.k =~ "x.*" }` return trace 7 on
+    // its own, because an attribute leaf is evaluated by asking the
+    // membership set whether it contains the span.
+    let ctx = "trace-7-projects-only-j";
+    let res = search(
+        port,
+        r#"{ span.k =~ "x.*" || span.j = "x" }"#,
+        w0,
+        w1,
+        "",
+        ctx,
+    );
+    let json = res.json(ctx);
+    let traces = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no traces in {json}"));
+    let seven = traces
+        .iter()
+        .find(|t| t["traceID"].as_str() == Some(&hex(&tid(7))))
+        .unwrap_or_else(|| panic!("{ctx}: trace 7 must be returned: {json}"));
+    let attrs: Vec<String> = seven["spanSets"][0]["spans"][0]["attributes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: trace 7 projects no attributes: {json}"))
+        .iter()
+        .map(|a| a["key"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        attrs,
+        vec!["j".to_string()],
+        "{ctx}: trace 7 matched on `j` only, so `k` must not be projected: {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #557 criteria 3 and 4 — **the numeric arms of the located
+/// element.**
+///
+/// Two spans, its own spawn so the six-trace table above keeps its
+/// answers:
+///
+/// ```text
+/// 1  span.port = "8080"          the STRING, which the writer also stores as 8080
+/// 2  span.m   = "bad", span.m = 400   a non-numeric element AHEAD of a numeric one
+/// ```
+///
+/// * criterion 3: `{ span.port >= 8080 }` matches span 1 — the writer
+///   derives `val_num` from the rendered TEXT, so a string that parses as
+///   a number is numerically comparable;
+/// * criterion 4: `{ span.m = 400 }` does NOT match span 2 — the located
+///   element is `"bad"`, whose `attr_num` is `NULL`, and a `NULL` numeric
+///   comparison is false rather than a reason to advance to the next
+///   element.
+#[tokio::test]
+async fn a_numeric_condition_tests_the_located_element_and_nothing_further() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_237;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_h");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    for (n, name, attrs) in [
+        (1u8, "port-string", vec![kv_str("port", "8080")]),
+        (
+            2u8,
+            "m-bad-then-400",
+            vec![kv_str("m", "bad"), kv_int("m", 400)],
+        ),
+    ] {
+        let s = span(tid(n), sid(1), None, name, ts(base, n as i64), MS, attrs);
+        ingest(port, vec![s], checkout_resource(), name);
+    }
+
+    for (q, expected, ctx) in [
+        (
+            r#"{ span.port >= 8080 }"#,
+            ids(&[1]),
+            "a-string-that-parses-as-a-number-is-numerically-comparable",
+        ),
+        (
+            r#"{ span.m = 400 }"#,
+            BTreeSet::new(),
+            "a-non-numeric-located-element-makes-a-numeric-test-false",
+        ),
+        // The control that says span 2 is reachable at all: its located
+        // element IS `"bad"`, so the text form finds it. Without this the
+        // empty answer above would be satisfied by a span the window or
+        // the generator never produced.
+        (
+            r#"{ span.m = "bad" }"#,
+            ids(&[2]),
+            "the-located-element-is-the-first-one-the-sender-wrote",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
+
+    drop_db(db).await;
+}
+
+/// Issue #557 criterion 8 — **the event and link collections keep
+/// any-element matching, in BOTH directions.**
+///
+/// A span's `event.<key>` is one value PER EVENT, not one per span, so a
+/// condition on it cannot locate "the" element. The arity carve-out keeps
+/// those two scopes matching when ANY element matches, and the reader's
+/// single inversion turns that into the all-match rule the tree already
+/// applies to the field-vs-field form (the owner's 2026-08-05 ruling).
+///
+/// ```text
+/// 1  three events carrying code = c1 / c2 / c3
+/// 2  three events named evX / evY / evZ, no `code` anywhere
+/// 3  no events at all
+/// 4  two links carrying lk = l1 / l2
+/// ```
+///
+/// **The two negated rows freeze a divergence from the reference pending
+/// the #558 ruling**, and say so in their own assertion message: the
+/// reference returns the c1/c2/c3 span for `{ event.code != "c3" }` and
+/// for `{ event.code != "zz" }`, where we return the other two spans and
+/// all three spans respectively. The ledger entries are
+/// `traceql-event-link-operand-any-match` (the all-match direction) and
+/// `2026-07-16-negation-matches-missing-key` (the absent-key direction).
+/// A later change there is an application of that ruling, not a
+/// regression here.
+#[tokio::test]
+async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_238;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_i");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // Span 1: three events, each with its own `code`. Every event time is
+    // AFTER the span's start — a fixture that leaves `time_unix_nano` at
+    // the fixture's own value makes `timeSinceStart` a large negative
+    // delta (issue #556's commit message records the same trap).
+    let start1 = ts(base, 1);
+    let mut s1 = span(tid(1), sid(1), None, "ev-codes", start1, MS, vec![]);
+    s1.events = ["c1", "c2", "c3"]
+        .iter()
+        .enumerate()
+        .map(
+            |(i, code)| opentelemetry_proto::tonic::trace::v1::span::Event {
+                time_unix_nano: start1 + (i as u64 + 1) * 1_000_000,
+                name: format!("ev-{code}"),
+                attributes: vec![kv_str("code", code)],
+                dropped_attributes_count: 0,
+            },
+        )
+        .collect();
+    ingest(port, vec![s1], checkout_resource(), "ev-codes");
+
+    // Span 2: three events, no `code` key at all.
+    let start2 = ts(base, 2);
+    let mut s2 = span(tid(2), sid(1), None, "ev-names", start2, MS, vec![]);
+    s2.events = ["evX", "evY", "evZ"]
+        .iter()
+        .enumerate()
+        .map(
+            |(i, ev)| opentelemetry_proto::tonic::trace::v1::span::Event {
+                time_unix_nano: start2 + (i as u64 + 1) * 1_000_000,
+                name: (*ev).to_string(),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            },
+        )
+        .collect();
+    ingest(port, vec![s2], checkout_resource(), "ev-names");
+
+    // Span 3: no events at all.
+    let s3 = span(tid(3), sid(1), None, "ev-none", ts(base, 3), MS, vec![]);
+    ingest(port, vec![s3], checkout_resource(), "ev-none");
+
+    // Span 4: two links, each carrying its own `lk`. It sits in a LATER
+    // window of its own, because it carries no `code` and would otherwise
+    // join the two negated answers below — which are the three-span
+    // fixture's answers, exactly.
+    let (l0, l1) = (base + 1_200, base + 1_800);
+    let start4 = ts(base, 1_300);
+    let mut s4 = span(tid(4), sid(1), None, "links", start4, MS, vec![]);
+    s4.links = ["l1", "l2"]
+        .iter()
+        .map(|lk| opentelemetry_proto::tonic::trace::v1::span::Link {
+            trace_id: tid(0xEE).to_vec(),
+            span_id: sid(0xAA).to_vec(),
+            attributes: vec![kv_str("lk", lk)],
+            ..Default::default()
+        })
+        .collect();
+    ingest(port, vec![s4], checkout_resource(), "links");
+
+    // The positive direction: EVERY event's value matches, including the
+    // last. A locate-then-test arm on the event scope would answer
+    // nothing at all here.
+    for code in ["c1", "c2", "c3"] {
+        let q = format!(r#"{{ event.code = "{code}" }}"#);
+        let ctx = format!("event-code-eq-{code}");
+        let res = search(port, &q, w0, w1, "", &ctx);
+        assert_eq!(
+            trace_set(&res.json(&ctx)),
+            ids(&[1]),
+            "{ctx}: every event's value matches, not only the first"
+        );
+    }
+    for lk in ["l1", "l2"] {
+        let q = format!(r#"{{ link.lk = "{lk}" }}"#);
+        let ctx = format!("link-lk-eq-{lk}");
+        let res = search(port, &q, l0, l1, "", &ctx);
+        assert_eq!(
+            trace_set(&res.json(&ctx)),
+            ids(&[4]),
+            "{ctx}: the same any-element rule on links"
+        );
+    }
+
+    // The negated direction, FROZEN and divergent. Both rows are marked
+    // in their own message so a later change reads as the ruling being
+    // applied rather than as a test breaking.
+    const PENDING: &str = "frozen pending the issue #558 ruling; the reference answers \
+                           differently and the divergence is recorded as \
+                           `traceql-event-link-operand-any-match` and \
+                           `2026-07-16-negation-matches-missing-key`";
+    let ctx = "event-code-neq-c3";
+    let res = search(port, r#"{ event.code != "c3" }"#, w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        ids(&[2, 3]),
+        "{ctx}: a span one of whose events matches is EXCLUDED, and a span with no `code` \
+         matches — {PENDING} (the reference returns the c1/c2/c3 span)"
+    );
+    let ctx = "event-code-neq-zz";
+    let res = search(port, r#"{ event.code != "zz" }"#, w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        ids(&[1, 2, 3]),
+        "{ctx}: no event carries `zz`, so every span matches, the two with no `code` \
+         included — {PENDING} (the reference returns the c1/c2/c3 span only)"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #557 criterion 5 — **one request with one attribute condition
+/// over one batch sends exactly THREE statements, and with two conditions
+/// still three.**
+///
+/// Two instruments over the same spawn, because one of them is not
+/// discriminating on its own:
+///
+/// * the product's own census — `X-Pulsus-Explain: 1` returns the stages
+///   the request pushed, and the assertion is on the exact MULTISET, so a
+///   statement added under any name fails;
+/// * `system.query_log` — what the database finished, counted over the
+///   window the request occupies.
+///
+/// **Two queries, because one count cannot tell the builds apart.** A
+/// build still issuing a membership read per probe would count 4 and 5; a
+/// build issuing one for the second condition only would count 3 and 4.
+/// Three and three is the only pair this change produces.
+#[tokio::test]
+async fn one_request_with_an_attribute_condition_sends_three_statements() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_239;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_j");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // Six traces, one span each — one batch by construction
+    // (`exec::BATCH_TRACES` is 32).
+    for n in 1..=6u8 {
+        let s = span(
+            tid(n),
+            sid(1),
+            None,
+            "op",
+            ts(base, n as i64),
+            MS,
+            vec![kv_str("k", "x"), kv_str("j", "x")],
+        );
+        ingest(port, vec![s], checkout_resource(), "counted");
+    }
+
+    let admin = pulsus_clickhouse::ChClient::new(live_db::conn_config("default"))
+        .await
+        .expect("connect the counting client");
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+    struct CountRow {
+        n: u64,
+    }
+
+    async fn flush(admin: &pulsus_clickhouse::ChClient) {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &pulsus_clickhouse::QuerySettings::new(),
+                pulsus_clickhouse::Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the query log");
+    }
+
+    async fn finished_statements(
+        admin: &pulsus_clickhouse::ChClient,
+        db: &str,
+        since_us: i64,
+    ) -> u64 {
+        use futures::StreamExt;
+        let sql = format!(
+            "SELECT count() AS n FROM system.query_log \
+             WHERE type = 'QueryFinish' \
+               AND query_kind = 'Select' \
+               AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
+               AND (has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_attrs_idx')) \
+               AND NOT has(tables, 'system.query_log')"
+        );
+        let mut stream = admin
+            .query_stream::<CountRow>(&sql, &pulsus_clickhouse::QuerySettings::new())
+            .await
+            .expect("count finished statements");
+        stream.next().await.expect("a row").expect("decode").n
+    }
+
+    // The count, read across a one-second quiet period after the request
+    // has returned. The flush is not a barrier, so an early read can
+    // legitimately be short; the assertion is on the terminal reading and
+    // a count still moving over the final half of the window fails
+    // rather than being accepted at whatever it last read.
+    async fn settled(admin: &pulsus_clickhouse::ChClient, db: &str, since_us: i64) -> u64 {
+        flush(admin).await;
+        let opened = Instant::now();
+        let window = Duration::from_secs(1);
+        let mut readings: Vec<(Duration, u64)> = Vec::new();
+        loop {
+            flush(admin).await;
+            let n = finished_statements(admin, db, since_us).await;
+            let at = opened.elapsed();
+            readings.push((at, n));
+            if at >= window {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tail: Vec<u64> = readings
+            .iter()
+            .filter(|(at, _)| *at >= window / 2)
+            .map(|(_, n)| *n)
+            .collect();
+        assert!(
+            !tail.is_empty() && tail.windows(2).all(|w| w[0] == w[1]),
+            "the statement count was still moving over the final half of the window: \
+             {readings:?}"
+        );
+        *tail.last().expect("a terminal reading")
+    }
+
+    fn since_us() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_micros(),
+        )
+        .expect("micros fit an i64")
+    }
+
+    for (q, probes) in [
+        (r#"{ span.k = "x" }"#, 1usize),
+        (r#"{ span.k = "x" && span.j = "x" }"#, 2usize),
+    ] {
+        // (b) the product's own census.
+        let ctx = format!("explain-stages-{probes}-probe");
+        let path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(q));
+        let raw = request_with_headers(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
+            .unwrap_or_else(|| panic!("{ctx}: the explained request must be reachable"));
+        assert_eq!(
+            raw.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&raw.body)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&raw.body).expect("explain response parses");
+        let mut stages: Vec<String> = body["explain"]["stages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ctx}: no stages in {body}"))
+            .iter()
+            .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        stages.sort();
+        assert_eq!(
+            stages,
+            vec![
+                "phase1_candidate_generator".to_string(),
+                "phase2_hydration".to_string(),
+                "root_hydration".to_string(),
+            ],
+            "{ctx}: {q} must push exactly three stages — an attribute condition adds none: \
+             {body}"
+        );
+
+        // (c) what the database finished. The window opens just before
+        // the request and the search runs UNEXPLAINED, so the explained
+        // run above cannot contribute to it.
+        let since = since_us();
+        let res = search(port, q, w0, w1, "", &ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
+        assert_eq!(
+            trace_set(&res.json(&ctx)).len(),
+            6,
+            "{ctx}: all six traces match, so the batch is non-empty"
+        );
+        assert_eq!(
+            settled(&admin, db, since).await,
+            3,
+            "{ctx}: {q} — one generator, one hydration read, one root read. A build still \
+             issuing a membership read per probe would count {}",
+            3 + probes
+        );
+    }
+
+    drop_db(db).await;
+}
+
+/// Issue #557 criterion 12's evidence — **what an UNSCOPED attribute
+/// condition reaches.**
+///
+/// One span carrying one key at each of the five attribute scopes plus an
+/// event whose NAME is a writer-reserved intrinsic:
+///
+/// ```text
+/// resource        ronly = "r"
+/// span            sonly = "s"
+/// instrumentation ionly = "i"
+/// event           code  = "c3"     (on the span's one event)
+/// link            lk    = "l2"     (on the span's one link)
+/// event:intrinsic name  = "evQ"    (the event's own name, writer-reserved)
+/// ```
+///
+/// The unscoped chain resolves span → resource → event → link →
+/// instrumentation and **never a writer-reserved intrinsic scope**, which
+/// is what `docs/api.md` already says of the tag route and what the
+/// search route did not do before this change. So `{ .name = "evQ" }`
+/// answers nothing while `{ event:name = "evQ" }` returns the span: the
+/// two namespaces are disjoint by construction.
+///
+/// These are the six queries the ledger entry
+/// `traceql-unscoped-attribute-scope-reach` prints as its evidence, and
+/// this test is where our side of that table is measured.
+#[tokio::test]
+async fn an_unscoped_condition_reaches_five_attribute_scopes_and_no_intrinsic_one() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_240;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_k");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+    let start = ts(base, 1);
+
+    let mut s = span(
+        tid(1),
+        sid(1),
+        None,
+        "scopes",
+        start,
+        MS,
+        vec![kv_str("sonly", "s")],
+    );
+    s.events = vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+        time_unix_nano: start + 1_000_000,
+        name: "evQ".to_string(),
+        attributes: vec![kv_str("code", "c3")],
+        dropped_attributes_count: 0,
+    }];
+    s.links = vec![opentelemetry_proto::tonic::trace::v1::span::Link {
+        trace_id: tid(0xEE).to_vec(),
+        span_id: sid(0xAA).to_vec(),
+        attributes: vec![kv_str("lk", "l2")],
+        ..Default::default()
+    }];
+
+    // The instrumentation scope carries its own attributes, which the
+    // shared `ingest` helper leaves empty — so this one request is
+    // assembled here.
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", "checkout"), kv_str("ronly", "r")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "live-scope".to_string(),
+                    version: String::new(),
+                    attributes: vec![kv_str("ionly", "i")],
+                    dropped_attributes_count: 0,
+                }),
+                spans: vec![s],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .expect("the five-scope ingest must be reachable");
+    assert_eq!(
+        res.status,
+        200,
+        "ingest body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+
+    for (q, expected, ctx) in [
+        (
+            r#"{ .ronly = "r" }"#,
+            ids(&[1]),
+            "unscoped-reaches-resource",
+        ),
+        (r#"{ .sonly = "s" }"#, ids(&[1]), "unscoped-reaches-span"),
+        (r#"{ .code = "c3" }"#, ids(&[1]), "unscoped-reaches-event"),
+        (r#"{ .lk = "l2" }"#, ids(&[1]), "unscoped-reaches-link"),
+        (
+            r#"{ .ionly = "i" }"#,
+            ids(&[1]),
+            "unscoped-reaches-instrumentation",
+        ),
+        (
+            r#"{ instrumentation.ionly = "i" }"#,
+            ids(&[1]),
+            "the-scoped-form-of-the-same-attribute",
+        ),
+        // The one the unscoped chain does NOT reach: `name` here is the
+        // EVENT's own name, stored under the writer's reserved intrinsic
+        // scope, and the chain names the five attribute scopes only.
+        (
+            r#"{ .name = "evQ" }"#,
+            BTreeSet::new(),
+            "unscoped-skips-the-reserved-intrinsic-scope",
+        ),
+        // …and the intrinsic form of the same value does return it, so
+        // the empty answer above is about the SCOPE and not about the
+        // value being absent.
+        (
+            r#"{ event:name = "evQ" }"#,
+            ids(&[1]),
+            "the-intrinsic-form-of-the-same-value",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
 
     drop_db(db).await;
 }

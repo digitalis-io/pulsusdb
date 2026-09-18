@@ -210,13 +210,18 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             scope_name: String::new(),
             scope_version: String::new(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
-            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
-            attr_key: Vec::new(),
-            attr_scope: Vec::new(),
-            attr_val: Vec::new(),
-            attr_type: Vec::new(),
-            attr_num: Vec::new(),
+            // Hand-built (issue #556), and since issue #557 the span's
+            // own arrays carry the SAME attribute the index row below
+            // registers: the phase-1 candidate comes from the index and
+            // the phase-2 condition is a predicate column over these
+            // five arrays, so a span with empty arrays would be healed,
+            // hydrated and then dropped. What this test withholds is the
+            // INDEX row, which is what the backfill heals.
+            attr_key: vec![ATTR_KEY.to_string()],
+            attr_scope: vec![ATTR_SCOPE.to_string()],
+            attr_val: vec![ATTR_VAL.to_string()],
+            attr_type: vec![AttrValueType::Int],
+            attr_num: vec![Some(500.0)],
         }],
         attrs: vec![AttrRecord {
             date,
@@ -605,13 +610,15 @@ fn instrumentation_batch(ts_ns: i64, date: u16) -> ParsedTraces {
             scope_name: "io.opentelemetry.contrib.http".to_string(),
             scope_version: "1.4.2".to_string(),
             payload: vec![0x01],
-            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
-            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
-            attr_key: Vec::new(),
-            attr_scope: Vec::new(),
-            attr_val: Vec::new(),
-            attr_type: Vec::new(),
-            attr_num: Vec::new(),
+            // Hand-built (issue #556), carrying since issue #557 the same
+            // instrumentation attribute the index row below registers —
+            // the scoped attribute's phase-2 condition is a predicate
+            // column over these arrays.
+            attr_key: vec!["telemetry.sdk.language".to_string()],
+            attr_scope: vec!["instrumentation".to_string()],
+            attr_val: vec!["rust".to_string()],
+            attr_type: vec![AttrValueType::String],
+            attr_num: vec![None],
         }],
         attrs: vec![AttrRecord {
             date,

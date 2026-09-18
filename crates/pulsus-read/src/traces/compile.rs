@@ -1,15 +1,20 @@
 //! TraceQL against the shared compile core (issue #492).
 //!
-//! **Wired, and no TraceQL statement moves.** Since part 3
+//! **Wired, and, as issue #492 part 3 landed it, no TraceQL statement
+//! moved.** Issue #557 moves one — the attribute condition's — and 45
+//! goldens with it; the sentence below is the record of what held when
+//! this module was written. Since part 3
 //! [`super::search_plan::plan_search`] builds a chain here on every
 //! search request, folds it and plans it;
 //! [`super::exec::TraceEngine`]'s per-batch read dispatch walks that
 //! chain instead of six hand-written index loops; and
 //! `X-Pulsus-Explain: 1` on the search route returns the plan's shape.
-//! Every statement is still rendered by the shipped builders, so all 83
-//! frozen SQL goldens are byte-unchanged — which is what makes a moved
-//! golden, in whatever part next moves one, a renderer defect rather
-//! than an unattributable mix of two changes.
+//! Every statement was still rendered by the shipped builders, so all 83
+//! frozen SQL goldens were byte-unchanged at that revision — which is
+//! what makes a moved golden, in whatever part next moves one, a
+//! renderer defect rather than an unattributable mix of two changes.
+//! Issue #557 is the part that next moved one, and it moved exactly the
+//! 45 goldens whose query plans an attribute condition.
 //!
 //! What lands here is the chain link set, the [`Lang`] impl, the chain
 //! builder ([`chain_of`]), and the two rules the design rests on: `Emit`
@@ -23,10 +28,12 @@
 //! do not qualify instead of transporting them. Every other stage still
 //! contributes no SQL.
 //!
-//! **A lowered TraceQL search is four statements, not two, and the
-//! aggregate pushdown does not change the count.** The four are the
-//! compiled generator, the window-bounded hydration read, the membership
-//! read and the winners' root read. The middle two survive lowering
+//! **A lowered TraceQL search is three statements, not two, and the
+//! aggregate pushdown does not change the count.** The three are the
+//! compiled generator, the window-bounded hydration read and the
+//! winners' root read; the attribute condition rides the hydration read
+//! as one predicate column (issue #557). The middle one survives
+//! lowering
 //! because `spanSets[].matched` and `spanSets[].spans[]` are written
 //! unconditionally
 //! (`pulsus-server/src/traces_api/search_response.rs:428-430`,
@@ -42,10 +49,12 @@
 //! is made here.
 //!
 //! The saving is in what each statement carries, not in how many there
-//! are: on the corpus part 4 measured, 46 statements and 166,450 result
-//! bytes become 4 and 19,710, because every candidate the generator
-//! returns already qualifies and the batch loop stops on the first
-//! batch.
+//! are: on the corpus part 4 measured — before issue #557, when the
+//! attribute condition still sent a statement of its own — 46 statements
+//! and 166,450 result bytes become 4 and 19,710, because every candidate
+//! the generator returns already qualifies and the batch loop stops on
+//! the first batch. That is a recorded run and is not restated against
+//! the statement set #557 leaves.
 
 use pulsus_traceql::{
     AggregateOp, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, PipelineStage, Query,
@@ -76,8 +85,6 @@ pub const TRACE_SPANS_ROOT: SourceRef = SourceRef("trace_spans:root");
 /// The batch hydration read: the span table again, seeded on one batch of
 /// candidate trace ids and bounded by the request window.
 pub const TRACE_SPANS_HYDRATION: SourceRef = SourceRef("trace_spans:hydration");
-/// One attribute membership probe's batch read.
-pub const TRACE_ATTRS_MEMBERSHIP: SourceRef = SourceRef("trace_attrs_idx:membership");
 /// One attribute VALUE batch read — `val_num` for an aggregate operand,
 /// `val` for a `select()` field. Both are the same read shape against the
 /// same index, which is why they share a source and the executor names
@@ -91,6 +98,11 @@ pub const TRACE_SPANS_CTX: SourceRef = SourceRef("trace_spans:trace_ctx");
 /// The direct-child-count co-load (issue #184), same table, same
 /// trace-wide reach.
 pub const TRACE_SPANS_CHILD_COUNT: SourceRef = SourceRef("trace_spans:child_count");
+
+/// The name the membership link records on the hydration statement's
+/// projection (issue #557): one `UInt8` element per attribute condition,
+/// in `SearchPlan::probes` order.
+pub const PROBE_COLUMN: &str = "attr_probe";
 
 /// The key every TraceQL handoff is seeded on: phase 2 and the winners'
 /// root read are all `trace_id IN (…)` primary-key reads.
@@ -145,7 +157,7 @@ pub enum TqlLink {
         ///
         /// **Computed since part 4** by
         /// [`super::search_plan::generator_is_exact`], which compares the
-        /// membership read's predicate against the generator's for THIS
+        /// probe's index-form predicate against the generator's for THIS
         /// query rather than arguing about them. It is `false` for almost
         /// every query, and that is the measured truth rather than a
         /// placeholder: `CompiledSpanFilter`'s own contract calls the
@@ -167,8 +179,12 @@ pub enum TqlLink {
     },
     /// The batch hydration read.
     Hydrate,
-    /// One attribute membership probe's batch read; the index is into
+    /// One attribute condition, as ONE PREDICATE COLUMN on the batch
+    /// hydration statement (issue #557); the index is into
     /// `SearchPlan::probes`.
+    ///
+    /// The link stays in the chain and issues no statement of its own:
+    /// it lowers into the statement [`TqlLink::Hydrate`] sends.
     Membership(usize),
     /// One aggregate operand's `val_num` batch read; the index is into
     /// `SearchPlan::agg_fields`.
@@ -613,6 +629,7 @@ macro_rules! dispatchers {
 
 dispatchers!(
     SourceLower,
+    MembershipLower,
     Phase2ReadLower,
     TraceLevelLower,
     StructuralLower,
@@ -630,6 +647,7 @@ dispatchers!(
 );
 
 static SOURCE: SourceLower = SourceLower;
+static MEMBERSHIP: MembershipLower = MembershipLower;
 static PHASE2_READ: Phase2ReadLower = Phase2ReadLower;
 static TRACE_LEVEL: TraceLevelLower = TraceLevelLower;
 static STRUCTURAL: StructuralLower = StructuralLower;
@@ -658,8 +676,8 @@ impl Lang for Tql {
     fn lower_of(stage: &TqlLink) -> &'static dyn Lower<Tql> {
         match stage {
             TqlLink::Source { .. } => &SOURCE,
+            TqlLink::Membership(_) => &MEMBERSHIP,
             TqlLink::Hydrate
-            | TqlLink::Membership(_)
             | TqlLink::AggValues(_)
             | TqlLink::SelectValues(_)
             | TqlLink::EventSet(_) => &PHASE2_READ,
@@ -694,13 +712,17 @@ impl Lang for Tql {
     fn source_of(stage: &TqlLink, rel: &Relation<Tql>) -> SourceRef {
         match stage {
             TqlLink::Hydrate => TRACE_SPANS_HYDRATION,
-            TqlLink::Membership(_) => TRACE_ATTRS_MEMBERSHIP,
             TqlLink::AggValues(_) | TqlLink::SelectValues(_) => TRACE_ATTRS_VALUES,
             TqlLink::EventSet(_) => TRACE_ATTRS_EVENT_SETS,
             TqlLink::TraceCtx => TRACE_SPANS_CTX,
             TqlLink::ChildCount => TRACE_SPANS_CHILD_COUNT,
             TqlLink::Emit => TRACE_SPANS_ROOT,
-            TqlLink::Source { .. }
+            // Issue #557: the membership link reads no source of its own
+            // — its predicate column rides the hydration statement — so
+            // it names the relation's, which is what the core reads as
+            // "no source handoff".
+            TqlLink::Membership(_)
+            | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
             | TqlLink::BoolTruth
@@ -713,14 +735,14 @@ impl Lang for Tql {
     fn handoff_key(stage: &TqlLink, _rel: &Relation<Tql>) -> Option<Name> {
         match stage {
             TqlLink::Hydrate
-            | TqlLink::Membership(_)
             | TqlLink::AggValues(_)
             | TqlLink::SelectValues(_)
             | TqlLink::EventSet(_)
             | TqlLink::TraceCtx
             | TqlLink::ChildCount
             | TqlLink::Emit => Some(Name::from(TRACE_ID)),
-            TqlLink::Source { .. }
+            TqlLink::Membership(_)
+            | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
             | TqlLink::BoolTruth
@@ -744,7 +766,6 @@ impl Lang for Tql {
     fn handoff_bound(stage: &TqlLink, _rel: &Relation<Tql>, cx: &PlanCx<'_>) -> Option<SeedBound> {
         match stage {
             TqlLink::Hydrate
-            | TqlLink::Membership(_)
             | TqlLink::AggValues(_)
             | TqlLink::SelectValues(_)
             | TqlLink::EventSet(_)
@@ -754,7 +775,8 @@ impl Lang for Tql {
                 value: cx.config.seed_bound_rows?,
             }),
             TqlLink::Emit => Some(SeedBound::RequestLimit(cx.bounds.limit?)),
-            TqlLink::Source { .. }
+            TqlLink::Membership(_)
+            | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
             | TqlLink::BoolTruth
@@ -840,6 +862,52 @@ impl Lower<Tql> for SourceLower {
             }
             _ => Fidelity::Wider,
         }
+    }
+}
+
+impl Lower<Tql> for MembershipLower {
+    /// **A column on the statement that already fetches the batch, not a
+    /// statement of its own** (issue #557). The condition is
+    /// `arrayFirstIndex` over the span row's `(attr_key, attr_scope)`
+    /// arrays followed by the value test applied to the element it lands
+    /// on, rendered into the hydration statement's SELECT list, so there
+    /// is no second source and no handoff.
+    fn capability(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Capability {
+        Capability::Yes
+    }
+
+    /// Records the predicate column on the relation's projection — which
+    /// is what the fold means by "this link landed in the statement".
+    fn apply(
+        &self,
+        s: &TqlLink,
+        mut rel: Relation<Tql>,
+        _cx: &LowerCx<'_, Tql>,
+    ) -> Result<Relation<Tql>, PlanError> {
+        if let TqlLink::Membership(i) = s {
+            rel.projection
+                .push((Name::from(PROBE_COLUMN), format!("attr_probe[{}]", i + 1)));
+        }
+        Ok(rel)
+    }
+
+    /// **Not the default.** [`Lower::fidelity`]'s default is
+    /// [`Fidelity::Wider`] (`crates/pulsus-read/src/compile/fold.rs:932-938`),
+    /// and `fold.rs:974` clears `rel.exact` for anything but
+    /// `Equivalent`. The column is the condition — the located element's
+    /// value test, neither weaker nor stronger — so `Equivalent` is what
+    /// holds. Taking the default costs the pushed aggregate `HAVING` on
+    /// 154 of the 2,000 enumerated shapes, which
+    /// `tests/traces_pushdown_shape_freeze.rs` is the check for.
+    fn fidelity(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Fidelity {
+        Fidelity::Equivalent
+    }
+
+    /// No state effect: the column adds a per-span answer the evaluator
+    /// consults, rewrites no column's provenance and narrows no
+    /// predicate, so the identity is the whole effect.
+    fn residual_effect(&self, _s: &TqlLink, rel: Relation<Tql>) -> Relation<Tql> {
+        rel
     }
 }
 
@@ -1450,6 +1518,11 @@ pub struct ChainFacts<'a> {
 /// `search_eval::evaluate_batch` does over the hydrated batch, then the
 /// pipeline fold, then the winners' root read.
 ///
+/// **One link in it issues nothing.** `Membership` stays in the chain —
+/// it is where the attribute condition is accounted for — and since
+/// issue #557 it lowers into the hydration statement as a predicate
+/// column rather than sending a read of its own.
+///
 /// **The `by()` cardinality pre-flight probe is deliberately not a
 /// link.** It is an admission check that runs before phase 1 and answers
 /// `422` without reading a result row; it produces no candidate and
@@ -1765,9 +1838,12 @@ mod tests {
     /// strictly more than the query once they are residual, and issue
     /// #492 item 9's mid-pipeline `{...}` filter, which clears it for the
     /// same reason) and nine whose effect is none (`Source`, `Coalesce` with no
-    /// preceding `By`, and the seven per-batch reads — five phase-2
-    /// statements plus the two trace-wide co-loads — which add rows the
-    /// evaluator consults and rewrite no column).
+    /// preceding `By`, and the seven per-batch links — four phase-2
+    /// statements, the membership predicate column issue #557 put on the
+    /// hydration statement, and the two trace-wide co-loads — which add
+    /// per-span answers the evaluator consults and rewrite no column).
+    /// **The counts do not move**: `Membership` is still a link and
+    /// still asserts the identity.
     #[test]
     fn every_residual_state_effect_is_the_one_the_document_states() {
         let sel = parse_selector(r#"{ resource.service.name = "checkout" }"#);
@@ -1911,9 +1987,10 @@ mod tests {
                 has_effect: true,
             },
         ];
-        // Issue #492 part 3's ten new links. `Hydrate`, the four indexed
-        // phase-2 reads and the two co-loads state NO effect and assert
-        // it; the three engine links clear `exact`.
+        // Issue #492 part 3's ten new links. `Hydrate`, the three
+        // indexed phase-2 reads, the membership predicate column and the
+        // two co-loads state NO effect and assert it; the three engine
+        // links clear `exact`.
         let mut rows = rows;
         for (name, link) in [
             ("Hydrate", TqlLink::Hydrate),

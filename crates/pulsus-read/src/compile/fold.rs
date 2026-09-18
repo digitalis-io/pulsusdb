@@ -200,9 +200,13 @@ pub trait OpenSource: fmt::Debug + Send + Sync {
 ///
 /// **This is not an accommodation for one language.** A TraceQL
 /// attribute (`.foo`, `span.bar`) is a name that is not a column and
-/// resolves to an attribute-index read; a LogQL `| json` label is a name
-/// that is not a column and resolves to a JSON extraction over the line.
-/// They are one concept.
+/// resolves to one of three things: the phase-1 index generator; a
+/// predicate column over the span row's own attribute arrays, for a
+/// phase-2 condition (issue #557); or, for a `select()`, an aggregate or
+/// a comparison operand, a VALUE READ that still goes to
+/// `trace_attrs_idx` — issue #558 is the part that moves that one. A
+/// LogQL `| json` label is a name that is not a column and resolves to a
+/// JSON extraction over the line. They are one concept.
 ///
 /// `Arc`, not `Box`: `ColSet` must be `Clone`, and a boxed trait object
 /// is not. `Arc` rather than `Rc` because the plan object crosses an

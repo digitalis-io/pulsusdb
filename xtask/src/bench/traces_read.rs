@@ -275,7 +275,16 @@ fn evidence_stages(
         },
         StageSpec {
             stage: "phase2_hydration",
-            sql: plan.hydration_sql_for(batch),
+            // Issue #557 put one predicate column per attribute condition
+            // on the production hydration statement. This stage
+            // reproduces a FROZEN run — `docs/benchmarks/data/traces-lowering-92.json`
+            // and the tables bound to it — and that run measured the
+            // twelve-column statement, so the recipe renders the same
+            // twelve columns through the control builder. Rendering the
+            // current production form here would measure a different
+            // statement under the frozen row's name, and would not
+            // decode into `HydrationRow` besides.
+            sql: plan.hydration_sql_without_probes_for(batch),
             roster: Roster::TraceIds(batch.to_vec()),
             decoder: Decoder::Hydration,
         },
@@ -570,6 +579,26 @@ fn now_ns() -> i64 {
 /// engine performs the same `cityHash64(trace_id) % total_weight`
 /// placement the rosters derive), then polls until fully visible
 /// (Distributed inserts are asynchronous — no fixed sleeps).
+///
+/// **The span row carries the same attribute in its own five arrays**
+/// (issue #557). Phase 1 still generates its candidates from
+/// `trace_attrs_idx`, but the phase-2 condition is a predicate column
+/// over `attr_key`/`attr_scope`/`attr_num`, so a seed that writes only
+/// the index row produces candidates that then match nothing — measured
+/// on a two-shard cluster before this line existed: 79 candidates from
+/// the generator, 4,000 spans on the shards, zero of them carrying a
+/// non-empty `attr_key` on either shard, and `TraceEngine::search`
+/// returning 0 traces while every individual stage returned rows. The
+/// `_dist` wrapper carries all five columns with the local tables'
+/// types; what was missing was the data, not the schema.
+///
+/// The arrays mirror the index row the next statement inserts, field for
+/// field: `attr_key`/`key`, `attr_scope`/`scope`, `attr_val`/`val`,
+/// `attr_type`/`val_type`, `attr_num`/`val_num`. `val_type` is named
+/// explicitly because it defaults to the empty string when omitted
+/// (migration 39), which is the value the read path treats as
+/// type-unknown — a silent mismatch with the `'int'` the span row
+/// carries.
 async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Result<()> {
     let spread = WINDOW_NS / TRACES as i64;
     exec(
@@ -577,7 +606,8 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Resul
         &format!(
             "INSERT INTO {db}.trace_spans_dist \
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -585,7 +615,10 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Resul
                'op', \
                if(number % {CHECKOUT_EVERY} = 0, 'checkout', concat('svc-', toString(number % 8))), \
                {base_ns} + toInt64(number) * {spread}, \
-               1000000, if(number % {CHECKOUT_EVERY} = 0, 2, 0), 1, 1, 'p' \
+               1000000, if(number % {CHECKOUT_EVERY} = 0, 2, 0), 1, 1, 'p', \
+               ['http.status_code'], ['span'], \
+               [if(number % {CHECKOUT_EVERY} = 0, '500', '200')], ['int'], \
+               [if(number % {CHECKOUT_EVERY} = 0, 500., 200.)]::Array(Nullable(Float64)) \
              FROM numbers({TRACES})"
         ),
     )
@@ -594,11 +627,12 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) -> anyhow::Resul
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx_dist \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
                'http.status_code', \
-               if(number % {CHECKOUT_EVERY} = 0, '500', '200'), 'span', \
+               if(number % {CHECKOUT_EVERY} = 0, '500', '200'), 'span', 'int', \
                if(number % {CHECKOUT_EVERY} = 0, 500.0, 200.0), \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \

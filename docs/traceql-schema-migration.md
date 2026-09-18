@@ -1236,6 +1236,28 @@ picks the `resource` entry, and the rule picks the `span` one that comes after i
 five is the other end of the same rule — the located element is not numeric, so a
 numeric test is **false** rather than skipping to the next element.
 
+**Two of the five scopes are not single-valued, and the rule carves them out.** `span`,
+`resource` and `instrumentation` are maps: a span has one `k` at each, and a repeat is a
+sender bug the locate resolves deterministically. `event` and `link` are not — a span
+carries one `exception.type` per EVENT and one `spanID` per LINK — so "the element the
+span's `k` resolves to" is not a thing that exists there. Applying locate-then-test to
+them would make `{ event:name = "evZ" }` stop matching a span whose events are
+`evX, evY, evZ`, which is what the shipped live assertion
+`literal-event-name-unchanged` requires it to match. **At those two scopes the condition
+locates the first MATCHING element instead** — `arrayFirstIndex((k, s, v) -> k = … AND
+s = 'event' AND <test on v>, attr_key, attr_scope, attr_val)` — so the span matches when
+ANY element does, and the reader's single inversion turns that into the all-match rule
+the owner's 2026-08-05 ruling already settled for the field-vs-field form. The same
+alias then serves the fused value, so a multi-valued condition projects the element that
+satisfied it.
+
+That makes the unscoped chain's five arms two kinds rather than one: at a single-valued
+scope the arm is `present ? <test on the located element> : next`, and at `event` or
+`link` it is `present ? <first matching element found> : next`. The chain's ORDER is
+unchanged — span, resource, event, link, instrumentation, first scope PRESENT — and so
+is the value it fuses. Issue #557 ships exactly this, and its criterion 8 freezes the
+event and link answers in both directions as live assertions.
+
 **It costs nothing on this corpus.** The two forms read the same columns over the same
 granules; five repetitions of each, zero counter spread, instrument as the table below:
 
