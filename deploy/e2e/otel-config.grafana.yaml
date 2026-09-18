@@ -1,0 +1,49 @@
+# otel-collector config for the local-only Grafana demo stack
+# (deploy/e2e/compose.grafana.yaml) — a trimmed variant of
+# otel-config.single.yaml with two deltas:
+#
+# 1. `max_recv_msg_size_mib: 16` on the `otlp` receiver's `grpc`
+#    protocol. firehose's metric exporter sends one full-catalog batch
+#    per export tick regardless of `SPEEDUP` (only the tick rate scales
+#    with `SPEEDUP`, not batch size), and this demo's fleet/catalog size
+#    (deploy/e2e/firehose env in compose.grafana.yaml) already exceeds
+#    gRPC's 4MiB default max-recv-message-size on its own —
+#    "ResourceExhausted: received message larger than max" on the
+#    firehose side.
+# 2. Every pipeline exports to `pulsusdb` only — the reference-store
+#    fan-out legs (`prometheusremotewrite/prom`, `otlp/tempo`,
+#    `otlphttp/loki`) that otel-config.single.yaml uses for the
+#    metrics/traces/logs differential scenarios are dropped: this demo
+#    only cares about pulsusdb's own Grafana datasources, and firehose's
+#    backdated timestamps (see `MONTH_DAYS`/`SPEEDUP` comments in
+#    compose.grafana.yaml) previously tripped the reference Loki's own
+#    (differing) reject-old-sample window — simplest fix is to not send
+#    it data this stack never reads.
+#
+# A dedicated copy, not an edit to otel-config.single.yaml, because that
+# file is shared with CI's pinned differential scenarios
+# (logs_roundtrip/metrics_differential/traces_differential/
+# logs_pipeline_differential in e2e/src/scenarios.rs) — this overlay must
+# not change collector behavior for the harness's own compose stack.
+# Keep this file's `otlphttp` exporter endpoint in sync with
+# otel-config.single.yaml by hand if that file's pulsusdb target ever
+# changes; there's no templating between them.
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317, max_recv_msg_size_mib: 16 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+exporters:
+  otlphttp:
+    endpoint: http://172.29.0.11:3100
+  prometheusremotewrite/pulsus:
+    endpoint: http://172.29.0.11:3100/api/v1/write
+    add_metric_suffixes: false
+
+service:
+  pipelines:
+    logs: { receivers: [otlp], exporters: [otlphttp] }
+    metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
+    traces: { receivers: [otlp], exporters: [otlphttp] }
+    # the profiles pipeline lands with its own milestone (M5)

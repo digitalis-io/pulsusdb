@@ -1,0 +1,18 @@
+# Provisions Grafana's Tempo datasource against pulsusdb's M4 compat
+# surface (docs/api.md §8.1: `/api/traces/{traceId}`, `/api/search`,
+# `/api/search/tags`, `/api/echo`, ...) for the local `grafana` overlay
+# (deploy/e2e/compose.grafana.yaml). `url` uses pulsusdb's static
+# ipv4_address (172.29.0.11), matching the `loki.yaml` datasource's
+# convention in this directory — no inter-container DNS resolution
+# required. `PULSUS_COMPAT_ENDPOINTS=true` (already set on the
+# `pulsusdb` service by compose.single.yaml) is required for these
+# routes to be mounted.
+apiVersion: 1
+
+datasources:
+  - name: PulsusDB (Tempo compat)
+    uid: pulsus-tempo
+    type: tempo
+    access: proxy
+    url: http://172.29.0.11:3100
+    editable: false
