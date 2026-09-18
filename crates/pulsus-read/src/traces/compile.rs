@@ -85,13 +85,9 @@ pub const TRACE_SPANS_ROOT: SourceRef = SourceRef("trace_spans:root");
 /// The batch hydration read: the span table again, seeded on one batch of
 /// candidate trace ids and bounded by the request window.
 pub const TRACE_SPANS_HYDRATION: SourceRef = SourceRef("trace_spans:hydration");
-/// One attribute VALUE batch read — `val_num` for an aggregate operand,
-/// `val` for a `select()` field. Both are the same read shape against the
-/// same index, which is why they share a source and the executor names
-/// both stages `phase2_attr_values`.
-pub const TRACE_ATTRS_VALUES: SourceRef = SourceRef("trace_attrs_idx:values");
-/// One MULTI-VALUED event/link set batch read (issue #351).
-pub const TRACE_ATTRS_EVENT_SETS: SourceRef = SourceRef("trace_attrs_idx:event_sets");
+/// One MULTI-VALUED event/link set batch read (issue #351), off the span
+/// row's own arrays since issue #558.
+pub const TRACE_SPANS_EVENT_SETS: SourceRef = SourceRef("trace_spans:event_sets");
 /// The trace-level context co-load (issue #184): the span table, read
 /// trace-wide with no time predicate.
 pub const TRACE_SPANS_CTX: SourceRef = SourceRef("trace_spans:trace_ctx");
@@ -99,9 +95,11 @@ pub const TRACE_SPANS_CTX: SourceRef = SourceRef("trace_spans:trace_ctx");
 /// trace-wide reach.
 pub const TRACE_SPANS_CHILD_COUNT: SourceRef = SourceRef("trace_spans:child_count");
 
-/// The name the membership link records on the hydration statement's
-/// projection (issue #557): one `UInt8` element per attribute condition,
-/// in `SearchPlan::probes` order.
+/// The name every slot link records on the hydration statement's
+/// projection (issue #557 for the conditions, #558 for the projected
+/// field values): one `UInt8` element per slot, in the order
+/// `SearchPlan`'s `SlotLayout` establishes — probes, then `select()`
+/// fields, then aggregate fields, then event/link set widths.
 pub const PROBE_COLUMN: &str = "attr_slot";
 
 /// The key every TraceQL handoff is seeded on: phase 2 and the winners'
@@ -630,6 +628,7 @@ macro_rules! dispatchers {
 dispatchers!(
     SourceLower,
     MembershipLower,
+    AttrSlotLower,
     Phase2ReadLower,
     TraceLevelLower,
     StructuralLower,
@@ -648,6 +647,7 @@ dispatchers!(
 
 static SOURCE: SourceLower = SourceLower;
 static MEMBERSHIP: MembershipLower = MembershipLower;
+static ATTR_SLOT: AttrSlotLower = AttrSlotLower;
 static PHASE2_READ: Phase2ReadLower = Phase2ReadLower;
 static TRACE_LEVEL: TraceLevelLower = TraceLevelLower;
 static STRUCTURAL: StructuralLower = StructuralLower;
@@ -677,10 +677,8 @@ impl Lang for Tql {
         match stage {
             TqlLink::Source { .. } => &SOURCE,
             TqlLink::Membership(_) => &MEMBERSHIP,
-            TqlLink::Hydrate
-            | TqlLink::AggValues(_)
-            | TqlLink::SelectValues(_)
-            | TqlLink::EventSet(_) => &PHASE2_READ,
+            TqlLink::AggValues(_) | TqlLink::SelectValues(_) => &ATTR_SLOT,
+            TqlLink::Hydrate | TqlLink::EventSet(_) => &PHASE2_READ,
             TqlLink::TraceCtx | TqlLink::ChildCount => &TRACE_LEVEL,
             TqlLink::Structural => &STRUCTURAL,
             TqlLink::NestedSet => &NESTED_SET,
@@ -712,16 +710,17 @@ impl Lang for Tql {
     fn source_of(stage: &TqlLink, rel: &Relation<Tql>) -> SourceRef {
         match stage {
             TqlLink::Hydrate => TRACE_SPANS_HYDRATION,
-            TqlLink::AggValues(_) | TqlLink::SelectValues(_) => TRACE_ATTRS_VALUES,
-            TqlLink::EventSet(_) => TRACE_ATTRS_EVENT_SETS,
+            TqlLink::EventSet(_) => TRACE_SPANS_EVENT_SETS,
             TqlLink::TraceCtx => TRACE_SPANS_CTX,
             TqlLink::ChildCount => TRACE_SPANS_CHILD_COUNT,
             TqlLink::Emit => TRACE_SPANS_ROOT,
-            // Issue #557: the membership link reads no source of its own
-            // — its predicate column rides the hydration statement — so
-            // it names the relation's, which is what the core reads as
-            // "no source handoff".
+            // Issue #557 for the membership link and issue #558 for the
+            // two value links: each reads no source of its own — its slot
+            // rides the hydration statement — so it names the relation's,
+            // which is what the core reads as "no source handoff".
             TqlLink::Membership(_)
+            | TqlLink::AggValues(_)
+            | TqlLink::SelectValues(_)
             | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
@@ -735,13 +734,13 @@ impl Lang for Tql {
     fn handoff_key(stage: &TqlLink, _rel: &Relation<Tql>) -> Option<Name> {
         match stage {
             TqlLink::Hydrate
-            | TqlLink::AggValues(_)
-            | TqlLink::SelectValues(_)
             | TqlLink::EventSet(_)
             | TqlLink::TraceCtx
             | TqlLink::ChildCount
             | TqlLink::Emit => Some(Name::from(TRACE_ID)),
             TqlLink::Membership(_)
+            | TqlLink::AggValues(_)
+            | TqlLink::SelectValues(_)
             | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
@@ -765,17 +764,16 @@ impl Lang for Tql {
     /// not be attached to (D4).
     fn handoff_bound(stage: &TqlLink, _rel: &Relation<Tql>, cx: &PlanCx<'_>) -> Option<SeedBound> {
         match stage {
-            TqlLink::Hydrate
-            | TqlLink::AggValues(_)
-            | TqlLink::SelectValues(_)
-            | TqlLink::EventSet(_)
-            | TqlLink::TraceCtx
-            | TqlLink::ChildCount => Some(SeedBound::Config {
-                name: MAX_CANDIDATES_CONFIG,
-                value: cx.config.seed_bound_rows?,
-            }),
+            TqlLink::Hydrate | TqlLink::EventSet(_) | TqlLink::TraceCtx | TqlLink::ChildCount => {
+                Some(SeedBound::Config {
+                    name: MAX_CANDIDATES_CONFIG,
+                    value: cx.config.seed_bound_rows?,
+                })
+            }
             TqlLink::Emit => Some(SeedBound::RequestLimit(cx.bounds.limit?)),
             TqlLink::Membership(_)
+            | TqlLink::AggValues(_)
+            | TqlLink::SelectValues(_)
             | TqlLink::Source { .. }
             | TqlLink::Structural
             | TqlLink::NestedSet
@@ -911,12 +909,69 @@ impl Lower<Tql> for MembershipLower {
     }
 }
 
+impl Lower<Tql> for AttrSlotLower {
+    /// **A column on the statement that already fetches the batch, not a
+    /// statement of its own** (issue #558). A `select()` field, an
+    /// aggregate argument and a `by()` key are `arrayFirstIndex` over the
+    /// span row's `(attr_key, attr_scope)` arrays followed by that one
+    /// element's value, numeric reading and stored kind, rendered into
+    /// the hydration statement's SELECT list — so there is no second
+    /// source and no handoff.
+    fn capability(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Capability {
+        Capability::Yes
+    }
+
+    /// Records the slot column on the relation's projection — which is
+    /// what the fold means by "this link landed in the statement".
+    ///
+    /// The subscript is the link's own index plus one because
+    /// `SlotLayout` puts the probes first, then the `select()` slots,
+    /// then the aggregate slots; the fold has no access to the layout, so
+    /// the name is recorded without a subscript rather than with one the
+    /// two sides could disagree about. What the projection carries is the
+    /// FACT that the value is a column on this statement.
+    fn apply(
+        &self,
+        _s: &TqlLink,
+        mut rel: Relation<Tql>,
+        _cx: &LowerCx<'_, Tql>,
+    ) -> Result<Relation<Tql>, PlanError> {
+        rel.projection
+            .push((Name::from(PROBE_COLUMN), PROBE_COLUMN.to_string()));
+        Ok(rel)
+    }
+
+    /// **Not the default.** [`Lower::fidelity`]'s default is
+    /// [`Fidelity::Wider`], and `fold.rs:974` clears `rel.exact` for
+    /// anything but `Equivalent`. The slot is the value the evaluator
+    /// would otherwise have read from a second statement — the same
+    /// answer, neither weaker nor stronger — so `Equivalent` is what
+    /// holds. Taking the default costs the pushed aggregate `HAVING`:
+    /// measured at 423 drifted rows and 81 changed push statuses over
+    /// the enumerated shapes, which
+    /// `tests/traces_pushdown_shape_freeze.rs` is the check for.
+    fn fidelity(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Fidelity {
+        Fidelity::Equivalent
+    }
+
+    /// No state effect: the column adds a per-span value the evaluator
+    /// consults, rewrites no column's provenance and narrows no
+    /// predicate, so the identity is the whole effect.
+    fn residual_effect(&self, _s: &TqlLink, rel: Relation<Tql>) -> Relation<Tql> {
+        rel
+    }
+}
+
 impl Lower<Tql> for Phase2ReadLower {
     /// A second statement, not a second clause: the read is over a
     /// different source keyed by this statement's result, which is a
     /// source handoff and never a fold into the seed's `WHERE`. No SQL
     /// form has been written that would put it INTO the seed statement,
     /// which is what `NotYetLowered` says.
+    ///
+    /// Two links dispatch here since issue #558: the batch hydration read
+    /// and the event/link value set, whose `arrayJoin` over a span's own
+    /// array emits one row per value and so cannot be a column.
     fn capability(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Capability {
         Capability::No(BlockReason::NotYetLowered)
     }
@@ -1987,10 +2042,10 @@ mod tests {
                 has_effect: true,
             },
         ];
-        // Issue #492 part 3's ten new links. `Hydrate`, the three
-        // indexed phase-2 reads, the membership predicate column and the
-        // two co-loads state NO effect and assert it; the three engine
-        // links clear `exact`.
+        // Issue #492 part 3's ten new links. `Hydrate`, the one indexed
+        // phase-2 read left, the membership and value slot columns and
+        // the two co-loads state NO effect and assert it; the three
+        // engine links clear `exact`.
         let mut rows = rows;
         for (name, link) in [
             ("Hydrate", TqlLink::Hydrate),

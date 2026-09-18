@@ -992,6 +992,137 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
     );
 }
 
+/// Asserts that the attribute index and the span row agree, element for
+/// element, for `trace_ids` in `db` (issue #558).
+///
+/// # Why a live suite needs this
+///
+/// A TraceQL search generates its candidates from `trace_attrs_idx` and
+/// then reads the value out of `trace_spans`'s own attribute arrays. A
+/// fixture that writes only one of the two stores produces a candidate
+/// that matches nothing, or a value read that finds nothing — a defect in
+/// the FIXTURE that reads exactly like a defect in the code. Every raw
+/// `INSERT INTO … trace_attrs_idx` in this repository omitted `val_type`,
+/// which takes the catalog default `''` (`crates/pulsus-schema/src/catalog.rs`),
+/// so the index stored the empty kind while the span row beside it stored
+/// one of the writer's four spellings.
+///
+/// # What it compares, and what it cannot
+///
+/// A two-way multiset difference over
+/// `(trace_id, span_id, key, scope, val, val_type, val_num)`: one
+/// `EXCEPT` for elements the index holds and the span row does not, and
+/// one for the reverse, so a MISSING element and an EXTRA one are
+/// distinguished and the panic prints the differing rows.
+///
+/// **It cannot check array ORDER.** `trace_attrs_idx` carries no element
+/// ordinal, so the index cannot say what order a span's attributes were
+/// written in, and no comparison against it can check the order that
+/// decides which element is "first". A fixture that needs order asserts
+/// it by the expected value instead.
+///
+/// `db` is a database name and `trace_ids` are lowercase hex trace ids,
+/// 32 characters each. Both are composed into SQL, so both must come from
+/// the suite's own fixtures and never from anything a user supplies —
+/// this is test support, not a query builder.
+pub fn assert_stores_agree(db: &str, trace_ids: &[&str]) {
+    assert!(
+        !trace_ids.is_empty(),
+        "assert_stores_agree needs a trace id"
+    );
+    for id in trace_ids {
+        assert!(
+            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+            "{id:?} is not a 32-character hex trace id"
+        );
+    }
+    let in_list = trace_ids
+        .iter()
+        .map(|id| format!("unhex('{id}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let index_side = format!(
+        "SELECT trace_id, span_id, key, scope, val, val_type, val_num \
+         FROM {db}.trace_attrs_idx WHERE trace_id IN ({in_list})"
+    );
+    let span_side = format!(
+        "SELECT trace_id, span_id, k, s, v, t, n FROM {db}.trace_spans \
+         ARRAY JOIN attr_key AS k, attr_scope AS s, attr_val AS v, attr_type AS t, attr_num AS n \
+         WHERE trace_id IN ({in_list})"
+    );
+    let sql = format!(
+        "SELECT 'index_only' AS side, * FROM ({index_side} EXCEPT {span_side}) \
+         UNION ALL \
+         SELECT 'span_only' AS side, * FROM ({span_side} EXCEPT {index_side}) \
+         FORMAT TSV"
+    );
+    let body = clickhouse_query(&sql);
+    assert!(
+        body.trim().is_empty(),
+        "the attribute index and the span row disagree for {trace_ids:?} in {db}. Rows below are \
+         `side, trace_id, span_id, key, scope, val, val_type, val_num`; `index_only` means the \
+         index holds an element the span row does not, `span_only` the reverse. A search \
+         generates candidates from the index and reads the value from the span row, so a fixture \
+         whose two stores disagree produces a candidate that matches nothing or a kind the \
+         response renders wrong:\n{body}"
+    );
+}
+
+/// Runs one statement against the ClickHouse this run's suites use and
+/// returns its body, panicking on any transport failure or non-200.
+///
+/// `PULSUS_TEST_CH_HOST` / `PULSUS_TEST_CH_HTTP_PORT`, the same pair every
+/// live suite reads, with the same defaults. `pub` since issue #558, for
+/// the suites that read `system.query_log` to say which statements a
+/// request sent.
+pub fn clickhouse_query(sql: &str) -> String {
+    let host = std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port = std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string());
+    let url = format!("http://{host}:{port}/");
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--max-time",
+            "60",
+            "--data-binary",
+            "@-",
+        ])
+        .arg(&url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(sql.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap_or_else(|e| panic!("curl {url} could not be run: {e}"));
+    assert!(
+        out.status.success(),
+        "curl {url} exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (payload, status) = body
+        .rsplit_once('\n')
+        .unwrap_or_else(|| panic!("curl {url} wrote no status line: {body:?}"));
+    assert_eq!(
+        status.trim(),
+        "200",
+        "ClickHouse answered HTTP {} for:\n{sql}\n{payload}",
+        status.trim()
+    );
+    payload.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

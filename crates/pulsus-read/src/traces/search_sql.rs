@@ -11,10 +11,14 @@
 //! `UNION ALL` — plan v7 delta 1): an index-served top-K
 //! `GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT gen_cap+1`
 //! confined to the leaf's pruned prefix. Phase 2 renders the batched
-//! hydration and value reads over explicit candidate `trace_id` lists;
-//! since issue #557 the hydration statement also carries one predicate
-//! column per attribute condition, so a condition sends no read of its
-//! own.
+//! hydration read over explicit candidate `trace_id` lists; since issue
+//! #557 the hydration statement also carries one predicate column per
+//! attribute condition, so a condition sends no read of its own, and
+//! since issue #558 it carries the projected value, the numeric reading
+//! and the stored kind of every `select()` field, aggregate argument and
+//! `by()` key too — so those send no read of their own either. The one
+//! phase-2 attribute statement left is [`event_set_sql`], which expands
+//! a span's own event/link array.
 
 use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
@@ -55,7 +59,7 @@ pub(crate) const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
 
 /// The unaliased, unwrapped byte-bound truncation expression — the ONE
 /// definition of the cap (issue #184 plan v4: `byte_capped`,
-/// `byte_capped_agg`, and the [`trace_ctx_sql`] co-load's `argMin` value
+/// and the [`trace_ctx_sql`] co-load's `argMin` value
 /// projections all build on this single helper, so the cap length and
 /// fallback can never diverge between the displayed-root path and the
 /// trace-context co-load; the in-module AC-Δ1c/Δ1d/Δ1e tests pin the
@@ -77,14 +81,6 @@ pub(crate) fn byte_cap_expr(col: &str) -> String {
 /// [`hydration_sql`]/[`root_sql`] on `service`/`name`/`status_message`.
 fn byte_capped(col: &str) -> String {
     format!("{} AS {col}", byte_cap_expr(col))
-}
-
-/// The same byte-bound expression wrapped in `any(...)` for the
-/// aggregate `attr_values_sql` string arm (dedup replicas via
-/// `GROUP BY (trace_id, span_id)`), unaliased — the caller appends
-/// `AS v`.
-fn byte_capped_agg(col: &str) -> String {
-    format!("any({})", byte_cap_expr(col))
 }
 
 /// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
@@ -224,7 +220,11 @@ pub fn generator_sql(
     sql
 }
 
-/// One condition's span-row predicate column (issue #557).
+/// One attribute SLOT's span-row columns (issue #557, widened by #558).
+///
+/// A slot is a CONDITION's probe, a PROJECTED FIELD's locator, or an
+/// event/link set's WIDTH. The four rendered arrays share one index
+/// space, which [`super::search_plan::SlotLayout`] owns.
 ///
 /// The parts are already-rendered fragments: this module assembles them
 /// into a statement and never decides what a value test says.
@@ -234,9 +234,11 @@ pub struct ProbeColumn {
     pub with_items: Vec<String>,
     /// The positive `UInt8` test. Never negated — the reader inverts.
     pub test: String,
-    /// `(value, kind)` when a projection needs this probe's matched value
-    /// (issue #479), both read from the element `test` landed on.
-    pub value: Option<(String, String)>,
+    /// `(value, numeric, kind)` when something projects this slot's
+    /// value (issue #479 for the fused matched value, #558 for the
+    /// projected field and the set width), all three read at the element
+    /// `test` landed on.
+    pub value: Option<(String, String, String)>,
 }
 
 /// `arrayFirstIndex((k, s) -> k = <key> AND s = <scope>, attr_key, attr_scope) AS <alias>`
@@ -314,15 +316,40 @@ pub fn probe_chain(arms: &[(String, String)], fallback: &str) -> String {
     }
 }
 
-/// The byte-capped fused value and the stored kind, both read at `alias`
-/// (issue #557). The cap is [`byte_cap_expr`], the same one
-/// [`hydration_sql`] applies to `service`/`name`, so a projected
-/// attribute value obeys the same 8192-byte source truncation as every
-/// other projected string.
-pub fn probe_value_exprs(alias: &str) -> (String, String) {
+/// The byte-capped value, the numeric reading and the stored kind, all
+/// three subscripted at `alias` (issue #557; issue #558 adds the middle
+/// one). The cap is [`byte_cap_expr`], the same one [`hydration_sql`]
+/// applies to `service`/`name`, so a projected attribute value obeys the
+/// same 8192-byte source truncation as every other projected string.
+///
+/// **The number is READ, never derived from the text.** `attr_num` is
+/// the reading the writer stored, decided from the whole of
+/// `(scope, key, value)` — a link's `spanID` of `0000000000000001`
+/// stores `NULL` although the text parses as `1.0`
+/// (`crates/pulsus-write/src/protocols/otlp_traces.rs:748`). Computing
+/// the number from `attr_val` here would answer `1.0` there.
+pub fn probe_value_exprs(alias: &str) -> (String, String, String) {
     (
         byte_cap_expr(&format!("attr_val[{alias}]")),
+        format!("attr_num[{alias}]"),
         format!("attr_type[{alias}]"),
+    )
+}
+
+/// One event/link set's per-span WIDTH (issue #558) — how many values
+/// that span will contribute when the value statement expands its array.
+///
+/// `arrayCount` over `(attr_key, attr_scope)` reads those two arrays and
+/// NO other column, in particular not `attr_val` and not `attr_num`, so
+/// the pre-expansion bound costs no column read. The reader sums it over
+/// the batch's hydrated rows and refuses BEFORE issuing
+/// [`event_set_sql`], which is what `max_result_rows` cannot do: that
+/// setting is checked per BLOCK and `arrayJoin` emits one span's whole
+/// set as one block.
+pub fn set_width_expr(key_literal: &str, scope_literal: &str) -> String {
+    format!(
+        "arrayCount((k, s) -> k = {key_literal} AND s = {scope_literal}, \
+         attr_key, attr_scope)"
     )
 }
 
@@ -334,54 +361,68 @@ pub fn probe_value_exprs(alias: &str) -> (String, String) {
 /// physical summary columns and the span's own attribute arrays — never
 /// span payloads (`pulsus-read` stays OTLP-agnostic).
 ///
-/// **`probes` empty renders byte-for-byte what this builder rendered
+/// **`slots` empty renders byte-for-byte what this builder rendered
 /// before issue #557**, which is checkable rather than asserted: 27 of
-/// the 72 committed goldens plan no probe.
+/// the 72 committed goldens plan no slot.
 ///
 /// `shape` is NOT derived here. It is produced by
 /// `SearchPlan::hydration_shape()` and passed in, because the decoder
 /// calls the same method on the same plan and the two must be one value.
 ///
-/// The probe expressions are PROJECTIONS, never predicates: the `WHERE`
+/// The slot expressions are PROJECTIONS, never predicates: the `WHERE`
 /// clause does not move, so part and granule selection cannot change —
 /// gated by `tests/traces_search_explain.rs` against
 /// `SearchPlan::hydration_sql_without_probes_for`.
+///
+/// **The numeric array is always `CAST`** (issue #558). A slot needing no
+/// number renders the bare `NULL`, and in the commonest shape —
+/// `{ span.k = "x" }`, one probe fusing its matched value, no field, no
+/// width — EVERY element is `NULL`, which ClickHouse 26.3.29.7 types as
+/// `Array(Nullable(Nothing))`. That does not decode into
+/// `Vec<Option<f64>>`.
 pub fn hydration_sql(
     spans_table: &str,
     trace_ids: &[[u8; 16]],
     window: TimeWindow,
     max_spans_per_trace: usize,
     shape: HydrationShape,
-    probes: &[ProbeColumn],
+    slots: &[ProbeColumn],
 ) -> String {
     let mut with_clause = String::new();
     let mut probe_cols = String::new();
     if shape != HydrationShape::Plain {
-        let items: Vec<&str> = probes
+        let items: Vec<&str> = slots
             .iter()
             .flat_map(|p| p.with_items.iter().map(String::as_str))
             .collect();
         if !items.is_empty() {
             with_clause = format!("WITH {}\n", items.join(",\n     "));
         }
-        let tests: Vec<&str> = probes.iter().map(|p| p.test.as_str()).collect();
+        let tests: Vec<&str> = slots.iter().map(|p| p.test.as_str()).collect();
         probe_cols = format!(",\n       [{}] AS attr_slot", tests.join(", "));
         if shape == HydrationShape::ProbesAndValues {
-            // Every array carries exactly `probes.len()` elements and a
-            // probe no projection reads a value from carries the literal
-            // `''` — so no second index mapping exists to get wrong.
-            let values: Vec<&str> = probes
+            // Every array carries exactly `slots.len()` elements and a
+            // slot nothing reads a value from carries the literal `''`
+            // (or `NULL` in the numeric array) — so no second index
+            // mapping exists to get wrong.
+            let values: Vec<&str> = slots
                 .iter()
-                .map(|p| p.value.as_ref().map_or("''", |(v, _)| v.as_str()))
+                .map(|p| p.value.as_ref().map_or("''", |(v, _, _)| v.as_str()))
                 .collect();
-            let kinds: Vec<&str> = probes
+            let kinds: Vec<&str> = slots
                 .iter()
-                .map(|p| p.value.as_ref().map_or("''", |(_, t)| t.as_str()))
+                .map(|p| p.value.as_ref().map_or("''", |(_, _, t)| t.as_str()))
+                .collect();
+            let nums: Vec<&str> = slots
+                .iter()
+                .map(|p| p.value.as_ref().map_or("NULL", |(_, n, _)| n.as_str()))
                 .collect();
             probe_cols.push_str(&format!(
-                ",\n       [{}] AS attr_slot_val,\n       [{}] AS attr_slot_type",
+                ",\n       [{}] AS attr_slot_val,\n       [{}] AS attr_slot_type,\n       \
+                 CAST([{}] AS Array(Nullable(Float64))) AS attr_slot_num",
                 values.join(", "),
-                kinds.join(", ")
+                kinds.join(", "),
+                nums.join(", ")
             ));
         }
     }
@@ -472,61 +513,25 @@ pub fn membership_sql(
     )
 }
 
-/// Phase 2 — one attribute field's per-span value read over one batch
-/// (`avg(.attr)`-style aggregates read `val_num`; `select(.attr)` reads
-/// `val`). `any(…)` + `GROUP BY (trace_id, span_id)` dedups replays
-/// without `FINAL`.
-///
-/// **Both arms project `any(val_type) AS t`** (issue #510) so the response
-/// renders a value in the arm the sender stored it as, rather than in
-/// whichever of the two reads happened to answer. It is one more
-/// `LowCardinality(String)` column over rows already being read: the
-/// `WHERE` clause, the `(key, scope)` index prefix, the date/time
-/// pruning and the `trace_id IN` restriction are untouched, so part and
-/// granule selection cannot move — gated by
-/// `tests/traces_search_explain.rs`'s
-/// `attr_value_reads_keep_their_index_selection`.
-pub fn attr_values_sql(
-    attrs_table: &str,
-    key_literal: &str,
-    scope_literal: Option<&str>,
-    numeric: bool,
-    trace_ids: &[[u8; 16]],
-    window: TimeWindow,
-) -> String {
-    let value_col = if numeric {
-        "any(val_num) AS v, any(val_type) AS t".to_string()
-    } else {
-        format!("{} AS v, any(val_type) AS t", byte_capped_agg("val"))
-    };
-    let extra = if numeric {
-        "\n  AND isNotNull(val_num)"
-    } else {
-        ""
-    };
-    let scope_clause = match scope_literal {
-        Some(scope) => format!("\n  AND scope = {scope}"),
-        None => String::new(),
-    };
-    format!(
-        "SELECT trace_id, span_id, {value_col}\n\
-         FROM {attrs_table}\n\
-         WHERE {}\n  AND key = {key_literal}{scope_clause}{extra}\n  AND {}\n  AND {}\n\
-         GROUP BY trace_id, span_id",
-        date_clause(window),
-        time_clause(window),
-        trace_id_in(trace_ids)
-    )
-}
-
 /// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span values over
-/// one batch (issue #351): the values `{ .a = event:name }` compares
-/// against, **one row per value**.
+/// one batch (issue #351; moved off the attribute index onto the span
+/// row by issue #558): the values `{ .a = event:name }` compares against,
+/// **one row per value**.
 ///
-/// Index-served on the same `(key, scope)` prefix the literal form
-/// probes, plus the window's date/time pruning and the batch's
-/// `trace_id IN` restriction. Same rows read as the scalar
-/// [`attr_values_sql`] would read; only the projection differs.
+/// **It expands a RETAINED-ROW subquery.** The inner statement carries
+/// `hydration_sql`'s own `WHERE`, `ORDER BY` and
+/// `LIMIT max_spans_per_trace BY trace_id` — without the `+ 1` overflow
+/// probe row, which the reader discards — so the rows this expands are
+/// exactly the rows the reader evaluated. Expanding the whole window
+/// instead returns values for spans the search never evaluated, and the
+/// measured consequence is a false refusal: on one trace of 10,002 stored
+/// spans the unconstrained shape expanded 10,002 values where the reader
+/// evaluated 10,000, and at a 10,000-row result cap it answered code 396
+/// where the retained-row shape answered 200 with exactly 10,000 rows.
+///
+/// That identity is also what makes the pre-expansion bound exact: the
+/// sum of [`set_width_expr`] over the batch's hydrated rows IS this
+/// statement's physical row count.
 ///
 /// **NO aggregate — deliberately, and this is the memory contract, not a
 /// style choice.** The first cut of this read used
@@ -543,41 +548,57 @@ pub fn attr_values_sql(
 /// blow-up would have surfaced as a 500 rather than the required 422.
 ///
 /// Row-per-value restores the stated shape exactly: every row is
-/// fixed-width columns plus ONE byte-capped string, the read is bounded
-/// by `max_rows_to_read`/`max_bytes_to_read` (both `throw`, both already
-/// mapped to `422 query_too_broad`), and the executor charges each value
-/// against the retention budget BEFORE retaining it.
+/// fixed-width columns plus ONE byte-capped string, and the executor
+/// charges each value against the retention budget BEFORE retaining it.
 ///
 /// **Duplicate rows need no server-side `DISTINCT`.** At-least-once
 /// replays can repeat a value, and repetition is inert under both
 /// matching rules: ANY-match is unaffected by a repeat, and ALL-match
 /// compares `matchCount == elemCount`, which a duplicated element
-/// increments on both sides. Dropping the `DISTINCT` removes the last
-/// server-side hash state from this read.
+/// increments on both sides. `trace_spans` is a plain MergeTree, so a
+/// replay duplicates the whole span row and therefore the whole set.
 ///
-/// String values are byte-capped with the shared cap helper, exactly as
-/// the scalar `val` read caps its one value, so both sides of a
-/// comparison are capped consistently.
+/// A span whose filtered array is empty emits no row at all, which is the
+/// empty set — the answer an absent index row gave before.
 pub fn event_set_sql(
-    attrs_table: &str,
+    spans_table: &str,
     set: super::filter::EventSetField,
     trace_ids: &[[u8; 16]],
     window: TimeWindow,
+    max_spans_per_trace: usize,
 ) -> String {
-    let (value_col, extra) = if set.is_numeric() {
-        ("val_num AS v".to_string(), "\n  AND isNotNull(val_num)")
+    let key = escape::ch_string(set.key());
+    let scope = escape::ch_string(set.scope());
+    let (inner_col, value_expr) = if set.is_numeric() {
+        (
+            "attr_num",
+            format!(
+                "arrayJoin(arrayFilter((n, k, s) -> k = {key} AND s = {scope} \
+                 AND isNotNull(n), attr_num, attr_key, attr_scope)) AS v"
+            ),
+        )
     } else {
-        (format!("{} AS v", byte_cap_expr("val")), "")
+        (
+            "attr_val",
+            format!(
+                "arrayJoin(arrayMap(x -> {}, \
+                 arrayFilter((v, k, s) -> k = {key} AND s = {scope}, \
+                 attr_val, attr_key, attr_scope))) AS v",
+                byte_cap_expr("x")
+            ),
+        )
     };
     format!(
-        "SELECT trace_id, span_id, {value_col}\n\
-         FROM {attrs_table}\n\
-         WHERE {}\n  AND key = {}\n  AND scope = {}{extra}\n  AND {}\n  AND {}",
-        date_clause(window),
-        escape::ch_string(set.key()),
-        escape::ch_string(set.scope()),
+        "SELECT trace_id, span_id, {value_expr}\n\
+         FROM (\n  \
+         SELECT trace_id, span_id, attr_key, attr_scope, {inner_col}\n  \
+         FROM {spans_table}\n  \
+         WHERE {}\n    AND {}\n  \
+         ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n  \
+         LIMIT {max_spans_per_trace} BY trace_id\n\
+         )",
+        trace_id_in(trace_ids),
         time_clause(window),
-        trace_id_in(trace_ids)
     )
 }
 
@@ -696,12 +717,23 @@ mod tests {
     /// down another layer.
     ///
     /// What the exactness buys, all at once and without a separate
-    /// assertion for each: no aggregate and no subquery anywhere; the
-    /// `(key, scope)` index prefix; date, time and batch pruning; the
-    /// byte-capped `val` for the three string members and `val_num` +
-    /// `isNotNull` for the numeric one; and one row per value, which is
-    /// the memory contract (`traces::exec`'s Layer-1 residual bound —
-    /// an array column would be row-unbounded).
+    /// assertion for each: no aggregate anywhere; the batch's `trace_id`
+    /// restriction and the request window; the byte cap applied to each
+    /// expanded element for the three string members and `isNotNull` on
+    /// the numeric one; and one row per value, which is the memory
+    /// contract (`traces::exec`'s Layer-1 residual bound — an array
+    /// column would be row-unbounded).
+    ///
+    /// **Issue #558 puts a subquery in this statement on purpose, and
+    /// the exactness is what makes that visible.** The read moved off
+    /// `trace_attrs_idx` onto the span row's own arrays, and the inner
+    /// statement is the RETAINED-ROW set: `hydration_sql`'s own
+    /// `ORDER BY` and `LIMIT MAX_SPANS_PER_TRACE BY trace_id`, without
+    /// the `+ 1` overflow probe row the reader discards. Expanding the
+    /// whole window instead returns values for spans the search never
+    /// evaluated. The clause to look at is therefore
+    /// `LIMIT 10000 BY trace_id` inside the `FROM (…)`: removing it is
+    /// what this string refuses.
     ///
     /// The goldens pin two of these four through a planned query; this
     /// pins all four at the builder, including both link intrinsics,
@@ -712,49 +744,56 @@ mod tests {
         let cases: [(EventSetField, &str); 4] = [
             (
                 EventSetField::EventName,
-                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
-                 FROM trace_attrs_idx\n\
-                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
-                 \x20 AND key = 'name'\n\
-                 \x20 AND scope = 'event:intrinsic'\n\
-                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
-                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+                "SELECT trace_id, span_id, arrayJoin(arrayMap(x -> if(length(x) <= 8192, x, substringUTF8(x, 1, 2048)), arrayFilter((v, k, s) -> k = 'name' AND s = 'event:intrinsic', attr_val, attr_key, attr_scope))) AS v\n\
+                 FROM (\n\
+                 \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
+                 \x20\x20FROM trace_spans\n\
+                 \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
+                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
+                 \x20\x20LIMIT 10000 BY trace_id\n\
+                 )",
             ),
             (
                 EventSetField::EventTimeSinceStart,
-                "SELECT trace_id, span_id, val_num AS v\n\
-                 FROM trace_attrs_idx\n\
-                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
-                 \x20 AND key = 'timeSinceStart'\n\
-                 \x20 AND scope = 'event:intrinsic'\n\
-                 \x20 AND isNotNull(val_num)\n\
-                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
-                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+                "SELECT trace_id, span_id, arrayJoin(arrayFilter((n, k, s) -> k = 'timeSinceStart' AND s = 'event:intrinsic' AND isNotNull(n), attr_num, attr_key, attr_scope)) AS v\n\
+                 FROM (\n\
+                 \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_num\n\
+                 \x20\x20FROM trace_spans\n\
+                 \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
+                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
+                 \x20\x20LIMIT 10000 BY trace_id\n\
+                 )",
             ),
             (
                 EventSetField::LinkSpanId,
-                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
-                 FROM trace_attrs_idx\n\
-                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
-                 \x20 AND key = 'spanID'\n\
-                 \x20 AND scope = 'link:intrinsic'\n\
-                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
-                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+                "SELECT trace_id, span_id, arrayJoin(arrayMap(x -> if(length(x) <= 8192, x, substringUTF8(x, 1, 2048)), arrayFilter((v, k, s) -> k = 'spanID' AND s = 'link:intrinsic', attr_val, attr_key, attr_scope))) AS v\n\
+                 FROM (\n\
+                 \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
+                 \x20\x20FROM trace_spans\n\
+                 \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
+                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
+                 \x20\x20LIMIT 10000 BY trace_id\n\
+                 )",
             ),
             (
                 EventSetField::LinkTraceId,
-                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
-                 FROM trace_attrs_idx\n\
-                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
-                 \x20 AND key = 'traceID'\n\
-                 \x20 AND scope = 'link:intrinsic'\n\
-                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
-                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+                "SELECT trace_id, span_id, arrayJoin(arrayMap(x -> if(length(x) <= 8192, x, substringUTF8(x, 1, 2048)), arrayFilter((v, k, s) -> k = 'traceID' AND s = 'link:intrinsic', attr_val, attr_key, attr_scope))) AS v\n\
+                 FROM (\n\
+                 \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
+                 \x20\x20FROM trace_spans\n\
+                 \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
+                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
+                 \x20\x20LIMIT 10000 BY trace_id\n\
+                 )",
             ),
         ];
         for (set, expected) in cases {
             assert_eq!(
-                event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W),
+                event_set_sql("trace_spans", set, &[[7u8; 16]], W, 10_000),
                 expected,
                 "{set:?}: the value read is asserted EXACTLY — any difference, including \
                  an appended clause, a nested subquery, a re-casing or a whitespace \
@@ -899,9 +938,9 @@ mod tests {
     /// Issue #57 re-audit AC-A1 (+ issue #184): the byte-bound truncation
     /// expression appears in every string-returning Phase-2 builder
     /// (hydration/root plain columns — `status_message` included since
-    /// issue #184 — the `attr_values_sql` string arm, and the trace-context
-    /// co-load's root projections) and NOWHERE in the generator/membership/
-    /// numeric-value SQL rendered HERE — the cap is a response/evaluation
+    /// issue #184 — the `event_set_sql` string arm, and the trace-context
+    /// co-load's root projections) and NOWHERE in the generator/membership
+    /// SQL rendered HERE — the cap is a response/evaluation
     /// concern, with exactly one predicate exception living in
     /// `filter::physical_sql` (issue #184 code review): the `statusMessage`
     /// Phase-1 predicate compares the capped column via the shared helper
@@ -938,18 +977,29 @@ mod tests {
         let root = root_sql("trace_spans", &[[7u8; 16]]);
         assert!(root.contains(&needle), "{root}");
 
+        // Issue #558: the event/link set reads the span row's own array,
+        // and caps each expanded element with the SAME helper.
         let val_needle = format!(
-            "any(if(length(val) <= {TRACE_STR_COL_CAP}, val, \
-             substringUTF8(val, 1, {TRACE_STR_COL_CP_FALLBACK}))) AS v"
+            "if(length(x) <= {TRACE_STR_COL_CAP}, x, \
+             substringUTF8(x, 1, {TRACE_STR_COL_CP_FALLBACK}))"
         );
-        let select_values =
-            attr_values_sql("trace_attrs_idx", "'foo'", None, false, &[[7u8; 16]], W);
-        assert!(select_values.contains(&val_needle), "{select_values}");
-        // The numeric arm is untouched — no cap expression, plain
-        // `any(val_num) AS v`.
-        let agg_values = attr_values_sql("trace_attrs_idx", "'foo'", None, true, &[[7u8; 16]], W);
-        assert!(!agg_values.contains("substringUTF8"), "{agg_values}");
-        assert_eq!(agg_values.matches("any(val_num) AS v").count(), 1);
+        let names = event_set_sql(
+            "trace_spans",
+            super::super::filter::EventSetField::EventName,
+            &[[7u8; 16]],
+            W,
+            10_000,
+        );
+        assert!(names.contains(&val_needle), "{names}");
+        // The numeric arm is untouched — no cap expression.
+        let offsets = event_set_sql(
+            "trace_spans",
+            super::super::filter::EventSetField::EventTimeSinceStart,
+            &[[7u8; 16]],
+            W,
+            10_000,
+        );
+        assert!(!offsets.contains("substringUTF8"), "{offsets}");
 
         // Generator/membership SQL never truncates — never touches
         // strings at all, and carries no `substringUTF8`.
@@ -969,21 +1019,15 @@ mod tests {
         assert!(!child_counts.contains("substringUTF8"), "{child_counts}");
     }
 
-    /// Issue #184 plan v4: `byte_capped`/`byte_capped_agg` are built ON
-    /// `byte_cap_expr` (its render is a substring of both), and the cap
-    /// literals are unchanged — the coder verification gate half covering
-    /// the displayed-root path.
+    /// Issue #184 plan v4: `byte_capped` is built ON `byte_cap_expr` (its
+    /// render is a substring), and the cap literals are unchanged — the
+    /// coder verification gate half covering the displayed-root path.
     #[test]
     fn byte_capped_wrappers_derive_from_the_shared_cap_expression() {
         assert!(byte_capped("name").contains(&byte_cap_expr("name")));
-        assert!(byte_capped_agg("val").contains(&byte_cap_expr("val")));
         assert_eq!(
             byte_capped("name"),
             format!("{} AS name", byte_cap_expr("name"))
-        );
-        assert_eq!(
-            byte_capped_agg("val"),
-            format!("any({})", byte_cap_expr("val"))
         );
     }
 

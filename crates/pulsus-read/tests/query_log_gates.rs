@@ -1829,8 +1829,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         ),
         format!(
             "INSERT INTO {run_db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-             SELECT toDate({date_days}), 'http.status_code', '500', 'span', NULL, \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
+             SELECT toDate({date_days}), 'http.status_code', '500', 'span', 'int', 500., \
                     {ts_ns} + number, unhex('{trace_hex}'), \
                     reinterpretAsFixedString(toUInt64(number + 1)), 1000000 \
              FROM numbers(64)"
@@ -1851,6 +1852,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
         max_series: 1_000,
         generator_max_memory_bytes: MEM_CEILING,
         // The surface-wide ceiling under test. Set equal to the generator's

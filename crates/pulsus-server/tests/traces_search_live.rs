@@ -296,6 +296,17 @@ fn kv_int(key: &str, value: i64) -> KeyValue {
     }
 }
 
+/// A `double` attribute (issue #558's fourth stored kind).
+fn kv_double(key: &str, value: f64) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::DoubleValue(value)),
+        }),
+        key_strindex: 0,
+    }
+}
+
 fn tid(n: u8) -> [u8; 16] {
     let mut id = [0u8; 16];
     id[15] = n;
@@ -1816,7 +1827,18 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     let port = 31_136;
     let db = &pulsus_testkit::test_db("pulsus_traces_search_it_f");
     drop_db(db).await;
-    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50")]);
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50"),
+            // Issue #558: the VALUE count is what the refusal is about
+            // now. The row budget stays at 50 because the
+            // `{ name = "ev-bulk" }` control below exists to show the
+            // budget is not already exhausted without the event read.
+            ("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", "50"),
+        ],
+    );
 
     let base = now_s() - 3_600;
     let (w0, w1) = (base, base + 600);
@@ -1846,20 +1868,84 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         "{ctx}: the budget must not already be exhausted without the event read"
     );
 
-    // The event value read is the only attrs read here, and its rows
-    // exceed the 50-row budget: a clean 422, never an unbounded
-    // materialization.
+    // The 400 event values exceed the 50-value budget: a clean 422, never
+    // an unbounded materialization.
+    //
+    // **Issue #558 changed which quantity is compared, and the message
+    // says so.** Before, the refusal was `max_rows_to_read` on the index
+    // read — the body read
+    // `query too broad: trace scan budget of 50 rows exceeded`. Now the
+    // reader sums the per-span widths the hydration statement projected
+    // and refuses BEFORE the value statement exists, so the body names
+    // the value budget and the count. Both bodies contain "budget", which
+    // is why this assertion does not move.
     let ctx = "wide-event-set-is-422";
     let wide_query = "{ name != event:name }";
     let path = format!(
         "/api/traces/v1/search?q={}&start={w0}&end={w1}",
         enc(wide_query)
     );
+    // The mark for the query-log reading below, taken on the DATABASE's
+    // own clock just before the request. `system.query_log` outlives
+    // databases, so a filter on the database name alone would count this
+    // test's previous runs — which it did, and read two expansions from a
+    // run before the bound existed.
+    let mark = pulsus_testkit::clickhouse_query("SELECT toString(now64(6)) FORMAT TSV")
+        .trim()
+        .to_string();
     let res = get(port, &path, ctx);
     let body = assert_error_body(&res, 422, ctx);
     assert!(
         body.contains("budget"),
         "{ctx}: a wide event set must be refused, {body:?}"
+    );
+    assert!(
+        body.contains("value budget of 50 values") && body.contains("400 values in this batch"),
+        "{ctx}: the refusal must name the VALUE budget and the count it measured, so a reader          can tell a pre-expansion refusal from the row budget firing: {body:?}"
+    );
+
+    // **The distinction the message alone cannot make**: that no set was
+    // expanded. `system.query_log` for this database must carry the batch
+    // hydration statement — the one that returned the widths — and NO
+    // statement expanding a span's array. Before issue #558 the refusal
+    // came from the read the expansion was already inside, so a body
+    // saying "422" could not tell a pre-expansion refusal from one
+    // expanded block of 400.
+    //
+    // The reader's pool connects with this run's own database, so
+    // `current_database` is one half of the filter and the mark taken
+    // above is the other: the database name is unique to this PREFIX, not
+    // to this RUN, and `system.query_log` outlives the database. The
+    // reading itself runs against `default`, so it is outside its own
+    // filter. The count settles rather than being read once:
+    // `SYSTEM FLUSH LOGS` is not a barrier.
+    let ctx = "no-arrayjoin-statement-for-the-refused-request";
+    let counts = pulsus_testkit::settle_by(
+        Instant::now() + Duration::from_secs(60),
+        Duration::from_millis(500),
+        ctx,
+        || {
+            pulsus_testkit::clickhouse_query("SYSTEM FLUSH LOGS");
+            let row = pulsus_testkit::clickhouse_query(&format!(
+                "SELECT countIf(query LIKE '%attr_slot%') AS hydrations, \
+                        countIf(query LIKE '%arrayJoin%') AS expansions \
+                 FROM system.query_log \
+                 WHERE type = 'QueryStart' AND current_database = '{db}' \
+                   AND event_time_microseconds >= toDateTime64('{mark}', 6) \
+                 FORMAT TSV"
+            ));
+            let cells: Vec<String> = row.trim().split('\t').map(str::to_string).collect();
+            match cells.as_slice() {
+                [h, _] if h != "0" => Some(cells.clone()),
+                _ => None,
+            }
+        },
+    );
+    assert_eq!(
+        counts[1], "0",
+        "{ctx}: the reader refused from the widths the hydration statement returned, so no \
+         statement expanding a span's event array may have been sent. Counts \
+         (hydration-shaped, arrayJoin-shaped): {counts:?}"
     );
 
     // The SUCCESS control, on a second server over the SAME database with
@@ -2908,15 +2994,40 @@ async fn a_numeric_condition_tests_the_located_element_and_nothing_further() {
 /// 4  two links carrying lk = l1 / l2
 /// ```
 ///
-/// **The two negated rows freeze a divergence from the reference pending
-/// the #558 ruling**, and say so in their own assertion message: the
-/// reference returns the c1/c2/c3 span for `{ event.code != "c3" }` and
-/// for `{ event.code != "zz" }`, where we return the other two spans and
-/// all three spans respectively. The ledger entries are
+/// **The two negated rows are a RULED divergence from the reference**,
+/// and say so in their own assertion message. The owner ruled on
+/// 2026-09-18 that today's answer stands: `!=` and `!~` on an event or
+/// link attribute are all-match, so a span is returned only when none of
+/// its events satisfies the positive condition, and a span carrying no
+/// such key is returned.
+///
+/// ```text
+///   span emits three events
+///     event.level = "info"     connection acquired
+///     event.level = "warn"     slow query
+///     event.level = "error"    query failed
+///
+///   { event.level != "error" }
+///     ours       span not returned   -- it errored
+///     reference  span returned       -- "info" and "warn" are not "error"
+/// ```
+///
+/// Under the reference's reading a span that errored comes back when the
+/// query asked for spans that did not, and any span with two or more
+/// events always carries something that differs — which makes it
+/// impossible to filter out spans holding a particular event. That is why
+/// we are correct here and the reference is not.
+///
+/// **What the ruling changed is the stated BASIS, not the behaviour.**
+/// The 2026-08-05 ruling said all-match was the reference's own designed
+/// multi-value rule. Measurement at the pinned digest shows it is not,
+/// for the attribute-versus-literal form: the reference returns the
+/// c1/c2/c3 span for `{ event.code != "c3" }` and for
+/// `{ event.code != "zz" }`, and it does NOT return spans with no events,
+/// where we do. The ledger entries are
 /// `traceql-event-link-operand-any-match` (the all-match direction) and
-/// `2026-07-16-negation-matches-missing-key` (the absent-key direction).
-/// A later change there is an application of that ruling, not a
-/// regression here.
+/// `2026-07-16-negation-matches-missing-key` (the absent-key direction),
+/// and both keep their measured rows.
 #[tokio::test]
 async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
     if !should_run() {
@@ -3014,20 +3125,21 @@ async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
         );
     }
 
-    // The negated direction, FROZEN and divergent. Both rows are marked
-    // in their own message so a later change reads as the ruling being
-    // applied rather than as a test breaking.
-    const PENDING: &str = "frozen pending the issue #558 ruling; the reference answers \
-                           differently and the divergence is recorded as \
-                           `traceql-event-link-operand-any-match` and \
-                           `2026-07-16-negation-matches-missing-key`";
+    // The negated direction: a RULED divergence, not a pending one. The
+    // owner ruled on 2026-09-18 that today's answer stands, because the
+    // reference's reading returns a span that errored to a query asking
+    // for spans that did not.
+    const RULED: &str = "a deliberate divergence the owner ruled on 2026-09-18: all-match is \
+                         correct and the reference is wrong here, recorded as \
+                         `traceql-event-link-operand-any-match` and \
+                         `2026-07-16-negation-matches-missing-key`";
     let ctx = "event-code-neq-c3";
     let res = search(port, r#"{ event.code != "c3" }"#, w0, w1, "", ctx);
     assert_eq!(
         trace_set(&res.json(ctx)),
         ids(&[2, 3]),
         "{ctx}: a span one of whose events matches is EXCLUDED, and a span with no `code` \
-         matches — {PENDING} (the reference returns the c1/c2/c3 span)"
+         matches — {RULED} (the reference returns the c1/c2/c3 span)"
     );
     let ctx = "event-code-neq-zz";
     let res = search(port, r#"{ event.code != "zz" }"#, w0, w1, "", ctx);
@@ -3035,7 +3147,7 @@ async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
         trace_set(&res.json(ctx)),
         ids(&[1, 2, 3]),
         "{ctx}: no event carries `zz`, so every span matches, the two with no `code` \
-         included — {PENDING} (the reference returns the c1/c2/c3 span only)"
+         included — {RULED} (the reference returns the c1/c2/c3 span only)"
     );
 
     drop_db(db).await;
@@ -3082,7 +3194,15 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
             "op",
             ts(base, n as i64),
             MS,
-            vec![kv_str("k", "x"), kv_str("j", "x")],
+            vec![
+                kv_str("k", "x"),
+                kv_str("j", "x"),
+                // Issue #558: a `select()` field and an aggregate
+                // argument, so the third row of the table below plans two
+                // value reads and its count is non-vacuous.
+                kv_str("foo", "F"),
+                kv_int("retries", 3),
+            ],
         );
         ingest(port, vec![s], checkout_resource(), "counted");
     }
@@ -3171,12 +3291,22 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
         .expect("micros fit an i64")
     }
 
-    for (q, probes) in [
+    // `(query, how many statements a build that had not moved the reads
+    // onto the hydration statement would send beyond the three)`.
+    for (q, extra) in [
         (r#"{ span.k = "x" }"#, 1usize),
         (r#"{ span.k = "x" && span.j = "x" }"#, 2usize),
+        // Issue #558 criterion 10: no attribute CONDITION at all —
+        // `resource.service.name` is a physical column — and two value
+        // reads, one `select()` field and one aggregate argument. Before,
+        // this query sent five statements.
+        (
+            r#"{ resource.service.name = "checkout" } | avg(span.retries) > 1 | select(span.foo)"#,
+            2usize,
+        ),
     ] {
         // (b) the product's own census.
-        let ctx = format!("explain-stages-{probes}-probe");
+        let ctx = format!("explain-stages-plus-{extra}");
         let path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(q));
         let raw = request_with_headers(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
             .unwrap_or_else(|| panic!("{ctx}: the explained request must be reachable"));
@@ -3202,7 +3332,8 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
                 "phase2_hydration".to_string(),
                 "root_hydration".to_string(),
             ],
-            "{ctx}: {q} must push exactly three stages — an attribute condition adds none: \
+            "{ctx}: {q} must push exactly three stages — an attribute condition adds none, \
+             and since issue #558 nor does a `select()` field or an aggregate argument: \
              {body}"
         );
 
@@ -3221,8 +3352,9 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
             settled(&admin, db, since).await,
             3,
             "{ctx}: {q} — one generator, one hydration read, one root read. A build still \
-             issuing a membership read per probe would count {}",
-            3 + probes
+             issuing a membership read per probe, or a value read per projected field, would \
+             count {}",
+            3 + extra
         );
     }
 
@@ -3368,6 +3500,476 @@ async fn an_unscoped_condition_reaches_five_attribute_scopes_and_no_intrinsic_on
         assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
         assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
     }
+
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #558 — the projected value comes from the span row
+// ---------------------------------------------------------------------
+
+/// Every span object of the first spanSet of one trace, in response
+/// order (issue #558).
+fn spans_of_trace(json: &serde_json::Value, trace_hex: &str, ctx: &str) -> Vec<serde_json::Value> {
+    json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no traces in {json}"))
+        .iter()
+        .find(|t| t["traceID"].as_str() == Some(trace_hex))
+        .unwrap_or_else(|| panic!("{ctx}: trace {trace_hex} is not in {json}"))["spanSets"][0]
+        ["spans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One span object's projected `(key, "<arm>=<text>")` pairs (issue
+/// #510's type-tagged form, so a wrong wire arm fails instead of reading
+/// as an absent value).
+fn tagged_attrs(span: &serde_json::Value) -> Vec<(String, String)> {
+    span["attributes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            let v = &a["value"];
+            let tagged = ["stringValue", "intValue", "doubleValue", "boolValue"]
+                .iter()
+                .find_map(|arm| {
+                    v.get(*arm).map(|x| {
+                        let text = x
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| x.to_string());
+                        format!("{arm}={text}")
+                    })
+                })
+                .unwrap_or_else(|| format!("<no arm> {v}"));
+            (a["key"].as_str().unwrap_or_default().to_string(), tagged)
+        })
+        .collect()
+}
+
+/// Issue #558 criteria 1, 2 and 3 — **which element a repeated
+/// attribute key resolves to, and that its value and its kind come from
+/// that one element.**
+///
+/// Fixture A, ingested through `POST /v1/traces` so the parser writes the
+/// attribute index and the span row's arrays from one record:
+///
+/// ```text
+///   trace 1   span.dup = 7   then  span.dup = 5     two elements, one scope
+///   trace 2   resource.k = "R"  and  span.k = "S"   two scopes, resource stored FIRST
+///   trace 3   span.n = "abc"  then  span.n = 5      two elements, one scope, two KINDS
+///   trace 4   span.e = ""                           present and empty
+///   trace 5   no attributes at all
+/// ```
+///
+/// * **criterion 1** — the answer is the FIRST element within the
+///   highest-precedence scope present, so trace 1 renders `7` under
+///   `select(span.dup)`, is returned by `avg(span.dup) > 6` and not by
+///   `> 7`, and produces the single group `7` under `by(span.dup)`. The
+///   base answered `5` to all four: the old read took `any(val)` over a
+///   `GROUP BY`, which is arbitrary and unstable across merges.
+/// * **criterion 2** — the rule is first-within-the-highest-precedence-
+///   scope-PRESENT, not first in the array. `resource.k` is stored first
+///   (`crates/pulsus-write/src/protocols/otlp_traces.rs`), and `.k` still
+///   renders `"S"`.
+/// * **criterion 3** — the value and its declared kind come from the SAME
+///   element. Trace 3's first `n` is the string `"abc"`, whose `attr_num`
+///   is NULL, so `select(span.n)` renders `stringValue` and
+///   `avg(span.n) > 0` returns NO traces — where the base returned the
+///   trace, because its numeric read filtered on `isNotNull(val_num)` and
+///   so saw the SECOND element while the text read could see the first.
+#[tokio::test]
+async fn a_repeated_attribute_key_resolves_to_one_element_value_and_kind() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_241;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_l");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    for (n, name, attrs) in [
+        (
+            1u8,
+            "dup-7-then-5",
+            vec![kv_int("dup", 7), kv_int("dup", 5)],
+        ),
+        (
+            3u8,
+            "n-abc-then-5",
+            vec![kv_str("n", "abc"), kv_int("n", 5)],
+        ),
+        (4u8, "e-empty", vec![kv_str("e", "")]),
+        (5u8, "no-attrs", vec![]),
+    ] {
+        let s = span(tid(n), sid(1), None, name, ts(base, n as i64), MS, attrs);
+        ingest(port, vec![s], checkout_resource(), name);
+    }
+    // Trace 2 needs `k` at BOTH scopes, and a resource attribute is the
+    // only way to put one there.
+    let s2 = span(
+        tid(2),
+        sid(1),
+        None,
+        "k-R-and-S",
+        ts(base, 2),
+        MS,
+        vec![kv_str("k", "S")],
+    );
+    ingest(
+        port,
+        vec![s2],
+        vec![kv_str("service.name", "checkout"), kv_str("k", "R")],
+        "k-R-and-S",
+    );
+
+    pulsus_testkit::assert_stores_agree(
+        db,
+        &[
+            &hex(&tid(1)),
+            &hex(&tid(2)),
+            &hex(&tid(3)),
+            &hex(&tid(4)),
+            &hex(&tid(5)),
+        ],
+    );
+
+    // ---- criterion 1 ---------------------------------------------------
+    let ctx = "dup-select";
+    let res = search(port, r#"{ } | select(span.dup)"#, w0, w1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    let json = res.json(ctx);
+    let spans = spans_of_trace(&json, &hex(&tid(1)), ctx);
+    assert_eq!(
+        tagged_attrs(&spans[0]),
+        vec![("dup".to_string(), "intValue=7".to_string())],
+        "{ctx}: the FIRST element of the highest-precedence scope present, \
+         not whichever row an aggregate reached: {json}"
+    );
+    // Every other trace carries no `dup` and renders no entry for it.
+    for n in [2u8, 3, 4, 5] {
+        let other = spans_of_trace(&json, &hex(&tid(n)), ctx);
+        assert!(
+            !tagged_attrs(&other[0]).iter().any(|(k, _)| k == "dup"),
+            "{ctx}: trace {n} carries no dup, so it projects no dup entry: {json}"
+        );
+    }
+
+    for (q, expected, ctx) in [
+        (r#"{ } | avg(span.dup) > 6"#, ids(&[1]), "dup-avg-gt-6"),
+        (
+            r#"{ } | avg(span.dup) > 7"#,
+            BTreeSet::new(),
+            "dup-avg-gt-7",
+        ),
+        (r#"{ } | select(span.n)"#, ids(&[1, 2, 3, 4, 5]), "n-select"),
+        (r#"{ } | avg(span.n) > 0"#, BTreeSet::new(), "n-avg-gt-0"),
+        (r#"{ } | select(span.e)"#, ids(&[1, 2, 3, 4, 5]), "e-select"),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200");
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
+
+    let ctx = "dup-by";
+    let res = search(port, r#"{ } | by(span.dup)"#, w0, w1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    let json = res.json(ctx);
+    let one = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no traces in {json}"))
+        .iter()
+        .find(|t| t["traceID"].as_str() == Some(&hex(&tid(1))))
+        .unwrap_or_else(|| panic!("{ctx}: trace 1 must be returned: {json}"));
+    let sets = one["spanSets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no spanSets: {json}"));
+    assert_eq!(sets.len(), 1, "{ctx}: one group for one span: {json}");
+    assert_eq!(
+        sets[0]["attributes"][0]["value"]["intValue"], "7",
+        "{ctx}: the group key is the element the rule resolves to: {json}"
+    );
+
+    // ---- criterion 2 ---------------------------------------------------
+    let ctx = "unscoped-k-scope-precedence";
+    let res = search(port, r#"{ } | select(.k)"#, w0, w1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    let json = res.json(ctx);
+    let spans = spans_of_trace(&json, &hex(&tid(2)), ctx);
+    assert_eq!(
+        tagged_attrs(&spans[0]),
+        vec![("k".to_string(), "stringValue=S".to_string())],
+        "{ctx}: span scope wins over resource scope even though the resource element is \
+         stored FIRST — the rule is first-within-the-highest-precedence-scope-present, not \
+         first in the array: {json}"
+    );
+
+    // ---- criterion 3 ---------------------------------------------------
+    let ctx = "n-select-kind";
+    let res = search(port, r#"{ } | select(span.n)"#, w0, w1, "", ctx);
+    let json = res.json(ctx);
+    let spans = spans_of_trace(&json, &hex(&tid(3)), ctx);
+    assert_eq!(
+        tagged_attrs(&spans[0]),
+        vec![("n".to_string(), "stringValue=abc".to_string())],
+        "{ctx}: the value and its declared kind come from ONE element, so the string arm \
+         carries the string element's text: {json}"
+    );
+
+    // `span.e` is present and EMPTY, which is not absent.
+    let ctx = "e-select-empty";
+    let res = search(port, r#"{ } | select(span.e)"#, w0, w1, "", ctx);
+    let json = res.json(ctx);
+    let spans = spans_of_trace(&json, &hex(&tid(4)), ctx);
+    assert_eq!(
+        tagged_attrs(&spans[0]),
+        vec![("e".to_string(), "stringValue=".to_string())],
+        "{ctx}: present and empty renders an entry; absent renders none: {json}"
+    );
+    // …and a span with no attributes at all renders no entry.
+    let spans = spans_of_trace(&json, &hex(&tid(5)), ctx);
+    assert!(
+        tagged_attrs(&spans[0]).is_empty(),
+        "{ctx}: a span with no attributes projects nothing: {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #558 — **the unscoped chain does not reach the writer-reserved
+/// intrinsic scopes for a VALUE read either.**
+///
+/// One span with no `span.name` and no `resource.name`, carrying one
+/// event named `"evQ"`. The event's name is stored under the writer's
+/// reserved `event:intrinsic` scope, and `filter::UNSCOPED_SCOPE_CHAIN`
+/// names the five ATTRIBUTE scopes only.
+///
+/// This is an answer change the issue body does not state, in the
+/// direction issue #557 shipped for the CONDITION: the base rendered
+/// `{"key":"name","value":{"stringValue":"evQ"}}`, because the old value
+/// read rendered no scope clause at all and `any()` reached every scope
+/// the key appeared at. Ledger entry
+/// `traceql-unscoped-attribute-scope-reach`.
+#[tokio::test]
+async fn an_unscoped_value_read_skips_the_reserved_intrinsic_scopes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_242;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+    let start = ts(base, 1);
+
+    let mut s = span(tid(1), sid(1), None, "only-an-event", start, MS, vec![]);
+    s.events = vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+        time_unix_nano: start + 1_000_000,
+        name: "evQ".to_string(),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+    }];
+    ingest(port, vec![s], checkout_resource(), "only-an-event");
+
+    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1))]);
+
+    let ctx = "unscoped-name-value";
+    let res = search(port, r#"{ } | select(.name)"#, w0, w1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    let json = res.json(ctx);
+    assert_eq!(trace_set(&json), ids(&[1]), "{ctx}: the trace is returned");
+    let spans = spans_of_trace(&json, &hex(&tid(1)), ctx);
+    assert!(
+        !tagged_attrs(&spans[0]).iter().any(|(k, _)| k == "name"),
+        "{ctx}: the only stored `name` element sits at the reserved event:intrinsic scope, \
+         which the five-scope chain does not reach, so the trace comes back with NO name \
+         entry: {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #558 §2 — **a mixed projection reads every field from its own
+/// element, and every kind from the element its value came from.**
+///
+/// Fixture C, one span:
+///
+/// ```text
+///   span.a = "x2"   then  span.a = "x1"      two elements, same key, same scope
+///   span.b = 9      then  span.b = 2         the same, numeric
+///   resource.c = "R"  and  span.c = "y"      two scopes, resource stored FIRST
+///   span.d = 4.5                             one element, the fourth kind
+/// ```
+///
+/// One query carries two distinct `select()` fields and two distinct
+/// aggregate fields, so the plan renders four field slots in one slot
+/// space, and each must subscript its own located element.
+///
+/// **What this fixture claims and what it does not.** The `.c` position
+/// differs from the base deterministically — the unscoped value read
+/// rendered no scope clause, and the base returned the RESOURCE value.
+/// The other three positions are LAYOUT coverage, not a before/after
+/// claim: `any()` over a `GROUP BY` picks a row nothing can predict, so
+/// no base answer is asserted for them. Their evidence is the break —
+/// swapping `selects` and `aggs` inside `SlotLayout::build` must change
+/// the value under at least one key.
+#[tokio::test]
+async fn a_mixed_projection_reads_every_field_from_its_own_element() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_243;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_n");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    let s = span(
+        tid(1),
+        sid(1),
+        None,
+        "mixed",
+        ts(base, 1),
+        MS,
+        vec![
+            kv_str("a", "x2"),
+            kv_str("a", "x1"),
+            kv_int("b", 9),
+            kv_int("b", 2),
+            kv_str("c", "y"),
+            kv_double("d", 4.5),
+        ],
+    );
+    ingest(
+        port,
+        vec![s],
+        vec![kv_str("service.name", "checkout"), kv_str("c", "R")],
+        "mixed",
+    );
+
+    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1))]);
+
+    let ctx = "mixed-projection";
+    let q = r#"{ } | select(span.a) | select(.c) | avg(span.b) > 1 | avg(span.d) > 1"#;
+    let res = search(port, q, w0, w1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}: {q}");
+    let json = res.json(ctx);
+    assert_eq!(trace_set(&json), ids(&[1]), "{ctx}: {q}");
+    let spans = spans_of_trace(&json, &hex(&tid(1)), ctx);
+    let mut got = tagged_attrs(&spans[0]);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), "stringValue=x2".to_string()),
+            ("c".to_string(), "stringValue=y".to_string()),
+        ],
+        "{ctx}: four slots, four distinct located elements — `a` takes the FIRST of two \
+         same-scope elements and `c` takes the SPAN scope over the resource one: {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #558 criterion 5 — **the boundary of the value budget, on both
+/// sides.**
+///
+/// Two spans in two traces, one carrying exactly 50 event names and one
+/// carrying 51, under `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES=50`. Neither
+/// number is a dramatic value, and the pair is what shows the bound is
+/// the configured budget rather than a block size or a row cap.
+///
+/// **One boundary answer moves, in the permissive direction, and it is
+/// not a regression.** At the base BOTH answered `422` with the row
+/// budget at 50, because `max_rows_to_read` counted every row the index
+/// statement read and N values are at least N rows. The comparison is
+/// now `values > budget`, so 50 answers `200` and 51 still answers `422`.
+/// The quantity a user can predict from their own data is what is
+/// bounded.
+///
+/// The row budget is left at its default here so that nothing but the
+/// value budget can produce the refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_244;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_p");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", "50")]);
+
+    let base = now_s() - 3_600;
+
+    for (n, count) in [(1u8, 50u32), (2u8, 51u32)] {
+        let start = ts(base, n as i64);
+        let mut sp = span(
+            tid(n),
+            sid(1),
+            None,
+            &format!("ev-{count}"),
+            start,
+            MS,
+            vec![],
+        );
+        sp.events = (0..count)
+            .map(|i| opentelemetry_proto::tonic::trace::v1::span::Event {
+                time_unix_nano: start + u64::from(i) + 1,
+                name: format!("e{n}-{i:04}"),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            })
+            .collect();
+        ingest(port, vec![sp], checkout_resource(), "boundary span");
+    }
+
+    pulsus_testkit::assert_stores_agree(db, &[&hex(&tid(1)), &hex(&tid(2))]);
+
+    // Exactly the budget: served. The window is narrowed to the one
+    // trace, because the bound is over the whole BATCH's widths and both
+    // spans in one batch would sum to 101. `ts` puts a span half a second
+    // past its whole-second offset, so each window is the second AFTER
+    // the offset the span was seeded at.
+    let ctx = "exactly-the-budget-is-200";
+    let (a0, a1) = (base, base + 2);
+    let res = search(port, "{ name != event:name }", a0, a1, "", ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        ids(&[1]),
+        "{ctx}: 50 values against a budget of 50 is not over it — the comparison is \
+         `values > budget`"
+    );
+
+    // One more: refused, and the message names the count.
+    let ctx = "one-past-the-budget-is-422";
+    let (b0, b1) = (base + 2, base + 3);
+    let path = format!(
+        "/api/traces/v1/search?q={}&start={b0}&end={b1}",
+        enc("{ name != event:name }")
+    );
+    let res = get(port, &path, ctx);
+    let body = assert_error_body(&res, 422, ctx);
+    assert!(
+        body.contains("value budget of 50 values") && body.contains("51 values in this batch"),
+        "{ctx}: 51 values against a budget of 50 is over it, and the refusal names both \
+         numbers: {body:?}"
+    );
 
     drop_db(db).await;
 }

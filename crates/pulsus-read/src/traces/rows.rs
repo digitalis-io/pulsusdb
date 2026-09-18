@@ -116,14 +116,22 @@ pub struct HydrationProbeRow {
     pub attr_slot: Vec<u8>,
 }
 
-/// [`HydrationProbeRow`] plus the fused matched value and its stored
-/// kind, both indexed BY PROBE (issue #557, carrying issue #479's fused
-/// value onto the span row).
+/// [`HydrationProbeRow`] plus each slot's value, numeric reading and
+/// stored kind (issue #557 carried issue #479's fused matched value onto
+/// the span row; issue #558 added the numeric array and widened a slot
+/// to be a condition's probe, a projected field's locator or an
+/// event/link set's width).
 ///
-/// A probe no projection reads a value from carries the literal `''` in
-/// both arrays, so the three arrays share one index space and there is no
+/// A slot nothing reads a value from carries the literal `''` in the two
+/// string arrays and `NULL` in the numeric one, so the four arrays share
+/// one index space — `SearchPlan`'s `SlotLayout` — and there is no
 /// second mapping to get wrong.
-#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+///
+/// **`attr_slot_num` is `Nullable(Float64)` and the statement CASTs it.**
+/// A plan whose every slot renders `NULL` types as
+/// `Array(Nullable(Nothing))` without the cast, which does not decode
+/// into `Vec<Option<f64>>`.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct HydrationProbeValueRow {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
@@ -140,11 +148,12 @@ pub struct HydrationProbeValueRow {
     pub attr_slot: Vec<u8>,
     pub attr_slot_val: Vec<String>,
     pub attr_slot_type: Vec<String>,
+    pub attr_slot_num: Vec<Option<f64>>,
 }
 
-/// One numeric attribute value row (`search_sql::attr_values_sql` with
-/// `numeric = true`; `val_num` is `Nullable(Float64)` — `isNotNull` is in
-/// the predicate but `any()` keeps the column Nullable).
+/// One numeric attribute value row (`search_sql::event_set_sql` with a
+/// numeric set — the expanded `attr_num` element stays
+/// `Nullable(Float64)` although the filter drops the nulls).
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
 pub struct NumValueRow {
     pub trace_id: [u8; 16],
@@ -152,8 +161,7 @@ pub struct NumValueRow {
     pub v: Option<f64>,
 }
 
-/// One string attribute value row (`search_sql::event_set_sql`, and the
-/// pre-#510 shape of the value reads).
+/// One string attribute value row (`search_sql::event_set_sql`).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StrValueRow {
     pub trace_id: [u8; 16],
@@ -161,29 +169,18 @@ pub struct StrValueRow {
     pub v: String,
 }
 
-/// One numeric attribute value row carrying the STORED OTLP kind
-/// (`search_sql::attr_values_sql` with `numeric = true`, issue #510).
-///
-/// A separate type rather than a field added to [`NumValueRow`]:
-/// RowBinary decoding is positional, and `NumValueRow` also decodes
-/// `search_sql::event_set_sql`, whose three-column projection issue #510
-/// deliberately does not move. `t` is positionally LAST, matching the
-/// builder's SELECT list.
-#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
-pub struct TypedNumValueRow {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
-    pub v: Option<f64>,
-    pub t: String,
-}
-
 /// One string attribute value row carrying the STORED OTLP kind
-/// (`search_sql::attr_values_sql` with `numeric = false`, and
-/// `search_sql::membership_sql` with `with_value = true` — issue #510).
+/// (`search_sql::membership_sql` with `with_value = true` — issue #510).
 ///
-/// A separate type for the same reason [`TypedNumValueRow`] is one:
-/// [`StrValueRow`] still decodes the three-column `event_set_sql`
-/// projection.
+/// **No production caller since issue #558**, which reads a projected
+/// field's value, number and kind from the span row's own arrays. It is
+/// kept for exactly one reader, beside the three things
+/// `search_sql::membership_sql` is kept for: `xtask`'s
+/// `bench/traces_read.rs` decodes the fused four-column membership
+/// statement with it when it rebuilds
+/// `docs/benchmarks/data/traces-lowering-92.json`'s frozen
+/// `phase2_membership` stage, and deleting this type makes that artefact
+/// unrebuildable.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TypedStrValueRow {
     pub trace_id: [u8; 16],

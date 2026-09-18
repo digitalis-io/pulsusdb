@@ -5782,7 +5782,8 @@ mod tests {
             let (traces, _) = super::super::exec::group_hydrated_rows(
                 rows,
                 &[],
-                &mut [],
+                &super::super::search_plan::SlotLayout::default(),
+                &mut super::super::exec::BatchSlots::default(),
                 &mut budget,
                 &mut charged,
             )

@@ -33,6 +33,11 @@ use thiserror::Error;
 ///   error code.
 /// - [`TooBroadReason::TraceScanBudgetRows`] — `max_rows_to_read` (code
 ///   158) on the traces read paths only; LogQL never sets that setting.
+/// - [`TooBroadReason::TraceEventSetValues`] — the event/link value-set
+///   bound (issue #558). Its pre-expansion form is a Rust-side check
+///   against the widths the hydration statement returned, never a
+///   ClickHouse code; its `values: None` form maps code 396 on the value
+///   statement alone.
 /// - [`TooBroadReason::TraceMetricsSetRows`] — the trace-metrics
 ///   semi-join IN-set limits (`max_rows_in_set`/`max_bytes_in_set`,
 ///   throw — code 191) set **only** by `traces::exec`'s metrics query
@@ -99,6 +104,22 @@ pub enum TooBroadReason {
     /// **only** by `traces::exec`'s own error mapper; LogQL's
     /// `map_read_error` never produces it.
     TraceScanBudgetRows { budget_rows: u64 },
+    /// The event/link value-set bound (issue #558,
+    /// `reader.traceql_event_set_max_values`).
+    ///
+    /// `values` is `Some` when the reader refused BEFORE issuing the
+    /// value statement, from the widths the hydration statement returned;
+    /// `None` when the value statement's own result bound fired, which
+    /// code 396 cannot attribute to rows or bytes.
+    ///
+    /// `budget_values` is `reader.traceql_event_set_max_values`, **not**
+    /// the row scan budget: the two bound different quantities and say
+    /// so. Set **only** by `traces::exec`'s own event-set error mapper
+    /// and its pre-expansion check.
+    TraceEventSetValues {
+        values: Option<u64>,
+        budget_values: u64,
+    },
     /// A TraceQL metrics attribute-filter semi-join's IN-set exceeded its
     /// budget (`max_rows_in_set`/`max_bytes_in_set` +
     /// `set_overflow_mode='throw'` — server code 191, issue #59 plan v2
@@ -454,6 +475,19 @@ impl fmt::Display for TooBroadReason {
             }
             TooBroadReason::TraceScanBudgetRows { budget_rows } => {
                 write!(f, "trace scan budget of {budget_rows} rows exceeded")
+            }
+            TooBroadReason::TraceEventSetValues {
+                values,
+                budget_values,
+            } => {
+                write!(
+                    f,
+                    "event/link value set exceeds the value budget of {budget_values} values"
+                )?;
+                match values {
+                    Some(values) => write!(f, " ({values} values in this batch)"),
+                    None => Ok(()),
+                }
             }
             TooBroadReason::TraceMetricsSetRows { max_set_rows } => {
                 write!(
