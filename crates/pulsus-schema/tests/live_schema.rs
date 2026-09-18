@@ -1076,24 +1076,61 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     // after the fact — `ALTER TABLE … MODIFY COLUMN fingerprint UInt128` —
     // would appear here and would rewrite every part.
     //
-    // The list is NOT empty and the plan's expectation that it would be is
-    // corrected here: `run_init` at this base issues eleven mutations on a
-    // fresh database, all of them `MATERIALIZE TTL` or a `PROJECTION`
-    // command on the trace tables, none of them touching a column type.
-    // So the assertion is the one that is true and still says what the
-    // criterion means: no `MODIFY COLUMN` of any kind.
-    let modify_column = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM system.mutations \
-             WHERE database = '{db}' AND command ILIKE '%MODIFY COLUMN%'"
-        ),
-    )
-    .await;
+    // Issue #498's plan says the list is empty. It is not: `run_init`
+    // issues mutations of its own on a fresh database, measured on
+    // ClickHouse 26.3.29.7, none of them touching a column. So the
+    // assertion is the **set** the initialisation is allowed to issue,
+    // with its cardinality — not merely the absence of one kind. Excluding
+    // `MODIFY COLUMN` alone would admit `MATERIALIZE COLUMN fingerprint`,
+    // which is exactly the shape the criterion exists to rule out.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct MutationRow {
+        command: String,
+    }
+    let sql = format!(
+        "SELECT command FROM system.mutations WHERE database = '{db}' ORDER BY command"
+    );
+    let mut stream = client
+        .query_stream::<MutationRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.mutations");
+    let mut commands: Vec<String> = Vec::new();
+    while let Some(row) = stream.next().await {
+        commands.push(row.expect("decode MutationRow").command);
+    }
+    drop(stream);
+
+    // The kinds `run_init` may issue, and nothing else. `MATERIALIZE TTL`
+    // comes from the delete-TTL on the sample tables; the three
+    // `PROJECTION` commands come from the span projections. A command
+    // outside this list is a schema change nobody reviewed, whatever it
+    // says about columns.
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "(MATERIALIZE TTL)",
+        "(MATERIALIZE PROJECTION ",
+        "(DROP PROJECTION IF EXISTS ",
+    ];
+    let unexpected: Vec<&String> = commands
+        .iter()
+        .filter(|c| !ALLOWED_PREFIXES.iter().any(|p| c.starts_with(p)))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a fresh database issued a mutation outside the reviewed set: {unexpected:?}\n\
+         all commands: {commands:?}"
+    );
+
+    // And the cardinality, so a NEW mutation of an allowed kind is a
+    // decision somebody makes rather than a line nobody reads. The split
+    // measured on this base is seven `MATERIALIZE TTL` and four
+    // `PROJECTION` commands.
+    let ttl = commands.iter().filter(|c| *c == "(MATERIALIZE TTL)").count();
+    let projection = commands.len() - ttl;
     assert_eq!(
-        modify_column, 0,
-        "a fresh database issued {modify_column} MODIFY COLUMN mutation(s); the fingerprint \
-         columns are created wide, never widened afterwards"
+        (commands.len(), ttl, projection),
+        (11, 7, 4),
+        "the mutations a fresh database issues moved; read each one before repinning: \
+         {commands:?}"
     );
 
     drop_database(&client, db).await;
