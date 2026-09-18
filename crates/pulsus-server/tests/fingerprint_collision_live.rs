@@ -47,7 +47,7 @@ mod live_db;
 
 use live_db::drop_db;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -267,6 +267,37 @@ fn logs_push_body(ts_ns: i64) -> Vec<u8> {
         .expect("snappy-compress the push")
 }
 
+/// The **second push of B**, alone, carrying the same entry as the first:
+/// the same nanosecond timestamp and the same line.
+///
+/// This is what produces the second of the two states the criterion
+/// names. A stream row is written once per fingerprint per process, from
+/// a cache the writer holds in memory, so a restart is what makes the
+/// writer consider `B` again. Under a 64-bit fingerprint the two label
+/// sets hashed to one value and `log_streams` is a
+/// `ReplacingMergeTree` ordered on `fingerprint` alone
+/// (`crates/pulsus-schema/src/catalog.rs` migration 6), so the second
+/// write replaced the first row: the same fingerprint then resolved to
+/// `B`'s labels, and `A`'s selector answered with `B`'s label set.
+fn logs_push_b_again(ts_ns: i64) -> Vec<u8> {
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{service_name="{LOGS_B}"}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: ts_ns / 1_000_000_000,
+                    nanos: (ts_ns % 1_000_000_000) as i32,
+                }),
+                line: "line from stream B".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress the push")
+}
+
 fn remote_write_body(series: &[(&str, f64, i64)]) -> Vec<u8> {
     let req = WriteRequest {
         timeseries: series
@@ -366,6 +397,237 @@ fn instant_series(port: u16, query: &str, at_ns: i64) -> Vec<(BTreeMap<String, S
     out
 }
 
+/// The values a logs `label/{name}/values` request answers over an
+/// explicit window, sorted.
+fn label_values(port: u16, name: &str, t0_ns: i64) -> Vec<String> {
+    let start = t0_ns - 3_600_000_000_000;
+    let end = t0_ns + 3_600_000_000_000;
+    let path = format!("/api/logs/v1/label/{name}/values?start={start}&end={end}");
+    let res = http_get(port, &path);
+    assert_eq!(res.status, 200, "label values status (body: {})", res.body);
+    let json: serde_json::Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|e| panic!("json: {e}: {}", res.body));
+    let empty = Vec::new();
+    let mut out: Vec<String> = json["data"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// One answered series: its full label map, paired with whatever the
+/// reader collects from its points.
+type Series<T> = (BTreeMap<String, String>, T);
+
+/// One logs aggregation answered as a matrix: each series' full label map
+/// paired with the distinct values it carries across the steps.
+///
+/// The values are collected rather than counted because a series count on
+/// its own does not say which streams answered: two series both labelled
+/// `1d9…` is the shape the widening exists to prevent, and a length check
+/// passes on it.
+fn logs_aggregation(port: u16, query: &str, t0_ns: i64) -> Vec<Series<BTreeSet<String>>> {
+    let start = t0_ns - 3_600_000_000_000;
+    let end = t0_ns + 3_600_000_000_000;
+    let path = format!(
+        "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=3600",
+        urlencode(query)
+    );
+    let res = http_get(port, &path);
+    assert_eq!(res.status, 200, "aggregation status (body: {})", res.body);
+    let json: serde_json::Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|e| panic!("json: {e}: {}", res.body));
+    let empty = Vec::new();
+    let mut out: Vec<Series<BTreeSet<String>>> = json["data"]["result"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|s| {
+            let labels = s["metric"]
+                .as_object()
+                .expect("series labels")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect();
+            let values = s["values"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .map(|v| v[1].as_str().unwrap_or_default().to_string())
+                .collect();
+            (labels, values)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every series a **range** expression answers, with its points as
+/// `(millisecond, value)` pairs — the raw `pulsus_probe[2m]` answer,
+/// which is a matrix rather than the instant vector `instant_series`
+/// reads.
+///
+/// The wire carries the timestamp as a number of seconds that may have a
+/// fractional part, so it is read as `f64` and converted; `as_i64` on a
+/// JSON float returns `None` and would silently make every point `0`.
+fn range_series(port: u16, query: &str, at_ns: i64) -> Vec<Series<Vec<(i64, String)>>> {
+    let time = at_ns / 1_000_000_000;
+    let path = format!("/api/v1/query?query={}&time={time}", urlencode(query));
+    let res = http_get(port, &path);
+    assert_eq!(res.status, 200, "range query status (body: {})", res.body);
+    let json: serde_json::Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|e| panic!("json: {e}: {}", res.body));
+    assert_eq!(
+        json["data"]["resultType"].as_str(),
+        Some("matrix"),
+        "a range expression must answer a matrix: {}",
+        res.body
+    );
+    let empty = Vec::new();
+    let mut out: Vec<Series<Vec<(i64, String)>>> = json["data"]["result"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|s| {
+            let labels = s["metric"]
+                .as_object()
+                .expect("metric labels")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect();
+            let points = s["values"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .map(|v| {
+                    let secs = v[0].as_f64().expect("a matrix point timestamp is a number");
+                    (
+                        (secs * 1000.0).round() as i64,
+                        v[1].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            (labels, points)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every logs answer the criterion requires, at one of the two states.
+///
+/// `b_lines` is how many copies of `B`'s line the fixture has pushed by
+/// then — one after the first push, two after the second. `A` has one in
+/// both states, which is what makes the second state discriminating: the
+/// answer to `A`'s selector must not grow when `B` is written again.
+///
+/// ```text
+///   state              A's selector   B's selector   regex   sum by()   label values
+///   one stream row     1 line, f47…   1 line, 1d9…   2       1 and 1    f47…, 1d9…
+///   both stream rows   1 line, f47…   2 lines, 1d9…  2       1 and 2    f47…, 1d9…
+/// ```
+fn assert_logs_answers(port: u16, t0_ns: i64, b_lines: usize, state: &str) {
+    // Each selector names ONE stream and gets that stream's own lines,
+    // labelled with its own label set. Before the widening, `{…="f47…"}`
+    // returned B's line labelled `1d9…`, and `{…="1d9…"}` returned `[]`.
+    for (service, line, want_lines) in [
+        (LOGS_A, "line from stream A", 1usize),
+        (LOGS_B, "line from stream B", b_lines),
+    ] {
+        let got = query_streams(port, &format!(r#"{{service_name="{service}"}}"#), t0_ns);
+        assert_eq!(
+            got.len(),
+            1,
+            "[{state}] {{service_name=\"{service}\"}} answered {} streams, not one: {got:?}",
+            got.len()
+        );
+        assert_eq!(
+            got[0].0.get("service_name").map(String::as_str),
+            Some(service),
+            "[{state}] the returned stream carries the other stream's labels: {got:?}"
+        );
+        assert_eq!(
+            got[0].1,
+            vec![line.to_string(); want_lines],
+            "[{state}] the returned lines are not {service}'s own {want_lines}: {got:?}"
+        );
+    }
+
+    // The regex selector reaches BOTH through `log_streams_idx`'s
+    // `HAVING uniqExact(key, val) = 1`, which a shared fingerprint used to
+    // fail for both streams at once — not just the loser.
+    let both = query_streams(
+        port,
+        &format!(r#"{{service_name=~"{LOGS_A}|{LOGS_B}"}}"#),
+        t0_ns,
+    );
+    let by_service: BTreeMap<&str, &Vec<String>> = both
+        .iter()
+        .filter_map(|(labels, lines)| {
+            labels
+                .get("service_name")
+                .map(|s| (s.as_str(), lines))
+                .filter(|(s, _)| *s == LOGS_A || *s == LOGS_B)
+        })
+        .collect();
+    assert_eq!(
+        both.len(),
+        2,
+        "[{state}] the regex selector answered {} streams, not two: {both:?}",
+        both.len()
+    );
+    assert_eq!(
+        by_service.len(),
+        2,
+        "[{state}] the two answered streams are not {LOGS_A} and {LOGS_B}: {both:?}"
+    );
+    assert_eq!(
+        by_service.get(LOGS_A).map(|v| v.as_slice()),
+        Some(["line from stream A".to_string()].as_slice()),
+        "[{state}] the regex answer for {LOGS_A}: {both:?}"
+    );
+    assert_eq!(
+        by_service.get(LOGS_B).map(|v| v.as_slice()),
+        Some(vec!["line from stream B".to_string(); b_lines].as_slice()),
+        "[{state}] the regex answer for {LOGS_B}: {both:?}"
+    );
+
+    // And the metric form over the same selector. The labels and the
+    // values are asserted, not the series count: two series both labelled
+    // `1d9…` is exactly the shape the widening prevents, and a count of
+    // two passes on it.
+    let agg = format!(
+        r#"sum by (service_name) (count_over_time({{service_name=~"{LOGS_A}|{LOGS_B}"}}[1h]))"#
+    );
+    let series = logs_aggregation(port, &agg, t0_ns);
+    let mut want: Vec<(BTreeMap<String, String>, BTreeSet<String>)> =
+        [(LOGS_A, "1".to_string()), (LOGS_B, b_lines.to_string())]
+            .into_iter()
+            .map(|(service, v)| {
+                (
+                    BTreeMap::from([("service_name".to_string(), service.to_string())]),
+                    BTreeSet::from([v]),
+                )
+            })
+            .collect();
+    want.sort();
+    assert_eq!(
+        series, want,
+        "[{state}] the aggregation must answer one series per stream, each carrying that \
+         stream's own count"
+    );
+
+    // And the discovery route over the same window.
+    assert_eq!(
+        label_values(port, "service_name", t0_ns),
+        vec![LOGS_B.to_string(), LOGS_A.to_string()],
+        "[{state}] label/service_name/values must list both colliding values"
+    );
+}
+
 /// **The two colliding pairs are two streams and two series, end to end.**
 #[tokio::test(flavor = "multi_thread")]
 async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
@@ -375,13 +637,13 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     }
     let db = pulsus_testkit::test_db("pulsus_server_it_fp_collision");
     drop_db(&db).await;
-    let _guard = spawn_ready(ANSWERS_PORT, &db);
+    let guard = spawn_ready(ANSWERS_PORT, &db);
 
     // `T0` is taken once and every bound below is derived from it.
     let t0_ns = now_ns();
     let t0_ms = t0_ns / 1_000_000;
 
-    // ---- logs -------------------------------------------------------
+    // ---- logs, state one: one push, the writer's cache warm ---------
     let res = http_request(
         ANSWERS_PORT,
         "POST",
@@ -392,82 +654,28 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     .expect("push reachable");
     assert_eq!(res.status, 204, "push status (body: {})", res.body);
 
-    // Each selector names ONE stream and gets that stream's own line,
-    // labelled with its own label set. Before the widening, `{…="f47…"}`
-    // returned B's line labelled `1d9…`, and `{…="1d9…"}` returned `[]`.
-    for (service, line) in [
-        (LOGS_A, "line from stream A"),
-        (LOGS_B, "line from stream B"),
-    ] {
-        let got = query_streams(
-            ANSWERS_PORT,
-            &format!(r#"{{service_name="{service}"}}"#),
-            t0_ns,
-        );
-        assert_eq!(
-            got.len(),
-            1,
-            "{{service_name=\"{service}\"}} answered {} streams, not one: {got:?}",
-            got.len()
-        );
-        assert_eq!(
-            got[0].0.get("service_name").map(String::as_str),
-            Some(service),
-            "the returned stream carries the other stream's labels: {got:?}"
-        );
-        assert_eq!(
-            got[0].1,
-            vec![line.to_string()],
-            "the returned lines are not {service}'s own: {got:?}"
-        );
-    }
+    assert_logs_answers(ANSWERS_PORT, t0_ns, 1, "one stream row");
 
-    // The regex selector reaches BOTH through `log_streams_idx`'s
-    // `HAVING uniqExact(key, val) = 1`, which a shared fingerprint used to
-    // fail for both streams at once — not just the loser.
-    let both = query_streams(
+    // ---- logs, state two: a restart, then a second push of B ---------
+    // The writer holds its written-stream set in memory, so only a
+    // restart makes it consider `B` again. Under a 64-bit fingerprint
+    // that second write landed on the same `log_streams` key as `A` —
+    // the table replaces on `fingerprint` alone — and `A`'s selector
+    // began answering with `B`'s label set. Both states are asserted
+    // because they gave two different wrong answers.
+    drop(guard);
+    let _guard = spawn_ready(ANSWERS_PORT, &db);
+    let res = http_request(
         ANSWERS_PORT,
-        &format!(r#"{{service_name=~"{LOGS_A}|{LOGS_B}"}}"#),
-        t0_ns,
-    );
-    assert_eq!(
-        both.len(),
-        2,
-        "the regex selector answered {} streams, not two: {both:?}",
-        both.len()
-    );
-    for (labels, lines) in &both {
-        assert_eq!(lines.len(), 1, "each stream carries one line: {both:?}");
-        assert!(
-            labels
-                .get("service_name")
-                .is_some_and(|s| s == LOGS_A || s == LOGS_B),
-            "an unexpected stream came back: {both:?}"
-        );
-    }
+        "POST",
+        "/loki/api/v1/push",
+        Some("application/x-protobuf"),
+        &logs_push_b_again(t0_ns),
+    )
+    .expect("second push reachable");
+    assert_eq!(res.status, 204, "second push status (body: {})", res.body);
 
-    // And the metric form over the same selector: two series, one each.
-    let start = t0_ns - 3_600_000_000_000;
-    let end = t0_ns + 3_600_000_000_000;
-    let agg = format!(
-        r#"sum by (service_name) (count_over_time({{service_name=~"{LOGS_A}|{LOGS_B}"}}[1h]))"#
-    );
-    let path = format!(
-        "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=3600",
-        urlencode(&agg)
-    );
-    let res = http_get(ANSWERS_PORT, &path);
-    assert_eq!(res.status, 200, "aggregation status (body: {})", res.body);
-    let json: serde_json::Value = serde_json::from_str(&res.body).expect("json");
-    let empty = Vec::new();
-    let series = json["data"]["result"].as_array().unwrap_or(&empty);
-    assert_eq!(
-        series.len(),
-        2,
-        "the aggregation answered {} series, not two: {}",
-        series.len(),
-        res.body
-    );
+    assert_logs_answers(ANSWERS_PORT, t0_ns, 2, "both stream rows");
 
     // ---- metrics ----------------------------------------------------
     // A at T0, B at T0+15s: at T0+1s only A has a sample and both a broken
@@ -532,6 +740,29 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
         );
     }
 
+    // The raw range answer, before any aggregation reduces it: two
+    // series, one point each. Today one series carries both points, so
+    // the range selector alone shows the merge.
+    let raw = range_series(ANSWERS_PORT, "pulsus_probe[2m]", at);
+    let want_raw: Vec<Series<Vec<(i64, String)>>> =
+        [(METRICS_B, t0_ms + 15_000, "22"), (METRICS_A, t0_ms, "11")]
+            .into_iter()
+            .map(|(service, ts_ms, v)| {
+                (
+                    BTreeMap::from([
+                        ("__name__".to_string(), "pulsus_probe".to_string()),
+                        ("service_name".to_string(), service.to_string()),
+                    ]),
+                    vec![(ts_ms, v.to_string())],
+                )
+            })
+            .collect();
+    assert_eq!(
+        raw, want_raw,
+        "`pulsus_probe[2m]` must answer two series with one point each; before the widening one \
+         series carried both points and the other was absent"
+    );
+
     // `min`/`max` over the range: one label set used to carry both 11 and
     // 22, and no series in the fixture has both.
     for (op, a, b) in [("max_over_time", "11", "22"), ("min_over_time", "11", "22")] {
@@ -569,12 +800,32 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     let res = http_get(ANSWERS_PORT, &path);
     assert_eq!(res.status, 200, "series status (body: {})", res.body);
     let json: serde_json::Value = serde_json::from_str(&res.body).expect("json");
-    let listed = json["data"].as_array().unwrap_or(&empty);
+    let no_series = Vec::new();
+    let mut listed: Vec<BTreeMap<String, String>> = json["data"]
+        .as_array()
+        .unwrap_or(&no_series)
+        .iter()
+        .map(|s| {
+            s.as_object()
+                .expect("a series is an object")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .collect();
+    listed.sort();
+    let want_listed: Vec<BTreeMap<String, String>> = [METRICS_B, METRICS_A]
+        .into_iter()
+        .map(|service| {
+            BTreeMap::from([
+                ("__name__".to_string(), "pulsus_probe".to_string()),
+                ("service_name".to_string(), service.to_string()),
+            ])
+        })
+        .collect();
     assert_eq!(
-        listed.len(),
-        2,
-        "/api/v1/series listed {} series, not two: {}",
-        listed.len(),
+        listed, want_listed,
+        "/api/v1/series must list both colliding label sets: {}",
         res.body
     );
 
