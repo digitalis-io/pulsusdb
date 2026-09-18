@@ -87,15 +87,38 @@ fn ch_http_port() -> u16 {
         .unwrap_or(19123)
 }
 
-fn now_ns() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos(),
-    )
-    .expect("fits i64")
-}
+/// **The pinned instant.** `2026-01-15T00:00:00Z`, as nanoseconds.
+///
+/// Criterion 7 requires a fixed `T0` and says in as many words that it is
+/// never `now`. Every bound this suite sends is derived from it, and no
+/// request relies on a default window: both families default a missing
+/// `start` to one hour anchored on the wall clock, so a fixed instant in
+/// the past would fall outside a default window and the suite would report
+/// `[]` as success.
+///
+/// ```text
+///   fixture      A's line, B's line        at T0
+///                B's line again            at T0, after the restart
+///                pulsus_probe = 11         at T0
+///                pulsus_probe = 22         at T0 + 15s
+///   evaluated    logs        T0 - 1h .. T0 + 1h, explicit on every request
+///                metrics     at T0 + 16s, the first instant at which both
+///                              series have a sample
+/// ```
+///
+/// **Its TTL cannot erase it.** The sample tables carry
+/// `timestamp_ns + INTERVAL <retention_days> DAY DELETE`, so at the default
+/// seven days an instant this far in the past is dropped before the first
+/// query runs. The server this suite spawns sets `PULSUS_RETENTION_DAYS`
+/// to a hundred years, which `apply_ttl` puts on the tables at every
+/// `run_init` — so the pinned instant stays readable however long the
+/// constant sits here.
+const T0_NS: i64 = 1_768_435_200_000_000_000;
+
+/// The retention this suite's server runs with, in days: a hundred years,
+/// so [`T0_NS`] is never inside the delete window. The schema applies it at
+/// start-up, and the databases are dropped at the end of each test.
+const RETENTION_DAYS: &str = "36500";
 
 struct HttpResponse {
     status: u16,
@@ -223,6 +246,9 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
         // at this measurement returned empty for exactly that reason.
         .env("PULSUS_CACHE_TTL", "1s")
         .env("PULSUS_COMPAT_ENDPOINTS", "true")
+        // The fixture's instant is pinned in the past; the default
+        // seven-day TTL would delete it before the first query.
+        .env("PULSUS_RETENTION_DAYS", RETENTION_DAYS)
         .env("CLICKHOUSE_SERVER", ch_host())
         .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
         .env("CLICKHOUSE_DB", db);
@@ -639,8 +665,9 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     drop_db(&db).await;
     let guard = spawn_ready(ANSWERS_PORT, &db);
 
-    // `T0` is taken once and every bound below is derived from it.
-    let t0_ns = now_ns();
+    // `T0` is a constant, never the clock, and every bound below is
+    // derived from it (criterion 7).
+    let t0_ns = T0_NS;
     let t0_ms = t0_ns / 1_000_000;
 
     // ---- logs, state one: one push, the writer's cache warm ---------
@@ -847,12 +874,15 @@ async fn the_accept_reject_surface_is_unchanged() {
     let port = SURFACE_PORT;
     let _guard = spawn_ready(port, &db);
 
-    let now_s = now_ns() / 1_000_000_000;
+    // The same pinned instant, for the same reason: nothing here depends
+    // on the wall clock, and a suite that reads it in one test and not the
+    // other invites the next reader to assume one of them must need it.
+    let at_s = T0_NS / 1_000_000_000;
     // A malformed selector is still a 400.
     let res = http_get(
         port,
         &format!(
-            "/api/v1/query?query={}&time={now_s}",
+            "/api/v1/query?query={}&time={at_s}",
             urlencode("pulsus_probe{service_name=")
         ),
     );
@@ -866,7 +896,7 @@ async fn the_accept_reject_surface_is_unchanged() {
     let res = http_get(
         port,
         &format!(
-            "/api/v1/query?query={}&time={now_s}",
+            "/api/v1/query?query={}&time={at_s}",
             urlencode("pulsus_absent_metric")
         ),
     );
