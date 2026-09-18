@@ -1294,7 +1294,7 @@ mod tests {
         // The two figures the plan measured with a counting allocator, on a
         // `HashMap` whose pair is 48 bytes: 229,376 entries allocate
         // 12,845,072 bytes and one more entry doubles it.
-        struct Entry32([u8; 32]);
+        struct Entry32(#[allow(dead_code)] [u8; 32]);
         assert_eq!(size_of::<(u128, Entry32)>(), 48);
         assert_eq!(hash_map_bytes::<u128, Entry32>(229_376), 12_845_072);
         assert_eq!(hash_map_bytes::<u128, Entry32>(229_377), 25_690_128);
@@ -1341,11 +1341,25 @@ mod tests {
     fn a_second_identical_push_is_suppressed() {
         let d = index();
         let id = identity(7);
+        let Admission::Admit(mut guard) = admit(&d, id) else {
+            panic!("the first push must admit");
+        };
+        guard.note_target(true);
+        guard.seal();
+        assert!(is_suppressed(&admit(&d, id)));
+    }
+
+    /// A push that reached no buffer at all stored nothing, so there is
+    /// nothing for a later identical push to duplicate: it is admitted.
+    #[test]
+    fn a_push_that_touched_no_target_does_not_suppress_the_next_one() {
+        let d = index();
+        let id = identity(8);
         let Admission::Admit(guard) = admit(&d, id) else {
             panic!("the first push must admit");
         };
         guard.seal();
-        assert!(is_suppressed(&admit(&d, id)));
+        assert!(matches!(admit(&d, id), Admission::Admit(_)));
     }
 
     #[test]
@@ -1356,11 +1370,15 @@ mod tests {
             Admission::Admit(guard) => drop(guard),
             other => panic!("expected an admission, got {other:?}"),
         }
+        assert_eq!(
+            d.snapshot().rollbacks_total,
+            1,
+            "the rolled-back claim is counted once"
+        );
         assert!(
             matches!(admit(&d, id), Admission::Admit(_)),
             "a rolled-back claim must not suppress the next push"
         );
-        assert_eq!(d.snapshot().rollbacks_total, 1);
     }
 
     #[test]

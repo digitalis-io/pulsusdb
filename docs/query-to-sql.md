@@ -5350,11 +5350,11 @@ engine will read, and what it will return:
 | LogQL entry limit | default 100, ceiling 5,000; above the ceiling is `400` | `docs/api.md` §2.1 |
 | LogQL metric grid | at most 11,000 intervals; over it is `422` | `logql/window.rs:148` |
 | LogQL stream count | 100,000 fingerprints | `logql/params.rs:121` |
-| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:378`, default at `:511`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
-| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:455`, default at `:524`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
+| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:399`, default at `:532`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
+| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:476`, default at `:545`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
 | LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1296`; refused `422`, never cut short |
-| LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:400`, default at `:512`. Applies only while a stage that drops lines is evaluated after the read |
-| TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:412`, default at `:514`. Per first statement and for the merged set |
+| LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:421`, default at `:533`. Applies only while a stage that drops lines is evaluated after the read |
+| TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:433`, default at `:535`. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:117` |
 | spans per trace | 10,000 | `traces/exec.rs:122`; a trace over it is reported incomplete |
 | TraceQL span-read bytes | 256 MiB | `traces/exec.rs:147` |
@@ -5862,7 +5862,7 @@ noticed and are not grounds for a new round.
 
    **Measured, and it changes what an amendment has to meet: the whole-request join form does not
    survive the shipped generator memory ceiling.** At `max_memory_usage = 536870912` — the shipped
-   `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:543`, applied by
+   `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:564`, applied by
    `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:2933`) — the form §2.9's TraceQL30
    works refused on all three takes with `Code: 241` at `maximum: 512.00 MiB`, no rows out, while
    the identical statement with only the join removed answered its 20 rows on all three takes at the

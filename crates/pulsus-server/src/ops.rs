@@ -660,14 +660,14 @@ mod tests {
         assert_sample(
             r,
             &format!(
-                r#"pulsus_ingest_duplicate_pushes_total{{declared="0",signal="{signal}"}}"#
+                r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="0"}}"#
             ),
             (base + 1) as f64,
         );
         assert_sample(
             r,
             &format!(
-                r#"pulsus_ingest_duplicate_pushes_total{{declared="1",signal="{signal}"}}"#
+                r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="1"}}"#
             ),
             (base + 2) as f64,
         );

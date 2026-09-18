@@ -276,8 +276,14 @@ async fn crash_partial_failure_series_uncertain_never_reports_a_false_success() 
     // (b) the LRU was not promoted: a fresh admission for the identical
     // series key must be treated as a miss again (re-emitted), not
     // suppressed.
+    //
+    // The second admission carries `unix_milli = 1`, not `0` (issue #494):
+    // the series key is `(name, fingerprint, bucket, value_type)` and the
+    // bucket is an hour wide, so this is the identical KEY — but it is not
+    // the identical PUSH, which the suppression index would answer with the
+    // first push's outcome instead of admitting.
     writer
-        .admit(batch_for("http_requests_total", 7, 0, true), PushHeaders::default())
+        .admit(batch_for("http_requests_total", 7, 1, true), PushHeaders::default())
         .expect("queue has room");
     assert_eq!(
         writer.metrics().series_lru_misses_total,
@@ -631,9 +637,12 @@ async fn series_backfill_heal_promotes_the_series_lru() {
     assert_eq!(writer.metrics().series_registrations_total, 1);
 
     // Re-admit the identical `(name, fp, bucket, value_type)`: promoted
-    // by the confirmed heal, it must hit the LRU — no new series row.
+    // by the confirmed heal, it must hit the LRU — no new series row. The
+    // millisecond differs so this is a different PUSH with the same series
+    // key; see the note in
+    // `crash_partial_failure_series_uncertain_never_reports_a_false_success`.
     writer
-        .admit(batch_for("http_requests_total", 52, 0, true), PushHeaders::default())
+        .admit(batch_for("http_requests_total", 52, 1, true), PushHeaders::default())
         .expect("queue has room");
 
     let metrics = writer.metrics();

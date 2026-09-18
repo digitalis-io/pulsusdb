@@ -358,8 +358,13 @@ async fn duplicate_admit_race_before_the_first_stream_flush_settles_is_harmless(
     writer
         .admit(batch_for(7, "svc", 1_700_000_000_000_000_000, true), PushHeaders::default())
         .expect("queue has room");
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(7, "svc", 1_700_000_000_000_000_000, true), PushHeaders::default())
+        .admit(batch_for(7, "svc", 1_700_000_000_000_000_001, true), PushHeaders::default())
         .expect("queue has room");
 
     assert_eq!(
@@ -681,8 +686,13 @@ async fn post_flush_admit_of_the_same_stream_key_is_suppressed_by_the_lru() {
 
     // Second admit: the identical `(fingerprint, month)` key, now
     // durably known via the confirmed-flush LRU promotion.
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(21, "svc", 1_700_000_000_000_000_000, true), PushHeaders::default())
+        .admit(batch_for(21, "svc", 1_700_000_000_000_000_001, true), PushHeaders::default())
         .expect("queue has room");
 
     let metrics = writer.metrics();
@@ -808,8 +818,13 @@ async fn backfill_heal_promotes_the_stream_lru() {
 
     // Re-admit the identical `(fingerprint, month)`: promoted by the
     // confirmed heal, it must hit the LRU — no new StreamRow.
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(32, "svc", 1_700_000_000_000_000_000, true), PushHeaders::default())
+        .admit(batch_for(32, "svc", 1_700_000_000_000_000_001, true), PushHeaders::default())
         .expect("queue has room");
 
     let metrics = writer.metrics();
