@@ -53,7 +53,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use prost::Message;
+use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
 use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
 
@@ -543,27 +545,77 @@ fn range_series(port: u16, query: &str, at_ns: i64) -> Vec<Series<Vec<(i64, Stri
     out
 }
 
-/// Every logs answer the criterion requires, at one of the two states.
+/// How many rows `log_streams` holds, and how many distinct fingerprints
+/// are among them, read straight from ClickHouse.
 ///
-/// `b_lines` is how many copies of `B`'s line the fixture has pushed by
-/// then — one after the first push, two after the second. `A` has one in
-/// both states, which is what makes the second state discriminating: the
-/// answer to `A`'s selector must not grow when `B` is written again.
+/// **This is what makes a state's name a checked fact rather than a
+/// description.** "Both stream rows" is a statement about storage, not
+/// about an answer, and every route above it reads through the same
+/// resolution step — so a build that collapsed two streams into one row
+/// could still be described as being in that state by a test that only
+/// looks at responses. `FINAL` because `log_streams` is a
+/// `ReplacingMergeTree` ordered on `fingerprint` alone: without it the
+/// superseded row is still on disk and the count is a merge schedule
+/// rather than an identity.
+async fn stream_rows(db: &str) -> (u64, u64) {
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Counts {
+        rows: u64,
+        fingerprints: u64,
+    }
+    let client = ChClient::new(live_db::conn_config(db))
+        .await
+        .expect("connect to count log_streams");
+    let mut stream = client
+        .query_stream::<Counts>(
+            &format!(
+                "SELECT count() AS rows, uniqExact(fingerprint) AS fingerprints \
+                 FROM {db}.log_streams FINAL"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query log_streams");
+    let row = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode the counts");
+    (row.rows, row.fingerprints)
+}
+
+/// Every logs answer the criterion requires, at one of the three states.
+///
+/// `b_lines` is how many copies of `B`'s line are **inside the query
+/// window** by then. `A` has one at every state, which is what makes the
+/// later states discriminating: the answer to `A`'s selector must not
+/// change when `B` is written again.
 ///
 /// ```text
-///   state              A's selector   B's selector   regex   sum by()   label values
-///   one stream row     1 line, f47…   1 line, 1d9…   2       1 and 1    f47…, 1d9…
-///   both stream rows   1 line, f47…   2 lines, 1d9…  2       1 and 2    f47…, 1d9…
+///   state                       A's sel.      B's sel.       regex   sum by()   label values
+///   one stream row              1 line, f47…  1 line, 1d9…   2       1 and 1    f47…, 1d9…
+///   both rows, one sample each  1 line, f47…  1 line, 1d9…   2       1 and 1    f47…, 1d9…
+///   both rows, two B samples    1 line, f47…  2 lines, 1d9…  2       1 and 2    f47…, 1d9…
 /// ```
 ///
-/// **The second row corrects the approved plan for issue #498, which
-/// states one `B` line and `sum by()` value `1` there.** That answer is
-/// not reachable from the fixture the same plan specifies. `log_samples`
-/// is a plain `MergeTree` (`crates/pulsus-schema/src/catalog.rs`,
-/// migration 8) — it does not deduplicate, and ClickHouse's insert
-/// deduplication is a `Replicated*` feature — so pushing `B`'s entry a
-/// second time writes a second row, and `count_over_time` counts two.
-/// Measured against a running server: `{service_name="1d9…"}` answers
+/// **The middle row is the state the approved plan for issue #498 names,
+/// and its answers are the plan's.** The plan reaches that state by
+/// pushing `B` a second time, and asks for one `B` line and `sum by()`
+/// value `1`. Both cannot hold at once if the second push lands inside
+/// the window: `log_samples` is a plain `MergeTree`
+/// (`crates/pulsus-schema/src/catalog.rs`, migration 8), it does not
+/// deduplicate, and ClickHouse's insert deduplication is a `Replicated*`
+/// feature — so a second in-window push is a second row and
+/// `count_over_time` counts two. The state the plan describes is reached
+/// by putting the second push **outside** the window: the stream row is
+/// written again, which is the part that matters, and the window still
+/// holds one sample per stream.
+///
+/// **The third row keeps the other reading**, because it is the one that
+/// showed the fixture and the answer table could not both be right, and
+/// because it is a sharper test of the same property: `A`'s line count
+/// stays at one while `B`'s doubles. Measured there,
+/// `{service_name="1d9…"}` answers
 ///
 /// ```text
 ///   "values": [["<T0>", "line from stream B"],
@@ -571,10 +623,18 @@ fn range_series(port: u16, query: &str, at_ns: i64) -> Vec<Series<Vec<(i64, Stri
 /// ```
 ///
 /// with `"entries": 2`, and the aggregation answers `1` for `A` and `2`
-/// for `B`. What the state is for is unaffected and is asserted above:
-/// `A`'s answer must not grow when `B` is written again, which is exactly
-/// what a shared identity used to make it do.
-fn assert_logs_answers(port: u16, t0_ns: i64, b_lines: usize, state: &str) {
+/// for `B`.
+async fn assert_logs_answers(port: u16, db: &str, t0_ns: i64, b_lines: usize, state: &str) {
+    // The state's name is about storage, so it is read from storage.
+    // Every route below resolves a selector through `log_streams`, so a
+    // build that collapsed the two streams into one row would answer
+    // wrongly rather than report the collapse.
+    assert_eq!(
+        stream_rows(db).await,
+        (2, 2),
+        "[{state}] log_streams must hold one row per stream, with distinct fingerprints"
+    );
+
     // Each selector names ONE stream and gets that stream's own lines,
     // labelled with its own label set. Before the widening, `{…="f47…"}`
     // returned B's line labelled `1d9…`, and `{…="1d9…"}` returned `[]`.
@@ -700,17 +760,47 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     .expect("push reachable");
     assert_eq!(res.status, 204, "push status (body: {})", res.body);
 
-    assert_logs_answers(ANSWERS_PORT, t0_ns, 1, "one stream row");
+    assert_logs_answers(ANSWERS_PORT, &db, t0_ns, 1, "one stream row").await;
 
-    // ---- logs, state two: a restart, then a second push of B ---------
+    // ---- logs, state two: a restart, then B written again ------------
     // The writer holds its written-stream set in memory, so only a
     // restart makes it consider `B` again. Under a 64-bit fingerprint
     // that second write landed on the same `log_streams` key as `A` —
     // the table replaces on `fingerprint` alone — and `A`'s selector
-    // began answering with `B`'s label set. Both states are asserted
-    // because they gave two different wrong answers.
+    // began answering with `B`'s label set.
+    //
+    // **The second push lands outside the query window**, six hours past
+    // `T0` and inside the same month, so the stream row is written again
+    // while the window still holds one sample per stream. That is the
+    // state the plan names, and the answers below are the plan's: two
+    // streams, one line each, and `sum by()` value one each.
     drop(guard);
-    let _guard = spawn_ready(ANSWERS_PORT, &db);
+    let guard = spawn_ready(ANSWERS_PORT, &db);
+    let outside_window_ns = t0_ns + 6 * 3_600_000_000_000;
+    let res = http_request(
+        ANSWERS_PORT,
+        "POST",
+        "/loki/api/v1/push",
+        Some("application/x-protobuf"),
+        &logs_push_b_again(outside_window_ns),
+    )
+    .expect("second push reachable");
+    assert_eq!(res.status, 204, "second push status (body: {})", res.body);
+
+    assert_logs_answers(
+        ANSWERS_PORT,
+        &db,
+        t0_ns,
+        1,
+        "both stream rows, one sample each",
+    )
+    .await;
+
+    // ---- logs, state three: B written again INSIDE the window --------
+    // The same second push the plan describes, run to its own
+    // consequence. No restart: the stream row is already there and this
+    // state is about the sample, which a plain `MergeTree` stores twice.
+    // `A`'s line count must not move while `B`'s doubles.
     let res = http_request(
         ANSWERS_PORT,
         "POST",
@@ -718,10 +808,18 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
         Some("application/x-protobuf"),
         &logs_push_b_again(t0_ns),
     )
-    .expect("second push reachable");
-    assert_eq!(res.status, 204, "second push status (body: {})", res.body);
+    .expect("third push reachable");
+    assert_eq!(res.status, 204, "third push status (body: {})", res.body);
 
-    assert_logs_answers(ANSWERS_PORT, t0_ns, 2, "both stream rows");
+    assert_logs_answers(
+        ANSWERS_PORT,
+        &db,
+        t0_ns,
+        2,
+        "both stream rows, two B samples",
+    )
+    .await;
+    let _guard = guard;
 
     // ---- metrics ----------------------------------------------------
     // A at T0, B at T0+15s: at T0+1s only A has a sample and both a broken
