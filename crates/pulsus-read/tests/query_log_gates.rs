@@ -4749,27 +4749,6 @@ async fn group_key_statements(
     // one and a regex looking for one matches nothing.
     let fp_re = regex::Regex::new(r"fingerprint IN \(toUInt128\('(\d+)'\)\)").expect("regex");
     let mut out = std::collections::HashMap::new();
-    // **The barrier waits for the rows to settle, not merely to appear.**
-    //
-    // `want` counts CASES, and a case enters this map as soon as its FIRST
-    // statement reaches `system.query_log`. So `out.len() >= want` is
-    // satisfiable while a case's later statements are still unflushed, and
-    // the caller then classifies a partial list: a `lane` case seen as
-    // `throw` is the key statement and the raw scan with the lane
-    // statement not yet written. `SYSTEM FLUSH LOGS` flushes what has been
-    // written, which is not the same as everything the queries issued.
-    //
-    // One run of this suite was reported failing that way and passing on
-    // its own. **That run was not reproduced here** — three runs under the
-    // default parallel runner and two after this change all passed — so
-    // what is stated is the mechanism the code allows, not a reproduction.
-    //
-    // The loop therefore also requires two consecutive polls to agree. It
-    // waits for quiescence rather than for a particular shape: a barrier
-    // that waited for the lane statement could not observe a build that
-    // stopped emitting one, which is the state this fixture exists to
-    // detect. The cost is one extra poll per call, about a second.
-    let mut previous: Option<std::collections::HashMap<u64, Vec<(GroupKeyStatement, i32)>>> = None;
     for _ in 0..30 {
         admin
             .execute(
@@ -4821,10 +4800,9 @@ async fn group_key_statements(
                 .push((kind, row.exception_code));
         }
         drop(stream);
-        if out.len() >= want && previous.as_ref() == Some(&out) {
+        if out.len() >= want {
             break;
         }
-        previous = Some(out.clone());
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     out
