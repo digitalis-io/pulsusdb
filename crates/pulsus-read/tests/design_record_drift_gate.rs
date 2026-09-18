@@ -2670,15 +2670,23 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 /// and nothing said so.
 ///
 /// The check is the same shape as the dataset's: each entry names the
-/// citing document, the text it cites, and the phrase the cited line must
-/// carry. A citation that moves stops containing its phrase and this
-/// names the row.
+/// citing document, the text it cites, **how many times it cites it**, and
+/// the phrase the cited line must carry. A citation that moves stops
+/// containing its phrase and this names the row.
 ///
 /// ```text
-///   citing document          cites                      the cited line must carry
-///   ----------------------   ------------------------   -------------------------------
-///   docs/query-to-sql.md     docs/schemas.md:835        never a `UNION ALL`
+///   citing document        cites                 times   the cited line must carry
+///   --------------------   -------------------   -----   -------------------------
+///   docs/query-to-sql.md   docs/schemas.md:835       2   never a `UNION ALL`
 /// ```
+///
+/// **The count is not decoration, and leaving it out was the same defect
+/// this test exists to catch.** The first version asked whether the
+/// citation appeared at all. `docs/query-to-sql.md` names that line twice;
+/// with one of the two moved back to the superseded number, a
+/// greater-than-zero check reported the document correct while it said two
+/// different things about where the rule lives — which is exactly how the
+/// stale citation survived a merge in the first place.
 ///
 /// It is deliberately a hand-written list rather than a parse of every
 /// `.md:<line>` occurrence: the records quote line references inside
@@ -2686,18 +2694,21 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 /// at the time and updating it would rewrite the quotation.
 #[test]
 fn every_cross_document_line_citation_names_the_line_it_quotes() {
-    const CROSS_DOC_CITATIONS: &[(&str, &str, &str)] = &[(
+    const CROSS_DOC_CITATIONS: &[(&str, &str, usize, &str)] = &[(
         "docs/query-to-sql.md",
         "docs/schemas.md:835",
+        2,
         "never a `UNION ALL`",
     )];
 
     let mut wrong: Vec<String> = Vec::new();
-    for (citing, citation, phrase) in CROSS_DOC_CITATIONS {
+    for (citing, citation, times, phrase) in CROSS_DOC_CITATIONS {
         let citing_text = read(citing);
         let occurrences = citing_text.matches(citation).count();
-        if occurrences == 0 {
-            wrong.push(format!("{citing} no longer cites {citation}"));
+        if occurrences != *times {
+            wrong.push(format!(
+                "{citing} cites {citation} {occurrences} time(s), expected {times}"
+            ));
             continue;
         }
         let (path, line) = citation
