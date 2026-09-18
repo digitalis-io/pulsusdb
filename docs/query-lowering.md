@@ -1203,7 +1203,7 @@ table marked the non-finite numeric threshold parser-shadowed on the strength of
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
 `400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1080`, whose rule is
-`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1076` to `:1080`. **An unreachability
+`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1077` to `:1080`. **An unreachability
 claim is a universal over inputs**, so each of the four was re-checked by constructing the input
 that would defeat it rather than by reading the lexer: three spellings each for the regex-operator,
 `count()`-with-field and one-arity-without-field rows, and ten for the numeric threshold, including
@@ -4943,7 +4943,7 @@ These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
 `metric_pipeline_construct` (`:1698`) are private — an integration test cannot call any of them.
 **They go in `plan.rs`'s existing `mod tests` (`plan.rs:4243`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:4494`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:4500`). An earlier version of this section
 offered a second option — **wave 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
@@ -5487,20 +5487,20 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 692 |
-| of those, citing a bare basename | 539 |
+| citation occurrences in the five artefacts | 689 |
+| of those, citing a bare basename | 536 |
 | of those, written as a continuation of a citation earlier on the line | 44 |
-| `(document, token)` pairs the rule resolves | 362 |
-| occurrences those resolved pairs cover | 495 |
-| `(document, token)` pairs it cannot resolve | 104 |
-| occurrences those frozen pairs cover | 197 |
-| resolved rows anchored on a token the citing prose prints | 174 |
-| resolved rows anchored on a snapshot of the cited line | 188 |
+| `(document, token)` pairs the rule resolves | 367 |
+| occurrences those resolved pairs cover | 505 |
+| `(document, token)` pairs it cannot resolve | 97 |
+| occurrences those frozen pairs cover | 184 |
+| resolved rows anchored on a token the citing prose prints | 177 |
+| resolved rows anchored on a snapshot of the cited line | 190 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 92 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 10 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `ambiguous_basename` | 90 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 5 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
 | the reviewed verdict on a fallback disagreement | cases |
@@ -5514,11 +5514,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 692 citation occurrences the five artefacts make, 539 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 495 occurrences, and cannot resolve 104 covering 197. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
+Of the 689 citation occurrences the five artefacts make, 536 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 367 `(document, token)` pairs covering 505 occurrences, and cannot resolve 97 covering 184. Of the resolved rows, 177 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1969` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1986` (in `docs/query-lowering.md`), `predicate.rs:946` (cited from 2 documents), `predicate.rs:950` (cited from 2 documents), `search_plan.rs:1076` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1969` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1986` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
 
 The citations the rule answers differently for two occurrences of are .
 

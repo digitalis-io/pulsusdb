@@ -1730,16 +1730,17 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// one that was measured against itself.** It called `resolve_citation`
 /// the truth and counted how often the fallback differed from it, which
 /// measures disagreement between two rules rather than error in either.
-/// Read one at a time, two of the six divergences are cases where the
-/// **resolver** points at the wrong file.
+/// Read one at a time, some divergences are cases where the **resolver**
+/// points at the wrong file, not the fallback.
 ///
-/// What this test asserts instead: the divergence set is exactly the
-/// six reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
-/// cannot appear without a person reading it; and four of the six are
-/// citations where the fallback answers a file the citing prose does not
-/// describe. **Four wrong answers out of six disagreements is why the
-/// fallback is not applied** — not a percentage, four cases anyone can
-/// read.
+/// What this test asserts instead: the divergence set is exactly the one
+/// reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new divergence
+/// cannot appear without a person reading it, and every member's verdict
+/// is the one a person recorded. **The counts live in the assertion at
+/// the end of this function and nowhere else**, because a count written
+/// in prose beside a table goes stale the moment the table moves — which
+/// it did, twice, when two branches each edited the array. Read them
+/// there.
 #[test]
 fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
     let tracked = tracked_rust_files();

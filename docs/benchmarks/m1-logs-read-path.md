@@ -416,15 +416,50 @@ shard-locally and what crosses the network. Every
 FINGERPRINT-DERIVED roster, count and derivation quoted in the Evidence
 column is superseded** (issue #498): those were measured under the
 previous sharding key, and the `fingerprint % total_weight` derivation
-quoted in the first row names it.
+quoted in the first row names it. A roster the harness does **not**
+derive from a fingerprint is unaffected by a change of sharding key, and
+stays current — the `resolution` and `discovery` stages have no
+`fingerprint` condition to prune by, so their expected set is
+unconditionally the full cluster whatever the key is. That is why the
+second row's full-roster figure below is current rather than superseded.
 
-**The exception is a stage with no `fingerprint` condition to prune by.**
-Its expected roster is unconditionally the whole cluster — the harness
-does not derive it from any fingerprint — so no sharding key can move it.
-That covers the `resolution` and `discovery` stages, and it is why the
-second row's full-roster figure below is marked current rather than
-superseded. The same marking is on `docs/schemas.md` §7's own status
-paragraph.
+**Where that split is evidenced, since it is not where a reader would
+first look.** The capture carries no per-stage SQL: each
+`stage_evidence` entry holds only `stage`, `explain_pipeline` and
+`shards`, and the single `sql` field on a query is its terminal
+statement. What distinguishes the stages is the **presence of a
+fingerprint-derived `pruned_reason`** on a shard entry, counted over
+[`data/logs-read-dist.json`](data/logs-read-dist.json):
+
+```text
+  query                                  stage          pruned   fingerprint-derived
+  ------------------------------------   ------------   ------   -------------------
+  label_scoped_stream_read_6h            resolution          0                     0
+  label_scoped_stream_read_6h            hydration           1                     1
+  label_scoped_stream_read_6h            samples             1                     1
+  body_search_24h                        resolution          0                     0
+  body_search_24h                        hydration           1                     1
+  body_search_24h                        samples             1                     1
+  label_series_discovery_7d              discovery           0                     0
+  count_rate_rollup_over_corpus_window   resolution          0                     0
+  count_rate_rollup_over_corpus_window   hydration           0                     0
+  count_rate_rollup_over_corpus_window   rollup_range        0                     0
+```
+
+The harness side of the same split is `StageRoster::Full` against
+`StageRoster::Fingerprints` in `xtask/src/bench/queries.rs`, which is
+what decides the expected set before a query runs.
+
+Two of those rows need reading rather than counting.
+`count_rate_rollup_over_corpus_window`'s `hydration` and `rollup_range`
+**are** fingerprint-scoped; they show no pruned shard because their
+fingerprint set reached every shard, so there was nothing to prune. A
+zero in the last column means "no shard was pruned here", not "this stage
+has no fingerprint condition" — the two coincide for `resolution` and
+`discovery` and come apart for those two.
+
+`docs/schemas.md` §7's status paragraph states the same rule in the same
+shape.
 
 | `docs/schemas.md` §7 row | Verdict (shape only) | Evidence (rosters and counts superseded) |
 |---|---|---|

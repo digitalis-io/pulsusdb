@@ -135,6 +135,7 @@ docs/query-lowering.md	plan.rs:3771	crates/pulsus-read/src/logql/plan.rs	3771		p
 docs/query-lowering.md	plan.rs:3778	crates/pulsus-read/src/logql/plan.rs	3778		prose	LineFormat
 docs/query-lowering.md	plan.rs:3797	crates/pulsus-read/src/logql/plan.rs	3797		prose	is_pushable_line_filter
 docs/query-lowering.md	plan.rs:4243	crates/pulsus-read/src/logql/plan.rs	4243		prose	mod tests
+docs/query-lowering.md	plan.rs:4500	crates/pulsus-read/src/logql/plan.rs	4500		prose	use super::*
 docs/query-lowering.md	post_agg.rs:3008-3011	crates/pulsus-read/src/logql/post_agg.rs	3008	3011	prose	.rev()
 docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs	3307		prose	merge_matrix_collisions
 docs/query-lowering.md	predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
@@ -142,6 +143,7 @@ docs/query-lowering.md	predicate.rs:92	crates/pulsus-read/src/logql/predicate.rs
 docs/query-lowering.md	search_eval.rs:1856	crates/pulsus-read/src/traces/search_eval.rs	1856		line	/// ancestor), the `reached` set terminates every cycle, and an
 docs/query-lowering.md	search_eval.rs:2439	crates/pulsus-read/src/traces/search_eval.rs	2439		line	.get(*field_idx)
 docs/query-lowering.md	search_eval.rs:2483	crates/pulsus-read/src/traces/search_eval.rs	2483		line	/// target. Only the physical sources can fill that target, so a typed
+docs/query-lowering.md	search_plan.rs:1077	crates/pulsus-read/src/traces/search_plan.rs	1077		line	/// The plan projected for the explain surface. Built only in
 docs/query-lowering.md	search_plan.rs:1080	crates/pulsus-read/src/traces/search_plan.rs	1080		line	self.compiled.shape(&self.stage_names)
 docs/query-lowering.md	search_plan.rs:1377	crates/pulsus-read/src/traces/search_plan.rs	1377		line	PhysicalPredicate::Status { op, code } => PhysicalEval::Status {
 docs/query-lowering.md	search_plan.rs:1434	crates/pulsus-read/src/traces/search_plan.rs	1434		line	TraceCtxPred::RootName { op, value } => {
@@ -195,7 +197,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:628	crates/pulsus-r
 docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:630	crates/pulsus-read/src/logql/compile.rs	630		prose	BlockReason::NotYetLowered
 docs/query-to-sql.md	crates/pulsus-read/src/logql/error.rs:782-785	crates/pulsus-read/src/logql/error.rs	782	785	line	"pipeline error: '{error_type}' for series: '{series}'.\n\ Use a label filter to intentionally skip this error. (e.g | _
 docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:169	crates/pulsus-read/src/logql/ip.rs	169		prose	[0-9]{1,3}(?:\.[0-9]{1,3}){3}
-docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:338	crates/pulsus-read/src/logql/labels.rs	338		line	sm_ctx.sm_over_stream.clear();
+docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	structured_metadata
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:372-409	crates/pulsus-read/src/logql/labels.rs	372	409	line	fn merge_metadata_pairs( base_len: usize, pairs: impl Iterator<Item = (String, String)>, merge_buf: &mut Vec<(String, St
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:2898	crates/pulsus-read/src/logql/pipeline.rs	2898		line	let mut live: u32 = 0;
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3041	crates/pulsus-read/src/logql/pipeline.rs	3041		prose	DURATION_UNITS
@@ -214,7 +216,7 @@ docs/query-to-sql.md	crates/pulsus-traceql/src/ast.rs:981	crates/pulsus-traceql/
 docs/query-to-sql.md	escape.rs:100	crates/pulsus-read/src/logql/escape.rs	100		prose	\\_
 docs/query-to-sql.md	escape.rs:101	crates/pulsus-read/src/logql/escape.rs	101		line	other => pattern.push(other),
 docs/query-to-sql.md	escape.rs:139-149	crates/pulsus-read/src/logql/escape.rs	139	149	line	// One `^(?:…)$` template occurrence, whatever the strategy — the // issue #240 anchoring guard counts this site and kee
-docs/query-to-sql.md	escape.rs:150-155	crates/pulsus-read/src/logql/escape.rs	150	155	line	/// The **unanchored** `match()` regex text for `pat` (line filters are /// substring searches). Same issue #331 strateg
+docs/query-to-sql.md	escape.rs:151-156	crates/pulsus-read/src/logql/escape.rs	151	156	line	/// The **unanchored** `match()` regex text for `pat` (line filters are /// substring searches). Same issue #331 strateg
 docs/query-to-sql.md	escape.rs:156-163	crates/pulsus-read/src/logql/escape.rs	156	163	line	fn unanchored_match_regex(pat: &str) -> String { match pulsus_re2::clickhouse_match_strategy(pat) { ClickhouseMatchStrat
 docs/query-to-sql.md	escape.rs:157-160	crates/pulsus-read/src/logql/escape.rs	157	160	line	match pulsus_re2::clickhouse_match_strategy(pat) { ClickhouseMatchStrategy::Verbatim => pat.to_string(), ClickhouseMatch
 docs/query-to-sql.md	escape.rs:213-236	crates/pulsus-read/src/logql/escape.rs	213	236	prose	(?-s)
@@ -232,6 +234,7 @@ docs/query-to-sql.md	filter.rs:78-81	crates/pulsus-read/src/traces/filter.rs	78	
 docs/query-to-sql.md	filter.rs:833	crates/pulsus-read/src/traces/filter.rs	833		line	}
 docs/query-to-sql.md	filter.rs:843	crates/pulsus-read/src/traces/filter.rs	843		line	// (a raw comparison silently dropped any over-cap message
 docs/query-to-sql.md	filter.rs:961	crates/pulsus-read/src/traces/filter.rs	961		prose	ValuePred::KeyExists
+docs/query-to-sql.md	labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	structured_metadata
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted
 docs/query-to-sql.md	logql/charge.rs:1296	crates/pulsus-read/src/logql/charge.rs	1296		line	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:775-781	crates/pulsus-read/src/logql/error.rs	775	781	prose	400
@@ -300,6 +303,8 @@ docs/query-to-sql.md	predicate.rs:493	crates/pulsus-read/src/logql/predicate.rs	
 docs/query-to-sql.md	predicate.rs:501	crates/pulsus-read/src/logql/predicate.rs	501		line	let core = if lf.or_matches.is_empty() {
 docs/query-to-sql.md	predicate.rs:501-520	crates/pulsus-read/src/logql/predicate.rs	501	520	line	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
 docs/query-to-sql.md	predicate.rs:522	crates/pulsus-read/src/logql/predicate.rs	522		prose	NOT
+docs/query-to-sql.md	predicate.rs:947	crates/pulsus-read/src/logql/predicate.rs	947		line	fn contains_predicate(phrase: &str) -> String {
+docs/query-to-sql.md	predicate.rs:951	crates/pulsus-read/src/logql/predicate.rs	951		line	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
 docs/query-to-sql.md	pulsus-config/src/model.rs:378	crates/pulsus-config/src/model.rs	378		line	pub logql_scan_budget_bytes: ByteSize,
 docs/query-to-sql.md	pulsus-config/src/model.rs:511	crates/pulsus-config/src/model.rs	511		line	/// (the row allocation is bounded pre-query). Must be >= 1
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limits.rs	96		line	pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;
