@@ -163,7 +163,7 @@ async fn create_table_query(client: &ChClient, db: &str, name: &str) -> String {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LogSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,

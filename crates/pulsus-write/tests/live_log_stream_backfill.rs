@@ -26,7 +26,7 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet, UnixNano};
+use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, LogStreamRow, LogWriter};
 use pulsus_write::{LogRow, LogSink, ParsedLogs, StreamRow, WriterTables};
@@ -165,13 +165,13 @@ impl BlockInserter<LogStreamRow> for InjectingInserter {
 
 const TS_NS: i64 = 1_700_000_000_000_000_000; // 2023-11-14 UTC -> month 2023-11-01
 
-fn batch_for(fingerprint: u64, service: &str) -> ParsedLogs {
+fn batch_for(fingerprint: u128, service: &str) -> ParsedLogs {
     let (labels, _) =
         LabelSet::from_normalized([("service_name".to_string(), service.to_string())]);
     ParsedLogs {
         rows: vec![LogRow {
             service: service.to_string(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             timestamp_ns: UnixNano(TS_NS),
             severity: 0,
             body: "hello".to_string(),
@@ -179,7 +179,7 @@ fn batch_for(fingerprint: u64, service: &str) -> ParsedLogs {
         }],
         streams: vec![StreamRow {
             month: Date::start_of_month_utc(TS_NS).unwrap(),
-            fingerprint,
+            fingerprint: Fingerprint::from_raw(fingerprint),
             service: service.to_string(),
             labels,
             updated_ns: TS_NS,
@@ -194,12 +194,12 @@ fn month_days() -> u16 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct FingerprintRow {
-    fingerprint: u64,
+    fingerprint: u128,
 }
 
 /// The stage-1-shaped resolution query (docs/schemas.md §3.2): does the
 /// `(key, val)` pair resolve `fingerprint`s in the sample's month?
-async fn stage1_fingerprints(client: &ChClient, db: &str, service: &str) -> Vec<u64> {
+async fn stage1_fingerprints(client: &ChClient, db: &str, service: &str) -> Vec<u128> {
     let sql = format!(
         "SELECT fingerprint FROM {db}.log_streams_idx \
          WHERE month = toDate({days}) AND key = 'service_name' AND val = '{service}' \
@@ -223,10 +223,10 @@ struct CountRow {
     n: u64,
 }
 
-async fn streams_final_count(client: &ChClient, db: &str, fingerprint: u64) -> u64 {
+async fn streams_final_count(client: &ChClient, db: &str, fingerprint: u128) -> u64 {
     let sql = format!(
         "SELECT count() AS n FROM {db}.log_streams FINAL \
-         WHERE fingerprint = {fingerprint} AND month = toDate({days})",
+         WHERE fingerprint = toUInt128('{fingerprint}') AND month = toDate({days})",
         days = month_days(),
     );
     let mut stream = client
@@ -286,7 +286,7 @@ async fn l1_lost_registration_backfill_resolves_the_stream_in_the_samples_month(
         WriterTables::logs_default(),
     );
 
-    let fingerprint = 77u64;
+    let fingerprint = 77u128;
     let service = "backfill-l1-svc";
     let wait = writer
         .admit_flush(batch_for(fingerprint, service))
@@ -356,7 +356,7 @@ async fn l2_false_poisoned_duplicate_reinsert_collapses_on_final_read() {
         WriterTables::logs_default(),
     );
 
-    let fingerprint = 88u64;
+    let fingerprint = 88u128;
     let service = "backfill-l2-svc";
     let wait = writer
         .admit_flush(batch_for(fingerprint, service))

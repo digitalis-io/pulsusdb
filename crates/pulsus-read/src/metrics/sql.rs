@@ -38,6 +38,8 @@
 //! engine must apply it before this text reaches `ChClient::query_stream`,
 //! exactly as `logql::exec` already does for its own regex SQL.
 
+use pulsus_model::FpLiteral;
+
 use crate::logql::escape::ch_string;
 
 use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher};
@@ -143,10 +145,14 @@ pub fn historical_resolution_query(
 /// here — the fingerprint list is already the answer; this is a pure
 /// `fingerprint -> labels` lookup, filtered only by `metric_name` (the
 /// schema's metric-scoping invariant) and the explicit `IN (...)` list.
-pub fn series_labels_by_fingerprint(series_table: &str, metric_name: &str, fps: &[u64]) -> String {
+pub fn series_labels_by_fingerprint(
+    series_table: &str,
+    metric_name: &str,
+    fps: &[FpLiteral],
+) -> String {
     let fp_list = fps
         .iter()
-        .map(u64::to_string)
+        .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -276,7 +282,7 @@ pub fn discovery_distinct_names_query(
 pub fn discovery_fetch_multi(
     series_table: &str,
     metric_names: &[String],
-    fps: &[u64],
+    fps: &[FpLiteral],
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
@@ -287,7 +293,7 @@ pub fn discovery_fetch_multi(
         .join(", ");
     let fp_list = fps
         .iter()
-        .map(u64::to_string)
+        .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     // No matchers: the resolved `(name, fingerprint)` set IS the answer, so
@@ -404,6 +410,7 @@ mod tests {
     use super::*;
     use crate::metrics::anchored_re2_literal_for_test;
     use crate::metrics::matcher::MatchOp;
+    use pulsus_model::Fingerprint;
 
     fn window() -> DataWindow {
         DataWindow {
@@ -483,16 +490,28 @@ mod tests {
 
     #[test]
     fn series_labels_by_fingerprint_renders_an_explicit_fingerprint_list() {
-        let sql = series_labels_by_fingerprint("metric_series", "up", &[101, 205, 990]);
+        let sql = series_labels_by_fingerprint(
+            "metric_series",
+            "up",
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
+        );
         assert_eq!(
             sql,
-            "SELECT fingerprint, labels\nFROM metric_series\nWHERE metric_name = 'up'\n  AND fingerprint IN (101, 205, 990)\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
+            "SELECT fingerprint, labels\nFROM metric_series\nWHERE metric_name = 'up'\n  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
         );
     }
 
     #[test]
     fn series_labels_by_fingerprint_has_no_window_or_matcher_predicates() {
-        let sql = series_labels_by_fingerprint("metric_series", "up", &[1]);
+        let sql = series_labels_by_fingerprint(
+            "metric_series",
+            "up",
+            &[Fingerprint::from_raw(1).sql_literal()],
+        );
         assert!(!sql.contains("unix_milli >="));
         assert!(!sql.contains("JSONExtractString"));
     }
@@ -1031,7 +1050,10 @@ mod tests {
         let sql = discovery_fetch_multi(
             "metric_series",
             &["up".to_string(), "up_alias".to_string()],
-            &[101, 205],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+            ],
             window(),
             3_600_000,
         );
@@ -1040,7 +1062,7 @@ mod tests {
             "SELECT fingerprint, metric_name, labels\n\
              FROM metric_series\n\
              WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND fingerprint IN (101, 205)\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
              ORDER BY unix_milli DESC\n\
              LIMIT 1 BY metric_name, fingerprint"
@@ -1052,7 +1074,7 @@ mod tests {
         let sql = discovery_fetch_multi(
             "metric_series",
             &["up".to_string()],
-            &[7],
+            &[Fingerprint::from_raw(7).sql_literal()],
             DataWindow {
                 start_ms: 3_600_001,
                 end_ms: 7_300_000,
@@ -1067,7 +1089,13 @@ mod tests {
     /// no-residency-leak invariant.
     #[test]
     fn discovery_fetch_multi_always_constrains_the_request_window() {
-        let sql = discovery_fetch_multi("metric_series", &["up".to_string()], &[1], window(), 1);
+        let sql = discovery_fetch_multi(
+            "metric_series",
+            &["up".to_string()],
+            &[Fingerprint::from_raw(1).sql_literal()],
+            window(),
+            1,
+        );
         assert!(sql.contains("AND unix_milli >= "));
         assert!(sql.contains(" AND unix_milli <= "));
     }
@@ -1078,7 +1106,7 @@ mod tests {
         let sql = discovery_fetch_multi(
             "metric_series",
             &[payload.to_string()],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window(),
             3_600_000,
         );

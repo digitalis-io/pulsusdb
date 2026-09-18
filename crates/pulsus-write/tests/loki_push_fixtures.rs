@@ -22,6 +22,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
+use pulsus_model::Fingerprint;
 use pulsus_write::ingest::decompress::{Encoding, decompress};
 use pulsus_write::protocols::log_level::LevelDiscovery;
 use pulsus_write::protocols::loki_push::{
@@ -91,7 +92,12 @@ const EXPECTED_ROWS: &[(i64, &str)] = &[
 /// same decoded output) is what actually pins the parse: recomputing over
 /// the just-decoded labels only proves internal self-consistency and would
 /// silently track any decode drift.
-const EXPECTED_FINGERPRINT: pulsus_model::Fingerprint = 0x0444_F261_FF1E_744E;
+///
+/// 128 bits since issue #498. The leading word is the value this constant
+/// held before — the `cityHash64` half is unchanged over the same buffer,
+/// so the decode this test pins is pinned to the same bytes it was.
+const EXPECTED_FINGERPRINT: pulsus_model::Fingerprint =
+    Fingerprint::from_raw(0x0444_F261_FF1E_744E_1E29_A0F4_818B_1D4E);
 
 /// The real promtail capture decodes to the exact rows/labels/fingerprint a
 /// wrong hand-rolled tag could not reproduce — every value pinned as a

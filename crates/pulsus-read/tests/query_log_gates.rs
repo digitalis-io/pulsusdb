@@ -39,6 +39,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::predicate::{literal, month_literal};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
@@ -157,7 +158,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -226,7 +227,7 @@ async fn seed_corpus(db: &str) -> (ChClient, i64) {
         };
         rows.push(SeedSampleRow {
             service: SERVICE.to_string(),
-            fingerprint: FP_CORPUS,
+            fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
             severity: 0,
             body,
@@ -494,7 +495,7 @@ async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
     let sql = sql::stage3(
         &format!("{db}.log_samples"),
         &[literal(SERVICE)],
-        &[FP_CORPUS],
+        &[Fingerprint::from_raw(u128::from(FP_CORPUS)).sql_literal()],
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -554,7 +555,7 @@ async fn body_search_skip_index_prunes_most_granules() {
     let sql = sql::stage3(
         &format!("{db}.log_samples"),
         &[literal(SERVICE)],
-        &[FP_CORPUS],
+        &[Fingerprint::from_raw(u128::from(FP_CORPUS)).sql_literal()],
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -1024,7 +1025,7 @@ async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
         };
         rows.push(SeedSampleRow {
             service: SERVICE.to_string(),
-            fingerprint: FP_CORPUS,
+            fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
             severity: 0,
             body,
@@ -2045,7 +2046,7 @@ async fn seed_metric_series_472(client: &ChClient, db: &str, table: &str, bucket
             &format!(
                 "CREATE TABLE {db}.{table} (\
                    metric_name  LowCardinality(String), \
-                   fingerprint  UInt64  CODEC(Delta(8), ZSTD(1)), \
+                   fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
                    unix_milli   Int64   CODEC(Delta(8), ZSTD(1)), \
                    labels       String  CODEC(ZSTD(5))\
                  ) ENGINE = MergeTree \
@@ -2550,7 +2551,7 @@ type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct BucketedSeedRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -2636,7 +2637,7 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
 
     let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
         service: service.to_string(),
-        fingerprint: fp,
+        fingerprint: u128::from(fp),
         timestamp_ns: ts,
         severity: 0,
         body: body.to_string(),
@@ -2933,7 +2934,7 @@ async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct UnwrapSeedRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -3051,7 +3052,7 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
             .enumerate()
             .map(|(i, v)| UnwrapSeedRow {
                 service: "w4".to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 timestamp_ns: t0 + i as i64,
                 severity: 0,
                 body: format!(r#"{{"v":{v:?}}}"#),
@@ -3314,7 +3315,7 @@ fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
         .enumerate()
         .map(|(i, v)| UnwrapSeedRow {
             service: "w4".to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             timestamp_ns: t0 + i as i64,
             severity: 0,
             body: format!(r#"{{"v":{v:?}}}"#),
@@ -3842,7 +3843,7 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         for (i, v) in values.iter().enumerate() {
             rows.push(BucketedSeedRow {
                 service: name.to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 timestamp_ns: t - 30_000_000_000 + i as i64,
                 severity: 0,
                 body: format!(r#"{{"latency":{v}}}"#),
@@ -4249,7 +4250,7 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
             .enumerate()
             .map(|(i, v)| BucketedSeedRow {
                 service: name.to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 timestamp_ns: t - 30_000_000_000 + i as i64,
                 severity: 0,
                 body: format!(r#"{{"latency":{v:?}}}"#),
@@ -4519,7 +4520,7 @@ async fn seed_group_key_cases(
         for (j, (body, sm)) in case.entries.iter().enumerate() {
             rows.push(BucketedSeedRow {
                 service: case.id.clone(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 timestamp_ns: t - 50_000_000_000 + j as i64,
                 severity: 0,
                 body: body.clone(),
@@ -4743,7 +4744,10 @@ async fn group_key_statements(
     db: &str,
     want: usize,
 ) -> std::collections::HashMap<u64, Vec<(GroupKeyStatement, i32)>> {
-    let fp_re = regex::Regex::new(r"fingerprint IN \((\d+)\)").expect("regex");
+    // `toUInt128('<decimal>')` since issue #498 — a bare decimal above
+    // `2^64` is read by ClickHouse as `Float64`, so no statement carries
+    // one and a regex looking for one matches nothing.
+    let fp_re = regex::Regex::new(r"fingerprint IN \(toUInt128\('(\d+)'\)\)").expect("regex");
     let mut out = std::collections::HashMap::new();
     for _ in 0..30 {
         admin
@@ -5040,7 +5044,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             .expect("seed log_streams_idx");
         rows.push(BucketedSeedRow {
             service: service.to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             timestamp_ns: t - 10_000_000_000,
             severity: 0,
             body: body.to_string(),
@@ -5578,14 +5582,14 @@ async fn the_key_statement_does_not_throw_on_rows_outside_its_filter() {
     };
     let columns = sql::GroupKeyColumns {
         keys: u.keys.iter().map(|k| (k.clone(), Vec::new())).collect(),
-        classes: Some(vec![vec![1009]]),
+        classes: Some(vec![vec![Fingerprint::from_raw(1009).sql_literal()]]),
     };
     let s1 = sql::metric_range_unwrapped(
         "log_samples",
         u,
         &columns,
         &[literal("checkout")],
-        &[1009],
+        &[Fingerprint::from_raw(1009).sql_literal()],
         sql::BucketedScan {
             window: TimeWindow {
                 start_ns: base + 999_000_000,
@@ -7155,8 +7159,8 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
     }
     let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
     let mut fp = 900_000u64;
-    let mut group_meta: Vec<std::collections::HashMap<u64, StreamMetaRow>> = Vec::new();
-    let mut group_bodies: Vec<std::collections::HashMap<u64, (String, String, String)>> =
+    let mut group_meta: Vec<std::collections::HashMap<Fingerprint, StreamMetaRow>> = Vec::new();
+    let mut group_bodies: Vec<std::collections::HashMap<Fingerprint, (String, String, String)>> =
         Vec::new();
     for (name, corpus, stream, sm) in &groups {
         let mut labels = std::collections::BTreeMap::new();
@@ -7176,14 +7180,17 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
         for (case, body) in &corpora[corpus] {
             fp += 1;
             meta.insert(
-                fp,
+                Fingerprint::from_raw(u128::from(fp)),
                 StreamMetaRow {
-                    fingerprint: fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(fp)),
                     service: name.clone(),
                     labels: labels_json.clone(),
                 },
             );
-            bodies.insert(fp, (case.clone(), body.clone(), sm_text.clone()));
+            bodies.insert(
+                Fingerprint::from_raw(u128::from(fp)),
+                (case.clone(), body.clone(), sm_text.clone()),
+            );
             streams.push(format!(
                 "({month}, {fp}, '{name}', {}, 0)",
                 literal(&labels_json).as_sql()
@@ -7191,7 +7198,7 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
             idx.push(format!("({month}, 'service_name', '{name}', {fp})"));
             rows.push(BucketedSeedRow {
                 service: name.clone(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 timestamp_ns: t - 30_000_000_000,
                 severity: 0,
                 body: body.clone(),
@@ -7409,7 +7416,12 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
                 u,
                 probe.columns(),
                 &[literal(name)],
-                probe.fingerprints(),
+                &probe
+                    .fingerprints()
+                    .iter()
+                    .copied()
+                    .map(Fingerprint::sql_literal)
+                    .collect::<Vec<_>>(),
                 sql::BucketedScan {
                     window: TimeWindow {
                         start_ns: mp.start_ns,
@@ -7436,7 +7448,7 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
             for (fp, (case, body, sm)) in &group_bodies[gi] {
                 comparisons += 1;
                 let as_body = UnwrappedLaneRow {
-                    class: 0,
+                    class: Fingerprint::from_raw(0),
                     bucket_ns: t,
                     decided: 0,
                     keys: probe
@@ -7591,7 +7603,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "6d0365da22a957554ed1eb6bfacad59601b85875d82c59bbbb6b190e896c7855";
+    "138cac82947c253a716e254afd57ca098ca8704632a5f52370a12d170bb5238a";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7808,20 +7820,49 @@ fn sort_fingerprint_lists(sql: &str) -> String {
     while let Some(at) = rest.find(needle) {
         let (head, tail) = rest.split_at(at + needle.len());
         out.push_str(head);
-        match tail.find(')') {
+        // Each element is `toUInt128('<decimal>')` since issue #498, so the
+        // list's own closing parenthesis is the LAST one before the next
+        // clause, not the first — the first now closes the first element's
+        // call. Scanning to a balanced close is what keeps this a list
+        // sorter rather than a text cutter.
+        let mut depth = 1usize;
+        let mut close = None;
+        for (i, c) in tail.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match close {
             None => {
                 rest = tail;
                 break;
             }
             Some(close) => {
-                let mut ids: Vec<u64> = tail[..close]
+                let mut ids: Vec<u128> = tail[..close]
                     .split(',')
-                    .filter_map(|t| t.trim().parse().ok())
+                    .filter_map(|t| {
+                        let t = t.trim();
+                        // `toUInt128('123')` or, on a sub-query form, text
+                        // that is not an element at all.
+                        let inner = t
+                            .strip_prefix("toUInt128('")
+                            .and_then(|r| r.strip_suffix("')"))
+                            .unwrap_or(t);
+                        inner.parse().ok()
+                    })
                     .collect();
                 ids.sort_unstable();
                 out.push_str(
                     &ids.iter()
-                        .map(u64::to_string)
+                        .map(|v| format!("toUInt128('{v}')"))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -8124,7 +8165,7 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         for i in 0..count {
             rows.push(BucketedSeedRow {
                 service: service.to_string(),
-                fingerprint: fp,
+                fingerprint: u128::from(fp),
                 // Inside the one window `(T - 60s, T]`, and every body is
                 // JSON so `| json | __error__=""` keeps every line and the
                 // two range routes count the same rows.

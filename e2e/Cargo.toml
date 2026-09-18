@@ -46,4 +46,10 @@ snap.workspace = true
 # drift fails `cargo test --workspace`, never a nightly run.
 [dev-dependencies]
 pulsus-logql = { path = "../crates/pulsus-logql" }
+# Issue #498: the witness cases build `StreamMetaRow` values, whose
+# `fingerprint` is a `pulsus_model::Fingerprint` — a sealed newtype with no
+# integer conversion, so the type has to be named here. A workspace path
+# dependency this crate already links through `pulsus-read`; no new external
+# crate enters the lockfile.
+pulsus-model = { path = "../crates/pulsus-model" }
 pulsus-read = { path = "../crates/pulsus-read" }

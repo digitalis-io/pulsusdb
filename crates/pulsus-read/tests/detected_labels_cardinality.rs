@@ -24,6 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::predicate::month_literal;
 use pulsus_read::logql::sql;
 
@@ -764,7 +765,8 @@ fn the_provenance_transcript_and_the_artifact_agree() {
 /// the number on the HTTP response body.
 #[test]
 fn the_detected_labels_aggregate_is_still_an_exact_count() {
-    for fingerprints in [None, Some(&[7u64, 9][..])] {
+    let some_fps = [7, 9].map(|v| Fingerprint::from_raw(v).sql_literal());
+    for fingerprints in [None, Some(&some_fps[..])] {
         let rendered = sql::detected_labels(
             "log_streams_idx",
             &[month_literal(2026, 8)],

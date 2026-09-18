@@ -15,7 +15,7 @@
     "service": "orders",
     "labels_json": "{\"deployment_environment\":\"prod\",\"k8s_pod_name\":\"pod-9\",\"service_name\":\"orders\"}",
     "structured_metadata_json": "{\"scope_name\":\"orders-scope\",\"scope_version\":\"2.1.0\"}",
-    "fingerprint": 5747284062854669674,
+    "fingerprint": "106018678226389731979056199006757146494",
     "body": "order placed",
     "severity": 9,
     "timestamp_source": "time_unix_nano",

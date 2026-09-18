@@ -68,6 +68,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pulsus_logql::parse;
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows::TailSampleRow;
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
@@ -683,7 +684,7 @@ fn level_rows(n: u64) -> Vec<Result<TailSampleRow, ReadError>> {
     (0..n)
         .map(|i| {
             Ok(TailSampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 2_000_000 - i as i64,
                 body: format!(r#"{{"level":"v{i}"}}"#),
                 body_hash: i,
@@ -714,7 +715,10 @@ fn absorb_page_value_cap_is_inert_on_a_detected_fields_probe() {
     let _guard = lock_serial();
     let compiled = compile(r#"{app="x"}"#);
     let mut probe = DetectedFieldsProbe::new(5000, 3);
-    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "x".to_string())],
+    );
     let mut stream = futures::stream::iter(level_rows(40));
     let decision = futures::executor::block_on(probe.absorb_page(&compiled, &mut stream, 1))
         .expect("absorb_page succeeds");
@@ -747,7 +751,10 @@ fn absorb_page_value_cap_stops_feeding_on_a_field_values_probe() {
     let _guard = lock_serial();
     let compiled = compile(r#"{app="x"}"#);
     let mut probe = DetectedFieldsProbe::for_field_values(5000, "level", 3);
-    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "x".to_string())],
+    );
     let mut stream = futures::stream::iter(level_rows(40));
     let decision = futures::executor::block_on(probe.absorb_page(&compiled, &mut stream, 1))
         .expect("absorb_page succeeds");
@@ -794,16 +801,19 @@ fn case_e_sampled_rows_are_streamed_one_row_live() {
     );
     let compiled = compile(r#"{app="x"}"#);
     let mut probe = DetectedFieldsProbe::new(5000, 1000);
-    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "x".to_string())],
+    );
     // Warm the parsers (LazyLock) outside the window so their one-time
     // compilation is not read as streaming cost.
     probe
-        .feed_row(&compiled, 1, 0, "zzzz", "")
+        .feed_row(&compiled, Fingerprint::from_raw(1), 0, "zzzz", "")
         .expect("warm row");
     let (decision, w) = measure(|| {
         let rows = (0..2000u64).map(|i| {
             Ok::<TailSampleRow, ReadError>(TailSampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 2_000_000 - i as i64,
                 body: "z".repeat(65_536),
                 body_hash: i,
@@ -883,7 +893,13 @@ fn assert_narrow_tail_bound(
     let ((), w) = measure(|| {
         for i in 0..200i64 {
             probe
-                .feed_row(compiled, 1, 1_000_000 + i, "!!! narrow", "")
+                .feed_row(
+                    compiled,
+                    Fingerprint::from_raw(1),
+                    1_000_000 + i,
+                    "!!! narrow",
+                    "",
+                )
                 .expect("narrow row");
         }
     });
@@ -921,10 +937,19 @@ fn case_f_wide_sm_row_does_not_bloat_the_carried_scratch() {
     let _guard = lock_serial();
     let compiled = compile(r#"{app="x"}"#);
     let mut probe = DetectedFieldsProbe::with_byte_budget(10_000, 8, MAX_DETECTED_FIELD_BYTES);
-    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "x".to_string())],
+    );
     let sm = wide_sm_json(65_536);
     probe
-        .feed_row(&compiled, 1, 2_000_000, "wide row body", &sm)
+        .feed_row(
+            &compiled,
+            Fingerprint::from_raw(1),
+            2_000_000,
+            "wide row body",
+            &sm,
+        )
         .expect("wide row");
     drop(sm);
     assert_narrow_tail_bound(&mut probe, &compiled, "case F");
@@ -937,10 +962,13 @@ fn case_g_wide_json_body_does_not_bloat_the_carried_scratch() {
     let _guard = lock_serial();
     let compiled = compile(r#"{app="x"} | json"#);
     let mut probe = DetectedFieldsProbe::with_byte_budget(10_000, 8, MAX_DETECTED_FIELD_BYTES);
-    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "x".to_string())],
+    );
     let body = wide_sm_json(65_536);
     probe
-        .feed_row(&compiled, 1, 2_000_000, &body, "")
+        .feed_row(&compiled, Fingerprint::from_raw(1), 2_000_000, &body, "")
         .expect("wide row");
     drop(body);
     assert_narrow_tail_bound(&mut probe, &compiled, "case G");
@@ -985,24 +1013,25 @@ fn run_shape(query: &str, body: &str, sm: &str, case: &str) -> ShapeRun {
     let base = [("app".to_string(), "x".to_string())];
 
     let mut legacy = DetectedFieldsProbe::new(1000, 5000);
-    legacy.add_stream(1, &base);
+    legacy.add_stream(Fingerprint::from_raw(1), &base);
     for _ in 0..WARMUP {
         legacy
-            .feed_row_legacy_shape(&compiled, 1, 5, body, sm)
+            .feed_row_legacy_shape(&compiled, Fingerprint::from_raw(1), 5, body, sm)
             .expect("legacy warm-up");
     }
-    let (_, w_legacy) = measure(|| legacy.feed_row_legacy_shape(&compiled, 1, 5, body, sm));
+    let (_, w_legacy) =
+        measure(|| legacy.feed_row_legacy_shape(&compiled, Fingerprint::from_raw(1), 5, body, sm));
     assert_no_overflow(case);
 
     let mut newp = DetectedFieldsProbe::new(1000, 5000);
-    newp.add_stream(1, &base);
+    newp.add_stream(Fingerprint::from_raw(1), &base);
     for _ in 0..WARMUP {
-        newp.feed_row(&compiled, 1, 5, body, sm)
+        newp.feed_row(&compiled, Fingerprint::from_raw(1), 5, body, sm)
             .expect("new warm-up");
     }
-    let (_, w_new_1) = measure(|| newp.feed_row(&compiled, 1, 5, body, sm));
+    let (_, w_new_1) = measure(|| newp.feed_row(&compiled, Fingerprint::from_raw(1), 5, body, sm));
     assert_no_overflow(case);
-    let (_, w_new_2) = measure(|| newp.feed_row(&compiled, 1, 5, body, sm));
+    let (_, w_new_2) = measure(|| newp.feed_row(&compiled, Fingerprint::from_raw(1), 5, body, sm));
     assert_no_overflow(case);
 
     eprintln!(

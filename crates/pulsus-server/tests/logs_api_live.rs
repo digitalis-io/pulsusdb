@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::predicate::{self, literal, month_literal};
 use pulsus_read::logql::sql::{
     self, BucketedScan, MetricShape, MetricSource, ScanLowerBound, ScanProjection, TimeWindow,
@@ -837,7 +838,10 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         ],
         &[],
     );
-    let stage2_sql = sql::stage2("log_streams", &[FP_A]);
+    let stage2_sql = sql::stage2(
+        "log_streams",
+        &[Fingerprint::from_raw(u128::from(FP_A)).sql_literal()],
+    );
     // Issue #507 (W2): `count_over_time` at a step EQUAL to its range is a
     // clean bucketed chain, so the aggregation is lowered into the
     // statement and the explain reports the bucketed read — one row per
@@ -855,7 +859,7 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
     let metric_sql = sql::metric_range_bucketed(
         MetricSource::new("log_samples", MetricShape::RawCount),
         &[literal("checkout")],
-        &[FP_A],
+        &[Fingerprint::from_raw(u128::from(FP_A)).sql_literal()],
         BucketedScan {
             window: TimeWindow {
                 start_ns: window_start - POST_GOLDEN_STEP_NS,

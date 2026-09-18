@@ -13,7 +13,7 @@
     "service": "checkout-api",
     "labels_json": "{\"service_name\":\"checkout-api\"}",
     "structured_metadata_json": "{\"scope_name\":\"checkout-scope\",\"scope_version\":\"3.2.1\"}",
-    "fingerprint": 15015674171264045977,
+    "fingerprint": "276990298531518622924187036706941534301",
     "body": "checkout completed",
     "severity": 12,
     "timestamp_source": "observed_time_unix_nano",

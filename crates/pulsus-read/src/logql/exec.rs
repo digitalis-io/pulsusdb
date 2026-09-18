@@ -27,6 +27,7 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
 use pulsus_logql::{
     Expr, LabelFilterExpr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector,
 };
+use pulsus_model::{Fingerprint, FpLiteral};
 
 use super::charge::{
     MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_POINT_SLOT,
@@ -52,7 +53,7 @@ use super::detected_probe::{
 };
 
 use super::labels::{
-    EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
+    EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, derived_stream_fingerprint,
     merge_labels_with_structured_metadata, render_labels_json_sorted, series_labels,
 };
 use super::post_agg::{
@@ -63,6 +64,15 @@ use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggS
 use super::warnings::Warnings;
 use super::window::{ClientWindow, materialize_vector_lit};
 use crate::canonical_labels::parse_canonical_labels;
+
+/// Mints a resolved fingerprint set into the only form that may enter SQL
+/// (issue #498). Every `super::sql` builder takes `&[FpLiteral]`, so a raw
+/// identity cannot reach a statement: above `2^64` a bare decimal literal
+/// is read by ClickHouse as `Float64` and silently matches the wrong row.
+/// One allocation per statement built, 16 bytes per fingerprint.
+fn sql_literals(fps: &[Fingerprint]) -> Vec<FpLiteral> {
+    fps.iter().copied().map(Fingerprint::sql_literal).collect()
+}
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
 /// `max_bytes_to_read` overflow this module sets from
@@ -143,7 +153,7 @@ impl EngineConfig {
 /// the JSON envelope and already depends on a JSON crate for it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamResult {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub service: String,
     /// With `categorize_labels` (issue #463) this holds the
     /// STREAM-category labels only; without it, the full final label set
@@ -659,7 +669,7 @@ impl LogQlEngine {
         // Always >= 1 literal (`months_overlapping` never returns empty),
         // so the stage-2 month IN-list has no empty-IN hazard.
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let fingerprints: Option<Vec<u64>> = match selector {
+        let fingerprints: Option<Vec<Fingerprint>> = match selector {
             None => None,
             Some(expr) => {
                 let ctx = self.config.plan_ctx();
@@ -699,7 +709,8 @@ impl LogQlEngine {
                 Some(fps)
             }
         };
-        let fps = fingerprints.as_deref();
+        let minted = fingerprints.as_deref().map(sql_literals);
+        let fps = minted.as_deref();
         let window = self.activity_window(b);
         let sql = match query {
             DiscoveryQuery::LabelNames => super::sql::label_names(
@@ -810,7 +821,7 @@ impl LogQlEngine {
             limit: 1,
             direction: Direction::Backward,
         };
-        let mut fingerprints: Vec<u64> = Vec::new();
+        let mut fingerprints: Vec<Fingerprint> = Vec::new();
         let mut streams_table = self.config.streams.clone();
         // Issue #399: stage 1 is month-scoped (`sql::stage1`, shared with
         // every other LogQL path — see `LogQlEngine::active_fingerprints`
@@ -883,7 +894,7 @@ impl LogQlEngine {
                     "series_activity_filter",
                     super::sql::active_fingerprints(
                         &self.config.rollup_table,
-                        Some(&fingerprints),
+                        Some(&sql_literals(&fingerprints)),
                         window,
                         self.config.rollup_res_ns,
                     ),
@@ -898,7 +909,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&streams_table, &fingerprints),
+                super::sql::stage2(&streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -966,7 +977,7 @@ impl LogQlEngine {
     /// broad'" guarantee to the stage-1 index scan itself, not just
     /// stage 3/metric reads — a broad `log_streams_idx` scan must never run
     /// uncapped.
-    async fn resolve_fingerprints(&self, stage1_sql: &str) -> Result<Vec<u64>, ReadError> {
+    async fn resolve_fingerprints(&self, stage1_sql: &str) -> Result<Vec<Fingerprint>, ReadError> {
         let mut fingerprints = Vec::new();
         let mut stream = self
             .query_stream::<StreamRow>(stage1_sql, &self.budget_settings())
@@ -1004,14 +1015,14 @@ impl LogQlEngine {
     async fn all_active_fingerprints(
         &self,
         window: super::sql::TimeWindow,
-    ) -> Result<Vec<u64>, ReadError> {
+    ) -> Result<Vec<Fingerprint>, ReadError> {
         let sql = super::sql::active_fingerprints(
             &self.config.rollup_table,
             None,
             window,
             self.config.rollup_res_ns,
         );
-        let mut fingerprints: Vec<u64> = Vec::new();
+        let mut fingerprints: Vec<Fingerprint> = Vec::new();
         // Scoped so the pooled connection's lease drops before the caller
         // issues stage 2 (the `ChRowStream` lease contract).
         {
@@ -1041,13 +1052,13 @@ impl LogQlEngine {
     async fn hydrate(
         &self,
         streams_table: &str,
-        fingerprints: &[u64],
-    ) -> Result<HashMap<u64, StreamMetaRow>, ReadError> {
+        fingerprints: &[Fingerprint],
+    ) -> Result<HashMap<Fingerprint, StreamMetaRow>, ReadError> {
         let mut out = HashMap::with_capacity(fingerprints.len());
         if fingerprints.is_empty() {
             return Ok(out);
         }
-        let sql = super::sql::stage2(streams_table, fingerprints);
+        let sql = super::sql::stage2(streams_table, &sql_literals(fingerprints));
         let mut stream = self
             .query_stream::<StreamMetaRow>(&sql, &self.budget_settings())
             .await?;
@@ -1155,16 +1166,16 @@ impl LogQlEngine {
     /// `series_inner`'s sort/dedup contract is untouched.
     async fn active_fingerprints(
         &self,
-        fingerprints: &[u64],
+        fingerprints: &[Fingerprint],
         window: super::sql::TimeWindow,
-    ) -> Result<Vec<u64>, ReadError> {
+    ) -> Result<Vec<Fingerprint>, ReadError> {
         let sql = super::sql::active_fingerprints(
             &self.config.rollup_table,
-            Some(fingerprints),
+            Some(&sql_literals(fingerprints)),
             window,
             self.config.rollup_res_ns,
         );
-        let mut active: BTreeSet<u64> = BTreeSet::new();
+        let mut active: BTreeSet<Fingerprint> = BTreeSet::new();
         // Scoped so the pooled connection's lease drops before the caller
         // issues stage 2 (the `ChRowStream` lease contract).
         {
@@ -1294,7 +1305,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &fingerprints),
+                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -1312,7 +1323,7 @@ impl LogQlEngine {
         let sql = super::sql::stage3(
             &sp.samples_table,
             &services,
-            &fingerprints,
+            &sql_literals(&fingerprints),
             super::sql::TimeWindow {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
@@ -1474,9 +1485,9 @@ impl LogQlEngine {
         &self,
         sp: &StreamsPlan,
         compiled: &super::pipeline::CompiledPipeline,
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         services: &[CheckedLiteral],
-        fingerprints: &[u64],
+        fingerprints: &[Fingerprint],
         scan_limit: u32,
         opts: ResponseOptions,
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
@@ -1512,14 +1523,18 @@ impl LogQlEngine {
             let ks_lower = match st.cursor {
                 None => super::sql::KeysetLower::First,
                 Some(c) => super::sql::KeysetLower::After {
-                    tuple: c.tuple,
+                    // Minted here: the cursor enters a tuple comparison,
+                    // where a bare decimal above `2^64` re-delivers the
+                    // boundary row walking forward and skips it walking
+                    // back (issue #498).
+                    tuple: (c.tuple.0, c.tuple.1.sql_literal(), c.tuple.2),
                     offset: c.seen,
                 },
             };
             let sql = super::sql::stage3_keyset(
                 &sp.samples_table,
                 services,
-                fingerprints,
+                &sql_literals(fingerprints),
                 window,
                 ks_lower,
                 sp.direction,
@@ -1657,7 +1672,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&mp.streams_table, &fingerprints),
+                super::sql::stage2(&mp.streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -1728,7 +1743,7 @@ impl LogQlEngine {
             let sql = super::sql::metric_instant(
                 metric_source(mp),
                 &services,
-                &fingerprints,
+                &sql_literals(&fingerprints),
                 super::sql::TimeWindow {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
@@ -1911,8 +1926,8 @@ impl LogQlEngine {
         mp: &MetricPlan,
         u: &super::sql::UnwrappedValue,
         services: &[CheckedLiteral],
-        fingerprints: &[u64],
-        meta: &HashMap<u64, StreamMetaRow>,
+        fingerprints: &[Fingerprint],
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
         // One compile serves both routes: today's route runs exactly the
@@ -1998,7 +2013,7 @@ impl LogQlEngine {
             u,
             &resolved.columns,
             services,
-            &resolved.fingerprints,
+            &sql_literals(&resolved.fingerprints),
             scan,
             &mp.extra_predicates,
             super::sql::UndecidedRows::Throw,
@@ -2090,7 +2105,7 @@ impl LogQlEngine {
             u,
             &resolved.columns,
             services,
-            &resolved.fingerprints,
+            &sql_literals(&resolved.fingerprints),
             scan,
             &mp.extra_predicates,
         ) else {
@@ -2157,8 +2172,8 @@ impl LogQlEngine {
         mp: &MetricPlan,
         client: &ClientAgg,
         compiled: &CompiledPipeline,
-        fingerprints: &[u64],
-        meta: &HashMap<u64, StreamMetaRow>,
+        fingerprints: &[Fingerprint],
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         services: &[CheckedLiteral],
         predicates: &[CheckedFragment],
         mut explain: Option<&mut PlanExplain>,
@@ -2345,7 +2360,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&scan.streams_table, &fingerprints),
+                super::sql::stage2(&scan.streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -2508,7 +2523,7 @@ impl LogQlEngine {
         if fingerprints.is_empty() {
             return Ok(explain);
         }
-        let stage2_sql = super::sql::stage2(&sp.streams_table, &fingerprints);
+        let stage2_sql = super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints));
         explain.push("stage2_hydration", stage2_sql.clone(), None);
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
@@ -2517,7 +2532,7 @@ impl LogQlEngine {
         let stage3_sql = super::sql::stage3(
             &sp.samples_table,
             &services,
-            &fingerprints,
+            &sql_literals(&fingerprints),
             super::sql::TimeWindow {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
@@ -2565,7 +2580,7 @@ impl LogQlEngine {
         }
         explain.push(
             "stage2_hydration",
-            super::sql::stage2(&mp.streams_table, &fingerprints),
+            super::sql::stage2(&mp.streams_table, &sql_literals(&fingerprints)),
             None,
         );
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
@@ -2624,7 +2639,7 @@ impl LogQlEngine {
                                     u,
                                     &resolved.columns,
                                     &services,
-                                    &resolved.fingerprints,
+                                    &sql_literals(&resolved.fingerprints),
                                     scan,
                                     &mp.extra_predicates,
                                     super::sql::UndecidedRows::Throw,
@@ -2659,7 +2674,7 @@ impl LogQlEngine {
                 None => super::sql::metric_instant(
                     metric_source(mp),
                     &services,
-                    &fingerprints,
+                    &sql_literals(&fingerprints),
                     window,
                     mp.scan_lower,
                     &lowered.predicates,
@@ -2750,7 +2765,7 @@ pub struct VolumeEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailCursor {
     /// `(timestamp_ns, fingerprint, cityHash64(body))`.
-    pub tuple: (i64, u64, u64),
+    pub tuple: (i64, Fingerprint, u64),
     /// Rows equal to `tuple` already delivered — the next page's `OFFSET`.
     pub seen: u32,
 }
@@ -2869,7 +2884,7 @@ pub struct TailSetup {
     /// resolved on this connection — the orphan-cache that keeps a
     /// partial-failure (older-month-registered) stream resolvable after
     /// the stage-1 month window narrows past its registration month.
-    resolved: Vec<u64>,
+    resolved: Vec<Fingerprint>,
     /// The response-shape options the connection was opened with (issue
     /// #463) — the tail's whole lifetime, since the header is read once
     /// at upgrade and a WebSocket has no per-frame request.
@@ -2967,7 +2982,11 @@ impl LogQlEngine {
         };
         let (sql, routing) = if sp.line_filters.is_empty() {
             (
-                super::sql::log_stats_rollup(&self.config.rollup_table, &fingerprints, window),
+                super::sql::log_stats_rollup(
+                    &self.config.rollup_table,
+                    &sql_literals(&fingerprints),
+                    window,
+                ),
                 super::plan::RoutingDecision {
                     chosen: super::plan::RouteChoice::Rollup,
                     reason: "rollup: no line filter — stats served from the rollup with zero \
@@ -2982,7 +3001,7 @@ impl LogQlEngine {
             if let Some(e) = explain.as_mut() {
                 e.push(
                     "stage2_hydration",
-                    super::sql::stage2(&sp.streams_table, &fingerprints),
+                    super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
                     None,
                 );
             }
@@ -2992,7 +3011,7 @@ impl LogQlEngine {
                 super::sql::log_stats_raw(
                     &sp.samples_table,
                     &services,
-                    &fingerprints,
+                    &sql_literals(&fingerprints),
                     window,
                     &sp.line_filters,
                 ),
@@ -3119,7 +3138,7 @@ impl LogQlEngine {
         };
         let sql = super::sql::log_patterns_read(
             &self.config.patterns_table,
-            &fingerprints,
+            &sql_literals(&fingerprints),
             window,
             step_ns,
         );
@@ -3260,7 +3279,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &fingerprints),
+                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -3270,7 +3289,11 @@ impl LogQlEngine {
             start_ns: q.bounds.start_ns,
             end_ns: q.bounds.end_ns,
         };
-        let sql = super::sql::log_volume_rollup(&self.config.rollup_table, &fingerprints, window);
+        let sql = super::sql::log_volume_rollup(
+            &self.config.rollup_table,
+            &sql_literals(&fingerprints),
+            window,
+        );
         if let Some(e) = explain.as_mut() {
             let routing = super::plan::RoutingDecision {
                 chosen: super::plan::RouteChoice::Rollup,
@@ -3565,7 +3588,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &fingerprints),
+                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -3573,7 +3596,7 @@ impl LogQlEngine {
         let services = distinct_escaped_services(&meta);
         // Base labels parsed once per fingerprint, not per row (the
         // `StreamAccumulator` idiom).
-        let base_labels: HashMap<u64, Vec<(String, String)>> = meta
+        let base_labels: HashMap<Fingerprint, Vec<(String, String)>> = meta
             .iter()
             .map(|(fp, m)| (*fp, parse_canonical_labels(&m.labels)))
             .collect();
@@ -3592,7 +3615,7 @@ impl LogQlEngine {
             let sql = super::sql::stage3(
                 &sp.samples_table,
                 &services,
-                &fingerprints,
+                &sql_literals(&fingerprints),
                 window,
                 &sp.line_filters,
                 sp.direction,
@@ -3660,7 +3683,7 @@ impl LogQlEngine {
             let first_page_sql = super::sql::stage3_keyset(
                 &sp.samples_table,
                 &services,
-                &fingerprints,
+                &sql_literals(&fingerprints),
                 window,
                 super::sql::KeysetLower::First,
                 sp.direction,
@@ -3747,9 +3770,9 @@ impl LogQlEngine {
         &self,
         sp: &StreamsPlan,
         compiled: &CompiledPipeline,
-        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         services: &[CheckedLiteral],
-        fingerprints: &[u64],
+        fingerprints: &[Fingerprint],
         line_limit: u32,
         acc: &mut FieldAccumulator,
     ) -> Result<bool, ReadError> {
@@ -3779,14 +3802,18 @@ impl LogQlEngine {
             let ks_lower = match st.cursor {
                 None => super::sql::KeysetLower::First,
                 Some(c) => super::sql::KeysetLower::After {
-                    tuple: c.tuple,
+                    // Minted here: the cursor enters a tuple comparison,
+                    // where a bare decimal above `2^64` re-delivers the
+                    // boundary row walking forward and skips it walking
+                    // back (issue #498).
+                    tuple: (c.tuple.0, c.tuple.1.sql_literal(), c.tuple.2),
                     offset: c.seen,
                 },
             };
             let sql = super::sql::stage3_keyset(
                 &sp.samples_table,
                 services,
-                fingerprints,
+                &sql_literals(fingerprints),
                 window,
                 ks_lower,
                 sp.direction,
@@ -3958,14 +3985,18 @@ impl LogQlEngine {
         let ks_lower = match lower {
             TailLower::Start { .. } => super::sql::KeysetLower::First,
             TailLower::After(c) => super::sql::KeysetLower::After {
-                tuple: c.tuple,
+                // The cursor's fingerprint is minted here: it enters a
+                // tuple comparison, where a bare decimal above `2^64`
+                // re-delivers the boundary row walking forward and skips
+                // it walking back (issue #498).
+                tuple: (c.tuple.0, c.tuple.1.sql_literal(), c.tuple.2),
                 offset: c.seen,
             },
         };
         let sql = super::sql::stage3_keyset(
             &setup.plan.samples_table,
             &services,
-            fingerprints,
+            &sql_literals(fingerprints),
             window,
             ks_lower,
             Direction::Forward,
@@ -4103,7 +4134,7 @@ fn refresh_tail_months(
 /// present in an earlier batch survives a later batch that no longer
 /// resolves it, because its stage-1 month scrolled out of the current
 /// poll window).
-fn merge_resolved(cache: &mut Vec<u64>, new: &[u64]) {
+fn merge_resolved(cache: &mut Vec<Fingerprint>, new: &[Fingerprint]) {
     if new.is_empty() {
         return;
     }
@@ -4249,7 +4280,7 @@ pub(crate) fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
 pub fn run_pipeline_rows(
     rows: Vec<SampleRow>,
     compiled: &super::pipeline::CompiledPipeline,
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     result_limit: u32,
 ) -> Result<Vec<StreamResult>, ReadError> {
     // A one-shot feed over the whole slice — byte-identical output and
@@ -4382,7 +4413,7 @@ impl StreamsPagedState {
 /// pre-#312 drain's `filter_map` did at the other end.
 #[derive(Debug, Default)]
 pub(in crate::logql) struct FastPathGroups {
-    by_fp: HashMap<u64, StreamResult>,
+    by_fp: HashMap<Fingerprint, StreamResult>,
     sm: SmFanOutAccumulator,
     /// Issue #463. With `categorize-labels` the response groups by the
     /// STREAM-category label set, not by fingerprint-or-merged-set — so a
@@ -4395,7 +4426,7 @@ pub(in crate::logql) struct FastPathGroups {
     cat_groups: HashMap<String, FanOutGroup>,
     /// Reused per row on the categorised metadata path only — the same
     /// clear-and-refill discipline `SmFanOutAccumulator` uses.
-    cat_base: HashMap<u64, Vec<(String, String)>>,
+    cat_base: HashMap<Fingerprint, Vec<(String, String)>>,
     cat_merge_buf: Vec<(String, String)>,
     cat_sm_buf: Vec<(String, String)>,
     cat_sm_ctx: StructuredMetadataCtx,
@@ -4420,7 +4451,7 @@ impl FastPathGroups {
     pub(in crate::logql) fn push_row(
         &mut self,
         row: SampleRow,
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         budget: &mut StreamsResultBudget,
     ) -> Result<(), ReadError> {
         let Some(m) = meta.get(&row.fingerprint) else {
@@ -4501,7 +4532,7 @@ impl FastPathGroups {
                 .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
                 .collect();
             let json = render_labels_json_sorted(&sorted);
-            let fp = fnv1a64(json.as_bytes());
+            let fp = derived_stream_fingerprint(json.as_bytes());
             (json, fp)
         };
         push_fanout_entry(
@@ -4569,7 +4600,7 @@ impl StreamsFastPathProbe {
     pub fn push_row(
         &mut self,
         row: SampleRow,
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
     ) -> Result<(), ReadError> {
         self.groups.push_row(row, meta, &mut self.budget)
     }
@@ -4659,10 +4690,10 @@ pub const STREAM_FEED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 /// call) but reused across every row within the page, preserving the
 /// zero-per-row-alloc dropped-row path.
 pub struct StreamAccumulator<'m> {
-    meta: &'m HashMap<u64, StreamMetaRow>,
+    meta: &'m HashMap<Fingerprint, StreamMetaRow>,
     result_limit: u32,
     // Base labels parsed once per fingerprint, not per row.
-    base_labels: HashMap<u64, Vec<(String, String)>>,
+    base_labels: HashMap<Fingerprint, Vec<(String, String)>>,
     // Transform path groups by source fingerprint; fan-out groups by the
     // canonical rendered labels JSON (sorted keys — it doubles as the
     // equality key). Two maps instead of a shared key enum so the fan-out
@@ -4672,7 +4703,7 @@ pub struct StreamAccumulator<'m> {
     // `StreamResult.labels_json` at final collection — never cloned out of
     // the entry, so high-cardinality fan-out (every row a new group) pays
     // no per-group key duplication either (review round 3).
-    fp_groups: HashMap<u64, StreamResult>,
+    fp_groups: HashMap<Fingerprint, StreamResult>,
     label_groups: HashMap<String, FanOutGroup>,
     survivors: u32,
     /// The issue #312 peak-retention ledger — result charges plus the
@@ -4692,13 +4723,13 @@ pub struct StreamAccumulator<'m> {
 }
 
 impl<'m> StreamAccumulator<'m> {
-    pub fn new(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32) -> Self {
+    pub fn new(meta: &'m HashMap<Fingerprint, StreamMetaRow>, result_limit: u32) -> Self {
         Self::with_cap(meta, result_limit, MAX_STREAMS_RESULT_BYTES)
     }
 
     /// [`Self::new`] with the issue #463 wire-shape decision stated.
     pub fn with_opts(
-        meta: &'m HashMap<u64, StreamMetaRow>,
+        meta: &'m HashMap<Fingerprint, StreamMetaRow>,
         result_limit: u32,
         opts: super::params::ResponseOptions,
     ) -> Self {
@@ -4708,8 +4739,12 @@ impl<'m> StreamAccumulator<'m> {
     }
 
     /// A test-visible ceiling; production sites call [`Self::new`].
-    pub fn with_cap(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32, cap: u64) -> Self {
-        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    pub fn with_cap(
+        meta: &'m HashMap<Fingerprint, StreamMetaRow>,
+        result_limit: u32,
+        cap: u64,
+    ) -> Self {
+        let mut base_labels: HashMap<Fingerprint, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
             base_labels.insert(*fp, parse_canonical_labels(&m.labels));
         }
@@ -5006,7 +5041,7 @@ pub(in crate::logql) struct PushdownInstantGroups {
     /// Each resolved stream's base label set, snapshotted ONCE — the
     /// pre-#249 code called `series_labels` per returned row, and
     /// `(fingerprint, structured_metadata)` returns strictly more rows.
-    base_labels: HashMap<u64, LabelSet>,
+    base_labels: HashMap<Fingerprint, LabelSet>,
     /// Rendered final label set -> `(labels, summed count)`.
     groups: HashMap<String, (LabelSet, u64)>,
     /// Query-lifetime group bytes, never discharged: the groups ARE the
@@ -5021,7 +5056,7 @@ pub(in crate::logql) struct PushdownInstantGroups {
 }
 
 impl PushdownInstantGroups {
-    pub(in crate::logql) fn new(meta: &HashMap<u64, StreamMetaRow>, caps: AggCaps) -> Self {
+    pub(in crate::logql) fn new(meta: &HashMap<Fingerprint, StreamMetaRow>, caps: AggCaps) -> Self {
         PushdownInstantGroups {
             base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
             groups: HashMap::new(),
@@ -5154,7 +5189,7 @@ impl PushdownInstantGroups {
 pub(in crate::logql) struct PushdownRangeGroups {
     /// Each resolved stream's base label set, snapshotted ONCE — one
     /// fingerprint returns up to (grid points x metadata variants) rows.
-    base_labels: HashMap<u64, LabelSet>,
+    base_labels: HashMap<Fingerprint, LabelSet>,
     /// Rendered final label set -> `(labels, grid point -> summed count)`.
     groups: HashMap<String, (LabelSet, HashMap<i64, u64>)>,
     /// The emit grid's first point and the query's end. A row can arrive
@@ -5174,7 +5209,7 @@ pub(in crate::logql) struct PushdownRangeGroups {
 
 impl PushdownRangeGroups {
     pub(in crate::logql) fn new(
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         caps: AggCaps,
         grid_start_ns: i64,
         end_ns: i64,
@@ -5331,7 +5366,7 @@ impl PushdownRangeGroups {
 fn bucketed_range_sql(
     mp: &MetricPlan,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[Fingerprint],
     predicates: &[CheckedFragment],
 ) -> Result<String, BucketGridRefusal> {
     // A plan with no step has no grid at all. Expressed as a refusal
@@ -5347,7 +5382,7 @@ fn bucketed_range_sql(
     super::sql::metric_range_bucketed(
         metric_source(mp),
         services,
-        fingerprints,
+        &sql_literals(fingerprints),
         super::sql::BucketedScan {
             window: super::sql::TimeWindow {
                 start_ns: mp.start_ns,
@@ -5581,7 +5616,7 @@ pub fn bucketed_fallback_client_agg(mp: &MetricPlan) -> ClientAgg {
 fn client_metric_read_sql(
     mp: &MetricPlan,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[Fingerprint],
     window: super::sql::TimeWindow,
     predicates: &[CheckedFragment],
 ) -> String {
@@ -5599,7 +5634,7 @@ fn client_metric_read_sql(
         super::sql::metric_raw_samples_sliding(
             &mp.table,
             services,
-            fingerprints,
+            &sql_literals(fingerprints),
             window,
             mp.scan_lower,
             predicates,
@@ -5609,7 +5644,7 @@ fn client_metric_read_sql(
         super::sql::metric_raw_samples(
             &mp.table,
             services,
-            fingerprints,
+            &sql_literals(fingerprints),
             window,
             mp.scan_lower,
             predicates,
@@ -5839,7 +5874,7 @@ fn metric_source(mp: &MetricPlan) -> super::sql::MetricSource<'_> {
 /// [`super::escape::ch_string`], so "every service literal reaching a
 /// `logql::sql` builder was escaped" stops being a fact about this function
 /// and becomes one rustc holds up at the parameter.
-fn distinct_escaped_services(meta: &HashMap<u64, StreamMetaRow>) -> Vec<CheckedLiteral> {
+fn distinct_escaped_services(meta: &HashMap<Fingerprint, StreamMetaRow>) -> Vec<CheckedLiteral> {
     let mut services: Vec<&str> = meta.values().map(|m| m.service.as_str()).collect();
     services.sort_unstable();
     services.dedup();
@@ -5899,7 +5934,7 @@ fn inject_target_matchers(le: &LogExpr, target_labels: &[String]) -> LogExpr {
 /// value-desc/name-asc presentation — truncated to `limit`.
 fn accumulate_volume(
     rows: &[VolumeRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     aggregate_by: VolumeAggregateBy,
     labels_to_match: &BTreeSet<String>,
     restrict_label_names: bool,
@@ -5987,8 +6022,8 @@ fn pop_value(vals: &mut Vec<QueryResult>) -> QueryResult {
 /// over the plan's own pipeline — so there is no second renderer.
 fn stage3_predicates(
     sp: &StreamsPlan,
-    fingerprints: &[u64],
-    meta: &HashMap<u64, StreamMetaRow>,
+    fingerprints: &[Fingerprint],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     budget: usize,
 ) -> LoweredPredicates {
     let mut out = sp.line_filters.clone();
@@ -6040,9 +6075,9 @@ struct LoweredPredicates {
 /// One stream's exposed label set, by fingerprint — parsed once per read
 /// rather than once per filter leaf.
 fn label_sets(
-    fingerprints: &[u64],
-    meta: &HashMap<u64, StreamMetaRow>,
-) -> Option<HashMap<u64, Vec<(String, String)>>> {
+    fingerprints: &[Fingerprint],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+) -> Option<HashMap<Fingerprint, Vec<(String, String)>>> {
     let mut out = HashMap::with_capacity(fingerprints.len());
     for fp in fingerprints {
         // A selected fingerprint stage 2 did not hydrate has no label set,
@@ -6059,10 +6094,10 @@ fn label_sets(
 /// filter leaf (issue #544). See
 /// [`super::predicate::MetadataNameClasses`] for the rule.
 struct NameClasses {
-    stream_label: Vec<u64>,
-    stream_label_true: Vec<u64>,
-    unsuffixed: Vec<u64>,
-    direct: Vec<u64>,
+    stream_label: Vec<Fingerprint>,
+    stream_label_true: Vec<Fingerprint>,
+    unsuffixed: Vec<Fingerprint>,
+    direct: Vec<Fingerprint>,
     base_name: Option<String>,
 }
 
@@ -6070,8 +6105,8 @@ fn classify_metadata_name(
     name: &str,
     op: MatchOp,
     value: &str,
-    fingerprints: &[u64],
-    labels: &HashMap<u64, Vec<(String, String)>>,
+    fingerprints: &[Fingerprint],
+    labels: &HashMap<Fingerprint, Vec<(String, String)>>,
 ) -> Option<NameClasses> {
     let base = name.strip_suffix("_extracted");
     let mut classes = NameClasses {
@@ -6142,8 +6177,8 @@ fn classify_metadata_name(
 /// claim the budget in full.
 fn render_metadata_tree(
     expr: &LabelFilterExpr,
-    fingerprints: &[u64],
-    labels: &HashMap<u64, Vec<(String, String)>>,
+    fingerprints: &[Fingerprint],
+    labels: &HashMap<Fingerprint, Vec<(String, String)>>,
     remaining: &mut usize,
 ) -> Option<CheckedFragment> {
     let mut nodes: Vec<&LabelFilterExpr> = Vec::new();
@@ -6162,11 +6197,11 @@ fn render_metadata_tree(
                     m.op,
                     &m.value,
                     super::predicate::MetadataNameClasses {
-                        selected: fingerprints,
-                        stream_label: &c.stream_label,
-                        stream_label_true: &c.stream_label_true,
-                        unsuffixed: &c.unsuffixed,
-                        direct: &c.direct,
+                        selected: &sql_literals(fingerprints),
+                        stream_label: &sql_literals(&c.stream_label),
+                        stream_label_true: &sql_literals(&c.stream_label_true),
+                        unsuffixed: &sql_literals(&c.unsuffixed),
+                        direct: &sql_literals(&c.direct),
                         base_name: c.base_name.as_deref(),
                     },
                     *remaining,
@@ -6204,8 +6239,8 @@ fn render_metadata_tree(
 /// when the render does not fit the budget (issue #544).
 fn metadata_predicates(
     pipeline: &[Stage],
-    fingerprints: &[u64],
-    meta: &HashMap<u64, StreamMetaRow>,
+    fingerprints: &[Fingerprint],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     budget: usize,
 ) -> Option<Vec<CheckedFragment>> {
     let plan = super::plan::compile_metadata_label_filters(pipeline)?;
@@ -6217,8 +6252,8 @@ fn metadata_predicates(
 /// client stage holds a pipeline to read them off.
 fn metadata_predicates_of(
     stages: &[Stage],
-    fingerprints: &[u64],
-    meta: &HashMap<u64, StreamMetaRow>,
+    fingerprints: &[Fingerprint],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     budget: usize,
 ) -> Option<Vec<CheckedFragment>> {
     let labels = label_sets(fingerprints, meta)?;
@@ -6255,8 +6290,8 @@ fn plans_a_metadata_filter(pipeline: &[Stage]) -> bool {
 /// false` is what makes the caller swap the restored client stage in.
 fn metric_predicates(
     mp: &MetricPlan,
-    fingerprints: &[u64],
-    meta: &HashMap<u64, StreamMetaRow>,
+    fingerprints: &[Fingerprint],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     budget: usize,
 ) -> LoweredPredicates {
     let mut out = mp.extra_predicates.clone();
@@ -6292,9 +6327,9 @@ mod tests {
         use crate::logql::pipeline::ParentSum;
         let mut meta = HashMap::new();
         meta.insert(
-            1,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "s".to_string(),
                 labels: r#"{"__error__":"s","service_name":"s"}"#.to_string(),
             },
@@ -6302,9 +6337,9 @@ mod tests {
         // A stream with no `__error__` label, so a metadata `__error__` is not
         // renamed `__error___extracted` and fills the slot.
         meta.insert(
-            2,
+            Fingerprint::from_raw(2),
             StreamMetaRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "s".to_string(),
                 labels: r#"{"service_name":"s"}"#.to_string(),
             },
@@ -6315,12 +6350,12 @@ mod tests {
             keeps_unwrapped: false,
         });
         let instant = |sm: &str| MetricInstantRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             n: 1,
             structured_metadata: sm.to_string(),
         };
         let instant_fp2 = |sm: &str| MetricInstantRow {
-            fingerprint: 2,
+            fingerprint: Fingerprint::from_raw(2),
             n: 1,
             structured_metadata: sm.to_string(),
         };
@@ -6341,7 +6376,7 @@ mod tests {
             "instant: a metadata error fills the slot"
         );
         let bucket = |sm: &str| MetricRangeBucketRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             bucket_ns: 60_000_000_000,
             n: 1,
             structured_metadata: sm.to_string(),
@@ -6361,7 +6396,6 @@ mod tests {
     }
 
     use super::super::charge::{AggCaps, PUSHDOWN_INSTANT_SLOT, group_entry_bytes};
-    use super::super::labels::fnv1a64;
     use super::super::plan::{ClientAgg, ClientValue};
     use super::*;
     use crate::logql::testkit::*;
@@ -6415,7 +6449,8 @@ mod tests {
             end_ns: 60_000_000_000,
             step_ns: 15_000_000_000,
         });
-        let range_sql = client_metric_read_sql(&range_mp, &svc, &[1], window, &[]);
+        let range_sql =
+            client_metric_read_sql(&range_mp, &svc, &[Fingerprint::from_raw(1)], window, &[]);
         assert!(
             range_sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
             "range EXPLAIN/exec must report the sliding scan: {range_sql}"
@@ -6424,7 +6459,8 @@ mod tests {
         let instant_mp = mk(QuerySpec::Instant {
             at_ns: 60_000_000_000,
         });
-        let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window, &[]);
+        let instant_sql =
+            client_metric_read_sql(&instant_mp, &svc, &[Fingerprint::from_raw(1)], window, &[]);
         assert!(
             instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
             "instant must keep its total order: {instant_sql}"
@@ -6675,14 +6711,14 @@ mod tests {
     }
 
     /// `(fingerprint, service, canonical labels JSON)` fixtures.
-    fn vol_meta(entries: &[(u64, &str, &str)]) -> HashMap<u64, StreamMetaRow> {
+    fn vol_meta(entries: &[(u64, &str, &str)]) -> HashMap<Fingerprint, StreamMetaRow> {
         entries
             .iter()
             .map(|(fp, service, labels)| {
                 (
-                    *fp,
+                    Fingerprint::from_raw(u128::from(*fp)),
                     StreamMetaRow {
-                        fingerprint: *fp,
+                        fingerprint: Fingerprint::from_raw(u128::from(*fp)),
                         service: service.to_string(),
                         labels: labels.to_string(),
                     },
@@ -6694,7 +6730,7 @@ mod tests {
     fn vol_rows(list: &[(u64, u64)]) -> Vec<VolumeRow> {
         list.iter()
             .map(|(fingerprint, bytes)| VolumeRow {
-                fingerprint: *fingerprint,
+                fingerprint: Fingerprint::from_raw(u128::from(*fingerprint)),
                 bytes: *bytes,
             })
             .collect()
@@ -7141,8 +7177,11 @@ mod tests {
     /// raised setting is load-bearing, not vacuous.
     #[test]
     fn stage2_at_default_max_streams_worst_case_fits_under_the_query_text_cap() {
-        let fps: Vec<u64> =
-            std::iter::repeat_n(u64::MAX, super::super::params::DEFAULT_MAX_STREAMS).collect();
+        let fps: Vec<FpLiteral> = std::iter::repeat_n(
+            Fingerprint::from_raw(u128::MAX).sql_literal(),
+            super::super::params::DEFAULT_MAX_STREAMS,
+        )
+        .collect();
         let sql = super::super::sql::stage2("log_streams", &fps);
         let bytes = sql.len() as u64;
         assert!(
@@ -7163,12 +7202,15 @@ mod tests {
     /// MiB — comfortably under the 8 MiB cap, comfortably over the
     /// ClickHouse default.
     fn worst_case_envelope() -> (
-        Vec<u64>,
+        Vec<FpLiteral>,
         Vec<CheckedLiteral>,
         Vec<super::super::predicate::CheckedFragment>,
     ) {
-        let fps: Vec<u64> =
-            std::iter::repeat_n(u64::MAX, super::super::params::DEFAULT_MAX_STREAMS).collect();
+        let fps: Vec<FpLiteral> = std::iter::repeat_n(
+            Fingerprint::from_raw(u128::MAX).sql_literal(),
+            super::super::params::DEFAULT_MAX_STREAMS,
+        )
+        .collect();
         // 64-byte literals (`'` + 62 chars + `'`). Issue #286: minted, not
         // hand-written — `predicate::literal` IS `ch_string`, and a
         // 62-digit value escapes to nothing, so the rendered bytes are the
@@ -7239,7 +7281,11 @@ mod tests {
                 end_ns: i64::MAX,
             },
             super::super::sql::KeysetLower::After {
-                tuple: (i64::MAX, u64::MAX, u64::MAX),
+                tuple: (
+                    i64::MAX,
+                    Fingerprint::from_raw(u128::MAX).sql_literal(),
+                    u64::MAX,
+                ),
                 offset: u32::MAX,
             },
             Direction::Backward,
@@ -7818,25 +7864,39 @@ mod tests {
     /// narrowed stage-1 window, but the connection still remembers it).
     #[test]
     fn merge_resolved_preserves_a_fingerprint_absent_from_a_later_batch() {
-        let mut cache: Vec<u64> = Vec::new();
-        merge_resolved(&mut cache, &[5, 1, 3]);
+        let mut cache: Vec<Fingerprint> = Vec::new();
+        merge_resolved(
+            &mut cache,
+            &[
+                Fingerprint::from_raw(5),
+                Fingerprint::from_raw(1),
+                Fingerprint::from_raw(3),
+            ],
+        );
         assert_eq!(
             cache,
-            vec![1, 3, 5],
+            [1, 3, 5].map(Fingerprint::from_raw),
             "sorted + deduped after the first batch"
         );
 
         // The second (later, narrowed-window) batch no longer resolves
         // fingerprint 1, repeats 3, and adds a new fingerprint 7.
-        merge_resolved(&mut cache, &[7, 3]);
+        merge_resolved(
+            &mut cache,
+            &[Fingerprint::from_raw(7), Fingerprint::from_raw(3)],
+        );
         assert_eq!(
             cache,
-            vec![1, 3, 5, 7],
+            [1, 3, 5, 7].map(Fingerprint::from_raw),
             "fingerprint 1 (absent from the second batch) survives; 3 dedups; 7 is added"
         );
 
         merge_resolved(&mut cache, &[]);
-        assert_eq!(cache, vec![1, 3, 5, 7], "an empty batch changes nothing");
+        assert_eq!(
+            cache,
+            [1, 3, 5, 7].map(Fingerprint::from_raw),
+            "an empty batch changes nothing"
+        );
     }
 
     #[test]
@@ -7860,7 +7920,7 @@ mod tests {
         ));
     }
 
-    fn tail_row(ts: i64, fp: u64, hash: u64) -> TailSampleRow {
+    fn tail_row(ts: i64, fp: Fingerprint, hash: u64) -> TailSampleRow {
         TailSampleRow {
             fingerprint: fp,
             timestamp_ns: ts,
@@ -7876,7 +7936,7 @@ mod tests {
     #[test]
     fn advance_tail_cursor_keeps_the_previous_cursor_on_an_empty_page() {
         let prev = Some(TailCursor {
-            tuple: (10, 1, 5),
+            tuple: (10, Fingerprint::from_raw(1), 5),
             seen: 2,
         });
         assert_eq!(advance_tail_cursor(prev, &[]), prev);
@@ -7888,13 +7948,13 @@ mod tests {
     #[test]
     fn advance_tail_cursor_counts_the_trailing_tie_run() {
         let rows = [
-            tail_row(10, 1, 1),
-            tail_row(10, 2, 7),
-            tail_row(10, 2, 7),
-            tail_row(10, 2, 7),
+            tail_row(10, Fingerprint::from_raw(1), 1),
+            tail_row(10, Fingerprint::from_raw(2), 7),
+            tail_row(10, Fingerprint::from_raw(2), 7),
+            tail_row(10, Fingerprint::from_raw(2), 7),
         ];
         let next = advance_tail_cursor(None, &rows).expect("non-empty page");
-        assert_eq!(next.tuple, (10, 2, 7));
+        assert_eq!(next.tuple, (10, Fingerprint::from_raw(2), 7));
         assert_eq!(next.seen, 3);
     }
 
@@ -7904,19 +7964,25 @@ mod tests {
     #[test]
     fn advance_tail_cursor_carries_seen_for_an_unchanged_tuple_and_resets_on_change() {
         let prev = Some(TailCursor {
-            tuple: (10, 2, 7),
+            tuple: (10, Fingerprint::from_raw(2), 7),
             seen: 3,
         });
         // Page 2 of the same tie group: every row still equals the tuple.
-        let same = [tail_row(10, 2, 7), tail_row(10, 2, 7)];
+        let same = [
+            tail_row(10, Fingerprint::from_raw(2), 7),
+            tail_row(10, Fingerprint::from_raw(2), 7),
+        ];
         let next = advance_tail_cursor(prev, &same).expect("non-empty page");
-        assert_eq!(next.tuple, (10, 2, 7));
+        assert_eq!(next.tuple, (10, Fingerprint::from_raw(2), 7));
         assert_eq!(next.seen, 5, "3 already delivered + 2 new");
 
         // The cursor tuple changed: the count restarts at the new run.
-        let moved = [tail_row(10, 2, 7), tail_row(11, 1, 4)];
+        let moved = [
+            tail_row(10, Fingerprint::from_raw(2), 7),
+            tail_row(11, Fingerprint::from_raw(1), 4),
+        ];
         let next = advance_tail_cursor(prev, &moved).expect("non-empty page");
-        assert_eq!(next.tuple, (11, 1, 4));
+        assert_eq!(next.tuple, (11, Fingerprint::from_raw(1), 4));
         assert_eq!(next.seen, 1);
     }
 
@@ -7934,21 +8000,21 @@ mod tests {
         // Page 1 fetched only the first colliding body (LIMIT split the
         // pair mid-run).
         let first = TailSampleRow {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             timestamp_ns: 10,
             body: "alpha".to_string(),
             body_hash: 42,
             structured_metadata: String::new(),
         };
         let second = TailSampleRow {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             timestamp_ns: 10,
             body: "beta".to_string(),
             body_hash: 42, // injected collision: distinct body, same hash
             structured_metadata: String::new(),
         };
         let c1 = advance_tail_cursor(None, std::slice::from_ref(&first)).expect("cursor");
-        assert_eq!(c1.tuple, (10, 7, 42));
+        assert_eq!(c1.tuple, (10, Fingerprint::from_raw(7), 42));
         assert_eq!(
             c1.seen, 1,
             "one occurrence of the colliding tuple delivered"
@@ -7957,7 +8023,7 @@ mod tests {
         // Page 2 (SQL: `>= tuple OFFSET 1`) fetches exactly the second
         // colliding body; the unchanged tuple carries the count forward.
         let c2 = advance_tail_cursor(Some(c1), std::slice::from_ref(&second)).expect("cursor");
-        assert_eq!(c2.tuple, (10, 7, 42));
+        assert_eq!(c2.tuple, (10, Fingerprint::from_raw(7), 42));
         assert_eq!(
             c2.seen, 2,
             "both distinct bodies of the collision counted — the next OFFSET skips exactly both"
@@ -8007,9 +8073,9 @@ mod tests {
 
         let mut meta = HashMap::new();
         meta.insert(
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "checkout".to_string(),
                 labels: r#"{"app":"x","service_name":"checkout"}"#.to_string(),
             },
@@ -8021,13 +8087,13 @@ mod tests {
         let rows = || {
             vec![
                 SampleRow {
-                    fingerprint: 1,
+                    fingerprint: Fingerprint::from_raw(1),
                     timestamp_ns: 10,
                     body: "keep y=z msg=a".to_string(),
                     structured_metadata: String::new(),
                 },
                 SampleRow {
-                    fingerprint: 1,
+                    fingerprint: Fingerprint::from_raw(1),
                     timestamp_ns: 11,
                     body: "keep y=other".to_string(),
                     structured_metadata: String::new(),
@@ -8099,20 +8165,20 @@ mod tests {
         super::super::pipeline::CompiledPipeline::compile(&log.pipeline).expect("compile")
     }
 
-    fn meta_two_streams() -> HashMap<u64, StreamMetaRow> {
+    fn meta_two_streams() -> HashMap<Fingerprint, StreamMetaRow> {
         HashMap::from([
             (
-                1u64,
+                Fingerprint::from_raw(1),
                 StreamMetaRow {
-                    fingerprint: 1,
+                    fingerprint: Fingerprint::from_raw(1),
                     service: "checkout".to_string(),
                     labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
                 },
             ),
             (
-                2u64,
+                Fingerprint::from_raw(2),
                 StreamMetaRow {
-                    fingerprint: 2,
+                    fingerprint: Fingerprint::from_raw(2),
                     service: "billing".to_string(),
                     labels: r#"{"env":"staging","service_name":"billing"}"#.to_string(),
                 },
@@ -8133,7 +8199,7 @@ mod tests {
         let meta = meta_two_streams();
         let compiled = pipeline_of(r#"{a="b"}"#);
         let rows = vec![SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"SMVAL","trace_id":"abc"}"#.to_string(),
@@ -8161,10 +8227,10 @@ mod tests {
     #[test]
     fn structured_metadata_double_collision_overwrites_the_extracted_slot_once() {
         // A stream whose base labels include both `env` and `env_extracted`.
-        let meta: HashMap<u64, StreamMetaRow> = [(
-            7u64,
+        let meta: HashMap<Fingerprint, StreamMetaRow> = [(
+            Fingerprint::from_raw(7),
             StreamMetaRow {
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 service: "checkout".to_string(),
                 labels: r#"{"env":"prod","env_extracted":"baseval","service_name":"checkout"}"#
                     .to_string(),
@@ -8174,7 +8240,7 @@ mod tests {
         .collect();
         let compiled = pipeline_of(r#"{a="b"}"#);
         let rows = vec![SampleRow {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval"}"#.to_string(),
@@ -8197,10 +8263,10 @@ mod tests {
     /// Matches the grafana/loki:3.4.2 oracle probe (`env_extracted=smextra`).
     #[test]
     fn structured_metadata_supplying_its_own_extracted_key_collapses_to_one_entry() {
-        let meta: HashMap<u64, StreamMetaRow> = [(
-            7u64,
+        let meta: HashMap<Fingerprint, StreamMetaRow> = [(
+            Fingerprint::from_raw(7),
             StreamMetaRow {
-                fingerprint: 7,
+                fingerprint: Fingerprint::from_raw(7),
                 service: "checkout".to_string(),
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
@@ -8209,7 +8275,7 @@ mod tests {
         .collect();
         let compiled = pipeline_of(r#"{a="b"}"#);
         let rows = vec![SampleRow {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval","env_extracted":"smextra"}"#.to_string(),
@@ -8294,7 +8360,10 @@ mod tests {
             assert!(
                 r.labels_json.find("\"env\"").unwrap() < r.labels_json.find("\"method\"").unwrap()
             );
-            assert_eq!(r.fingerprint, fnv1a64(r.labels_json.as_bytes()));
+            assert_eq!(
+                r.fingerprint,
+                derived_stream_fingerprint(r.labels_json.as_bytes())
+            );
             assert_eq!(r.service, "checkout");
         }
     }
@@ -8428,7 +8497,7 @@ mod tests {
         let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100)
             .expect("no template budget breach");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].fingerprint, 1);
+        assert_eq!(results[0].fingerprint, Fingerprint::from_raw(1));
         assert_eq!(
             results[0].labels_json, r#"{"env":"prod","service_name":"checkout"}"#,
             "transform path must splice hydration labels verbatim"
@@ -8527,20 +8596,20 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// The two streams of the b25 fixture, as this crate's hydrated meta.
-    fn sm_meta() -> HashMap<u64, StreamMetaRow> {
+    fn sm_meta() -> HashMap<Fingerprint, StreamMetaRow> {
         let mut m = HashMap::new();
         m.insert(
-            1,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "sm".to_string(),
                 labels: r#"{"app":"x","fp":"1","service_name":"sm"}"#.to_string(),
             },
         );
         m.insert(
-            2,
+            Fingerprint::from_raw(2),
             StreamMetaRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "sm".to_string(),
                 labels: r#"{"app":"y","fp":"2","service_name":"sm"}"#.to_string(),
             },
@@ -8557,10 +8626,25 @@ mod tests {
             structured_metadata: sm.to_string(),
         };
         vec![
-            row(1, 10_000_000_000, "alpha", r#"{"n":"10","trace":"a"}"#),
-            row(1, 20_000_000_000, "beta", r#"{"n":"20","trace":"bb"}"#),
-            row(1, 30_000_000_000, "gamma", ""),
-            row(2, 40_000_000_000, "delta", r#"{"app":"SMVAL","trace":"a"}"#),
+            row(
+                Fingerprint::from_raw(1),
+                10_000_000_000,
+                "alpha",
+                r#"{"n":"10","trace":"a"}"#,
+            ),
+            row(
+                Fingerprint::from_raw(1),
+                20_000_000_000,
+                "beta",
+                r#"{"n":"20","trace":"bb"}"#,
+            ),
+            row(Fingerprint::from_raw(1), 30_000_000_000, "gamma", ""),
+            row(
+                Fingerprint::from_raw(2),
+                40_000_000_000,
+                "delta",
+                r#"{"app":"SMVAL","trace":"a"}"#,
+            ),
         ]
     }
 
@@ -8574,10 +8658,14 @@ mod tests {
             structured_metadata: sm.to_string(),
         };
         vec![
-            row(1, 1, r#"{"n":"10","trace":"a"}"#),
-            row(1, 1, r#"{"n":"20","trace":"bb"}"#),
-            row(1, 1, ""),
-            row(2, 1, r#"{"app":"SMVAL","trace":"a"}"#),
+            row(Fingerprint::from_raw(1), 1, r#"{"n":"10","trace":"a"}"#),
+            row(Fingerprint::from_raw(1), 1, r#"{"n":"20","trace":"bb"}"#),
+            row(Fingerprint::from_raw(1), 1, ""),
+            row(
+                Fingerprint::from_raw(2),
+                1,
+                r#"{"app":"SMVAL","trace":"a"}"#,
+            ),
         ]
     }
 
@@ -8590,10 +8678,14 @@ mod tests {
             structured_metadata: sm.to_string(),
         };
         vec![
-            row(1, 5, r#"{"n":"10","trace":"a"}"#),
-            row(1, 4, r#"{"n":"20","trace":"bb"}"#),
-            row(1, 5, ""),
-            row(2, 5, r#"{"app":"SMVAL","trace":"a"}"#),
+            row(Fingerprint::from_raw(1), 5, r#"{"n":"10","trace":"a"}"#),
+            row(Fingerprint::from_raw(1), 4, r#"{"n":"20","trace":"bb"}"#),
+            row(Fingerprint::from_raw(1), 5, ""),
+            row(
+                Fingerprint::from_raw(2),
+                5,
+                r#"{"app":"SMVAL","trace":"a"}"#,
+            ),
         ]
     }
 
@@ -8830,12 +8922,12 @@ mod tests {
         // rather than assumed.
         let rows = vec![
             MetricInstantRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 n: 1,
                 structured_metadata: String::new(),
             },
             MetricInstantRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 n: 8,
                 structured_metadata: r#"{"__error_details__":"det"}"#.to_string(),
             },
@@ -8911,12 +9003,12 @@ mod tests {
         // Two streams, so the outer aggregation has two series to fold.
         let rows = vec![
             MetricInstantRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 n: 1,
                 structured_metadata: String::new(),
             },
             MetricInstantRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 n: 4,
                 structured_metadata: String::new(),
             },
@@ -9024,7 +9116,7 @@ mod tests {
 
         // No resolved stream carries `lvl`, so the proviso holds.
         let meta0 = sm_meta();
-        let fps0: Vec<u64> = meta0.keys().copied().collect();
+        let fps0: Vec<Fingerprint> = meta0.keys().copied().collect();
         let without = stage3_predicates(
             &sp,
             &fps0,
@@ -9048,14 +9140,14 @@ mod tests {
         // One resolved stream carries `lvl` as a label, so it does not.
         let mut meta = sm_meta();
         meta.insert(
-            3,
+            Fingerprint::from_raw(3),
             StreamMetaRow {
-                fingerprint: 3,
+                fingerprint: Fingerprint::from_raw(3),
                 service: "sm".to_string(),
                 labels: r#"{"lvl":"warn","service_name":"sm"}"#.to_string(),
             },
         );
-        let fps: Vec<u64> = meta.keys().copied().collect();
+        let fps: Vec<Fingerprint> = meta.keys().copied().collect();
         let with = stage3_predicates(
             &sp,
             &fps,
@@ -9085,20 +9177,20 @@ mod tests {
     /// So a row of fp 10 carrying `lvl=info` and a row of fp 11 carrying
     /// none are the SAME output series — which is the only shape that can
     /// tell fold-then-emit from emit-then-fold.
-    fn range_meta() -> HashMap<u64, StreamMetaRow> {
+    fn range_meta() -> HashMap<Fingerprint, StreamMetaRow> {
         let mut m = HashMap::new();
         m.insert(
-            10,
+            Fingerprint::from_raw(10),
             StreamMetaRow {
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
             },
         );
         m.insert(
-            11,
+            Fingerprint::from_raw(11),
             StreamMetaRow {
-                fingerprint: 11,
+                fingerprint: Fingerprint::from_raw(11),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","lvl":"info","service_name":"r"}"#.to_string(),
             },
@@ -9110,7 +9202,7 @@ mod tests {
     const RANGE_END_NS: i64 = 300_000_000_000;
     const RANGE_STEP_NS: i64 = 60_000_000_000;
 
-    fn bucket_row(fp: u64, bucket_ns: i64, n: u64, sm: &str) -> MetricRangeBucketRow {
+    fn bucket_row(fp: Fingerprint, bucket_ns: i64, n: u64, sm: &str) -> MetricRangeBucketRow {
         MetricRangeBucketRow {
             fingerprint: fp,
             bucket_ns,
@@ -9171,9 +9263,19 @@ mod tests {
     fn a_folded_series_has_a_point_wherever_either_fingerprint_had_a_row() {
         let series = range_series(
             &[
-                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
-                bucket_row(11, 120_000_000_000, 3, ""),
-                bucket_row(10, 180_000_000_000, 1, r#"{"lvl":"info"}"#),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    60_000_000_000,
+                    2,
+                    r#"{"lvl":"info"}"#,
+                ),
+                bucket_row(Fingerprint::from_raw(11), 120_000_000_000, 3, ""),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    180_000_000_000,
+                    1,
+                    r#"{"lvl":"info"}"#,
+                ),
             ],
             None,
         );
@@ -9203,11 +9305,21 @@ mod tests {
     fn two_metadata_variants_at_one_grid_point_sum_into_one_point() {
         let series = range_series(
             &[
-                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
-                bucket_row(11, 60_000_000_000, 5, ""),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    60_000_000_000,
+                    2,
+                    r#"{"lvl":"info"}"#,
+                ),
+                bucket_row(Fingerprint::from_raw(11), 60_000_000_000, 5, ""),
                 // A THIRD variant that is a different series, so the sum
                 // above is not merely "everything at this grid point".
-                bucket_row(10, 60_000_000_000, 4, r#"{"lvl":"warn"}"#),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    60_000_000_000,
+                    4,
+                    r#"{"lvl":"warn"}"#,
+                ),
             ],
             None,
         );
@@ -9232,9 +9344,19 @@ mod tests {
     fn a_row_bucketed_outside_the_emit_grid_is_not_a_point() {
         let series = range_series(
             &[
-                bucket_row(10, RANGE_GRID_START_NS - RANGE_STEP_NS, 9, ""),
-                bucket_row(10, 60_000_000_000, 2, ""),
-                bucket_row(10, RANGE_END_NS + RANGE_STEP_NS, 9, ""),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    RANGE_GRID_START_NS - RANGE_STEP_NS,
+                    9,
+                    "",
+                ),
+                bucket_row(Fingerprint::from_raw(10), 60_000_000_000, 2, ""),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    RANGE_END_NS + RANGE_STEP_NS,
+                    9,
+                    "",
+                ),
             ],
             None,
         );
@@ -9254,8 +9376,13 @@ mod tests {
     fn the_rate_divisor_is_applied_to_the_summed_count() {
         let series = range_series(
             &[
-                bucket_row(10, 60_000_000_000, 2, r#"{"lvl":"info"}"#),
-                bucket_row(11, 60_000_000_000, 5, ""),
+                bucket_row(
+                    Fingerprint::from_raw(10),
+                    60_000_000_000,
+                    2,
+                    r#"{"lvl":"info"}"#,
+                ),
+                bucket_row(Fingerprint::from_raw(11), 60_000_000_000, 5, ""),
             ],
             Some(60_000_000_000),
         );
@@ -9276,7 +9403,7 @@ mod tests {
             PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, RANGE_GRID_START_NS, RANGE_END_NS);
         let err = g
             .push_row(&bucket_row(
-                10,
+                Fingerprint::from_raw(10),
                 60_000_000_000,
                 1,
                 r#"{"__error__":"boom"}"#,
@@ -9302,7 +9429,7 @@ mod tests {
         let fat = "v".repeat(64 * 1024);
         let err = g
             .push_row(&bucket_row(
-                10,
+                Fingerprint::from_raw(10),
                 60_000_000_000,
                 1,
                 &format!(r#"{{"big":"{fat}"}}"#),
@@ -9368,7 +9495,7 @@ mod tests {
             }
         };
         let services: Vec<CheckedLiteral> = Vec::new();
-        let fingerprints = [1u64];
+        let fingerprints = [Fingerprint::from_raw(1)];
 
         // The control: the planned shape renders.
         let base = planned(r#"count_over_time({a="b"}[1m])"#);
@@ -9484,7 +9611,7 @@ mod tests {
         sm_kept: &[(&str, &str)],
     ) -> MetricRangeUnwrappedRow {
         MetricRangeUnwrappedRow {
-            class: 0,
+            class: Fingerprint::from_raw(0),
             bucket_ns,
             keys: Vec::new(),
             v,
@@ -9513,9 +9640,9 @@ mod tests {
         let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
         let mut meta = HashMap::new();
         meta.insert(
-            10,
+            Fingerprint::from_raw(10),
             StreamMetaRow {
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
             },
@@ -9583,9 +9710,9 @@ mod tests {
         let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
         let mut meta = HashMap::new();
         meta.insert(
-            10,
+            Fingerprint::from_raw(10),
             StreamMetaRow {
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
             },
@@ -9602,13 +9729,13 @@ mod tests {
         );
         for _ in 0..3 {
             fold.push_lane_row(&UnwrappedLaneRow {
-                class: 0,
+                class: Fingerprint::from_raw(0),
                 bucket_ns: 660_000_000_000,
                 decided: 0,
                 keys: vec![(0, String::new())],
                 v: 0.0,
                 body: r#"{"latency":0.1}"#.to_string(),
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 sm_text: String::new(),
                 sm_kept: Vec::new(),
             })
@@ -9646,9 +9773,9 @@ mod tests {
         let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
         let mut meta = HashMap::new();
         meta.insert(
-            10,
+            Fingerprint::from_raw(10),
             StreamMetaRow {
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
             },
@@ -9664,13 +9791,13 @@ mod tests {
             AggCaps::DEFAULT,
         );
         let lane = |bucket_ns: i64, decided: u8, body: &str, v: f64| UnwrappedLaneRow {
-            class: 0,
+            class: Fingerprint::from_raw(0),
             bucket_ns,
             decided,
             keys: vec![(1, "x".to_string())],
             v,
             body: body.to_string(),
-            fingerprint: 10,
+            fingerprint: Fingerprint::from_raw(10),
             sm_text: String::new(),
             sm_kept: Vec::new(),
         };
@@ -9709,9 +9836,9 @@ mod tests {
         let compiled = CompiledPipeline::compile(&u.stages).expect("compile");
         let mut meta = HashMap::new();
         meta.insert(
-            10,
+            Fingerprint::from_raw(10),
             StreamMetaRow {
-                fingerprint: 10,
+                fingerprint: Fingerprint::from_raw(10),
                 service: "r".to_string(),
                 labels: r#"{"app":"x","service_name":"r"}"#.to_string(),
             },
@@ -9727,13 +9854,13 @@ mod tests {
             AggCaps::DEFAULT,
         );
         let lane = |body: &str, sm_text: &str| UnwrappedLaneRow {
-            class: 0,
+            class: Fingerprint::from_raw(0),
             bucket_ns: 660_000_000_000,
             decided: 0,
             keys: vec![(1, "x".to_string())],
             v: 0.0,
             body: body.to_string(),
-            fingerprint: 10,
+            fingerprint: Fingerprint::from_raw(10),
             sm_text: sm_text.to_string(),
             sm_kept: Vec::new(),
         };
@@ -9953,7 +10080,7 @@ mod tests {
         let mut g = PushdownInstantGroups::new(&meta, AggCaps::DEFAULT);
         let err = g
             .push_row(&MetricInstantRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 n: 1,
                 structured_metadata: r#"{"__error__":"boom"}"#.to_string(),
             })
@@ -9982,7 +10109,7 @@ mod tests {
         let fat = "v".repeat(64 * 1024);
         let err = g
             .push_row(&MetricInstantRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 n: 1,
                 structured_metadata: format!(r#"{{"big":"{fat}"}}"#),
             })

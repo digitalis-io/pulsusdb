@@ -401,7 +401,7 @@ fn pruned_reason(ids: &[[u8; 16]], topology: &ClusterTopology, shard_num: u32) -
                 "cityHash64({}) = {hash}, % {} = {slot} -> shard {}",
                 hex32(id),
                 topology.total_weight(),
-                topology.shard_for_fingerprint(hash)
+                topology.shard_for_fingerprint(u128::from(hash))
             )
         })
         .collect();
@@ -430,7 +430,7 @@ async fn capture_stage(
         Roster::Full => topology.all_shards(),
         Roster::TraceIds(ids) => ids
             .iter()
-            .map(|id| topology.shard_for_fingerprint(city_hash_64_16(id)))
+            .map(|id| topology.shard_for_fingerprint(u128::from(city_hash_64_16(id))))
             .collect(),
     };
     let observed: BTreeSet<u32> = by_shard
@@ -640,7 +640,7 @@ fn pick_batch(topology: &ClusterTopology, want: usize) -> Vec<[u8; 16]> {
     for n in (0..TRACES).step_by(CHECKOUT_EVERY as usize) {
         let id = trace_id_of(n);
         by_shard
-            .entry(topology.shard_for_fingerprint(city_hash_64_16(&id)))
+            .entry(topology.shard_for_fingerprint(u128::from(city_hash_64_16(&id))))
             .or_default()
             .push(id);
     }
@@ -729,7 +729,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     {
         let owners: BTreeSet<u32> = batch
             .iter()
-            .map(|id| topology.shard_for_fingerprint(city_hash_64_16(id)))
+            .map(|id| topology.shard_for_fingerprint(u128::from(city_hash_64_16(id))))
             .collect();
         anyhow::ensure!(
             owners == topology.all_shards(),

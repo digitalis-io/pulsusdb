@@ -204,7 +204,7 @@ async fn admit_and_drain(db: &str, batch: ParsedLogs) {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 struct PatternRow {
-    fingerprint: u64,
+    fingerprint: u128,
     bucket_ns: i64,
     pattern: String,
     count: u64,
@@ -230,13 +230,15 @@ async fn read_patterns(client: &ChClient, db: &str) -> Vec<PatternRow> {
 /// buffer layout (`key ++ 0xFF ++ value ++ 0xFF`) — NOT
 /// `pulsus_model::stream_fingerprint` (the `ingest_fidelity.rs` non-tautology
 /// rule). Only one label here (`service_name=checkout`).
-async fn ch_fingerprint(client: &ChClient) -> u64 {
+async fn ch_fingerprint(client: &ChClient) -> u128 {
     #[derive(Row, serde::Serialize, serde::Deserialize)]
     struct FpRow {
-        fp: u64,
+        fp: u128,
     }
+    // The 128-bit composition, derived server-side (issue #498).
     let sql = format!(
-        "SELECT cityHash64(concat('service_name', unhex('FF'), '{SERVICE}', unhex('FF'))) AS fp"
+        "WITH concat('service_name', unhex('FF'), '{SERVICE}', unhex('FF')) AS buf \
+         SELECT bitShiftLeft(toUInt128(cityHash64(buf)), 64) + toUInt128(xxHash64(buf)) AS fp"
     );
     let mut stream = client
         .query_stream::<FpRow>(&sql, &QuerySettings::new())

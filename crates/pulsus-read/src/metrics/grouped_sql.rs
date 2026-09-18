@@ -77,6 +77,8 @@
 //! and no `by`/`without` list is rendered, so the three grouping forms
 //! produce **byte-identical text** outside the `gids` array.
 
+use pulsus_model::FpLiteral;
+
 use super::grouped::{Grid, GroupedOp};
 use super::sample_sql;
 
@@ -119,7 +121,7 @@ pub fn grouped_fetch(
     samples_table: &str,
     hist_samples_table: &str,
     metric_name: &str,
-    fps: &[u64],
+    fps: &[FpLiteral],
     gids: &[u32],
     grid: Grid,
     lower_excl_ms: i64,
@@ -253,6 +255,7 @@ pub fn grouped_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     fn grid() -> Grid {
         Grid {
@@ -268,7 +271,11 @@ mod tests {
             "metric_samples",
             "metric_hist_samples",
             "http_requests_total",
-            &[101, 205, 990],
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
             &[0, 1, 0],
             grid(),
             1_782_906_900_000,
@@ -295,7 +302,7 @@ mod tests {
             sql(GroupedOp::Max),
             "WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, \
              300000 AS lookback,\n\
-             \x20    [101, 205, 990] AS fps,\n\
+             \x20    [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,\n\
              \x20    CAST([0, 1, 0], 'Array(UInt32)') AS gids\n\
              SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, \
              any(flags) AS flags\n\
@@ -401,7 +408,10 @@ mod tests {
             "metric_samples",
             "metric_hist_samples",
             "m",
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             &[0, 1],
             grid(),
             0,
@@ -412,7 +422,10 @@ mod tests {
             "metric_samples",
             "metric_hist_samples",
             "m",
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             &[0, 0],
             grid(),
             0,
@@ -450,7 +463,7 @@ mod tests {
             "metric_samples",
             "metric_hist_samples",
             payload,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             &[0],
             grid(),
             0,

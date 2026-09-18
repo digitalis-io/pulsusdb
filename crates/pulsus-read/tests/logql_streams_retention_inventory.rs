@@ -79,8 +79,11 @@ const RETAINING_TYPES: &[&str] = &[
     "Vec<SampleRow>",
     "Vec<TailSampleRow>",
     "Vec<StreamResult>",
-    "HashMap<u64,Vec<(i64,String)>>",
-    "HashMap<u64,StreamResult>",
+    // Keyed by the identity, which became a 16-byte `Fingerprint`
+    // newtype with issue #498. The `u64` spellings are gone from the
+    // tree, so they are replaced rather than kept beside these.
+    "HashMap<Fingerprint,Vec<(i64,String)>>",
+    "HashMap<Fingerprint,StreamResult>",
     "HashMap<String,FanOutGroup>",
 ];
 
@@ -337,7 +340,11 @@ const PINNED: &[(&str, &str, &str)] = &[
     ("detected_probe.rs", "push_fanout_entry", "FanOutGroup{..}"),
     ("detected_probe.rs", "push_fanout_entry", "entries.push"),
     // --- exec.rs: the declared containers.
-    ("exec.rs", "<item>", "field:by_fp:HashMap<u64,StreamResult>"),
+    (
+        "exec.rs",
+        "<item>",
+        "field:by_fp:HashMap<Fingerprint,StreamResult>",
+    ),
     // Issue #463's categorised fast-path map. Charged through the SAME
     // `push_fanout_entry` body as `label_groups` and `groups` above —
     // `charge_group` before the vacant insert, `charge_entry` (now
@@ -353,7 +360,7 @@ const PINNED: &[(&str, &str, &str)] = &[
     (
         "exec.rs",
         "<item>",
-        "field:fp_groups:HashMap<u64,StreamResult>",
+        "field:fp_groups:HashMap<Fingerprint,StreamResult>",
     ),
     ("exec.rs", "<item>", "field:items:Vec<StreamResult>"),
     (

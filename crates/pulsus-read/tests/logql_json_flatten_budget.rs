@@ -30,6 +30,7 @@
 //! targeted `| json a="b.c"` form, not `null`/array fields (which build
 //! no key at all).
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::{
     DetectedFieldsProbe, MAX_JSON_FLATTEN_KEY_BYTES, ReadError, RowBudget, TooBroadReason,
@@ -324,11 +325,14 @@ fn every_row_starts_from_a_full_key_budget() {
 #[test]
 fn the_detected_fields_auto_parse_pass_surfaces_the_breach() {
     let mut probe = DetectedFieldsProbe::new(10, 100);
-    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "a".to_string())],
+    );
     let err = probe
         .feed_row(
             &compiled(r#"{app="a"}"#),
-            1,
+            Fingerprint::from_raw(1),
             0,
             &quadratic_line(32_761, 2_979),
             "",
@@ -369,9 +373,18 @@ fn a_whitespace_ancestor_is_free_for_keys_and_charged_for_captured_paths() {
 
     // `/detected_fields`: capture on — the same ledger refuses.
     let mut probe = DetectedFieldsProbe::new(10, 100);
-    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "a".to_string())],
+    );
     let err = probe
-        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &line, "")
+        .feed_row(
+            &compiled(r#"{app="a"}"#),
+            Fingerprint::from_raw(1),
+            0,
+            &line,
+            "",
+        )
         .expect_err("the captured paths must be charged to the row ledger");
     assert!(
         matches!(
@@ -432,9 +445,18 @@ fn nesting_depth_is_capped_upstream_which_bounds_the_capture_stack() {
         "126 wrappers must flatten"
     );
     let mut probe = DetectedFieldsProbe::new(10, 1000);
-    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    probe.add_stream(
+        Fingerprint::from_raw(1),
+        &[("app".to_string(), "a".to_string())],
+    );
     probe
-        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &nested_line(126), "")
+        .feed_row(
+            &compiled(r#"{app="a"}"#),
+            Fingerprint::from_raw(1),
+            0,
+            &nested_line(126),
+            "",
+        )
         .expect("126 wrappers is inside the ledger under capture too");
 
     // 127 is refused by the JSON parse itself, before the flatten: the
@@ -445,7 +467,13 @@ fn nesting_depth_is_capped_upstream_which_bounds_the_capture_stack() {
          moves, JsonPaths' peak-live-set arithmetic must be recomputed"
     );
     probe
-        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &nested_line(127), "")
+        .feed_row(
+            &compiled(r#"{app="a"}"#),
+            Fingerprint::from_raw(1),
+            0,
+            &nested_line(127),
+            "",
+        )
         .expect("an over-deep line is the malformed class, never an error");
 }
 

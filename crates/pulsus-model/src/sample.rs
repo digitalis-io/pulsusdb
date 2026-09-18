@@ -52,11 +52,11 @@ mod tests {
     #[test]
     fn metric_sample_stores_fields_verbatim() {
         let s = MetricSample {
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             ts: UnixMilli(1_700_000_000_000),
             value: 1.5,
         };
-        assert_eq!(s.fingerprint, 42);
+        assert_eq!(s.fingerprint, Fingerprint::from_raw(42));
         assert_eq!(s.ts.0, 1_700_000_000_000);
         assert_eq!(s.value, 1.5);
     }
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn log_sample_stores_fields_verbatim() {
         let s = LogSample {
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             ts: UnixNano(1_700_000_000_123_456_789),
             severity: 3,
             body: "boot complete".to_string(),
@@ -77,7 +77,7 @@ mod tests {
     fn series_pairs_fingerprint_with_labels() {
         let labels = LabelSet::from_verbatim(vec![("service".to_string(), "checkout".to_string())]);
         let series = Series {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             labels: labels.clone(),
         };
         assert_eq!(series.labels, labels);

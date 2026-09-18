@@ -1709,6 +1709,7 @@ dependencies = [
  "clap",
  "prost",
  "pulsus-logql",
+ "pulsus-model",
  "pulsus-read",
  "reqwest",
  "serde",

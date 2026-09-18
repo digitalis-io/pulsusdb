@@ -277,10 +277,13 @@ impl Lang for Pql {
     // read, so no cut is possible and `handoff_bound` returning `None` is
     // not reached.
 
-    /// A fingerprint renders as up to 20 decimal digits (`u64::MAX`) plus
-    /// the two-byte `", "` separator inside an `IN (…)` list, and
+    /// A fingerprint renders as `toUInt128('<decimal>')` — 13 characters
+    /// of call form plus up to 39 decimal digits (`u128::MAX`) — plus the
+    /// two-byte `", "` separator inside an `IN (…)` list, and
     /// `fingerprint IN ()` is the 17-byte frame. `ast_elements` counts the
-    /// identifier, the `IN` function, the list and one literal per value.
+    /// identifier, the `IN` function, the list and one literal per value;
+    /// the call wrapper is one node per value either way, so the element
+    /// count did not move when the identity widened (issue #498).
     ///
     /// **`text_bytes` over-counts by exactly 2** — the last value carries
     /// no separator — and that is the safe direction: the core compares
@@ -288,7 +291,7 @@ impl Lang for Pql {
     /// earlier.
     fn handoff_cost(n: u64) -> HandoffCost {
         HandoffCost {
-            text_bytes: 17 + n * 22,
+            text_bytes: 17 + n * 54,
             ast_elements: 3 + n,
         }
     }
@@ -1324,7 +1327,7 @@ mod tests {
         selector_pred(
             &format!("metric_name = '{tag}'"),
             "unix_milli > 1 AND unix_milli <= 2",
-            "fingerprint IN (7)",
+            "fingerprint IN (toUInt128('7'))",
         )
     }
 
@@ -1441,7 +1444,7 @@ mod tests {
                     grouped_selector_pred(
                         "metric_name = 'http_requests_total'",
                         "unix_milli > 1 AND unix_milli <= 2",
-                        "fingerprint IN (7)",
+                        "fingerprint IN (toUInt128('7'))",
                     )
                 } else {
                     pred("http_requests_total")
@@ -1579,7 +1582,7 @@ mod tests {
     #[test]
     fn handoff_cost_bounds_the_rendered_fingerprint_list() {
         for n in [0usize, 1, 2, 500] {
-            let fps = vec![u64::MAX; n];
+            let fps = vec![pulsus_model::Fingerprint::from_raw(u128::MAX).sql_literal(); n];
             let rendered = super::super::sample_sql::render_fingerprint_list(&fps);
             let frame = "fingerprint IN ()".len();
             assert_eq!(frame, 17, "the frame this constant counts");

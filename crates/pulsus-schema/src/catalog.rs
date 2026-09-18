@@ -14,14 +14,15 @@
 //! metric tiers are out of scope (issue #5).
 //!
 //! **Amendment policy:** migrations are append-only from the first tagged
-//! release onward. In-place amendment of an already-listed migration was
-//! permitted only pre-release (no tagged release, no persistent
-//! deployments, CI databases created fresh per run), and issue #54's scope
-//! amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last such
-//! amendment window (task-manager ruling on #54). Developers with a local
-//! schema created before that amendment must drop and re-reconcile it —
-//! the checksum drift guard ([`MigrationScope::Checksum`]) correctly
-//! refuses to touch the stale tables.
+//! release onward. In-place amendment of an already-listed migration is
+//! permitted only while the condition that allows it holds — no tagged
+//! release, no persistent deployments, databases created fresh — and issue
+//! #498's widening of the `fingerprint` column to `UInt128` in migrations
+//! 4, 5, 6, 7, 8, 9, 23 and 29 was the last such amendment window
+//! (task-manager ruling on #498). Developers with a local schema created
+//! before that amendment must drop and re-reconcile it — the checksum
+//! drift guard ([`MigrationScope::Checksum`]) correctly refuses to touch
+//! the stale tables.
 
 use crate::render::Family;
 
@@ -171,7 +172,7 @@ pub const MIGRATIONS: &[Migration] = &[
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.metric_series{{on_cluster}} (\n\
                  metric_name  LowCardinality(String),\n\
-                 fingerprint  UInt64  CODEC(Delta(8), ZSTD(1)),\n\
+                 fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),\n\
                  unix_milli   Int64   CODEC(Delta(8), ZSTD(1)),\n\
                  labels       String  CODEC(ZSTD(5))\n\
              ) ENGINE = MergeTree\n\
@@ -188,7 +189,7 @@ pub const MIGRATIONS: &[Migration] = &[
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}} (\n\
                  metric_name  LowCardinality(String),\n\
-                 fingerprint  UInt64   CODEC(Delta(8), ZSTD(1)),\n\
+                 fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),\n\
                  unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),\n\
                  value        Float64  CODEC(Gorilla, ZSTD(1))\n\
              ) ENGINE = MergeTree\n\
@@ -208,7 +209,7 @@ pub const MIGRATIONS: &[Migration] = &[
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.log_streams{{on_cluster}} (\n\
                  month        Date,\n\
-                 fingerprint  UInt64,\n\
+                 fingerprint  UInt128,\n\
                  service      LowCardinality(String),\n\
                  labels       String  CODEC(ZSTD(5)),\n\
                  updated_ns   Int64\n\
@@ -228,7 +229,7 @@ pub const MIGRATIONS: &[Migration] = &[
                  month        Date,\n\
                  key          LowCardinality(String),\n\
                  val          String,\n\
-                 fingerprint  UInt64\n\
+                 fingerprint  UInt128\n\
              ) ENGINE = ReplacingMergeTree\n\
              PARTITION BY month\n\
              ORDER BY (key, val, fingerprint);",
@@ -243,7 +244,7 @@ pub const MIGRATIONS: &[Migration] = &[
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}} (\n\
                  service       LowCardinality(String),\n\
-                 fingerprint   UInt64,\n\
+                 fingerprint   UInt128,\n\
                  timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),\n\
                  severity      Int8    DEFAULT 0,\n\
                  body          String  CODEC(ZSTD(1)),\n\
@@ -269,7 +270,7 @@ pub const MIGRATIONS: &[Migration] = &[
         family: Some(Family::Logs),
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}} (\n\
-                 fingerprint  UInt64,\n\
+                 fingerprint  UInt128,\n\
                  bucket_ns    Int64,\n\
                  count        SimpleAggregateFunction(sum, UInt64),\n\
                  bytes        SimpleAggregateFunction(sum, UInt64)\n\
@@ -482,7 +483,7 @@ pub const MIGRATIONS: &[Migration] = &[
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}} (\n\
                  metric_name        LowCardinality(String),\n\
-                 fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),\n\
+                 fingerprint        UInt128   CODEC(Delta(8), ZSTD(1)),\n\
                  unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),\n\
                  schema             Int8     CODEC(ZSTD(1)),\n\
                  zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),\n\
@@ -607,7 +608,7 @@ pub const MIGRATIONS: &[Migration] = &[
         family: Some(Family::Logs),
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}} (\n\
-                 fingerprint  UInt64,\n\
+                 fingerprint  UInt128,\n\
                  bucket_ns    Int64,\n\
                  pattern      String  CODEC(ZSTD(1)),\n\
                  count        SimpleAggregateFunction(sum, UInt64)\n\
@@ -1390,7 +1391,7 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.metric_hist_samples"));
         // Scalars: identity + the Prometheus integer histogram head.
         assert!(ddl.contains("metric_name        LowCardinality(String),"));
-        assert!(ddl.contains("fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),"));
+        assert!(ddl.contains("fingerprint        UInt128   CODEC(Delta(8), ZSTD(1)),"));
         assert!(ddl.contains("unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),"));
         assert!(ddl.contains("schema             Int8     CODEC(ZSTD(1)),"));
         assert!(ddl.contains("zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),"));
@@ -1576,7 +1577,7 @@ mod tests {
     fn log_patterns_ddl_is_a_time_pruned_aggregating_mergetree() {
         let ddl = rendered_static(29);
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.log_patterns"));
-        assert!(ddl.contains("fingerprint  UInt64,"));
+        assert!(ddl.contains("fingerprint  UInt128,"));
         assert!(ddl.contains("bucket_ns    Int64,"));
         assert!(ddl.contains("pattern      String  CODEC(ZSTD(1)),"));
         assert!(ddl.contains("count        SimpleAggregateFunction(sum, UInt64)"));

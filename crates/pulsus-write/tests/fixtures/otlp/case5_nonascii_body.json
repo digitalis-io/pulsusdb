@@ -13,7 +13,7 @@
     "service": "notify-svc",
     "labels_json": "{\"service_name\":\"notify-svc\"}",
     "structured_metadata_json": "{\"scope_name\":\"notify-scope\",\"scope_version\":\"0.9.0\"}",
-    "fingerprint": 5282372178617206305,
+    "fingerprint": "97442567681035163467590217361680589928",
     "body": "café ✅ 日本語 — \"quoted\"\nnewline",
     "severity": 9,
     "timestamp_source": "time_unix_nano",

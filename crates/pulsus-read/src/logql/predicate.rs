@@ -225,6 +225,7 @@
 //! `&str`, because the next reader would trust it.
 
 use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
+use pulsus_model::FpLiteral;
 
 use super::escape::ch_like_contains;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
@@ -1366,16 +1367,16 @@ pub const MAX_METADATA_FRAGMENT_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataNameClasses<'a> {
     /// Every selected fingerprint, in the statement's own order.
-    pub selected: &'a [u64],
+    pub selected: &'a [FpLiteral],
     /// The name is a label of this stream; the verdict is constant over
     /// every row of the fingerprint.
-    pub stream_label: &'a [u64],
+    pub stream_label: &'a [FpLiteral],
     /// …of those, the ones whose constant verdict is `true`.
-    pub stream_label_true: &'a [u64],
+    pub stream_label_true: &'a [FpLiteral],
     /// The name un-suffixes onto a stream label of this stream.
-    pub unsuffixed: &'a [u64],
+    pub unsuffixed: &'a [FpLiteral],
     /// The ordinary case: the metadata key answers directly.
-    pub direct: &'a [u64],
+    pub direct: &'a [FpLiteral],
     /// The name minus its `_extracted` suffix, for the `unsuffixed` arm.
     /// `Some` exactly when `unsuffixed` is non-empty.
     pub base_name: Option<&'a str>,
@@ -1481,9 +1482,15 @@ fn class_expression(
     }
 }
 
-/// `fingerprint IN (a, b, c)` / `fingerprint NOT IN (…)`.
-fn fingerprint_test(fps: &[u64], negated: bool) -> String {
-    let mut out = String::with_capacity(fps.len() * 22 + 24);
+/// `fingerprint IN (toUInt128('a'), …)` / `fingerprint NOT IN (…)`.
+///
+/// The call form is not optional above `2^64`, where ClickHouse reads a
+/// bare decimal literal as `Float64` (issue #498); the parameter is a
+/// minted literal, so the form is the type's rather than this function's.
+fn fingerprint_test(fps: &[FpLiteral], negated: bool) -> String {
+    // `toUInt128('')` is 14 characters plus up to 39 decimal digits and
+    // the `, ` separator.
+    let mut out = String::with_capacity(fps.len() * 55 + 24);
     out.push_str(if negated {
         "fingerprint NOT IN ("
     } else {
@@ -1617,7 +1624,7 @@ pub fn metadata_string_filter(
 }
 
 /// The fingerprints of one class.
-fn class_list<'a>(classes: &MetadataNameClasses<'a>, which: ComplementClass) -> &'a [u64] {
+fn class_list<'a>(classes: &MetadataNameClasses<'a>, which: ComplementClass) -> &'a [FpLiteral] {
     match which {
         ComplementClass::StreamLabel => classes.stream_label,
         ComplementClass::Unsuffixed => classes.unsuffixed,
@@ -1668,7 +1675,7 @@ fn render_encoding(
     // The complement arm, whose `NOT IN` list is every OTHER class in
     // full — never the fingerprints the arms above happened to render.
     if let Some(which) = complement {
-        let mut others: Vec<u64> = Vec::new();
+        let mut others: Vec<FpLiteral> = Vec::new();
         for other in order {
             if other == which {
                 continue;
@@ -1731,7 +1738,7 @@ pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFr
 /// The three classes must partition the selected set, and the passing
 /// stream-label fingerprints must be a subset of the stream-label class.
 fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal> {
-    let mut union: Vec<u64> = Vec::with_capacity(
+    let mut union: Vec<FpLiteral> = Vec::with_capacity(
         classes.stream_label.len() + classes.unsuffixed.len() + classes.direct.len(),
     );
     union.extend_from_slice(classes.stream_label);
@@ -1741,12 +1748,12 @@ fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilt
         return Err(MetadataFilterRefusal::ClassesDoNotPartition);
     }
     union.sort_unstable();
-    let mut want: Vec<u64> = classes.selected.to_vec();
+    let mut want: Vec<FpLiteral> = classes.selected.to_vec();
     want.sort_unstable();
     if union != want {
         return Err(MetadataFilterRefusal::ClassesDoNotPartition);
     }
-    let mut a: Vec<u64> = classes.stream_label.to_vec();
+    let mut a: Vec<FpLiteral> = classes.stream_label.to_vec();
     a.sort_unstable();
     if !classes
         .stream_label_true
@@ -1763,6 +1770,8 @@ fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilt
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::Fingerprint;
+
     use super::*;
 
     fn regex_filter(value: &str) -> LineFilter {
@@ -2217,18 +2226,18 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A selection of `n` fingerprints, spread so no two are adjacent.
-    fn fps(n: usize) -> Vec<u64> {
-        (0..n as u64)
-            .map(|i| 18_000_000_000_000_000_000 + i * 7_919)
+    fn fps(n: usize) -> Vec<FpLiteral> {
+        (0..n as u128)
+            .map(|i| Fingerprint::from_raw(18_000_000_000_000_000_000 + i * 7_919).sql_literal())
             .collect()
     }
 
     fn classes<'a>(
-        selected: &'a [u64],
-        stream_label: &'a [u64],
-        stream_label_true: &'a [u64],
-        unsuffixed: &'a [u64],
-        direct: &'a [u64],
+        selected: &'a [FpLiteral],
+        stream_label: &'a [FpLiteral],
+        stream_label_true: &'a [FpLiteral],
+        unsuffixed: &'a [FpLiteral],
+        direct: &'a [FpLiteral],
         base_name: Option<&'a str>,
     ) -> MetadataNameClasses<'a> {
         MetadataNameClasses {
@@ -2318,7 +2327,7 @@ mod tests {
         assert!(ok.is_ok(), "a true partition renders: {ok:?}");
 
         // One fingerprint missing from every class.
-        let short: Vec<u64> = c[..2].to_vec();
+        let short: Vec<FpLiteral> = c[..2].to_vec();
         assert_eq!(
             metadata_string_filter(
                 "env_extracted",
@@ -2331,7 +2340,7 @@ mod tests {
             "a fingerprint in no class"
         );
         // One fingerprint in two classes at once.
-        let both: Vec<u64> = c.iter().chain(a.iter().take(1)).copied().collect();
+        let both: Vec<FpLiteral> = c.iter().chain(a.iter().take(1)).copied().collect();
         assert_eq!(
             metadata_string_filter(
                 "env_extracted",
@@ -2423,7 +2432,7 @@ mod tests {
             ),
         ];
         for (name, a, a_true, b, c, want) in cases {
-            let pick = |ix: &[usize]| -> Vec<u64> { ix.iter().map(|i| sel[*i]).collect() };
+            let pick = |ix: &[usize]| -> Vec<FpLiteral> { ix.iter().map(|i| sel[*i]).collect() };
             let (a, a_true, b, c) = (pick(a), pick(a_true), pick(b), pick(c));
             let base = if b.is_empty() { None } else { Some("env") };
             let (fragment, complement) = metadata_string_filter(
@@ -2567,8 +2576,8 @@ mod tests {
     #[test]
     fn a_render_past_the_budget_is_refused_rather_than_truncated() {
         let sel = fps(1_000);
-        let a: Vec<u64> = sel[..500].to_vec();
-        let c: Vec<u64> = sel[500..].to_vec();
+        let a: Vec<FpLiteral> = sel[..500].to_vec();
+        let c: Vec<FpLiteral> = sel[500..].to_vec();
         let full = metadata_string_filter(
             "env",
             MatchOp::Eq,

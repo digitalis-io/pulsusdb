@@ -881,6 +881,7 @@ async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
@@ -889,7 +890,7 @@ mod tests {
 
     fn stream(labels: &str, entries: Vec<(i64, &str)>) -> StreamResult {
         StreamResult {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "checkout".to_string(),
             labels_json: labels.to_string(),
             entries: entries
@@ -1063,7 +1064,7 @@ mod tests {
         let sql = pulsus_read::logql::sql::stage3_keyset(
             "log_samples",
             &[pulsus_read::logql::predicate::literal("checkout")],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             pulsus_read::logql::sql::TimeWindow {
                 start_ns: 0,
                 end_ns: 10,
@@ -1259,7 +1260,7 @@ mod tests {
     fn full_page_resumes_from_the_boundary_cursor_not_the_slice_upper() {
         let mut s = ScanState::new(100);
         let cursor = TailCursor {
-            tuple: (250, 7, 42),
+            tuple: (250, Fingerprint::from_raw(7), 42),
             seen: 3,
         };
         let page = TailPage {
@@ -1285,7 +1286,7 @@ mod tests {
         let page = TailPage {
             streams: vec![],
             next: Some(TailCursor {
-                tuple: (300, 1, 1),
+                tuple: (300, Fingerprint::from_raw(1), 1),
                 seen: 1,
             }),
             fetched: 4,
@@ -1302,7 +1303,7 @@ mod tests {
         // upper): the keyset stays live so same-instant ties resume.
         let mut s = ScanState::new(100);
         let at_upper = TailCursor {
-            tuple: (500, 1, 1),
+            tuple: (500, Fingerprint::from_raw(1), 1),
             seen: 2,
         };
         let page = TailPage {
@@ -1808,7 +1809,7 @@ mod tests {
                 Some(FullPageMode::TracksUpper) => Ok(TailPage {
                     streams: vec![],
                     next: Some(TailCursor {
-                        tuple: (upper_ns, 0, 0),
+                        tuple: (upper_ns, Fingerprint::from_raw(0), 0),
                         seen: 0,
                     }),
                     fetched: fetch_limit,
@@ -1816,7 +1817,7 @@ mod tests {
                 Some(FullPageMode::Frozen(ts)) => Ok(TailPage {
                     streams: vec![],
                     next: Some(TailCursor {
-                        tuple: (ts, 0, 0),
+                        tuple: (ts, Fingerprint::from_raw(0), 0),
                         seen: 0,
                     }),
                     fetched: fetch_limit,

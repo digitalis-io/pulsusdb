@@ -15,6 +15,7 @@
 
 use std::borrow::Cow;
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::CompiledPipeline;
 use pulsus_read::logql::pipeline::PipelineError;
 use pulsus_read::logql::template::{self, Template, TemplateEnv, TemplateKind};
@@ -774,15 +775,15 @@ fn a_budget_breach_surfaces_as_the_bounded_query_too_broad_422_class() {
         r#"{{a="b"}} | line_format "{{{{ repeat {over} \"x\" }}}}""#
     ));
     let meta = std::collections::HashMap::from([(
-        1u64,
+        Fingerprint::from_raw(1),
         StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "svc".to_string(),
             labels: r#"{"env":"prod"}"#.to_string(),
         },
     )]);
     let rows = vec![SampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 0,
         body: "line".to_string(),
         structured_metadata: String::new(),
@@ -1313,15 +1314,15 @@ fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_deta
     // ingest limit is involved.
     let pipeline = compiled(r#"{a="b"} | line_format `{{ duration (repeat 419430 __line__) }}`"#);
     let meta = std::collections::HashMap::from([(
-        1u64,
+        Fingerprint::from_raw(1),
         StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: "svc".to_string(),
             labels: r#"{"env":"prod"}"#.to_string(),
         },
     )]);
     let rows = vec![SampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 0,
         body: line.clone(),
         structured_metadata: String::new(),
@@ -1351,7 +1352,7 @@ fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_deta
     // `__error_details__`, exactly as the reference serves it.
     let pipeline = compiled(r#"{a="b"} | line_format `{{ duration (repeat 419429 __line__) }}`"#);
     let rows = vec![SampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 0,
         body: line,
         structured_metadata: String::new(),

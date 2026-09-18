@@ -12,8 +12,8 @@
 //! `from_verbatim`, which every other case in this file uses for traces.
 
 use pulsus_model::{
-    LabelSet, build_metric_buffer, build_stream_buffer, canonicalize_label_key, metric_fingerprint,
-    raw_cityhash64, stream_fingerprint,
+    Fingerprint, LabelSet, build_metric_buffer, build_stream_buffer, canonicalize_label_key,
+    metric_fingerprint, raw_cityhash64, stream_fingerprint,
 };
 use serde_json::Value;
 
@@ -54,6 +54,57 @@ fn labels_from_json(labels: &Value) -> LabelSet {
     LabelSet::from_verbatim(pairs_from_json(labels))
 }
 
+/// A fixture case's committed identity: the 128-bit composition and both of
+/// its 64-bit halves, each pinned separately (issue #498). The halves are
+/// the values the two functions returned before the widening, so a change
+/// that moved only one primitive is still caught by name.
+struct CommittedFingerprint {
+    fp128: u128,
+    city64: u64,
+    xx64: u64,
+}
+
+fn committed_fingerprint(case: &Value) -> CommittedFingerprint {
+    let parse_u64 = |k: &str| -> u64 {
+        case[k]
+            .as_str()
+            .unwrap_or_else(|| panic!("{k} is a decimal string"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{k} parses as u64"))
+    };
+    CommittedFingerprint {
+        fp128: case["fingerprint128"]
+            .as_str()
+            .expect("fingerprint128 is a decimal string")
+            .parse()
+            .expect("fingerprint128 parses as u128"),
+        city64: parse_u64("fingerprint_city64"),
+        xx64: parse_u64("fingerprint_xx64"),
+    }
+}
+
+/// Checks the committed triple against itself and against the one half a
+/// test can still call directly: `cityHash64` leads, `xxHash64(seed 0)`
+/// trails, and `raw_cityhash64` must reproduce the leading word over the
+/// same buffer. `Fingerprint` has no accessor, so the low word is pinned by
+/// the fixture's own arithmetic rather than by reading the value back out.
+fn assert_composition(buf: &[u8], committed: &CommittedFingerprint, name: &str) {
+    assert_eq!(
+        committed.fp128 >> 64,
+        u128::from(committed.city64),
+        "{name}: the high half must be the committed cityHash64"
+    );
+    assert_eq!(
+        committed.fp128 as u64, committed.xx64,
+        "{name}: the low half must be the committed xxHash64"
+    );
+    assert_eq!(
+        raw_cityhash64(buf),
+        committed.city64,
+        "{name}: cityHash64 over the canonical buffer"
+    );
+}
+
 /// Issue #4 AC#3 / architecture.md §2.3: an OTel-style attribute
 /// (`service.name = "checkout"`), an already-normalized label
 /// (`service_name = "checkout"`), and the physical `service` column value
@@ -89,16 +140,33 @@ fn normalization_chain_pins_otel_and_prenormalized_paths_to_identical_output() {
         );
 
         let expected_json = case["canonical_json"].as_str().expect("canonical_json");
-        let expected_metric_fp: u64 = case["metric_fingerprint"]
+        let expected_metric_fp: u128 = case["metric_fingerprint128"]
             .as_str()
-            .expect("metric_fingerprint")
+            .expect("metric_fingerprint128")
             .parse()
-            .expect("metric_fingerprint parses as u64");
-        let expected_stream_fp: u64 = case["stream_fingerprint"]
+            .expect("metric_fingerprint128 parses as u128");
+        let expected_stream_fp: u128 = case["stream_fingerprint128"]
             .as_str()
-            .expect("stream_fingerprint")
+            .expect("stream_fingerprint128")
             .parse()
-            .expect("stream_fingerprint parses as u64");
+            .expect("stream_fingerprint128 parses as u128");
+        // The pre-#498 halves stay pinned: the stream vector is the
+        // leading word of the stream composition, and the metric vector is
+        // the trailing word of the metric composition.
+        assert_eq!(
+            case["stream_fingerprint"]
+                .as_str()
+                .expect("stream_fingerprint"),
+            (expected_stream_fp >> 64).to_string(),
+            "{name}: the pre-widening stream vector must be the high half"
+        );
+        assert_eq!(
+            case["metric_fingerprint"]
+                .as_str()
+                .expect("metric_fingerprint"),
+            (expected_metric_fp as u64).to_string(),
+            "{name}: the pre-widening metric vector must be the low half"
+        );
         let expected_service = case["service"].as_str().expect("service");
 
         for (label, set) in [("otel", &otel_set), ("normalized", &normalized_set)] {
@@ -109,12 +177,12 @@ fn normalization_chain_pins_otel_and_prenormalized_paths_to_identical_output() {
             );
             assert_eq!(
                 metric_fingerprint(set),
-                expected_metric_fp,
+                Fingerprint::from_raw(expected_metric_fp),
                 "{name} ({label}): metric fingerprint"
             );
             assert_eq!(
                 stream_fingerprint(set),
-                expected_stream_fp,
+                Fingerprint::from_raw(expected_stream_fp),
                 "{name} ({label}): stream fingerprint"
             );
             assert_eq!(
@@ -151,16 +219,20 @@ fn metric_fingerprint_vectors_match() {
         let name = case["name"].as_str().expect("name");
         let labels = labels_from_json(&case["labels"]);
         let expected_buf = decode_hex(case["buffer_hex"].as_str().expect("buffer_hex"));
-        let expected_fp: u64 = case["fingerprint"]
-            .as_str()
-            .expect("fingerprint")
-            .parse()
-            .expect("fingerprint parses as u64");
+        let committed = committed_fingerprint(case);
+        // The pre-#498 vector is the low half for this family, and it is
+        // still pinned under its own key.
+        assert_eq!(
+            case["fingerprint"].as_str().expect("fingerprint"),
+            committed.xx64.to_string(),
+            "{name}: the pre-widening vector must still be the xxHash64 half"
+        );
 
         assert_eq!(build_metric_buffer(&labels), expected_buf, "{name}: buffer");
+        assert_composition(&expected_buf, &committed, name);
         assert_eq!(
             metric_fingerprint(&labels),
-            expected_fp,
+            Fingerprint::from_raw(committed.fp128),
             "{name}: fingerprint"
         );
     }
@@ -203,16 +275,20 @@ fn stream_fingerprint_vectors_match() {
         let name = case["name"].as_str().expect("name");
         let labels = labels_from_json(&case["labels"]);
         let expected_buf = decode_hex(case["buffer_hex"].as_str().expect("buffer_hex"));
-        let expected_fp: u64 = case["fingerprint"]
-            .as_str()
-            .expect("fingerprint")
-            .parse()
-            .expect("fingerprint parses as u64");
+        let committed = committed_fingerprint(case);
+        // The pre-#498 vector is the high half for this family, and it is
+        // still pinned under its own key.
+        assert_eq!(
+            case["fingerprint"].as_str().expect("fingerprint"),
+            committed.city64.to_string(),
+            "{name}: the pre-widening vector must still be the cityHash64 half"
+        );
 
         assert_eq!(build_stream_buffer(&labels), expected_buf, "{name}: buffer");
+        assert_composition(&expected_buf, &committed, name);
         assert_eq!(
             stream_fingerprint(&labels),
-            expected_fp,
+            Fingerprint::from_raw(committed.fp128),
             "{name}: fingerprint"
         );
     }

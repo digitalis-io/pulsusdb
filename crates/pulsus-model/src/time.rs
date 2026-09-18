@@ -15,11 +15,136 @@ pub struct UnixMilli(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixNano(pub i64);
 
-/// A 64-bit series/stream fingerprint. A plain alias, not a newtype: it
-/// must match `pulsus-clickhouse`'s `u64` `Row` column type 1:1 (`UInt64`
-/// round-trips values above `2^63`, docs/decisions/0001-clickhouse-client.md)
-/// with zero conversion overhead at the insert/query boundary.
-pub type Fingerprint = u64;
+/// A 128-bit series/stream identity, and the only value that may be turned
+/// into fingerprint SQL. Stored as a ClickHouse `UInt128` column
+/// (docs/schemas.md §3), carried as `u128` on the wire by `#[serde(transparent)]`
+/// so the `Row` derive sees the bare integer with no conversion at the
+/// insert/query boundary.
+///
+/// # Why 128 bits (issue #498)
+///
+/// Both stores identified a series by a 64-bit hash with no comparison of
+/// the underlying label set, so two label sets that collided shared one
+/// identity and the loser's rows became unreachable. See
+/// [`crate::stream_fingerprint`] for the composition.
+///
+/// # Why a newtype with no `Display`
+///
+/// Above `2^64` ClickHouse reads a bare decimal literal as `Float64`, which
+/// is exact only to `2^53`: `WHERE fingerprint = 18446744073709551617`
+/// silently matches the row holding `18446744073709551616`, and
+/// `fingerprint IN (<bare list>)` prunes every granule and returns nothing.
+/// Measured on ClickHouse 26.3.29.7. The only exact form is
+/// `toUInt128('<decimal>')`, so the only way to spell a fingerprint in SQL
+/// is [`FpLiteral`], minted by [`Fingerprint::sql_literal`]. `Fingerprint`
+/// itself implements neither `Display` nor `ToString`, so the wrong form is
+/// a compile error rather than a wrong answer.
+///
+/// This is `MonthLiteral`'s mechanism
+/// (`crates/pulsus-read/src/logql/predicate.rs:363`): the
+/// mint takes an integer, so "no caller text enters the predicate" is a
+/// property rustc holds up rather than an observation about callers.
+///
+/// # THE SEAL — four properties, each demonstrated
+///
+/// Formatting it directly does not compile:
+///
+/// ```compile_fail,E0277
+/// let fp = pulsus_model::Fingerprint::from_raw(7);
+/// let s = format!("{fp}");
+/// ```
+///
+/// Neither does `to_string`:
+///
+/// ```compile_fail,E0599
+/// let fp = pulsus_model::Fingerprint::from_raw(7);
+/// let s = fp.to_string();
+/// ```
+///
+/// The minted literal's inner value cannot be read back out — binding the
+/// field touches exactly the one layer this seal is about, where
+/// `(lit.0).0` would reach through both and stay red even after the seal is
+/// removed (measured, issue #498 plan round 6):
+///
+/// ```compile_fail,E0616
+/// let lit = pulsus_model::Fingerprint::from_raw(7).sql_literal();
+/// let inner: pulsus_model::Fingerprint = lit.0;
+/// ```
+///
+/// And one cannot be forged around the mint:
+///
+/// ```compile_fail,E0423
+/// let fp = pulsus_model::Fingerprint::from_raw(7);
+/// let lit = pulsus_model::FpLiteral(fp);
+/// ```
+///
+/// The last two fences are over-determined by one removal — putting `pub`
+/// on [`FpLiteral`]'s field greens both — and the first two by the other,
+/// adding `impl Display for Fingerprint`. Said here rather than left to be
+/// discovered, the way this repository's other over-determined fences are
+/// marked.
+///
+/// # What this does NOT prove
+///
+/// The set of safe-code routes to the inner `u128` is not closed, and this
+/// type does not claim it is. `Hash` hands the value to a recording
+/// `Hasher`, `Serialize` writes it as a decimal, and `Debug` prints it;
+/// all three are required (map keys, the RowBinary column, diagnostics).
+/// What stands between a derive and a statement is the renderer checks in
+/// `crates/pulsus-model/tests/fingerprint_renderer_inventory.rs` and
+/// `crates/pulsus-read/tests/fingerprint_rendering.rs`, not this seal.
+/// The seal stops the accident — someone writing `format!("{fp}")` in a new
+/// builder — not the deliberate route.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct Fingerprint(u128);
+
+impl Fingerprint {
+    /// Wraps a raw 128-bit value. Construction is not the hazard —
+    /// rendering is — so this stays open: the writer's hash composition,
+    /// a row read back from ClickHouse and a test vector all arrive as
+    /// integers.
+    pub const fn from_raw(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// The mint. The whole public surface besides [`Fingerprint::from_raw`],
+    /// and the only way a fingerprint reaches SQL.
+    pub const fn sql_literal(self) -> FpLiteral {
+        FpLiteral(self)
+    }
+}
+
+/// A fingerprint rendered as ClickHouse SQL: `toUInt128('<decimal>')`,
+/// exact at every value. Minted only by [`Fingerprint::sql_literal`]; its
+/// field carries **no visibility modifier**, which is the seal.
+///
+/// `Copy` and 16 bytes wide, so a `&[FpLiteral]` chunks and forwards the
+/// same way a `&[Fingerprint]` did; the text is produced at `Display` time
+/// and never stored.
+/// `Ord` is the wrapped fingerprint's ordering — the read path sorts and
+/// binary-searches minted sets while partitioning them; it reads nothing
+/// out of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FpLiteral(
+    /// NO visibility modifier — the seal.
+    Fingerprint,
+);
+
+impl std::fmt::Display for FpLiteral {
+    /// The one implementation in the tree that converts a typed fingerprint
+    /// value into text. Searched with
+    /// `git grep -nE 'impl([^\n]*)?(std::fmt::)?Display for' -- '*.rs'` over
+    /// every tracked Rust file: two others emit fingerprint SQL —
+    /// `SqlExpr` (`crates/pulsus-read/src/compile/fold.rs:83`) and `Pred`
+    /// (`:532`) — and both `write_str` a `String` rendered earlier, so they
+    /// carry text rather than converting a value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "toUInt128('{}')", self.0.0)
+    }
+}
 
 /// The default `metric_series` activity-bucket width in milliseconds
 /// (docs/schemas.md §2.1, `PULSUS_SERIES_ACTIVITY_BUCKET`,
@@ -70,7 +195,7 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// `u16` (not, say, an `i32` day count) so it matches ClickHouse's native
 /// `Date` wire encoding 1:1 — days since epoch, valid up to `2149-06-06`
 /// (`u16::MAX`) — with zero conversion overhead at the insert boundary,
-/// same rationale as [`Fingerprint`]'s bare `u64`.
+/// same rationale as [`Fingerprint`]'s `#[serde(transparent)]` `u128`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date(u16);
 
@@ -229,9 +354,27 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_round_trips_values_above_i64_max() {
-        let fp: Fingerprint = 0xFFFF_FFFF_FFFF_FFF1;
-        assert!(fp > (1u64 << 63));
+    fn fingerprint_round_trips_values_above_u64_max() {
+        let fp = Fingerprint::from_raw(0x1_0000_0000_0000_0001);
+        assert!(fp > Fingerprint::from_raw(u64::MAX as u128));
+    }
+
+    #[test]
+    fn the_literal_renders_the_exact_call_form_at_every_boundary_value() {
+        // 2^64-1, 2^64, 2^64+1, 2^64+2: the last value a bare decimal
+        // literal reads exactly, the first `Float64`, the value 2^64+1
+        // rounds onto, and its neighbour.
+        for raw in [
+            18_446_744_073_709_551_615u128,
+            18_446_744_073_709_551_616,
+            18_446_744_073_709_551_617,
+            18_446_744_073_709_551_618,
+        ] {
+            assert_eq!(
+                Fingerprint::from_raw(raw).sql_literal().to_string(),
+                format!("toUInt128('{raw}')")
+            );
+        }
     }
 
     #[test]

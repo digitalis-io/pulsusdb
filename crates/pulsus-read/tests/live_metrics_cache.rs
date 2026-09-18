@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, floor_to_activity_bucket};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, floor_to_activity_bucket};
 use pulsus_read::metrics::sql::{historical_resolution_query, historical_series_subquery};
 use pulsus_read::{
     DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp, Resolution, SeriesResolver,
@@ -99,7 +99,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -122,10 +122,10 @@ fn double_placeholders(sql: &str) -> String {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 struct FingerprintRow {
-    fingerprint: u64,
+    fingerprint: Fingerprint,
 }
 
-async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<u64> {
+async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<Fingerprint> {
     let doubled = double_placeholders(sql);
     let mut stream = client
         .query_stream::<FingerprintRow>(&doubled, &QuerySettings::new())
@@ -225,7 +225,7 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
     // the series — proving the historical path never returns a false
     // empty for a series the cache itself cannot see.
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
-    assert_eq!(fingerprints, vec![4242]);
+    assert_eq!(fingerprints, [4242].map(Fingerprint::from_raw));
 
     drop_database(&bootstrap, db).await;
 }
@@ -279,7 +279,7 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(
         fingerprints,
-        vec![1],
+        [1].map(Fingerprint::from_raw),
         "the 10:00-bucketed row must match a 10:30-10:40 query; the 11:00 row must not"
     );
 
@@ -372,10 +372,10 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
         bucket,
         &[matcher],
     );
-    let via_sql: Vec<u64> = {
+    let via_sql: Vec<Fingerprint> = {
         #[derive(Row, serde::Serialize, serde::Deserialize)]
         struct LabelsRow {
-            fingerprint: u64,
+            fingerprint: Fingerprint,
             #[allow(dead_code)]
             labels: String,
         }
@@ -392,7 +392,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
         out
     };
 
-    assert_eq!(in_process, vec![10, 20]);
+    assert_eq!(in_process, [10, 20].map(Fingerprint::from_raw));
     assert_eq!(in_process, via_sql);
 
     drop_database(&bootstrap, db).await;
@@ -456,12 +456,12 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
         other => panic!("expected SqlFallback(ColdCache), got {other:?}"),
     };
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
-    assert_eq!(via_sql, vec![99]);
+    assert_eq!(via_sql, [99].map(Fingerprint::from_raw));
 
     // Now warm the same data and confirm the in-process answer agrees.
     cold_cache.refresh().await.expect("refresh");
     match cold_cache.resolve("up", &[], window) {
-        Resolution::Fingerprints(fps) => assert_eq!(fps, vec![99]),
+        Resolution::Fingerprints(fps) => assert_eq!(fps, [99].map(Fingerprint::from_raw)),
         other => panic!("expected Fingerprints, got {other:?}"),
     }
 
@@ -589,7 +589,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     );
     let degraded = execute_fingerprint_sql(&client, &sql).await;
     assert!(
-        !degraded.contains(&999),
+        !degraded.contains(&Fingerprint::from_raw(999)),
         "fallback SQL must exclude the out-of-window series 999: {degraded:?}"
     );
 
@@ -613,7 +613,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     // the correctly-bounded ground truth and the fallback SQL must exclude
     // it — an unbounded ground truth would have included it here.
     assert!(
-        !truth.contains(&999),
+        !truth.contains(&Fingerprint::from_raw(999)),
         "ground truth must exclude the out-of-window series 999: {truth:?}"
     );
 
@@ -642,15 +642,15 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
         other => panic!("expected a cache hit after refresh, got {other:?}"),
     };
     assert!(
-        fresh_in_process.contains(&999),
+        fresh_in_process.contains(&Fingerprint::from_raw(999)),
         "sanity check: 999 is within the cache's residency window and must be resident: {fresh_in_process:?}"
     );
-    let fresh_in_process_within_request_window: Vec<u64> = fresh_in_process
+    let fresh_in_process_within_request_window: Vec<Fingerprint> = fresh_in_process
         .into_iter()
-        .filter(|fp| *fp != 999)
+        .filter(|fp| *fp != Fingerprint::from_raw(999))
         .collect();
 
-    assert_eq!(degraded, vec![501, 502]);
+    assert_eq!(degraded, [501, 502].map(Fingerprint::from_raw));
     assert_eq!(
         degraded, truth,
         "degraded SQL must match independent ground truth"
@@ -731,7 +731,7 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
         Resolution::Fingerprints(fps) => fps,
         other => panic!("expected a cache hit, got {other:?}"),
     };
-    assert_eq!(in_process, vec![7]);
+    assert_eq!(in_process, [7].map(Fingerprint::from_raw));
 
     let sql = historical_series_subquery("metric_series", "up", window, bucket, &[matcher]);
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
@@ -804,7 +804,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
 
     // A handful of series: small enough that the tight ceiling never bites,
     // so there IS a last good snapshot for the failed sweep to retain.
-    let small: Vec<SeedSeriesRow> = (0..10u64)
+    let small: Vec<SeedSeriesRow> = (0..10u128)
         .map(|n| SeedSeriesRow {
             metric_name: "up".to_string(),
             fingerprint: n + 1,

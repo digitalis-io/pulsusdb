@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::{EngineConfig, LogQlEngine, TimeBounds};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
@@ -111,7 +112,7 @@ struct ExplainRow {
 /// statement executor, so seeding goes through the block inserter).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct PatSeedRow {
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     bucket_ns: i64,
     pattern: String,
     count: u64,
@@ -195,7 +196,13 @@ fn slash_pair(raw: &str, block: &str, field: &str) -> Option<(u64, u64)> {
     None
 }
 
-const FP: u64 = 18_374_000_000_000_000_001;
+const FP_RAW: u128 = 18_374_000_000_000_000_001;
+
+/// The fixture fingerprint, minted — every builder takes literals
+/// (issue #498).
+fn fp() -> FpLiteral {
+    Fingerprint::from_raw(FP_RAW).sql_literal()
+}
 const DAY_NS: i64 = 86_400_000_000_000;
 const SECOND_NS: i64 = 1_000_000_000;
 const BUCKET_NS: i64 = 10_000_000_000; // 10s ingest bucket
@@ -238,7 +245,7 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
     let base = day_start_ago(1);
     let rows: Vec<PatSeedRow> = (0..40_000i64)
         .map(|i| PatSeedRow {
-            fingerprint: FP,
+            fingerprint: Fingerprint::from_raw(FP_RAW),
             bucket_ns: base + i * SECOND_NS,
             pattern: format!("pattern alpha {i}"),
             count: 1,
@@ -254,7 +261,7 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
     };
     let full_raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[FP], full_window, BUCKET_NS as u64),
+        &sql::log_patterns_read(table, &[fp()], full_window, BUCKET_NS as u64),
     )
     .await;
     let (_full_sel, total_granules) = block_granules(&full_raw, "PrimaryKey")
@@ -271,7 +278,7 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
     };
     let narrow_raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[FP], narrow_window, BUCKET_NS as u64),
+        &sql::log_patterns_read(table, &[fp()], narrow_window, BUCKET_NS as u64),
     )
     .await;
     let (narrow_sel, _) = block_granules(&narrow_raw, "PrimaryKey")
@@ -305,13 +312,13 @@ async fn patterns_read_prunes_daily_partitions() {
         &db,
         &[
             PatSeedRow {
-                fingerprint: FP,
+                fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: day_a,
                 pattern: "pattern one".to_string(),
                 count: 1,
             },
             PatSeedRow {
-                fingerprint: FP,
+                fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: day_b,
                 pattern: "pattern two".to_string(),
                 count: 1,
@@ -333,7 +340,7 @@ async fn patterns_read_prunes_daily_partitions() {
     };
     let raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[FP], window, BUCKET_NS as u64),
+        &sql::log_patterns_read(table, &[fp()], window, BUCKET_NS as u64),
     )
     .await;
     let (sel, total) =
@@ -384,7 +391,7 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
         &client,
         &format!(
             "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
-             (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({b0}))), {FP}, 'checkout', \
+             (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({b0}))), {FP_RAW}, 'checkout', \
              '{{\"service_name\":\"checkout\"}}', 0)"
         ),
     )
@@ -393,7 +400,7 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
         &client,
         &format!(
             "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) VALUES \
-             (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({b0}))), 'service_name', 'checkout', {FP})"
+             (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({b0}))), 'service_name', 'checkout', {FP_RAW})"
         ),
     )
     .await;
@@ -407,19 +414,19 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
         &db,
         &[
             PatSeedRow {
-                fingerprint: FP,
+                fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b0,
                 pattern: "pattern b".to_string(),
                 count: 1,
             },
             PatSeedRow {
-                fingerprint: FP,
+                fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b1,
                 pattern: "pattern b".to_string(),
                 count: 2,
             },
             PatSeedRow {
-                fingerprint: FP,
+                fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b2,
                 pattern: "pattern a".to_string(),
                 count: 2,

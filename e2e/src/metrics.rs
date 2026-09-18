@@ -2515,7 +2515,7 @@ mod tests {
                 "explain": {
                     "stages": [
                         {"name": "series_resolution", "sql": "label cache: 3 matching series", "note": null},
-                        {"name": "sample_fetch", "sql": "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE fingerprint IN (1, 2, 3)", "note": null},
+                        {"name": "sample_fetch", "sql": "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE fingerprint IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))", "note": null},
                     ]
                 }
             }

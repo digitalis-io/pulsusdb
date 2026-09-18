@@ -19,11 +19,12 @@ use std::collections::HashMap;
 use super::charge::{StreamsResultBudget, alloc_block_bytes, entry_category_bytes};
 use super::exec::{EntryCategories, StreamResult, TailCursor};
 use super::labels::{
-    EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
+    EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, derived_stream_fingerprint,
     merge_labels_with_structured_metadata, render_labels_json_sorted,
 };
 use super::pipeline::{JsonPaths, LabelCategory};
 use crate::canonical_labels::{parse_canonical_labels, parse_canonical_labels_into};
+use pulsus_model::Fingerprint;
 
 /// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:
 /// the map key is the single owned copy of the rendered label set, moved
@@ -32,7 +33,7 @@ use crate::canonical_labels::{parse_canonical_labels, parse_canonical_labels_int
 /// effectively per-row).
 #[derive(Debug)]
 pub(in crate::logql) struct FanOutGroup {
-    pub(in crate::logql) fingerprint: u64,
+    pub(in crate::logql) fingerprint: Fingerprint,
     pub(in crate::logql) service: String,
     pub(in crate::logql) entries: Vec<(i64, String)>,
     /// Parallel to [`Self::entries`] in categorised mode (issue #463),
@@ -62,7 +63,7 @@ pub(in crate::logql) enum GroupKey<'a> {
     /// from the caller's fallback.
     Rendered {
         labels_json: String,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
     },
 }
 
@@ -105,7 +106,7 @@ pub(in crate::logql) fn push_fanout_entry(
                 .find(|(k, _)| k == "service_name")
                 .map(|(_, v)| v.as_ref())
                 .unwrap_or(fallback_service);
-            let fingerprint = fnv1a64(labels_json.as_bytes());
+            let fingerprint = derived_stream_fingerprint(labels_json.as_bytes());
             (labels_json, fingerprint, service)
         }
         GroupKey::Rendered {
@@ -385,11 +386,11 @@ impl DetectedRowFeeder {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::logql) fn feed_row(
         &mut self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         timestamp_ns: i64,
         body: &str,
         structured_metadata: &str,
-        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         compiled: &super::pipeline::CompiledPipeline,
         acc: &mut FieldAccumulator,
     ) -> Result<bool, ReadError> {
@@ -634,7 +635,7 @@ fn observe_detected_row_legacy_shape<'a>(
 /// left and survives only as this tracker's independent oracle.
 #[derive(Debug)]
 pub(in crate::logql) struct TailCursorTracker {
-    tuple: Option<(i64, u64, u64)>,
+    tuple: Option<(i64, Fingerprint, u64)>,
     run: u32,
     rows: u32,
 }
@@ -652,7 +653,7 @@ impl TailCursorTracker {
     pub(in crate::logql) fn observe(
         &mut self,
         timestamp_ns: i64,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         body_hash: u64,
     ) {
         self.rows = self.rows.saturating_add(1);
@@ -743,7 +744,7 @@ impl DetectedPagedState {
         stream: &mut S,
         read_bytes: impl FnOnce(&S) -> Option<u64>,
         map_err: impl Fn(E) -> ReadError,
-        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         compiled: &super::pipeline::CompiledPipeline,
         acc: &mut FieldAccumulator,
     ) -> Result<Option<bool>, ReadError>
@@ -822,7 +823,7 @@ impl DetectedPagedState {
 pub struct DetectedFieldsProbe {
     acc: FieldAccumulator,
     state: DetectedPagedState,
-    base_labels: HashMap<u64, Vec<(String, String)>>,
+    base_labels: HashMap<Fingerprint, Vec<(String, String)>>,
     /// The legacy shape's third owned SM-observation buffer — pre-#244
     /// `feed_detected_rows` carried one across a page's rows; held here
     /// (test-only) so `feed_row_legacy_shape` reproduces that steady
@@ -872,7 +873,7 @@ impl DetectedFieldsProbe {
         }
     }
 
-    pub fn add_stream(&mut self, fingerprint: u64, labels: &[(String, String)]) {
+    pub fn add_stream(&mut self, fingerprint: Fingerprint, labels: &[(String, String)]) {
         self.base_labels.insert(fingerprint, labels.to_vec());
     }
 
@@ -896,7 +897,7 @@ impl DetectedFieldsProbe {
     pub fn feed_row(
         &mut self,
         compiled: &super::pipeline::CompiledPipeline,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         timestamp_ns: i64,
         body: &str,
         structured_metadata: &str,
@@ -933,7 +934,7 @@ impl DetectedFieldsProbe {
     pub fn feed_row_legacy_shape(
         &mut self,
         compiled: &super::pipeline::CompiledPipeline,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         timestamp_ns: i64,
         body: &str,
         structured_metadata: &str,
@@ -1061,7 +1062,7 @@ impl DetectedFieldsProbe {
 /// [`StreamAccumulator`]: super::exec::StreamAccumulator
 #[derive(Debug, Default)]
 pub(in crate::logql) struct SmFanOutAccumulator {
-    base_cache: HashMap<u64, Vec<(String, String)>>,
+    base_cache: HashMap<Fingerprint, Vec<(String, String)>>,
     groups: HashMap<String, FanOutGroup>,
     // Reused across rows (clear + refill, capacity-amortized) — never a fresh
     // per-row allocation of the label vector itself. `sm_buf` is the SM-pair
@@ -1078,7 +1079,7 @@ impl SmFanOutAccumulator {
     pub(in crate::logql) fn push_row(
         &mut self,
         row: &SampleRow,
-        meta: &HashMap<u64, StreamMetaRow>,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
         budget: &mut StreamsResultBudget,
     ) -> Result<(), ReadError> {
         let Some(m) = meta.get(&row.fingerprint) else {
@@ -1202,7 +1203,7 @@ pub(in crate::logql) fn split_merged_categories(
 #[cfg(test)]
 pub(in crate::logql) fn fan_out_sm_fast_path(
     sm_rows: &[SampleRow],
-    meta: &HashMap<u64, StreamMetaRow>,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
     budget: &mut StreamsResultBudget,
 ) -> Result<Vec<StreamResult>, ReadError> {
     let mut acc = SmFanOutAccumulator::default();
@@ -1233,7 +1234,7 @@ mod tests {
     /// drive the SHIPPED per-row path.
     fn feed_rows_via_feeder(
         rows: &[SampleRow],
-        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         compiled: &super::super::pipeline::CompiledPipeline,
         acc: &mut FieldAccumulator,
         matched: &mut u32,
@@ -1270,23 +1271,26 @@ mod tests {
         };
         let compiled = super::super::pipeline::CompiledPipeline::compile(&le.pipeline)
             .expect("compile pipeline");
-        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
-        base_labels.insert(1, vec![("app".to_string(), "x".to_string())]);
+        let mut base_labels: HashMap<Fingerprint, Vec<(String, String)>> = HashMap::new();
+        base_labels.insert(
+            Fingerprint::from_raw(1),
+            vec![("app".to_string(), "x".to_string())],
+        );
         let rows = vec![
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 3,
                 body: r#"{"level":"common","code":1}"#.to_string(),
                 structured_metadata: String::new(),
             },
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 2,
                 body: "not json at all".to_string(),
                 structured_metadata: String::new(),
             },
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 1,
                 body: r#"{"level":"rare","code":7}"#.to_string(),
                 structured_metadata: String::new(),
@@ -1322,11 +1326,14 @@ mod tests {
         };
         let compiled = super::super::pipeline::CompiledPipeline::compile(&le.pipeline)
             .expect("compile pipeline");
-        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
-        base_labels.insert(1, vec![("app".to_string(), "x".to_string())]);
+        let mut base_labels: HashMap<Fingerprint, Vec<(String, String)>> = HashMap::new();
+        base_labels.insert(
+            Fingerprint::from_raw(1),
+            vec![("app".to_string(), "x".to_string())],
+        );
         let rows: Vec<SampleRow> = (0..5)
             .map(|i| SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: i,
                 body: format!(r#"{{"seq":"{i}"}}"#),
                 structured_metadata: String::new(),
@@ -1356,9 +1363,12 @@ mod tests {
         super::super::pipeline::CompiledPipeline::compile(&le.pipeline).expect("compile")
     }
 
-    fn detected_base_labels() -> HashMap<u64, Vec<(String, String)>> {
+    fn detected_base_labels() -> HashMap<Fingerprint, Vec<(String, String)>> {
         let mut base_labels = HashMap::new();
-        base_labels.insert(1, vec![("app".to_string(), "x".to_string())]);
+        base_labels.insert(
+            Fingerprint::from_raw(1),
+            vec![("app".to_string(), "x".to_string())],
+        );
         base_labels
     }
 
@@ -1366,7 +1376,7 @@ mod tests {
     /// would let a wrong drain produce the right field set).
     fn detected_tail_row(i: u64) -> TailSampleRow {
         TailSampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: 1_000 - i as i64, // newest-first, all distinct
             body: format!(r#"{{"f{i}":{i}}}"#),
             body_hash: 0x9000 + i,
@@ -1397,7 +1407,7 @@ mod tests {
         st: &mut DetectedPagedState,
         acc: &mut FieldAccumulator,
         compiled: &super::super::pipeline::CompiledPipeline,
-        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         items: Vec<Result<TailSampleRow, ReadError>>,
         read_bytes: u64,
     ) -> Result<Option<bool>, ReadError> {
@@ -1618,7 +1628,7 @@ mod tests {
                         )
                     };
                     TailSampleRow {
-                        fingerprint: fp,
+                        fingerprint: Fingerprint::from_raw(u128::from(fp)),
                         timestamp_ns: ts,
                         body: format!("b{i}"),
                         body_hash: h,
@@ -1682,7 +1692,15 @@ mod tests {
         }
         sm.push('}');
         let survived = feeder
-            .feed_row(1, 1, "body", &sm, &base_labels, &compiled, &mut acc)
+            .feed_row(
+                Fingerprint::from_raw(1),
+                1,
+                "body",
+                &sm,
+                &base_labels,
+                &compiled,
+                &mut acc,
+            )
             .expect("no error");
         assert!(survived);
         let check = |feeder: &DetectedRowFeeder, ctx: &str| {
@@ -1719,7 +1737,15 @@ mod tests {
         // cap, then feed a row whose fingerprint never hydrated.
         feeder.merge_buf = Vec::with_capacity(3 * MAX_FEEDER_SCRATCH_SLOTS);
         let survived = feeder
-            .feed_row(999, 1, "body", "", &base_labels, &compiled, &mut acc)
+            .feed_row(
+                Fingerprint::from_raw(999),
+                1,
+                "body",
+                "",
+                &base_labels,
+                &compiled,
+                &mut acc,
+            )
             .expect("no error");
         assert!(!survived, "unknown fingerprint is skipped");
         check(&feeder, "after the fingerprint-miss row");
@@ -1769,15 +1795,25 @@ mod tests {
     fn probe_feed_row_and_legacy_shape_agree_on_a_smoke_row() {
         let compiled = detected_compiled(r#"{app="x"} | json"#);
         let mut new_probe = DetectedFieldsProbe::new(100, 1000);
-        new_probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+        new_probe.add_stream(
+            Fingerprint::from_raw(1),
+            &[("app".to_string(), "x".to_string())],
+        );
         let mut legacy_probe = DetectedFieldsProbe::new(100, 1000);
-        legacy_probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+        legacy_probe.add_stream(
+            Fingerprint::from_raw(1),
+            &[("app".to_string(), "x".to_string())],
+        );
         let body = r#"{"level":"info","code":7}"#;
         let sm = r#"{"trace_id":"abc"}"#;
-        assert!(new_probe.feed_row(&compiled, 1, 5, body, sm).expect("ok"));
+        assert!(
+            new_probe
+                .feed_row(&compiled, Fingerprint::from_raw(1), 5, body, sm)
+                .expect("ok")
+        );
         assert!(
             legacy_probe
-                .feed_row_legacy_shape(&compiled, 1, 5, body, sm)
+                .feed_row_legacy_shape(&compiled, Fingerprint::from_raw(1), 5, body, sm)
                 .expect("ok")
         );
         let (mut new_fields, new_capped) = new_probe.finish();
@@ -1914,30 +1950,30 @@ mod tests {
     fn fan_out_sm_fast_path_applies_the_reserved_sm_gate() {
         let mut meta = HashMap::new();
         meta.insert(
-            1u64,
+            Fingerprint::from_raw(1),
             StreamMetaRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 service: "v2".to_string(),
                 labels: r#"{"service_name":"v2"}"#.to_string(),
             },
         );
         meta.insert(
-            2u64,
+            Fingerprint::from_raw(2),
             StreamMetaRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 service: "v3".to_string(),
                 labels: r#"{"service_name":"v3"}"#.to_string(),
             },
         );
         let rows = vec![
             SampleRow {
-                fingerprint: 1,
+                fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 1,
                 body: "a=Hello b=World".to_string(),
                 structured_metadata: r#"{"__error__":"boom"}"#.to_string(),
             },
             SampleRow {
-                fingerprint: 2,
+                fingerprint: Fingerprint::from_raw(2),
                 timestamp_ns: 2,
                 body: "a=Hello b=World".to_string(),
                 structured_metadata: r#"{"__error_details__":"bdet"}"#.to_string(),

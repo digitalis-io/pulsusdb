@@ -3,6 +3,7 @@
 //! `ChClient::query_stream`.
 
 use pulsus_clickhouse::Row;
+use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
 /// One `metric_series` row from the §5.2 sweep (`SELECT fingerprint,
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// [`super::refresh`], not here (this module only owns the wire shape).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SeriesRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub metric_name: String,
     pub labels: String,
 }
@@ -37,7 +38,7 @@ mod tests {
     #[test]
     fn series_row_derives_are_usable() {
         let a = SeriesRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             metric_name: "up".to_string(),
             labels: "{}".to_string(),
         };

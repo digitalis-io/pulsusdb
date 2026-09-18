@@ -20,6 +20,7 @@ use futures::StreamExt;
 use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_read::logql::sql;
 use pulsus_read::querytext::MAX_QUERY_TEXT_BYTES;
 
@@ -92,7 +93,7 @@ async fn setup_db(db: &str) -> ChClient {
 
     client
         .execute(
-            "CREATE TABLE log_streams (fingerprint UInt64, service String, labels String) \
+            "CREATE TABLE log_streams (fingerprint UInt128, service String, labels String) \
              ENGINE = Memory",
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -105,7 +106,7 @@ async fn setup_db(db: &str) -> ChClient {
     // accepts it; this test still never touches storage pruning.
     client
         .execute(
-            "CREATE TABLE metric_samples (metric_name String, fingerprint UInt64, \
+            "CREATE TABLE metric_samples (metric_name String, fingerprint UInt128, \
              unix_milli Int64, value Float64) ENGINE = MergeTree \
              ORDER BY (metric_name, fingerprint, unix_milli)",
             &QuerySettings::new(),
@@ -118,7 +119,7 @@ async fn setup_db(db: &str) -> ChClient {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct Stage2Row {
-    fingerprint: u64,
+    fingerprint: u128,
     service: String,
     labels: String,
 }
@@ -126,7 +127,7 @@ struct Stage2Row {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MultiSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -136,8 +137,8 @@ struct MultiSampleRow {
 /// `u64::MAX` literals (22 B/entry ≈ 286,000 B), well below
 /// `DEFAULT_MAX_STREAMS` (100,000) so this witness is conservative, not a
 /// contrived edge.
-fn oversized_fingerprint_set() -> Vec<u64> {
-    vec![u64::MAX; 13_000]
+fn oversized_fingerprint_set() -> Vec<FpLiteral> {
+    vec![Fingerprint::from_raw(u128::MAX).sql_literal(); 13_000]
 }
 
 /// Drains a query to completion, mapping any per-row error into the same

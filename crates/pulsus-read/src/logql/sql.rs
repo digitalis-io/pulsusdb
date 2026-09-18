@@ -14,6 +14,8 @@
 //! deliberately stay `&str`; `predicate.rs`'s module doc records that residual
 //! and why neither candidate mechanism was taken.
 
+use pulsus_model::FpLiteral;
+
 use super::params::Direction;
 use super::predicate::{CheckedFragment, CheckedLiteral, MonthLiteral};
 
@@ -310,10 +312,10 @@ pub struct GroupKeyColumns {
     /// streams carry its name (the body's value is renamed out of the answer
     /// there). Empty lists on the targeted form: a declared label is never
     /// blanked.
-    pub keys: Vec<(UnwrapKeyLabel, Vec<u64>)>,
+    pub keys: Vec<(UnwrapKeyLabel, Vec<FpLiteral>)>,
     /// `None`: one class per fingerprint. Otherwise the fingerprints of each
     /// class, by class id.
-    pub classes: Option<Vec<Vec<u64>>>,
+    pub classes: Option<Vec<Vec<FpLiteral>>>,
 }
 
 /// What a group key statement does with a row the database cannot decide
@@ -553,7 +555,7 @@ pub fn probe(
 pub fn label_names(
     streams_idx_table: &str,
     months: &[MonthLiteral],
-    fingerprints: Option<&[u64]>,
+    fingerprints: Option<&[FpLiteral]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -583,7 +585,7 @@ pub fn label_values(
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
-    fingerprints: Option<&[u64]>,
+    fingerprints: Option<&[FpLiteral]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -624,7 +626,7 @@ pub fn label_values(
 pub fn detected_labels(
     streams_idx_table: &str,
     months: &[MonthLiteral],
-    fingerprints: Option<&[u64]>,
+    fingerprints: Option<&[FpLiteral]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -677,7 +679,7 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 /// that function for why the obvious `bucket_ns > start_ns` is wrong here.
 pub fn active_fingerprints(
     rollup_table: &str,
-    fingerprints: Option<&[u64]>,
+    fingerprints: Option<&[FpLiteral]>,
     window: TimeWindow,
     rollup_res_ns: u64,
 ) -> String {
@@ -722,7 +724,7 @@ fn join_fragments(branches: &[CheckedFragment]) -> String {
 /// Stage 2 — hydration (docs/schemas.md §3.2 line 307), byte-exact to the
 /// canonical shape: `SELECT fingerprint, service, labels FROM log_streams
 /// WHERE fingerprint IN (...)`.
-pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
+pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
     let fp_list = fp_list(fingerprints);
     format!(
         "SELECT fingerprint, service, labels FROM {streams_table} WHERE fingerprint IN ({fp_list})"
@@ -774,7 +776,7 @@ pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
 pub fn stage3(
     samples_table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     line_filters: &[CheckedFragment],
     direction: Direction,
@@ -825,7 +827,11 @@ pub enum KeysetLower {
     First,
     After {
         /// The boundary `(timestamp_ns, fingerprint, cityHash64(body))`.
-        tuple: (i64, u64, u64),
+        /// The fingerprint is a minted literal: this is a tuple
+        /// comparison, and a bare decimal above `2^64` re-delivers the
+        /// boundary row walking forward and skips it walking back (issue
+        /// #498).
+        tuple: (i64, FpLiteral, u64),
         /// How many rows equal to `tuple` were already delivered — the
         /// SQL `OFFSET`.
         offset: u32,
@@ -861,7 +867,7 @@ pub enum KeysetLower {
 pub fn stage3_keyset(
     samples_table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: KeysetLower,
     direction: Direction,
@@ -931,7 +937,11 @@ pub fn stage3_keyset(
 /// selector-scoped partition-count proxy (`uniqExact` of the bucket's
 /// date — docs/api.md §2.5). Same half-open bucket predicate as
 /// [`metric_range`].
-pub fn log_stats_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWindow) -> String {
+pub fn log_stats_rollup(
+    rollup_table: &str,
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+) -> String {
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     format!(
@@ -948,7 +958,7 @@ pub fn log_stats_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWi
 pub fn log_stats_raw(
     samples_table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     line_filters: &[CheckedFragment],
 ) -> String {
@@ -973,7 +983,11 @@ pub fn log_stats_raw(
 /// predicate family as [`log_stats_rollup`]/[`metric_range`], so the
 /// identical MinMax + `(fingerprint, bucket_ns)` primary-key pruning
 /// applies (`tests/explain_indexes.rs`' Tier-1 gate).
-pub fn log_volume_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWindow) -> String {
+pub fn log_volume_rollup(
+    rollup_table: &str,
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+) -> String {
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     format!(
@@ -999,7 +1013,7 @@ pub const MAX_PATTERNS: usize = 1000;
 /// already-assembled series. Half-open window `[start, end)` (D4).
 pub fn log_patterns_read(
     patterns_table: &str,
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     step_ns: u64,
 ) -> String {
@@ -1036,7 +1050,7 @@ pub fn log_patterns_read(
 pub fn metric_range(
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: ScanLowerBound,
     step_ns: u64,
@@ -1085,7 +1099,7 @@ pub fn metric_range(
 pub fn metric_instant(
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
@@ -1184,7 +1198,7 @@ impl ScanProjection {
 pub fn metric_raw_samples(
     samples_table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
@@ -1232,7 +1246,7 @@ pub fn metric_raw_samples(
 pub fn metric_raw_samples_sliding(
     samples_table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
@@ -1305,7 +1319,7 @@ pub struct BucketedScan {
 pub fn metric_range_bucketed(
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
@@ -1371,7 +1385,7 @@ pub struct KeyStatementTestKnobs {
 /// ```
 fn unwrapped_reader_columns(
     value: &UnwrappedValue,
-    keys: &[(UnwrapKeyLabel, Vec<u64>)],
+    keys: &[(UnwrapKeyLabel, Vec<FpLiteral>)],
 ) -> Result<Vec<String>, KeyStatementRefusal> {
     use super::predicate::{
         ReaderColumns, json_depth_bound, json_flatten_key_budget_bound, literal,
@@ -1441,7 +1455,10 @@ fn unwrapped_reader_columns(
 /// `[(k0_present, k0_value), …] AS keys`: each key label's decided text,
 /// blank where a stream label or metadata entry of that name renames the
 /// body's value out of the answer (issue #507).
-fn unwrapped_keys_column(value: &UnwrappedValue, keys: &[(UnwrapKeyLabel, Vec<u64>)]) -> String {
+fn unwrapped_keys_column(
+    value: &UnwrappedValue,
+    keys: &[(UnwrapKeyLabel, Vec<FpLiteral>)],
+) -> String {
     if keys.is_empty() {
         return "CAST([], 'Array(Tuple(UInt8, String))') AS keys".to_string();
     }
@@ -1474,19 +1491,32 @@ fn unwrapped_keys_column(value: &UnwrappedValue, keys: &[(UnwrapKeyLabel, Vec<u6
     format!("[{}] AS keys", items.join(", "))
 }
 
-fn unwrapped_class_expr(classes: &Option<Vec<Vec<u64>>>) -> String {
+fn unwrapped_class_expr(classes: &Option<Vec<Vec<FpLiteral>>>) -> String {
     match classes {
         None => "fingerprint".to_string(),
-        Some(classes) if classes.len() <= 1 => "toUInt64(0)".to_string(),
+        Some(classes) if classes.len() <= 1 => "toUInt128(0)".to_string(),
         Some(classes) => {
-            let fps: Vec<u64> = classes.iter().flatten().copied().collect();
+            let fps: Vec<FpLiteral> = classes.iter().flatten().copied().collect();
+            // The class ids are small ordinals, NOT fingerprints, and they
+            // are rendered as the `UInt64`s they are. The `transform` is
+            // then widened to `UInt128` so that `class` is one type across
+            // every arm of this function — the no-grouping arm above
+            // renders the `fingerprint` column itself, and a row struct
+            // decodes one type per column.
+            //
+            // **`transform` cannot RETURN a `UInt128`** (issue #498):
+            // ClickHouse 26.3.29.7 answers `Unexpected type UInt128 in
+            // function 'transform'` when the `to` array or the default is
+            // one, while accepting a `UInt128` as the value being mapped.
+            // So the widening is outside the call rather than inside its
+            // arguments.
             let ids: Vec<String> = classes
                 .iter()
                 .enumerate()
                 .flat_map(|(id, c)| std::iter::repeat_n(id.to_string(), c.len()))
                 .collect();
             format!(
-                "transform(fingerprint, [{}], [{}], toUInt64(0))",
+                "toUInt128(transform(fingerprint, [{}], [{}], toUInt64(0)))",
                 fp_list(&fps),
                 ids.join(", ")
             )
@@ -1502,7 +1532,7 @@ fn unwrapped_inner_level(
     readers: &[String],
     table: &str,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
@@ -1559,7 +1589,7 @@ pub fn metric_range_unwrapped(
     value: &UnwrappedValue,
     columns: &GroupKeyColumns,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
     undecided: UndecidedRows,
@@ -1622,7 +1652,7 @@ pub fn metric_range_unwrapped_rows(
     value: &UnwrappedValue,
     columns: &GroupKeyColumns,
     services: &[CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
 ) -> Result<String, KeyStatementRefusal> {
@@ -1673,7 +1703,7 @@ pub fn metric_range_unwrapped_verdicts(
     value: &UnwrappedValue,
     keys: &[UnwrapKeyLabel],
 ) -> Result<String, KeyStatementRefusal> {
-    let keys: Vec<(UnwrapKeyLabel, Vec<u64>)> =
+    let keys: Vec<(UnwrapKeyLabel, Vec<FpLiteral>)> =
         keys.iter().map(|k| (k.clone(), Vec::new())).collect();
     let readers = unwrapped_reader_columns(value, &keys)?;
     // A corpus row belongs to no stream and carries no metadata, so no key
@@ -1721,10 +1751,19 @@ fn metric_prewhere(services: &[CheckedLiteral]) -> String {
     }
 }
 
-fn fp_list(fingerprints: &[u64]) -> String {
+/// The comma-separated `toUInt128('<decimal>')` list every stage-2 and
+/// stage-3 `fingerprint IN (...)` carries.
+///
+/// The call form is not optional above `2^64`: ClickHouse reads a bare
+/// decimal literal there as `Float64`, exact only to `2^53`, so a bare
+/// list silently matches a neighbouring fingerprint under `=` and prunes
+/// every granule under `IN` (issue #498, measured on ClickHouse
+/// 26.3.29.7). The parameter is a minted literal, never a `Fingerprint`,
+/// so the form is the type's rather than this function's.
+fn fp_list(fingerprints: &[FpLiteral]) -> String {
     fingerprints
         .iter()
-        .map(u64::to_string)
+        .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1750,6 +1789,7 @@ fn service_predicate(services: &[CheckedLiteral]) -> String {
 mod tests {
     use super::*;
     use crate::logql::predicate::{literal, month_literal};
+    use pulsus_model::Fingerprint;
 
     /// The pushed-down fragment fixture these builders' loop tests append.
     ///
@@ -1861,8 +1901,14 @@ mod tests {
     #[test]
     fn stage2_renders_the_canonical_hydration_shape() {
         assert_eq!(
-            stage2("log_streams", &[18374, 99120]),
-            "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (18374, 99120)"
+            stage2(
+                "log_streams",
+                &[
+                    Fingerprint::from_raw(18374).sql_literal(),
+                    Fingerprint::from_raw(99120).sql_literal()
+                ]
+            ),
+            "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
         );
     }
 
@@ -1948,17 +1994,22 @@ mod tests {
         let scoped = detected_labels(
             "log_streams_idx",
             &[month_literal(2026, 7)],
-            Some(&[7, 9]),
+            Some(&[
+                Fingerprint::from_raw(7).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ]),
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             RES_5S,
         );
         assert!(scoped.contains(
             "AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE \
-             fingerprint IN (7, 9) AND bucket_ns >="
+             fingerprint IN (toUInt128('7'), toUInt128('9')) AND bucket_ns >="
         ));
         assert_eq!(
-            scoped.matches("fingerprint IN (7, 9)").count(),
+            scoped
+                .matches("fingerprint IN (toUInt128('7'), toUInt128('9'))")
+                .count(),
             1,
             "the stage-1 list must be rendered exactly once: {scoped}"
         );
@@ -1971,7 +2022,7 @@ mod tests {
             RES_5S,
         );
         assert_eq!(
-            scoped.replace("fingerprint IN (7, 9) AND ", ""),
+            scoped.replace("fingerprint IN (toUInt128('7'), toUInt128('9')) AND ", ""),
             unscoped,
             "scoped form must be the unscoped scan plus only the pushed-down list"
         );
@@ -2008,11 +2059,14 @@ mod tests {
         assert_eq!(
             active_fingerprints(
                 "log_metrics_5s",
-                Some(&[101, 205]),
+                Some(&[
+                    Fingerprint::from_raw(101).sql_literal(),
+                    Fingerprint::from_raw(205).sql_literal()
+                ]),
                 DISCOVERY_WINDOW,
                 RES_5S
             ),
-            "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (101, 205) \
+            "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) \
              AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000"
         );
     }
@@ -2056,7 +2110,32 @@ mod tests {
 
     #[test]
     fn fp_list_joins_with_comma_space() {
-        assert_eq!(fp_list(&[1, 2, 3]), "1, 2, 3");
+        let fps = [1, 2, 3].map(|v| Fingerprint::from_raw(v).sql_literal());
+        assert_eq!(
+            fp_list(&fps),
+            "toUInt128('1'), toUInt128('2'), toUInt128('3')"
+        );
+    }
+
+    /// The four values where a bare decimal and the exact call form first
+    /// disagree (issue #498): `2^64-1` is the last value a bare literal
+    /// reads exactly, `2^64` is the first `Float64` and is what `2^64+1`
+    /// rounds ONTO, and `2^64+2` is its neighbour — a test built only on
+    /// the first two passes on a build that renders bare decimals.
+    #[test]
+    fn fp_list_renders_the_exact_call_form_at_the_2_64_boundary() {
+        let fps = [
+            18_446_744_073_709_551_615u128,
+            18_446_744_073_709_551_616,
+            18_446_744_073_709_551_617,
+            18_446_744_073_709_551_618,
+        ]
+        .map(|v| Fingerprint::from_raw(v).sql_literal());
+        assert_eq!(
+            fp_list(&fps),
+            "toUInt128('18446744073709551615'), toUInt128('18446744073709551616'), \
+             toUInt128('18446744073709551617'), toUInt128('18446744073709551618')"
+        );
     }
 
     #[test]
@@ -2064,7 +2143,10 @@ mod tests {
         let sql = metric_range(
             MetricSource::new("log_metrics_5s", MetricShape::RollupCount),
             &[],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 0,
                 end_ns: 100,
@@ -2081,7 +2163,10 @@ mod tests {
         let sql = metric_range(
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout")],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 0,
                 end_ns: 100,
@@ -2098,7 +2183,10 @@ mod tests {
         let sql = metric_range(
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout"), literal("billing")],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 0,
                 end_ns: 100,
@@ -2118,7 +2206,7 @@ mod tests {
         let sql = stage3_keyset(
             "log_samples",
             &[literal("checkout")],
-            &[18374],
+            &[Fingerprint::from_raw(18374).sql_literal()],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
@@ -2133,7 +2221,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (18374)\n\
+             WHERE fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
              LIMIT 500"
@@ -2149,13 +2237,16 @@ mod tests {
         let sql = stage3_keyset(
             "log_samples",
             &[literal("checkout"), literal("billing")],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
             },
             KeysetLower::After {
-                tuple: (1_500, 7, 42),
+                tuple: (1_500, Fingerprint::from_raw(7).sql_literal(), 42),
                 offset: 3,
             },
             Direction::Forward,
@@ -2167,9 +2258,9 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
-             WHERE fingerprint IN (1, 2)\n\
+             WHERE fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
              \x20 AND timestamp_ns >= 1500 AND timestamp_ns <= 2000\n\
-             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, 7, 42)\n\
+             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, toUInt128('7'), 42)\n\
              \x20 AND body LIKE '%err%'\n\
              ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
              LIMIT 500 OFFSET 3"
@@ -2186,7 +2277,7 @@ mod tests {
         let sql = stage3_keyset(
             "log_samples",
             &[literal("checkout")],
-            &[18374],
+            &[Fingerprint::from_raw(18374).sql_literal()],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
@@ -2201,7 +2292,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (18374)\n\
+             WHERE fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
              LIMIT 500"
@@ -2218,13 +2309,16 @@ mod tests {
         let sql = stage3_keyset(
             "log_samples",
             &[literal("checkout"), literal("billing")],
-            &[1, 2],
+            &[
+                Fingerprint::from_raw(1).sql_literal(),
+                Fingerprint::from_raw(2).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
             },
             KeysetLower::After {
-                tuple: (1_500, 7, 42),
+                tuple: (1_500, Fingerprint::from_raw(7).sql_literal(), 42),
                 offset: 3,
             },
             Direction::Backward,
@@ -2236,9 +2330,9 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
-             WHERE fingerprint IN (1, 2)\n\
+             WHERE fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 1500\n\
-             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, 7, 42)\n\
+             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, toUInt128('7'), 42)\n\
              \x20 AND body LIKE '%err%'\n\
              ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
              LIMIT 500 OFFSET 3"
@@ -2253,7 +2347,7 @@ mod tests {
         let sql = stage3_keyset(
             "log_samples",
             &[literal("checkout")],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             TimeWindow {
                 start_ns: 0,
                 end_ns: 10,
@@ -2272,7 +2366,10 @@ mod tests {
     fn log_stats_rollup_is_byte_exact() {
         let sql = log_stats_rollup(
             "log_metrics_5s",
-            &[18374, 99120],
+            &[
+                Fingerprint::from_raw(18374).sql_literal(),
+                Fingerprint::from_raw(99120).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
@@ -2282,7 +2379,7 @@ mod tests {
             sql,
             "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\n\
              FROM log_metrics_5s\n\
-             WHERE fingerprint IN (18374, 99120) AND bucket_ns > 1000 AND bucket_ns <= 2000"
+             WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns > 1000 AND bucket_ns <= 2000"
         );
         assert!(!sql.contains("body"), "rollup stats must never read body");
     }
@@ -2295,7 +2392,10 @@ mod tests {
     fn log_patterns_read_is_byte_exact() {
         let sql = log_patterns_read(
             "log_patterns",
-            &[18374, 99120],
+            &[
+                Fingerprint::from_raw(18374).sql_literal(),
+                Fingerprint::from_raw(99120).sql_literal(),
+            ],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
@@ -2308,7 +2408,7 @@ mod tests {
              FROM (\n  \
                SELECT pattern, intDiv(bucket_ns, 10000000000) * 10000000000 AS ts_ns, sum(count) AS cnt\n  \
                FROM log_patterns\n  \
-               WHERE fingerprint IN (18374, 99120) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
+               WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
                GROUP BY pattern, ts_ns\n\
              )\n\
              GROUP BY pattern\n\
@@ -2326,7 +2426,7 @@ mod tests {
         let sql = log_stats_raw(
             "log_samples",
             &[literal("checkout")],
-            &[18374],
+            &[Fingerprint::from_raw(18374).sql_literal()],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
@@ -2338,7 +2438,7 @@ mod tests {
             "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (18374)\n\
+             WHERE fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              \x20 AND body LIKE '%err%'"
         );
@@ -2349,7 +2449,7 @@ mod tests {
         let sql = metric_instant(
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout")],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             TimeWindow {
                 start_ns: 0,
                 end_ns: 100,
@@ -2378,7 +2478,7 @@ mod tests {
         let sliding = metric_raw_samples_sliding(
             "log_samples",
             &svc,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             ScanLowerBound::Inclusive,
             &[],
@@ -2393,7 +2493,7 @@ mod tests {
         let instant_raw = metric_raw_samples(
             "log_samples",
             &svc,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             ScanLowerBound::Inclusive,
             &[],
@@ -2406,7 +2506,7 @@ mod tests {
         let instant_agg = metric_instant(
             raw_source,
             &svc,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             ScanLowerBound::Inclusive,
             &[],
@@ -2419,7 +2519,7 @@ mod tests {
         let range_agg = metric_range(
             raw_source,
             &svc,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             ScanLowerBound::Inclusive,
             60,
@@ -2445,7 +2545,7 @@ mod tests {
         let sliding = metric_raw_samples_sliding(
             "log_samples",
             &svc,
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             ScanLowerBound::Exclusive,
             &[],
@@ -2501,7 +2601,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2512,7 +2612,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2524,7 +2624,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2535,7 +2635,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2547,7 +2647,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2558,7 +2658,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2570,7 +2670,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2581,7 +2681,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2593,7 +2693,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2604,7 +2704,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2616,7 +2716,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2627,7 +2727,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2639,7 +2739,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2650,7 +2750,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2662,7 +2762,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -2673,7 +2773,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -2685,7 +2785,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2696,7 +2796,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2708,7 +2808,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2719,7 +2819,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2731,7 +2831,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2742,7 +2842,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2754,7 +2854,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2765,7 +2865,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2777,7 +2877,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2788,7 +2888,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2800,7 +2900,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2811,7 +2911,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2823,7 +2923,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2834,7 +2934,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2846,7 +2946,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -2857,7 +2957,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -2928,7 +3028,7 @@ mod tests {
     /// the concrete window bounds, a second or third extra predicate,
     /// zero or more than two months, and broader key spellings.
     struct W0Fixtures {
-        fingerprints: Vec<u64>,
+        fingerprints: Vec<FpLiteral>,
         window: TimeWindow,
         no_service: Vec<CheckedLiteral>,
         one_service: Vec<CheckedLiteral>,
@@ -2953,7 +3053,9 @@ mod tests {
                 .expect("a Contains filter compiles no regex"),
             ];
             W0Fixtures {
-                fingerprints: vec![18374, 99120],
+                fingerprints: [18374, 99120]
+                    .map(|v| Fingerprint::from_raw(v).sql_literal())
+                    .to_vec(),
                 window: TimeWindow {
                     start_ns: 1_782_906_900_000_000_000,
                     end_ns: 1_782_928_800_000_000_000,
@@ -3118,7 +3220,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -3129,7 +3231,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -3140,7 +3242,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -3151,7 +3253,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -3162,7 +3264,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3173,7 +3275,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3184,7 +3286,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3195,7 +3297,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3206,7 +3308,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3217,7 +3319,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
@@ -3228,7 +3330,7 @@ mod tests {
             &[
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
-                r"WHERE fingerprint IN (18374, 99120)",
+                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -3524,7 +3626,10 @@ mod tests {
         );
         let one_class = GroupKeyColumns {
             keys: vec![(key("status", "status"), Vec::new())],
-            classes: Some(vec![vec![18374, 99120]]),
+            classes: Some(vec![vec![
+                Fingerprint::from_raw(18374).sql_literal(),
+                Fingerprint::from_raw(99120).sql_literal(),
+            ]]),
         };
         let targeted = value(UnwrapForm::Targeted, &["latency"], MetadataSent::Text);
         let per_fp = GroupKeyColumns {
@@ -3620,7 +3725,10 @@ mod tests {
                     &bare_no_key,
                     &GroupKeyColumns {
                         keys: Vec::new(),
-                        classes: Some(vec![vec![18374, 99120]]),
+                        classes: Some(vec![vec![
+                            Fingerprint::from_raw(18374).sql_literal(),
+                            Fingerprint::from_raw(99120).sql_literal(),
+                        ]]),
                     },
                     UndecidedRows::Throw,
                 ),
@@ -3630,8 +3738,14 @@ mod tests {
                 s1(
                     &by_status,
                     &GroupKeyColumns {
-                        keys: vec![(key("status", "status"), vec![99120])],
-                        classes: Some(vec![vec![18374], vec![99120]]),
+                        keys: vec![(
+                            key("status", "status"),
+                            vec![Fingerprint::from_raw(99120).sql_literal()],
+                        )],
+                        classes: Some(vec![
+                            vec![Fingerprint::from_raw(18374).sql_literal()],
+                            vec![Fingerprint::from_raw(99120).sql_literal()],
+                        ]),
                     },
                     UndecidedRows::Throw,
                 ),
@@ -3642,7 +3756,10 @@ mod tests {
                     &underscores,
                     &GroupKeyColumns {
                         keys: vec![(key("_", "_"), Vec::new()), (key("a_b", "a_b"), Vec::new())],
-                        classes: Some(vec![vec![18374, 99120]]),
+                        classes: Some(vec![vec![
+                            Fingerprint::from_raw(18374).sql_literal(),
+                            Fingerprint::from_raw(99120).sql_literal(),
+                        ]]),
                     },
                     UndecidedRows::Throw,
                 ),

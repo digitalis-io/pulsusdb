@@ -6093,9 +6093,14 @@ divergence rather than a gap.
     \u{0001}>, "__error__": <the same>}` — the framing that carries BOTH
     category objects. Driven through the shipped fast-path accumulator
     and the shipped item renderer: `rendered = 1,860,644 B`,
-    `charged = 759,596 B`, ratio **2.450**. The other three framings
-    measure 2.433 (`structuredMetadata` only), 2.431 (`parsed` only) and
-    2.383 (`{}`), so the two-category framing is the binding one.
+    `charged = 759,724 B`, ratio **2.449**. The other three framings
+    measure 2.433 (`structuredMetadata` only), 2.430 (`parsed` only) and
+    2.382 (`{}`), so the two-category framing is the binding one.
+
+    The charged column moved by 128 B per group with issue #498: the
+    identity became 16 bytes, so `STREAM_GROUP_SLOT` went 112 -> 128 and
+    `map_entry_bytes` with it. One group here, so every ratio moved in
+    the third decimal and none of them crossed the `3 ×` bound.
 
     **The charge's term list**, which `entry_category_bytes` destructures
     so a new field without a term is a build failure:

@@ -2344,6 +2344,15 @@ keep.** That is not a detail; it removes most of the work.
 | a rollback plan for stored data | nothing |
 | a staged rollout, one option at a time | one change |
 
+> **Historical, 2026-09-17.** The window was reopened by a ruling on issue #498, for the
+> reason the policy already states: there is no tagged release and no persistent
+> deployment, so a `CREATE` can still be edited where it stands. That issue widened
+> `fingerprint` to `UInt128` in migrations 4, 5, 6, 7, 8, 9, 23 and 29. **The analysis
+> below and its conclusion are unchanged** — the span change is expressible as
+> append-only migrations and needed no amendment, which is why it took none. What has
+> moved is the surrounding statement of policy: the inventory is **four** places, this
+> passage included, and the window's latest occupant is issue #498 rather than issue #54.
+
 **Amending migration 16 and 18 in place is not currently permitted.** Three places say
 the migration catalogue is append-only and that the window for in-place amendment closed:
 

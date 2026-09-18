@@ -70,6 +70,16 @@ use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 use super::dataset::DatasetSummary;
+use pulsus_model::{Fingerprint, FpLiteral};
+
+/// Mints raw identities read back from the database into the literal form
+/// the product's builders take (issue #498).
+fn sql_literals(fps: &[u128]) -> Vec<FpLiteral> {
+    fps.iter()
+        .map(|v| Fingerprint::from_raw(*v).sql_literal())
+        .collect()
+}
+
 use super::query_log::{
     QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log, tagged_settings,
 };
@@ -146,7 +156,12 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct FingerprintRow {
-    fingerprint: u64,
+    /// The raw 128-bit identity, decoded as the integer rather than as a
+    /// `Fingerprint` (issue #498): this scenario models the `Distributed`
+    /// sharding expression, which is `fingerprint % total_weight`
+    /// arithmetic on the stored value. The seal is about rendering, and
+    /// every statement this file builds still goes through the mint below.
+    fingerprint: u128,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -275,8 +290,8 @@ impl ClusterTopology {
     /// non-negative-integer sharding-key expression (our bare
     /// `fingerprint` column, docs/schemas.md §7 — no hash wrapper):
     /// `slots[value % total_weight]`.
-    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u64) -> u32 {
-        let slot = (fingerprint % self.total_weight) as usize;
+    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u128) -> u32 {
+        let slot = (fingerprint % u128::from(self.total_weight)) as usize;
         self.slots[slot]
     }
 
@@ -541,7 +556,7 @@ enum StageRoster {
     /// predicate — the expected participants are exactly the shards
     /// owning one or more of these fingerprints under
     /// [`ClusterTopology::shard_for_fingerprint`].
-    Fingerprints(Vec<u64>),
+    Fingerprints(Vec<u128>),
 }
 
 /// One executed stage of a shape's read: its logical name
@@ -573,9 +588,9 @@ fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u3
             format!("shard {shard_num} unexpectedly excluded from a Full-roster stage")
         }
         StageRoster::Fingerprints(fingerprints) => {
-            let slots: Vec<u64> = fingerprints
+            let slots: Vec<u128> = fingerprints
                 .iter()
-                .map(|fp| fp % topology.total_weight)
+                .map(|fp| fp % u128::from(topology.total_weight))
                 .collect();
             let owning_shards: std::collections::BTreeSet<u32> = slots
                 .iter()
@@ -944,7 +959,7 @@ async fn resolve_fingerprints(
     stage1_sql: &str,
     query_id: &str,
     dist: bool,
-) -> anyhow::Result<Vec<u64>> {
+) -> anyhow::Result<Vec<u128>> {
     let settings = reader_settings(dist, query_id, ProductMode::Flat);
     let mut stream = client
         .query_stream::<FingerprintRow>(stage1_sql, &settings)
@@ -1053,7 +1068,7 @@ async fn run_streams_once(
     }
 
     let s2_id = format!("{base_id}-s2");
-    let stage2_sql = sql::stage2(&tables.streams, &fingerprints);
+    let stage2_sql = sql::stage2(&tables.streams, &sql_literals(&fingerprints));
     let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
     stages.push(StageRef {
         stage: "hydration",
@@ -1075,7 +1090,7 @@ async fn run_streams_once(
     let sql3 = sql::stage3(
         &tables.samples,
         &escaped,
-        &fingerprints,
+        &sql_literals(&fingerprints),
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -1499,7 +1514,7 @@ async fn run_metric_shape(
         }
 
         let s2_id = format!("{query_id}-s2");
-        let stage2_sql = sql::stage2(&mp.streams_table, &fingerprints);
+        let stage2_sql = sql::stage2(&mp.streams_table, &sql_literals(&fingerprints));
         let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
         stages.push(StageRef {
             stage: "hydration",
@@ -1528,7 +1543,7 @@ async fn run_metric_shape(
         let sql3 = sql::metric_range(
             source,
             &services,
-            &fingerprints,
+            &sql_literals(&fingerprints),
             TimeWindow {
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,

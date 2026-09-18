@@ -24,6 +24,7 @@
 //! Everything runs in the SINGLE `#[test]` below so no parallel test
 //! thread can pollute the per-thread counter.
 
+use pulsus_model::Fingerprint;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -113,7 +114,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
         if name == "foo" {
             for g in 0..GROUPS {
                 series.push(FetchedSeries {
-                    fingerprint: g as u64,
+                    fingerprint: Fingerprint::from_raw(u128::from(g as u64)),
                     metric_name: Some("foo".to_string()),
                     labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                     samples: samples(1.0),
@@ -125,7 +126,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
             for g in 0..GROUPS {
                 for m in 0..MANY_PER_GROUP {
                     series.push(FetchedSeries {
-                        fingerprint: fp,
+                        fingerprint: Fingerprint::from_raw(u128::from(fp)),
                         metric_name: Some("bar".to_string()),
                         labels: Labels::new([
                             ("g".to_string(), format!("g{g}")),

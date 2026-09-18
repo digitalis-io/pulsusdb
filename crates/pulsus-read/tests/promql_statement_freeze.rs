@@ -58,6 +58,7 @@
 
 use sha2::{Digest, Sha256};
 
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_promql::{DEFAULT_LOOKBACK_MS, PlanParams, parse, plan};
 use pulsus_read::metrics::grouped::Grid;
 use pulsus_read::metrics::{MetricsConfig, grouped, grouped_sql, sample_sql};
@@ -126,7 +127,7 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 /// The three constants published on issue #548 before the code existed.
 const ENTRIES: usize = 30;
 const LINES: usize = 736;
-const BYTES: usize = 36_859;
+const BYTES: usize = 39_043;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two.
 const STATEMENTS: usize = 56;
@@ -134,7 +135,13 @@ const STATEMENTS: usize = 56;
 const START_MS: i64 = 1_782_907_200_000;
 const END_MS: i64 = 1_782_928_800_000;
 const STEP_MS: i64 = 60_000;
-const FPS: [u64; 3] = [101, 205, 990];
+const FPS_RAW: [u128; 3] = [101, 205, 990];
+
+/// The frozen fingerprint set, minted — every builder takes literals
+/// (issue #498).
+fn fps() -> [FpLiteral; 3] {
+    FPS_RAW.map(|v| Fingerprint::from_raw(v).sql_literal())
+}
 const SAMPLES: &str = "metric_samples";
 const HIST: &str = "metric_hist_samples";
 
@@ -238,28 +245,36 @@ fn render() -> String {
                     emit(
                         &mut out,
                         &grouped_sql::grouped_fetch(
-                            SAMPLES, HIST, n, &FPS, &GIDS, shape.grid, lo, hi, shape.op,
+                            SAMPLES,
+                            HIST,
+                            n,
+                            &fps(),
+                            &GIDS,
+                            shape.grid,
+                            lo,
+                            hi,
+                            shape.op,
                         ),
                     );
                 }
                 (_, Some(n)) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch(SAMPLES, n, &FPS, lo, hi),
+                        &sample_sql::sample_fetch(SAMPLES, n, &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch(HIST, n, &FPS, lo, hi),
+                        &sample_sql::hist_sample_fetch(HIST, n, &fps(), lo, hi),
                     );
                 }
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &FPS, lo, hi),
+                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &FPS, lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &fps(), lo, hi),
                     );
                 }
             }
@@ -396,7 +411,7 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
         SAMPLES,
         HIST,
         "http_requests_total",
-        &FPS,
+        &fps(),
         &GIDS,
         Grid {
             start_ms: 1_782_907_200_000,

@@ -43,6 +43,7 @@ use futures::StreamExt;
 use pulsus_clickhouse::Row;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_logql::{RangeAggOp, parse};
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_read::logql::predicate::literal;
 use pulsus_read::logql::rows::MetricBucketRow;
 use pulsus_read::logql::sql::{self, MetricShape, TimeWindow};
@@ -358,7 +359,7 @@ async fn fetch_timestamps(
 /// Doubles literal `?`s exactly as `LogQlEngine::query_stream` does
 /// internally (`exec.rs::escape_query_placeholders`) — this file calls
 /// `ChClient` directly, bypassing that wrapper.
-async fn query_bucket_map(client: &ChClient, sql: &str) -> BTreeMap<(u64, i64), u64> {
+async fn query_bucket_map(client: &ChClient, sql: &str) -> BTreeMap<(Fingerprint, i64), u64> {
     let full = sql.replace('?', "??");
     let mut stream = client
         .query_stream::<MetricBucketRow>(&full, &QuerySettings::new())
@@ -383,8 +384,8 @@ async fn assert_rollup_matches_raw(
     db: &str,
     query: &str,
     params: &QueryParams,
-    fps: &[u64],
-) -> BTreeMap<(u64, i64), u64> {
+    fps: &[FpLiteral],
+) -> BTreeMap<(Fingerprint, i64), u64> {
     // Issue #227 retires the range rollup ROUTING, but the `metric_range`
     // rollup SQL builder + the `log_metrics_5s` table still exist — this is a
     // FUNCTION-level correctness gate that the tumbling rollup pre-aggregate
@@ -451,7 +452,10 @@ async fn count_over_time_rollup_matches_raw_at_step_equal_to_resolution() {
         db,
         r#"count_over_time({service_name="checkout"}[1m])"#,
         &params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
 }
@@ -467,7 +471,10 @@ async fn count_over_time_rollup_matches_raw_at_step_twelve_times_resolution() {
         db,
         r#"count_over_time({service_name="checkout"}[1m])"#,
         &params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
 }
@@ -488,7 +495,10 @@ async fn rate_numerator_rollup_matches_raw() {
         db,
         r#"rate({service_name="checkout"}[1m])"#,
         &params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
 }
@@ -504,7 +514,10 @@ async fn bytes_over_time_rollup_matches_raw() {
         db,
         r#"bytes_over_time({service_name="checkout"}[1m])"#,
         &params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
     // Sanity: bytes must differ from a plain row count (two bodies of
@@ -517,7 +530,10 @@ async fn bytes_over_time_rollup_matches_raw() {
         db,
         r#"count_over_time({service_name="checkout"}[1m])"#,
         &cot_params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
     assert_ne!(raw_map, count_map, "bytes and row counts must differ");
@@ -534,7 +550,10 @@ async fn bytes_rate_numerator_rollup_matches_raw() {
         db,
         r#"bytes_rate({service_name="checkout"}[1m])"#,
         &params,
-        &[FP_A, FP_B],
+        &[
+            Fingerprint::from_raw(u128::from(FP_A)).sql_literal(),
+            Fingerprint::from_raw(u128::from(FP_B)).sql_literal(),
+        ],
     )
     .await;
 }

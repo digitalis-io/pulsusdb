@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::exec::{
     STREAM_FEED_CHUNK_BYTES, StreamAccumulator, StreamsFastPathProbe, StreamsPagedProbe,
 };
@@ -41,12 +42,17 @@ use pulsus_read::logql::{
 const MIN_ALLOC_BYTES: u64 = 32;
 /// `size_of::<(i64, String)>()`.
 const STREAM_ENTRY_SLOT: u64 = 32;
-/// `max(size_of::<(u64, StreamResult)>(), size_of::<(String, FanOutGroup)>())`.
+/// `max(size_of::<(Fingerprint, StreamResult)>(), size_of::<(String, FanOutGroup)>())`.
 ///
 /// 88 -> 112 with issue #463: `StreamResult` gained a `categories`
 /// `Vec` (24 B) and `FanOutGroup` gained the same, so both shapes grew
 /// by one `Vec` and the production constant — a `size_of` — moved with
 /// them. This is a per-STREAM widening, not per-entry.
+///
+/// 112 -> 128 with issue #498: the identity became a 16-byte
+/// `Fingerprint`, which is both the `by_fp` map's key and a field of
+/// both group shapes. Same kind of movement, same evidence: the
+/// pre-#463 reproduction below still runs at the pre-#463 width.
 ///
 /// **What makes the new figures trustworthy is not that they were
 /// recomputed, it is that the same recomputation reproduces the OLD
@@ -57,7 +63,7 @@ const STREAM_ENTRY_SLOT: u64 = 32;
 /// that quietly changed a term would produce four plausible new totals
 /// and no signal at all, and this is what says the term list did not
 /// move — only its one input did.
-const STREAM_GROUP_SLOT: u64 = 112;
+const STREAM_GROUP_SLOT: u64 = 128;
 
 /// The pre-#463 slot width, kept solely so the check above has an input
 /// whose ANSWER is already on the record.
@@ -121,11 +127,11 @@ fn result_footprint(streams: &[StreamResult]) -> u64 {
 const SVC: &str = "svc";
 const LABELS: &str = r#"{"service_name":"svc"}"#;
 
-fn meta_one() -> HashMap<u64, StreamMetaRow> {
+fn meta_one() -> HashMap<Fingerprint, StreamMetaRow> {
     HashMap::from([(
-        1u64,
+        Fingerprint::from_raw(1),
         StreamMetaRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             service: SVC.to_string(),
             labels: LABELS.to_string(),
         },
@@ -142,7 +148,7 @@ fn compiled(query: &str) -> CompiledPipeline {
 
 fn row(i: usize, body_len: usize, sm: &str) -> SampleRow {
     SampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
         body: "x".repeat(body_len),
         structured_metadata: sm.to_string(),
@@ -151,7 +157,7 @@ fn row(i: usize, body_len: usize, sm: &str) -> SampleRow {
 
 fn tail_row(i: usize, body_len: usize) -> TailSampleRow {
     TailSampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
         body: "x".repeat(body_len),
         body_hash: i as u64,
@@ -337,7 +343,7 @@ fn the_ledger_equals_what_came_back() {
         for i in 0..200 {
             acc.push_row(
                 SampleRow {
-                    fingerprint: 1,
+                    fingerprint: Fingerprint::from_raw(1),
                     timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
                     body: format!("lvl=info seq={i} msg=xxxxxxxxxxxxxxxxxxxx"),
                     structured_metadata: String::new(),
@@ -596,10 +602,10 @@ fn the_derivation_rows_are_admitted_and_row_d_is_refused() {
 
     // The exact figures the doc table publishes, so a slot width moving
     // reddens here as well as the admit/refuse verdict.
-    assert_eq!(rows[0].1, 700_079_776);
-    assert_eq!(rows[1].1, 1_032_754_952);
-    assert_eq!(rows[2].1, 268_437_032);
-    assert_eq!(rows[3].1, 1_099_513_504);
+    assert_eq!(rows[0].1, 700_719_776);
+    assert_eq!(rows[1].1, 1_032_755_080);
+    assert_eq!(rows[2].1, 268_437_160);
+    assert_eq!(rows[3].1, 1_100_153_504);
 
     for (name, total, admitted) in rows {
         assert_eq!(
@@ -725,7 +731,7 @@ fn the_categorised_shape_charges_its_third_element() {
     let mut categorised = StreamsFastPathProbe::with_cap_categorized(MAX_STREAMS_RESULT_BYTES);
     for i in 0..200 {
         let r = |body_len: usize| SampleRow {
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
             body: "b".repeat(body_len),
             structured_metadata: sm.clone(),
@@ -767,7 +773,7 @@ fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
     let value: String = "v".repeat(4_096);
     let sm = format!(r#"{{"trace_id":"{value}"}}"#);
     let row = |i: usize| SampleRow {
-        fingerprint: 1,
+        fingerprint: Fingerprint::from_raw(1),
         timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
         body: "b".repeat(8),
         structured_metadata: sm.clone(),
@@ -811,7 +817,8 @@ fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
 /// pre-#463 slot width.**
 ///
 /// `STREAM_GROUP_SLOT` moved 88 -> 112 because `StreamResult` and
-/// `FanOutGroup` each gained one `Vec`, and the four totals in
+/// `FanOutGroup` each gained one `Vec`, then 112 -> 128 because the
+/// identity became 16 bytes wide (issue #498), and the four totals in
 /// `MAX_STREAMS_RESULT_BYTES`' doc table moved with it. Recomputing them
 /// proves nothing on its own: a recomputation that dropped or added a
 /// term would produce four plausible new totals and no signal at all.
@@ -854,14 +861,14 @@ fn the_doc_table_arithmetic_reproduces_the_pre_463_figures() {
     // asserts against the same constants.
     assert_eq!(
         rows(STREAM_GROUP_SLOT),
-        [700_079_776, 1_032_754_952, 268_437_032, 1_099_513_504],
+        [700_719_776, 1_032_755_080, 268_437_160, 1_100_153_504],
         "the shipped slot width no longer produces the committed doc table"
     );
 
     // The whole delta is the slot, and it is the same per group either
     // way: `map_entry_bytes(112) - map_entry_bytes(88)`.
     let per_group = map_entry_bytes(STREAM_GROUP_SLOT) - map_entry_bytes(STREAM_GROUP_SLOT_PRE_463);
-    assert_eq!(per_group, 192);
+    assert_eq!(per_group, 320);
     for (groups, i) in [(5_000u64, 0usize), (1, 1), (1, 2), (5_000, 3)] {
         assert_eq!(
             rows(STREAM_GROUP_SLOT)[i] - rows(STREAM_GROUP_SLOT_PRE_463)[i],

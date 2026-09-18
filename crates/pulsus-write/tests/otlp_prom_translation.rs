@@ -39,6 +39,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use prost::Message as _;
 use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
+use pulsus_model::Fingerprint;
 use pulsus_write::protocols::otlp_metrics::{self, MetricIngestSettings};
 use pulsus_write::{Backpressure, FlushWait, MetricSink, ParsedMetrics};
 use serde_json::{Value, json};
@@ -121,7 +122,7 @@ fn render(metric_name: &str, labels: &[(String, String)], value: f64, unix_milli
 /// rows. A stale sample renders its bit pattern, not `NaN`, so two distinct
 /// NaNs can never compare equal.
 fn our_rows(parsed: &ParsedMetrics) -> Vec<String> {
-    let labels_of: BTreeMap<(&str, u64), Vec<(String, String)>> = parsed
+    let labels_of: BTreeMap<(&str, Fingerprint), Vec<(String, String)>> = parsed
         .series
         .iter()
         .map(|s| {

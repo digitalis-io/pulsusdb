@@ -42,7 +42,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::{ExpHistogramMode, WriterConfig};
 use pulsus_model::{
-    DEFAULT_ACTIVITY_BUCKET_MS, LabelSet, NativeHistogram, STALE_NAN_BITS, Span, metric_fingerprint,
+    DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, STALE_NAN_BITS, Span,
+    metric_fingerprint,
 };
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::protocols::otlp_metrics;
@@ -168,7 +169,12 @@ fn hist_with_internal_zero(sum: f64) -> NativeHistogram {
     }
 }
 
-fn hist_point(name: &str, fp: u64, unix_milli: i64, histogram: NativeHistogram) -> HistogramPoint {
+fn hist_point(
+    name: &str,
+    fp: Fingerprint,
+    unix_milli: i64,
+    histogram: NativeHistogram,
+) -> HistogramPoint {
     HistogramPoint {
         metric_name: Arc::from(name),
         fingerprint: fp,
@@ -177,7 +183,7 @@ fn hist_point(name: &str, fp: u64, unix_milli: i64, histogram: NativeHistogram) 
     }
 }
 
-fn series_ref(name: &str, fp: u64, labels: LabelSet) -> SeriesRef {
+fn series_ref(name: &str, fp: Fingerprint, labels: LabelSet) -> SeriesRef {
     SeriesRef {
         metric_name: Arc::from(name),
         fingerprint: fp,
@@ -227,11 +233,15 @@ async fn hist_sum_nan_payloads_survive_clickhouse_bit_for_bit_and_stay_distinct(
         let (labels, _) = LabelSet::from_normalized([("form".to_string(), fp.to_string())]);
         batch.hist_samples.push(hist_point(
             "nan_probe",
-            fp,
+            Fingerprint::from_raw(u128::from(fp)),
             ts,
             hist_with_internal_zero(sum),
         ));
-        batch.series.push(series_ref("nan_probe", fp, labels));
+        batch.series.push(series_ref(
+            "nan_probe",
+            Fingerprint::from_raw(u128::from(fp)),
+            labels,
+        ));
     }
     flush(&writer, batch).await;
     writer.shutdown(Duration::from_secs(5)).await;

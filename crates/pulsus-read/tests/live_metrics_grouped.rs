@@ -63,7 +63,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, STALE_NAN_BITS};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, FpLiteral, STALE_NAN_BITS};
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::metrics::grouped::{Grid, GroupedOp};
@@ -129,7 +129,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSeriesRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     labels: String,
 }
@@ -137,7 +137,7 @@ struct SeedSeriesRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     value: f64,
 }
@@ -145,7 +145,7 @@ struct SeedSampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
     metric_name: String,
-    fingerprint: u64,
+    fingerprint: u128,
     unix_milli: i64,
     schema: i8,
     zero_threshold: f64,
@@ -275,7 +275,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
                 .collect();
             SeedSeriesRow {
                 metric_name: s.metric.clone(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: bucket,
                 labels: serde_json::to_string(&map).expect("labels json"),
             }
@@ -286,7 +286,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
                 metric_name: s.metric.clone(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
             })
@@ -310,7 +310,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
             let metric = s.metric.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
                 metric_name: metric.clone(),
-                fingerprint: s.fp,
+                fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
                 zero_threshold: cols.zero_threshold,
@@ -1202,7 +1202,11 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         "[549] corpus                                          op      pushed : raw    ratio"
     );
     for case in &cases {
-        let fps: Vec<u64> = case.series.iter().map(|s| s.fp).collect();
+        let fps: Vec<FpLiteral> = case
+            .series
+            .iter()
+            .map(|s| Fingerprint::from_raw(u128::from(s.fp)).sql_literal())
+            .collect();
         // Every series of these corpora is in one `status` group per its
         // own label, so the gid vector is the group index. Built here
         // rather than taken from `decide`, so the row count is measured
@@ -1281,7 +1285,11 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
     let tag = pulsus_testkit::test_ident("pulsus_read_it_grouped_bytes");
     let mut ids: Vec<(String, String, usize)> = Vec::new();
     for (n, case) in cases.iter().enumerate() {
-        let fps: Vec<u64> = case.series.iter().map(|s| s.fp).collect();
+        let fps: Vec<FpLiteral> = case
+            .series
+            .iter()
+            .map(|s| Fingerprint::from_raw(u128::from(s.fp)).sql_literal())
+            .collect();
         let gids = vec![0u32; fps.len()];
         let pushed_sql = grouped_sql::grouped_fetch(
             "metric_samples",
@@ -1738,7 +1746,9 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     // The first statement's own run count, measured directly: with a
     // chunk of 4 the query still sends the heavy second statement, so it
     // cannot be read off a served/refused boundary.
-    let first_chunk: Vec<u64> = (1..=400u64).collect();
+    let first_chunk: Vec<FpLiteral> = (1..=400u128)
+        .map(|v| Fingerprint::from_raw(v).sql_literal())
+        .collect();
     let sql = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
@@ -1773,17 +1783,32 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     // ```text
     //   ceiling    chunk 1 (4,000 rows in)   chunk 2 (96,400 rows in)
     //    4 MiB     refused                   refused
-    //    6 MiB     ran                       refused      <- the test runs here
+    //   10 MiB     ran                       refused      <- the test runs here
     //   64 MiB     ran                       ran
     // ```
     //
-    // The 8 and 10 MiB rows are dropped rather than kept as prose: they
-    // are inside the same window and add a minute of live time to say
-    // what 6 and 64 already say. What matters is that a window EXISTS and
-    // that 6 MiB is inside it — the two rows above and below it are what
-    // establish that, and they are the two that run.
-    const CEILING: u64 = 6 * 1024 * 1024;
-    let heavy_chunk: Vec<u64> = (401..=800u64).collect();
+    // **The window moved with issue #498** and the figures are the ones
+    // measured after it. The identity is a `UInt128`, so every place this
+    // statement carries the `fingerprint` column — the two scans, the
+    // `PARTITION BY`, the `transform` array — costs twice the bytes it
+    // did, and the light statement's peak crossed the old 6 MiB ceiling.
+    // The edges were re-measured one ceiling at a time:
+    //
+    // ```text
+    //    6 MiB     refused                   refused
+    //    8 MiB     ran                       refused
+    //   12 MiB     ran                       refused
+    //   16 MiB     ran                       ran
+    // ```
+    //
+    // 10 MiB is inside the new window with a row either side of it that
+    // this test executes. The 8 and 12 MiB rows are recorded here rather
+    // than run: they say what 4 and 64 already say, at a minute of live
+    // time each.
+    const CEILING: u64 = 10 * 1024 * 1024;
+    let heavy_chunk: Vec<FpLiteral> = (401..=800u128)
+        .map(|v| Fingerprint::from_raw(v).sql_literal())
+        .collect();
     let heavy_sql = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
@@ -1865,4 +1890,99 @@ async fn the_budget_answers_before_a_later_statements_failure() {
         first_charge - 1
     );
     h.finish().await;
+}
+
+/// **Issue #498 criterion 5: the grouped statement's `fps` array types as
+/// `Array(UInt128)` and assigns the right group id at the boundary.**
+///
+/// The grouped instant read hands ClickHouse two parallel arrays and lets
+/// `transform(fingerprint, fps, gids, …)` map each stored fingerprint to
+/// its group. That is the one place where a wrong literal **mis-assigns a
+/// group** rather than merely losing rows: a bare decimal above `2^64` is
+/// read as `Float64`, two neighbouring fingerprints round onto one value,
+/// and their samples are aggregated under whichever group won the
+/// rounding.
+///
+/// So this asserts the array's type and the mapping, at `2^64+1` and
+/// `2^64+2` — the pair that differs by one and rounds onto the same
+/// `Float64`.
+#[tokio::test]
+async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_grouped_fp128");
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    drop_database(&bootstrap, &db).await;
+    init_db(&bootstrap, &db).await;
+    let client = ChClient::new(test_config(&db))
+        .await
+        .expect("connect to db");
+
+    // The two values a bare literal cannot separate.
+    const A: u128 = 18_446_744_073_709_551_617;
+    const B: u128 = 18_446_744_073_709_551_618;
+
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE fp128_transform (fingerprint UInt128) ENGINE = MergeTree \
+                 ORDER BY fingerprint AS SELECT arrayJoin([toUInt128('{A}'), \
+                 toUInt128('{B}')]) AS fingerprint"
+            ),
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the two-row fixture");
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct TypeRow {
+        t: String,
+    }
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct GidRow {
+        fingerprint: u128,
+        gid: u32,
+    }
+
+    // The array the builder renders — `[toUInt128('…'), toUInt128('…')]` —
+    // types as `Array(UInt128)` with no `CAST` of its own.
+    let sql =
+        format!("WITH [toUInt128('{A}'), toUInt128('{B}')] AS fps SELECT toTypeName(fps) AS t");
+    let mut stream = client
+        .query_stream::<TypeRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("type query");
+    let ty = stream.next().await.expect("one row").expect("decode").t;
+    drop(stream);
+    assert_eq!(
+        ty, "Array(UInt128)",
+        "the rendered `fps` array does not type as Array(UInt128): {ty}"
+    );
+
+    // And `transform` maps each of the two to its own group id.
+    let sql = format!(
+        "WITH [toUInt128('{A}'), toUInt128('{B}')] AS fps, \
+         CAST([101, 102], 'Array(UInt32)') AS gids \
+         SELECT fingerprint, transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid \
+         FROM fp128_transform WHERE fingerprint IN fps ORDER BY fingerprint"
+    );
+    let mut stream = client
+        .query_stream::<GidRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("transform query");
+    let mut got: Vec<(u128, u32)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        got.push((row.fingerprint, row.gid));
+    }
+    drop(stream);
+    assert_eq!(
+        got,
+        vec![(A, 101), (B, 102)],
+        "the group ids at the 2^64 boundary are not the ones `fps`/`gids` name"
+    );
+
+    drop_database(&bootstrap, &db).await;
 }

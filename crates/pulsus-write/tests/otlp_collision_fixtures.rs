@@ -49,6 +49,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
+use pulsus_model::Fingerprint;
 use pulsus_write::ParsedMetrics;
 use pulsus_write::protocols::otlp_metrics::{self, MetricIngestSettings};
 use serde_json::{Value, json};
@@ -284,7 +285,7 @@ fn push_with_role<'a>(case: &'a Value, role: &str) -> &'a Value {
 /// `(metric_name, fingerprint)` — the translated series identity, WITHOUT
 /// the timestamp, so the timestamp clause of the rule can be varied
 /// independently of it.
-type Identity = (String, u64);
+type Identity = (String, Fingerprint);
 
 fn float_identities(parsed: &ParsedMetrics) -> BTreeMap<Identity, f64> {
     parsed
@@ -795,7 +796,7 @@ fn the_histogram_wins_in_both_orders_and_the_two_orders_agree() {
             .iter()
             .map(|s| {
                 format!(
-                    "{} #{} @{} = {}",
+                    "{} #{:?} @{} = {}",
                     s.metric_name, s.fingerprint, s.unix_milli, s.value
                 )
             })
@@ -804,7 +805,7 @@ fn the_histogram_wins_in_both_orders_and_the_two_orders_agree() {
         let mut hists: Vec<String> = parsed
             .hist_samples
             .iter()
-            .map(|h| format!("{} #{} @{}", h.metric_name, h.fingerprint, h.unix_milli))
+            .map(|h| format!("{} #{:?} @{}", h.metric_name, h.fingerprint, h.unix_milli))
             .collect();
         hists.sort();
         // Only a fixture whose two pushes share ONE timestamp can be

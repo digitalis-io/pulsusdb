@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     ClientAgg, ClientValue, ClientWindow, CompiledPipeline, Direction, Plan, PlanCtx, QueryParams,
@@ -42,14 +43,14 @@ const ROWS: usize = 20_000;
 const WARMUP: usize = 3;
 const REPS: usize = 11;
 
-fn meta_of(streams: &[(u64, &str)]) -> HashMap<u64, StreamMetaRow> {
+fn meta_of(streams: &[(u64, &str)]) -> HashMap<Fingerprint, StreamMetaRow> {
     streams
         .iter()
         .map(|(fp, labels)| {
             (
-                *fp,
+                Fingerprint::from_raw(u128::from(*fp)),
                 StreamMetaRow {
-                    fingerprint: *fp,
+                    fingerprint: Fingerprint::from_raw(u128::from(*fp)),
                     service: "svc".to_string(),
                     labels: labels.to_string(),
                 },
@@ -62,7 +63,7 @@ fn meta_of(streams: &[(u64, &str)]) -> HashMap<u64, StreamMetaRow> {
 fn rows_on(fp: u64) -> Vec<MetricScanRow> {
     (0..ROWS)
         .map(|i| MetricScanRow {
-            fingerprint: fp,
+            fingerprint: Fingerprint::from_raw(u128::from(fp)),
             timestamp_ns: (i as i64) * 1_000_000,
             body: "line".to_string(),
             structured_metadata: String::new(),
@@ -210,7 +211,7 @@ fn zz_print_mixed_shape_slider_withholding_timings() {
     let i_meta = meta_of(&[(1, r#"{"app":"a","x":"1"}"#)]);
     let i_rows = rows_on(1);
 
-    let run = |rows: &[MetricScanRow], meta: &HashMap<u64, StreamMetaRow>| -> u128 {
+    let run = |rows: &[MetricScanRow], meta: &HashMap<Fingerprint, StreamMetaRow>| -> u128 {
         let t0 = Instant::now();
         let out = run_client_agg_rows(rows, &compiled, meta, &client, window, rate_window_ns)
             .expect("served");

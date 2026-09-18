@@ -5,7 +5,7 @@
 //! reservation (architect plan).
 
 use pulsus_clickhouse::Row;
-use pulsus_model::LabelSet;
+use pulsus_model::{Fingerprint, LabelSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
@@ -24,7 +24,7 @@ use crate::writer::spool::SpoolEncode;
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct LogSampleRow {
     pub service: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub timestamp_ns: i64,
     pub severity: i8,
     pub body: String,
@@ -66,7 +66,7 @@ impl LogSampleRow {
 
     fn estimate(service: &str, body: &str, structured_metadata_len: usize) -> u64 {
         (service.len() + body.len() + structured_metadata_len
-            + 8 /* fingerprint */ + 8 /* timestamp_ns */ + 1/* severity */) as u64
+            + 16 /* fingerprint */ + 8 /* timestamp_ns */ + 1/* severity */) as u64
     }
 }
 
@@ -88,7 +88,7 @@ impl SpoolEncode for LogSampleRow {
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct LogStreamRow {
     pub month: u16,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub service: String,
     pub labels: String,
     pub updated_ns: i64,
@@ -126,7 +126,7 @@ impl LogStreamRow {
     }
 
     fn estimate(service: &str, labels_len: usize) -> u64 {
-        (service.len() + labels_len + 2 /* month */ + 8 /* fingerprint */ + 8/* updated_ns */)
+        (service.len() + labels_len + 2 /* month */ + 16 /* fingerprint */ + 8/* updated_ns */)
             as u64
     }
 }
@@ -187,7 +187,7 @@ fn estimate_canonical_json_len(labels: &LabelSet) -> usize {
 /// `SimpleAggregateFunction(sum, UInt64)` column (the `log_metrics` idiom).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LogPatternRow {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub bucket_ns: i64,
     pub pattern: String,
     pub count: u64,
@@ -201,7 +201,7 @@ impl LogPatternRow {
     /// [`crate::patterns::est_template_bound`] upper bound instead (the pattern
     /// String cannot be measured before extraction).
     pub fn est_bytes(&self) -> u64 {
-        (self.pattern.len() + 8 /* fingerprint */ + 8 /* bucket_ns */ + 8/* count */) as u64
+        (self.pattern.len() + 16 /* fingerprint */ + 8 /* bucket_ns */ + 8/* count */) as u64
     }
 }
 
@@ -230,7 +230,7 @@ impl SpoolEncode for LogPatternRow {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricSampleRow {
     pub metric_name: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub value: f64,
 }
@@ -262,7 +262,7 @@ impl MetricSampleRow {
     }
 
     fn estimate(metric_name: &str) -> u64 {
-        (metric_name.len() + 8 /* fingerprint */ + 8 /* unix_milli */ + 8/* value */) as u64
+        (metric_name.len() + 16 /* fingerprint */ + 8 /* unix_milli */ + 8/* value */) as u64
     }
 }
 
@@ -319,7 +319,7 @@ impl SpoolEncode for MetricSampleRow {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricSeriesRow {
     pub metric_name: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub labels: String,
     pub value_type: u8,
@@ -364,7 +364,7 @@ impl MetricSeriesRow {
 
     fn estimate(metric_name: &str, labels_len: usize) -> u64 {
         (metric_name.len() + labels_len
-            + 8 /* fingerprint */ + 8 /* unix_milli */ + 1/* value_type */) as u64
+            + 16 /* fingerprint */ + 8 /* unix_milli */ + 1/* value_type */) as u64
     }
 }
 
@@ -391,7 +391,7 @@ impl SpoolEncode for MetricSeriesRow {
 /// miss; duplicates are bounded (one per poisoned generation per key) and
 /// collapse at read.
 impl BackfillRow for MetricSeriesRow {
-    type Key = (String, u64, i64, u8);
+    type Key = (String, Fingerprint, i64, u8);
 
     fn backfill_key(&self) -> Self::Key {
         (
@@ -427,7 +427,7 @@ impl BackfillRow for MetricSeriesRow {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricHistSampleRow {
     pub metric_name: String,
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub schema: i8,
     pub zero_threshold: f64,
@@ -509,7 +509,7 @@ impl MetricHistSampleRow {
         custom_count: usize,
     ) -> u64 {
         (metric_name_len
-            + 8 /* fingerprint */ + 8 /* unix_milli */ + 1 /* schema */
+            + 16 /* fingerprint */ + 8 /* unix_milli */ + 1 /* schema */
             + 8 /* zero_threshold */ + 8 /* zero_count */ + 8 /* count */ + 8 /* sum */
             + 1 /* counter_reset_hint */
             + span_count * (4 /* offset */ + 4 /* length */)
@@ -913,7 +913,7 @@ mod tests {
     fn log_sample_row_from_log_row_copies_every_field() {
         let row = LogRow {
             service: "checkout".to_string(),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             timestamp_ns: UnixNano(1_700_000_000_000_000_000),
             severity: 9,
             body: "hello".to_string(),
@@ -921,7 +921,7 @@ mod tests {
         };
         let mapped = LogSampleRow::from(&row);
         assert_eq!(mapped.service, "checkout");
-        assert_eq!(mapped.fingerprint, 42);
+        assert_eq!(mapped.fingerprint, Fingerprint::from_raw(42));
         assert_eq!(mapped.timestamp_ns, 1_700_000_000_000_000_000);
         assert_eq!(mapped.severity, 9);
         assert_eq!(mapped.body, "hello");
@@ -932,7 +932,7 @@ mod tests {
     fn log_sample_row_est_bytes_grows_with_body_length() {
         let short = LogSampleRow {
             service: String::new(),
-            fingerprint: 0,
+            fingerprint: Fingerprint::from_raw(0),
             timestamp_ns: 0,
             severity: 0,
             body: "a".to_string(),
@@ -955,7 +955,7 @@ mod tests {
     fn log_sample_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
         let row = LogRow {
             service: "checkout".to_string(),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             timestamp_ns: UnixNano(1_700_000_000_000_000_000),
             severity: 9,
             body: "hello world".to_string(),
@@ -975,7 +975,7 @@ mod tests {
     fn log_sample_row_spool_encoding_shape_is_unchanged_plain_json() {
         let row = LogSampleRow {
             service: "checkout".to_string(),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             timestamp_ns: 1_700_000_000_000_000_000,
             severity: 9,
             body: "hello".to_string(),
@@ -1003,14 +1003,14 @@ mod tests {
             LabelSet::from_normalized([("service_name".to_string(), "checkout".to_string())]);
         let row = StreamRow {
             month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             service: "checkout".to_string(),
             labels,
             updated_ns: 123,
         };
         let mapped = LogStreamRow::from(&row);
         assert_eq!(mapped.month, row.month.days_since_epoch());
-        assert_eq!(mapped.fingerprint, 7);
+        assert_eq!(mapped.fingerprint, Fingerprint::from_raw(7));
         assert_eq!(mapped.service, "checkout");
         assert_eq!(mapped.labels, r#"{"service_name":"checkout"}"#);
         assert_eq!(mapped.updated_ns, 123);
@@ -1024,7 +1024,7 @@ mod tests {
         ]);
         let row = StreamRow {
             month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             service: "checkout".to_string(),
             labels,
             updated_ns: 123,
@@ -1041,7 +1041,7 @@ mod tests {
     fn log_stream_row_spool_encoding_shape_is_unchanged_plain_json() {
         let row = LogStreamRow {
             month: 19_800,
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             service: "checkout".to_string(),
             labels: r#"{"service_name":"checkout"}"#.to_string(),
             updated_ns: 123,
@@ -1065,13 +1065,13 @@ mod tests {
     fn metric_sample_row_from_metric_point_copies_every_field() {
         let point = MetricPoint {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             unix_milli: 1_700_000_000_000,
             value: 1.5,
         };
         let mapped = MetricSampleRow::from(&point);
         assert_eq!(mapped.metric_name, "http_requests_total");
-        assert_eq!(mapped.fingerprint, 42);
+        assert_eq!(mapped.fingerprint, Fingerprint::from_raw(42));
         assert_eq!(mapped.unix_milli, 1_700_000_000_000);
         assert_eq!(mapped.value, 1.5);
     }
@@ -1085,7 +1085,7 @@ mod tests {
     fn metric_sample_row_preserves_the_stale_nan_bit_pattern_exactly() {
         let point = MetricPoint {
             metric_name: Arc::from("up"),
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: f64::from_bits(STALE_NAN_BITS),
         };
@@ -1107,7 +1107,7 @@ mod tests {
     fn metric_sample_row_spool_encoding_preserves_a_stale_nan_via_value_bits_as_a_string() {
         let row = MetricSampleRow {
             metric_name: "up".to_string(),
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: f64::from_bits(STALE_NAN_BITS),
         };
@@ -1130,7 +1130,7 @@ mod tests {
     fn metric_sample_row_spool_encoding_keeps_a_finite_value_human_readable() {
         let row = MetricSampleRow {
             metric_name: "up".to_string(),
-            fingerprint: 1,
+            fingerprint: Fingerprint::from_raw(1),
             unix_milli: 0,
             value: 1.5,
         };
@@ -1146,7 +1146,7 @@ mod tests {
     fn metric_sample_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
         let point = MetricPoint {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 42,
+            fingerprint: Fingerprint::from_raw(42),
             unix_milli: 1_700_000_000_000,
             value: 1.5,
         };
@@ -1162,12 +1162,12 @@ mod tests {
         let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
         let series = SeriesRef {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             labels,
         };
         let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 0);
         assert_eq!(mapped.metric_name, "http_requests_total");
-        assert_eq!(mapped.fingerprint, 7);
+        assert_eq!(mapped.fingerprint, Fingerprint::from_raw(7));
         assert_eq!(mapped.unix_milli, 3_600_000);
         assert_eq!(mapped.labels, r#"{"job":"checkout"}"#);
         assert_eq!(mapped.value_type, 0);
@@ -1184,7 +1184,7 @@ mod tests {
         ]);
         let series = SeriesRef {
             metric_name: Arc::from("http_requests_total"),
-            fingerprint: 7,
+            fingerprint: Fingerprint::from_raw(7),
             labels,
         };
         let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 1);
@@ -1234,7 +1234,7 @@ mod tests {
     fn hist_point_with_internal_zero(sum: f64) -> HistogramPoint {
         HistogramPoint {
             metric_name: Arc::from("http_request_duration_seconds"),
-            fingerprint: 99,
+            fingerprint: Fingerprint::from_raw(99),
             unix_milli: 1_700_000_000_000,
             histogram: NativeHistogram {
                 counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
@@ -1260,7 +1260,7 @@ mod tests {
         let point = hist_point_with_internal_zero(4.5);
         let row = MetricHistSampleRow::from(&point);
         assert_eq!(row.metric_name, "http_request_duration_seconds");
-        assert_eq!(row.fingerprint, 99);
+        assert_eq!(row.fingerprint, Fingerprint::from_raw(99));
         assert_eq!(row.unix_milli, 1_700_000_000_000);
         assert_eq!(row.schema, 2);
         assert_eq!(row.zero_threshold.to_bits(), 1e-9f64.to_bits());

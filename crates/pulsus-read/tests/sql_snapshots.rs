@@ -6,6 +6,7 @@
 //! direction/limit variants; and the `Instant`/`Range` `QuerySpec` shapes.
 
 use pulsus_logql::parse;
+use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_read::logql::predicate::{CheckedFragment, literal, month_literal};
 use pulsus_read::logql::sql::{self, MetricShape, ScanLowerBound, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
@@ -142,7 +143,7 @@ fn a_non_ascii_label_name_plans_identically_to_an_ascii_one() {
         r#"sum by (éx) (count_over_time({app="x"}[5m]))"#,
         &range_params(100, Direction::Backward),
     );
-    let fps = [18374u64, 99120];
+    let fps = [18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal());
     let services = [literal("checkout")];
     assert_eq!(
         sliding_sql(&ascii, &services, &fps),
@@ -347,7 +348,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
     let sql = sql::stage3(
         &sp.samples_table,
         &[literal("checkout")],
-        &[18374, 99120],
+        &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal()),
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -361,7 +362,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE fingerprint IN (18374, 99120)\n\
+         WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
          \x20 AND body LIKE '%connection refused%'\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
@@ -392,7 +393,7 @@ fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder(
         let fast = sql::stage3(
             "log_samples",
             &[literal("checkout")],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             &[],
             direction,
@@ -401,7 +402,7 @@ fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder(
         let paged = sql::stage3_keyset(
             "log_samples",
             &[literal("checkout")],
-            &[1],
+            &[Fingerprint::from_raw(1).sql_literal()],
             window,
             sql::KeysetLower::First,
             direction,
@@ -429,7 +430,10 @@ fn stage3_uses_in_list_for_more_than_one_service() {
     let sql = sql::stage3(
         "log_samples",
         &[literal("checkout"), literal("billing")],
-        &[1, 2],
+        &[
+            Fingerprint::from_raw(1).sql_literal(),
+            Fingerprint::from_raw(2).sql_literal(),
+        ],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -446,7 +450,7 @@ fn direction_forward_orders_ascending() {
     let sql = sql::stage3(
         "log_samples",
         &[literal("checkout")],
-        &[1],
+        &[Fingerprint::from_raw(1).sql_literal()],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -464,7 +468,7 @@ fn direction_backward_orders_descending() {
     let sql = sql::stage3(
         "log_samples",
         &[literal("checkout")],
-        &[1],
+        &[Fingerprint::from_raw(1).sql_literal()],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -511,7 +515,7 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
     let sql = sql::stage3(
         &with_parser.samples_table,
         &[literal("checkout")],
-        &[18374],
+        &[Fingerprint::from_raw(18374).sql_literal()],
         TimeWindow {
             start_ns: with_parser.start_ns,
             end_ns: with_parser.end_ns,
@@ -540,7 +544,7 @@ fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
     let sql = sql::stage3(
         &sp.samples_table,
         &[literal("checkout")],
-        &[18374],
+        &[Fingerprint::from_raw(18374).sql_literal()],
         TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
@@ -633,8 +637,11 @@ fn a_line_filter_after_drop_or_keep_still_pushes_down() {
 #[test]
 fn stage2_is_byte_exact_to_schemas_md_3_2() {
     assert_eq!(
-        sql::stage2("log_streams", &[18374, 99120]),
-        "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (18374, 99120)"
+        sql::stage2(
+            "log_streams",
+            &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal())
+        ),
+        "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
     );
 }
 
@@ -746,7 +753,7 @@ fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
 fn sliding_sql(
     mp: &pulsus_read::logql::MetricPlan,
     services: &[pulsus_read::logql::predicate::CheckedLiteral],
-    fingerprints: &[u64],
+    fingerprints: &[FpLiteral],
 ) -> String {
     sql::metric_raw_samples_sliding(
         &mp.table,
@@ -798,7 +805,11 @@ fn a_structured_metadata_key_in_the_selector_resolves_against_the_stream_index()
         "stage 1 never mentions structured metadata: {}",
         mp.stage1_sql
     );
-    let read = sliding_sql(&mp, &[literal("checkout")], &[101]);
+    let read = sliding_sql(
+        &mp,
+        &[literal("checkout")],
+        &[Fingerprint::from_raw(101).sql_literal()],
+    );
     let (select, rest) = read.split_once("\nFROM ").expect("a SELECT list");
     assert!(select.contains("structured_metadata"));
     assert!(
@@ -820,7 +831,14 @@ fn a_line_filter_range_slides_raw_and_pushes_the_filter_down() {
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
+    let sql = sliding_sql(
+        &mp,
+        &[literal("checkout")],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
         "sliding raw scan must carry PREWHERE service, got:\n{sql}"
@@ -837,7 +855,14 @@ fn bytes_range_with_a_line_filter_slides_raw() {
     assert!(mp.client.is_some());
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
+    let sql = sliding_sql(
+        &mp,
+        &[literal("checkout")],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
         "sliding raw scan must carry PREWHERE service, got:\n{sql}"
@@ -861,7 +886,14 @@ fn a_non_dividing_step_still_slides_raw_for_range() {
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(&mp, &[literal("checkout"), literal("billing")], &[101, 205]);
+    let sql = sliding_sql(
+        &mp,
+        &[literal("checkout"), literal("billing")],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(
         sql.contains("PREWHERE service IN ('checkout', 'billing')\n"),
         "sliding raw scan must carry PREWHERE service IN (...) for multiple services, got:\n{sql}"
@@ -882,7 +914,14 @@ fn a_range_query_never_routes_to_the_rollup() {
     // The sliding raw scan DOES carry a service PREWHERE (unlike the old
     // rollup path) to keep the `(service, fingerprint, timestamp_ns)` PK
     // prefix engaged.
-    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
+    let sql = sliding_sql(
+        &mp,
+        &[literal("checkout")],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(sql.contains("PREWHERE service = 'checkout'\n"));
 }
 
@@ -895,7 +934,11 @@ fn metric_range_sql_uses_intdiv_bucketing() {
     let sql = sql::metric_range(
         rollup_source(),
         &[],
-        &[101, 205, 990],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+            Fingerprint::from_raw(990).sql_literal(),
+        ],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -908,7 +951,7 @@ fn metric_range_sql_uses_intdiv_bucketing() {
         sql,
         "SELECT fingerprint, intDiv(bucket_ns, 60000000000) * 60000000000 AS step, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (101, 205, 990) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint, step"
     );
 }
@@ -918,7 +961,10 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
     let sql = sql::metric_instant(
         rollup_source(),
         &[],
-        &[101, 205],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -937,7 +983,7 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
         sql,
         "SELECT fingerprint, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (101, 205) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("intDiv"));
@@ -956,7 +1002,10 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
 fn log_volume_rollup_is_byte_exact() {
     let sql = sql::log_volume_rollup(
         "log_metrics_5s",
-        &[101, 205],
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
         TimeWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -966,7 +1015,7 @@ fn log_volume_rollup_is_byte_exact() {
         sql,
         "SELECT fingerprint, sum(bytes) AS bytes\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (101, 205) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("body"), "zero body reads by construction");
@@ -1040,7 +1089,10 @@ fn detected_labels_scoped_is_byte_exact() {
     let sql = sql::detected_labels(
         "log_streams_idx",
         &[month_literal(2026, 7), month_literal(2026, 8)],
-        Some(&[101, 205]),
+        Some(&[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ]),
         "log_metrics_5s",
         DISCOVERY_WINDOW,
         DISCOVERY_RES_NS,
@@ -1051,7 +1103,7 @@ fn detected_labels_scoped_is_byte_exact() {
             "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\n\
              FROM log_streams_idx\n\
              WHERE month IN ('2026-07-01', '2026-08-01')\n\
-             \x20 AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (101, 205) AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000)\n\
+             \x20 AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000)\n\
              GROUP BY key\n\
              ORDER BY key"
         )
@@ -1091,10 +1143,10 @@ fn label_names_is_byte_exact() {
 /// assertions below is produced by `sql::`: a mutation inside the
 /// shared builder must move only the left side.
 const ACTIVE_SCOPED_1: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE fingerprint IN (7) AND bucket_ns >= 1751328000000000000 \
+     WHERE fingerprint IN (toUInt128('7')) AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 const ACTIVE_SCOPED_3: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE fingerprint IN (101, 205, 4294967296) AND bucket_ns >= 1751328000000000000 \
+     WHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('4294967296')) AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 
 /// The three whole-statement templates AC 1 compares against, one per
@@ -1111,7 +1163,7 @@ const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, c
 struct ScopedTriple {
     name: &'static str,
     months: Vec<pulsus_read::logql::predicate::MonthLiteral>,
-    fingerprints: Vec<u64>,
+    fingerprints: Vec<FpLiteral>,
     window: TimeWindow,
     active: &'static str,
     month: &'static str,
@@ -1127,7 +1179,7 @@ fn scoped_triples() -> Vec<ScopedTriple> {
         ScopedTriple {
             name: "T1",
             months: vec![month_literal(2026, 7)],
-            fingerprints: vec![7],
+            fingerprints: vec![Fingerprint::from_raw(7).sql_literal()],
             window: DISCOVERY_WINDOW,
             active: ACTIVE_SCOPED_1,
             month: "month = '2026-07-01'",
@@ -1135,7 +1187,11 @@ fn scoped_triples() -> Vec<ScopedTriple> {
         ScopedTriple {
             name: "T2",
             months: vec![month_literal(2026, 7), month_literal(2026, 8)],
-            fingerprints: vec![101, 205, 4_294_967_296],
+            fingerprints: vec![
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(4_294_967_296).sql_literal(),
+            ],
             window: DISCOVERY_WINDOW,
             active: ACTIVE_SCOPED_3,
             month: "month IN ('2026-07-01', '2026-08-01')",
@@ -1143,7 +1199,7 @@ fn scoped_triples() -> Vec<ScopedTriple> {
         ScopedTriple {
             name: "T3",
             months: vec![month_literal(2026, 7)],
-            fingerprints: vec![7],
+            fingerprints: vec![Fingerprint::from_raw(7).sql_literal()],
             window: TimeWindow {
                 start_ns: 1_751_328_003_000_000_000,
                 end_ns: 1_751_331_600_000_000_000,
@@ -1390,7 +1446,7 @@ fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
     pulsus_read::logql::sql::metric_raw_samples_sliding(
         &mp.table,
         &[literal("checkout")],
-        &[18374, 99120],
+        &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal()),
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
@@ -1421,7 +1477,7 @@ fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_n
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE fingerprint IN (18374, 99120)\n\
+         WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
          \x20 AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000\n\
          ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"
     );
@@ -1552,7 +1608,7 @@ fn n_variants(n: usize, common: &str) -> String {
 #[test]
 fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
     let services = &[literal("checkout")];
-    let fps = &[101u64, 205];
+    let fps = &[101, 205].map(|v| Fingerprint::from_raw(v).sql_literal());
     for params in [
         range_params(100, Direction::Backward),
         QueryParams {
@@ -1677,7 +1733,7 @@ const OFFSET_AT_NS: i64 = i64::MAX - 3_600_000_000_000 + 1;
 /// Renders `sql::metric_instant` from a plan exactly as `LogQlEngine`
 /// would for an instant metric query, so the asserted text is the text
 /// that would reach ClickHouse.
-fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[u64]) -> String {
+fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[FpLiteral]) -> String {
     sql::metric_instant(
         sql::MetricSource::new(
             &mp.table,
@@ -1723,7 +1779,13 @@ fn an_offset_past_the_timestamp_axis_renders_the_degenerate_empty_window() {
     let mp = metric_plan(r#"count_over_time({env="prod"}[5m] offset -1h)"#, &params);
     assert!(mp.empty_domain, "the shifted domain left the axis");
     assert_eq!((mp.start_ns, mp.grid_start_ns, mp.end_ns), (0, 0, -1));
-    let sql = instant_sql(&mp, &[101, 205]);
+    let sql = instant_sql(
+        &mp,
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(
         sql.contains("timestamp_ns > 0 AND timestamp_ns <= -1"),
         "expected the degenerate empty window, got:\n{sql}"
@@ -1752,7 +1814,13 @@ fn an_offset_inside_the_timestamp_axis_still_renders_its_real_window() {
     // T - 1h = i64::MAX - 2h + 1, and the scan reaches a further 5m back.
     let end = OFFSET_AT_NS - 3_600_000_000_000;
     let start = end - 300_000_000_000;
-    let sql = instant_sql(&mp, &[101, 205]);
+    let sql = instant_sql(
+        &mp,
+        &[
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ],
+    );
     assert!(
         sql.contains(&format!("timestamp_ns > {start} AND timestamp_ns <= {end}")),
         "expected the shifted-but-representable window, got:\n{sql}"

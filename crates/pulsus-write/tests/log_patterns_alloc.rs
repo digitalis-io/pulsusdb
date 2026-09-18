@@ -23,7 +23,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
 
-use pulsus_model::UnixNano;
+use pulsus_model::{Fingerprint, UnixNano};
 use pulsus_write::LogRow;
 use pulsus_write::patterns::{
     AGG_BASE_OVERHEAD, MAX_DISTINCT_PATTERNS_PER_BATCH, PATTERN_ROW_OVERHEAD, aggregate_patterns,
@@ -121,10 +121,10 @@ unsafe impl GlobalAlloc for LivePeakAlloc {
 #[global_allocator]
 static ALLOCATOR: LivePeakAlloc = LivePeakAlloc;
 
-fn row(fingerprint: u64, body: String) -> LogRow {
+fn row(fingerprint: u128, body: String) -> LogRow {
     LogRow {
         service: "svc".to_string(),
-        fingerprint,
+        fingerprint: Fingerprint::from_raw(fingerprint),
         timestamp_ns: UnixNano(0),
         severity: 0,
         body,
@@ -157,7 +157,12 @@ fn measured_peak(rows: &[LogRow]) -> (u64, usize) {
 /// N distinct digit-free literal bodies (one row each) at `fingerprint`.
 fn distinct_rows(n: usize, fingerprint: u64) -> Vec<LogRow> {
     (0..n)
-        .map(|i| row(fingerprint, format!("alpha bravo charlie {}", ident(i))))
+        .map(|i| {
+            row(
+                u128::from(fingerprint),
+                format!("alpha bravo charlie {}", ident(i)),
+            )
+        })
         .collect()
 }
 

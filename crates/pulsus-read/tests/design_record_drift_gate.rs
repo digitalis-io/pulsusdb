@@ -1683,7 +1683,7 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below; the count of cases
 // is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1711,13 +1711,6 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:318",
-        0,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
     ),
 ];
 
@@ -1843,7 +1836,14 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // judged — `quantile_over_time` with no quantile — moved with the
         // declaration it names, and at its new line the two rules agree,
         // so there is no divergence left to hold a judgement about.
-        (4, 1, 0),
+        //
+        // Issue #498 removed the remaining `FallbackRight` row the same
+        // way: `labels.rs:318` named
+        // `merge_labels_with_structured_metadata`, which moved to `:328`
+        // when the identity widened, and at :328 the anchor rule answers
+        // `logql/labels.rs` — the file the citing prose describes and the
+        // one the fallback already gave.
+        (4, 0, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

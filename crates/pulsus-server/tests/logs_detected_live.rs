@@ -266,7 +266,7 @@ async fn seed_activity(client: &ChClient, db: &str, ts_ns: i64, fingerprints: &[
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -1439,7 +1439,7 @@ async fn detected_fields_classify_a_line_as_json_exactly_when_json_reads_it() {
         .await;
         rows.push(SeedSampleRow {
             service: svc.to_string(),
-            fingerprint: fp,
+            fingerprint: u128::from(fp),
             timestamp_ns: now - 2_000_000_000,
             severity: 0,
             body: body.to_string(),

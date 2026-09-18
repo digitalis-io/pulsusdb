@@ -46,6 +46,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_logql::{LineFilter, LineFilterOp};
+use pulsus_model::Fingerprint;
 use pulsus_read::logql::Direction;
 use pulsus_read::logql::predicate::{self, literal};
 use pulsus_read::logql::rows::SampleRow;
@@ -302,7 +303,7 @@ async fn matched_indices(
     let sql = sql::stage3(
         &format!("{db}.log_samples"),
         &[literal("checkout")],
-        &[FP],
+        &[Fingerprint::from_raw(u128::from(FP)).sql_literal()],
         TimeWindow {
             start_ns: ts_ns - 3_600_000_000_000,
             end_ns: ts_ns + 3_600_000_000_000,

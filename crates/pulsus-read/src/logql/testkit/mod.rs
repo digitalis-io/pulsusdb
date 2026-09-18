@@ -12,15 +12,19 @@ use std::collections::HashMap;
 
 use super::agg::LabelSet;
 use super::window::ClientWindow;
+use pulsus_model::Fingerprint;
 
 // ---- Issue #227: sliding-window range engine ----
 
-pub(in crate::logql) fn slide_meta(fp: u64, labels_json: &str) -> HashMap<u64, StreamMetaRow> {
+pub(in crate::logql) fn slide_meta(
+    fp: u64,
+    labels_json: &str,
+) -> HashMap<Fingerprint, StreamMetaRow> {
     let mut m = HashMap::new();
     m.insert(
-        fp,
+        Fingerprint::from_raw(u128::from(fp)),
         StreamMetaRow {
-            fingerprint: fp,
+            fingerprint: Fingerprint::from_raw(u128::from(fp)),
             service: "svc".to_string(),
             labels: labels_json.to_string(),
         },
@@ -58,7 +62,7 @@ pub(in crate::logql) fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
 
 pub(in crate::logql) fn sample(fp: u64, ts: i64, body: &str) -> SampleRow {
     SampleRow {
-        fingerprint: fp,
+        fingerprint: Fingerprint::from_raw(u128::from(fp)),
         timestamp_ns: ts,
         body: body.to_string(),
         structured_metadata: String::new(),

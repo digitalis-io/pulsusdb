@@ -123,7 +123,7 @@ fn now_ns() -> i64 {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
     service: String,
-    fingerprint: u64,
+    fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
@@ -133,7 +133,7 @@ struct SeedSampleRow {
 /// One seeded stream: its fingerprint, its `service` column and the
 /// canonical-JSON label set stage 2 returns.
 struct Stream {
-    fingerprint: u64,
+    fingerprint: u128,
     service: &'static str,
     labels: &'static str,
 }

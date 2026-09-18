@@ -109,6 +109,7 @@ pub fn render_markdown(report: &BenchReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_model::Fingerprint;
 
     fn sample_report() -> BenchReport {
         BenchReport {
@@ -126,7 +127,7 @@ mod tests {
                 load_elapsed_ms: 5,
                 canonical_service: "svc-000".to_string(),
                 canonical_env: "prod".to_string(),
-                canonical_fingerprint: 1,
+                canonical_fingerprint: Fingerprint::from_raw(1),
             },
             queries: vec![QueryEvidence {
                 name: "example".to_string(),

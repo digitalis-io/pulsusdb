@@ -45,7 +45,7 @@ The schema's PromQL obligation is **fetch shapes, plus one reduction**: full Pro
 ```sql
 CREATE TABLE metric_samples (
     metric_name  LowCardinality(String),
-    fingerprint  UInt64   CODEC(Delta(8), ZSTD(1)),
+    fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),
     unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
     value        Float64  CODEC(Gorilla, ZSTD(1))
 ) ENGINE = MergeTree
@@ -65,7 +65,7 @@ SETTINGS ttl_only_drop_parts = 1;
 ```sql
 CREATE TABLE metric_series (
     metric_name  LowCardinality(String),
-    fingerprint  UInt64  CODEC(Delta(8), ZSTD(1)),
+    fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),
     unix_milli   Int64   CODEC(Delta(8), ZSTD(1)),   -- hour-bucketed "last active"
     labels       String  CODEC(ZSTD(5))              -- canonical JSON, sorted keys
 ) ENGINE = MergeTree
@@ -90,7 +90,7 @@ At the design-target cardinality (millions of active series), **label resolution
        metric_name  LowCardinality(String),
        key          LowCardinality(String),
        val          String,
-       fingerprint  UInt64
+       fingerprint  UInt128
    ) ENGINE = ReplacingMergeTree
    PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(bucket))
    ORDER BY (metric_name, key, val, bucket, fingerprint);
@@ -138,7 +138,7 @@ Downsampling happens **entirely inside ClickHouse** with classic insert-triggere
 ```sql
 CREATE TABLE metric_samples_5m (
     metric_name   LowCardinality(String),
-    fingerprint   UInt64                                 CODEC(Delta(8), ZSTD(1)),
+    fingerprint   UInt128                                 CODEC(Delta(8), ZSTD(1)),
     ts            DateTime                               CODEC(DoubleDelta, ZSTD(1)),
     val_min       SimpleAggregateFunction(min, Float64)  CODEC(Gorilla, ZSTD(1)),
     val_max       SimpleAggregateFunction(max, Float64)  CODEC(Gorilla, ZSTD(1)),
@@ -209,7 +209,7 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
 
 ```sql
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS lookback,
-     [101, 205, 990] AS fps,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, any(flags) AS flags
 FROM (
@@ -300,7 +300,7 @@ The M7 extension foreshadowed in §2 lands as a **separate, dedicated samples ta
 ```sql
 CREATE TABLE metric_hist_samples (
     metric_name        LowCardinality(String),
-    fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),
+    fingerprint        UInt128   CODEC(Delta(8), ZSTD(1)),
     unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),
     schema             Int8     CODEC(ZSTD(1)),   -- exponential schema (−4..8); −53 = NHCB
     zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),
@@ -355,7 +355,7 @@ ALTER TABLE metric_series ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;
 ```sql
 CREATE TABLE log_streams (
     month        Date,                          -- toStartOfMonth(first write in month)
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     service      LowCardinality(String),        -- resource service.name ('' if absent)
     labels       String  CODEC(ZSTD(5)),        -- canonical JSON, sorted keys
     updated_ns   Int64
@@ -367,7 +367,7 @@ CREATE TABLE log_streams_idx (
     month        Date,
     key          LowCardinality(String),
     val          String,
-    fingerprint  UInt64
+    fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
 ORDER BY (key, val, fingerprint);
@@ -378,7 +378,7 @@ ORDER BY (key, val, fingerprint);
 ```sql
 CREATE TABLE log_samples (
     service       LowCardinality(String),
-    fingerprint   UInt64,
+    fingerprint   UInt128,
     timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
     severity      Int8    DEFAULT 0,             -- OTel SeverityNumber (0 = unset)
     body          String  CODEC(ZSTD(1)),
@@ -398,7 +398,7 @@ SETTINGS ttl_only_drop_parts = 1;
 -- (default 5s) sets the bucket size; the table is named for it (log_metrics_5s
 -- by default) and the MV bucket expression is rendered from it.
 CREATE TABLE log_metrics_5s (
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, {res_ns}) * {res_ns}
     count        SimpleAggregateFunction(sum, UInt64),
     bytes        SimpleAggregateFunction(sum, UInt64)
@@ -417,7 +417,7 @@ ORDER BY (fingerprint, bucket_ns);
 -- function of the line, so counts sum correctly across batches, shards,
 -- replicas, and retries. Kill-switch: PULSUS_LOG_PATTERNS (default true).
 CREATE TABLE log_patterns (
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, 10s) * 10s
     pattern      String  CODEC(ZSTD(1)),
     count        SimpleAggregateFunction(sum, UInt64)
@@ -918,7 +918,7 @@ LIMIT {SERVICE_GRAPH_MAX_EDGES + 1}
 CREATE TABLE profile_samples (
     type_id        LowCardinality(String),        -- e.g. process_cpu:cpu:nanoseconds:cpu:nanoseconds
     service        LowCardinality(String),
-    fingerprint    UInt64,
+    fingerprint    UInt128,
     timestamp_ns   Int64  CODEC(DoubleDelta, ZSTD(1)),
     duration_ns    Int64,
     payload_type   Int8,
@@ -935,7 +935,7 @@ SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE profile_series (
     month        Date,
-    fingerprint  UInt64,
+    fingerprint  UInt128,
     type_id      LowCardinality(String),
     service      LowCardinality(String),
     labels       String CODEC(ZSTD(5)),
@@ -948,7 +948,7 @@ CREATE TABLE profile_series_idx (
     month        Date,
     key          LowCardinality(String),
     val          String,
-    fingerprint  UInt64
+    fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
 ORDER BY (key, val, fingerprint);
@@ -996,7 +996,7 @@ CREATE TABLE mv_checksums (
 ORDER BY mv_name;
 ```
 
-**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
+**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration is permitted only while the condition that allows it holds — no tagged release, no persistent deployments, databases created fresh; the `fingerprint` widening to `UInt128` (issue #498, migrations 4, 5, 6, 7, 8, 9, 23 and 29) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
 
 ---
 
