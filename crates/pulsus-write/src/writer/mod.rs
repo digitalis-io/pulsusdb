@@ -109,7 +109,8 @@ pub use metrics::{
 };
 pub use push_dedup::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
-    PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, plan_capacities,
+    PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
+    metric_identity, plan_capacities,
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
@@ -691,6 +692,14 @@ impl LogWriter {
         Ok(Admitted::Stored(receivers))
     }
 
+    /// This writer's push-suppression index (issue #494), or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off. The writer is the only production
+    /// caller; the accessor exists so a test can read the index's state
+    /// rather than inferring it from row counts.
+    pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
+        self.shared.dedup.as_ref()
+    }
+
     /// A point-in-time metrics snapshot (`/metrics` exposition is the
     /// server's job, architect plan "out of scope"; this crate only
     /// maintains the atomics).
@@ -778,11 +787,7 @@ impl LogSink for LogWriter {
         self.admit_batch(batch, AdmitMode::Async, push).map(|_| ())
     }
 
-    fn admit_flush(
-        &self,
-        batch: ParsedLogs,
-        push: PushHeaders,
-    ) -> Result<FlushWait, AdmitRefusal> {
+    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
         match self.admit_batch(batch, AdmitMode::Sync, push)? {
             Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
                 join_generations(receivers)

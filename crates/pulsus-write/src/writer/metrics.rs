@@ -197,11 +197,7 @@ impl SpoolCounters for WriterMetrics {
 }
 
 impl WriterMetrics {
-    pub fn snapshot(
-        &self,
-        queue_bytes: u64,
-        dedup: DedupMetricsSnapshot,
-    ) -> WriterMetricsSnapshot {
+    pub fn snapshot(&self, queue_bytes: u64, dedup: DedupMetricsSnapshot) -> WriterMetricsSnapshot {
         WriterMetricsSnapshot {
             dedup,
             samples: self.samples.snapshot(),

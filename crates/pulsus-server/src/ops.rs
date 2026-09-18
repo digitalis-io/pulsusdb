@@ -15,8 +15,8 @@ use axum::routing::get;
 use pulsus_clickhouse::ChError;
 use pulsus_read::LabelCache;
 use pulsus_write::writer::{
-    BackfillMetricsSnapshot, DedupMetricsSnapshot, MetricWriterMetricsSnapshot, TableMetricsSnapshot,
-    TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
+    BackfillMetricsSnapshot, DedupMetricsSnapshot, MetricWriterMetricsSnapshot,
+    TableMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
 };
 
 use crate::app::AppState;
@@ -257,14 +257,12 @@ fn record_dedup_metrics(signal: &'static str, d: &DedupMetricsSnapshot) {
         .absolute(d.mixed_outcome_total);
     metrics::counter!("pulsus_ingest_dedup_unknown_total", "signal" => signal)
         .absolute(d.unknown_total);
-    metrics::counter!("pulsus_ingest_dedup_shed_total", "signal" => signal)
-        .absolute(d.shed_total);
+    metrics::counter!("pulsus_ingest_dedup_shed_total", "signal" => signal).absolute(d.shed_total);
     metrics::counter!("pulsus_ingest_dedup_wait_shed_total", "signal" => signal)
         .absolute(d.wait_shed_total);
     metrics::counter!("pulsus_ingest_dedup_rollbacks_total", "signal" => signal)
         .absolute(d.rollbacks_total);
-    metrics::gauge!("pulsus_ingest_dedup_wait_bytes", "signal" => signal)
-        .set(d.wait_bytes as f64);
+    metrics::gauge!("pulsus_ingest_dedup_wait_bytes", "signal" => signal).set(d.wait_bytes as f64);
     metrics::gauge!("pulsus_ingest_dedup_bytes", "signal" => signal).set(d.bytes as f64);
 }
 
@@ -659,16 +657,12 @@ mod tests {
     fn assert_dedup_series(r: &str, signal: &str, base: u64) {
         assert_sample(
             r,
-            &format!(
-                r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="0"}}"#
-            ),
+            &format!(r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="0"}}"#),
             (base + 1) as f64,
         );
         assert_sample(
             r,
-            &format!(
-                r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="1"}}"#
-            ),
+            &format!(r#"pulsus_ingest_duplicate_pushes_total{{signal="{signal}",declared="1"}}"#),
             (base + 2) as f64,
         );
         for (name, off) in [

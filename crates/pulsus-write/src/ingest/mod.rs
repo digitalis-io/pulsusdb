@@ -149,11 +149,7 @@ pub trait LogSink: Send + Sync {
     /// `0`, the default): the handler `.await`s the returned
     /// [`FlushWait`] and only then responds `200`. For a suppressed push
     /// the returned wait resolves to **the original push's** outcome.
-    fn admit_flush(
-        &self,
-        batch: ParsedLogs,
-        push: PushHeaders,
-    ) -> Result<FlushWait, AdmitRefusal>;
+    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal>;
 }
 
 #[cfg(test)]

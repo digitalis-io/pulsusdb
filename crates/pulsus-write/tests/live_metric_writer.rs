@@ -158,7 +158,10 @@ async fn metric_metadata_a_to_b_to_a_collapses_to_the_latest_value_on_final_read
     let metric_name = "http_requests_total";
     for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
         let wait = writer
-            .admit_flush(metadata(metric_name, metric_type, updated_ns), PushHeaders::default())
+            .admit_flush(
+                metadata(metric_name, metric_type, updated_ns),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         tokio::time::timeout(Duration::from_secs(10), wait)
             .await
@@ -312,7 +315,9 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(batch, PushHeaders::default()).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")
@@ -413,7 +418,9 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(batch, PushHeaders::default()).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")

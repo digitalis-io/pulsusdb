@@ -357,7 +357,10 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
     let fingerprint = 77u64;
     let ts_ms = now_ms();
     let wait = writer
-        .admit_flush(series_batch(metric_name, u128::from(fingerprint), ts_ms), PushHeaders::default())
+        .admit_flush(
+            series_batch(metric_name, u128::from(fingerprint), ts_ms),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -482,7 +485,10 @@ async fn l_m2_metadata_duplicate_and_stale_reinserts_collapse_to_the_max_updated
     let metric_name = "backfill_lm2_total";
     let updated_ns = 1_700_000_000_000_000_000i64;
     let wait = writer
-        .admit_flush(metadata_batch(metric_name, "counter", updated_ns), PushHeaders::default())
+        .admit_flush(
+            metadata_batch(metric_name, "counter", updated_ns),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await

@@ -934,10 +934,9 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
             remote_write_backpressure_response()
         }
-        AdmitRefusal::KeyReused => go_http_error_response(
-            StatusCode::BAD_REQUEST,
-            format!("{KEY_REUSED_MESSAGE}\n"),
-        ),
+        AdmitRefusal::KeyReused => {
+            go_http_error_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
+        }
     }
 }
 
@@ -947,10 +946,9 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
             loki_backpressure_response()
         }
-        AdmitRefusal::KeyReused => loki_plain_text_response(
-            StatusCode::BAD_REQUEST,
-            format!("{KEY_REUSED_MESSAGE}\n"),
-        ),
+        AdmitRefusal::KeyReused => {
+            loki_plain_text_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
+        }
     }
 }
 

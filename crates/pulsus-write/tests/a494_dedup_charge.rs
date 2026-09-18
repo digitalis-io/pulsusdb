@@ -439,4 +439,3 @@ fn a_oneshot_channel_fits_inside_one_registrations_charge() {
     );
     drop(channel);
 }
-

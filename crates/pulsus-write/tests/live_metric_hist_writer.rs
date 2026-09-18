@@ -142,7 +142,9 @@ fn writer(client: Arc<ChClient>) -> MetricWriter {
 }
 
 async fn flush(writer: &MetricWriter, batch: ParsedMetrics) {
-    let wait = writer.admit_flush(batch, PushHeaders::default()).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles within the test timeout")

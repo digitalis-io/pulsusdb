@@ -595,7 +595,9 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, _, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX, None);
+        let (_, _, rx) = ctx
+            .buffer
+            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 
@@ -648,7 +650,9 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, _, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX, None);
+        let (_, _, rx) = ctx
+            .buffer
+            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 

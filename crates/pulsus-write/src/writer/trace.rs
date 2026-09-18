@@ -278,12 +278,12 @@ impl TraceWriter {
                 if should_notify {
                     self.shared.spans_notify.notify_one();
                 }
-            } else if self.shared.spans.append(
-                span_rows,
-                span_bytes,
-                self.shared.runtime.batch_bytes,
-                None,
-            ).0 {
+            } else if self
+                .shared
+                .spans
+                .append(span_rows, span_bytes, self.shared.runtime.batch_bytes, None)
+                .0
+            {
                 self.shared.spans_notify.notify_one();
             }
         }
@@ -300,12 +300,12 @@ impl TraceWriter {
                 if should_notify {
                     self.shared.attrs_notify.notify_one();
                 }
-            } else if self.shared.attrs.append(
-                attr_rows,
-                attr_bytes,
-                self.shared.runtime.batch_bytes,
-                None,
-            ).0 {
+            } else if self
+                .shared
+                .attrs
+                .append(attr_rows, attr_bytes, self.shared.runtime.batch_bytes, None)
+                .0
+            {
                 self.shared.attrs_notify.notify_one();
             }
         }

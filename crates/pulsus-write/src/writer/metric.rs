@@ -59,12 +59,12 @@ use crate::writer::backfill::{self, BackfillHealedHook, RegistrationBacklog};
 use crate::writer::buffer;
 use crate::writer::config::WriterRuntime;
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
+use crate::writer::push_dedup::{self, Admission, ClaimGuard, PushDedup};
 use crate::writer::registration::{MetadataCache, SeriesKey, SeriesLru};
 use crate::writer::rows::{
     MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
 };
 use crate::writer::spool;
-use crate::writer::push_dedup::{self, Admission, ClaimGuard, PushDedup};
 use crate::writer::table::{self, BlockInserter, ChBlockInserter, ShutdownSignal, TableContext};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
@@ -838,6 +838,13 @@ impl MetricWriter {
             guard.seal();
         }
         Ok(Admitted::Stored(receivers))
+    }
+
+    /// This writer's push-suppression index (issue #494), or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off — see
+    /// [`LogWriter::dedup`](crate::writer::LogWriter::dedup).
+    pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
+        self.shared.dedup.as_ref()
     }
 
     /// A point-in-time metrics snapshot.

@@ -94,11 +94,7 @@ impl LogSink for WriterSink {
         }
     }
 
-    fn admit_flush(
-        &self,
-        batch: ParsedLogs,
-        push: PushHeaders,
-    ) -> Result<FlushWait, AdmitRefusal> {
+    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
             Some(writer) => writer.admit_flush(batch, push),
             None => Err(AdmitRefusal::Backpressure),

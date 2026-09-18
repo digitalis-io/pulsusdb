@@ -421,8 +421,8 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // ceiling checks — see `INGEST_DEDUP_WINDOW_FLOOR_MS` and
     // `INGEST_DEDUP_MAX_BYTES_FLOOR` for what each end protects.
     {
-        let window_ms = u64::try_from(cfg.writer.ingest_dedup_window.0.as_millis())
-            .unwrap_or(u64::MAX);
+        let window_ms =
+            u64::try_from(cfg.writer.ingest_dedup_window.0.as_millis()).unwrap_or(u64::MAX);
         if !(INGEST_DEDUP_WINDOW_FLOOR_MS..=INGEST_DEDUP_WINDOW_CEILING_MS).contains(&window_ms) {
             return Err(range_err(
                 "writer.ingest_dedup_window",
@@ -1216,13 +1216,9 @@ mod tests {
                 other => panic!("{bad_ms} ms: expected a Value error, got {other:?}"),
             }
         }
-        for ok_ms in [
-            INGEST_DEDUP_WINDOW_FLOOR_MS,
-            INGEST_DEDUP_WINDOW_CEILING_MS,
-        ] {
+        for ok_ms in [INGEST_DEDUP_WINDOW_FLOOR_MS, INGEST_DEDUP_WINDOW_CEILING_MS] {
             let mut cfg = Config::default();
-            cfg.writer.ingest_dedup_window =
-                HumanDuration(std::time::Duration::from_millis(ok_ms));
+            cfg.writer.ingest_dedup_window = HumanDuration(std::time::Duration::from_millis(ok_ms));
             assert!(validate(&cfg).is_ok(), "{ok_ms} ms must be accepted");
         }
         assert!(validate(&Config::default()).is_ok());
@@ -1253,10 +1249,7 @@ mod tests {
                 other => panic!("{bad} bytes: expected a Value error, got {other:?}"),
             }
         }
-        for ok in [
-            INGEST_DEDUP_MAX_BYTES_FLOOR,
-            INGEST_DEDUP_MAX_BYTES_CEILING,
-        ] {
+        for ok in [INGEST_DEDUP_MAX_BYTES_FLOOR, INGEST_DEDUP_MAX_BYTES_CEILING] {
             let mut cfg = Config::default();
             cfg.writer.ingest_dedup_max_bytes = ByteSize(ok);
             assert!(validate(&cfg).is_ok(), "{ok} bytes must be accepted");

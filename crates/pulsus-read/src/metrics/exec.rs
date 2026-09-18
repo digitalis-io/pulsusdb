@@ -2516,7 +2516,10 @@ fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
     }
     for (k, f) in floats.iter().enumerate() {
         let bits = f.value().to_bits();
-        if floats[..k].iter().any(|prev| prev.value().to_bits() == bits) {
+        if floats[..k]
+            .iter()
+            .any(|prev| prev.value().to_bits() == bits)
+        {
             continue;
         }
         out.push(Sample::float(t_ms, f.value()));

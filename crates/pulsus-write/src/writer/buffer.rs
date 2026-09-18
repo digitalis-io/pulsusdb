@@ -141,11 +141,7 @@ impl<R> TableBuffer<R> {
         Self::append_locked(&mut inner, rows, bytes, claim);
         let (tx, rx) = oneshot::channel();
         inner.current.waiters.push(tx);
-        (
-            inner.current.bytes >= max_bytes,
-            inner.current.id,
-            rx,
-        )
+        (inner.current.bytes >= max_bytes, inner.current.id, rx)
     }
 
     /// Issue #494: the claim key is pushed onto THIS generation's ticket

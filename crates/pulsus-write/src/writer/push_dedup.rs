@@ -49,10 +49,16 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pulsus_model::{Fingerprint, LabelSet};
 use tokio::sync::oneshot;
+// `tokio::time::Instant`, not `std::time::Instant`: the window and the
+// claim deadline are both minutes long, and a test that has to wait them
+// out in wall-clock time is a test nobody runs. Outside a runtime this is
+// the standard-library clock; under `#[tokio::test(start_paused = true)]`
+// it is the runtime's, so ageing and expiry are exercised in milliseconds.
+use tokio::time::Instant;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::ingest::PushHeaders;
@@ -265,13 +271,14 @@ fn key_digest(key: &str) -> PushDigest {
     d.finish()
 }
 
-/// Resolves a log push's identity.
-pub(crate) fn log_identity(batch: &ParsedLogs, headers: &PushHeaders) -> PushIdentity {
+/// Resolves a log push's identity — the digest of the `Idempotency-Key`
+/// when the client sent one, else of the request's own content.
+pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders) -> PushIdentity {
     identity_from(log_content_digest(batch), headers)
 }
 
-/// Resolves a metric push's identity.
-pub(crate) fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIdentity {
+/// Resolves a metric push's identity — see [`log_identity`].
+pub fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIdentity {
     identity_from(metric_content_digest(batch), headers)
 }
 
@@ -801,7 +808,11 @@ impl PushDedup {
     }
 
     fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+        self.epoch
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     /// Looks up, and claims if absent — **one critical section**, so two
@@ -815,7 +826,9 @@ impl PushDedup {
 
         if let Some(entry) = core.claims.get(&id.key) {
             if entry.content != id.content {
-                self.metrics.key_reused_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .key_reused_total
+                    .fetch_add(1, Ordering::Relaxed);
                 return Admission::KeyReused;
             }
             if entry.state == ClaimState::Released {
@@ -977,7 +990,6 @@ impl PushDedup {
                 .fetch_add(aged, Ordering::Relaxed);
         }
     }
-
 }
 
 impl Core {
@@ -1471,7 +1483,10 @@ mod tests {
         d.settle_target(id.key, TargetOutcome::Committed, true);
         d.settle_target(id.key, TargetOutcome::NotCommitted, false);
         assert!(
-            matches!(d.begin_wait(id.key), Some(WaitStart::Settled(ClaimOutcome::Ok))),
+            matches!(
+                d.begin_wait(id.key),
+                Some(WaitStart::Settled(ClaimOutcome::Ok))
+            ),
             "a failure on a target outside the acknowledgement must not \
              become the suppressed caller's answer"
         );
@@ -1502,25 +1517,13 @@ mod tests {
             guard.note_target(true);
             guard.seal();
         }
-        let Some(WaitStart::Registered {
-            guard: g1,
-            rx: rx1,
-        }) = d.begin_wait(a.key)
-        else {
+        let Some(WaitStart::Registered { guard: g1, rx: rx1 }) = d.begin_wait(a.key) else {
             panic!("must register");
         };
-        let Some(WaitStart::Registered {
-            guard: g2,
-            rx: rx2,
-        }) = d.begin_wait(a.key)
-        else {
+        let Some(WaitStart::Registered { guard: g2, rx: rx2 }) = d.begin_wait(a.key) else {
             panic!("must register");
         };
-        let Some(WaitStart::Registered {
-            guard: g3,
-            rx: rx3,
-        }) = d.begin_wait(b.key)
-        else {
+        let Some(WaitStart::Registered { guard: g3, rx: rx3 }) = d.begin_wait(b.key) else {
             panic!("must register");
         };
 
