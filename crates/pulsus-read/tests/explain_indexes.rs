@@ -2946,30 +2946,49 @@ async fn the_group_key_read_selects_the_raw_scans_granules() {
 // =====================================================================
 
 /// **Criterion 8: a `fingerprint IN (toUInt128(…), …)` read is a point
-/// read of the primary key, and it prunes.**
+/// read of the primary key, it prunes, and the control it is measured
+/// against means something.**
 ///
 /// The column widened from `UInt64` to `UInt128` and it still leads the
-/// `log_streams_idx` order key, so the claim is that the exact call form
-/// reaches the index rather than being read as a `Float64` expression the
-/// index cannot use. That is one `EXPLAIN` and four conjuncts.
+/// order key, so the claim is that the exact call form reaches the index
+/// rather than being read as a `Float64` expression the index cannot use.
 ///
-/// **The bound is per ACTIVE PART, and the part count is asserted first.**
-/// `selected <= 2 * fps.len()` was derived and the measurement came back
-/// against it: three inserts of one key range gave `Parts: 3/3` and
-/// **12 of 30** granules, because each part carries its own granule for
-/// each point. After `OPTIMIZE TABLE … FINAL` the same read is
-/// `Parts: 1/1`, `Granules: 4/30`. So the test optimizes, asserts one
-/// active part, and only then bounds the granules — an assertion whose
-/// order is the difference between a bound and a flake.
+/// **The fixture is 300 rows at `index_granularity = 10` — thirty
+/// granules — written as three inserts that each span the whole key
+/// domain.** Both halves of that sentence are load-bearing:
+///
+/// ```text
+///   three inserts, each spanning the domain   Parts: 3/3   Granules:  9/30   <- 9 > 2*3
+///   OPTIMIZE TABLE … FINAL, then the same     Parts: 1/1   Granules:  5/30   <- 5 <= 2*3
+/// ```
+///
+/// The `selected <= 2 * fps.len()` bound is **per active part**: three
+/// overlapping parts each carry a granule for each point, so the bound
+/// does not hold before the merge. That is why `Parts: 1/1` is asserted
+/// first — the order is the difference between a bound and a flake.
+///
+/// **The key domain deliberately straddles two ranges**, and each is there
+/// for one break:
+///
+/// ```text
+///   60 rows at 0 .. 59                the control break has granules to prune:
+///                                       `fingerprint >= toUInt128('50')` reads 26 of 30,
+///                                       where `>= toUInt128('0')` reads 30 of 30
+///   240 rows at 2^64 + i*7919         the point literals are values a bare decimal
+///                                       cannot carry: exact reads [60, 180, 299],
+///                                       bare reads [60]
+/// ```
+///
+/// A fixture wholly above `2^64` passes the control break — every stored
+/// value is `>= 50` either way — and a fixture wholly below `2^53` passes
+/// the bare-literal break. Neither break can be dropped, so neither range
+/// can be.
 ///
 /// **The control is a WIDE fingerprint predicate, not the term removed.**
 /// With no `WHERE` at all ClickHouse answers from
 /// `ReadFromPreparedSource (Optimized trivial count)` and prints no
 /// `Indexes` block, so a control built that way has nothing to compare and
-/// the test would panic looking for a missing line. `fingerprint >=
-/// toUInt128('0')` selects every granule — measured 30/30 — which is what
-/// makes `control_selected == control_total` a statement about the control
-/// rather than a coincidence.
+/// the test would panic looking for a missing line.
 #[tokio::test]
 async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
     skip_unless_live!();
@@ -2989,12 +3008,23 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
     cfg.database = db.to_string();
     let client = ChClient::new(cfg).await.expect("connect (data client)");
 
-    // 300 rows at `index_granularity = 10` — thirty granules, pinned here
-    // rather than inherited, so the totals below are the fixture's.
+    /// Thirty granules of ten rows each, pinned here rather than
+    /// inherited, so the totals below are the fixture's own.
+    const GRANULARITY: u64 = 10;
+    const ROWS: u64 = 300;
+    const GRANULES: u64 = ROWS / GRANULARITY;
+    /// `2^64` — the first value a bare decimal literal cannot carry.
+    const WIDE_BASE: u128 = 18_446_744_073_709_551_616;
+    /// The low end of the domain, present so the control break prunes.
+    const NARROW_ROWS: u128 = 60;
+
     client
         .execute(
-            "CREATE TABLE fp128_prune (fingerprint UInt128, n UInt64) \
-             ENGINE = MergeTree ORDER BY fingerprint SETTINGS index_granularity = 10",
+            &format!(
+                "CREATE TABLE fp128_prune (fingerprint UInt128, n UInt64) \
+                 ENGINE = MergeTree ORDER BY fingerprint \
+                 SETTINGS index_granularity = {GRANULARITY}"
+            ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
@@ -3007,27 +3037,35 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
         n: u64,
     }
 
-    // Three inserts of one key range, which is the shape that produced the
-    // counterexample: three parts, each holding a granule per point.
-    let rows: Vec<FpRow> = (0..300u128)
+    let rows: Vec<FpRow> = (0..NARROW_ROWS)
         .map(|i| FpRow {
-            // Spread ABOVE 2^64, so every value is one a bare decimal
-            // literal cannot carry.
-            fingerprint: 18_446_744_073_709_551_616 + i * 7_919,
+            fingerprint: i,
             n: i as u64,
         })
+        .chain((0..(ROWS as u128 - NARROW_ROWS)).map(|i| FpRow {
+            fingerprint: WIDE_BASE + i * 7_919,
+            n: (NARROW_ROWS + i) as u64,
+        }))
         .collect();
-    for _ in 0..3 {
+    assert_eq!(rows.len() as u64, ROWS, "the fixture is 300 rows");
+
+    // Three inserts, each spanning the whole key domain — the shape that
+    // produced the counterexample to the per-part bound. Every third row,
+    // so no part is a sub-range of the key space.
+    for offset in 0..3usize {
+        let part: Vec<FpRow> = rows.iter().skip(offset).step_by(3).cloned().collect();
         client
-            .insert_block("fp128_prune", &rows)
+            .insert_block("fp128_prune", &part)
             .await
             .expect("insert fixture rows");
     }
 
+    // Three points, all in the wide half, so a bare decimal is a
+    // different value at every one of them.
     let points: [u128; 3] = [
-        18_446_744_073_709_551_616,
-        18_446_744_073_709_551_616 + 150 * 7_919,
-        18_446_744_073_709_551_616 + 299 * 7_919,
+        WIDE_BASE,
+        WIDE_BASE + 120 * 7_919,
+        WIDE_BASE + 239 * 7_919,
     ];
     let fps = points
         .iter()
@@ -3036,12 +3074,20 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
         .join(", ");
     let read = format!("SELECT n FROM fp128_prune WHERE fingerprint IN ({fps})");
 
-    // Before the merge: three active parts, and the bound does NOT hold.
-    // Asserted rather than described, so the reason the optimize is here is
-    // a measurement in the test instead of a sentence about one.
+    // Before the merge: three active parts, and the per-part bound does
+    // NOT hold. Asserted rather than described, so the reason the optimize
+    // is here is a measurement in the test instead of a sentence about one.
     let before = explain_raw(&client, &read).await;
     let (parts_before, _) = parts_selected(&before).expect("a Parts: line before the merge");
     assert_eq!(parts_before, 3, "the fixture must start with three parts");
+    let (selected_before, total_before) =
+        primary_key_granules(&before).expect("a PrimaryKey Granules: line before the merge");
+    assert_eq!(total_before, GRANULES, "the fixture is thirty granules");
+    assert!(
+        selected_before > 2 * points.len() as u64,
+        "over three parts the per-part bound must NOT hold, or asserting Parts: 1/1 first \
+         proves nothing; got {selected_before}/{total_before}"
+    );
 
     client
         .execute(
@@ -3059,6 +3105,7 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
 
     let (selected, total) = primary_key_granules(&raw)
         .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in:\n{raw}"));
+    assert_eq!(total, GRANULES, "the fixture is thirty granules: {raw}");
     assert!(selected >= 1, "the read selected nothing: {raw}");
     assert!(
         selected <= 2 * points.len() as u64,
@@ -3072,12 +3119,11 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
     );
 
     // **And the read answers with the three rows it names.** Pruning alone
-    // does not separate the exact call form from a bare decimal: measured
-    // on this fixture, the bare form reads THREE granules of thirty and
-    // the exact form four, so a granule bound passes either way. What
-    // separates them is the answer — bare returns one row of three,
-    // because `2^64` is exactly representable as an `f64` and the other
-    // two points round away from any stored value.
+    // does not separate the exact call form from a bare decimal — measured
+    // on this fixture the two differ by two granules — so the answer is
+    // what separates them: bare returns one row of three, because `2^64`
+    // is exactly representable as an `f64` and the other two points round
+    // away from any stored value.
     #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
     struct NRow {
         n: u64,
@@ -3093,31 +3139,42 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
     drop(stream);
     got.sort_unstable();
     assert_eq!(
-        got.len(),
-        9,
-        "the fixture inserts the same 300 rows three times, so each point carries three rows \
-         (`OPTIMIZE … FINAL` merges parts, it does not deduplicate a plain MergeTree); got \
-         {got:?}"
-    );
-    got.dedup();
-    assert_eq!(
         got,
-        vec![0, 150, 299],
+        vec![60, 180, 299],
         "the point read answered {got:?} rather than the three rows its three fingerprints name"
     );
 
-    // The control: a predicate on the same column that admits everything.
-    let control = explain_raw(
-        &client,
-        "SELECT n FROM fp128_prune WHERE fingerprint >= toUInt128('0')",
-    )
-    .await;
+    // **The control, and what makes it one.** A predicate on the same
+    // column that admits every granule — `>= toUInt128('0')` reads 30 of
+    // 30. Raising the threshold into the domain prunes: `>= toUInt128('50')`
+    // reads 26 of 30. Asserting both is what says the control's 30/30 is a
+    // property of the predicate rather than of the fixture.
+    let control_sql = "SELECT n FROM fp128_prune WHERE fingerprint >= toUInt128('0')";
+    let control = explain_raw(&client, control_sql).await;
     let (control_selected, control_total) = primary_key_granules(&control)
         .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in the control:\n{control}"));
     assert_eq!(
         control_selected, control_total,
         "the control does not read every granule ({control_selected}/{control_total}), so the \
          gated read's ratio says nothing:\n{control}"
+    );
+    assert_eq!(
+        control_total, GRANULES,
+        "the control reads a different fixture: {control}"
+    );
+
+    let raised = explain_raw(
+        &client,
+        "SELECT n FROM fp128_prune WHERE fingerprint >= toUInt128('50')",
+    )
+    .await;
+    let (raised_selected, raised_total) = primary_key_granules(&raised)
+        .unwrap_or_else(|| panic!("no PrimaryKey Granules: line in the raised control:\n{raised}"));
+    assert!(
+        raised_selected < raised_total,
+        "raising the control's threshold into the key domain must prune ({raised_selected}/\
+         {raised_total}); if it does not, the fixture has nothing below it and the control's \
+         own 30/30 is an artefact:\n{raised}"
     );
 
     drop_database(&bootstrap, db).await;
