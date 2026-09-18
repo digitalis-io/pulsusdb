@@ -1683,20 +1683,13 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below; the count of cases
 // is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2933",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
-    ),
-    (
-        "docs/query-lowering.md",
-        "exec.rs:2933",
-        1,
-        ReviewedVerdict::FallbackWrong,
-        "the same citation a third time. Issue #557's dated §9.2 paragraph moved the          census block, which is where this occurrence sits; the reading is the one above",
     ),
     (
         "docs/query-lowering.md",
@@ -1844,21 +1837,21 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // declaration it names, and at its new line the two rules agree,
         // so there is no divergence left to hold a judgement about.
         //
-        // Issue #557 adds one `FallbackWrong` row and no new judgement:
-        // `exec.rs:2933` is cited a THIRD time, from §12.3's own
-        // generated census block, because the dated §9.2 paragraph moved
-        // the block's line. The reading is the one the other two
-        // occurrences carry.
+        // Two rows left #557's six when the two branches met, and the
+        // gate named both rather than anyone deciding them.
         //
-        // Issue #498 removed the remaining `FallbackRight` row the same
-        // way: `labels.rs:318` named
-        // `merge_labels_with_structured_metadata`, which moved to `:328`
-        // when the identity widened, and at :328 the anchor rule answers
-        // `logql/labels.rs` — the file the citing prose describes and the
-        // one the fallback already gave. So the five rows this tree
-        // carries are #557's six minus that one, and every remaining
-        // verdict is `FallbackWrong`.
-        (5, 0, 0),
+        // `labels.rs:318` named `merge_labels_with_structured_metadata`,
+        // which moved to `:328` when the identity widened; at `:328` the
+        // anchor rule answers `logql/labels.rs`, the file the citing prose
+        // describes and the one the fallback already gave, so there is no
+        // divergence left to hold a judgement about.
+        //
+        // `exec.rs:2933` at occurrence 1 sat in §12.3's own generated
+        // census block. Regenerating that block against the merged tree
+        // changed which citations it prints, so the occurrence is gone and
+        // the two rules agree at every occurrence that remains. The other
+        // two occurrences of that citation keep their reading.
+        (4, 0, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

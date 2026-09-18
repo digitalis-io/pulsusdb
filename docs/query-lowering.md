@@ -837,7 +837,7 @@ measurement.
 **One shipped instance on the core's route, and the same shape in LogQL's own compiler.**
 
 - LogQL's compiler, which is not built on the core, resolves the selector to fingerprints over
-  `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:482`), then reads `log_streams` and
+  `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:484`), then reads `log_streams` and
   `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:725`, `sql.rs:774`). Three statements; in
   the core's terms that is two source handoffs, but LogQL's compiler does not use `Cut`. Its seed is
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
@@ -943,8 +943,8 @@ at exit 0 (§11.1), so the quotation above cannot drift without that gate redden
 **This narrows a rule §2.4 already carried and did not bound.** The lattice says `a || b` becomes
 `sql_a OR sql_b` in one statement. That is right **when both sides read the same source**, and wrong
 when they do not: `resource.service.name` is a physical column of `trace_spans`
-(`crates/pulsus-schema/src/catalog.rs:358`, ordered by `(trace_id, timestamp_ns)`) while
-`span.http.method` is a row of `trace_attrs_idx` (`catalog.rs:382`, ordered by
+(`crates/pulsus-schema/src/catalog.rs:359`, ordered by `(trace_id, timestamp_ns)`) while
+`span.http.method` is a row of `trace_attrs_idx` (`catalog.rs:383`, ordered by
 `(key, val, scope, timestamp_ns, trace_id, span_id)`). A disjunction over one of each is reachable,
 not theoretical.
 
@@ -963,7 +963,7 @@ core builds carries either today.
 compiler, separate from the core (owner decision, #507). Its page loop is
 `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:83`, set at `:1655` from
 `has_unpushed_dropping_stage`, `:1673`); when it is set the read is one statement per page through
-`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:861`) with
+`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:867`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. Whether a compiled LogQL filter
 lets the request's limit into the statement is decided in `plan.rs`; §2.7.7's `Fidelity` does not
 reach it. §7.1's `Limit` row reads that decision in the model's terms, as analysis.
@@ -1141,7 +1141,7 @@ on every run.
 | the request's limit, window and step | **yes** |
 | a seed's plan-time upper bound | **yes** — every one is a request parameter, a config field or a named constant |
 | a seed's rendered size against the two ceilings | **yes**, O(1), no round trip |
-| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:519`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
+| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:521`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
 | the per-row cost of a database-side expression against the cost of transporting the row | **no.** Nothing measures it. Under the cost model of §9.1 it does not matter; if that model is ever revised this is the first number needed |
 | behaviour across shards | **out of scope** by owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) |
 | behaviour at 1 TB | **no** — [#25](https://github.com/digitalis-io/pulsusdb/issues/25) |
@@ -2498,8 +2498,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2105` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2151` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2106` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2152` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -2732,7 +2732,7 @@ lines above them, and neither number was wrong about what it measured.
 `min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
 trap §9.2 records against itself). That is the whole `key = 'a'` (or `'c'`) partition, once per
 read, and it equals the phase-1 generator's own read. `trace_id` is the fifth column of `ORDER BY
-(key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:382`), so a batch's
+(key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:383`), so a batch's
 `trace_id IN (32 ids)` prunes nothing inside it.
 
 **And §9.2's cheap fix does not apply.** §9.2 records that narrowing the *membership* read's
@@ -3117,7 +3117,7 @@ memory at production volume, and whether 80,658,368 rows per generator statement
 
 **What it is.** An **additional** `trace_attrs_idx`-shaped table ordered `(trace_id, span_id, key)`,
 alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
-(`crates/pulsus-schema/src/catalog.rs:382`) — **not instead of it**.
+(`crates/pulsus-schema/src/catalog.rs:383`) — **not instead of it**.
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
 existing key-ordered `trace_attrs_idx` — which is **1,128,726,045** bytes on four builds of the
@@ -4089,7 +4089,7 @@ Its three prerequisites, each with what a taker must read first:
 2. **The presence-count discriminator.** A bare `anyIf` maps "the span carries the key with an empty
    value" and "the span carries no such row" onto the same output row. `val_type` cannot tell them
    apart: migration 39 added it with `DEFAULT ''` and pre-existing rows read back `''`
-   (`crates/pulsus-schema/src/catalog.rs:813`), and `StoredType::from_stored` maps `''` to `Unknown`
+   (`crates/pulsus-schema/src/catalog.rs:814`), and `StoredType::from_stored` maps `''` to `Unknown`
    (`crates/pulsus-read/src/traces/search_eval.rs:183`). The merged statement must carry
    `countIf(key = … AND scope = …) > 0` as its own column, which is what a3 does.
 
@@ -5487,27 +5487,26 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 690 |
-| of those, citing a bare basename | 537 |
-| of those, written as a continuation of a citation earlier on the line | 43 |
-| `(document, token)` pairs the rule resolves | 383 |
-| occurrences those resolved pairs cover | 573 |
-| `(document, token)` pairs it cannot resolve | 80 |
-| occurrences those frozen pairs cover | 117 |
-| resolved rows anchored on a token the citing prose prints | 194 |
-| resolved rows anchored on a snapshot of the cited line | 189 |
+| citation occurrences in the five artefacts | 692 |
+| of those, citing a bare basename | 539 |
+| of those, written as a continuation of a citation earlier on the line | 44 |
+| `(document, token)` pairs the rule resolves | 362 |
+| occurrences those resolved pairs cover | 495 |
+| `(document, token)` pairs it cannot resolve | 104 |
+| occurrences those frozen pairs cover | 197 |
+| resolved rows anchored on a token the citing prose prints | 174 |
+| resolved rows anchored on a snapshot of the cited line | 188 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 70 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 6 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `ambiguous_basename` | 92 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 10 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
-| `occurrences_disagree` | 2 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
-| the fallback answers a file the citing prose does not describe | 5 |
-| the fallback is right and the anchor rule points elsewhere | 1 |
+| the fallback answers a file the citing prose does not describe | 4 |
+| the fallback is right and the anchor rule points elsewhere | 0 |
 | the sentence describes both candidates, so neither answer is wrong | 0 |
 
 | anchor kind | what a row of that kind can show |
@@ -5515,13 +5514,13 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 690 citation occurrences the five artefacts make, 537 name a bare basename and 43 are written as a continuation of a citation earlier on the same line. The rule resolves 383 `(document, token)` pairs covering 573 occurrences, and cannot resolve 80 covering 117. Of the resolved rows, 194 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
+Of the 692 citation occurrences the five artefacts make, 539 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 495 occurrences, and cannot resolve 104 covering 197. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 6 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1969` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1986` (in `docs/query-lowering.md`), `search_plan.rs:1076` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1969` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:1986` (in `docs/query-lowering.md`), `predicate.rs:946` (cited from 2 documents), `predicate.rs:950` (cited from 2 documents), `search_plan.rs:1076` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
 
-The citations the rule answers differently for two occurrences of are `exec.rs:2933` (in `docs/query-lowering.md`), `labels.rs:318` (in `docs/query-to-sql.md`).
+The citations the rule answers differently for two occurrences of are .
 
 The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2893-2899` in `docs/query-lowering.md`, `exec.rs:2933` in `docs/query-lowering.md`, `exec.rs:719` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
@@ -5544,13 +5543,15 @@ test regenerates both datasets from the one rule.
 reasons, counts them and says what each one means: a list of row labels beside a generated table is
 a second copy of the table's own labels, and this section has already had one go stale.
 
-**`occurrences_disagree` is a category part 8 did not expect to need.** An earlier revision assumed
-a token names one target wherever it is written, so one occurrence with evidence settled the
-others, and the check kept the first answer and discarded the rest — which meant it was not
-comparing the set. A code review found tokens where the answers differ — the block above counts
-them under `occurrences_disagree`. Two contradictory answers are not an answer, so they are frozen
-rather than settled by whichever occurrence came first, and the check now computes each key's
-verdict over **every** occurrence of it.
+**Occurrences that disagree are a category part 8 did not expect to need.** An earlier revision
+assumed a token names one target wherever it is written, so one occurrence with evidence settled
+the others, and the check kept the first answer and discarded the rest — which meant it was not
+comparing the set. A code review found tokens where the answers differ. Two contradictory answers
+are not an answer, so they are frozen rather than settled by whichever occurrence came first, and
+the check now computes each key's verdict over **every** occurrence of it. **The category has no
+member at this revision** — its one member, `labels.rs:318`, moved to `:328` when issue #498
+widened the identity, and at its new line the rule answers one file — which is why the block above
+no longer lists it and why the name is not backticked here.
 
 `every_citation_in_the_design_record_has_a_row` runs the rule over every citation and compares its
 verdict with the two datasets **in every direction**: a citation covered by neither is a hole; a
@@ -5580,7 +5581,8 @@ sentence about the label encoder answered with `logql/labels.rs`.
 > is not a rule that answers wrongly. The second, **8.26%**, was committed and re-runnable but
 > **measured against itself**: it treated `resolve_citation` as the truth, and `resolve_citation` is
 > the other rule under test. Reading the cases one at a time showed some where the **anchor rule**
-> is the one pointing at the wrong file — the ones now frozen as `occurrences_disagree`. A rate
+> is the one pointing at the wrong file — the ones that were frozen for disagreeing across their
+> occurrences. A rate
 > computed that way says how often two rules differ, not how often either is wrong. **Named cases
 > with their reasoning are worth more than a percentage measured against itself**, and the test
 > asserts the set of disagreements is exactly the set that has been read, so a new one cannot
@@ -5589,9 +5591,10 @@ sentence about the label encoder answered with `logql/labels.rs`.
 **What would close the hole, stated as work rather than promised.** Each of those frozen citing
 lines needs to print an identifier the cited line carries — the same rule the resolved ones satisfy
 — after
-a reading of the cited line against the claim beside it. The `occurrences_disagree` ones are
-already read: the review established that their citing prose describes `logql/labels.rs`,
-`logql/sql.rs` and `logql/sql.rs`, and those citations need path-qualifying to say so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
+a reading of the cited line against the claim beside it. The ones that disagreed across their
+occurrences were already read: the review established that their citing prose describes
+`logql/labels.rs`, `logql/sql.rs` and `logql/sql.rs`, and those citations need path-qualifying to
+say so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
 nothing, and each needs a line number that means something. None of it is part 8's.
 
 **Running the regenerator is not a way to make a red check green.** The `line` and `anchor` of a
