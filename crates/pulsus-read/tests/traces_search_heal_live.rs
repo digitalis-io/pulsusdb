@@ -210,6 +210,13 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             scope_name: String::new(),
             scope_version: String::new(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+            attr_key: Vec::new(),
+            attr_scope: Vec::new(),
+            attr_val: Vec::new(),
+            attr_type: Vec::new(),
+            attr_num: Vec::new(),
         }],
         attrs: vec![AttrRecord {
             date,
@@ -460,6 +467,13 @@ fn two_service_batch(ts_ns: i64) -> ParsedTraces {
         scope_name: String::new(),
         scope_version: String::new(),
         payload: vec![0x01],
+        // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+        // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+        attr_key: Vec::new(),
+        attr_scope: Vec::new(),
+        attr_val: Vec::new(),
+        attr_type: Vec::new(),
+        attr_num: Vec::new(),
     };
     ParsedTraces {
         spans: vec![span(0xA1, 0x01, "svc-a"), span(0xB2, 0x02, "svc-b")],
@@ -591,6 +605,13 @@ fn instrumentation_batch(ts_ns: i64, date: u16) -> ParsedTraces {
             scope_name: "io.opentelemetry.contrib.http".to_string(),
             scope_version: "1.4.2".to_string(),
             payload: vec![0x01],
+            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+            attr_key: Vec::new(),
+            attr_scope: Vec::new(),
+            attr_val: Vec::new(),
+            attr_type: Vec::new(),
+            attr_num: Vec::new(),
         }],
         attrs: vec![AttrRecord {
             date,

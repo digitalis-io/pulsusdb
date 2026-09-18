@@ -415,9 +415,9 @@ Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7292	-	-	req.latency	ac
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7296	-	-	req.latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	lvl	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	tid	accept	accept	-	-	
-Site	Literal	docs/api.md:225	-	-	path	accept	accept	-	-	
-Site	Literal	docs/api.md:234	-	-	latency	accept	accept	-	-	
-Site	Literal	docs/api.md:237	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/api.md:226	-	-	path	accept	accept	-	-	
+Site	Literal	docs/api.md:235	-	-	latency	accept	accept	-	-	
+Site	Literal	docs/api.md:238	-	-	latency	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2689	-	-	a	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2690	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2692	-	-	a	accept	accept	-	-	

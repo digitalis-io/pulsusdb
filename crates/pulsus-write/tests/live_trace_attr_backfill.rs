@@ -204,6 +204,13 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             scope_name: String::new(),
             scope_version: String::new(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
+            // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
+            attr_key: Vec::new(),
+            attr_scope: Vec::new(),
+            attr_val: Vec::new(),
+            attr_type: Vec::new(),
+            attr_num: Vec::new(),
         }],
         attrs: vec![AttrRecord {
             date,

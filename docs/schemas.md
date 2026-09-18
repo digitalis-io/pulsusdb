@@ -688,6 +688,39 @@ ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time (
 ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time;
 ```
 
+**The span's own attribute arrays** (issue #556, migrations 49-59 —
+`crates/pulsus-schema/src/catalog.rs`, ids 49 to 59). Five aligned arrays plus the constraint
+that keeps them aligned. These are `ALTER`s and not part of the frozen `CREATE` above for the
+same reason as the projections: the constraint's `CHECK` names five columns the `CREATE` does
+not declare, so moving it inside the block stops it parsing —
+`Code: 47 ... Missing columns: 'attr_num' 'attr_key' ... (UNKNOWN_IDENTIFIER)`.
+
+Each `ADD COLUMN` also has a cluster-only `_dist` twin (ids 50, 52, 54, 56, 58) that repeats it
+against `trace_spans_dist`, because the wrapper is created from a `CREATE ... AS` that does not
+inherit the base table's `ALTER`s. The constraint has **no** twin: a `Distributed` table refuses
+one (`Code: 48 ... Alter of type 'ADD_CONSTRAINT' is not supported by storage Distributed`), and
+does not need one — a misaligned row sent through the wrapper is refused by the base table's
+constraint.
+
+```sql
+ALTER TABLE trace_spans
+ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));
+ALTER TABLE trace_spans
+ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));
+ALTER TABLE trace_spans
+ADD COLUMN IF NOT EXISTS attr_val Array(String);
+ALTER TABLE trace_spans
+ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));
+ALTER TABLE trace_spans
+ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));
+ALTER TABLE trace_spans
+ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK
+length(attr_key) = length(attr_scope)
+AND length(attr_key) = length(attr_val)
+AND length(attr_key) = length(attr_type)
+AND length(attr_key) = length(attr_num);
+```
+
 - **One table, four physical orders** (finding #5, extended by issues #478 and #555). The base order makes trace-by-ID a point read; the `service_time` projection is a physically re-sorted copy of the 14 non-payload columns that ClickHouse's optimizer selects automatically for service + time predicates; the `name_time` projection (migrations 47/48) is the same 14 columns sorted `(name, timestamp_ns)`, which is what gives a span-name search a sorted path — neither the base order nor `service_time` leads with `name`; and the `span_name_day` **aggregate** projection (migrations 42/43, `SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() GROUP BY d, name`) holds one row per `(UTC day, span name)` so the §4.3 Span Name dropdown reads the distinct names instead of the spans. `name_time` does not replace it: that one is sorted by `name` but still holds a row per span, where the aggregate holds one per `(UTC day, span name)`. It is selected by the DAY expression the table is partitioned by — the same predicate `tags_sql::span_name_values_sql` emits — and a `timestamp_ns` predicate defeats it, which is why that builder carries no sub-day bound. Being an aggregate projection it is tiny (one row per distinct day-and-name pair); the three projections' write amplification is an explicit trade for the read shapes. **Neither re-sorted copy stores the `payload`** (migrations 44-48, issue #555): the only statement that selects it is the §4.2 trace-by-ID point read, which filters on `trace_id` — the base table's first sort key — so the optimizer never reaches a projection for it. What dropping that second copy costs and saves, on a named corpus with the settings it was taken at, is docs/traceql-schema-migration.md §4-§5; no figure is repeated here, because a number away from its instrument cannot be checked. The `idx_duration` minmax works *within* the projection because slow spans cluster weakly by time — it prunes granules for `duration > X` searches; it is deliberately **not** relied on in the base order (finding: minmax on unclustered data is useless — here the projection provides the clustering context).
 
 ```sql
@@ -731,6 +764,7 @@ ORDER BY (scope, key, val, val_type);   -- PRIMARY KEY stays (scope, key, val)
 - Tag **names** read only `trace_tag_catalog` — name discovery never scans span payloads — and the intrinsic vocabulary (the `intrinsic` scope, the closed `status`/`kind` value sets) is served from the TraceQL grammar with no read at all (issue #475). **Tag values read one of three places** (issue #478): the catalog, for an attribute key with no narrowing `q`, byte-identically to before; `trace_attrs_idx` intersected with the matching span set, for an attribute key narrowed by `q`; and `trace_spans` for `name`/`span:name`, which the catalog cannot answer at all because `trace_tag_catalog_mv` projects `trace_attrs_idx` alone and holds no span-`name` row.
 - **`trace_spans.shared` (issue #173, additive migration).** A `shared UInt8 DEFAULT 0` column is added to `trace_spans` by an additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (never a mutation of the frozen CREATE above; pre-#173 rows read back `0`). It is `1` iff the span carried the `zipkin.shared = "true"` attribute at OTLP parse time — the exact wire contract the Zipkin receiver emits (`str_kv("zipkin.shared", "true")`), documented so an OTLP-native sender may set it too. The attribute itself still flows to `trace_attrs_idx` unchanged; the column exists only so the service-graph edge MV below can identify a Zipkin shared span (whose SERVER side is stored under the *client's* `span_id`) and key it by its own id rather than its inherited `parent_id`.
 - **`trace_spans.status_message` (issue #184, migrations 35/36).** A `status_message String DEFAULT ''` column added by the same additive-`ALTER` pattern (id 35 on the base table, id 36 the cluster-gated `_dist` copy; the frozen CREATE above is never mutated, pre-#184 rows read back `''`). It stores the OTLP `Status.message` verbatim — previously dropped at parse time — so the `statusMessage` / `span:statusMessage` TraceQL intrinsic is queryable as a physical span column (a bounded time-window span scan in Phase 1, exact hydrated-column evaluation in Phase 2, byte-capped on read like `name`/`service`).
+- **`trace_spans.attr_key` / `attr_scope` / `attr_val` / `attr_type` / `attr_num` (issue #556, migrations 49-59).** Five **aligned** arrays printed above, added by the same additive-`ALTER` pattern (odd ids on the base table, even ids the cluster-gated `_dist` copies; the frozen CREATE is never mutated, rows written before them read back five EMPTY arrays). Element `i` of each array describes one attribute of that span: its verbatim key, its `scope` discriminator (the same seven spellings `trace_attrs_idx.scope` carries), its rendered value, its declared OTLP kind, and its numeric value or NULL. They carry exactly the attributes that also become `trace_attrs_idx` rows for that span, **in the same order** — the parser derives them from the same records rather than recomputing them, so the number is decided by the whole of (scope, key, value) and not by the value text: a link's `spanID` of `0000000000000001` parses as `1.0` and is stored NULL in both places. Migration 59's `attr_arrays_aligned` CHECK refuses an `INSERT` whose five lengths are not equal (`Code: 469 VIOLATED_CONSTRAINT`); a row naming no array column at all is accepted, because `0 = 0 = 0 = 0 = 0`. A `CHECK` does **not** see an `ALTER TABLE ... UPDATE` mutation, so any later backfill must check alignment itself. **Nothing reads these columns today** — `trace_attrs_idx` still answers every attribute query; they are the write half of the storage change tracked by issue #537, and the `timeSinceStart` intrinsic's `attr_num` reproduces `trace_attrs_idx.val_num` bit for bit, including its `i64 as f64` rounding above 2^53.
 - **`trace_spans.scope_name` / `trace_spans.scope_version` (issue #192, migrations 37/38).** Two `LowCardinality(String) DEFAULT ''` columns added by the same additive-`ALTER` pattern (id 37 on the base table, id 38 the cluster-gated `_dist` copy; the frozen CREATE above is never mutated, pre-#192 rows read back `''`). `LowCardinality` (unlike `status_message`'s plain `String`) matches the sibling `name`/`service` columns — instrumentation library name/version are genuinely low-cardinality. They store the OTLP `InstrumentationScope.name`/`version` verbatim so the `instrumentation:name` / `instrumentation:version` TraceQL intrinsics are queryable as physical span columns (bounded time-window span scan in Phase 1, exact hydrated-column evaluation in Phase 2, byte-capped on read like `name`/`service`), and so `compare()` has a per-span source (§4.2).
 
 **Service-graph edge ledger (issue #173, M7-E1).** `trace_edges` is a **ReplacingMergeTree half-row ledger**: one narrow row per edge-relevant span (a CLIENT/PRODUCER or a SERVER/CONSUMER span), with its own plain `timestamp_ns` — no `SimpleAggregateFunction` anywhere. The directed `client → server` edge is assembled at **query time** (§4.2), so pair completion is a pure function of the stored half-row multiset, never of background-merge progress.
