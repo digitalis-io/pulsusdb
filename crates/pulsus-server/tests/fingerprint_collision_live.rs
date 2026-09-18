@@ -584,6 +584,42 @@ async fn stream_rows(db: &str) -> (u64, u64) {
     (row.rows, row.fingerprints)
 }
 
+/// How many sample rows each stream has, across the whole table rather
+/// than a query window.
+///
+/// **This is the half that makes a state's name checkable.** The stream
+/// rows are `(2, 2)` at every state, so they cannot tell the three apart;
+/// what distinguishes them is what each push wrote, and that is a sample
+/// count. A state whose name says `B` was written again, run against a
+/// fixture that did not write it, fails here rather than passing every
+/// assertion that happens not to look.
+async fn sample_rows(db: &str) -> Vec<(String, u64)> {
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct PerService {
+        service: String,
+        samples: u64,
+    }
+    let client = ChClient::new(live_db::conn_config(db))
+        .await
+        .expect("connect to count log_samples");
+    let mut stream = client
+        .query_stream::<PerService>(
+            &format!(
+                "SELECT service, count() AS samples FROM {db}.log_samples \
+                 GROUP BY service ORDER BY service"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query log_samples");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode the per-service counts");
+        out.push((row.service, row.samples));
+    }
+    out
+}
+
 /// Every logs answer the criterion requires, at one of the three states.
 ///
 /// `b_lines` is how many copies of `B`'s line are **inside the query
@@ -591,12 +627,46 @@ async fn stream_rows(db: &str) -> (u64, u64) {
 /// later states discriminating: the answer to `A`'s selector must not
 /// change when `B` is written again.
 ///
+/// **A state is named for the write history that produced it, not for a
+/// row count.** All three hold two stream rows in a repaired build —
+/// asserted below — so a name like "one stream row" would describe what
+/// the *broken* build stored and contradict the assertion beside it. The
+/// plan for issue #498 names its two states that way, because it named
+/// them by the wrong answers they produced; the mapping is in the table.
+///
 /// ```text
-///   state                       A's sel.      B's sel.       regex   sum by()   label values
-///   one stream row              1 line, f47…  1 line, 1d9…   2       1 and 1    f47…, 1d9…
-///   both rows, one sample each  1 line, f47…  1 line, 1d9…   2       1 and 1    f47…, 1d9…
-///   both rows, two B samples    1 line, f47…  2 lines, 1d9…  2       1 and 2    f47…, 1d9…
+///   state                         what wrote it              the plan's name
+///   ---------------------------   ------------------------   ---------------
+///   one request, both streams     one push carrying both     "one stream row"
+///                                   streams
+///   restarted, B outside window   restart, then B written    "both stream rows"
+///                                   again six hours past T0
+///   B written inside the window   B written again at T0      (not in the plan;
+///                                                              see below)
+///
+///   state                         A's sel.      B's sel.       regex  sum by()  labels
+///   ---------------------------   ------------  -------------  -----  --------  ------
+///   one request, both streams     1 line, f47…  1 line, 1d9…   2      1 and 1   both
+///   restarted, B outside window   1 line, f47…  1 line, 1d9…   2      1 and 1   both
+///   B written inside the window   1 line, f47…  2 lines, 1d9…  2      1 and 2   both
 /// ```
+///
+/// **What each state is for.**
+///
+/// The first is the plan's `one stream row` row: the writer keeps a
+/// per-request set of streams it has already written, and under a 64-bit
+/// fingerprint the two label sets collided in it, so the second stream
+/// was dropped before ClickHouse saw it. The plan requires `A`'s line
+/// from `A`'s selector and `B`'s line, with `B`'s own labels, from `B`'s.
+///
+/// The second is the plan's `both stream rows` row, and the answers below
+/// are the plan's: two streams with one line each, `sum by()` value one
+/// per series, both label values.
+///
+/// The third is not a state the plan tables. It is the same second push
+/// the plan describes, landed inside the window, and it is kept because
+/// it is the sharper test of the same property — `A`'s line count must
+/// stay at one while `B`'s doubles.
 ///
 /// **The middle row is the state the approved plan for issue #498 names,
 /// and its answers are the plan's.** The plan reaches that state by
@@ -624,15 +694,39 @@ async fn stream_rows(db: &str) -> (u64, u64) {
 ///
 /// with `"entries": 2`, and the aggregation answers `1` for `A` and `2`
 /// for `B`.
-async fn assert_logs_answers(port: u16, db: &str, t0_ns: i64, b_lines: usize, state: &str) {
-    // The state's name is about storage, so it is read from storage.
-    // Every route below resolves a selector through `log_streams`, so a
-    // build that collapsed the two streams into one row would answer
-    // wrongly rather than report the collapse.
+async fn assert_logs_answers(
+    port: u16,
+    db: &str,
+    written: (u64, u64),
+    b_lines: usize,
+    t0_ns: i64,
+    state: &str,
+) {
+    // The state's name is a claim about what has been written, so both
+    // halves of it are read from storage before any answer is asked for.
+    //
+    // The stream rows are the same at every state — two, one per stream,
+    // with distinct fingerprints — and that is the part a collapsed
+    // identity breaks: every route below resolves a selector through
+    // `log_streams`, so without this the collapse would surface as a
+    // wrong answer several layers downstream instead of as itself.
+    //
+    // The sample counts are what tell the three states apart, and they
+    // are what the names describe. `written` is `(A's samples, B's)`
+    // across the whole table, not the query window, because what a state
+    // is named for is what it wrote.
     assert_eq!(
         stream_rows(db).await,
         (2, 2),
         "[{state}] log_streams must hold one row per stream, with distinct fingerprints"
+    );
+    assert_eq!(
+        sample_rows(db).await,
+        vec![
+            (LOGS_B.to_string(), written.1),
+            (LOGS_A.to_string(), written.0),
+        ],
+        "[{state}] log_samples must hold what this state's name says was written"
     );
 
     // Each selector names ONE stream and gets that stream's own lines,
@@ -749,7 +843,11 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     let t0_ns = T0_NS;
     let t0_ms = t0_ns / 1_000_000;
 
-    // ---- logs, state one: one push, the writer's cache warm ---------
+    // ---- logs, state one: one request carrying both streams ---------
+    // The writer's per-request set of already-written streams keyed on
+    // the fingerprint alone, so under 64 bits the second stream was
+    // dropped before ClickHouse saw it. Two stream rows is the repaired
+    // answer, which is what the state asserts.
     let res = http_request(
         ANSWERS_PORT,
         "POST",
@@ -760,7 +858,15 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     .expect("push reachable");
     assert_eq!(res.status, 204, "push status (body: {})", res.body);
 
-    assert_logs_answers(ANSWERS_PORT, &db, t0_ns, 1, "one stream row").await;
+    assert_logs_answers(
+        ANSWERS_PORT,
+        &db,
+        (1, 1),
+        1,
+        t0_ns,
+        "one request, both streams",
+    )
+    .await;
 
     // ---- logs, state two: a restart, then B written again ------------
     // The writer holds its written-stream set in memory, so only a
@@ -790,9 +896,10 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     assert_logs_answers(
         ANSWERS_PORT,
         &db,
-        t0_ns,
+        (1, 2),
         1,
-        "both stream rows, one sample each",
+        t0_ns,
+        "restarted, B outside the window",
     )
     .await;
 
@@ -814,9 +921,10 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     assert_logs_answers(
         ANSWERS_PORT,
         &db,
-        t0_ns,
+        (1, 3),
         2,
-        "both stream rows, two B samples",
+        t0_ns,
+        "B written inside the window",
     )
     .await;
     let _guard = guard;
