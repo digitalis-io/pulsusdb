@@ -1946,10 +1946,19 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
         gid: u32,
     }
 
-    // The array the builder renders — `[toUInt128('…'), toUInt128('…')]` —
-    // types as `Array(UInt128)` with no `CAST` of its own.
-    let sql =
-        format!("WITH [toUInt128('{A}'), toUInt128('{B}')] AS fps SELECT toTypeName(fps) AS t");
+    // **The array text comes from the production renderer, not from this
+    // file.** `grouped_sql::grouped_fetch` builds its `fps` array by
+    // calling `sample_sql::render_fingerprint_list`, so that is what is
+    // executed here. A test that writes out the SQL it expects cannot
+    // notice the renderer changing — with the elements hard-coded, making
+    // `FpLiteral` emit a bare decimal left this test green.
+    let rendered = sample_sql::render_fingerprint_list(&[
+        Fingerprint::from_raw(A).sql_literal(),
+        Fingerprint::from_raw(B).sql_literal(),
+    ]);
+
+    // It types as `Array(UInt128)` with no `CAST` of its own.
+    let sql = format!("WITH [{rendered}] AS fps SELECT toTypeName(fps) AS t");
     let mut stream = client
         .query_stream::<TypeRow>(&sql, &QuerySettings::new())
         .await
@@ -1958,12 +1967,13 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
     drop(stream);
     assert_eq!(
         ty, "Array(UInt128)",
-        "the rendered `fps` array does not type as Array(UInt128): {ty}"
+        "the rendered `fps` array does not type as Array(UInt128): {ty}\n  rendered: {rendered}"
     );
 
-    // And `transform` maps each of the two to its own group id.
+    // And `transform` maps each of the two to its own group id, over the
+    // same rendered array.
     let sql = format!(
-        "WITH [toUInt128('{A}'), toUInt128('{B}')] AS fps, \
+        "WITH [{rendered}] AS fps, \
          CAST([101, 102], 'Array(UInt32)') AS gids \
          SELECT fingerprint, transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid \
          FROM fp128_transform WHERE fingerprint IN fps ORDER BY fingerprint"
@@ -1981,7 +1991,36 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
     assert_eq!(
         got,
         vec![(A, 101), (B, 102)],
-        "the group ids at the 2^64 boundary are not the ones `fps`/`gids` name"
+        "the group ids at the 2^64 boundary are not the ones `fps`/`gids` name\n  \
+         rendered: {rendered}"
+    );
+
+    // The whole grouped statement carries the same array, so the check
+    // above is about the statement production sends rather than about a
+    // fragment assembled here.
+    let grid = Grid {
+        start_ms: 1_782_907_200_000,
+        step_ms: 15_000,
+        points: 2,
+        lookback_ms: DEFAULT_LOOKBACK_MS,
+    };
+    let statement = grouped_sql::grouped_fetch(
+        "metric_samples",
+        "metric_hist_samples",
+        "pulsus_probe",
+        &[
+            Fingerprint::from_raw(A).sql_literal(),
+            Fingerprint::from_raw(B).sql_literal(),
+        ],
+        &[101, 102],
+        grid,
+        1_782_907_200_000,
+        1_782_907_230_000,
+        GroupedOp::Max,
+    );
+    assert!(
+        statement.contains(&format!("[{rendered}] AS fps")),
+        "the grouped statement does not carry the rendered array:\n{statement}"
     );
 
     drop_database(&bootstrap, &db).await;
