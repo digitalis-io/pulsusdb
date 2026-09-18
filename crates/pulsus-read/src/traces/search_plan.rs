@@ -1128,9 +1128,9 @@ fn membership_predicate(probe: &AttrProbe) -> Result<String, PlanError> {
 pub enum HydrationShape {
     /// No attribute condition: the pre-#557 statement and row.
     Plain,
-    /// One `Array(UInt8)` column, `attr_probe`.
+    /// One `Array(UInt8)` column, `attr_slot`.
     Probes,
-    /// `attr_probe` plus `attr_probe_val` and `attr_probe_type`, both
+    /// `attr_slot` plus `attr_slot_val` and `attr_slot_type`, both
     /// `Array(String)` and both indexed BY PROBE, carrying the literal
     /// `''` for a probe no projection needs a value from — so no probe's
     /// column is read for a probe that does not need it, and no second
@@ -2561,7 +2561,7 @@ fn projection_value(
         // is NOT in the probe's set — since issue #557 that is the set
         // the hydration column filled — so it has no value to project.
         // A false bit supplies no value either way: the decoder inserts
-        // nothing for a span whose `attr_probe[i]` is 0.
+        // nothing for a span whose `attr_slot[i]` is 0.
         PlannedLeafEval::Attr { negated: true, .. } => None,
         PlannedLeafEval::Attr {
             probe_idx,
@@ -4475,14 +4475,14 @@ mod tests {
                 "{q}"
             );
             let sql = p.hydration_sql_for(&[[0u8; 16]]);
-            assert_eq!(sql.contains("AS attr_probe_val"), want, "{q}:\n{sql}");
+            assert_eq!(sql.contains("AS attr_slot_val"), want, "{q}:\n{sql}");
             // Every one of the five carries its predicate column, so the
             // value assertion above is not a statement about a statement
             // with no probe at all. The alias is matched with the
-            // delimiter that follows it, because `attr_probe` is a prefix
-            // of `attr_probe_val`.
+            // delimiter that follows it, because `attr_slot` is a prefix
+            // of `attr_slot_val`.
             assert!(
-                sql.contains("] AS attr_probe,\n") || sql.contains("] AS attr_probe\n"),
+                sql.contains("] AS attr_slot,\n") || sql.contains("] AS attr_slot\n"),
                 "{q}:\n{sql}"
             );
             // A probe that fuses nothing costs the pre-#557 statement
@@ -4490,7 +4490,7 @@ mod tests {
             // the string-equality class is an SQL IDENTITY, not a granule
             // measurement.
             if !want {
-                assert!(!sql.contains("attr_probe_type"), "{q}:\n{sql}");
+                assert!(!sql.contains("attr_slot_type"), "{q}:\n{sql}");
             }
         }
     }

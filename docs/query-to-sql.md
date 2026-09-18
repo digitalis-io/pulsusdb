@@ -3781,7 +3781,7 @@ WITH arrayFirstIndex((k, s) -> k = 'k' AND s = 'span', attr_key, attr_scope) AS 
      arrayFirstIndex((k, s, v) -> k = 'k' AND s = 'event' AND v = 'v', attr_key, attr_scope, attr_val) AS pm0e,
      arrayFirstIndex((k, s, v) -> k = 'k' AND s = 'link' AND v = 'v', attr_key, attr_scope, attr_val) AS pm0l
 SELECT …,
-       [if(pi0s != 0, attr_val[pi0s] = 'v', if(pi0r != 0, attr_val[pi0r] = 'v', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = 'v', 0)))))] AS attr_probe
+       [if(pi0s != 0, attr_val[pi0s] = 'v', if(pi0r != 0, attr_val[pi0r] = 'v', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = 'v', 0)))))] AS attr_slot
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000

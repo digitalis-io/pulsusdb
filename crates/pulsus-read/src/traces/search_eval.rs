@@ -123,7 +123,7 @@ pub type SpanKey = ([u8; 16], [u8; 8]);
 ///
 /// **Both shapes survive issue #557 and are filled from the hydration
 /// row.** A probe whose matched value no projection needs stays a bare
-/// key set, filled from the row's `attr_probe[i]` bit; a probe a
+/// key set, filled from the row's `attr_slot[i]` bit; a probe a
 /// projection reads a value from carries the value fused into the SAME
 /// row, so the map answers both questions and **the probe issues no
 /// statement of its own at all**.

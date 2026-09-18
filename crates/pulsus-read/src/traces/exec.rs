@@ -2525,7 +2525,7 @@ impl TraceEngine {
                                 + RETAINED_ENTRY_OVERHEAD
                                 + row.service.len()
                                 + row.name.len()
-                                + row.attr_probe.len()
+                                + row.attr_slot.len()
                         },
                     )
                     .await?;
@@ -2544,9 +2544,9 @@ impl TraceEngine {
                                 + RETAINED_ENTRY_OVERHEAD
                                 + row.service.len()
                                 + row.name.len()
-                                + row.attr_probe.len()
-                                + row.attr_probe_val.iter().map(String::len).sum::<usize>()
-                                + row.attr_probe_type.iter().map(String::len).sum::<usize>()
+                                + row.attr_slot.len()
+                                + row.attr_slot_val.iter().map(String::len).sum::<usize>()
+                                + row.attr_slot_type.iter().map(String::len).sum::<usize>()
                         },
                     )
                     .await?;
@@ -3594,7 +3594,7 @@ impl HydrationRowParts for HydrationProbeRow {
         self.span_id
     }
     fn probe_bits(&self) -> &[u8] {
-        &self.attr_probe
+        &self.attr_slot
     }
     fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
         None
@@ -3624,15 +3624,11 @@ impl HydrationRowParts for HydrationProbeValueRow {
         self.span_id
     }
     fn probe_bits(&self) -> &[u8] {
-        &self.attr_probe
+        &self.attr_slot
     }
     fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)> {
-        let value = std::mem::take(self.attr_probe_val.get_mut(i)?);
-        let kind = self
-            .attr_probe_type
-            .get(i)
-            .map(String::as_str)
-            .unwrap_or("");
+        let value = std::mem::take(self.attr_slot_val.get_mut(i)?);
+        let kind = self.attr_slot_type.get(i).map(String::as_str).unwrap_or("");
         Some((value, StoredType::from_stored(kind)))
     }
     fn into_span(self) -> HydratedSpan {
@@ -3676,7 +3672,7 @@ impl HydrationRowParts for HydrationProbeValueRow {
 ///   membership read charged before issue #557 moved the test onto this
 ///   statement, so the Layer-2 counter sees what it saw before.
 ///
-/// **Only a span whose `attr_probe[i]` is 1 enters `membership[i]`.** The
+/// **Only a span whose `attr_slot[i]` is 1 enters `membership[i]`.** The
 /// projected columns carry a value for EVERY span, including one the
 /// probe did not match; inserting that span would make the attribute leaf
 /// match it, because the evaluator asks the set (`search_eval`'s

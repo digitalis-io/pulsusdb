@@ -92,7 +92,7 @@ pub struct MembershipRow {
 
 /// [`HydrationRow`] plus the per-condition probe results (issue #557).
 ///
-/// Positional: `attr_probe` is LAST and index-aligned with
+/// Positional: `attr_slot` is LAST and index-aligned with
 /// `SearchPlan::probes`. The element is `1` when the span's located
 /// element satisfies that condition's positive value test.
 ///
@@ -113,7 +113,7 @@ pub struct HydrationProbeRow {
     pub kind: i8,
     pub scope_name: String,
     pub scope_version: String,
-    pub attr_probe: Vec<u8>,
+    pub attr_slot: Vec<u8>,
 }
 
 /// [`HydrationProbeRow`] plus the fused matched value and its stored
@@ -137,9 +137,9 @@ pub struct HydrationProbeValueRow {
     pub kind: i8,
     pub scope_name: String,
     pub scope_version: String,
-    pub attr_probe: Vec<u8>,
-    pub attr_probe_val: Vec<String>,
-    pub attr_probe_type: Vec<String>,
+    pub attr_slot: Vec<u8>,
+    pub attr_slot_val: Vec<String>,
+    pub attr_slot_type: Vec<String>,
 }
 
 /// One numeric attribute value row (`search_sql::attr_values_sql` with

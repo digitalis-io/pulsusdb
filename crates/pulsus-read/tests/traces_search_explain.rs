@@ -824,12 +824,12 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
     assert_eq!(rows_c.len(), 32, "10b: C decodes one row per batch id");
     assert_eq!(rows_d.len(), 32, "10b: D decodes one row per batch id");
     assert_eq!(
-        rows_a.iter().filter(|r| r.attr_probe[0] == 1).count(),
+        rows_a.iter().filter(|r| r.attr_slot[0] == 1).count(),
         32,
         "10b: every seeded span carries env=prod at resource scope"
     );
     assert_eq!(
-        rows_b.iter().filter(|r| r.attr_probe[1] == 1).count(),
+        rows_b.iter().filter(|r| r.attr_slot[1] == 1).count(),
         16,
         "10b: half the batch carries http.status_code=500"
     );
@@ -902,18 +902,18 @@ async fn the_probe_column_types_are_what_the_row_structs_decode(
                 .clone()
         };
         assert_eq!(
-            ty("attr_probe"),
+            ty("attr_slot"),
             "Array(UInt8)",
             "{label}: an unwrapped NULL comparison would make this Array(Nullable(UInt8)), \
              which does not decode into Vec<u8>:\n{sql}"
         );
         if p.hydration_shape() == HydrationShape::ProbesAndValues {
-            assert_eq!(ty("attr_probe_val"), "Array(String)", "{label}");
-            assert_eq!(ty("attr_probe_type"), "Array(String)", "{label}");
+            assert_eq!(ty("attr_slot_val"), "Array(String)", "{label}");
+            assert_eq!(ty("attr_slot_type"), "Array(String)", "{label}");
         }
         // The control: the same statement with the wrapper removed
         // describes the type this criterion exists to refuse. Without it,
-        // an assertion that `attr_probe` is `Array(UInt8)` would be
+        // an assertion that `attr_slot` is `Array(UInt8)` would be
         // satisfied by any build that never produced a NULL.
         if sql.contains("ifNull(") {
             let unwrapped = strip_ifnull(&sql);
@@ -926,8 +926,8 @@ async fn the_probe_column_types_are_what_the_row_structs_decode(
             .await;
             let raw_ty = raw
                 .iter()
-                .find(|r| r.name == "attr_probe")
-                .expect("the control describes attr_probe")
+                .find(|r| r.name == "attr_slot")
+                .expect("the control describes attr_slot")
                 .ty
                 .clone();
             assert_eq!(
@@ -3314,11 +3314,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         let plain = p.hydration_sql_without_probes_for(&batch);
         assert_ne!(probed, plain, "{label}: the two renders must differ");
         assert!(
-            probed.contains("AS attr_probe_val"),
+            probed.contains("AS attr_slot_val"),
             "{label}: the fusing render must project the matched value:\n{probed}"
         );
         assert!(
-            !plain.contains("attr_probe"),
+            !plain.contains("attr_slot"),
             "{label}: the control render must carry no probe column at all:\n{plain}"
         );
         let raw_probed = explain_raw(&client, &probed).await;
@@ -3364,14 +3364,14 @@ async fn two_phase_search_explain_and_budget_gates() {
     let eq_plan = plan_for(&engine, r#"{ .env = "prod" }"#, base, now);
     assert!(!eq_plan.probe_fuses_value(0));
     let eq_sql = eq_plan.hydration_sql_for(&[[0u8; 16]]);
-    // `attr_probe` is a prefix of `attr_probe_val`, so the alias is
+    // `attr_slot` is a prefix of `attr_slot_val`, so the alias is
     // matched with the delimiter that follows it.
     assert!(
-        eq_sql.contains("] AS attr_probe,\n") || eq_sql.contains("] AS attr_probe\n"),
+        eq_sql.contains("] AS attr_slot,\n") || eq_sql.contains("] AS attr_slot\n"),
         "a string-equality probe still renders its predicate column:\n{eq_sql}"
     );
     assert!(
-        !eq_sql.contains("attr_probe_val"),
+        !eq_sql.contains("attr_slot_val"),
         "a string-equality probe fuses no value, so it reads no value array:\n{eq_sql}"
     );
 
@@ -3480,12 +3480,12 @@ async fn two_phase_search_explain_and_budget_gates() {
         if *fuses {
             fusing_seen += 1;
             assert!(
-                sa.contains("AS attr_probe_val"),
+                sa.contains("AS attr_slot_val"),
                 "{label}: a fusing class must project its matched value:\n{sa}"
             );
         } else {
             assert!(
-                !sa.contains("attr_probe_val"),
+                !sa.contains("attr_slot_val"),
                 "{label}: nothing to fuse, so no value array is read:\n{sa}"
             );
         }
@@ -3496,12 +3496,12 @@ async fn two_phase_search_explain_and_budget_gates() {
         // no probe column at all.
         match *label {
             "string-equality" => assert!(
-                sa.contains("] AS attr_probe,\n") || sa.contains("] AS attr_probe\n"),
+                sa.contains("] AS attr_slot,\n") || sa.contains("] AS attr_slot\n"),
                 "{label}: one probe, one predicate column:\n{sa}"
             ),
             "physical-only" | "nested-set" | "aggregate-value-read" => {
                 assert!(
-                    !sa.contains("attr_probe"),
+                    !sa.contains("attr_slot"),
                     "{label}: this query plans no attribute condition:\n{sa}"
                 )
             }

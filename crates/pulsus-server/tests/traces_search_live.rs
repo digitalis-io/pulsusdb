@@ -2782,7 +2782,7 @@ async fn an_attribute_condition_tests_the_element_the_span_resolves_to() {
 
     // Criterion 14 — **a span the probe did not match contributes no
     // value and no membership.** Trace 7's `k` is `y`, so the `k` probe's
-    // bit is 0 for it; its projected `attr_probe_val` slot still carries
+    // bit is 0 for it; its projected `attr_slot_val` slot still carries
     // `"y"`, and a decoder that inserted it would render a second
     // attribute entry AND make `{ span.k =~ "x.*" }` return trace 7 on
     // its own, because an attribute leaf is evaluated by asking the

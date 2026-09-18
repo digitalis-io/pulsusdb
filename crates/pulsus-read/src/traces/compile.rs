@@ -102,7 +102,7 @@ pub const TRACE_SPANS_CHILD_COUNT: SourceRef = SourceRef("trace_spans:child_coun
 /// The name the membership link records on the hydration statement's
 /// projection (issue #557): one `UInt8` element per attribute condition,
 /// in `SearchPlan::probes` order.
-pub const PROBE_COLUMN: &str = "attr_probe";
+pub const PROBE_COLUMN: &str = "attr_slot";
 
 /// The key every TraceQL handoff is seeded on: phase 2 and the winners'
 /// root read are all `trace_id IN (…)` primary-key reads.
@@ -886,7 +886,7 @@ impl Lower<Tql> for MembershipLower {
     ) -> Result<Relation<Tql>, PlanError> {
         if let TqlLink::Membership(i) = s {
             rel.projection
-                .push((Name::from(PROBE_COLUMN), format!("attr_probe[{}]", i + 1)));
+                .push((Name::from(PROBE_COLUMN), format!("attr_slot[{}]", i + 1)));
         }
         Ok(rel)
     }

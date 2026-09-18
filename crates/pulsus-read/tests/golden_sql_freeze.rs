@@ -375,13 +375,20 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 2
 /// pre-#557 statement byte for byte rather than a statement that merely
 /// looks the same.
 ///
+/// **2026-09-18, issue #558**: the three aliases quoted in the block
+/// above are what issue #557 rendered and are left as that record. They
+/// are spelled `attr_slot`, `attr_slot_val` and `attr_slot_type` at the
+/// head, because a slot is now a condition's probe, a projected field's
+/// locator or an event/link set's width, and `probe` named only the
+/// first of the three.
+///
 /// The `WHERE` clause, the `ORDER BY`, the `LIMIT … BY trace_id` and the
 /// `trace_id IN` restriction are untouched in all 45: the probe
 /// expressions are projections, so part and granule selection cannot
 /// move — `traces_search_explain.rs`'s
 /// `the_probe_columns_keep_the_hydration_reads_index_selection` gates
 /// that as an identity rather than leaving it as this sentence.
-const PINNED_SQL_CORPUS: u64 = 0x881c_4028_6497_a255;
+const PINNED_SQL_CORPUS: u64 = 0x7716_660d_c678_02a4;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -365,7 +365,7 @@ pub fn hydration_sql(
             with_clause = format!("WITH {}\n", items.join(",\n     "));
         }
         let tests: Vec<&str> = probes.iter().map(|p| p.test.as_str()).collect();
-        probe_cols = format!(",\n       [{}] AS attr_probe", tests.join(", "));
+        probe_cols = format!(",\n       [{}] AS attr_slot", tests.join(", "));
         if shape == HydrationShape::ProbesAndValues {
             // Every array carries exactly `probes.len()` elements and a
             // probe no projection reads a value from carries the literal
@@ -379,7 +379,7 @@ pub fn hydration_sql(
                 .map(|p| p.value.as_ref().map_or("''", |(_, t)| t.as_str()))
                 .collect();
             probe_cols.push_str(&format!(
-                ",\n       [{}] AS attr_probe_val,\n       [{}] AS attr_probe_type",
+                ",\n       [{}] AS attr_slot_val,\n       [{}] AS attr_slot_type",
                 values.join(", "),
                 kinds.join(", ")
             ));

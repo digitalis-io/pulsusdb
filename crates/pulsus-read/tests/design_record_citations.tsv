@@ -71,7 +71,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2933	crates/pulsus-
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2996	crates/pulsus-read/src/traces/exec.rs	2996		line	/// #460, two different arbitrary sets from the same input shape.
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:403	crates/pulsus-read/src/traces/exec.rs	403		line	/// The ROOT SPAN's own metadata. `service`/`name` are the reference's
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:404	crates/pulsus-read/src/traces/exec.rs	404		line	/// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5466	crates/pulsus-read/src/traces/exec.rs	5466		line	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5462	crates/pulsus-read/src/traces/exec.rs	5462		line	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:719	crates/pulsus-read/src/traces/exec.rs	719		prose	map_trace_generator_error
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:895	crates/pulsus-read/src/traces/filter.rs	895		prose	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql

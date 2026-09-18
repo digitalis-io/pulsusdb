@@ -2267,7 +2267,7 @@ So a re-take at the default **refuses a statement the shipped reader would run**
 metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
-(`crates/pulsus-read/src/traces/exec.rs:5466`) is what keeps 4,096 shipped: it asserts that the
+(`crates/pulsus-read/src/traces/exec.rs:5462`) is what keeps 4,096 shipped: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
@@ -2425,7 +2425,7 @@ between two takes, is over statements and granules. Rows read and metered bytes 
 rather than checked, and they are outside it because they were measured to be, not because
 excluding them was convenient.**
 
-`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5466`)
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5462`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size

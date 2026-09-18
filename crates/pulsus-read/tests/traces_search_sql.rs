@@ -812,7 +812,7 @@ fn worked_example_pins_the_documented_fragments() {
         "arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) \
          AS pi0"
     ));
-    assert!(hydration.contains("[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_probe"));
+    assert!(hydration.contains("[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_slot"));
     assert!(
         hydration.contains("LIMIT 10001 BY trace_id"),
         "the per-trace overflow probe (MAX_SPANS_PER_TRACE + 1)"
@@ -1773,7 +1773,7 @@ fn plan_of(q: &str) -> SearchPlan {
 /// The aliases one statement's SELECT list emits, in order.
 ///
 /// **The splitter tracks `(` and `[` together.** A probe projection is
-/// `[a, b] AS attr_probe` — a comma inside brackets at paren depth zero —
+/// `[a, b] AS attr_slot` — a comma inside brackets at paren depth zero —
 /// so the paren-only splitter this is modelled on
 /// (`crates/pulsus-read/src/logql/sql.rs`'s
 /// `the_bucketed_row_type_is_named_for_the_statements_own_columns`) would
@@ -1928,7 +1928,7 @@ fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
         items.push(inner[start..].trim().to_string());
         items
     };
-    for alias in ["attr_probe", "attr_probe_val", "attr_probe_type"] {
+    for alias in ["attr_slot", "attr_slot_val", "attr_slot_type"] {
         assert_eq!(
             array_of(alias).len(),
             p.probes_len(),
@@ -1936,17 +1936,17 @@ fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
         );
     }
     assert_eq!(
-        array_of("attr_probe_val")[1],
+        array_of("attr_slot_val")[1],
         "''",
         "the non-fusing probe's value slot is the literal empty string:\n{sql}"
     );
     assert_eq!(
-        array_of("attr_probe_type")[1],
+        array_of("attr_slot_type")[1],
         "''",
         "the non-fusing probe's kind slot is the literal empty string:\n{sql}"
     );
     assert_ne!(
-        array_of("attr_probe_val")[0],
+        array_of("attr_slot_val")[0],
         "''",
         "the fusing probe's value slot reads the located element"
     );
@@ -2019,7 +2019,7 @@ fn every_numeric_probe_arm_is_wrapped_against_a_null_element() {
         let sql = plan_of(q).hydration_sql_for(&BATCH);
         let probe_line = sql
             .lines()
-            .find(|l| l.contains("] AS attr_probe"))
+            .find(|l| l.contains("] AS attr_slot"))
             .unwrap_or_else(|| panic!("{q}: no probe column:\n{sql}"));
         let numeric_reads = probe_line.matches("attr_num[").count();
         assert!(numeric_reads > 0, "{q}: no numeric arm rendered:\n{sql}");
