@@ -108,8 +108,8 @@ pub use metrics::{
     WriterMetricsSnapshot,
 };
 pub use push_dedup::{
-    Capacities, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup, PushDigest,
-    index_bytes, plan_capacities,
+    Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
+    PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, plan_capacities,
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
@@ -126,7 +126,6 @@ use crate::patterns::{
     est_template_bound,
 };
 use crate::protocols::otlp_logs::{ParsedLogs, StreamRow};
-use push_dedup::{Admission, ClaimGuard};
 use table::{ShutdownSignal, TableContext};
 
 const SAMPLES_TABLE: &str = "log_samples";

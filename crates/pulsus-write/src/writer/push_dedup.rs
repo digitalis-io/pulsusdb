@@ -69,6 +69,15 @@ use crate::protocols::otlp_logs::ParsedLogs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PushDigest(u128);
 
+impl PushDigest {
+    /// Wraps a raw 128-bit value. The digest functions above are the only
+    /// production mint; this exists so a caller driving the index directly
+    /// — the charge and ownership suites — can name a key.
+    pub const fn from_raw(value: u128) -> Self {
+        PushDigest(value)
+    }
+}
+
 /// A push's resolved identity: the index key, the content digest the entry
 /// stores for key-reuse detection, and whether the client declared a retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,8 +402,20 @@ const fn waiter_side_bytes(waiters: usize) -> u64 {
 }
 
 /// The whole index's footprint at its bound — the figure the knob bounds.
+///
+/// Three fixed allocations sit beside the two collections and are charged
+/// here because the knob bounds the whole index: the `Arc<Mutex<Core>>`
+/// the lock lives in, the `Arc<DedupMetrics>` the counters live in, and
+/// the `Arc<PushDedup>` the handle itself lives in. Together they are a
+/// few hundred bytes — small, and a model that leaves them out is a model
+/// that disagrees with the allocator, which is the failure mode §0 exists
+/// to stop.
 pub const fn index_bytes(claims: usize, waiters: usize) -> u64 {
-    arc_bytes::<Mutex<Core>>() + claim_table_bytes(claims) + waiter_side_bytes(waiters)
+    arc_bytes::<Mutex<Core>>()
+        + arc_bytes::<DedupMetrics>()
+        + arc_bytes::<PushDedup>()
+        + claim_table_bytes(claims)
+        + waiter_side_bytes(waiters)
 }
 
 /// The reserved sizes an index built against `max_bytes` lands on.
@@ -509,7 +530,7 @@ pub enum ClaimOutcome {
 
 /// How one target settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TargetOutcome {
+pub enum TargetOutcome {
     /// The insert committed.
     Committed,
     /// Provably not committed — a non-retryable failure, or a pre-send
@@ -665,7 +686,7 @@ pub struct PushDedup {
 /// `settle` also takes, so a settle cannot slip between them and a claim
 /// cannot vanish between them either.
 #[derive(Debug)]
-pub(crate) enum Admission {
+pub enum Admission {
     /// Admit. `seal` must be called after the last append.
     Admit(ClaimGuard),
     /// Suppressed, and the original push's outcome is already known.
@@ -689,7 +710,7 @@ pub(crate) enum Admission {
 
 /// Whether a suppressed caller needs to be told the original's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaitMode {
+pub enum WaitMode {
     /// Sync mode: register, and wait for the original's answer.
     Register,
     /// Async mode: the handler answers `202` without waiting, so nothing is
@@ -787,7 +808,7 @@ impl PushDedup {
     /// concurrent identical pushes cannot both admit, and a suppressed
     /// sync caller registers for the original's outcome before the lock is
     /// released.
-    pub(crate) fn admit(self: &Arc<Self>, id: PushIdentity, wait: WaitMode) -> Admission {
+    pub fn admit(self: &Arc<Self>, id: PushIdentity, wait: WaitMode) -> Admission {
         let now_ms = self.now_ms();
         let mut core = self.lock();
         core.expire(now_ms);
@@ -880,7 +901,7 @@ impl PushDedup {
 
     /// Reports one target's fate for one claim, and completes the claim
     /// when every recorded target has reported.
-    fn settle_target(&self, key: PushDigest, outcome: TargetOutcome, counts_for_ack: bool) {
+    pub fn settle_target(&self, key: PushDigest, outcome: TargetOutcome, counts_for_ack: bool) {
         let mut core = self.lock();
         let Some(entry) = core.claims.get_mut(&key) else {
             return;
@@ -945,7 +966,7 @@ impl PushDedup {
     /// Driven once per flush cycle by the per-table flush task: expires
     /// claims whose window elapsed, and ages an open claim past its
     /// deadline into a tombstone.
-    pub(crate) fn tick(&self) {
+    pub fn tick(&self) {
         let now_ms = self.now_ms();
         let mut core = self.lock();
         core.expire(now_ms);
@@ -1109,7 +1130,7 @@ impl Core {
 /// between `admit` and the last append — so the claim is removed and the
 /// same body sent again is stored.
 #[derive(Debug)]
-pub(crate) struct ClaimGuard {
+pub struct ClaimGuard {
     dedup: Arc<PushDedup>,
     key: PushDigest,
     targets: u32,
@@ -1118,14 +1139,14 @@ pub(crate) struct ClaimGuard {
 }
 
 impl ClaimGuard {
-    pub(crate) fn key(&self) -> PushDigest {
+    pub fn key(&self) -> PushDigest {
         self.key
     }
 
     /// Records that this push appended to one more target.
     /// `counts_for_ack` is false for log patterns, which never join the
     /// durability acknowledgement (`writer/mod.rs:566-568`).
-    pub(crate) fn note_target(&mut self, counts_for_ack: bool) {
+    pub fn note_target(&mut self, counts_for_ack: bool) {
         self.targets += 1;
         if counts_for_ack {
             self.ack_targets += 1;
@@ -1134,7 +1155,7 @@ impl ClaimGuard {
 
     /// Fixes the target count after the last append. The guard is armed
     /// from here on: dropping it no longer removes the claim.
-    pub(crate) fn seal(mut self) {
+    pub fn seal(mut self) {
         self.sealed = true;
         let dedup = Arc::clone(&self.dedup);
         let key = self.key;
@@ -1237,7 +1258,7 @@ impl Drop for ClaimTicket {
 /// settlement takes the senders out of the map but never releases, so
 /// neither ordering double-releases and neither leaves a charge behind.
 #[derive(Debug)]
-pub(crate) struct WaitGuard {
+pub struct WaitGuard {
     dedup: Arc<PushDedup>,
     key: PushDigest,
     id: RegistrationId,
