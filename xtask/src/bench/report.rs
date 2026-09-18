@@ -68,7 +68,8 @@ pub fn render_markdown(report: &BenchReport) -> String {
              (`is_initial_query = 0`, a participating non-initiator shard), or `expected-pruned` \
              (a shard `optimize_skip_unused_shards` correctly excluded — `read_rows`/\
              `read_bytes`/`selected_marks` are `0`, and `pruned_reason` spells out the \
-             `fingerprint % total_weight` derivation). **Unpruned stages** (`resolution`, \
+             `cityHash64(fingerprint) % total_weight` derivation). **Unpruned stages** \
+             (`resolution`, \
              `discovery` — no `fingerprint` predicate to prune by) show every shard \
              **participating**. **Fingerprint-scoped stages** (`hydration`, `samples`, \
              `rollup_range`) show exactly the *computed owning subset* participating, with every \
