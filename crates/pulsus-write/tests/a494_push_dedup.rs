@@ -215,7 +215,11 @@ async fn the_declared_limit_has_three_legs() {
 /// Eight identical pushes fired at once: exactly one admits and seven are
 /// counted suppressed. The lookup and the claim are one critical section,
 /// so no two can both find the key absent.
-#[tokio::test]
+///
+/// A multi-threaded runtime and a barrier, so the eight really do overlap:
+/// `admit` is synchronous, so on a current-thread runtime they would run
+/// one after another and the race would not be exercised at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn eight_concurrent_identical_pushes_admit_exactly_one() {
     let samples = MockInserter::new(Behavior::Ok);
     let writer = Arc::new(writer_with(
@@ -223,11 +227,14 @@ async fn eight_concurrent_identical_pushes_admit_exactly_one() {
         samples.clone(),
         MockInserter::new(Behavior::Ok),
     ));
+    let gate = Arc::new(tokio::sync::Barrier::new(8));
 
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let writer = writer.clone();
+        let gate = gate.clone();
         tasks.spawn(async move {
+            gate.wait().await;
             writer.admit(batch(2, "concurrent", T, true), PushHeaders::default())
         });
     }
