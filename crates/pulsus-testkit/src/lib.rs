@@ -1001,19 +1001,46 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// then reads the value out of `trace_spans`'s own attribute arrays. A
 /// fixture that writes only one of the two stores produces a candidate
 /// that matches nothing, or a value read that finds nothing — a defect in
-/// the FIXTURE that reads exactly like a defect in the code. Every raw
-/// `INSERT INTO … trace_attrs_idx` in this repository omitted `val_type`,
-/// which takes the catalog default `''` (`crates/pulsus-schema/src/catalog.rs`),
-/// so the index stored the empty kind while the span row beside it stored
-/// one of the writer's four spellings.
+/// the FIXTURE that reads exactly like a defect in the code.
+///
+/// **The subset this was written for, stated exactly.** Thirteen raw
+/// `INSERT INTO … trace_attrs_idx` statements in the three LIVE SEARCH
+/// fixtures issue #558 touched — `traces_search_explain.rs` (7),
+/// `traces_search_pushdown_live.rs` (5) and `query_log_gates.rs` (1) —
+/// named no `val_type`, so it took the catalog default `''`
+/// (`crates/pulsus-schema/src/catalog.rs`) while the span row beside it
+/// stored one of the writer's four spellings. Issue #558 made the kind a
+/// response renders come from the span row, so the two stores disagreeing
+/// became an answer difference rather than a latent one.
+///
+/// **That is not the repository's whole set.** Measured with
+/// `git grep -n 'INSERT INTO .*trace_attrs_idx' <rev> -- '*.rs'`, excluding
+/// this file (Git 2.53.0, GNU grep 3.12): **27 statements at
+/// `6713c5a1` and 26 at `4ebb3e48`**, across the comparison, query-log,
+/// trace-metrics, trace-search, trace-tags, schema-live and benchmark
+/// sources. The others are on the metrics, tag and schema paths, which do
+/// not read the span row's arrays; some already named `val_type` and some
+/// still do not. A fixture author on those paths is not covered by
+/// anything here.
 ///
 /// # What it compares, and what it cannot
 ///
-/// A two-way multiset difference over
-/// `(trace_id, span_id, key, scope, val, val_type, val_num)`: one
+/// A two-way set difference over the DISTINCT
+/// `(trace_id, span_id, key, scope, val, val_type, val_num)` tuples: one
 /// `EXCEPT` for elements the index holds and the span row does not, and
 /// one for the reverse, so a MISSING element and an EXTRA one are
 /// distinguished and the panic prints the differing rows.
+///
+/// **Distinct, and that is deliberate.** ClickHouse's bare `EXCEPT` is a
+/// MULTISET difference — measured on 26.3.29.7,
+/// `[1,1,2] EXCEPT [1]` returns two rows — so without the `DISTINCT` this
+/// helper could not be called on an at-least-once REPLAY corpus, where a
+/// fixture writes the index rows twice on purpose to reproduce what a
+/// `ReplacingMergeTree` read without `FINAL` sees. What it therefore
+/// cannot see is a duplicate of an element the other store already holds.
+/// Both readers are insensitive to exactly that by construction: the
+/// index read deduped with `SELECT DISTINCT`, and the span side dedups by
+/// `span_id` before any value is taken.
 ///
 /// **It cannot check array ORDER.** `trace_attrs_idx` carries no element
 /// ordinal, so the index cannot say what order a span's attributes were
@@ -1042,11 +1069,11 @@ pub fn assert_stores_agree(db: &str, trace_ids: &[&str]) {
         .collect::<Vec<_>>()
         .join(", ");
     let index_side = format!(
-        "SELECT trace_id, span_id, key, scope, val, val_type, val_num \
+        "SELECT DISTINCT trace_id, span_id, key, scope, val, val_type, val_num \
          FROM {db}.trace_attrs_idx WHERE trace_id IN ({in_list})"
     );
     let span_side = format!(
-        "SELECT trace_id, span_id, k, s, v, t, n FROM {db}.trace_spans \
+        "SELECT DISTINCT trace_id, span_id, k, s, v, t, n FROM {db}.trace_spans \
          ARRAY JOIN attr_key AS k, attr_scope AS s, attr_val AS v, attr_type AS t, attr_num AS n \
          WHERE trace_id IN ({in_list})"
     );

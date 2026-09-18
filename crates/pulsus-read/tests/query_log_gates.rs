@@ -1845,6 +1845,13 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             .await
             .unwrap_or_else(|e| panic!("seed failed: {e}\nSQL:\n{sql}"));
     }
+    // Issue #558: the two stores must hold the same elements. Phase 1
+    // generates candidates from the index and phase 2 reads the value,
+    // its number and its stored kind off the span row, so a fixture whose
+    // two stores disagree produces a candidate that matches nothing, or a
+    // kind the response renders wrong — and either reads as a defect in
+    // the code rather than in the seed.
+    pulsus_testkit::assert_stores_agree(&run_db, &[trace_hex]);
 
     let config = pulsus_read::TraceReadConfig {
         spans_table: "trace_spans".to_string(),

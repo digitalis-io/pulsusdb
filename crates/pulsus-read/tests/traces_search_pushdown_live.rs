@@ -273,6 +273,8 @@ fn corpus_q(base_ns: i64) -> Vec<Seeded> {
 /// merge is the state a read without `FINAL` can genuinely observe, and
 /// stopping merges holds the corpus in it.
 async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize) {
+    let seeded_trace_ids: std::collections::BTreeSet<[u8; 16]> =
+        rows.iter().map(|r| trace_id(r.trace)).collect();
     if attr_repeats > 1 {
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_attrs_idx")).await;
     }
@@ -380,6 +382,20 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
             .await;
         }
     }
+    // Issue #558 criterion 13: the two stores must hold the same
+    // elements. Phase 1 generates candidates from the index and phase 2
+    // reads the value, its number and its stored kind off the span row,
+    // so a fixture whose two stores disagree produces a candidate that
+    // matches nothing, or a kind the response renders wrong — and either
+    // reads as a defect in the code rather than in the seed. Called
+    // inside the seeder, so a NEW caller cannot forget it.
+    //
+    // `assert_stores_agree` compares DISTINCT elements, which is what
+    // lets the replay pass above be covered too: that pass writes the
+    // index rows twice on purpose, and a multiset comparison would report
+    // the deliberate duplicate.
+    let ids: Vec<String> = seeded_trace_ids.iter().map(hex32).collect();
+    pulsus_testkit::assert_stores_agree(db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
 }
 
 /// One TraceQL query, the fragment it must compile to, and the predicate
@@ -566,6 +582,15 @@ fn read_lines(raw: &str) -> Vec<String> {
 /// is about 62 granules at the default `index_granularity` of 8,192, so a
 /// prefix predicate prunes to a strict subset and the test can tell a
 /// pruning statement from a scanning one.
+///
+/// **It writes the INDEX only, and that is why issue #558's
+/// `pulsus_testkit::assert_stores_agree` is not called on it.** Granule
+/// selection over `trace_attrs_idx` is the whole subject here; a matching
+/// `trace_spans` corpus would add 500,000 span rows that no assertion in
+/// this fixture reads. The two stores are asymmetric on purpose, so the
+/// comparison would report the asymmetry the fixture exists to create.
+/// Every fixture in this file that writes BOTH stores is checked, inside
+/// `seed` and `seed_u`.
 const G_METHOD_ROWS: u64 = 200_000;
 const G_DECOY_ROWS: u64 = 200_000;
 const G_K_ROWS: u64 = 100_000;
@@ -1058,6 +1083,15 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
 /// control query below fills its heap on the first batch and stops on the
 /// threshold rule instead of walking every candidate two statements at a
 /// time.
+///
+/// **The two stores are deliberately unequal — 1,000,000 index rows
+/// against 64 span rows — which is why issue #558's
+/// `pulsus_testkit::assert_stores_agree` is not called on it.** The
+/// subject is the phase-1 generator's `GROUP BY trace_id` state at a
+/// million distinct trace ids; seeding a million spans to match would
+/// measure something else and would take the corpus out of the size this
+/// gate can be run at. Every fixture in this file that writes both stores
+/// for the same spans is checked, inside `seed` and `seed_u`.
 const M1_ROWS: u64 = 1_000_000;
 const M1_SPANS: u64 = 64;
 const M1_STEP_NS: i64 = 1_000;
@@ -1641,6 +1675,8 @@ fn corpus_u() -> Vec<URow> {
 /// two identical rows on the ordering key and would delete the very
 /// thing the test is about.
 async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeats: usize) {
+    let seeded_trace_ids: std::collections::BTreeSet<[u8; 16]> =
+        rows.iter().map(|r| trace_id(r.trace)).collect();
     if repeats > 1 {
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_attrs_idx")).await;
         exec(client, &format!("SYSTEM STOP MERGES {db}.trace_spans")).await;
@@ -1697,6 +1733,20 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
             .await;
         }
     }
+    // Issue #558 criterion 13: the two stores must hold the same
+    // elements. Phase 1 generates candidates from the index and phase 2
+    // reads the value, its number and its stored kind off the span row,
+    // so a fixture whose two stores disagree produces a candidate that
+    // matches nothing, or a kind the response renders wrong — and either
+    // reads as a defect in the code rather than in the seed. Called
+    // inside the seeder, so a NEW caller cannot forget it.
+    //
+    // `assert_stores_agree` compares DISTINCT elements, which is what
+    // lets the replay pass above be covered too: that pass writes the
+    // index rows twice on purpose, and a multiset comparison would report
+    // the deliberate duplicate.
+    let ids: Vec<String> = seeded_trace_ids.iter().map(hex32).collect();
+    pulsus_testkit::assert_stores_agree(db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
 }
 
 /// The eighteen (aggregate, operator) cells, and which six the six-cell
@@ -1966,6 +2016,9 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
         ),
     )
     .await;
+    // Issue #558 criterion 13: this corpus is seeded by hand rather than
+    // through `seed`, so the store-agreement check is called here.
+    pulsus_testkit::assert_stores_agree(db, &[&hex32(&trace_id(1))]);
 
     let engine = TraceEngine::new(
         ChClient::new(conn(db)).await.expect("connect (engine)"),
