@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn writer_metrics_snapshot_carries_the_passed_in_queue_bytes() {
         let metrics = WriterMetrics::default();
-        let snap = metrics.snapshot(4096);
+        let snap = metrics.snapshot(4096, DedupMetricsSnapshot::default());
         assert_eq!(snap.queue_bytes, 4096);
     }
 
@@ -420,7 +420,7 @@ mod tests {
         metrics
             .spool_uncertain_total
             .fetch_add(3, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.spool_poison_total, 1);
         assert_eq!(snap.spool_uncertain_total, 3);
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn metric_writer_metrics_snapshot_carries_the_passed_in_queue_bytes() {
         let metrics = MetricWriterMetrics::default();
-        let snap = metrics.snapshot(4096);
+        let snap = metrics.snapshot(4096, DedupMetricsSnapshot::default());
         assert_eq!(snap.queue_bytes, 4096);
     }
 
@@ -481,7 +481,7 @@ mod tests {
             .healed_total
             .fetch_add(3, Ordering::Relaxed);
         metrics.backfill.pending.store(4, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.backfill_enqueued_total, 7);
         assert_eq!(snap.backfill_healed_total, 3);
         assert_eq!(snap.backfill_pending, 4);
@@ -499,7 +499,7 @@ mod tests {
             .metadata_backfill
             .abandoned_total
             .fetch_add(2, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.series_backfill.healed_total, 1);
         assert_eq!(snap.metadata_backfill.abandoned_total, 2);
 
@@ -526,7 +526,7 @@ mod tests {
         metrics
             .metadata_upserts_total
             .fetch_add(3, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.series_registrations_total, 2);
         assert_eq!(snap.series_lru_hits_total, 1);
         assert_eq!(snap.series_lru_misses_total, 2);

@@ -8,6 +8,7 @@
 //! `PULSUS_TEST_CLICKHOUSE=1`-gated live counterparts, incl. the
 //! `ReplacingMergeTree(updated_ns)` collapse-on-read proof).
 
+use pulsus_write::PushHeaders;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -220,7 +221,7 @@ async fn sync_admit_flush_resolves_err_when_series_flush_fails_even_though_sampl
     let writer = writer_with(cfg, samples.clone(), series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 1, 0, true))
+        .admit_flush(batch_for("http_requests_total", 1, 0, true), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -257,7 +258,7 @@ async fn crash_partial_failure_series_uncertain_never_reports_a_false_success() 
     let writer = writer_with(cfg, samples.clone(), series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 7, 0, true))
+        .admit_flush(batch_for("http_requests_total", 7, 0, true), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -276,7 +277,7 @@ async fn crash_partial_failure_series_uncertain_never_reports_a_false_success() 
     // series key must be treated as a miss again (re-emitted), not
     // suppressed.
     writer
-        .admit(batch_for("http_requests_total", 7, 0, true))
+        .admit(batch_for("http_requests_total", 7, 0, true), PushHeaders::default())
         .expect("queue has room");
     assert_eq!(
         writer.metrics().series_lru_misses_total,
@@ -307,7 +308,7 @@ async fn same_bucket_second_sample_is_suppressed_by_the_series_lru() {
     // durability — the success-only LRU promotion hook runs strictly
     // before this wait resolves.
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 1, 0, true))
+        .admit_flush(batch_for("http_requests_total", 1, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -320,7 +321,7 @@ async fn same_bucket_second_sample_is_suppressed_by_the_series_lru() {
     // floors to the same bucket as 0 under the default 1h bucket_ms): must
     // be an LRU hit, no new registration.
     writer
-        .admit(batch_for("http_requests_total", 1, 60_000, false))
+        .admit(batch_for("http_requests_total", 1, 60_000, false), PushHeaders::default())
         .expect("queue has room");
 
     let metrics = writer.metrics();
@@ -353,7 +354,7 @@ async fn new_bucket_for_an_already_registered_series_emits_a_new_registration() 
     let writer = writer_with(cfg, samples.clone(), series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 1, 0, true))
+        .admit_flush(batch_for("http_requests_total", 1, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -365,7 +366,7 @@ async fn new_bucket_for_an_already_registered_series_emits_a_new_registration() 
     // seam does not require the caller to omit already-known series).
     let next_bucket = batch_for("http_requests_total", 1, BUCKET_MS, true);
 
-    let wait = writer.admit_flush(next_bucket).expect("queue has room");
+    let wait = writer.admit_flush(next_bucket, PushHeaders::default()).expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
         .expect("flush settles")
@@ -394,7 +395,7 @@ async fn registered_series_row_carries_the_bucket_floored_timestamp_not_the_raw_
 
     let raw_unix_milli = BUCKET_MS + 12_345; // mid-bucket, not on a boundary
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 1, raw_unix_milli, true))
+        .admit_flush(batch_for("http_requests_total", 1, raw_unix_milli, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -447,7 +448,7 @@ async fn shutdown_settles_inflight_waiters_across_all_three_tables() {
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(batch).expect("queue has room");
+    let wait = writer.admit_flush(batch, PushHeaders::default()).expect("queue has room");
 
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -493,7 +494,7 @@ async fn metadata_repeated_identical_descriptor_flushes_once_then_a_change_flush
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(meta("gauge")).expect("queue has room");
+    let wait = writer.admit_flush(meta("gauge"), PushHeaders::default()).expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
         .expect("flush settles")
@@ -503,7 +504,7 @@ async fn metadata_repeated_identical_descriptor_flushes_once_then_a_change_flush
 
     // Identical descriptor again: must be suppressed at admission (no
     // buffered row at all), not merely deduplicated at flush time.
-    writer.admit(meta("gauge")).expect("queue has room");
+    writer.admit(meta("gauge"), PushHeaders::default()).expect("queue has room");
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
         metadata.call_count(),
@@ -559,7 +560,7 @@ async fn series_backfill_reinserts_a_failed_series_registration_until_durable() 
     let writer = writer_with(cfg, samples.clone(), series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 51, 0, true))
+        .admit_flush(batch_for("http_requests_total", 51, 0, true), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -615,7 +616,7 @@ async fn series_backfill_heal_promotes_the_series_lru() {
     let writer = writer_with(cfg, samples, series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 52, 0, true))
+        .admit_flush(batch_for("http_requests_total", 52, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -632,7 +633,7 @@ async fn series_backfill_heal_promotes_the_series_lru() {
     // Re-admit the identical `(name, fp, bucket, value_type)`: promoted
     // by the confirmed heal, it must hit the LRU — no new series row.
     writer
-        .admit(batch_for("http_requests_total", 52, 0, true))
+        .admit(batch_for("http_requests_total", 52, 0, true), PushHeaders::default())
         .expect("queue has room");
 
     let metrics = writer.metrics();
@@ -661,7 +662,7 @@ async fn series_uncertain_generation_failure_is_never_enqueued_or_replayed() {
     let writer = writer_with(cfg, samples, series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 53, 0, true))
+        .admit_flush(batch_for("http_requests_total", 53, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -698,7 +699,7 @@ async fn series_uncertain_backfill_outcome_is_terminally_abandoned_never_retried
     let writer = writer_with(cfg, samples, series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 54, 0, true))
+        .admit_flush(batch_for("http_requests_total", 54, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -746,7 +747,7 @@ async fn series_deterministic_backfill_failure_abandons_without_spinning() {
     let writer = writer_with(cfg, samples, series.clone(), metadata);
 
     let wait = writer
-        .admit_flush(batch_for("http_requests_total", 55, 0, true))
+        .admit_flush(batch_for("http_requests_total", 55, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -792,7 +793,7 @@ async fn metadata_heal_invalidates_the_cache_so_an_identical_readmission_reemits
     let writer = writer_with(cfg, samples, series, metadata.clone());
 
     let wait = writer
-        .admit_flush(metadata_batch("up", "gauge", "help", 1))
+        .admit_flush(metadata_batch("up", "gauge", "help", 1), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -817,7 +818,7 @@ async fn metadata_heal_invalidates_the_cache_so_an_identical_readmission_reemits
     // promoted): admitting the IDENTICAL descriptor must RE-EMIT a
     // redundant, RMT-collapsed row — never be suppressed.
     let wait = writer
-        .admit_flush(metadata_batch("up", "gauge", "help", 2))
+        .admit_flush(metadata_batch("up", "gauge", "help", 2), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -862,7 +863,7 @@ async fn m7b_stale_metadata_heal_never_installs_over_a_resident_newer_descriptor
     // A@1 poisons: the stale row enters the backlog through the real
     // production hook.
     let wait = writer
-        .admit_flush(metadata_batch("up", "counter", "A", 1))
+        .admit_flush(metadata_batch("up", "counter", "A", 1), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -873,7 +874,7 @@ async fn m7b_stale_metadata_heal_never_installs_over_a_resident_newer_descriptor
     // B@2 confirms while stale A is still pending: the cache now holds B
     // (flush-success upsert).
     let wait = writer
-        .admit_flush(metadata_batch("up", "gauge", "B", 2))
+        .admit_flush(metadata_batch("up", "gauge", "B", 2), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -894,7 +895,7 @@ async fn m7b_stale_metadata_heal_never_installs_over_a_resident_newer_descriptor
     // emit — under an upsert-like hook A would be resident and the
     // admission suppressed, so this 4th insert would never arrive.
     let wait = writer
-        .admit_flush(metadata_batch("up", "counter", "A", 3))
+        .admit_flush(metadata_batch("up", "counter", "A", 3), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -935,7 +936,7 @@ async fn poisoned_sample_and_hist_flushes_never_touch_any_backfill_backlog() {
     let mut batch = batch_for("http_request_duration_seconds", 58, 0, true);
     batch.hist_samples = hist_batch_for("http_request_duration_seconds", 58, 0, false).hist_samples;
 
-    let wait = writer.admit_flush(batch).expect("queue has room");
+    let wait = writer.admit_flush(batch, PushHeaders::default()).expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout")
@@ -1029,7 +1030,7 @@ async fn native_histogram_batch_writes_hist_row_and_registers_value_type_one() {
     let writer = hist_writer_with(cfg, samples.clone(), series.clone(), hist.clone());
 
     let wait = writer
-        .admit_flush(hist_batch_for("http_request_duration_seconds", 7, 0, true))
+        .admit_flush(hist_batch_for("http_request_duration_seconds", 7, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1068,7 +1069,7 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
     // Float sample first: registers metric_series value_type=0, LRU-promoted
     // on flush.
     let wait = writer
-        .admit_flush(batch_for("m", 1, 0, true))
+        .admit_flush(batch_for("m", 1, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1080,7 +1081,7 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
     // Histogram sample at the SAME (name, fp, bucket): a distinct value_type
     // key, so it must register a SECOND metric_series row (value_type=1).
     let wait = writer
-        .admit_flush(hist_batch_for("m", 1, 0, true))
+        .admit_flush(hist_batch_for("m", 1, 0, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await

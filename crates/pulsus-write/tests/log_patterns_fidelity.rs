@@ -25,6 +25,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use pulsus_write::PushHeaders;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,7 +199,7 @@ async fn admit_and_drain(db: &str, batch: ParsedLogs) {
         &WriterConfig::default(),
         WriterTables::logs_default(),
     );
-    pulsus_write::LogSink::admit(&writer, batch).expect("queue has room");
+    pulsus_write::LogSink::admit(&writer, batch, PushHeaders::default()).expect("queue has room");
     writer.shutdown(Duration::from_secs(10)).await;
 }
 

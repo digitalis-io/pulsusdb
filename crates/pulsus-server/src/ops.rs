@@ -15,7 +15,7 @@ use axum::routing::get;
 use pulsus_clickhouse::ChError;
 use pulsus_read::LabelCache;
 use pulsus_write::writer::{
-    BackfillMetricsSnapshot, MetricWriterMetricsSnapshot, TableMetricsSnapshot,
+    BackfillMetricsSnapshot, DedupMetricsSnapshot, MetricWriterMetricsSnapshot, TableMetricsSnapshot,
     TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
 };
 
@@ -232,6 +232,42 @@ fn record_table_metrics(table: &'static str, t: &TableMetricsSnapshot) {
         .absolute(t.spool_write_failures_total);
 }
 
+/// Issue #494's push-suppression series, per signal. Emitted for both
+/// signals from one helper so a counter cannot be wired on one and
+/// forgotten on the other. `declared="1"` is a push whose client sent
+/// `Retry-Attempt`; `declared="0"` is one that did not.
+fn record_dedup_metrics(signal: &'static str, d: &DedupMetricsSnapshot) {
+    metrics::counter!(
+        "pulsus_ingest_duplicate_pushes_total",
+        "signal" => signal,
+        "declared" => "0",
+    )
+    .absolute(d.duplicate_pushes_total);
+    metrics::counter!(
+        "pulsus_ingest_duplicate_pushes_total",
+        "signal" => signal,
+        "declared" => "1",
+    )
+    .absolute(d.duplicate_pushes_declared_total);
+    metrics::counter!("pulsus_ingest_duplicate_rows_suppressed_total", "signal" => signal)
+        .absolute(d.duplicate_rows_suppressed_total);
+    metrics::counter!("pulsus_ingest_dedup_key_reused_total", "signal" => signal)
+        .absolute(d.key_reused_total);
+    metrics::counter!("pulsus_ingest_dedup_mixed_outcome_total", "signal" => signal)
+        .absolute(d.mixed_outcome_total);
+    metrics::counter!("pulsus_ingest_dedup_unknown_total", "signal" => signal)
+        .absolute(d.unknown_total);
+    metrics::counter!("pulsus_ingest_dedup_shed_total", "signal" => signal)
+        .absolute(d.shed_total);
+    metrics::counter!("pulsus_ingest_dedup_wait_shed_total", "signal" => signal)
+        .absolute(d.wait_shed_total);
+    metrics::counter!("pulsus_ingest_dedup_rollbacks_total", "signal" => signal)
+        .absolute(d.rollbacks_total);
+    metrics::gauge!("pulsus_ingest_dedup_wait_bytes", "signal" => signal)
+        .set(d.wait_bytes as f64);
+    metrics::gauge!("pulsus_ingest_dedup_bytes", "signal" => signal).set(d.bytes as f64);
+}
+
 /// The log writer's `pulsus_ingest_*` series: per-table (`log_samples`/
 /// `log_streams`/`log_patterns`), per-signal (`signal="logs"`),
 /// registration-cache, and backfill (`backlog="log_streams"`).
@@ -260,6 +296,7 @@ fn record_log_ingest_snapshot(s: &WriterMetricsSnapshot) {
         .absolute(s.collisions_total);
     metrics::counter!("pulsus_ingest_patterns_dropped_total", "signal" => "logs")
         .absolute(s.patterns_dropped_total);
+    record_dedup_metrics("logs", &s.dedup);
 
     record_backfill_metrics(
         "log_streams",
@@ -304,6 +341,8 @@ fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
         .absolute(s.collisions_total);
     metrics::counter!("pulsus_ingest_metadata_upserts_total", "signal" => "metrics")
         .absolute(s.metadata_upserts_total);
+
+    record_dedup_metrics("metrics", &s.dedup);
 
     record_backfill_metrics("metric_series", &s.series_backfill);
     record_backfill_metrics("metric_metadata", &s.metadata_backfill);
@@ -578,6 +617,79 @@ mod tests {
         }
     }
 
+    /// Issue #494: a `DedupMetricsSnapshot` with every exported field set to
+    /// a distinct nonzero value derived from `base` (offsets 1..=11), so a
+    /// counter wired to the wrong name or the wrong `signal`/`declared`
+    /// label fails rather than passing on a coincidence.
+    fn dedup_snap(base: u64) -> DedupMetricsSnapshot {
+        DedupMetricsSnapshot {
+            duplicate_pushes_total: base + 1,
+            duplicate_pushes_declared_total: base + 2,
+            duplicate_rows_suppressed_total: base + 3,
+            key_reused_total: base + 4,
+            mixed_outcome_total: base + 5,
+            unknown_total: base + 6,
+            shed_total: base + 7,
+            wait_shed_total: base + 8,
+            rollbacks_total: base + 9,
+            wait_bytes: base + 10,
+            bytes: base + 11,
+        }
+    }
+
+    fn assert_dedup_types(r: &str) {
+        for name in [
+            "pulsus_ingest_duplicate_pushes_total",
+            "pulsus_ingest_duplicate_rows_suppressed_total",
+            "pulsus_ingest_dedup_key_reused_total",
+            "pulsus_ingest_dedup_mixed_outcome_total",
+            "pulsus_ingest_dedup_unknown_total",
+            "pulsus_ingest_dedup_shed_total",
+            "pulsus_ingest_dedup_wait_shed_total",
+            "pulsus_ingest_dedup_rollbacks_total",
+        ] {
+            assert_type(r, name, "counter");
+        }
+        assert_type(r, "pulsus_ingest_dedup_wait_bytes", "gauge");
+        assert_type(r, "pulsus_ingest_dedup_bytes", "gauge");
+    }
+
+    /// Asserts all eleven issue #494 series for `signal` carry their exact
+    /// `dedup_snap(base)` values, including both `declared` label values.
+    fn assert_dedup_series(r: &str, signal: &str, base: u64) {
+        assert_sample(
+            r,
+            &format!(
+                r#"pulsus_ingest_duplicate_pushes_total{{declared="0",signal="{signal}"}}"#
+            ),
+            (base + 1) as f64,
+        );
+        assert_sample(
+            r,
+            &format!(
+                r#"pulsus_ingest_duplicate_pushes_total{{declared="1",signal="{signal}"}}"#
+            ),
+            (base + 2) as f64,
+        );
+        for (name, off) in [
+            ("pulsus_ingest_duplicate_rows_suppressed_total", 3u64),
+            ("pulsus_ingest_dedup_key_reused_total", 4),
+            ("pulsus_ingest_dedup_mixed_outcome_total", 5),
+            ("pulsus_ingest_dedup_unknown_total", 6),
+            ("pulsus_ingest_dedup_shed_total", 7),
+            ("pulsus_ingest_dedup_wait_shed_total", 8),
+            ("pulsus_ingest_dedup_rollbacks_total", 9),
+            ("pulsus_ingest_dedup_wait_bytes", 10),
+            ("pulsus_ingest_dedup_bytes", 11),
+        ] {
+            assert_sample(
+                r,
+                &format!(r#"{name}{{signal="{signal}"}}"#),
+                (base + off) as f64,
+            );
+        }
+    }
+
     /// Asserts all seven `record_table_metrics` series for `table` carry their
     /// exact `table_snap(base)` values.
     fn assert_table_series(r: &str, table: &str, base: u64) {
@@ -695,6 +807,7 @@ mod tests {
             backfill_healed_total: 44,
             backfill_abandoned_total: 45,
             backfill_pending: 46,
+            dedup: dedup_snap(70),
         };
         let r = render_local(|| record_log_ingest_snapshot(&snap));
 
@@ -759,6 +872,10 @@ mod tests {
             51.0,
         );
 
+        // Issue #494's push-suppression series.
+        assert_dedup_types(&r);
+        assert_dedup_series(&r, "logs", 70);
+
         // Backfill values (6 series).
         assert_backfill_series(&r, "log_streams", 40);
 
@@ -791,6 +908,7 @@ mod tests {
             rejected_total: 69,
             series_backfill: backfill_snap(140),
             metadata_backfill: backfill_snap(150),
+            dedup: dedup_snap(160),
         };
         let r = render_local(|| record_metric_ingest_snapshot(&snap));
 
@@ -867,6 +985,10 @@ mod tests {
         // Backfill values (2 backlogs × 6 series).
         assert_backfill_series(&r, "metric_series", 140);
         assert_backfill_series(&r, "metric_metadata", 150);
+
+        // Issue #494's push-suppression series, on the other signal.
+        assert_dedup_types(&r);
+        assert_dedup_series(&r, "metrics", 160);
 
         // Metrics writer has no pattern-drop series.
         assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));

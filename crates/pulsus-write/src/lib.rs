@@ -15,7 +15,9 @@ pub use ingest::metrics::{
     HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
 };
 pub use ingest::traces::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceSink};
-pub use ingest::{Backpressure, FlushWait, LogSink};
+pub use ingest::{
+    AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders,
+};
 pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{
     decode_protobuf as decode_loki_protobuf, parse_json as parse_loki_json,

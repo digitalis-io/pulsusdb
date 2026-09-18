@@ -575,6 +575,7 @@ mod tests {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             on_flush_success: None,
             on_flush_poisoned,
+            dedup: None,
         }
     }
 
@@ -594,7 +595,7 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        let (_, _, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 
@@ -647,7 +648,7 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        let (_, _, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 

@@ -1257,6 +1257,9 @@ mod tests {
     struct MockSink {
         outcome: Outcome,
         admitted: Mutex<Vec<ParsedLogs>>,
+        /// Issue #494: the push-identity headers each admission carried, so
+        /// a test can assert what the handler read off the request.
+        pushes: Mutex<Vec<PushHeaders>>,
     }
 
     #[derive(Clone)]
@@ -1264,6 +1267,19 @@ mod tests {
         Admit,
         Backpressure,
         FlushFails,
+        /// Issue #494: the sink refused because the request's
+        /// `Idempotency-Key` had already carried different content.
+        KeyReused,
+    }
+
+    impl Outcome {
+        fn refusal(&self) -> Option<AdmitRefusal> {
+            match self {
+                Outcome::Admit | Outcome::FlushFails => None,
+                Outcome::Backpressure => Some(AdmitRefusal::Backpressure),
+                Outcome::KeyReused => Some(AdmitRefusal::KeyReused),
+            }
+        }
     }
 
     impl MockSink {
@@ -1271,27 +1287,35 @@ mod tests {
             Arc::new(MockSink {
                 outcome,
                 admitted: Mutex::new(Vec::new()),
+                pushes: Mutex::new(Vec::new()),
             })
         }
     }
 
     impl LogSink for MockSink {
-        fn admit(&self, batch: ParsedLogs) -> Result<(), Backpressure> {
+        fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
-            match self.outcome {
-                Outcome::Admit | Outcome::FlushFails => Ok(()),
-                Outcome::Backpressure => Err(Backpressure),
+            self.pushes.lock().unwrap().push(push);
+            match self.outcome.refusal() {
+                None => Ok(()),
+                Some(refusal) => Err(refusal),
             }
         }
 
-        fn admit_flush(&self, batch: ParsedLogs) -> Result<FlushWait, Backpressure> {
+        fn admit_flush(
+            &self,
+            batch: ParsedLogs,
+            push: PushHeaders,
+        ) -> Result<FlushWait, AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
+            self.pushes.lock().unwrap().push(push);
             match self.outcome {
                 Outcome::Admit => Ok(FlushWait::new(async { Ok(()) })),
                 Outcome::FlushFails => Ok(FlushWait::new(async {
                     Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
                 })),
-                Outcome::Backpressure => Err(Backpressure),
+                Outcome::Backpressure => Err(AdmitRefusal::Backpressure),
+                Outcome::KeyReused => Err(AdmitRefusal::KeyReused),
             }
         }
     }
@@ -1800,6 +1824,8 @@ mod tests {
     struct MockMetricSink {
         outcome: Outcome,
         admitted: Mutex<Vec<ParsedMetrics>>,
+        /// Issue #494, as on [`MockSink`].
+        pushes: Mutex<Vec<PushHeaders>>,
     }
 
     impl MockMetricSink {
@@ -1807,27 +1833,35 @@ mod tests {
             Arc::new(MockMetricSink {
                 outcome,
                 admitted: Mutex::new(Vec::new()),
+                pushes: Mutex::new(Vec::new()),
             })
         }
     }
 
     impl MetricSink for MockMetricSink {
-        fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure> {
+        fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
-            match self.outcome {
-                Outcome::Admit | Outcome::FlushFails => Ok(()),
-                Outcome::Backpressure => Err(Backpressure),
+            self.pushes.lock().unwrap().push(push);
+            match self.outcome.refusal() {
+                None => Ok(()),
+                Some(refusal) => Err(refusal),
             }
         }
 
-        fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure> {
+        fn admit_flush(
+            &self,
+            batch: ParsedMetrics,
+            push: PushHeaders,
+        ) -> Result<FlushWait, AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
+            self.pushes.lock().unwrap().push(push);
             match self.outcome {
                 Outcome::Admit => Ok(FlushWait::new(async { Ok(()) })),
                 Outcome::FlushFails => Ok(FlushWait::new(async {
                     Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
                 })),
-                Outcome::Backpressure => Err(Backpressure),
+                Outcome::Backpressure => Err(AdmitRefusal::Backpressure),
+                Outcome::KeyReused => Err(AdmitRefusal::KeyReused),
             }
         }
     }
@@ -2285,7 +2319,10 @@ mod tests {
         fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
             self.admitted.lock().unwrap().push(batch);
             match self.outcome {
-                Outcome::Admit | Outcome::FlushFails => Ok(()),
+                // Traces are out of scope for issue #494: the trace sink
+                // has no suppression index and no `KeyReused` refusal, so
+                // that outcome is unreachable here.
+                Outcome::Admit | Outcome::FlushFails | Outcome::KeyReused => Ok(()),
                 Outcome::Backpressure => Err(Backpressure),
             }
         }
@@ -2293,7 +2330,7 @@ mod tests {
         fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
             self.admitted.lock().unwrap().push(batch);
             match self.outcome {
-                Outcome::Admit => Ok(FlushWait::new(async { Ok(()) })),
+                Outcome::Admit | Outcome::KeyReused => Ok(FlushWait::new(async { Ok(()) })),
                 Outcome::FlushFails => Ok(FlushWait::new(async {
                     Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
                 })),
