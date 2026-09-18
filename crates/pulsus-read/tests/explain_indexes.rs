@@ -3062,11 +3062,7 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
 
     // Three points, all in the wide half, so a bare decimal is a
     // different value at every one of them.
-    let points: [u128; 3] = [
-        WIDE_BASE,
-        WIDE_BASE + 120 * 7_919,
-        WIDE_BASE + 239 * 7_919,
-    ];
+    let points: [u128; 3] = [WIDE_BASE, WIDE_BASE + 120 * 7_919, WIDE_BASE + 239 * 7_919];
     let fps = points
         .iter()
         .map(|v| format!("toUInt128('{v}')"))

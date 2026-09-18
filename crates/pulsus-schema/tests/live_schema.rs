@@ -1087,9 +1087,8 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     struct MutationRow {
         command: String,
     }
-    let sql = format!(
-        "SELECT command FROM system.mutations WHERE database = '{db}' ORDER BY command"
-    );
+    let sql =
+        format!("SELECT command FROM system.mutations WHERE database = '{db}' ORDER BY command");
     let mut stream = client
         .query_stream::<MutationRow>(&sql, &QuerySettings::new())
         .await
@@ -1124,7 +1123,10 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     // decision somebody makes rather than a line nobody reads. The split
     // measured on this base is seven `MATERIALIZE TTL` and four
     // `PROJECTION` commands.
-    let ttl = commands.iter().filter(|c| *c == "(MATERIALIZE TTL)").count();
+    let ttl = commands
+        .iter()
+        .filter(|c| *c == "(MATERIALIZE TTL)")
+        .count();
     let projection = commands.len() - ttl;
     assert_eq!(
         (commands.len(), ttl, projection),
