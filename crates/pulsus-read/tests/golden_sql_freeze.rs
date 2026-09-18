@@ -342,7 +342,46 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 2
 /// Four of the eight new goldens carry a `HAVING` and four do not; the
 /// four that do not are the refusals, each rendering the statement its
 /// aggregate-free twin renders.
-const PINNED_SQL_CORPUS: u64 = 0x1247_7586_664d_c3fa;
+///
+/// **Moved on issue #557: 45 of the 72 `traces_search` goldens changed
+/// and the other 27 are byte-identical. No file was added or removed**,
+/// so the entry count stays at 91 and
+/// [`the_sql_golden_corpus_has_exactly_its_committed_membership`] is
+/// green at its unchanged `99`.
+///
+/// One change, in two halves. Every `== phase2 membership[i] ==` section
+/// is GONE — the attribute condition no longer sends a statement of its
+/// own — and each of those 45 files' hydration statement gained a `WITH`
+/// clause and one predicate column per condition:
+///
+/// ```text
+/// -== phase2 membership[0] ==
+/// -SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v, val_type AS t
+/// -FROM trace_attrs_idx
+/// -WHERE date >= … AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+/// -  AND timestamp_ns > … AND trace_id IN (…)
+///
+/// +WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span',
+/// +                     attr_key, attr_scope) AS pi0
+///  SELECT trace_id, span_id, parent_id, …, scope_version,
+/// +       [(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_probe,
+/// +       [<byte-capped attr_val[pi0]>] AS attr_probe_val,
+/// +       [attr_type[pi0]] AS attr_probe_type
+///  FROM trace_spans
+/// ```
+///
+/// The 27 that did not move are the queries that plan NO attribute
+/// condition, and they are the check that the empty-probe render is the
+/// pre-#557 statement byte for byte rather than a statement that merely
+/// looks the same.
+///
+/// The `WHERE` clause, the `ORDER BY`, the `LIMIT … BY trace_id` and the
+/// `trace_id IN` restriction are untouched in all 45: the probe
+/// expressions are projections, so part and granule selection cannot
+/// move — `traces_search_explain.rs`'s
+/// `the_probe_columns_keep_the_hydration_reads_index_selection` gates
+/// that as an identity rather than leaving it as this sentence.
+const PINNED_SQL_CORPUS: u64 = 0x881c_4028_6497_a255;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -31,8 +31,11 @@
 //!
 //! Of the seven committed `traces_search` goldens that render a
 //! `phase2 select values[…]` section, six also render at least one other
-//! per-batch `trace_attrs_idx` read — a membership read, an aggregate
-//! value read or an event set read — and exactly one does not.
+//! per-batch `trace_attrs_idx` read — an aggregate value read or an event
+//! set read — and exactly one does not. (Before issue #557 an attribute
+//! condition's membership read was a third kind; it is a predicate column
+//! on the hydration statement now and renders no section, which is why
+//! the count is what it is.)
 //! [`exactly_one_committed_select_case_has_no_merge_partner`] asserts
 //! both lists by name, so the claim fails whichever way it stops being
 //! true: a seventh case losing its partner, or the one case gaining one.
@@ -133,10 +136,9 @@ fn the_named_select_query_reads_the_attribute_index_exactly_once() {
 /// The per-batch `trace_attrs_idx` sections a committed `traces_search`
 /// golden can render. A `select()` case whose only entry here is its own
 /// value read has no statement to merge into.
-const ATTRS_READ_SECTIONS: [&str; 4] = [
+const ATTRS_READ_SECTIONS: [&str; 3] = [
     "== phase2 select values[",
     "== phase2 aggregate values[",
-    "== phase2 membership[",
     "== phase2 event set[",
 ];
 

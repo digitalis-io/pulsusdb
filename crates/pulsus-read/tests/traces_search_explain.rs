@@ -72,7 +72,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::{ReadError, TooBroadReason};
-use pulsus_read::traces::search_plan::{SearchParams, plan_search};
+use pulsus_read::traces::rows::{HydrationProbeRow, HydrationProbeValueRow, HydrationRow};
+use pulsus_read::traces::search_plan::{HydrationShape, SearchParams, plan_search};
 use pulsus_read::traces::search_sql;
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
@@ -150,6 +151,18 @@ async fn exec(client: &ChClient, sql: &str) {
 /// 47h, plus per-span attr-index rows — the dense `env=prod` prefix
 /// (every span — the AC3b fixture), the 1% `http.status_code=500`
 /// numeric target, and the `service.name` resource attribute.
+///
+/// **Issue #557: every span also carries the same three attributes in
+/// its own five arrays**, element for element and in the writer's scope
+/// order (resource, then span), so the two stores hold one corpus. All
+/// five arrays or none — `catalog.rs`'s `attr_arrays_aligned` CHECK
+/// refuses a partial insert with `Code: 469 VIOLATED_CONSTRAINT`.
+/// Before this the seeded spans had EMPTY arrays, and a byte comparison
+/// over a probe column would have compared two reads of nothing.
+///
+/// `500`/`200` are integers far under 2^53, so the `Float64` element,
+/// the text `'500'`/`'200'` and the index row's `val_num` are three
+/// exact renderings of one value.
 async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
     let spread = WINDOW_NS / CORPUS_SPANS as i64;
     exec(
@@ -157,7 +170,8 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         &format!(
             "INSERT INTO {db}.trace_spans \
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -166,7 +180,14 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
                if(number % {CHECKOUT_EVERY} = 0, 'checkout', concat('svc-', toString(number % 8))), \
                {base_ns} + toInt64(number) * {spread}, \
                toInt64(number) * 10000, \
-               if(number % {ERROR_EVERY} = 0, 2, 0), 1, 1, 'p' \
+               if(number % {ERROR_EVERY} = 0, 2, 0), 1, 1, 'p', \
+               ['env','service.name','http.status_code'], \
+               ['resource','resource','span'], \
+               ['prod', \
+                if(number % {CHECKOUT_EVERY} = 0, 'checkout', concat('svc-', toString(number % 8))), \
+                if(number % {ERROR_EVERY} = 0, '500', '200')], \
+               ['string','string','int'], \
+               [NULL, NULL, if(number % {ERROR_EVERY} = 0, 500., 200.)] \
              FROM numbers({CORPUS_SPANS})"
         ),
     )
@@ -509,7 +530,8 @@ async fn attr_value_reads_keep_their_index_selection(
 
     let ids = [[0u8; 16], [1u8; 16]];
     // One query per read shape: a numeric aggregate read, a `select()`
-    // string read, and a value-fusing membership probe.
+    // string read, and the retained membership builder's value-fusing
+    // arm — which has no production caller since issue #557.
     let agg = plan_for(engine, r#"{ } | avg(span.http.status_code) > 1"#, base, now);
     let sel = plan_for(engine, r#"{ } | select(span.http.method)"#, base, now);
     let probe = plan_for(engine, r#"{ span.http.status_code >= 500 }"#, base, now);
@@ -529,7 +551,14 @@ async fn attr_value_reads_keep_their_index_selection(
             ", any(val_type) AS t",
         ),
         (
-            "fused membership read",
+            // Issue #557 moved the attribute CONDITION onto the span
+            // row, so this statement has no production caller; the
+            // builder survives as the reproduction path for the frozen
+            // issue #492 evidence. The question issue #510 asked of it —
+            // does projecting the stored kind move granule selection? —
+            // is asked of the hydration statement's own value columns by
+            // `the_probe_columns_keep_the_hydration_reads_index_selection`.
+            "fused membership read (the retained reproduction builder)",
             probe.membership_sql_for(0, &ids),
             ", val_type AS t",
         ),
@@ -537,7 +566,7 @@ async fn attr_value_reads_keep_their_index_selection(
     for (label, sql, projection) in cases {
         assert!(
             sql.contains(projection),
-            "{label}: the production statement must carry {projection:?}:\n{sql}"
+            "{label}: the statement must carry {projection:?}:\n{sql}"
         );
         let control = sql.replace(projection, "");
         assert_ne!(control, sql, "{label}: the control must differ");
@@ -566,6 +595,376 @@ async fn attr_value_reads_keep_their_index_selection(
              above is vacuous"
         );
     }
+}
+
+/// `read_rows`/`read_bytes` for one exact `query_id` (issue #557).
+///
+/// A SEPARATE struct rather than two fields added to [`QueryLogRow`]:
+/// that row is decoded from a four-column SELECT two other helpers share,
+/// and the client validates a returned column against the struct's field
+/// names (`vendor/clickhouse/src/row_metadata.rs`), so a field added
+/// there is a decode error here.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct ReadCountsRow {
+    read_rows: u64,
+    read_bytes: u64,
+}
+
+/// One `DESCRIBE` row (issue #557) — the seven columns ClickHouse
+/// returns, so the decode binds on every name the server sends.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DescribeRow {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+    default_type: String,
+    default_expression: String,
+    comment: String,
+    codec_expression: String,
+    ttl_expression: String,
+}
+
+/// One batch of 32 candidate trace ids that EXIST in the seeded corpus,
+/// spread uniformly over the id space (`number = i * 3750`, and
+/// `CORPUS_SPANS / 32 = 3750`).
+///
+/// Ids the corpus does not carry would make every granule comparison
+/// below a comparison of two empty selections.
+fn corpus_batch() -> Vec<[u8; 16]> {
+    (0..32u64)
+        .map(|i| {
+            let mut id = [0u8; 16];
+            id[8..].copy_from_slice(&(i * 3750).to_be_bytes());
+            id
+        })
+        .collect()
+}
+
+/// The per-reading settings every criterion-10 statement carries, plus
+/// its own `query_id`.
+fn counted_settings(query_id: &str) -> QuerySettings {
+    QuerySettings::new()
+        .set("query_id", query_id)
+        .set("use_query_condition_cache", "0")
+        .set("optimize_move_to_prewhere", "1")
+        .set("max_block_size", "65409")
+        .set("max_threads", "16")
+}
+
+/// The `QueryFinish` row's byte and row counters for one exact
+/// `query_id`, waited for rather than read once.
+///
+/// `SYSTEM FLUSH LOGS` is not a barrier: the row can arrive after it, so
+/// this retries rather than asserting on the first read.
+async fn read_counts_by_id(client: &ChClient, query_id: &str) -> ReadCountsRow {
+    let sql = format!(
+        "SELECT read_rows, read_bytes FROM system.query_log \
+         WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
+         ORDER BY event_time_microseconds DESC LIMIT 1"
+    );
+    for _ in 0..50 {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let mut stream = client
+            .query_stream::<ReadCountsRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log read");
+        let mut row = None;
+        while let Some(r) = stream.next().await {
+            row = Some(r.expect("decode read-counts row"));
+        }
+        if let Some(row) = row {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no QueryFinish row for query_id {query_id}");
+}
+
+/// Drains one tagged statement to completion and RETURNS its rows.
+///
+/// [`drain_tagged`] decodes `CandidateRow`, which is the generator's
+/// shape and not hydration's; this is the same helper over any row type,
+/// because criterion 10b asserts over the decoded VALUES.
+async fn drain_tagged_rows<R: pulsus_clickhouse::ChRow>(
+    client: &ChClient,
+    sql: &str,
+    settings: &QuerySettings,
+) -> Vec<R> {
+    let sql = sql.replace('?', "??");
+    let mut stream = client
+        .query_stream::<R>(&sql, settings)
+        .await
+        .unwrap_or_else(|e| panic!("tagged query failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode row"));
+    }
+    out
+}
+
+/// Criterion 10 — **a second attribute condition reads no more bytes,
+/// and the probe columns move no row.**
+///
+/// Four statements over ONE batch of 32 trace ids, each rendered by the
+/// PRODUCTION builder and run under its own `query_id`:
+///
+/// ```text
+/// A  { resource.env = "prod" }                                      Probes, 1 probe
+/// B  { resource.env = "prod" && span.http.status_code = "500" }     Probes, 2 probes
+/// C  { resource.env =~ "pro.*" }                                    ProbesAndValues, 1 probe
+/// D  A's plan with every probe column removed                       Plain
+/// ```
+///
+/// **A and B read the same arrays and that is why the equality can
+/// hold**: B's second leaf is a STRING equality, so it renders against
+/// the text column only. A numeric leaf would add `attr_num`, and the
+/// equality would be false — correctly.
+///
+/// **The two validity gates are 10a and 10b, not the byte relations.**
+/// Both byte relations are TRUE on a corpus whose five arrays are all
+/// empty, measured: with empty arrays A and B still read equal bytes and
+/// C still reads more. So the gates are statements about the DATA — every
+/// span carries three aligned elements — and about the probe expression
+/// resolving at all.
+async fn the_second_attribute_condition_reads_no_more_bytes(
+    client: &ChClient,
+    engine: &TraceEngine,
+    base: i64,
+    now: i64,
+) {
+    // 10a: the corpus shape, asked of the database over the whole seeded
+    // table. This is what an empty-array seed fails.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+    struct ShapeRow {
+        total: u64,
+        aligned: u64,
+    }
+    // Scoped to the SEEDED CORPUS, which `seed_corpus` is the only writer
+    // of: by the time this gate runs the table also holds every other
+    // fixture in this file, in the same window, each with its own
+    // attribute count. `name = 'op'` is what the seed writes and no other
+    // fixture here does — measured on the live corpus, 120,000 rows.
+    let shape_sql = format!(
+        "SELECT count() AS total, \
+         countIf(length(attr_key) = 3 AND length(attr_scope) = 3 AND length(attr_val) = 3 \
+         AND length(attr_type) = 3 AND length(attr_num) = 3) AS aligned \
+         FROM {DB}.trace_spans WHERE name = 'op'"
+    );
+    let shape: Vec<ShapeRow> = drain_tagged_rows(client, &shape_sql, &QuerySettings::new()).await;
+    let shape = shape.first().copied().expect("one shape row");
+    assert_eq!(
+        (shape.total, shape.aligned),
+        (CORPUS_SPANS, CORPUS_SPANS),
+        "10a: every seeded span must carry all five arrays, three elements each — without \
+         them the byte relations below compare two reads of nothing"
+    );
+
+    let batch = corpus_batch();
+
+    // The window opens at `base - 1` because the search bound is
+    // START-OPEN (`timestamp_ns > start`) and the seed writes its first
+    // span at exactly `base`. At `base` that span is excluded and the
+    // batch decodes 31 rows, which would make the 32/16 counts below
+    // wrong for a reason that has nothing to do with this change.
+    let (w_start, w_end) = (base - 1, now);
+    let a = plan_for(engine, r#"{ resource.env = "prod" }"#, w_start, w_end);
+    let b = plan_for(
+        engine,
+        r#"{ resource.env = "prod" && span.http.status_code = "500" }"#,
+        w_start,
+        w_end,
+    );
+    let c = plan_for(engine, r#"{ resource.env =~ "pro.*" }"#, w_start, w_end);
+    assert_eq!(a.probes_len(), 1, "A: one probe");
+    assert_eq!(b.probes_len(), 2, "B: two probes");
+    assert_eq!(c.probes_len(), 1, "C: one probe");
+    assert_eq!(a.hydration_shape(), HydrationShape::Probes);
+    assert_eq!(b.hydration_shape(), HydrationShape::Probes);
+    assert_eq!(c.hydration_shape(), HydrationShape::ProbesAndValues);
+
+    let sql_a = a.hydration_sql_for(&batch);
+    let sql_b = b.hydration_sql_for(&batch);
+    let sql_c = c.hydration_sql_for(&batch);
+    let sql_d = a.hydration_sql_without_probes_for(&batch);
+    assert_ne!(
+        sql_a, sql_b,
+        "A and B must differ as text, or 10c is vacuous"
+    );
+    assert_ne!(
+        sql_a, sql_c,
+        "A and C must differ as text, or 10d is vacuous"
+    );
+    assert_ne!(
+        sql_a, sql_d,
+        "A and D must differ as text, or 10e is vacuous"
+    );
+
+    let stamp = now_ns();
+    let (id_a, id_b, id_c, id_d) = (
+        format!("c557-a-{stamp}"),
+        format!("c557-b-{stamp}"),
+        format!("c557-c-{stamp}"),
+        format!("c557-d-{stamp}"),
+    );
+    let rows_a: Vec<HydrationProbeRow> =
+        drain_tagged_rows(client, &sql_a, &counted_settings(&id_a)).await;
+    let rows_b: Vec<HydrationProbeRow> =
+        drain_tagged_rows(client, &sql_b, &counted_settings(&id_b)).await;
+    let rows_c: Vec<HydrationProbeValueRow> =
+        drain_tagged_rows(client, &sql_c, &counted_settings(&id_c)).await;
+    let rows_d: Vec<HydrationRow> =
+        drain_tagged_rows(client, &sql_d, &counted_settings(&id_d)).await;
+
+    // 10b: probe TRUTH. The counts are deterministic from the seed —
+    // every span carries `env`, and `number % ERROR_EVERY = 0` holds for
+    // 16 of the 32 batch ids (`number = i * 3750`, and `3750 i mod 100`
+    // is `50 i mod 100`, which is zero for even `i`).
+    assert_eq!(rows_a.len(), 32, "10b: A decodes one row per batch id");
+    assert_eq!(rows_b.len(), 32, "10b: B decodes one row per batch id");
+    assert_eq!(rows_c.len(), 32, "10b: C decodes one row per batch id");
+    assert_eq!(rows_d.len(), 32, "10b: D decodes one row per batch id");
+    assert_eq!(
+        rows_a.iter().filter(|r| r.attr_probe[0] == 1).count(),
+        32,
+        "10b: every seeded span carries env=prod at resource scope"
+    );
+    assert_eq!(
+        rows_b.iter().filter(|r| r.attr_probe[1] == 1).count(),
+        16,
+        "10b: half the batch carries http.status_code=500"
+    );
+
+    let (ca, cb, cc, cd) = (
+        read_counts_by_id(client, &id_a).await,
+        read_counts_by_id(client, &id_b).await,
+        read_counts_by_id(client, &id_c).await,
+        read_counts_by_id(client, &id_d).await,
+    );
+    // 10c: the second condition is free — it reads the same arrays.
+    assert_eq!(
+        cb.read_bytes, ca.read_bytes,
+        "10c: a second condition over the same arrays reads the same bytes ({} vs {})",
+        cb.read_bytes, ca.read_bytes
+    );
+    assert_eq!(
+        cb.read_rows, ca.read_rows,
+        "10c: a second condition reads the same rows"
+    );
+    // 10d: the instrument can tell one more physical array from none.
+    // NOT a validity gate — it is true on an empty-array corpus too.
+    assert!(
+        cc.read_bytes > ca.read_bytes,
+        "10d: the fused-value render reads MORE bytes than the bare probe ({} vs {})",
+        cc.read_bytes,
+        ca.read_bytes
+    );
+    // 10e: the projection moves no row.
+    assert_eq!(
+        cd.read_rows, ca.read_rows,
+        "10e: the probe columns are projections, so granule selection cannot move ({} vs {})",
+        cd.read_rows, ca.read_rows
+    );
+}
+
+/// Criterion 4(b) — **the probe column's type, asked of the database.**
+///
+/// A Rust assertion cannot establish a ClickHouse expression's type, and
+/// this one decides whether the row decodes at all: without the `ifNull`
+/// wrapper a numeric arm is `Nullable(UInt8)` and `Vec<u8>` refuses it.
+/// `DESCRIBE` answers without executing the read.
+async fn the_probe_column_types_are_what_the_row_structs_decode(
+    client: &ChClient,
+    engine: &TraceEngine,
+    base: i64,
+    now: i64,
+) {
+    let batch = [[0u8; 16], [1u8; 16]];
+    for (label, q) in [
+        ("numeric comparison", r#"{ span.http.status_code >= 500 }"#),
+        (
+            "numeric arithmetic",
+            r#"{ span.http.status_code * 2 > 500 }"#,
+        ),
+        ("key existence", r#"{ span.http.status_code != nil }"#),
+        ("unscoped chain, numeric", r#"{ .http.status_code >= 500 }"#),
+    ] {
+        let p = plan_for(engine, q, base, now);
+        assert_eq!(p.probes_len(), 1, "{label}: one probe");
+        let sql = p.hydration_sql_for(&batch);
+        let described: Vec<DescribeRow> =
+            drain_tagged_rows(client, &format!("DESCRIBE ({sql})"), &QuerySettings::new()).await;
+        let ty = |name: &str| -> String {
+            described
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{label}: no column {name}:\n{sql}"))
+                .ty
+                .clone()
+        };
+        assert_eq!(
+            ty("attr_probe"),
+            "Array(UInt8)",
+            "{label}: an unwrapped NULL comparison would make this Array(Nullable(UInt8)), \
+             which does not decode into Vec<u8>:\n{sql}"
+        );
+        if p.hydration_shape() == HydrationShape::ProbesAndValues {
+            assert_eq!(ty("attr_probe_val"), "Array(String)", "{label}");
+            assert_eq!(ty("attr_probe_type"), "Array(String)", "{label}");
+        }
+        // The control: the same statement with the wrapper removed
+        // describes the type this criterion exists to refuse. Without it,
+        // an assertion that `attr_probe` is `Array(UInt8)` would be
+        // satisfied by any build that never produced a NULL.
+        if sql.contains("ifNull(") {
+            let unwrapped = strip_ifnull(&sql);
+            assert_ne!(unwrapped, sql, "{label}: the control must differ");
+            let raw: Vec<DescribeRow> = drain_tagged_rows(
+                client,
+                &format!("DESCRIBE ({unwrapped})"),
+                &QuerySettings::new(),
+            )
+            .await;
+            let raw_ty = raw
+                .iter()
+                .find(|r| r.name == "attr_probe")
+                .expect("the control describes attr_probe")
+                .ty
+                .clone();
+            assert_eq!(
+                raw_ty, "Array(Nullable(UInt8))",
+                "{label}: without the wrapper the column IS nullable, which is why the \
+                 wrapper is required:\n{unwrapped}"
+            );
+        }
+    }
+}
+
+/// Removes one `ifNull(<expr>, 0)` wrapper, leaving `<expr>` — the
+/// control render for criterion 4(b). Scans for the matching close paren
+/// rather than assuming the expression carries none of its own.
+fn strip_ifnull(sql: &str) -> String {
+    let Some(at) = sql.find("ifNull(") else {
+        return sql.to_string();
+    };
+    let inner_start = at + "ifNull(".len();
+    let mut depth = 1usize;
+    let mut end = inner_start;
+    for (i, c) in sql[inner_start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = inner_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let inner = &sql[inner_start..end];
+    let inner = inner.rsplit_once(", 0").map_or(inner, |(head, _)| head);
+    format!("{}{}{}", &sql[..at], inner, &sql[end + 1..])
 }
 
 /// One `#[tokio::test]` running every gate in sequence — the corpus is
@@ -1522,24 +1921,66 @@ async fn two_phase_search_explain_and_budget_gates() {
     let st = now + 30 * 3_600_000_000_000;
     const T1: &str = "00000000000000000000000000517201";
     const T2: &str = "00000000000000000000000000517202";
-    /// `(span_hex, parent_hex, name, service, ts, status_code)`.
-    type StructuralSpanSpec<'a> = (&'a str, &'a str, &'a str, &'a str, i64, i8);
+    /// `(span_hex, parent_hex, name, service, ts, status_code, attrs)` —
+    /// `attrs` is the span's own `(key, value)` list at `span` scope.
+    ///
+    /// **Issue #557: the attribute has to be on the SPAN ROW too.** The
+    /// phase-2 condition is a predicate column over `attr_key`/
+    /// `attr_scope`/`attr_val`, so a fixture that writes only the index
+    /// row generates the candidate and then matches nothing. Every
+    /// attribute a structural fixture asserts on is therefore written
+    /// twice — once into `trace_attrs_idx` for phase 1, once into the
+    /// span's arrays for phase 2 — which is what the writer does for a
+    /// span that arrives over OTLP.
+    type StructuralSpanSpec<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a str,
+        i64,
+        i8,
+        &'a [(&'a str, &'a str)],
+    );
+    /// A ClickHouse array literal of quoted strings, typed so an EMPTY
+    /// list is still `Array(String)` and satisfies the alignment CHECK.
+    fn str_array(items: impl Iterator<Item = String>) -> String {
+        let body: Vec<String> = items.map(|s| format!("'{s}'")).collect();
+        if body.is_empty() {
+            "[]::Array(String)".to_string()
+        } else {
+            format!("[{}]", body.join(", "))
+        }
+    }
     async fn insert_structural_span(
         client: &ChClient,
         trace_hex: &str,
         spec: StructuralSpanSpec<'_>,
     ) {
-        let (span_hex, parent_hex, name, service, ts, status) = spec;
+        let (span_hex, parent_hex, name, service, ts, status, attrs) = spec;
+        let keys = str_array(attrs.iter().map(|(k, _)| (*k).to_string()));
+        let scopes = str_array(attrs.iter().map(|_| "span".to_string()));
+        let vals = str_array(attrs.iter().map(|(_, v)| (*v).to_string()));
+        let types = str_array(attrs.iter().map(|_| "string".to_string()));
+        let nums = if attrs.is_empty() {
+            "[]::Array(Nullable(Float64))".to_string()
+        } else {
+            format!(
+                "[{}]::Array(Nullable(Float64))",
+                vec!["NULL"; attrs.len()].join(", ")
+            )
+        };
         exec(
             client,
             &format!(
                 "INSERT INTO {DB}.trace_spans \
                  (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-                  status_code, kind, payload_type, payload) \
+                  status_code, kind, payload_type, payload, \
+                  attr_key, attr_scope, attr_val, attr_type, attr_num) \
                  SELECT toFixedString(unhex('{trace_hex}'), 16), \
                         toFixedString(unhex('{span_hex}'), 8), \
                         toFixedString(unhex('{parent_hex}'), 8), \
-                        '{name}', '{service}', {ts}, 1000, {status}, 1, 1, 'p'"
+                        '{name}', '{service}', {ts}, 1000, {status}, 1, 1, 'p', \
+                        {keys}, {scopes}, {vals}, {types}, {nums}"
             ),
         )
         .await;
@@ -1562,17 +2003,35 @@ async fn two_phase_search_explain_and_budget_gates() {
     const B: &str = "00000000000000b1";
     const C: &str = "00000000000000c1";
     const D: &str = "00000000000000d1";
+    const FOO_X: &[(&str, &str)] = &[("foo", "x")];
+    const NO_ATTRS: &[(&str, &str)] = &[];
     for spec in [
-        (A, ZERO8, "root-a", "checkout", st, 0),
-        (B, A, "child-b", "websvc", st + 10, 0),
-        (C, B, "grand-c", "websvc", st + 20, 2),
-        (D, A, "sib-d", "websvc", st + 30, 0),
-        ("00000000000000e1", ZERO8, "root-b", "websvc", st + 40, 0),
+        (A, ZERO8, "root-a", "checkout", st, 0, NO_ATTRS),
+        (B, A, "child-b", "websvc", st + 10, 0, FOO_X),
+        (C, B, "grand-c", "websvc", st + 20, 2, NO_ATTRS),
+        (D, A, "sib-d", "websvc", st + 30, 0, NO_ATTRS),
+        (
+            "00000000000000e1",
+            ZERO8,
+            "root-b",
+            "websvc",
+            st + 40,
+            0,
+            NO_ATTRS,
+        ),
     ] {
         insert_structural_span(&client, T1, spec).await;
     }
     for spec in [
-        ("00000000000000f1", ZERO8, "root-f", "othersvc", st + 50, 0),
+        (
+            "00000000000000f1",
+            ZERO8,
+            "root-f",
+            "othersvc",
+            st + 50,
+            0,
+            NO_ATTRS,
+        ),
         (
             "00000000000000f2",
             "00000000000000f1",
@@ -1580,6 +2039,7 @@ async fn two_phase_search_explain_and_budget_gates() {
             "websvc",
             st + 60,
             0,
+            FOO_X,
         ),
         (
             "00000000000000f3",
@@ -1588,6 +2048,7 @@ async fn two_phase_search_explain_and_budget_gates() {
             "websvc",
             st + 70,
             2,
+            NO_ATTRS,
         ),
     ] {
         insert_structural_span(&client, T2, spec).await;
@@ -1741,18 +2202,25 @@ async fn two_phase_search_explain_and_budget_gates() {
     const AC6_B2: &str = "00000000000000d6";
     const AC6_D: &str = "00000000000000e6";
     // Spans (name carries the label so the assertions read the returned set).
+    // Issue #557: each span's own attribute list, written into its arrays
+    // as well as into the index rows below.
+    const AC6_A_ATTRS: &[(&str, &str)] = &[("k", "a"), ("h", "hg")];
+    const AC6_B_ATTRS: &[(&str, &str)] = &[("k", "b"), ("g", "gg"), ("h", "hg")];
+    const AC6_C_ATTRS: &[(&str, &str)] = &[("k", "c"), ("g", "gg")];
+    const AC6_B2_ATTRS: &[(&str, &str)] = &[("k", "b2"), ("g", "gg"), ("h", "hg")];
+    const AC6_D_ATTRS: &[(&str, &str)] = &[("k", "d")];
     for spec in [
-        (AC6_A, ZERO8, "ac6-a", "svc", ac6_st, 0),
-        (AC6_B, AC6_A, "ac6-b", "svc", ac6_st + 10, 0),
-        (AC6_C, AC6_B, "ac6-c", "svc", ac6_st + 20, 0),
-        (AC6_B2, AC6_A, "ac6-b2", "svc", ac6_st + 30, 0),
+        (AC6_A, ZERO8, "ac6-a", "svc", ac6_st, 0, AC6_A_ATTRS),
+        (AC6_B, AC6_A, "ac6-b", "svc", ac6_st + 10, 0, AC6_B_ATTRS),
+        (AC6_C, AC6_B, "ac6-c", "svc", ac6_st + 20, 0, AC6_C_ATTRS),
+        (AC6_B2, AC6_A, "ac6-b2", "svc", ac6_st + 30, 0, AC6_B2_ATTRS),
     ] {
         insert_structural_span(&client, AC6_T1, spec).await;
     }
     insert_structural_span(
         &client,
         AC6_T2,
-        (AC6_D, ZERO8, "ac6-d", "svc", ac6_st + 40, 0),
+        (AC6_D, ZERO8, "ac6-d", "svc", ac6_st + 40, 0, AC6_D_ATTRS),
     )
     .await;
     // Attribute rows: (span, key, val).
@@ -1777,10 +2245,10 @@ async fn two_phase_search_explain_and_budget_gates() {
         .await;
     }
     for (span_hex, rows) in [
-        (AC6_A, &[("k", "a"), ("h", "hg")][..]),
-        (AC6_B, &[("k", "b"), ("g", "gg"), ("h", "hg")][..]),
-        (AC6_C, &[("k", "c"), ("g", "gg")][..]),
-        (AC6_B2, &[("k", "b2"), ("g", "gg"), ("h", "hg")][..]),
+        (AC6_A, AC6_A_ATTRS),
+        (AC6_B, AC6_B_ATTRS),
+        (AC6_C, AC6_C_ATTRS),
+        (AC6_B2, AC6_B2_ATTRS),
     ] {
         for (key, val) in rows {
             insert_ac6_attr(&client, AC6_T1, span_hex, key, val, ac6_st).await;
@@ -1898,12 +2366,56 @@ async fn two_phase_search_explain_and_budget_gates() {
     // cross-type rule is Tempo-verified and correct HERE.
     let fc_st = now + 36 * 3_600_000_000_000;
     const FC_T: &str = "00000000000000000000000000fc0001";
+    // Issue #557: these spans carry NO span-row arrays, deliberately. A
+    // field-vs-field comparison plans no membership probe — both operands
+    // are interned into the `val`/`val_num` value reads, which still go to
+    // `trace_attrs_idx` — so the index rows below are the whole fixture.
     for spec in [
-        ("00000000000000f1", ZERO8, "fc-eq", "svc", fc_st, 0),
-        ("00000000000000f2", ZERO8, "fc-ne", "svc", fc_st + 10, 0),
-        ("00000000000000f3", ZERO8, "fc-xt", "svc", fc_st + 20, 0),
-        ("00000000000000f4", ZERO8, "fc-ab", "svc", fc_st + 30, 0),
-        ("00000000000000f5", ZERO8, "fc-sx", "svc", fc_st + 40, 0),
+        (
+            "00000000000000f1",
+            ZERO8,
+            "fc-eq",
+            "svc",
+            fc_st,
+            0,
+            NO_ATTRS,
+        ),
+        (
+            "00000000000000f2",
+            ZERO8,
+            "fc-ne",
+            "svc",
+            fc_st + 10,
+            0,
+            NO_ATTRS,
+        ),
+        (
+            "00000000000000f3",
+            ZERO8,
+            "fc-xt",
+            "svc",
+            fc_st + 20,
+            0,
+            NO_ATTRS,
+        ),
+        (
+            "00000000000000f4",
+            ZERO8,
+            "fc-ab",
+            "svc",
+            fc_st + 30,
+            0,
+            NO_ATTRS,
+        ),
+        (
+            "00000000000000f5",
+            ZERO8,
+            "fc-sx",
+            "svc",
+            fc_st + 40,
+            0,
+            NO_ATTRS,
+        ),
     ] {
         insert_structural_span(&client, FC_T, spec).await;
     }
@@ -2435,82 +2947,110 @@ async fn two_phase_search_explain_and_budget_gates() {
     const EP_SPAN: &str = "0000000000e19201";
     const EQ: &str = "000000000000000000000000000e1922"; // Q: trace_id[15] = 0x22
     const EQ_SPAN: &str = "0000000000e19202";
+    /// One span's attributes: `(key, value, scope, val_num)` — `val_num`
+    /// is a SQL fragment, `"NULL"` for a text-only attribute.
+    type EventAttr<'a> = (&'a str, &'a str, &'a str, &'a str);
+    /// Inserts one span AND its attributes, into both stores.
+    ///
+    /// **Issue #557 fused the two inserts into one call.** The condition
+    /// is answered from the span row's arrays and the phase-1 candidate
+    /// from the index rows, so a fixture that writes one and not the
+    /// other generates a candidate that then matches nothing. Writing
+    /// them from ONE list is what the OTLP writer does
+    /// (`crates/pulsus-write/src/protocols/otlp_traces.rs` derives the
+    /// arrays from the same `AttrRecord` values the index rows carry).
     async fn insert_event_span(
         client: &ChClient,
         ts: i64,
         trace_hex: &str,
         span_hex: &str,
         name: &str,
+        attrs: &[EventAttr<'_>],
     ) {
+        let lit = |items: Vec<String>| -> String {
+            if items.is_empty() {
+                "[]::Array(String)".to_string()
+            } else {
+                format!("[{}]", items.join(", "))
+            }
+        };
+        let keys = lit(attrs.iter().map(|a| format!("'{}'", a.0)).collect());
+        let vals = lit(attrs.iter().map(|a| format!("'{}'", a.1)).collect());
+        let scopes = lit(attrs.iter().map(|a| format!("'{}'", a.2)).collect());
+        let types = lit(attrs
+            .iter()
+            .map(|a| {
+                if a.3 == "NULL" {
+                    "'string'".to_string()
+                } else {
+                    "'int'".to_string()
+                }
+            })
+            .collect());
+        let nums = if attrs.is_empty() {
+            "[]::Array(Nullable(Float64))".to_string()
+        } else {
+            format!(
+                "[{}]::Array(Nullable(Float64))",
+                attrs
+                    .iter()
+                    .map(|a| a.3.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         exec(
             client,
             &format!(
                 "INSERT INTO {DB}.trace_spans \
                  (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-                  status_code, kind, payload_type, payload) \
+                  status_code, kind, payload_type, payload, \
+                  attr_key, attr_scope, attr_val, attr_type, attr_num) \
                  SELECT toFixedString(unhex('{trace_hex}'), 16), \
                         toFixedString(unhex('{span_hex}'), 8), \
                         toFixedString(unhex('0000000000000000'), 8), \
-                        '{name}', 'evt192', {ts}, 1000, 0, 1, 1, 'p'"
+                        '{name}', 'evt192', {ts}, 1000, 0, 1, 1, 'p', \
+                        {keys}, {scopes}, {vals}, {types}, {nums}"
             ),
         )
         .await;
+        for (key, val, scope, val_num) in attrs {
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO {DB}.trace_attrs_idx \
+                     (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, \
+                      duration_ns) \
+                     SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', \
+                            {val_num}, {ts}, toFixedString(unhex('{trace_hex}'), 16), \
+                            toFixedString(unhex('{span_hex}'), 8), 1000"
+                ),
+            )
+            .await;
+        }
     }
-    async fn insert_event_attr(
-        client: &ChClient,
-        ts: i64,
-        ids: (&str, &str),
-        key: &str,
-        val: &str,
-        scope: &str,
-        val_num: &str,
-    ) {
-        let (trace_hex, span_hex) = ids;
-        exec(
-            client,
-            &format!(
-                "INSERT INTO {DB}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', \
-                        {val_num}, {ts}, toFixedString(unhex('{trace_hex}'), 16), \
-                        toFixedString(unhex('{span_hex}'), 8), 1000"
-            ),
-        )
-        .await;
-    }
-    insert_event_span(&client, g, EP, EP_SPAN, "event-span-p").await;
-    insert_event_attr(
+    insert_event_span(
         &client,
         g,
-        (EP, EP_SPAN),
-        "name",
-        "A",
-        "event:intrinsic",
-        "NULL",
+        EP,
+        EP_SPAN,
+        "event-span-p",
+        &[
+            ("name", "A", "event:intrinsic", "NULL"),
+            ("timeSinceStart", "3000000", "event:intrinsic", "3000000"),
+            ("exception.type", "IOError", "event", "NULL"),
+        ],
     )
     .await;
-    insert_event_attr(
+    insert_event_span(
         &client,
         g,
-        (EP, EP_SPAN),
-        "timeSinceStart",
-        "3000000",
-        "event:intrinsic",
-        "3000000",
+        EQ,
+        EQ_SPAN,
+        "event-span-q",
+        &[("name", "B", "event", "NULL")],
     )
     .await;
-    insert_event_attr(
-        &client,
-        g,
-        (EP, EP_SPAN),
-        "exception.type",
-        "IOError",
-        "event",
-        "NULL",
-    )
-    .await;
-    insert_event_span(&client, g, EQ, EQ_SPAN, "event-span-q").await;
-    insert_event_attr(&client, g, (EQ, EQ_SPAN), "name", "B", "event", "NULL").await;
 
     // Each construct returns EXACTLY span P (index-served), never span Q.
     for q in [
@@ -2612,46 +3152,26 @@ async fn two_phase_search_explain_and_budget_gates() {
     // insert_event_span / insert_event_attr are generic trace_spans /
     // trace_attrs_idx inserters (scope is a parameter) — reused verbatim for
     // the link rows.
-    insert_event_span(&client, g, LP, LP_SPAN, "link-span-p").await;
-    insert_event_attr(
+    insert_event_span(
         &client,
         g,
-        (LP, LP_SPAN),
-        "spanID",
-        LINK_SPAN_HEX,
-        "link:intrinsic",
-        "NULL",
+        LP,
+        LP_SPAN,
+        "link-span-p",
+        &[
+            ("spanID", LINK_SPAN_HEX, "link:intrinsic", "NULL"),
+            ("traceID", LINK_TRACE_HEX, "link:intrinsic", "NULL"),
+            ("relation", "child_of", "link", "NULL"),
+        ],
     )
     .await;
-    insert_event_attr(
+    insert_event_span(
         &client,
         g,
-        (LP, LP_SPAN),
-        "traceID",
-        LINK_TRACE_HEX,
-        "link:intrinsic",
-        "NULL",
-    )
-    .await;
-    insert_event_attr(
-        &client,
-        g,
-        (LP, LP_SPAN),
-        "relation",
-        "child_of",
-        "link",
-        "NULL",
-    )
-    .await;
-    insert_event_span(&client, g, LQ, LQ_SPAN, "link-span-q").await;
-    insert_event_attr(
-        &client,
-        g,
-        (LQ, LQ_SPAN),
-        "spanID",
-        "shadowval",
-        "link",
-        "NULL",
+        LQ,
+        LQ_SPAN,
+        "link-span-q",
+        &[("spanID", "shadowval", "link", "NULL")],
     )
     .await;
 
@@ -2752,19 +3272,23 @@ async fn two_phase_search_explain_and_budget_gates() {
         "an uppercase-hex link:traceID literal must resolve the lowercase-hex-stored span P"
     );
 
-    // ---- issue #479 AC5: the fused membership projection is granule-neutral
+    // ---- issue #557 criterion 9: the probe columns move no granule ----
     //
-    // For the SAME probe, the SAME corpus and the SAME window, the fused
-    // render and the unfused render select the SAME number of primary-key
-    // granules. An IDENTITY, not a pinned granule number and not a
-    // wall-time: the value predicate has already forced the `val` column to
-    // be read inside the selected granules, so adding it to the projection
-    // cannot change what prunes.
+    // For the SAME query, the SAME corpus and the SAME window, the
+    // statement carrying one predicate column per attribute condition and
+    // the statement carrying none select the SAME primary-key granules.
+    // An IDENTITY, not a pinned granule number and not a wall-time: the
+    // probe expressions are PROJECTIONS, so the `WHERE` clause, the
+    // `ORDER BY` and the `LIMIT … BY trace_id` are untouched and nothing
+    // that prunes has moved.
+    //
+    // This replaces issue #479's membership gates, which lost their
+    // subject: the statement they compared is no longer issued.
     //
     // The four classes enumerated are the four `ValuePred` classes that
-    // FUSE a value. `StringEq` never fuses — its value is the query's own
-    // literal — so the claim there is not neutrality but SQL identity, and
-    // it is asserted as such.
+    // FUSE a value, so the `ProbesAndValues` render — three array columns,
+    // not one — is what the identity is taken over. `StringEq` never
+    // fuses; its case is below and is an assertion about the SHAPE.
     for (label, q, select_q) in [
         ("regex", r#"{ .env =~ "pro.*" }"#, r#"{} | select(.env)"#),
         (
@@ -2785,51 +3309,84 @@ async fn two_phase_search_explain_and_budget_gates() {
             p.probe_fuses_value(0),
             "{label} ({q}) must fuse its matched value"
         );
-        let batch = [[0u8; 16], [1u8; 16]];
-        let fused = p.membership_sql_for(0, &batch);
-        let plain = p.membership_sql_without_value_for(0, &batch);
-        assert_ne!(fused, plain, "{label}: the two renders must differ");
-        let raw_fused = explain_raw(&client, &fused).await;
+        let batch = corpus_batch();
+        let probed = p.hydration_sql_for(&batch);
+        let plain = p.hydration_sql_without_probes_for(&batch);
+        assert_ne!(probed, plain, "{label}: the two renders must differ");
+        assert!(
+            probed.contains("AS attr_probe_val"),
+            "{label}: the fusing render must project the matched value:\n{probed}"
+        );
+        assert!(
+            !plain.contains("attr_probe"),
+            "{label}: the control render must carry no probe column at all:\n{plain}"
+        );
+        let raw_probed = explain_raw(&client, &probed).await;
         let raw_plain = explain_raw(&client, &plain).await;
         assert_eq!(
-            primary_key_granules(&raw_fused),
+            primary_key_granules(&raw_probed),
             primary_key_granules(&raw_plain),
-            "{label} ({q}): the fused projection must select the SAME granules\n\
-             fused:\n{raw_fused}\nplain:\n{raw_plain}"
+            "{label} ({q}): the probe columns must select the SAME granules\n\
+             probed:\n{raw_probed}\nplain:\n{raw_plain}"
         );
-        // The control that makes the identity discriminating: the value
-        // read this replaces prunes on `key` alone, so it selects a
-        // DIFFERENT (never smaller) granule set. Without it, "equal
-        // granules" would be satisfiable by any two statements that prune
-        // the same way for an unrelated reason.
+        // The control that makes the identity discriminating: narrowing
+        // the batch to ONE trace id is a change that must move granule
+        // selection. Without it, "equal granules" would be satisfied by a
+        // `primary_key_granules` that returned a constant.
+        let narrowed = p.hydration_sql_for(&batch[..1]);
+        assert_ne!(
+            narrowed, probed,
+            "{label}: the positive control must differ"
+        );
+        let raw_narrowed = explain_raw(&client, &narrowed).await;
+        assert_ne!(
+            primary_key_granules(&raw_narrowed),
+            primary_key_granules(&raw_probed),
+            "{label}: a narrower batch must select fewer granules, or this comparison cannot \
+             tell two selections apart\nnarrowed:\n{raw_narrowed}\nprobed:\n{raw_probed}"
+        );
+        // The separate `select()` value read this fusion replaces still
+        // goes to the attribute index and prunes on `key` alone. It is
+        // named here so the reader can see which read the fused column
+        // stands in for; issue #558 is the part that moves it.
         let sep = plan_for(&engine, select_q, base, now);
-        let values_sql = sep.select_values_sql_for(0, &batch);
-        let raw_values = explain_raw(&client, &values_sql).await;
         assert!(
-            primary_key_granules(&raw_values).0 >= primary_key_granules(&raw_fused).0,
-            "{label}: the separate key-only value read must not prune BETTER than the fused \
-             render — if it did, the fusion would be the pessimisation\nvalues:\n{raw_values}\n\
-             fused:\n{raw_fused}"
+            sep.select_values_sql_for(0, &batch)
+                .contains("FROM trace_attrs_idx"),
+            "{label}: the select() value read still reads the attribute index"
         );
     }
-    // `StringEq` fuses nothing, so its membership SQL is byte-identical to
-    // the pre-change render. That is what makes "an equality attribute
-    // condition costs no read" checkable rather than asserted.
+    // `StringEq` fuses nothing — its projected value is the query's own
+    // literal — so its hydration statement carries the probe column and
+    // NOT the two value arrays. That is what makes "an equality attribute
+    // condition adds one `UInt8` element and nothing else" checkable
+    // rather than asserted.
     let eq_plan = plan_for(&engine, r#"{ .env = "prod" }"#, base, now);
     assert!(!eq_plan.probe_fuses_value(0));
-    assert_eq!(
-        eq_plan.membership_sql_for(0, &[[0u8; 16]]),
-        eq_plan.membership_sql_without_value_for(0, &[[0u8; 16]]),
-        "a string-equality probe issues the SAME statement it did before the projection"
+    let eq_sql = eq_plan.hydration_sql_for(&[[0u8; 16]]);
+    // `attr_probe` is a prefix of `attr_probe_val`, so the alias is
+    // matched with the delimiter that follows it.
+    assert!(
+        eq_sql.contains("] AS attr_probe,\n") || eq_sql.contains("] AS attr_probe\n"),
+        "a string-equality probe still renders its predicate column:\n{eq_sql}"
+    );
+    assert!(
+        !eq_sql.contains("attr_probe_val"),
+        "a string-equality probe fuses no value, so it reads no value array:\n{eq_sql}"
     );
 
-    // ---- issue #479 AC6: the projection adds no statement, and no stage
-    // under ANY name.
+    // ---- issue #557 criterion 5(b): the attribute condition sends NO
+    // statement, under ANY name.
     //
-    // Two runs of each query on the same corpus and window: A the plan as
-    // built, B the same plan with every `probe_values[i]` forced false. A
-    // stage added under a NEW name changes the multiset; one added under an
-    // EXISTING name changes its count. Neither can pass.
+    // One run of each query on the same corpus and window, over eight
+    // shapes. A stage added under a NEW name shows in the multiset; one
+    // added under an EXISTING name shows in its count. The claim is
+    // `phase2_attr_membership` is absent entirely and `phase2_hydration`
+    // is issued exactly once per candidate batch.
+    //
+    // This replaces issue #479's A/B run against
+    // `without_fused_probe_values`, which was deleted with the membership
+    // statement it varied.
     fn stage_multiset(e: &pulsus_read::PlanExplain) -> std::collections::BTreeMap<String, usize> {
         let mut out = std::collections::BTreeMap::new();
         for s in &e.stages {
@@ -2837,10 +3394,10 @@ async fn two_phase_search_explain_and_budget_gates() {
         }
         out
     }
-    fn membership_sql_of(e: &pulsus_read::PlanExplain) -> String {
+    fn hydration_sql_of(e: &pulsus_read::PlanExplain) -> String {
         e.stages
             .iter()
-            .filter(|s| s.name == "phase2_attr_membership")
+            .filter(|s| s.name == "phase2_hydration")
             .map(|s| s.sql.clone())
             .collect::<Vec<_>>()
             .join("\n")
@@ -2873,15 +3430,10 @@ async fn two_phase_search_explain_and_budget_gates() {
     let mut value_read_seen = 0usize;
     for (label, q, fuses) in ac6 {
         let a = plan_for(&engine, q, base, now);
-        let b = a.without_fused_probe_values();
         let (_, ea) = engine
             .search_explained(&a)
             .await
-            .unwrap_or_else(|e| panic!("{label} A: {e}"));
-        let (_, eb) = engine
-            .search_explained(&b)
-            .await
-            .unwrap_or_else(|e| panic!("{label} B: {e}"));
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
 
         // ---- issue #492 part 3: the explained response carries the
         // compiled plan, and its FIRST part is named for the table the
@@ -2913,45 +3465,50 @@ async fn two_phase_search_explain_and_budget_gates() {
         }
 
         // (3a) direction-neutral validity gate, BEFORE the comparison:
-        // both traces are non-empty and both reached hydration, so a
-        // no-op implementation cannot satisfy (1) vacuously.
-        let (ma, mb) = (stage_multiset(&ea), stage_multiset(&eb));
-        assert!(!ma.is_empty() && !mb.is_empty(), "{label}: empty explain");
+        // the run is non-empty and reached hydration, so a no-op
+        // implementation cannot satisfy (1) vacuously.
+        let ma = stage_multiset(&ea);
+        assert!(!ma.is_empty(), "{label}: empty explain");
         assert!(
-            ma.contains_key("phase2_hydration") && mb.contains_key("phase2_hydration"),
-            "{label}: both runs must reach hydration"
+            ma.contains_key("phase2_hydration"),
+            "{label}: the run must reach hydration"
         );
 
-        // (3b) the projection is actually ON in A for exactly the fusing
-        // classes, and byte-identical for the others.
-        let (sa, sb) = (membership_sql_of(&ea), membership_sql_of(&eb));
+        // (3b) the fused value is on the hydration statement for exactly
+        // the fusing classes, and absent for the others.
+        let sa = hydration_sql_of(&ea);
         if *fuses {
             fusing_seen += 1;
-            assert_ne!(sa, sb, "{label}: A must fuse a value where B does not");
-            assert!(sa.contains(" AS v"), "{label}:\n{sa}");
+            assert!(
+                sa.contains("AS attr_probe_val"),
+                "{label}: a fusing class must project its matched value:\n{sa}"
+            );
         } else {
-            assert_eq!(sa, sb, "{label}: nothing to fuse, so the SQL is identical");
+            assert!(
+                !sa.contains("attr_probe_val"),
+                "{label}: nothing to fuse, so no value array is read:\n{sa}"
+            );
         }
-        // (3c) no identity is vacuous: the string-equality query DOES
-        // issue a membership read, while the physical-only and nested-set
-        // queries issue none — without this, two of the three "identical"
-        // comparisons would be `"" == ""`.
+        // (3c) no assertion is vacuous: the string-equality query DOES
+        // plan a probe, while the physical-only, nested-set and
+        // aggregate-value queries plan none — without this, three of the
+        // "no value array" checks above would hold over a statement with
+        // no probe column at all.
         match *label {
-            "string-equality" => assert!(!sa.is_empty(), "{label}: one probe, one read"),
+            "string-equality" => assert!(
+                sa.contains("] AS attr_probe,\n") || sa.contains("] AS attr_probe\n"),
+                "{label}: one probe, one predicate column:\n{sa}"
+            ),
             "physical-only" | "nested-set" | "aggregate-value-read" => {
                 assert!(
-                    sa.is_empty(),
-                    "{label}: this query issues no membership read"
+                    !sa.contains("attr_probe"),
+                    "{label}: this query plans no attribute condition:\n{sa}"
                 )
             }
             _ => {}
         }
 
         // (1) the decision gate.
-        assert_eq!(
-            ma, mb,
-            "{label} ({q}): the projection must add no stage under ANY name"
-        );
         // (2) the plan-derived identities, an independent second
         // assertion. Phase 2 runs per candidate BATCH, so the identity
         // carries the batch factor explicitly — `phase2_hydration` is
@@ -2963,8 +3520,15 @@ async fn two_phase_search_explain_and_budget_gates() {
         assert!(batches > 0, "{label}: at least one batch must hydrate");
         assert_eq!(
             ma.get("phase2_attr_membership").copied().unwrap_or(0),
-            a.probes_len() * batches,
-            "{label}: one membership read per probe per batch"
+            0,
+            "{label}: issue #557 — an attribute condition sends NO statement of its own, \
+             whatever the plan's {} probes",
+            a.probes_len()
+        );
+        assert_eq!(
+            ma.get("phase2_hydration").copied().unwrap_or(0),
+            batches,
+            "{label}: exactly one hydration statement per candidate batch"
         );
         let value_reads = a.select_attrs_len() + a.agg_fields_len();
         if value_reads > 0 {
@@ -3119,6 +3683,12 @@ async fn two_phase_search_explain_and_budget_gates() {
 
     // ---- issue #492 part 5: the pushdown is granule-neutral ------------
     the_pushdown_keeps_the_generators_index_selection(&client, &engine, base, now).await;
+
+    // ---- issue #557 criterion 10: the second condition is free ---------
+    the_second_attribute_condition_reads_no_more_bytes(&client, &engine, base, now).await;
+
+    // ---- issue #557 criterion 4(b): the probe column's type ------------
+    the_probe_column_types_are_what_the_row_structs_decode(&client, &engine, base, now).await;
 }
 
 /// Issue #492 part 5 criterion 14 — **the granule-identity gate for the

@@ -180,9 +180,6 @@ fn section_source(
             .expect("one FROM per generator section");
         return Some(table.trim_end_matches("_dist").to_string());
     }
-    if section.starts_with("phase2 membership[") {
-        return Some("trace_attrs_idx:membership".to_string());
-    }
     if section.starts_with("phase2 aggregate values[")
         || section.starts_with("phase2 select values[")
     {
@@ -294,10 +291,19 @@ fn the_generator_fan_out_exception_is_exactly_these_three() {
     );
 }
 
-/// The six queries the issue names, with the part counts it states.
+/// The six queries issue #492 names, with the part counts they plan.
+///
+/// **Issue #557 moved three of them.** An attribute condition used to
+/// send a membership statement of its own; it is now a predicate column
+/// on the hydration statement, so a query with one plans ONE FEWER SQL
+/// part. The three that moved are the ones carrying an attribute
+/// condition: `span.http.method = "GET"` twice, and the disjunction's
+/// second branch. `resource.service.name` is a physical column and plans
+/// no probe, and a `select()` field is a value read this change does not
+/// touch, so those three counts stand.
 const NAMED_QUERIES: [(&str, usize); 6] = [
-    (r#"{ span.http.method = "GET" }"#, 4),
-    (r#"{ span.http.method = "GET" } | max(duration) > 1s"#, 4),
+    (r#"{ span.http.method = "GET" }"#, 3),
+    (r#"{ span.http.method = "GET" } | max(duration) > 1s"#, 3),
     (
         r#"{ resource.service.name = "grp" } | by(name) | count() > 2"#,
         3,
@@ -312,7 +318,7 @@ const NAMED_QUERIES: [(&str, usize); 6] = [
     ),
     (
         r#"{ resource.service.name = "checkout" || span.http.method = "GET" }"#,
-        5,
+        4,
     ),
 ];
 
@@ -424,7 +430,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
         }
         let statements = plan.generator_sqls.len()
             + 1                                                 // hydration
-            + plan.probes_len()
+            // Issue #557: the probes send NO statement — each is a
+            // predicate column on the hydration read above.
             + plan.agg_fields_len()
             + plan.select_attrs_len()
             + plan.event_sets_len()
@@ -468,8 +475,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
     }
     assert_eq!(
         (total_statements, total_sections),
-        (301, 301),
-        "the committed corpus renders 301 statements and the plans account for all of them"
+        (251, 251),
+        "the committed corpus renders 251 statements and the plans account for all of them"
     );
     assert_eq!(
         preflight_cases,
@@ -531,7 +538,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
             *kinds.entry(kind).or_insert(0) += 1;
         }
     }
-    assert_eq!(total, 301, "the committed corpus renders 301 statements");
+    assert_eq!(total, 251, "the committed corpus renders 251 statements");
     assert_eq!(
         kinds.get("by() cardinality probe").copied().unwrap_or(0),
         1,
@@ -540,7 +547,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
     );
     assert_eq!(
         kinds.len(),
-        10,
+        9,
         "the section vocabulary this target maps: {kinds:?}"
     );
 }

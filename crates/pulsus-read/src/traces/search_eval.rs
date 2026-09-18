@@ -1,12 +1,22 @@
 //! Phase-2 exact evaluation (issue #57 plan v3-v7; docs/schemas.md §4.2)
 //! — pure, no I/O, unit-tested without a database. Given one hydrated
 //! candidate batch (spans deduped by `span_id`) plus its attribute
-//! membership / value reads, evaluates the **full** query exactly:
+//! membership SETS, filled from the hydration rows' predicate columns
+//! (issue #557), and its attribute value reads, evaluates the **full**
+//! query exactly:
 //!
 //! - the boolean `FieldExpr` tree per span (physical leaves on hydrated
 //!   columns; attribute leaves by membership — the ratified negation
-//!   rule: `!=`/`!~` matches a span iff **no** index row for that span
-//!   satisfies the positive predicate, so absent-key spans match);
+//!   rule: `!=`/`!~` matches a span iff it is NOT in the probe's
+//!   positive set, so a span with no such key matches. A span enters
+//!   that set when the probe's predicate holds for it: at the
+//!   single-valued scopes (span, resource, instrumentation) the
+//!   predicate tests the one element the locator lands on; over the
+//!   event and link collections — their attribute and reserved-key
+//!   scopes alike — it holds when ANY element matches (the arity
+//!   carve-out), so `{ event.code != "c3" }` matches the span whose
+//!   events carry other codes and the span carrying no `code`, and not
+//!   the span carrying `c3`);
 //! - cross-spanset algebra with matched-span membership preserved
 //!   (`{A} && {B}` keeps traces matching both, spanset = union of the
 //!   operands' matched spans; `||` unions — trace-level, task-manager
@@ -111,10 +121,17 @@ pub type SpanKey = ([u8; 16], [u8; 8]);
 /// maps otherwise, so other queries pay nothing).
 /// One probe's batch membership result (issue #479).
 ///
-/// A probe whose matched value no projection needs stays a bare key set —
-/// the read and the memory are unchanged. A probe a projection reads a
-/// value from carries the value fused into the SAME read, so the map
-/// answers both questions and no second statement is issued.
+/// **Both shapes survive issue #557 and are filled from the hydration
+/// row.** A probe whose matched value no projection needs stays a bare
+/// key set, filled from the row's `attr_probe[i]` bit; a probe a
+/// projection reads a value from carries the value fused into the SAME
+/// row, so the map answers both questions and **the probe issues no
+/// statement of its own at all**.
+///
+/// The memory contract is unchanged: `exec::group_hydrated_rows` charges
+/// each entry at the same `MEMBERSHIP_ENTRY_BYTES` (plus the value's
+/// length) the membership read charged before the condition moved onto
+/// the span row.
 #[derive(Debug)]
 pub enum ProbeMembership {
     Keys(HashSet<SpanKey>),
@@ -2405,9 +2422,11 @@ fn resolve_projection<'a>(
             ProjectionValue::ProbeLiteral { text, literal_type } => Some(ProjectedValue::Typed(
                 typed_attr_value(*literal_type, None, Some(text.as_str())),
             )),
-            // Issue #510: the fused membership read now carries the stored
-            // type beside the value, so the projection renders the arm the
-            // sender stored rather than always `stringValue`.
+            // Issue #510: the fused value carries the stored type beside
+            // it, so the projection renders the arm the sender stored
+            // rather than always `stringValue`. Issue #557: that pair
+            // rides the HYDRATION row — the same element the condition
+            // matched — rather than a read of its own.
             ProjectionValue::ProbeValue { probe_idx } => env
                 .attrs
                 .membership
@@ -3632,8 +3651,9 @@ mod tests {
     #[test]
     fn negation_matches_absent_and_different_but_not_equal() {
         // Ratified rule: `!=` matches spans lacking the key and spans
-        // with a different value; a span whose index rows satisfy the
-        // positive predicate does not match.
+        // with a different value; a span whose located element satisfies
+        // the positive predicate does not match — it is in the probe's
+        // membership set, and `negated` inverts it.
         let p = plan(r#"{ .env != "prod" }"#);
         let trace = TraceSpans {
             trace_id: tid(1),
@@ -3644,38 +3664,44 @@ mod tests {
             ],
         };
         // The probe is the positive `env = 'prod'`: span 2 has it; span 3
-        // has env=staging (so no row satisfies the positive predicate —
-        // not in the membership set); span 1 has no env at all.
+        // has env=staging, so its located element does not satisfy the
+        // positive predicate and it is not in the probe's membership set;
+        // span 1 has no `env` at all, so no element is located. **This
+        // test builds its `BatchAttrs` by hand**, so this comment
+        // describes the fixture, not a read.
         let attrs = membership(&p, &[(0, tid(1), sid(2))]);
         let matches = eval(&p, &[trace], &attrs);
         let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
         assert_eq!(ids, vec![sid(1), sid(3)]);
     }
 
-    /// **This test pins behaviour that is scheduled to change (issue #537).**
-    /// It asserts today's rule: an unscoped condition is satisfied by a
-    /// matching attribute at ANY scope, because the membership set unions
-    /// the scopes. The design record for the trace storage change
-    /// (`docs/traceql-schema-migration.md` §4 Q1 and §6.1) settles a
-    /// different rule — an unscoped attribute resolves to ONE value, the
-    /// first stored element within the highest-precedence scope present,
-    /// taking scopes span → resource → event → link → instrumentation, and
-    /// the filter tests that one value. Under that rule a span carrying
-    /// `resource.env = "prod"` and `span.env = "staging"` resolves `.env`
-    /// to `"staging"` and therefore MATCHES `{ .env != "prod" }`, where
-    /// this assertion requires it not to.
+    /// **The unscoped chain resolves to ONE element, span scope first**
+    /// (issue #557): span, then resource, then event, then link, then
+    /// instrumentation, taking the first scope PRESENT and the first
+    /// stored element within it. The filter tests that one element.
     ///
-    /// The divergence is recorded in
+    /// **This test builds its `BatchAttrs` by hand**, so it exercises the
+    /// evaluator and not how the set is computed, and its assertion did
+    /// not move when the computation did. The fixture's span carries
+    /// `env` at resource scope only, so `.env` resolves to `prod`, the
+    /// span is in the probe's set, and `{ .env != "prod" }` rejects it —
+    /// which is what the chain and the hand-built set agree on.
+    ///
+    /// The rule and the evidence are in
     /// `docs/benchmarks/traces-differential-ledger.md`
-    /// (`traceql-attribute-resolves-to-one-element`) and in `docs/api.md`
-    /// §4.2. **The assertion below is deliberately left as it is**: it
-    /// describes the shipped engine, and it is the change that must move
-    /// it, not the record of the change.
+    /// (`traceql-attribute-resolves-to-one-element` and
+    /// `traceql-unscoped-attribute-scope-reach`) and in `docs/api.md`
+    /// §4.2. What a span carrying `env` at BOTH scopes answers is the
+    /// case the ledger's table works; the live assertion for it is
+    /// `an_attribute_condition_tests_the_element_the_span_resolves_to`.
     #[test]
     fn dual_scope_membership_satisfies_an_unscoped_negation_correctly() {
-        // A span carrying env=prod at EITHER scope is excluded by
-        // `{ .env != "prod" }` — the unscoped probe unions both scopes,
-        // so one membership entry suffices to reject the span.
+        // The unscoped chain resolves to ONE element, span scope first
+        // (issue #557). This span carries `env` at resource scope only,
+        // so `.env` resolves to `prod`, the span enters the probe's
+        // membership set, and `{ .env != "prod" }` rejects it. The
+        // fixture builds that set by hand, so the ASSERTION does not
+        // move.
         let p = plan(r#"{ .env != "prod" }"#);
         let trace = TraceSpans {
             trace_id: tid(1),
@@ -4145,8 +4171,10 @@ mod tests {
         ];
         for (q, expected) in cases {
             let p = plan(q);
-            // Both sides are the identical `span.x = "1"` probe, deduped to
-            // one membership read holding {A, B}; both filters reference it.
+            // Both sides are the identical `span.x = "1"` probe, deduped
+            // to ONE probe, whose predicate column the hydration
+            // statement computes once and whose membership set holds
+            // {A, B}; both filters reference it.
             let attrs = membership(&p, &[(0, tid(1), sid(1)), (0, tid(1), sid(2))]);
             let matches = eval(&p, &[a_and_b()], &attrs);
             assert_eq!(&matched_ids(&matches), expected, "{q}");
@@ -4280,8 +4308,10 @@ mod tests {
         }
     }
 
-    /// Builds the membership reads for the AC6 fixture by matching each
-    /// registered probe against T1's `(key, val)` attribute rows.
+    /// Builds the membership SETS for the AC6 fixture by matching each
+    /// registered probe against T1's `(key, val)` attribute rows — by
+    /// hand, the way the hydration statement's predicate columns fill
+    /// them in production (issue #557).
     fn ac6_membership(p: &SearchPlan) -> BatchAttrs {
         use super::super::filter::ValuePred;
         const ROWS: &[(u8, &str, &str)] = &[
@@ -4419,8 +4449,9 @@ mod tests {
     /// message existed, the allowlist described it, and nothing ran it.
     #[test]
     fn truthiness_tolerates_a_non_boolean_where_negation_fails_the_query() {
-        // `{ .a }` plans as `.a = true`: a membership probe, so a span
-        // whose `a` is a string is simply not a member.
+        // `{ .a }` plans as `.a = true`: a probe whose value test is
+        // `= 'true'`, so a span whose `a` is a string fails the predicate
+        // and does not enter the set.
         let p = plan(r#"{ .a }"#);
         let trace = || TraceSpans {
             trace_id: tid(1),
@@ -5748,9 +5779,14 @@ mod tests {
             let p = plan_wide(q);
             let mut budget = ByteBudget::new(usize::MAX);
             let mut charged = 0usize;
-            let (traces, _) =
-                super::super::exec::group_hydrated_rows(rows, &mut budget, &mut charged)
-                    .expect("in budget");
+            let (traces, _) = super::super::exec::group_hydrated_rows(
+                rows,
+                &[],
+                &mut [],
+                &mut budget,
+                &mut charged,
+            )
+            .expect("in budget");
             assert_eq!(traces[0].spans.len(), 3, "the replay is deduped upstream");
             !eval(&p, &traces, &membership(&p, &[])).is_empty()
         };

@@ -16,7 +16,7 @@
 //! **The plan already exists in the shipped code; what was missing is a
 //! type that can say so.** The committed TraceQL SQL goldens are written
 //! per part and index the repeated ones — `== phase1 generator[0] ==`,
-//! `== phase2 hydration (sample batch) ==`, `== phase2 membership[0] ==`,
+//! `== phase2 hydration (sample batch) ==`,
 //! `== root hydration (sample winners) ==` in
 //! `crates/pulsus-read/tests/golden/traces_search/worked_example.sql`.
 //! That file is this type drawn by hand, one case at a time.

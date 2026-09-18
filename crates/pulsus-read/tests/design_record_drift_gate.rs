@@ -1683,31 +1683,38 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below; the count of cases
 // is unchanged at eight and so are the counted verdicts.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 6] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2869",
+        "exec.rs:2933",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2869",
+        "exec.rs:2933",
+        1,
+        ReviewedVerdict::FallbackWrong,
+        "the same citation a third time. Issue #557's dated §9.2 paragraph moved the          census block, which is where this occurrence sits; the reading is the one above",
+    ),
+    (
+        "docs/query-lowering.md",
+        "exec.rs:2933",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2830-2836",
+        "exec.rs:2893-2899",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:701",
+        "exec.rs:719",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
@@ -1843,7 +1850,13 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // judged — `quantile_over_time` with no quantile — moved with the
         // declaration it names, and at its new line the two rules agree,
         // so there is no divergence left to hold a judgement about.
-        (4, 1, 0),
+        //
+        // Issue #557 adds one `FallbackWrong` row and no new judgement:
+        // `exec.rs:2933` is cited a THIRD time, from §12.3's own
+        // generated census block, because the dated §9.2 paragraph moved
+        // the block's line. The reading is the one the other two
+        // occurrences carry.
+        (5, 1, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

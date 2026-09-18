@@ -1,8 +1,10 @@
 //! Issue #57 AC1: the hermetic, byte-frozen golden suite for the
 //! two-phase TraceQL search SQL (docs/schemas.md §4.2). Every case
 //! renders one deterministic composite — the plan's Phase-1 generator
-//! queries plus the Phase-2 batch SQL (hydration / membership / value
-//! reads over a fixed sample batch) and the winners' root hydration —
+//! queries plus the Phase-2 batch SQL (the hydration read, carrying one
+//! predicate column per attribute condition since issue #557, and the
+//! value reads, over a fixed sample batch) and the winners' root
+//! hydration —
 //! and byte-compares it against a committed file under
 //! `tests/golden/traces_search/`. These goldens double as T8's hermetic
 //! golden-corpus semantic gate; **do not** edit the committed files by
@@ -58,9 +60,9 @@ const CASES: &[Case] = &[
     Case {
         // The §4.2 worked example: the `&&` picks the statically most
         // selective generator (service equality via the `service_time`
-        // projection PREWHERE); the numeric attr condition becomes a
-        // Phase-2 membership read; `duration > 2s` evaluates engine-side
-        // on the hydrated `duration_ns` column.
+        // projection PREWHERE); the numeric attr condition rides the
+        // hydration read's predicate column (issue #557); `duration > 2s`
+        // evaluates engine-side on the hydrated `duration_ns` column.
         name: "worked_example",
         q: r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }"#,
         distributed: false,
@@ -527,8 +529,8 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
-        // Unscoped: neither the generator nor the membership read carries
-        // a `scope` term, so the two predicates are byte-equal and the
+        // Unscoped: neither the generator nor the probe's index-form
+        // predicate carries a `scope` term, so the two are byte-equal and the
         // exactness comparison decides it — the same way it does for the
         // scoped form.
         name: "issue492_unscoped_attr_with_max_duration",
@@ -709,12 +711,6 @@ fn composite(case: &Case) -> String {
         "\n== phase2 hydration (sample batch) ==\n{}\n",
         plan.hydration_sql_for(&BATCH)
     ));
-    for probe_idx in 0..plan.probes_len() {
-        out.push_str(&format!(
-            "\n== phase2 membership[{probe_idx}] ==\n{}\n",
-            plan.membership_sql_for(probe_idx, &BATCH)
-        ));
-    }
     for field_idx in 0..plan.agg_fields_len() {
         out.push_str(&format!(
             "\n== phase2 aggregate values[{field_idx}] ==\n{}\n",
@@ -807,12 +803,16 @@ fn worked_example_pins_the_documented_fragments() {
         generator.ends_with(&format!("LIMIT {}", MAX_CANDIDATES + 1)),
         "the per-generator cap+1 truncation probe"
     );
-    let membership = plan.membership_sql_for(0, &BATCH);
-    assert!(membership.contains("key = 'http.status_code'"));
-    assert!(membership.contains("val_num >= 500"));
-    assert!(membership.contains("scope = 'span'"));
-    assert!(membership.contains("date >="), "date partition pruning");
+    // Issue #557: the condition's own fragments now live on the
+    // hydration statement, as ONE predicate column — the locate over
+    // `(attr_key, attr_scope)`, the `!= 0` guard and the value test
+    // applied to the element it landed on.
     let hydration = plan.hydration_sql_for(&BATCH);
+    assert!(hydration.contains(
+        "arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) \
+         AS pi0"
+    ));
+    assert!(hydration.contains("[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_probe"));
     assert!(
         hydration.contains("LIMIT 10001 BY trace_id"),
         "the per-trace overflow probe (MAX_SPANS_PER_TRACE + 1)"
@@ -832,10 +832,6 @@ fn clustered_case_targets_the_dist_tables_everywhere() {
             .expect("clustered case"),
     );
     assert!(plan.generator_sqls[0].contains("FROM trace_spans_dist\n"));
-    assert!(
-        plan.membership_sql_for(0, &BATCH)
-            .contains("FROM trace_attrs_idx_dist\n")
-    );
     assert!(
         plan.hydration_sql_for(&BATCH)
             .contains("FROM trace_spans_dist\n")
@@ -1747,5 +1743,291 @@ fn regenerate_goldens() {
         let path = dir.join(format!("{}.sql", case.name));
         std::fs::write(&path, composite(case)).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
         eprintln!("wrote {path:?}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #557 — the probe column, the three row shapes, and the negation
+// ---------------------------------------------------------------------
+
+/// Plans one ad-hoc query against the same fixed window and tables the
+/// golden cases use.
+fn plan_of(q: &str) -> SearchPlan {
+    let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    plan_search(
+        &query,
+        &PARAMS,
+        &SearchCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            max_candidates: MAX_CANDIDATES,
+            max_series: 1_000,
+            distributed: false,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{q}: {e:?}"))
+}
+
+/// The aliases one statement's SELECT list emits, in order.
+///
+/// **The splitter tracks `(` and `[` together.** A probe projection is
+/// `[a, b] AS attr_probe` — a comma inside brackets at paren depth zero —
+/// so the paren-only splitter this is modelled on
+/// (`crates/pulsus-read/src/logql/sql.rs`'s
+/// `the_bucketed_row_type_is_named_for_the_statements_own_columns`) would
+/// read one column as two.
+fn select_aliases(sql: &str) -> Vec<String> {
+    let after_select = sql
+        .strip_prefix("SELECT ")
+        .or_else(|| sql.split_once("\nSELECT ").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("the statement carries a projection:\n{sql}"));
+    let list = after_select
+        .split_once("\nFROM ")
+        .unwrap_or_else(|| panic!("the projection ends at FROM:\n{sql}"))
+        .0;
+    let mut items: Vec<&str> = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in list.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&list[start..]);
+    items
+        .iter()
+        .map(|item| {
+            item.trim()
+                .rsplit(" AS ")
+                .next()
+                .expect("a column name")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Criterion 15, pin A — **the rendered aliases ARE the row struct's
+/// field names, in order, for each of the three shapes.**
+///
+/// RowBinary decoding binds on the NAME: the vendored client rejects a
+/// returned column no field has and validates the types
+/// (`vendor/clickhouse/src/row_metadata.rs`,
+/// `vendor/clickhouse/src/rowbinary/de.rs`), and validation is on by
+/// default. So a renamed alias here is a live decode failure and nothing
+/// hermetic notices — except this.
+#[test]
+fn every_hydration_shape_is_named_for_its_statements_own_columns() {
+    use pulsus_clickhouse::Row;
+    use pulsus_read::traces::rows::{HydrationProbeRow, HydrationProbeValueRow, HydrationRow};
+    use pulsus_read::traces::search_plan::HydrationShape;
+
+    let plain = plan_of(r#"{ status = error }"#);
+    let probes = plan_of(r#"{ .env = "prod" }"#);
+    let values = plan_of(r#"{ span.http.status_code >= 500 }"#);
+    assert_eq!(plain.hydration_shape(), HydrationShape::Plain);
+    assert_eq!(probes.hydration_shape(), HydrationShape::Probes);
+    assert_eq!(values.hydration_shape(), HydrationShape::ProbesAndValues);
+
+    assert_eq!(
+        select_aliases(&plain.hydration_sql_for(&BATCH)),
+        <HydrationRow as Row>::COLUMN_NAMES,
+        "the Plain statement's columns and `HydrationRow`'s fields must agree by NAME and in \
+         ORDER — the decode binds on the name, and one of these two is SQL text the compiler \
+         never reads"
+    );
+    assert_eq!(
+        select_aliases(&probes.hydration_sql_for(&BATCH)),
+        <HydrationProbeRow as Row>::COLUMN_NAMES,
+        "the Probes statement's columns and `HydrationProbeRow`'s fields must agree"
+    );
+    assert_eq!(
+        select_aliases(&values.hydration_sql_for(&BATCH)),
+        <HydrationProbeValueRow as Row>::COLUMN_NAMES,
+        "the ProbesAndValues statement's columns and `HydrationProbeValueRow`'s fields must agree"
+    );
+}
+
+/// Criterion 15, pin B — **the twelve-column prefix is shared.**
+///
+/// The `Row` derive cannot express a shared prefix, so the duplication is
+/// stated and checked. The slice is written from
+/// `HydrationRow::COLUMN_NAMES.len()` and not from the literal `12`: with
+/// the literal, a thirteenth column added to `HydrationRow` and to the
+/// `Plain` render alone would slice at 12 and this pin could not see the
+/// drift.
+#[test]
+fn the_probe_row_shapes_share_the_plain_rows_column_prefix() {
+    use pulsus_clickhouse::Row;
+    use pulsus_read::traces::rows::{HydrationProbeRow, HydrationProbeValueRow, HydrationRow};
+
+    let plain = <HydrationRow as Row>::COLUMN_NAMES;
+    assert_eq!(
+        &<HydrationProbeRow as Row>::COLUMN_NAMES[..plain.len()],
+        plain,
+        "`HydrationProbeRow` must open with `HydrationRow`'s twelve columns"
+    );
+    assert_eq!(
+        &<HydrationProbeValueRow as Row>::COLUMN_NAMES[..plain.len()],
+        plain,
+        "`HydrationProbeValueRow` must open with `HydrationRow`'s twelve columns"
+    );
+}
+
+/// Criterion 15, pin C — **the three arrays are one index space.**
+///
+/// For a plan whose probe 0 fuses a value and whose probe 1 does not, all
+/// three arrays carry exactly `probes.len()` elements and the non-fusing
+/// slot is the literal `''`. This is the only one of the three pins whose
+/// failure is SILENT: a value in the wrong slot decodes cleanly and
+/// renders the wrong attribute.
+#[test]
+fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
+    let p = plan_of(r#"{ span.a =~ "x.*" && span.b = "x" }"#);
+    assert_eq!(p.probes_len(), 2, "two distinct probes");
+    assert!(p.probe_fuses_value(0), "the regex probe fuses its value");
+    assert!(
+        !p.probe_fuses_value(1),
+        "the string-equality probe's value is the query's own literal"
+    );
+    let sql = p.hydration_sql_for(&BATCH);
+    // The three arrays, read out of the rendered statement by their
+    // aliases rather than by position in this file.
+    let array_of = |alias: &str| -> Vec<String> {
+        let line = sql
+            .lines()
+            .find(|l| l.trim_end_matches(',').ends_with(&format!("] AS {alias}")))
+            .unwrap_or_else(|| panic!("no {alias} column:\n{sql}"));
+        let inner = line
+            .trim()
+            .trim_start_matches('[')
+            .split_once("] AS ")
+            .expect("an array column")
+            .0;
+        let mut items: Vec<String> = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(inner[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(inner[start..].trim().to_string());
+        items
+    };
+    for alias in ["attr_probe", "attr_probe_val", "attr_probe_type"] {
+        assert_eq!(
+            array_of(alias).len(),
+            p.probes_len(),
+            "{alias} must carry one element per probe:\n{sql}"
+        );
+    }
+    assert_eq!(
+        array_of("attr_probe_val")[1],
+        "''",
+        "the non-fusing probe's value slot is the literal empty string:\n{sql}"
+    );
+    assert_eq!(
+        array_of("attr_probe_type")[1],
+        "''",
+        "the non-fusing probe's kind slot is the literal empty string:\n{sql}"
+    );
+    assert_ne!(
+        array_of("attr_probe_val")[0],
+        "''",
+        "the fusing probe's value slot reads the located element"
+    );
+}
+
+/// Criterion 2 — **the negation is never rendered inside an array
+/// function.** The probe column is POSITIVE and the reader inverts it
+/// (`search_eval`'s attribute arm compares `member != *negated`).
+///
+/// The two renders differ in NO byte, and the plan's `negated` flag is
+/// what tells them apart. Asserted for a single-valued scope and for the
+/// multi-valued event collection, so the arity carve-out is covered by
+/// the same rule.
+#[test]
+fn a_negated_condition_renders_the_same_statement_as_its_positive_form() {
+    for (positive, negated) in [
+        (r#"{ span.k = "x" }"#, r#"{ span.k != "x" }"#),
+        (r#"{ event.code = "c3" }"#, r#"{ event.code != "c3" }"#),
+    ] {
+        let p = plan_of(positive);
+        let n = plan_of(negated);
+        assert_eq!(
+            p.hydration_sql_for(&BATCH),
+            n.hydration_sql_for(&BATCH),
+            "{negated} must render the SAME statement as {positive} — the probe column is \
+             positive and the reader inverts it"
+        );
+        assert_eq!(
+            p.generator_sqls.len(),
+            1,
+            "{positive}: one generator, so the comparison below is not over an empty list"
+        );
+        assert_eq!(p.probes_len(), 1, "{positive}: one probe");
+        assert_eq!(n.probes_len(), 1, "{negated}: one probe");
+        let sql = n.hydration_sql_for(&BATCH);
+        assert!(
+            !sql.contains("NOT "),
+            "{negated}: no negation may reach the statement:\n{sql}"
+        );
+        // The flag is what differs. It is read off the plan's own `Debug`
+        // rendering, which is the same field `search_eval` reads when it
+        // inverts the membership answer.
+        assert!(
+            !format!("{p:?}").contains("negated: true"),
+            "{positive}: the positive form carries no negation"
+        );
+        assert!(
+            format!("{n:?}").contains("negated: true"),
+            "{negated}: the negation lives on the planned leaf, not in the SQL"
+        );
+    }
+}
+
+/// Criterion 4, hermetic half — **every rendered numeric probe test is
+/// `UInt8`**, which is the same thing the `ifNull` wrapper says from the
+/// other side: without it the projected column is `Nullable(UInt8)` and
+/// the row does not decode into `Vec<u8>`.
+///
+/// A Rust assertion cannot ask the database for an expression's type, so
+/// what is asserted here is the WRAPPER; `traces_search_explain.rs`'s
+/// `the_probe_column_types_are_what_the_row_structs_decode` asks
+/// ClickHouse with `DESCRIBE`.
+#[test]
+fn every_numeric_probe_arm_is_wrapped_against_a_null_element() {
+    for q in [
+        r#"{ span.http.status_code >= 500 }"#,
+        r#"{ span.http.status_code * 2 > 500 }"#,
+        r#"{ .http.status_code >= 500 }"#,
+    ] {
+        let sql = plan_of(q).hydration_sql_for(&BATCH);
+        let probe_line = sql
+            .lines()
+            .find(|l| l.contains("] AS attr_probe"))
+            .unwrap_or_else(|| panic!("{q}: no probe column:\n{sql}"));
+        let numeric_reads = probe_line.matches("attr_num[").count();
+        assert!(numeric_reads > 0, "{q}: no numeric arm rendered:\n{sql}");
+        assert_eq!(
+            probe_line.matches("ifNull(").count(),
+            numeric_reads,
+            "{q}: every numeric comparison must be wrapped — an unwrapped NULL makes the \
+             projected column Nullable(UInt8):\n{sql}"
+        );
     }
 }

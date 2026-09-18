@@ -138,8 +138,22 @@ const CONTROL: &str = "with_binding_control.txt";
 
 /// The corpus, and what it holds. The counts are a cheap tripwire for a
 /// corpus gaining or losing an entry; **they are not the protection**.
+///
+/// Issue #557 moved `SQL_STATEMENTS` from 446 to 396. The 45 committed
+/// `traces_search` goldens that carried a `== phase2 membership[i] ==`
+/// section — 50 sections between them — lost it: the attribute condition
+/// is a predicate column on the hydration statement now and sends no
+/// statement of its own. No `.sql` FILE was added or removed, so
+/// `SQL_FILES` stays at 126.
+///
+/// The same change puts a `WITH` clause on 45 of those goldens'
+/// hydration statements, which is the first `WITH` in the `traces_search`
+/// corpus. Every one of them is a scalar/array alias
+/// (`arrayFirstIndex(…) AS pi0`), so the parse below still reports ZERO
+/// `WithElement` binding nodes for them — which is what ADR 0008 D2 asks
+/// and what the loop above measures rather than assumes.
 const SQL_FILES: usize = 126;
-const SQL_STATEMENTS: usize = 446;
+const SQL_STATEMENTS: usize = 396;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;

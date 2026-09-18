@@ -530,9 +530,14 @@ async fn drive(
         let ids: Vec<[u8; 16]> = batch.iter().map(|c| c.trace_id).collect();
 
         let query_id = next_id(Stage::Hydration, batch_seq);
+        // Issue #557: the control render, for the reason the same swap
+        // carries in `traces_read.rs` — this recipe rebuilds a frozen
+        // measurement of the twelve-column statement, and the production
+        // builder now carries one predicate column per attribute
+        // condition.
         let spans: Vec<HydrationRow> = collect(
             client,
-            &plan.hydration_sql_for(&ids),
+            &plan.hydration_sql_without_probes_for(&ids),
             &statement_settings(&query_id, None),
         )
         .await?;
