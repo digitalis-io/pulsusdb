@@ -503,11 +503,12 @@ Byte-exact from `crates/pulsus-read/tests/golden/traces_metrics/`.
 ```sql
 -- emitted today, metrics_sql.rs:826; query { span.http.status_code >= 500 } | rate()
 -- golden traces_metrics/attr_semi_join.sql
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
+WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS pi0
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
        uniqExact(trace_id, span_id) AS n
 FROM trace_spans
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
-  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
 GROUP BY t
 ORDER BY t ASC
 ```
@@ -4422,16 +4423,21 @@ On the metrics routes the whole query already becomes SQL — filter and aggrega
 six entries are the form part 2 intends for the search route, and they are the only place in this
 document where a whole query is already one statement.
 
-**SQL today** — one statement. The attribute condition becomes a semi-join over the attribute index; the bucket, the grouping and the ordering are all in the statement.
+**SQL today** — one statement. Since issue
+[#559](https://github.com/digitalis-io/pulsusdb/issues/559) the attribute condition is a predicate
+over the span row's own arrays: a `WITH` item locates the element the span's `http.status_code`
+resolves to, and the `WHERE` clause tests THAT element. Nothing reads the attribute index. The
+bucket, the grouping and the ordering are all in the statement.
 
 `crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql`, the range route:
 
 ```sql
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
+WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS pi0
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
        uniqExact(trace_id, span_id) AS n
 FROM trace_spans
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
-  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
 GROUP BY t
 ORDER BY t ASC
 ```
@@ -4439,18 +4445,26 @@ ORDER BY t ASC
 `crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql`, the instant route:
 
 ```sql
+WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS pi0
 SELECT uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
-  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+  AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
 ```
 
 **SQL after this work** — unchanged. This work does not touch the metrics routes.
 
 The window is `timestamp_ns >= start AND timestamp_ns < end` — the **opposite** half-open form
 from the search route's `> start AND <= end` (`metrics_sql.rs:89` against `search_sql.rs:110-112`). A
-span whose timestamp equals `start` is counted here and not by a search. The bound is repeated inside
-the semi-join, so both sides agree.
+span whose timestamp equals `start` is counted here and not by a search. It appears once, because
+after issue #559 there is no second read to keep in step with it.
+
+**What the `ifNull` is for.** `attr_num` is `Array(Nullable(Float64))`, so a located element with
+no numeric reading — a span storing `span.n = "abc"` — makes the comparison `NULL`. That is falsy
+in a `WHERE` clause, which is the answer wanted for the positive form. It is NOT the answer wanted
+for the negated form, which renders `NOT (<positive test>)`: `NOT NULL` is `NULL`, also falsy, so
+the span would be DROPPED from `{ span.n != 400 }` where the absent-key rule requires it to be
+COUNTED. `ifNull(…, 0)` makes both forms answer.
 
 #### TraceQL20 — a rate grouped by service
 

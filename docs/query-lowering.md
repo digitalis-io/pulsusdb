@@ -1279,8 +1279,11 @@ See §5, which covers both languages.
 ### 3.3 Group 2 — could be lowered, has not been
 
 [`metrics_sql`](../crates/pulsus-read/src/traces/metrics_sql.rs) already compiles a `{...}` filter
-body to SQL — `compile_filter_predicate` (line 90) → `render_expr` (200) → `lower_leaf` (354),
-with attribute leaves lowered by `semi_join_sql` (490). **The search path does not call it.**
+body to SQL — `compile_filter_predicate` (line 202) → `render_expr` (378) → `lower_leaf` (530),
+with attribute leaves lowered by `LeafSink::attr_leaf` (354), which since issue
+[#559](https://github.com/digitalis-io/pulsusdb/issues/559) calls the SAME
+`filter::probe_column` the search route's span-row slots are built by. **The search path does not
+call `metrics_sql` itself.**
 Every row below is "this compiler already handles the leaf; nothing wraps its output in the rest
 of the pipeline."
 

@@ -541,8 +541,10 @@ async fn metrics_explain_and_budget_gates() {
         &explain_raw(&client, control_full.range_sql()).await,
         "trace_spans",
     );
-    let (full_sel, full_total) =
-        table_primary_key_granules(&explain_raw(&client, full_plan.range_sql()).await, "trace_spans");
+    let (full_sel, full_total) = table_primary_key_granules(
+        &explain_raw(&client, full_plan.range_sql()).await,
+        "trace_spans",
+    );
     let (narrow_sel, _) = table_primary_key_granules(
         &explain_raw(&client, narrow_plan.range_sql()).await,
         "trace_spans",
@@ -1085,8 +1087,10 @@ async fn metrics_explain_and_budget_gates() {
             &explain_raw(&client, control.range_sql()).await,
             "trace_spans",
         );
-        let (full_sel, full_total) =
-            table_primary_key_granules(&explain_raw(&client, full.range_sql()).await, "trace_spans");
+        let (full_sel, full_total) = table_primary_key_granules(
+            &explain_raw(&client, full.range_sql()).await,
+            "trace_spans",
+        );
         let (narrow_sel, _) = table_primary_key_granules(
             &explain_raw(&client, narrow.range_sql()).await,
             "trace_spans",
@@ -1535,9 +1539,12 @@ async fn metrics_attribute_filter_projection_loss_is_recorded(
         .await
         .expect("the combined filter still answers");
     exec(client, "SYSTEM FLUSH LOGS").await;
-    let row = query_log_like(client, &["arrayFirstIndex", "PREWHERE service = \\'checkout\\'"])
-        .await
-        .expect("the combined filter's QueryFinish row must exist");
+    let row = query_log_like(
+        client,
+        &["arrayFirstIndex", "PREWHERE service = \\'checkout\\'"],
+    )
+    .await
+    .expect("the combined filter's QueryFinish row must exist");
     assert!(
         row.projections.is_empty(),
         "the executed statement must name no projection, got {:?}",

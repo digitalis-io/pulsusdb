@@ -112,8 +112,7 @@ fn search_slot_and_with(q: &str) -> (String, Vec<String>) {
             _ => {}
         }
     }
-    let open =
-        open.unwrap_or_else(|| panic!("{q}: unbalanced attr_slot array:\n{sql}"));
+    let open = open.unwrap_or_else(|| panic!("{q}: unbalanced attr_slot array:\n{sql}"));
     let element = sql[open + 1..end].to_string();
     assert!(
         element.matches('[').count() == element.matches(']').count(),
@@ -213,7 +212,9 @@ const CASES: [(&str, &str); 15] = [
 fn the_metrics_statement_carries_the_search_statements_own_attribute_column() {
     for (label, q) in CASES {
         let (element, search_with) = search_slot_and_with(q);
-        let metrics = metrics_plan(&format!("{q} | rate()")).range_sql().to_string();
+        let metrics = metrics_plan(&format!("{q} | rate()"))
+            .range_sql()
+            .to_string();
         assert!(
             metrics.contains(&element),
             "{label}: the metrics statement does not carry the search route's attribute \
@@ -363,11 +364,12 @@ fn the_span_row_attribute_column_has_exactly_two_non_test_callers() {
 /// picking one silently.
 #[test]
 fn a_comparisons_two_filters_declare_disjoint_aliases_in_one_statement() {
-    let plan = metrics_plan(r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#);
+    let plan =
+        metrics_plan(r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#);
     let (cross_tab, _) = plan
         .compare_range()
         .expect("a comparison plan renders a cross-tab");
-    let aliases = with_aliases(&cross_tab);
+    let aliases = with_aliases(cross_tab);
     assert_eq!(
         aliases.len(),
         2,
@@ -445,7 +447,8 @@ fn no_metrics_filter_statement_reads_the_attribute_index() {
     // The comparison shape: its FILTER and SELECTION are on the span row,
     // and the only `trace_attrs_idx` read left in its cross-tab is the
     // attribute enumeration's `INNER JOIN`.
-    let plan = metrics_plan(r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#);
+    let plan =
+        metrics_plan(r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#);
     let (cross_tab, totals) = plan.compare_range().expect("a comparison plan");
     assert!(
         !totals.contains("trace_attrs_idx"),
@@ -458,8 +461,10 @@ fn no_metrics_filter_statement_reads_the_attribute_index() {
          enumeration's join, which issue #559 does not touch:\n{cross_tab}"
     );
     assert!(
-        cross_tab.contains("INNER JOIN (\n    SELECT DISTINCT trace_id, span_id, scope, key, val \
-                            FROM trace_attrs_idx"),
+        cross_tab.contains(
+            "INNER JOIN (\n    SELECT DISTINCT trace_id, span_id, scope, key, val \
+                            FROM trace_attrs_idx"
+        ),
         "and it is that join, not a filter semi-join:\n{cross_tab}"
     );
 }

@@ -420,9 +420,8 @@ fn the_projection_loss_entry_names_a_test_that_exists() {
     let file = field("guarding-file");
 
     let path = workspace_root().join(&file);
-    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("ledger guarding file {file} does not exist: {e}")
-    });
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("ledger guarding file {file} does not exist: {e}"));
     assert!(
         source.contains(&format!("fn {test_name}(")),
         "ledger guarding test {test_name:?} is missing from {file}. The entry records a \

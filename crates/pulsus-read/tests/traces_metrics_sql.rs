@@ -521,7 +521,10 @@ fn the_nested_set_root_lowering_pins_its_sql_and_its_prewhere_placement() {
         ),
         "{flag}"
     );
-    assert!(flag.contains("if(pi0s != 0, attr_val[pi0s] = 'true', "), "{flag}");
+    assert!(
+        flag.contains("if(pi0s != 0, attr_val[pi0s] = 'true', "),
+        "{flag}"
+    );
     assert!(!flag.contains("trace_attrs_idx"), "{flag}");
 }
 
@@ -572,7 +575,10 @@ fn clustered_case_targets_the_dist_tables_everywhere() {
         .compare_range()
         .expect("a comparison plan renders the cross-tab");
     assert!(compare.distributed());
-    assert!(cross_tab.contains("FROM trace_attrs_idx_dist WHERE"), "{cross_tab}");
+    assert!(
+        cross_tab.contains("FROM trace_attrs_idx_dist WHERE"),
+        "{cross_tab}"
+    );
     assert!(cross_tab.contains("FROM trace_spans_dist\n"), "{cross_tab}");
     assert!(totals.contains("FROM trace_spans_dist\n"), "{totals}");
 }
@@ -917,7 +923,11 @@ fn the_golden_domain_is_exactly_the_committed_stems() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    assert_eq!(with_a_base.len(), 26, "GOLDEN_SQL_WITH_A_BASE has a duplicate");
+    assert_eq!(
+        with_a_base.len(),
+        26,
+        "GOLDEN_SQL_WITH_A_BASE has a duplicate"
+    );
     assert_eq!(
         sql_stems(&golden_base_dir()),
         with_a_base,
@@ -955,7 +965,10 @@ fn the_three_declared_stem_lists_partition_the_corpus() {
     let with_base = set(&GOLDEN_SQL_WITH_A_BASE);
     let added = set(&ADDED_SINCE_THE_BASE_SNAPSHOT);
     assert_eq!(
-        with_base.union(&added).cloned().collect::<std::collections::BTreeSet<_>>(),
+        with_base
+            .union(&added)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
         all,
         "GOLDEN_SQL_WITH_A_BASE plus the added stems must be the whole corpus"
     );
@@ -970,7 +983,10 @@ fn the_three_declared_stem_lists_partition_the_corpus() {
         "a case's filter either carries an attribute condition or it does not"
     );
     assert_eq!(
-        no_attr.union(&with_attr).cloned().collect::<std::collections::BTreeSet<_>>(),
+        no_attr
+            .union(&with_attr)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
         with_base,
         "the two halves must cover exactly the stems the base snapshot holds"
     );

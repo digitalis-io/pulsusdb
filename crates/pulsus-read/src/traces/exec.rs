@@ -186,20 +186,39 @@ const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
 /// [`map_trace_generator_error`], applied only to phase-1 generator
 /// reads (issue #57 re-audit, sub-problem B).
 const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
-/// `SET_SIZE_LIMIT_EXCEEDED` — raised only by the metrics semi-join
-/// IN-set limits ([`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`],
-/// `set_overflow_mode='throw'`); no other trace/LogQL query sets a set
-/// limit, so this code maps exclusively on the metrics path (issue #59
-/// plan v2 delta 3 as amended, confirmed against a live 24.8 in
-/// `tests/traces_metrics_explain.rs`).
+/// `SET_SIZE_LIMIT_EXCEEDED` — raised by an `IN (SELECT …)` set built
+/// under [`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`]
+/// with `set_overflow_mode='throw'`. No other trace or LogQL query sets a
+/// set limit, so this code maps exclusively on the reads that carry
+/// [`metrics_settings`].
+///
+/// **Issue #559 removed the surface this used to name.** Until then the
+/// metrics FILTER lowered an attribute condition to
+/// `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)` and
+/// this code was that set overflowing; measured, 524,288 matching spans
+/// answered and 524,289 did not. The filter is now a predicate over the
+/// span row's own arrays and builds no set, so a metrics query with an
+/// attribute condition cannot raise this any more — its binding limit is
+/// `max_rows_to_read = reader.traceql_scan_budget_rows`, code 158.
+///
+/// The one read that still builds an `IN` set under these settings is the
+/// NARROWED tag-values read (`tags_sql::attr_values_narrowed_sql`), which
+/// keeps the any-element rule deliberately; it is what
+/// `traces_tags_live`'s narrowed-values budget test exercises. The
+/// constant, the mapping and the 422 wording are unchanged.
 const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
 
-/// The metrics attribute semi-join IN-set row budget (`max_rows_in_set`,
-/// throw): bounds the materialized `(trace_id, span_id)` set of every
-/// attr-filter membership subquery — a metrics window matching more
-/// than this many attribute rows is a `422 query_too_broad`, never an
-/// unbounded in-memory set. Documented constant (docs/schemas.md §4.2;
-/// promoted to config only on evidence).
+/// The IN-set row budget (`max_rows_in_set`, throw) carried by every read
+/// that takes [`metrics_settings`]: it bounds the materialized
+/// `(trace_id, span_id)` set of an `IN (SELECT …)` subquery, so a window
+/// matching more than this many rows is a `422 query_too_broad` rather
+/// than an unbounded in-memory set. Documented constant
+/// (docs/schemas.md §4.2; promoted to config only on evidence).
+///
+/// **Since issue #559 the metrics FILTER builds no such set** — it reads
+/// the span row's attribute arrays — so this bounds the narrowed
+/// tag-values read's `IN` set and nothing on the metrics filter path. The
+/// value does not move; the sentence naming the semi-join did.
 pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 
 /// The metrics IN-set byte budget (`max_bytes_in_set`, throw) — the byte
@@ -3033,14 +3052,23 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
 /// delta 3): the full search budget set ([`search_settings`]) plus the
-/// IN-set limits bounding every attribute semi-join's materialized set
-/// (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191 → 422 via the
-/// dedicated [`TooBroadReason::TraceMetricsSetRows`]). Clustered mode
-/// additionally injects `distributed_product_mode='local'`, rewriting
-/// `IN (SELECT … FROM trace_attrs_idx_dist …)` to the **local** shard
-/// table — co-sharding on `cityHash64(trace_id)` makes each shard's
-/// semi-join exact and kills the `_dist`-inside-`_dist`
-/// double-distributed path. (Honesty note: the time-bucket `GROUP BY`
+/// IN-set limits (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191
+/// → 422 via the dedicated [`TooBroadReason::TraceMetricsSetRows`]).
+///
+/// **Which reads those set limits still bind, after issue #559.** The
+/// metrics FILTER no longer builds an `IN` set — an attribute condition
+/// is a predicate over the span row's arrays — so on that path the
+/// binding limit is `max_rows_to_read`. The set limits still bind the
+/// narrowed tag-values read, which carries these same settings and keeps
+/// its own `(trace_id, span_id) IN (…)`.
+///
+/// Clustered mode additionally injects `distributed_product_mode='local'`,
+/// which rewrites an `IN (SELECT … FROM <table>_dist …)` to the **local**
+/// shard table — co-sharding on `cityHash64(trace_id)` makes each shard's
+/// answer exact and kills the `_dist`-inside-`_dist` double-distributed
+/// path. After issue #559 the readers that depend on it are `compare()`'s
+/// attribute enumeration and the narrowed tag-values read; the metrics
+/// filter no longer does. (Honesty note: the time-bucket `GROUP BY`
 /// itself is *not* shard-local — buckets exist on every shard; the
 /// coordinator merges per-bucket partial states, bounded by the point
 /// cap × shards. Scale evidence routes to #25.)

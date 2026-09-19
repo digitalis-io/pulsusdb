@@ -1363,7 +1363,10 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // Both filters render into THIS statement, so both alias sets are
     // declared here, outer first (issue #559). They cannot collide: the
     // selection compiles under the `c` prefix.
-    let with = with_clause(&merge_with(&outer.with_items, &inner_bool.with_items), "    ");
+    let with = with_clause(
+        &merge_with(&outer.with_items, &inner_bool.with_items),
+        "    ",
+    );
     let mut raw = format!(
         "{with}SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
          status_code AS i_status, service AS i_service, status_message AS i_status_message, \
