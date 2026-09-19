@@ -10,8 +10,24 @@
 # its own message.
 #
 # The scratch copy is a `git worktree`-free clone of the working tree into
-# a temporary directory: the attacks edit files, and nothing they edit may
+# a throwaway directory: the attacks edit files, and nothing they edit may
 # be the tree CI is about to build.
+#
+# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Every attack
+# here edits the protected CONTENT and leaves the workflow alone. That is
+# the shape of an accident, and accidents are what the check is for. It is
+# not the shape of a determined author, who would edit the content and the
+# step that supplies the comparison base together — the base is assigned
+# in `.github/workflows/ci.yml`, which ships in the tree under review, and
+# `PULSUSDB_DOC_SITES_UPSTREAM=HEAD` makes the added-line set empty and
+# the check exit 0. There is no attack here for that, and adding one would
+# not help: the scope statement at the top of `doc_sites.sh` records it,
+# with the two commands that measured it, because it is a property of how
+# this workflow is defined rather than a hole in this script. Every one of
+# the workflow's 148 command-running steps has it.
+#
+# So: a green run here means the drift detector still detects drift. It
+# does not mean the manifest cannot be bypassed.
 set -eu
 REPO=${REPO:-$(git rev-parse --show-toplevel)}
 cd "$REPO"

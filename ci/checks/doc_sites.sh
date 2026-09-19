@@ -21,7 +21,55 @@
 # gained three rows in §5 in this very change, which moved every later
 # line in the file without changing one of them.)
 #
-# WHAT IT CANNOT SEE, stated rather than papered over:
+# WHAT THIS IS, AND WHAT IT IS NOT. **It is a drift detector. It is not a
+# control against a determined author**, and the difference is not a
+# caveat — it decides what the output means.
+#
+# What it catches, and has caught:
+#
+#   * a `rewrite` row whose text is still in the tree: the change said it
+#     would replace that sentence and did not.
+#   * a `leave` row whose text has changed: the change touched something
+#     the manifest said it would not.
+#   * a new issue number inside a protected block. **Once on this branch
+#     on text a person actually wrote**, as against ten times on the
+#     self-test's injected attacks: after the base branch was merged, the
+#     base branch's own `#556` on `docs/architecture.md` read as a number
+#     this change had invented, and the check exited 1 saying so. That is
+#     the whole record of it catching drift, stated as one rather than
+#     rounded up. (The `refs=` column came from the opposite case — a
+#     reference an earlier version of this rule ALLOWED, which a code
+#     review found and the column now records as a decision.)
+#
+# Citations that have drifted are a different check in a different file:
+# `every_design_record_citation_still_points_at_what_it_names` in
+# `crates/pulsus-read/tests/design_record_drift_gate.rs`. It found ten
+# wrong citations on this branch. Those are not this script's catches and
+# are named here only so the two are not confused.
+#
+# What it does not catch: **a change that edits protected content and the
+# workflow step that supplies the comparison base in the same commit.**
+# The base is assigned in `.github/workflows/ci.yml`, and that file ships
+# in the tree under review. Measured, not reasoned:
+#
+#   $ git show origin/main:.github/workflows/ci.yml | grep -c doc_sites
+#   0
+#   $ PULSUSDB_DOC_SITES_UPSTREAM=HEAD sh ci/checks/doc_sites.sh; echo $?
+#   doc-sites: checked 27 sites (added lines measured against HEAD)
+#   0
+#
+# The first says this change adds the steps that set the variable. The
+# second says a base of `HEAD` makes the added-line set empty, so the
+# issue-reference half checks nothing and still exits 0.
+#
+# **This is how every step in this workflow works, not a property of this
+# one.** `.github/workflows/ci.yml` defines 192 steps across 11 jobs, 148
+# of which run a command, and all of them are read from the tree under
+# review. This check is conspicuous only because it reads like a security
+# control. It is not one. Its value is that it fails when documentation
+# drifts away from the code by accident, which is what happens.
+#
+# Two other things it cannot see, stated rather than papered over:
 #
 #   * a site nobody put in the manifest. The set is derived by the search
 #     published beside it in `doc_sites.expected`, and re-derivable, but
