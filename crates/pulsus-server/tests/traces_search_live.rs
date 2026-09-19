@@ -4330,3 +4330,93 @@ async fn a_comparison_whose_outer_filter_is_an_attribute_condition_answers() {
 
     drop_db(db).await;
 }
+
+/// **The unscoped chain's ORDER, which the eight-span fixture above
+/// cannot see.**
+///
+/// That fixture puts `k` at the resource scope on trace 6 and at the span
+/// scope on traces 2, 3 and 4 — never both on ONE span. So reversing
+/// `filter::UNSCOPED_SCOPE_CHAIN` changes nothing there: every span
+/// resolves at the only scope it carries the key at, whatever order the
+/// chain walks. Measured — with the chain reversed the eight-span test
+/// passed `1 passed; 0 failed`. What that fixture DOES see is the chain's
+/// MEMBERSHIP: replacing `resource` with `instrumentation` dropped trace 6
+/// and it failed on `{ .k = "x" }`.
+///
+/// This one span carries `k` at BOTH scopes with different values, which
+/// is the only shape that makes the ORDER observable. Span scope has
+/// precedence, so `.k` is `y`:
+///
+/// ```text
+///   stored:  span.k = "y",  resource.k = "x"
+///   { .k = "y" }  -> the span, on both routes
+///   { .k = "x" }  -> nothing, on both routes
+/// ```
+///
+/// Both routes are asserted, because the claim is that they agree: the
+/// metrics filter and the search filter walk one chain.
+#[tokio::test]
+async fn an_unscoped_key_resolves_to_the_span_scope_on_both_routes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_248;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m4");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    let s = span(
+        tid(1),
+        sid(1),
+        None,
+        "both-scopes",
+        ts(base, 1),
+        MS,
+        vec![kv_str("k", "y")],
+    );
+    ingest(
+        port,
+        vec![s],
+        vec![kv_str("service.name", "checkout"), kv_str("k", "x")],
+        "both-scopes",
+    );
+
+    for (q, expected, ctx) in [
+        (r#"{ .k = "y" }"#, ids(&[1]), "unscoped-span-scope-wins"),
+        (
+            r#"{ .k = "x" }"#,
+            BTreeSet::new(),
+            "unscoped-resource-loses",
+        ),
+        // The scoped forms are the control: each scope really does hold
+        // the value the chain is choosing between, so the pair above is a
+        // precedence answer and not an ingestion accident.
+        (r#"{ span.k = "y" }"#, ids(&[1]), "span-scope-holds-y"),
+        (
+            r#"{ resource.k = "x" }"#,
+            ids(&[1]),
+            "resource-scope-holds-x",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            expected,
+            "{ctx}: the SEARCH route's trace set for {q}"
+        );
+        let total = metrics_total(port, q, w0, w1, ctx);
+        assert_eq!(
+            total,
+            expected.len() as f64,
+            "{ctx}: the METRICS route counted {total} for {q} against the search route's {} \
+             traces",
+            expected.len()
+        );
+    }
+
+    drop_db(db).await;
+}
