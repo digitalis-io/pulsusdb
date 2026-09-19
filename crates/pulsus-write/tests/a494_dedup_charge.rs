@@ -439,3 +439,140 @@ fn a_oneshot_channel_fits_inside_one_registrations_charge() {
     );
     drop(channel);
 }
+
+// ---------------------------------------------------------------------
+// Criterion 19 — the waiter registry is bounded, measured by the allocator
+// ---------------------------------------------------------------------
+//
+// Every leg below asserts the ALLOCATOR's resident bytes, never a gauge.
+// A gauge that tracks the allocator is the thing in dispute, so it cannot
+// be the instrument: the round-7 review measured the two disagreeing on
+// one run — cancelling half moved resident by 480,000 bytes while the
+// gauge moved by 801,125.
+
+/// **(a) Mass waiters.** Block callers until the index refuses. The
+/// allocator's resident total stays at or below the knob throughout, the
+/// refusing caller is told `WaitShed` with `wait_shed_total` incremented,
+/// and its retry receives the original's outcome once the claim settles.
+#[test]
+fn blocking_callers_until_the_registry_refuses_stays_inside_the_knob() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let (index, construction) = resident_over(|| index_at(knob));
+    let id = open_claim(&index, 1);
+
+    let mut held: Vec<HeldWaiter> = Vec::new();
+    let (shed, registration_bytes) = resident_over(|| {
+        loop {
+            match index.admit(id, WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                Admission::WaitShed => break true,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    });
+    assert!(shed, "the registry must refuse rather than grow");
+    assert_eq!(
+        held.len(),
+        index.capacities().waiters,
+        "the registry holds exactly the capacity it reports"
+    );
+    assert_eq!(index.snapshot().wait_shed_total, 1);
+
+    // The test's own `Vec` of guards is not the index's memory.
+    let own = (held.capacity() * size_of::<HeldWaiter>()) as u64;
+    let resident = construction + registration_bytes - own;
+    assert!(
+        resident <= knob,
+        "a full registry holds {resident} bytes against a knob of {knob}"
+    );
+
+    // The refused caller's retry gets the original's outcome once the
+    // claim is terminal — it is never told the push was stored.
+    index.settle_target(id.key, pulsus_write::TargetOutcome::Committed, true);
+    assert!(
+        matches!(
+            index.admit(id, WaitMode::Register),
+            Admission::SuppressedSettled(ClaimOutcome::Ok)
+        ),
+        "the retry after a shed receives the original's answer"
+    );
+    drop(held);
+}
+
+/// **(b) Cancellation, then refill.** Block `n` callers, record resident
+/// bytes, cancel half, record again, then block `n/2` fresh callers and
+/// assert the index accepts them and resident returns to its earlier
+/// figure. The refill is what proves the budget was released rather than
+/// merely reported released.
+#[test]
+fn cancelling_half_the_waiters_releases_their_bytes_and_the_registry_refills() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let index = index_at(knob);
+    let id = open_claim(&index, 2);
+    let n = index.capacities().waiters;
+
+    let mut held: Vec<HeldWaiter> = Vec::with_capacity(n);
+    let ((), full) = resident_over(|| {
+        for _ in 0..n {
+            held.push(register_waiter(&index, id));
+        }
+    });
+    assert!(full > 0, "registrations allocate");
+
+    let keep = n / 2;
+    let ((), freed) = resident_over(|| {
+        held.truncate(keep);
+    });
+    assert!(
+        freed == 0,
+        "`resident_over` reports bytes KEPT; a block that only frees keeps none"
+    );
+
+    // Refill: the same number of fresh callers must be accepted, and the
+    // registry's resident total must come back to where it was.
+    let ((), refilled) = resident_over(|| {
+        for _ in 0..(n - keep) {
+            match index.admit(id, WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                other => panic!("a cancelled registration must be reusable, got {other:?}"),
+            }
+        }
+    });
+    assert_eq!(held.len(), n, "the registry is full again");
+    assert!(
+        refilled <= full,
+        "the refill allocated {refilled} bytes where the original fill allocated {full}"
+    );
+    assert!(
+        matches!(index.admit(id, WaitMode::Register), Admission::WaitShed),
+        "and the bound is where it was"
+    );
+    drop(held);
+}
+
+/// **(c) Async registers nothing.** The same duplicate pushes in async
+/// mode leave the allocator's resident total unchanged — asserted as a
+/// delta of zero, not as a gauge reading zero.
+#[test]
+fn an_async_suppressed_caller_allocates_nothing() {
+    let index = index_at(16 * 1024 * 1024);
+    let id = open_claim(&index, 3);
+
+    let ((), delta) = resident_over(|| {
+        for _ in 0..10_000 {
+            match index.admit(id, WaitMode::None) {
+                Admission::SuppressedSettled(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    });
+    assert_eq!(
+        delta, 0,
+        "ten thousand async suppressed pushes allocated {delta} bytes"
+    );
+    assert_eq!(
+        index.snapshot().wait_bytes,
+        0,
+        "and nothing is charged to the waiter budget"
+    );
+}
