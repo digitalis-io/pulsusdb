@@ -470,11 +470,11 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 
 | written as | SQL emitted today | marking and source |
 |---|---|---|
-| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:183`. An unscoped attribute adds **no** `scope` term (`filter.rs:1019`, `AttrScope::Unscoped => None`) |
+| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:183`. An unscoped attribute adds **no** `scope` term (`filter.rs:1206`, `AttrScope::Unscoped => None`) |
 | `{ resource.service.name = "checkout" }` | `PREWHERE service = 'checkout'` over `trace_spans` | *emitted today*, golden `count_pipeline.sql`. This one attribute is a physical column, so it reads the span table directly |
 | `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, golden `val_num_range.sql`. Skips granules on the `key` prefix only: `val_num` is not part of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:383`) |
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | *emitted today*, golden `service_regex.sql`. Anchored, unlike a LogQL line filter |
-| `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, golden `existence_present.sql`. `ValuePred::KeyExists` renders the constant `1` (`filter.rs:961`), leaving a pure `key` prefix scan |
+| `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, golden `existence_present.sql`. `ValuePred::KeyExists` renders the constant `1` (`filter.rs:964`), leaving a pure `key` prefix scan |
 | `{ .env != "prod" }` | the **positive** form as a predicate column on the hydration read — the locate over `(attr_key, attr_scope)`, then `attr_val[pi0] = 'prod'`; the first statement has no predicate at all | *emitted today*, golden `negated_attr.sql`. The negation is applied after the read, against the set of spans that matched the positive form |
 | `{ a && b }` | one statement for **one** of the two conditions | *emitted today*, golden `nested_boolean.sql`: `{ (.a="1" \|\| .b="2") && (.c="3" \|\| .d="4") }` produces two statements, for `a` and `b` only. `c` and `d` are applied after the read |
 | `{ a \|\| b }` | **two statements**, one per side, merged in `pulsus-server` | *emitted today*, golden `mixed_or.sql`. Not one `OR` predicate |
@@ -483,14 +483,14 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `{ traceDuration > 2s }` | none, plus one extra statement per batch reading each trace's full time span with **no time bound** | *emitted today*, golden `trace_duration.sql` |
 | `{ span:childCount > 2 }` | none, plus one extra statement per batch counting children with **no time bound** | *emitted today*, golden `child_count.sql` |
 | `{ a } > { b }` and every other structural relation | none — one statement per side, both applied after the read | *emitted today*, golden `structural_child.sql` |
-| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:2280` records it; `search_eval.rs:3127` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
+| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:2113` records it; `search_eval.rs:3127` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
 | `\| count() > 2` | none | *evaluated after the read*, golden `count_pipeline.sql` |
 | `\| by(span.foo)` | none — but it adds a per-batch statement reading `foo`'s value for every candidate span | *evaluated after the read*, golden `spanset_by_attr.sql` shows the value read and **no** `GROUP BY` |
 | `\| coalesce()` | none | *evaluated after the read*, golden `spanset_coalesce.sql` is byte-identical to the plain selector case |
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:384`. On the **search** route they are refused with `400` (`search_plan.rs:2291`, `:2298`, `:2304`) |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:948` records it as the plan's `reduce` and `exec.rs:3547` applies it to the framed series (called at `:843` for range, `:1528` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2298`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:398`. On the **search** route they are refused with `400` (`search_plan.rs:2124`, `:2131`, `:2137`) |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:968` records it as the plan's `reduce` and `exec.rs:3547` applies it to the framed series (called at `:843` for range, `:1528` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2131`) |
 | ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:217`. The final ordering across statements is done in `pulsus-server` |
 | `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:218`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
@@ -501,7 +501,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 Byte-exact from `crates/pulsus-read/tests/golden/traces_metrics/`.
 
 ```sql
--- emitted today, metrics_sql.rs:703; query { span.http.status_code >= 500 } | rate()
+-- emitted today, metrics_sql.rs:826; query { span.http.status_code >= 500 } | rate()
 -- golden traces_metrics/attr_semi_join.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
        uniqExact(trace_id, span_id) AS n
@@ -513,7 +513,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:748; query { span.http.status_code >= 500 } | sum_over_time(duration)
+-- emitted today, metrics_sql.rs:874; query { span.http.status_code >= 500 } | sum_over_time(duration)
 -- golden traces_metrics/sum_over_time_duration.sql
 SELECT t, toFloat64(sum(val)) AS v
 FROM (
@@ -529,7 +529,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:703; query { duration > 1s } | rate() by(resource.service.name)
+-- emitted today, metrics_sql.rs:826; query { duration > 1s } | rate() by(resource.service.name)
 -- golden traces_metrics/rate_by_service.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, service AS g0,
        uniqExact(trace_id, span_id) AS n
@@ -541,7 +541,7 @@ ORDER BY t ASC, g0
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:821; query {} | quantile_over_time(duration, 0.5, 0.9, 0.99)
+-- emitted today, metrics_sql.rs:951; query {} | quantile_over_time(duration, 0.5, 0.9, 0.99)
 -- golden traces_metrics/quantile_over_time_multi.sql
 SELECT t, CAST(quantilesTDigest(0.5, 0.9, 0.99)(val) AS Array(Float64)) AS qs
 FROM (
@@ -556,7 +556,7 @@ ORDER BY t ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:903; query { span.http.status_code >= 500 } | histogram_over_time(duration)
+-- emitted today, metrics_sql.rs:1036; query { span.http.status_code >= 500 } | histogram_over_time(duration)
 -- golden traces_metrics/histogram_over_time_duration.sql
 SELECT t, toUInt64(roundToExp2(val - 1)) * 2 AS bucket, count() AS n
 FROM (
@@ -573,7 +573,7 @@ ORDER BY t ASC, bucket ASC
 ```
 
 ```sql
--- emitted today, metrics_sql.rs:703; query { nestedSetParent < 0 } | rate()
+-- emitted today, metrics_sql.rs:826; query { nestedSetParent < 0 } | rate()
 -- golden traces_metrics/nested_set_root_rate.sql
 SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
        uniqExact(trace_id, span_id) AS n
@@ -586,7 +586,7 @@ ORDER BY t ASC
 
 **The two routes bound the window in opposite directions, deliberately.** Search uses
 `timestamp_ns > start AND timestamp_ns <= end` (`search_sql.rs:135`); metrics uses
-`timestamp_ns >= start AND timestamp_ns < end` (`metrics_sql.rs:95`). A span whose timestamp equals
+`timestamp_ns >= start AND timestamp_ns < end` (`metrics_sql.rs:116`). A span whose timestamp equals
 `start` is counted by the metrics route and not by the search route.
 
 ---
@@ -712,7 +712,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `{ a \|\| b }` | `sql_a OR sql_b` in **one** statement, or the constant `1` if either side cannot | *from the design*, `docs/query-lowering.md:303`. **This is a change:** today each side is its own statement, merged in `pulsus-server` |
 | `{ !a }` | `NOT sql_a`, only when `a` means exactly what it says; otherwise the constant `1` | *from the design*, `docs/query-lowering.md:304-305` |
 | `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, unchanged |
-| `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | *from the design*, `docs/query-lowering.md:777`. The expression already exists on the metrics route (`metrics_sql.rs:414`); this work brings it to the search route |
+| `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | *from the design*, `docs/query-lowering.md:777`. The expression already exists on the metrics route (`metrics_sql.rs:562`); this work brings it to the search route |
 | `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | *emitted today* (issue #492 parts 4 and 5). Conditions: the predicate so far means exactly what the query means, the rows so far are spans, no fragment is already in this statement's `HAVING`, and the (aggregate, operator) pair is one of the six that read the SAME direction as the evaluator. `max` reads HIGH over the generator's rows, so `>` and `>=` push and `<`, `<=`, `=`, `!=` refuse |
 | `\| count() > 2` | `HAVING uniqExact(span_id) > 2` | *emitted today*, the same conditions. `uniqExact(span_id)` and not `count()`: a replayed row inflates a plain count. `count()` reads HIGH, so `>` and `>=` push |
 | `\| min(duration) < 2s` | `HAVING min(duration_ns) < 2000000000` | *emitted today*. `min` reads LOW over the generator's rows, so `<` and `<=` push and the other four refuse |
@@ -720,9 +720,9 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`catalog.rs:344`) and the attribute index (`catalog.rs:371-385`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
-| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:383` and `search_plan.rs:1284`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. Still `400` on the search route (`search_plan.rs:2291`); this work does not change that |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:948` records it, `exec.rs:3547` applies it. Still `400` on the search route (`search_plan.rs:2298`) |
+| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:383` and `search_plan.rs:1256`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2124`); this work does not change that |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:968` records it, `exec.rs:3547` applies it. Still `400` on the search route (`search_plan.rs:2131`) |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
 | `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | none | *never becomes SQL*, `docs/query-lowering.md:778`. Part 5 |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | *from the design*, `docs/query-lowering.md:616`. Refuses over a wider-than-needed set: the sort key is the newest matching span's timestamp, so a row the SQL should not have returned changes the order, not only the set |
@@ -846,7 +846,7 @@ WHERE trace_id IN (unhex('…'), … the 20 that won)
 
 The design's own rendering of the first statement adds `AND scope = 'resource'`
 (`docs/query-lowering.md:742`). **Our shipped code adds no `scope` term for an unscoped
-attribute** — `AttrScope::Unscoped` maps to `None` (`filter.rs:843`) and the golden
+attribute** — `AttrScope::Unscoped` maps to `None` (`filter.rs:846`) and the golden
 `traces_search/unscoped_attr.sql` shows the predicate without it. The design's line therefore
 corresponds to `resource.service.namespace`, not to the `.service.namespace` it is written beside.
 Recorded as an open question at the end of this document rather than resolved here.
@@ -1169,7 +1169,7 @@ date (`catalog.rs:382-383`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `{ a && b }` | `sql_a AND sql_b`, in one statement | `WHERE` | *from the design*, `docs/query-lowering.md:302`. A side that does not become SQL contributes the constant `1`. **This is a change:** today the second half of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
 | `{ a \|\| b }` | `sql_a OR sql_b`, in one statement, or the constant `1` if either side cannot | `WHERE` | *from the design*, `docs/query-lowering.md:303`. **This is a change:** today each side is its own statement. Executed on the container: an `OR` of two different `key` values runs as one statement and reads both key prefixes |
 | `{ duration > 2s }` | `duration_ns > 2000000000` | `WHERE`, over `trace_spans` | *emitted today*. The `idx_duration` minmax index on `duration_ns` skips granules at granularity 4 (`catalog.rs:353`) |
-| `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | `WHERE` | *from the design*, `docs/query-lowering.md:777`. The text already exists on the metrics route (`metrics_sql.rs:414`) |
+| `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | `WHERE` | *from the design*, `docs/query-lowering.md:777`. The text already exists on the metrics route (`metrics_sql.rs:562`) |
 | `{ nestedSetLeft … }`, other than the root test | | — | **cannot become SQL.** A per-trace numbering computed at query time from the parent/child structure; no stored column carries it |
 | `{ traceDuration > 2s }`, `rootName`, `rootServiceName` | | — | **cannot become SQL.** Resolved from a read across the whole trace with no time bound, because the true root may start before the window |
 | `{ span:childCount > 2 }` | | — | **cannot become SQL**, the same reason |
@@ -1181,7 +1181,7 @@ date (`catalog.rs:382-383`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING` | — | *emitted today* (issue #492 part 5). **No subquery, no outer statement and no wrap.** With a `HAVING` in the level it refuses: the aggregate selected groups and the spans it selected are not recoverable from a statement that has already reduced them |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | — | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| select(.foo)` | a left join whose right side is the attribute index restricted to `key = 'foo'`, one value per span, projected as an extra column | `FROM … LEFT JOIN (…)` | **Not decided — refused pending an ADR 0008 clause.** The per-query form this row describes refuses at the shipped generator memory ceiling: measured in [query-lowering.md](query-lowering.md) §9.8, `Code: 241` at `maximum: 512.00 MiB` on all three takes, where the identical statement with only the join removed answered its 20 rows. Two corrections to what this row used to say. **One:** widening the selector's own `key` predicate to `key IN ('a', 'foo')` and picking the values apart with `anyIf` is **one** join-free alternative, not the only one — and it is the worse one. Written instead as a disjunction of both full predicates, the merged statement keeps the `val` prune and selects exactly the granules the two statements it replaces select (§9.8, table 1). The granule comparison behind the original rejection stands for the widened form alone: `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules; `key IN ('service.namespace', 'foo')` read **51 of 74**. **Two:** the claim this row used to carry — that the join replaces one statement per batch with one for the whole request — is measured false. The whole-request form is the one that refuses, and the form that runs is the per-batch join, which is one statement per batch (§9.8, table 3). **A join is a clause ADR 0008 does not name** — §10's open question 4 |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:90`. Still refused with `400` on the search route (`search_plan.rs:2291`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:111`. Still refused with `400` on the search route (`search_plan.rs:2124`) |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | `ORDER BY` | *from the design*, `docs/query-lowering.md:616`. Refuses over a set wider than the query: the sort key is the newest matching span's timestamp, so an extra row changes the order, not only the set |
 | `limit=20` | `LIMIT 20` | `LIMIT` | *from the design*, `docs/query-lowering.md:617` |
 | the response | none | — | **cannot become SQL.** The trace's root summary is read across the whole trace with no time bound and `TraceSearchResult.root` is not optional (`exec.rs:428`), so A compiled TraceQL search is never one statement**: the compiled generator, then the per-batch hydration read and one membership read per attribute probe, then the trace-root read with no time bound. The middle two cannot be dropped, because `spanSets[].matched` and `spanSets[].spans[]` are written unconditionally (`crates/pulsus-server/src/traces_api/search_response.rs:428-430` and `:507-512`), and a statement projecting `trace_id, max(timestamp_ns)` produces neither |
@@ -1742,9 +1742,14 @@ time bound (§2.4's last row). Those trailing reads are not repeated per example
 { resource.service.name = "checkout" && span.http.status_code >= 500 }
 ```
 
-**Marked: decided here.** The two conditions live in different tables, so one becomes a `PREWHERE`
-on the span table and the other a semi-join to the attribute index — the shape the metrics route
-already emits (`metrics_sql.rs:528`), brought to the search route.
+**Marked: decided here.** The service equality becomes a `PREWHERE` on the span table and the
+attribute condition a semi-join to the attribute index. **The statement below is the shape this
+route emitted when the entry was written, and it is not the metrics route's shape any more.**
+Issue [#559](https://github.com/digitalis-io/pulsusdb/issues/559) moved the metrics attribute
+condition onto the span row — `filter::probe_column`, called from `metrics_sql.rs:357` — so a
+metrics query with this filter now reads `trace_spans` alone. The search route's own phase-1
+generator still sends the semi-join below; what moved on the search route was phase 2, in issue
+#557.
 
 ```sql
 -- decided here; executed on 26.3.17.110
@@ -1794,7 +1799,7 @@ an `or` is its own statement and `pulsus-server` merges the trace-id lists (gold
 `traces_search/mixed_or.sql`). ClickHouse reads both `key` prefixes here as it would have read one
 each before, so the granules are the same; what disappears is a round trip and a client-side merge.
 **The `scope = 'resource'` term on the first branch is written because this example scopes the
-attribute.** An unscoped `.service.namespace` adds no scope term at all (`filter.rs:843`) — §10's
+attribute.** An unscoped `.service.namespace` adds no scope term at all (`filter.rs:846`) — §10's
 open question 1.
 
 #### TraceQL27 — an aggregate as a `HAVING`
@@ -3753,7 +3758,7 @@ show the new shape.
 { .k = "v" }
 ```
 
-**SQL today** — one first statement, then ONE statement per batch of 32 candidates, then one final statement: the attribute condition is a predicate column on the batch's hydration statement (#557), and it walks the five attribute scopes because the selector is unscoped. The phase-1 generator adds **no** `scope` term (`filter.rs:843`).
+**SQL today** — one first statement, then ONE statement per batch of 32 candidates, then one final statement: the attribute condition is a predicate column on the batch's hydration statement (#557), and it walks the five attribute scopes because the selector is unscoped. The phase-1 generator adds **no** `scope` term (`filter.rs:846`).
 
 `crates/pulsus-read/tests/golden/traces_search/unscoped_attr.sql`, phase1 generator[0]:
 
@@ -4060,7 +4065,7 @@ must produce SQL after. The design's own measurement on this kind of query: push
 
 **The aggregate produces no SQL today.** Every matching span is read and then discarded.
 
-**SQL today** — one first statement and one hydration statement per batch, and **no `HAVING`** anywhere. `search_plan.rs:1648` records the aggregate; `search_eval.rs:2439` is the only code that reads it.
+**SQL today** — one first statement and one hydration statement per batch, and **no `HAVING`** anywhere. `search_plan.rs:1481` records the aggregate; `search_eval.rs:2439` is the only code that reads it.
 
 `crates/pulsus-read/tests/golden/traces_search/count_pipeline.sql`, phase1 generator[0]:
 
@@ -4303,7 +4308,7 @@ ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 ```
 
-**SQL after this work** — `parent_id = toFixedString(unhex('0000000000000000'), 8)` — the expression the metrics route already emits (`metrics_sql.rs:414`), brought to the search route (`docs/query-lowering.md:777`).
+**SQL after this work** — `parent_id = toFixedString(unhex('0000000000000000'), 8)` — the expression the metrics route already emits (`metrics_sql.rs:562`), brought to the search route (`docs/query-lowering.md:777`).
 
 The metrics route's rendering of the identical condition, from
 `crates/pulsus-read/tests/golden/traces_metrics/nested_set_root_rate.sql`, is quoted in part 1.6. The
@@ -4443,7 +4448,7 @@ WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
 **SQL after this work** — unchanged. This work does not touch the metrics routes.
 
 The window is `timestamp_ns >= start AND timestamp_ns < end` — the **opposite** half-open form
-from the search route's `> start AND <= end` (`metrics_sql.rs:68` against `search_sql.rs:110-112`). A
+from the search route's `> start AND <= end` (`metrics_sql.rs:89` against `search_sql.rs:110-112`). A
 span whose timestamp equals `start` is counted here and not by a search. The bound is repeated inside
 the semi-join, so both sides agree.
 
@@ -4612,14 +4617,14 @@ payload into a stage evaluated after the read and then answer it.
 
 | query | `400` body | where |
 |---|---|---|
-| `{ .service.namespace = "prod" } \| max(.a + .b) > 1` | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | `search_plan.rs:1642-1645` |
-| `{ .service.namespace = "prod" } \| max(span:childCount) > 1` | `type mismatch: span:childCount is not numerically aggregatable` | `search_plan.rs:1630-1632` |
+| `{ .service.namespace = "prod" } \| max(.a + .b) > 1` | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | `search_plan.rs:1475-1478` |
+| `{ .service.namespace = "prod" } \| max(span:childCount) > 1` | `type mismatch: span:childCount is not numerically aggregatable` | `search_plan.rs:1463-1465` |
 | `{ .service.namespace = "prod" } \| max(.a) > 1s` | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | `search_plan.rs:1085-1086` |
-| `{ .service.namespace = "prod" } \| by(.a + .b) \| count() > 1` | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | `search_plan.rs:1555-1556` |
-| `{ .service.namespace = "prod" } \| by(event:name) \| count() > 1` | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | `search_plan.rs:1870-1871` |
-| `{ .service.namespace = "prod" } \| select(rootName)` | `type mismatch: select() of this intrinsic is not supported` | `search_plan.rs:1757-1758` |
-| `{ .service.namespace = "prod" } \| select(nestedSetLeft)` | `type mismatch: select() of a nested-set intrinsic is not supported` | `search_plan.rs:1712` |
-| `{ .service.namespace = "prod" } \| rate()` | the metrics stages are not search-route stages | `search_plan.rs:2291` |
+| `{ .service.namespace = "prod" } \| by(.a + .b) \| count() > 1` | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | `search_plan.rs:1388-1389` |
+| `{ .service.namespace = "prod" } \| by(event:name) \| count() > 1` | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | `search_plan.rs:1703-1704` |
+| `{ .service.namespace = "prod" } \| select(rootName)` | `type mismatch: select() of this intrinsic is not supported` | `search_plan.rs:1590-1591` |
+| `{ .service.namespace = "prod" } \| select(nestedSetLeft)` | `type mismatch: select() of a nested-set intrinsic is not supported` | `search_plan.rs:1545` |
+| `{ .service.namespace = "prod" } \| rate()` | the metrics stages are not search-route stages | `search_plan.rs:2124` |
 
 Every one carries `Content-Type: text/plain; charset=utf-8`. **The traces route does not set
 `X-Content-Type-Options: nosniff` and the logs route does** — `traces_api/error.rs:270-274` against
@@ -5373,7 +5378,7 @@ engine will read, and what it will return:
 - **The window on every statement.** Every compiled search statement carries the request's own
   half-open bound, `timestamp_ns > start AND timestamp_ns <= end` (`traces/search_sql.rs:110-112`),
   plus a `date` bound on `trace_attrs_idx`; the metrics route uses the other half-open form,
-  `>= start AND < end` (`traces/metrics_sql.rs:68`). So no compiled read covers a longer time range
+  `>= start AND < end` (`traces/metrics_sql.rs:89`). So no compiled read covers a longer time range
   than the request. The one exception is the trace-root read, which has no time bound by necessity
   (part 5) and is bounded instead by its list of literal ids.
 
@@ -5499,7 +5504,7 @@ cheaper than having the next reader find them.
   did; that is fourteen lines, not a proof, and the enumeration limit above is the honest boundary.
 - **The unscoped-attribute `scope` term.** The design's worked example writes
   `AND scope = 'resource'` for a selector written `.service.namespace`
-  (`docs/query-lowering.md:742`). `AttrScope::Unscoped` maps to `None` (`filter.rs:843`) and the
+  (`docs/query-lowering.md:742`). `AttrScope::Unscoped` maps to `None` (`filter.rs:846`) and the
   golden `traces_search/unscoped_attr.sql` shows no scope term. **This document follows the source
   and records the difference as an open question** rather than choosing one. What would settle it:
   the design's line saying which selector it means.
@@ -5821,7 +5826,7 @@ noticed and are not grounds for a new round.
 
 1. **The `scope` term on an unscoped attribute.** `docs/query-lowering.md:742` writes
    `AND scope = 'resource'` beside a selector written `.service.namespace`. Our source emits no
-   scope term for an unscoped attribute (`filter.rs:843`, golden
+   scope term for an unscoped attribute (`filter.rs:846`, golden
    `traces_search/unscoped_attr.sql`). Either the design's example means
    `resource.service.namespace`, or the target predicate differs from the current one in a way the
    design has not stated. **This document follows the source and does not choose.**

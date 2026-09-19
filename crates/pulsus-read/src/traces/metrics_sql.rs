@@ -1879,11 +1879,25 @@ mod tests {
         assert!(expr.starts_with("NOT (if(pi0s != 0, "), "{expr}");
         assert!(expr.contains("attr_val[pi0s] = 'prod'"), "{expr}");
         // The unscoped chain walks all five attribute scopes, in
-        // precedence order, and each arm tests its OWN element.
-        assert_eq!(f.with_items.len(), 5);
+        // precedence order, and each arm tests its OWN element: five
+        // presence locates, then the two MATCHING locates the
+        // multi-valued `event` and `link` scopes need because a
+        // condition there is any-element.
+        assert_eq!(f.with_items.len(), 7);
         for (item, scope) in f.with_items.iter().zip(filter::UNSCOPED_SCOPE_CHAIN) {
             assert!(item.contains(&format!("s = '{scope}'")), "{item}");
+            assert!(item.contains("(k, s) ->"), "{item}");
         }
+        assert!(
+            f.with_items[5].contains("(k, s, v) -> k = 'env' AND s = 'event' AND v = 'prod'"),
+            "{}",
+            f.with_items[5]
+        );
+        assert!(
+            f.with_items[6].contains("(k, s, v) -> k = 'env' AND s = 'link' AND v = 'prod'"),
+            "{}",
+            f.with_items[6]
+        );
     }
 
     #[test]

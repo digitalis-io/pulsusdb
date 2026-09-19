@@ -1766,8 +1766,22 @@ mod tests {
                 && cross.contains("LEFT JOIN"),
             "roots resolved over the DISTINCT trace_id IN-set, LEFT JOINed: {cross}"
         );
-        // The selection predicate is the inner filter compiled to a bool.
-        assert!(cross.contains("key = 'http.status_code'"), "{cross}");
+        // The selection predicate is the inner filter compiled to a
+        // bool. Issue #559: it is answered on the span row, and its
+        // locator is prefixed `c` so it cannot collide with the outer
+        // filter's — `compare()` is the one shape that declares two
+        // filters' aliases into one statement.
+        assert!(
+            cross.contains(
+                "WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', \
+                 attr_key, attr_scope) AS cpi0"
+            ),
+            "{cross}"
+        );
+        assert!(
+            cross.contains("(((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel"),
+            "{cross}"
+        );
         assert!(totals.contains("countIf(is_sel) AS sel_total"), "{totals}");
         // The distinct-(key,value) cap probe is reused by the engine.
         let probe = p
@@ -2094,7 +2108,23 @@ mod tests {
         )
         .unwrap();
         assert!(p.range_sql().contains("FROM trace_spans_dist\n"));
-        assert!(p.range_sql().contains("FROM trace_attrs_idx_dist WHERE"));
         assert!(p.distributed());
+        // Issue #559: the FILTER no longer reads the attribute index, so
+        // a filtered `rate()` names only `trace_spans_dist`. The
+        // clustered `_dist` substitution on `trace_attrs_idx` is still
+        // reached — by `compare()`'s attribute ENUMERATION, which this
+        // change does not touch — and that is asserted here rather than
+        // dropped.
+        let c = plan_trace_metrics(
+            &parse(r#"{ span.a = "1" } | compare({ span.b = "2" })"#).unwrap(),
+            &PARAMS,
+            &clustered,
+        )
+        .unwrap();
+        let (cross, totals) = c.compare_range().expect("a comparison plan");
+        assert!(c.distributed());
+        assert!(cross.contains("FROM trace_attrs_idx_dist WHERE"), "{cross}");
+        assert!(cross.contains("FROM trace_spans_dist\n"), "{cross}");
+        assert!(totals.contains("FROM trace_spans_dist\n"), "{totals}");
     }
 }

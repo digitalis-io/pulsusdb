@@ -112,6 +112,16 @@ fn render_plan(key: &str) -> String {
 /// *RED when:* any served by-key plans differently — which is what a
 /// grammar change reaching the read path looks like. It is not a count to
 /// refresh: regenerate only with the behaviour change written down.
+///
+/// **Regenerated on issue #559, for one field of one key.**
+/// `resource.service.name`'s `by_probe_sql` — the `| by()` cardinality
+/// preflight — moved with the metrics filter compiler it is built by:
+/// the fixture's `{ .x = 1 }` attribute condition is now answered on the
+/// span row instead of by a semi-join against `trace_attrs_idx`. Nothing
+/// else in the rendered plan moved. The preflight has to count by the
+/// rule the search it guards uses, or it refuses searches that would have
+/// succeeded; that is the whole change, recorded in
+/// `docs/query-lowering.md` and in the differential ledger.
 #[test]
 fn every_served_by_key_plans_as_it_did_before_the_grammar_change() {
     let mut rendered: BTreeMap<String, String> = BTreeMap::new();

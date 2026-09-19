@@ -5108,9 +5108,25 @@ mod tests {
             "cap+1 (max_series=1000): {probe}"
         );
         assert!(probe.contains("count() AS n"), "{probe}");
+        // The preflight carries the search's own filter, answered by the
+        // same rule the search answers it by (issue #559): the attribute
+        // condition is located on the span row, not counted out of the
+        // attribute index. A preflight that counted by a different rule
+        // would refuse searches that would have succeeded, and admit ones
+        // that will not.
         assert!(
-            probe.contains("key = 'a'"),
+            probe.contains(
+                "arrayFirstIndex((k, s) -> k = 'a' AND s = 'span', attr_key, attr_scope) AS pi0s"
+            ),
+            "carries the filter's locator: {probe}"
+        );
+        assert!(
+            probe.contains("if(pi0s != 0, attr_val[pi0s] = '1', "),
             "carries the filter predicate: {probe}"
+        );
+        assert!(
+            !probe.contains("trace_attrs_idx"),
+            "the preflight reads the span table only: {probe}"
         );
     }
 
