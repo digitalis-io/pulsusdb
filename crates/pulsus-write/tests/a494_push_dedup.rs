@@ -906,9 +906,20 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
         1,
         "exactly one push's samples reached the table"
     );
-    assert!(
-        metadata.rows_inserted() >= 1,
-        "and the descriptor is written whichever of them won the race"
+    assert_eq!(
+        metadata.rows_inserted(),
+        4,
+        "every one of the four enqueues its descriptor: suppression drops the sample, \
+         series and histogram rows and still offers the descriptor to the cache gate, and \
+         the gate emits a row unless the descriptor equals the one last CONFIRMED-flushed. \
+         Under this barrier none of the four has confirmed anything yet, so all four emit. \
+         Nothing user-visible duplicates: `metric_metadata` is a ReplacingMergeTree whose \
+         sorting key excludes the receiver-injected `updated_ns`, so the four collapse to \
+         one row — `a_concurrent_descriptor_race_leaves_one_visible_row` in \
+         `crates/pulsus-server/tests/push_dedup_live.rs` reads that count back from a live \
+         table. This is an exact figure rather than `>= 1` because round 4 of this issue's \
+         code review measured it and the notes claimed it; a claim with `>= 1` behind it is \
+         not the claim."
     );
 }
 

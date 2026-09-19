@@ -94,7 +94,9 @@ use prost::Message;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::Fingerprint;
 use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
-use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
+use pulsus_write::protocols::remote_write::{
+    Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest,
+};
 use pulsus_write::writer::{MetricHistSampleRow, MetricSampleRow, MetricSeriesRow};
 
 /// One fixed listener port per test: the suites in this crate run as
@@ -114,6 +116,7 @@ const METRICS_PORT: u16 = 31_633;
 const COLLAPSE_PORT: u16 = 31_634;
 const BUDGET_PORT: u16 = 31_635;
 const MECHANISM_OFF_PORT: u16 = 31_636;
+const DESCRIPTOR_RACE_PORT: u16 = 31_638;
 
 /// `2026-01-15T00:00:00Z` in nanoseconds — `T mod 5s == 0` and
 /// `T mod 10s == 0`, so L1's two entries share one rollup bucket and one
@@ -387,6 +390,52 @@ fn remote_write_body(job: &str, t1_ms: i64) -> Vec<u8> {
             ..Default::default()
         }],
         ..Default::default()
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress the write")
+}
+
+/// A remote write that carries a metric DESCRIPTOR as well as samples.
+///
+/// The descriptor is what makes a suppressed push still do work: the rows
+/// it would have stored are dropped, and the descriptor is still offered
+/// to the cache gate.
+fn remote_write_with_descriptor(metric: &str, job: &str, t1_ms: i64) -> Vec<u8> {
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![
+                Label {
+                    name: "__name__".to_string(),
+                    value: metric.to_string(),
+                },
+                Label {
+                    name: "job".to_string(),
+                    value: job.to_string(),
+                },
+            ],
+            samples: vec![
+                Sample {
+                    value: 1.0,
+                    timestamp: t1_ms,
+                },
+                Sample {
+                    value: 2.0,
+                    timestamp: t1_ms + 15_000,
+                },
+                Sample {
+                    value: 3.0,
+                    timestamp: t1_ms + 30_000,
+                },
+            ],
+            ..Default::default()
+        }],
+        metadata: vec![MetricMetadataProto {
+            r#type: 1,
+            metric_family_name: metric.to_string(),
+            help: "requests served".to_string(),
+            unit: String::new(),
+        }],
     };
     snap::raw::Encoder::new()
         .compress_vec(&req.encode_to_vec())
@@ -920,6 +969,83 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
         "off: six rows are stored, and the §7 read rule still answers three — \
          the two halves of this change are independent"
     );
+}
+
+// ---------------------------------------------------------------------
+// M3 — the concurrent descriptor race, read back from the table
+// ---------------------------------------------------------------------
+
+/// **M3.** Four content-identical, descriptor-bearing writes sent at once
+/// each enqueue their descriptor, and one row is visible.
+///
+/// **Why both halves are asserted somewhere.** Suppression drops the
+/// sample, series and histogram rows of the three it suppresses, and
+/// still offers each descriptor to the cache gate; the gate emits unless
+/// the descriptor equals the one last CONFIRMED-flushed, and under a
+/// barrier none of the four has confirmed anything, so all four emit.
+/// `concurrent_identical_descriptor_bearing_pushes_store_one_copy` in
+/// `crates/pulsus-write/tests/a494_push_dedup.rs` asserts that count is
+/// exactly four. What a reader sees is one row, because `metric_metadata`
+/// is a `ReplacingMergeTree(updated_ns)` ordered by `metric_name` alone —
+/// the receiver-injected `updated_ns` is excluded from the key, so the
+/// four collapse. This test reads that back from a live table, which the
+/// writer-level one cannot.
+///
+/// Round 4 of this issue's code review found the pair established visible
+/// retry correctness but neither of these two figures; the notes claimed
+/// them anyway. They are assertions now.
+#[tokio::test]
+async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
+    if !should_run() {
+        eprintln!("skipping: PULSUS_TEST_CLICKHOUSE is not set");
+        return;
+    }
+    assert_port_free(DESCRIPTOR_RACE_PORT);
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("a494_descriptor_race")).await;
+    let _server = spawn_ready(DESCRIPTOR_RACE_PORT, &db, &[]);
+    let client = client_for(db.name()).await;
+
+    let t1_ms = T_NS / 1_000_000;
+    let body = remote_write_with_descriptor("dedup_descriptor_race_total", "dupDesc", t1_ms);
+
+    // Four at once, so none of them has confirmed a flush when the others
+    // reach the cache gate. Threads rather than tasks: `push_metrics`
+    // blocks on a socket.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let body = body.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            push_metrics(DESCRIPTOR_RACE_PORT, &body, &[]).status
+        }));
+    }
+    for h in handles {
+        assert_eq!(
+            h.join().expect("push thread"),
+            204,
+            "every push is accepted"
+        );
+    }
+
+    wait_for_scalar(
+        &client,
+        "SELECT count() AS n FROM metric_samples \
+         WHERE metric_name = 'dedup_descriptor_race_total'",
+        3,
+        "M3: one push's three samples, not four pushes' twelve",
+    )
+    .await;
+
+    wait_for_scalar(
+        &client,
+        "SELECT count() AS n FROM metric_metadata FINAL \
+         WHERE metric_name = 'dedup_descriptor_race_total'",
+        1,
+        "M3: one descriptor row is visible however many were enqueued",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------
