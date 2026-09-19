@@ -19,7 +19,20 @@ cd "$REPO"
 # manifest verbatim, so they inherit it.
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+# Every reference this script creates lives under one prefix, and the
+# trap removes all of them however the script ends. An earlier version
+# deleted them on the last line, so a run that failed — which is what a
+# break test makes it do — left `refs/doc-sites-self-test/absorbed`
+# behind in the repository it was testing.
+SELF_TEST_REFS=refs/doc-sites-self-test
+cleanup() {
+  rm -rf "$work"
+  git -C "$REPO" for-each-ref --format='%(refname)' "$SELF_TEST_REFS/**" 2>/dev/null \
+    | while IFS= read -r r; do
+        [ -n "$r" ] && git -C "$REPO" update-ref -d "$r" 2>/dev/null || true
+      done
+}
+trap cleanup EXIT INT TERM
 fail() { echo "doc-sites-self-test: $1" >&2; exit 1; }
 
 # A copy of every file the manifest names, plus the manifest itself.
@@ -264,26 +277,22 @@ fi
 echo "self-test: a change already merged to the base branch selects nothing"
 copy_tree
 absorbed=$(throwaway_commit "HEAD^{tree}" -p "$BASE" -p HEAD)
-git -C "$REPO" update-ref refs/doc-sites-self-test/absorbed "$absorbed"
+git -C "$REPO" update-ref "$SELF_TEST_REFS/absorbed" "$absorbed"
 expect_refusal_without_upstream "the change already merged to the base"
 
 echo "self-test: a later unrelated feature merge selects nothing"
 copy_tree
 feature=$(throwaway_commit "$BASE^{tree}" -p "$BASE")
 later=$(throwaway_commit "HEAD^{tree}" -p HEAD -p "$feature")
-git -C "$REPO" update-ref refs/doc-sites-self-test/feature "$later"
+git -C "$REPO" update-ref "$SELF_TEST_REFS/feature" "$later"
 expect_refusal_without_upstream "a later unrelated feature merge"
 
 echo "self-test: a merge back-dated ahead of its own ancestor selects nothing"
 copy_tree
 THROWAWAY_DATE="2030-01-01T00:00:00+0000" older=$(throwaway_commit "HEAD^{tree}" -p HEAD -p "$BASE")
 newer=$(THROWAWAY_DATE="2001-01-01T00:00:00+0000" throwaway_commit "HEAD^{tree}" -p "$older" -p "$feature")
-git -C "$REPO" update-ref refs/doc-sites-self-test/backdated "$newer"
+git -C "$REPO" update-ref "$SELF_TEST_REFS/backdated" "$newer"
 expect_refusal_without_upstream "a descendant merge dated before its ancestor"
-
-git -C "$REPO" update-ref -d refs/doc-sites-self-test/absorbed
-git -C "$REPO" update-ref -d refs/doc-sites-self-test/feature
-git -C "$REPO" update-ref -d refs/doc-sites-self-test/backdated
 
 echo "self-test: an empty manifest"
 copy_tree
