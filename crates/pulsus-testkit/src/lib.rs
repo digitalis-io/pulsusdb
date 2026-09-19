@@ -1058,13 +1058,36 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// differing rows.
 ///
 /// **2. No span row's arrays hold the same element twice.** That is a
-/// separate assertion because the first one cannot make it: the index
-/// store **cannot represent a duplicate at all**. `trace_attrs_idx` is a
-/// `ReplacingMergeTree` ordered by
-/// `(key, val, scope, timestamp_ns, trace_id, span_id)`, so two index rows
-/// for one span's repeated element are identical on the whole ordering key
-/// and collapse to one. There is no cross-store comparison that can see
-/// span-side multiplicity, in either direction.
+/// separate assertion because **check 1 compares DISTINCT tuples on both
+/// sides**, so it answers a question about SETS and cannot see
+/// multiplicity in either direction. That is a property of the
+/// comparison, not of the store.
+///
+/// Check 1 is distinct because index-side duplicates are real and
+/// deliberate: an at-least-once REPLAY writes the index rows twice to
+/// reproduce what a `ReplacingMergeTree` read without `FINAL` sees, and
+/// repetition there is inert for every index read (the phase-1 generator
+/// aggregates under `GROUP BY trace_id`; the metrics and tag reads use
+/// `IN`/`DISTINCT`).
+///
+/// **What the index store actually does, measured rather than reasoned**
+/// (ClickHouse 26.3.29.7):
+///
+/// * `trace_attrs_idx` is ordered by
+///   `(key, val, scope, timestamp_ns, trace_id, span_id)`, which covers
+///   **five of the seven columns check 1 compares**. `val_type` and
+///   `val_num` are outside it — `system.columns` reports
+///   `is_in_sorting_key = 0` for both.
+/// * **Duplicate index rows are visible until a merge.** With merges
+///   stopped, two identical inserts read `2` raw and `1` under `FINAL`.
+///   An earlier revision of this comment said the store "cannot represent
+///   a duplicate at all"; that is false, and the replay corpora depend on
+///   it being false.
+/// * After a merge, two rows identical on those five columns collapse to
+///   one even when they differ in `val_type`/`val_num`, and the survivor
+///   is decided by insertion order: a `string` row followed by an `int`
+///   row leaves `int`. So the index cannot be trusted to hold two
+///   different KINDS for one element either.
 ///
 /// **And span-side multiplicity is response-affecting**, which is why it
 /// is checked rather than described. The event/link value-set WIDTH is
@@ -1149,10 +1172,10 @@ pub fn assert_stores_agree(db: &str) {
         dupes.trim().is_empty(),
         "a span row in {db} holds the same attribute element more than once. Rows below are \
          `trace, span, elements, distinct_elements, [the repeated elements]`. The two stores \
-         can still hold the same SET — the index is a ReplacingMergeTree whose ordering key \
-         collapses a repeated element, so it cannot represent one — but the event/link \
-         value-set width is `arrayCount` over these arrays, so the duplicate raises the width \
-         and can turn a search into `422` at the value budget:\n{dupes}"
+         can still hold the same SET, and the check above compares DISTINCT tuples, so it \
+         cannot see this — but the event/link value-set width is `arrayCount` over these \
+         arrays, so the duplicate raises the width and can turn a search into `422` at the \
+         value budget:\n{dupes}"
     );
 }
 
