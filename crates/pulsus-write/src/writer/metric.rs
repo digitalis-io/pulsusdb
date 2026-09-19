@@ -516,6 +516,145 @@ impl MetricWriter {
             return Err(AdmitRefusal::Backpressure);
         }
 
+        // Issue #494: the claim, taken before the byte reservation so a
+        // request refused by backpressure leaves no claim behind.
+        //
+        // **One claim per content, with no exception.** An earlier revision
+        // excepted a push that emits a `metric_metadata` descriptor, and
+        // the exception reopened the defect for exactly the traffic it was
+        // protecting: two CONCURRENT identical bodies carrying a descriptor
+        // and samples both admitted, and the table then held two sample
+        // rows. Excepting a class of push was not the mechanism.
+        //
+        // What is asymmetric is not the push, it is the two row families.
+        // A duplicate `metric_samples` row inflates every counting query,
+        // which is the defect this issue exists for. A duplicate
+        // `metric_metadata` row is a no-op by construction — the table is a
+        // `ReplacingMergeTree` keyed on `metric_name`, so a second row
+        // carrying the same descriptor collapses onto the first. The cost
+        // runs the other way: NOT writing a descriptor can be wrong,
+        // because the table is versioned by a receiver clock the push
+        // identity deliberately excludes, so
+        //
+        // ```text
+        //   counter at t1    emitted, wins
+        //   gauge   at t2    emitted, wins
+        //   counter at t3    same content as t1 -> suppressed
+        // ```
+        //
+        // would leave `gauge` winning for a metric that is a counter. The
+        // A/B/A test in `tests/live_metric_writer.rs` measured exactly that.
+        //
+        // So suppression applies to the rows where duplication is harmful
+        // and not to the one where omission is: **a suppressed push stores
+        // no sample, series or histogram row, and still offers its
+        // descriptor to the cache gate below.** Both concurrent identical
+        // pushes share one claim, one of them stores the samples, and the
+        // descriptor is written whichever of them wins the race.
+        let mut suppressed: Option<Suppressed> = None;
+        //
+        // The claim is taken EITHER way: a push that emits a descriptor is
+        // stored, but it still registers, so its own retry — which by then
+        // emits no descriptor, because this push's flush promoted the
+        // cache — finds it and is suppressed. Only the two suppression
+        // verdicts are overridden; a reused key is still a client error
+        // and a full table still sheds, because neither is about what this
+        // push stores.
+        let mut guard = match &self.shared.dedup {
+            Some(dedup) => {
+                let id = push_dedup::metric_identity(&batch, &push);
+                let rows = (batch.samples.len() + batch.hist_samples.len()) as u64;
+                match dedup.admit(id, mode.wait_mode()) {
+                    Admission::Admit(guard) => Some(guard),
+                    Admission::SuppressedSettled(outcome) => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Settled(outcome));
+                        None
+                    }
+                    Admission::SuppressedPending { guard, rx } => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Pending(guard, rx));
+                        None
+                    }
+                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
+                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
+                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
+                }
+            }
+            None => None,
+        };
+        let claim = guard.as_ref().map(ClaimGuard::key);
+
+        // `metric_metadata`: local-dedup (last occurrence per metric_name
+        // wins within one request), then gate on the last-*emitted* value
+        // (architect plan amendment 1, finding 2) — emit iff it differs
+        // from what `MetadataCache` last confirmed-flushed for this name.
+        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
+        for meta in &batch.metadata {
+            last_by_name.insert(&meta.metric_name, meta);
+        }
+        let mut new_metadata: Vec<&MetricMetadata> = Vec::new();
+        {
+            let cache = self
+                .shared
+                .metadata_cache
+                .lock()
+                .expect("metadata cache mutex poisoned");
+            for meta in last_by_name.into_values() {
+                let emit = match cache.get(&meta.metric_name) {
+                    Some((t, h, u)) => t != &meta.metric_type || h != &meta.help || u != &meta.unit,
+                    None => true,
+                };
+                if emit {
+                    new_metadata.push(meta);
+                }
+            }
+        }
+        let metadata_bytes: u64 = new_metadata
+            .iter()
+            .map(|m| MetricMetadataRow::est_source_bytes(m))
+            .sum();
+
+        // The suppressed push stops here: its samples are already stored
+        // by the push it repeats, and the only thing it still owes is the
+        // descriptor above. That append is ASYNC and carries no claim —
+        // the caller is answered with the ORIGINAL push's outcome, exactly
+        // as the contract says, and a `metric_metadata` flush never joins
+        // a durability acknowledgement it was not part of.
+        if let Some(suppressed) = suppressed {
+            if !new_metadata.is_empty() {
+                super::reserve_queued_bytes(
+                    &self.shared.queued_bytes,
+                    &self.shared.metrics.backpressure_total,
+                    metadata_bytes,
+                    self.shared.runtime.queue_bytes_limit,
+                )
+                .map_err(AdmitRefusal::from)?;
+                let metadata_rows: Vec<MetricMetadataRow> = new_metadata
+                    .iter()
+                    .map(|m| MetricMetadataRow::from(*m))
+                    .collect();
+                self.shared
+                    .metrics
+                    .metadata_upserts_total
+                    .fetch_add(metadata_rows.len() as u64, Ordering::Relaxed);
+                if self
+                    .shared
+                    .metadata
+                    .append(
+                        metadata_rows,
+                        metadata_bytes,
+                        self.shared.runtime.batch_bytes,
+                        None,
+                    )
+                    .0
+                {
+                    self.shared.metadata_notify.notify_one();
+                }
+            }
+            return Ok(Admitted::Suppressed(suppressed));
+        }
+
         self.shared
             .metrics
             .collisions_total
@@ -619,118 +758,7 @@ impl MetricWriter {
             .map(|(s, _, _)| MetricSeriesRow::est_source_bytes(s))
             .sum();
 
-        // `metric_metadata`: local-dedup (last occurrence per metric_name
-        // wins within one request), then gate on the last-*emitted* value
-        // (architect plan amendment 1, finding 2) — emit iff it differs
-        // from what `MetadataCache` last confirmed-flushed for this name.
-        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
-        for meta in &batch.metadata {
-            last_by_name.insert(&meta.metric_name, meta);
-        }
-        let mut new_metadata: Vec<&MetricMetadata> = Vec::new();
-        {
-            let cache = self
-                .shared
-                .metadata_cache
-                .lock()
-                .expect("metadata cache mutex poisoned");
-            for meta in last_by_name.into_values() {
-                let emit = match cache.get(&meta.metric_name) {
-                    Some((t, h, u)) => t != &meta.metric_type || h != &meta.help || u != &meta.unit,
-                    None => true,
-                };
-                if emit {
-                    new_metadata.push(meta);
-                }
-            }
-        }
-        let metadata_bytes: u64 = new_metadata
-            .iter()
-            .map(|m| MetricMetadataRow::est_source_bytes(m))
-            .sum();
-
         let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
-
-        // Issue #494: the claim, taken before the byte reservation so a
-        // request refused by backpressure leaves no claim behind — and
-        // after the metadata gate above, because **a push that emits a
-        // `metric_metadata` descriptor is never suppressed.**
-        //
-        // `metric_metadata` is a `ReplacingMergeTree` versioned by
-        // `updated_ns`, which is receiver-injected and therefore outside
-        // the push identity (it changes on every retry, so including it
-        // would stop a retry matching anything). That exclusion is right
-        // for a retry and wrong for a descriptor that comes BACK:
-        //
-        // ```text
-        //   counter at t1   emitted, wins
-        //   gauge   at t2   emitted, wins
-        //   counter at t3   same content as t1 -> suppressed
-        //                   -> `gauge` still wins, and the stored type is wrong
-        // ```
-        //
-        // Measured before this gate existed:
-        // `crates/pulsus-write/tests/live_metric_writer.rs`'s A/B/A test
-        // read back `gauge` where the metric is a `counter`.
-        //
-        // The gate above is what makes the rule cheap as well as correct.
-        // It emits a descriptor only when it differs from the one last
-        // confirmed-flushed, so a genuine retry — whose descriptor the
-        // cache already holds — emits none, stays claimable, and is
-        // suppressed exactly as before. What is admitted instead is the
-        // push whose descriptor is news, which is the one whose effect on
-        // storage a content digest cannot predict.
-        //
-        // The residual, stated rather than implied: a retry arriving
-        // before this push's metadata flush is confirmed still finds the
-        // descriptor un-cached, so it too emits one and is stored. That
-        // window is one flush cycle (`PULSUS_BATCH_MS`, 200 ms) plus the
-        // insert, against a client retry that follows a network timeout
-        // seconds later — and it fails in the safe direction, to the
-        // pre-#494 duplicate rather than to a wrong stored value.
-        //
-        // The claim is taken EITHER way: a push that emits a descriptor is
-        // stored, but it still registers, so its own retry — which by then
-        // emits no descriptor, because this push's flush promoted the
-        // cache — finds it and is suppressed. Only the two suppression
-        // verdicts are overridden; a reused key is still a client error
-        // and a full table still sheds, because neither is about what this
-        // push stores.
-        let emits_descriptor = !new_metadata.is_empty();
-        let mut guard = match &self.shared.dedup {
-            Some(dedup) => {
-                let id = push_dedup::metric_identity(&batch, &push);
-                let rows = (batch.samples.len() + batch.hist_samples.len()) as u64;
-                // A push that is going to be stored whatever the index
-                // says registers no waiter: it is not going to wait.
-                let wait = if emits_descriptor {
-                    push_dedup::WaitMode::None
-                } else {
-                    mode.wait_mode()
-                };
-                match dedup.admit(id, wait) {
-                    Admission::Admit(guard) => Some(guard),
-                    Admission::SuppressedSettled(_) | Admission::SuppressedPending { .. }
-                        if emits_descriptor =>
-                    {
-                        None
-                    }
-                    Admission::SuppressedSettled(outcome) => {
-                        dedup.count_suppressed(id.declared_retry, rows);
-                        return Ok(Admitted::Suppressed(Suppressed::Settled(outcome)));
-                    }
-                    Admission::SuppressedPending { guard, rx } => {
-                        dedup.count_suppressed(id.declared_retry, rows);
-                        return Ok(Admitted::Suppressed(Suppressed::Pending(guard, rx)));
-                    }
-                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
-                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
-                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
-                }
-            }
-            None => None,
-        };
-        let claim = guard.as_ref().map(ClaimGuard::key);
 
         // Atomic reservation (mirrors `LogWriter::admit_batch`): reserve
         // first, roll back on overflow.

@@ -839,8 +839,76 @@ async fn a_descriptor_that_comes_back_is_stored_again() {
     );
     assert_eq!(
         writer.metrics().dedup.duplicate_pushes_total,
-        0,
-        "and none of the three was suppressed"
+        1,
+        "the third push IS suppressed — it repeats the first — and the \
+         descriptor is written anyway, which is the whole point: \
+         suppression drops the rows a repeat would duplicate, not the one \
+         a repeat would correct"
+    );
+}
+
+/// The case an earlier revision reopened, committed so it cannot be
+/// reopened again: **two concurrent identical pushes carrying a descriptor
+/// AND samples store one copy of the samples.**
+///
+/// The revision before this one excepted descriptor-bearing pushes from
+/// suppression altogether, and two such requests raced each other into the
+/// table: both returned success and the samples were stored twice. One
+/// claim per content is what fixes it — the exception was never the
+/// mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
+    let samples = MockInserter::new(Behavior::Ok);
+    let metadata = MockInserter::new(Behavior::Ok);
+    let writer = Arc::new(metric_writer_with_samples(
+        never_flushes(),
+        samples.clone(),
+        metadata.clone(),
+    ));
+    let gate = Arc::new(tokio::sync::Barrier::new(4));
+
+    let body = || {
+        let mut batch = metadata_batch("http_requests_total", "counter", 1);
+        batch.samples.push(MetricPoint {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(11),
+            unix_milli: 1_700_000_000_000,
+            value: 1.0,
+        });
+        batch.series.push(SeriesRef {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(11),
+            labels: labels_with_service("svc"),
+        });
+        batch
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let writer = writer.clone();
+        let gate = gate.clone();
+        tasks.spawn(async move {
+            gate.wait().await;
+            MetricSink::admit(writer.as_ref(), body(), PushHeaders::default())
+        });
+    }
+    let results: Vec<Result<(), AdmitRefusal>> = tasks.join_all().await;
+    assert!(results.iter().all(Result::is_ok), "no push is refused");
+    assert_eq!(
+        writer.metrics().dedup.duplicate_pushes_total,
+        3,
+        "three of the four are suppressed"
+    );
+
+    writer.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(
+        samples.rows_inserted(),
+        1,
+        "exactly one push's samples reached the table"
+    );
+    assert!(
+        metadata.rows_inserted() >= 1,
+        "and the descriptor is written whichever of them won the race"
     );
 }
 
