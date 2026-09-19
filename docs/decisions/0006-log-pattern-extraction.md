@@ -52,12 +52,16 @@ on `fingerprint` with the rest of the logs family.
 **D3. Exactly-once framing.** The writer never auto-replays a block that could
 have committed: a post-send retryable failure is downgraded to `InsertUncertain`
 and spooled audit-only, never re-inserted. So `sum` inflation is impossible
-within the writer's own machinery. The only inflation vector is a client-level
-re-send after a 5xx/timeout ack — the identical event class that already
-inflates the `log_metrics` rollup. Pattern counts are therefore **exact on the
-clean path and best-effort-approximate under ingest-failure re-sends**, at
-`log_metrics` parity (proven by a live fidelity test that re-admits a batch and
-cross-checks both tables inflating by the same factor). Patterns are excluded
+within the writer's own machinery. A client-level re-send after a 5xx/timeout
+ack no longer inflates either, when it reaches the writer that accepted the
+original inside `PULSUS_INGEST_DEDUP_WINDOW`: issue #494 suppresses it before
+the insert. A re-send that reaches a **different** writer process still
+inflates, at `log_metrics` parity — the identical event class. Pattern counts
+are therefore **exact on the clean path and on a same-writer re-send, and
+best-effort-approximate under a cross-writer one** (the cited live fidelity
+test builds a new `LogWriter` per admit, so its two admits are the
+cross-writer case, and it cross-checks both tables inflating by the same
+factor). Patterns are excluded
 from the sync durability ack (a `log_patterns` flush failure never 500s an
 ingest whose log lines landed).
 

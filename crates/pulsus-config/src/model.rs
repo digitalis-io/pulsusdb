@@ -286,6 +286,24 @@ pub struct WriterConfig {
     /// today, which is why one knob is right now and wrong the moment that
     /// switch exists.
     pub discover_log_levels: bool,
+    /// `PULSUS_INGEST_DEDUP` (issue #494): retried-push suppression. Default
+    /// `true` — a content-identical push that reaches the same writer inside
+    /// [`Self::ingest_dedup_window`] stores nothing and answers with the
+    /// original push's outcome. `false` restores the pre-#494 behaviour, in
+    /// which a client that retries after a network timeout stores its entries
+    /// or samples twice.
+    pub ingest_dedup: bool,
+    /// `PULSUS_INGEST_DEDUP_WINDOW` (issue #494): how long a writer remembers
+    /// an accepted push. A retry that arrives after this has elapsed is a new
+    /// push and is stored. Accepted range `1s..=1h`.
+    pub ingest_dedup_window: HumanDuration,
+    /// `PULSUS_INGEST_DEDUP_MAX_BYTES` (issue #494): the whole per-signal
+    /// suppression index's memory bound — the reserved claim table plus every
+    /// live waiter registration. Accepted range `1MiB..=1GiB`. The index
+    /// reserves its collections once at construction from this figure and
+    /// never grows them, so this is a hard bound rather than a target; past
+    /// it a push is refused `429` and nothing is stored.
+    pub ingest_dedup_max_bytes: ByteSize,
 }
 
 impl Default for WriterConfig {
@@ -297,6 +315,9 @@ impl Default for WriterConfig {
             ingest_queue_bytes: ByteSize(256 * 1024 * 1024),
             log_patterns: true,
             discover_log_levels: true,
+            ingest_dedup: true,
+            ingest_dedup_window: HumanDuration(Duration::from_secs(300)),
+            ingest_dedup_max_bytes: ByteSize(16 * 1024 * 1024),
         }
     }
 }

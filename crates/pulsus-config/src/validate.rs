@@ -54,6 +54,20 @@ fn ceiling_err(field: &str, ceiling: u64, floor: u64, disables: &str) -> ConfigE
     )
 }
 
+/// Issue #494: a two-sided range rejection — `ConfigError::Value` naming the
+/// field, with the accepted range in `expected` (`{floor}..={ceiling}`) and
+/// which end was breached in the message. Distinct from [`ceiling_err`]
+/// because a knob with a meaningful FLOOR cannot report "exceeds the
+/// representable ceiling" for a value that is too small.
+fn range_err(field: &str, value: u64, floor: u64, ceiling: u64, unit: &str) -> ConfigError {
+    let side = if value < floor { "below" } else { "above" };
+    value_err(
+        field,
+        &format!("{value} {unit} is {side} the accepted range"),
+        &format!("{floor}..={ceiling} {unit}"),
+    )
+}
+
 /// Issue #96 (retroactive re-review): `reader.promql_max_metric_fanout`
 /// bounds a returned distinct-metric-name set (`metrics/exec.rs`'s
 /// `rows.len() as u64 > cap`) and a resolved-group count (`metrics/
@@ -103,6 +117,28 @@ pub const BATCH_MS_CEILING: u64 = 200_000;
 /// the memory backpressure guard before physical exhaustion. 1024x the
 /// 256 MiB default.
 pub const INGEST_QUEUE_BYTES_CEILING: u64 = 256 * 1024 * 1024 * 1024;
+
+/// `writer.ingest_dedup_window` — issue #494's suppression window: how long
+/// one writer remembers an accepted push. The floor is one second (below
+/// that a retry of a timed-out push never lands inside the window, so the
+/// knob stops suppressing anything); the ceiling is one hour (a longer
+/// window keeps claims for pushes no client is still retrying, and the
+/// index's byte bound then sheds live traffic to hold dead entries).
+pub const INGEST_DEDUP_WINDOW_FLOOR_MS: u64 = 1_000;
+/// See [`INGEST_DEDUP_WINDOW_FLOOR_MS`].
+pub const INGEST_DEDUP_WINDOW_CEILING_MS: u64 = 60 * 60 * 1_000;
+
+/// `writer.ingest_dedup_max_bytes` — issue #494's per-signal bound on the
+/// WHOLE suppression index (the reserved claim table plus every live waiter
+/// registration). The floor is 1 MiB: the index reserves its collections
+/// once at construction, and below a megabyte the claim table it can afford
+/// holds too few pushes for a retry to still be remembered. The ceiling is
+/// 1 GiB per signal, two signals, against the 256 MiB default ingest queue —
+/// a larger index would dominate the writer's memory without suppressing a
+/// retry the 1 GiB index does not already catch.
+pub const INGEST_DEDUP_MAX_BYTES_FLOOR: u64 = 1024 * 1024;
+/// See [`INGEST_DEDUP_MAX_BYTES_FLOOR`].
+pub const INGEST_DEDUP_MAX_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 
 /// `reader.cache_max_series` — the matched-set / IN-list cardinality
 /// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
@@ -407,6 +443,33 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             INGEST_QUEUE_BYTES_CEILING,
             1,
             "the ingest backpressure guard",
+        ));
+    }
+    // Issue #494: both ends matter, so these are range checks rather than
+    // ceiling checks — see `INGEST_DEDUP_WINDOW_FLOOR_MS` and
+    // `INGEST_DEDUP_MAX_BYTES_FLOOR` for what each end protects.
+    {
+        let window_ms =
+            u64::try_from(cfg.writer.ingest_dedup_window.0.as_millis()).unwrap_or(u64::MAX);
+        if !(INGEST_DEDUP_WINDOW_FLOOR_MS..=INGEST_DEDUP_WINDOW_CEILING_MS).contains(&window_ms) {
+            return Err(range_err(
+                "writer.ingest_dedup_window",
+                window_ms,
+                INGEST_DEDUP_WINDOW_FLOOR_MS,
+                INGEST_DEDUP_WINDOW_CEILING_MS,
+                "ms",
+            ));
+        }
+    }
+    if !(INGEST_DEDUP_MAX_BYTES_FLOOR..=INGEST_DEDUP_MAX_BYTES_CEILING)
+        .contains(&cfg.writer.ingest_dedup_max_bytes.0)
+    {
+        return Err(range_err(
+            "writer.ingest_dedup_max_bytes",
+            cfg.writer.ingest_dedup_max_bytes.0,
+            INGEST_DEDUP_MAX_BYTES_FLOOR,
+            INGEST_DEDUP_MAX_BYTES_CEILING,
+            "bytes",
         ));
     }
     positive_u64("reader.cache_max_series", cfg.reader.cache_max_series)?;
@@ -1168,6 +1231,73 @@ mod tests {
             u64::MAX,
             BATCH_MS_CEILING,
         );
+    }
+
+    /// Issue #494: the suppression window is a two-sided range, so both
+    /// ends are asserted — one millisecond under the floor and one over the
+    /// ceiling are rejected naming the field, and both ends themselves plus
+    /// the documented default (5m) are accepted. Fails if either half of the
+    /// range check is removed.
+    #[test]
+    fn ingest_dedup_window_rejects_both_sides_and_accepts_both_ends() {
+        assert_eq!(
+            Config::default().writer.ingest_dedup_window,
+            HumanDuration(std::time::Duration::from_secs(300))
+        );
+        for bad_ms in [
+            0,
+            INGEST_DEDUP_WINDOW_FLOOR_MS - 1,
+            INGEST_DEDUP_WINDOW_CEILING_MS + 1,
+        ] {
+            let mut cfg = Config::default();
+            cfg.writer.ingest_dedup_window =
+                HumanDuration(std::time::Duration::from_millis(bad_ms));
+            match validate(&cfg) {
+                Err(ConfigError::Value { field, .. }) => {
+                    assert_eq!(field, "writer.ingest_dedup_window", "at {bad_ms} ms");
+                }
+                other => panic!("{bad_ms} ms: expected a Value error, got {other:?}"),
+            }
+        }
+        for ok_ms in [INGEST_DEDUP_WINDOW_FLOOR_MS, INGEST_DEDUP_WINDOW_CEILING_MS] {
+            let mut cfg = Config::default();
+            cfg.writer.ingest_dedup_window = HumanDuration(std::time::Duration::from_millis(ok_ms));
+            assert!(validate(&cfg).is_ok(), "{ok_ms} ms must be accepted");
+        }
+        assert!(validate(&Config::default()).is_ok());
+    }
+
+    /// Issue #494: the index byte bound is likewise two-sided — the index
+    /// reserves its collections at construction, so a value under the floor
+    /// buys a claim table too small to remember a retry, and one over the
+    /// ceiling is memory the writer cannot spare.
+    #[test]
+    fn ingest_dedup_max_bytes_rejects_both_sides_and_accepts_both_ends() {
+        assert_eq!(
+            Config::default().writer.ingest_dedup_max_bytes,
+            ByteSize(16 * 1024 * 1024)
+        );
+        for bad in [
+            0,
+            INGEST_DEDUP_MAX_BYTES_FLOOR - 1,
+            INGEST_DEDUP_MAX_BYTES_CEILING + 1,
+            u64::MAX,
+        ] {
+            let mut cfg = Config::default();
+            cfg.writer.ingest_dedup_max_bytes = ByteSize(bad);
+            match validate(&cfg) {
+                Err(ConfigError::Value { field, .. }) => {
+                    assert_eq!(field, "writer.ingest_dedup_max_bytes", "at {bad} bytes");
+                }
+                other => panic!("{bad} bytes: expected a Value error, got {other:?}"),
+            }
+        }
+        for ok in [INGEST_DEDUP_MAX_BYTES_FLOOR, INGEST_DEDUP_MAX_BYTES_CEILING] {
+            let mut cfg = Config::default();
+            cfg.writer.ingest_dedup_max_bytes = ByteSize(ok);
+            assert!(validate(&cfg).is_ok(), "{ok} bytes must be accepted");
+        }
+        assert!(validate(&Config::default()).is_ok());
     }
 
     #[test]

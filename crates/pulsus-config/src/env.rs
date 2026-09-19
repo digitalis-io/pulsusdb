@@ -55,6 +55,9 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_INGEST_QUEUE_BYTES",
     "PULSUS_LOG_PATTERNS",
     "PULSUS_DISCOVER_LOG_LEVELS",
+    "PULSUS_INGEST_DEDUP",
+    "PULSUS_INGEST_DEDUP_WINDOW",
+    "PULSUS_INGEST_DEDUP_MAX_BYTES",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
     "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
@@ -304,6 +307,15 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_DISCOVER_LOG_LEVELS") {
         cfg.writer.discover_log_levels = parse_bool("PULSUS_DISCOVER_LOG_LEVELS", &v)?;
     }
+    if let Some(v) = read("PULSUS_INGEST_DEDUP") {
+        cfg.writer.ingest_dedup = parse_bool("PULSUS_INGEST_DEDUP", &v)?;
+    }
+    if let Some(v) = read("PULSUS_INGEST_DEDUP_WINDOW") {
+        cfg.writer.ingest_dedup_window = parse_dur("PULSUS_INGEST_DEDUP_WINDOW", &v)?;
+    }
+    if let Some(v) = read("PULSUS_INGEST_DEDUP_MAX_BYTES") {
+        cfg.writer.ingest_dedup_max_bytes = parse_size("PULSUS_INGEST_DEDUP_MAX_BYTES", &v)?;
+    }
     if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
         cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;
     }
@@ -447,8 +459,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            79,
-            "docs/configuration.md §§1-8 document exactly 79 variables"
+            82,
+            "docs/configuration.md §§1-8 document exactly 82 variables"
         );
     }
 

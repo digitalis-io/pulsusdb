@@ -154,14 +154,17 @@ impl ChClient {
     /// Columnar block insert into `table`.
     ///
     /// **Never auto-retried.** `metric_samples`/`log_samples` are append-only
-    /// `MergeTree` tables that are exact-once only by writer batch atomicity
-    /// (docs/schemas.md §8); silently retrying a partially-delivered insert
+    /// `MergeTree` tables; silently retrying a partially-delivered insert
     /// block would duplicate rows and, for tier tables fed by materialized
     /// views, permanently inflate `val_sum`/`val_count`
-    /// (docs/schemas.md §2.2) — an irreversible corruption. On error, the
-    /// classified [`ChError`] is returned; the caller owns idempotency
-    /// (typically: drop the batch and rely on at-least-once upstream
-    /// redelivery, per `pulsus-write`'s policy, out of scope here).
+    /// (docs/schemas.md §2.2) — an irreversible corruption. Nothing at this
+    /// layer makes a repeated insert safe: the guard against a *client's*
+    /// retry is one layer up, where `pulsus-write` suppresses a
+    /// content-identical push inside `PULSUS_INGEST_DEDUP_WINDOW` before it
+    /// reaches this call at all (issue #494). On error, the classified
+    /// [`ChError`] is returned; the caller owns idempotency (typically:
+    /// drop the batch and rely on at-least-once upstream redelivery, per
+    /// `pulsus-write`'s policy, out of scope here).
     ///
     /// Bounded by both a server-side `max_execution_time` (on the `INSERT`
     /// statement) and a client-side `tokio::time::timeout` wrapping the

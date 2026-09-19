@@ -20,6 +20,7 @@ use crate::writer::buffer::{Generation, TableBuffer};
 use crate::writer::config::WriterRuntime;
 use crate::writer::error::WriteError;
 use crate::writer::metrics::TableMetrics;
+use crate::writer::push_dedup::{ClaimTicket, PushDedup, TargetOutcome};
 use crate::writer::spool::{SpoolEncode, SpoolKind, SpoolWriter};
 
 /// Real-vs-mock seam over a columnar block insert (architect plan): the
@@ -143,6 +144,11 @@ pub(crate) struct TableContext<R> {
     /// `trace_attrs_idx` — issues #134/#139); `None` on every append-only
     /// table.
     pub on_flush_poisoned: Option<FlushPoisonedHook<R>>,
+    /// Issue #494: the push-suppression index this table's flush task
+    /// drives once per cycle, ageing open claims past their deadline and
+    /// dropping claims whose window has elapsed. `None` when
+    /// `PULSUS_INGEST_DEDUP` is off, and on every trace table.
+    pub dedup: Option<Arc<PushDedup>>,
 }
 
 /// Spawns this table's dedicated flush task: `select!{size/age-triggered
@@ -169,6 +175,12 @@ where
             }
             if shutdown_rx.borrow().is_some() {
                 break;
+            }
+            // Issue #494: the suppression index's one production caller.
+            // Once per flush cycle (`PULSUS_BATCH_MS`), which is also what
+            // bounds how stale the age eviction can be.
+            if let Some(dedup) = &ctx.dedup {
+                dedup.tick();
             }
             if ctx
                 .buffer
@@ -239,7 +251,7 @@ where
 /// reservation, so it always reaches the settle path exactly once.
 async fn settle_generation<R>(
     ctx: &TableContext<R>,
-    generation: Generation<R>,
+    mut generation: Generation<R>,
     mut shutdown_rx: watch::Receiver<Option<Instant>>,
 ) where
     R: ChRow + SpoolEncode + Send + Sync,
@@ -282,6 +294,12 @@ async fn settle_generation<R>(
         Err(_elapsed) => {
             ctx.queued_bytes
                 .fetch_sub(generation.bytes, Ordering::AcqRel);
+            // Issue #494: the forced-shutdown settle bypasses
+            // `finish_generation`'s reporting path, so it takes the ticket
+            // itself. A generation abandoned at the drain deadline has an
+            // UNKNOWN fate — the answer that never re-admits rows that may
+            // have committed.
+            take_ticket(&mut generation).settle(TargetOutcome::Uncertain);
             generation.settle(Err(WriteError::ShuttingDown));
         }
     }
@@ -303,6 +321,13 @@ where
 {
     let remaining = deadline.saturating_duration_since(Instant::now());
     tokio::time::timeout(remaining, attempt).await
+}
+
+/// Takes a generation's claim obligation, leaving an inert one behind —
+/// the only way to separate the rows from the ticket, and it hands the
+/// ticket to the caller rather than dropping it (issue #494).
+fn take_ticket<R>(generation: &mut Generation<R>) -> ClaimTicket {
+    std::mem::replace(&mut generation.claims, ClaimTicket::inert())
 }
 
 enum FlushOutcome {
@@ -366,12 +391,15 @@ where
 /// the single settle path (architect plan amendment 2).
 async fn finish_generation<R>(
     ctx: &TableContext<R>,
-    generation: Generation<R>,
+    mut generation: Generation<R>,
     outcome: FlushOutcome,
     started: Instant,
 ) where
     R: ChRow + SpoolEncode + Send + Sync,
 {
+    // Issue #494: one report per generation, with the fate this flush
+    // established — committed, provably not committed, or unknown.
+    let ticket = take_ticket(&mut generation);
     match outcome {
         FlushOutcome::Ok => {
             if let Some(hook) = &ctx.on_flush_success {
@@ -384,6 +412,7 @@ async fn finish_generation<R>(
             );
             ctx.queued_bytes
                 .fetch_sub(generation.bytes, Ordering::AcqRel);
+            ticket.settle(TargetOutcome::Committed);
             generation.settle(Ok(()));
         }
         FlushOutcome::Uncertain(msg) => {
@@ -403,6 +432,7 @@ async fn finish_generation<R>(
             }
             ctx.queued_bytes
                 .fetch_sub(generation.bytes, Ordering::AcqRel);
+            ticket.settle(TargetOutcome::Uncertain);
             generation.settle(Err(WriteError::Uncertain(msg)));
         }
         FlushOutcome::Poisoned(msg) => {
@@ -430,6 +460,7 @@ async fn finish_generation<R>(
             }
             ctx.queued_bytes
                 .fetch_sub(generation.bytes, Ordering::AcqRel);
+            ticket.settle(TargetOutcome::NotCommitted);
             generation.settle(Err(WriteError::Poisoned(msg)));
         }
     }
@@ -544,6 +575,7 @@ mod tests {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             on_flush_success: None,
             on_flush_poisoned,
+            dedup: None,
         }
     }
 
@@ -563,7 +595,9 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        let (_, _, rx) = ctx
+            .buffer
+            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 
@@ -616,7 +650,9 @@ mod tests {
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
-        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        let (_, _, rx) = ctx
+            .buffer
+            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 

@@ -1,0 +1,838 @@
+//! Issue #494, criterion 21: **the charge cannot drift from the allocator.**
+//!
+//! The suppression index's memory bound is not arithmetic written in a
+//! document — it is a model in `writer/push_dedup.rs` that the index itself
+//! evaluates at construction, reserving its collections and stepping them
+//! down until the modelled charge fits `PULSUS_INGEST_DEDUP_MAX_BYTES`.
+//! This suite is the oracle for that model: it builds the index to the
+//! capacities the index reports, counts what the allocator actually hands
+//! out, and fails if the two disagree.
+//!
+//! # Why this covers the accepted range rather than sampling it
+//!
+//! The accepted knob range is `1 MiB..=1 GiB` — 1,072,693,249 distinct byte
+//! values. Seven spot checks leave 1,072,693,242 of them untested, and a
+//! one-byte under-count at a knob nobody listed passes every one of them.
+//!
+//! The index's reserved sizes are **a step function of the knob**, because
+//! both collections are hash tables whose slot counts are powers of two:
+//!
+//! ```text
+//!   knob ->   1 MiB ......... 2 MiB ......... 4 MiB ......... 1 GiB
+//!   claims    [--- c0 ---][------ c1 ------][----- c2 -----] ...
+//!   waiters   [-w0-][-w1-][--w2--][--w3--][---w4---] ...
+//!             ^     ^     ^       ^       ^
+//!             every transition is a threshold this suite computes
+//! ```
+//!
+//! `plan_capacities` picks the largest claim step whose charge is at or
+//! below 80% of the knob, then the largest waiter step that still fits.
+//! Each is `max { k : threshold_k <= knob }`, so the pair can only change
+//! where a threshold is crossed. [`partitions`] walks those thresholds and
+//! returns every distinct `(claims, waiters)` pair the range produces,
+//! together with the **smallest** knob that produces it — the tightest
+//! constraint in that partition, since the pair is constant across it.
+//!
+//! For every partition this suite then:
+//!
+//! 1. builds the index and asserts the allocator's resident total is
+//!    **exactly** the construction model — not "at most", so a model that
+//!    drifts in either direction reddens;
+//! 2. asserts the whole-index charge (construction plus every registration
+//!    the waiter budget admits) is at or below that partition's smallest
+//!    knob.
+//!
+//! Every accepted knob value lies in exactly one partition and produces
+//! that partition's pair, so those two together establish the bound across
+//! the range rather than at a few points. [`registration_charge_is_an_upper_bound`]
+//! closes the remaining link by measuring what a live registration really
+//! allocates, against what it is charged.
+//!
+//! # The instrument
+//!
+//! A counting global allocator with **per-thread** counters. The Rust test
+//! harness runs each test on its own thread, and every allocation this
+//! suite measures is made and freed on that same thread, so another test
+//! running concurrently cannot move these figures. `Cell` in a `const`
+//! thread-local: no destructor, so the allocator itself never allocates.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::time::Duration;
+
+use pulsus_write::{
+    Admission, Capacities, ClaimOutcome, PushDedup, PushDigest, PushIdentity, TargetOutcome,
+    WaitGuard, WaitMode, index_bytes, plan_capacities,
+};
+use tokio::sync::oneshot;
+
+// ---------------------------------------------------------------------
+// The instrument
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static ALLOCATED: Cell<u64> = const { Cell::new(0) };
+    static FREED: Cell<u64> = const { Cell::new(0) };
+}
+
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = ALLOCATED.try_with(|c| c.set(c.get() + layout.size() as u64));
+        // SAFETY: `layout` is forwarded unchanged to the system allocator,
+        // which is this allocator's only backing store.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = FREED.try_with(|c| c.set(c.get() + layout.size() as u64));
+        // SAFETY: `ptr` came from `Self::alloc` above, which forwards to
+        // `System`, with this same `layout`.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let _ = ALLOCATED.try_with(|c| c.set(c.get() + new_size as u64));
+        let _ = FREED.try_with(|c| c.set(c.get() + layout.size() as u64));
+        // SAFETY: same contract as `dealloc`/`alloc`, forwarded verbatim.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+
+/// Bytes this thread allocated and has not freed, over `f`.
+fn resident_over<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let a0 = ALLOCATED.with(Cell::get);
+    let f0 = FREED.with(Cell::get);
+    let value = f();
+    let allocated = ALLOCATED.with(Cell::get) - a0;
+    let freed = FREED.with(Cell::get) - f0;
+    (value, allocated.saturating_sub(freed))
+}
+
+const FLOOR: u64 = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+const CEILING: u64 = pulsus_config::INGEST_DEDUP_MAX_BYTES_CEILING;
+
+fn index_at(max_bytes: u64) -> std::sync::Arc<PushDedup> {
+    PushDedup::new(
+        max_bytes,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+    )
+}
+
+// ---------------------------------------------------------------------
+// The partition of the accepted range
+// ---------------------------------------------------------------------
+
+/// One region of the accepted knob range over which the index's reserved
+/// sizes do not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Partition {
+    /// The smallest accepted knob producing `capacities` — the tightest
+    /// bound in the region, because the pair is constant across it.
+    min_knob: u64,
+    capacities: Capacities,
+}
+
+/// Every distinct reserved-size pair the accepted range produces, in
+/// ascending order of the smallest knob that produces it.
+///
+/// The search is over knob values, not over the formula's internals: it
+/// binary-searches for each change point, so it cannot silently agree with
+/// a wrong model of how `plan_capacities` decides. `contiguous_and_complete`
+/// checks the result covers `FLOOR..=CEILING` with no gap.
+fn partitions() -> Vec<Partition> {
+    let mut out = vec![Partition {
+        min_knob: FLOOR,
+        capacities: plan_capacities(FLOOR),
+    }];
+    let mut knob = FLOOR;
+    while knob < CEILING {
+        let current = plan_capacities(knob);
+        // The pair is monotone in the sense that it changes only at
+        // thresholds; find the first knob above `knob` where it differs, by
+        // doubling out to a knob that differs and then bisecting.
+        let mut lo = knob;
+        let mut hi = CEILING;
+        if plan_capacities(hi) == current {
+            break;
+        }
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if plan_capacities(mid) == current {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        knob = hi;
+        out.push(Partition {
+            min_knob: knob,
+            capacities: plan_capacities(knob),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// The criterion
+// ---------------------------------------------------------------------
+
+/// The partition is a partition: it starts at the accepted floor, every
+/// step is strictly larger than the last, and the pair is constant from
+/// each step's knob up to one byte below the next.
+#[test]
+fn the_partition_covers_the_whole_accepted_range() {
+    let parts = partitions();
+    assert!(parts.len() > 1, "the range must contain a transition");
+    assert_eq!(parts[0].min_knob, FLOOR);
+
+    for window in parts.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        assert!(a.min_knob < b.min_knob);
+        assert_ne!(
+            a.capacities, b.capacities,
+            "a partition boundary must change the reserved sizes"
+        );
+        assert_eq!(
+            plan_capacities(b.min_knob - 1),
+            a.capacities,
+            "one byte below {} must still be the previous partition",
+            b.min_knob
+        );
+        assert_eq!(plan_capacities(b.min_knob), b.capacities);
+    }
+    let last = parts[parts.len() - 1];
+    assert_eq!(
+        plan_capacities(CEILING),
+        last.capacities,
+        "the last partition must reach the accepted ceiling"
+    );
+}
+
+/// The load-bearing assertion. For every distinct reserved-size pair the
+/// accepted range produces: what the allocator hands out at construction is
+/// exactly what the model says, and the whole-index charge fits the
+/// smallest knob in that partition.
+#[test]
+fn every_reserved_size_the_accepted_range_produces_matches_the_allocator() {
+    let parts = partitions();
+    for part in &parts {
+        let Capacities { claims, waiters } = part.capacities;
+        assert!(claims > 0, "{part:?}: the claim table must hold a push");
+        assert!(waiters > 0, "{part:?}: the registry must hold a waiter");
+
+        let (index, resident) = resident_over(|| index_at(part.min_knob));
+        assert_eq!(
+            index.capacities(),
+            part.capacities,
+            "the index must report the sizes the model planned"
+        );
+
+        // The index reports the whole-index charge, not the construction
+        // charge, so the construction model is the whole charge minus the
+        // registrations that have not happened yet.
+        let whole = index.bound_bytes();
+        assert_eq!(
+            whole,
+            index_bytes(claims, waiters),
+            "{part:?}: the index's own bound must be the model's"
+        );
+        assert!(
+            whole <= part.min_knob,
+            "{part:?}: charge {whole} exceeds the smallest knob in its partition"
+        );
+
+        let construction = whole - registration_charge() * waiters as u64;
+        assert_eq!(
+            resident, construction,
+            "{part:?}: the allocator handed out {resident} bytes at construction, \
+             the model says {construction}"
+        );
+
+        // **Admitting claims must allocate nothing at all.** Construction
+        // equality alone cannot see it: memory an ENTRY owns raises no slot
+        // count and moves no `size_of`, so a `Box<[u8]>` field would sit
+        // entirely outside the model with every figure above still exact.
+        // (Round 1 of this issue's code review measured that: knob
+        // 1,048,576, model 956,856, allocator 2,709,944.)
+        //
+        // A fixed sample of admissions at every partition is the right
+        // shape rather than a compromise: the table is reserved once and
+        // never rehashes, and `assert_owns_no_heap` makes the entry type
+        // heap-free, so "one admission allocates nothing" is a property of
+        // the TYPES, not of the capacity. The full-capacity fill below is
+        // what checks the other half — that the table really does not grow
+        // when filled to the capacity it reports.
+        let sample = SAMPLE_ADMISSIONS.min(claims);
+        let ((), admitting) = resident_over(|| admit_n(&index, 0, sample));
+        assert_eq!(
+            admitting, 0,
+            "{part:?}: admitting {sample} claims allocated {admitting} bytes — \
+             the claim table grew, or an entry owns memory the model cannot see"
+        );
+        drop(index);
+    }
+    // Reported so a reader can see what the range actually contains, and
+    // can check that a knob of interest is covered without being listed.
+    println!(
+        "issue #494 criterion 21: {} distinct reserved-size pairs over {FLOOR}..={CEILING}",
+        parts.len()
+    );
+    for part in &parts {
+        println!(
+            "  min_knob={} claims={} waiters={} charge={}",
+            part.min_knob,
+            part.capacities.claims,
+            part.capacities.waiters,
+            index_bytes(part.capacities.claims, part.capacities.waiters)
+        );
+    }
+}
+
+/// The per-registration charge, derived from the model rather than written
+/// down here: the whole-index bound minus the same index's bound with one
+/// fewer waiter slot is exactly one registration's charge.
+fn registration_charge() -> u64 {
+    // `index_bytes` is linear in the waiter count apart from the map, which
+    // only steps at a power of two; two adjacent counts inside one step
+    // therefore differ by exactly the per-registration charge.
+    let c = plan_capacities(16 * 1024 * 1024);
+    index_bytes(c.claims, c.waiters) - index_bytes(c.claims, c.waiters - 1)
+}
+
+/// The round-8 review's own counterexample, made into a leg.
+///
+/// A one-byte breach was introduced at a knob of 2,097,152 and every case
+/// the previous criterion listed stayed green, because that knob was not
+/// one of them. 2,097,152 is **not** a partition boundary here — it sits
+/// inside the partition that starts at 1,782,200 — so this leg names it
+/// explicitly: the index built at it reserves that partition's sizes, and
+/// what the allocator hands out is at or below the knob itself.
+///
+/// The general argument still does the work: an accepted knob produces its
+/// partition's pair, and the pair decides the allocation. This leg is the
+/// instance a reader can check by hand.
+#[test]
+fn a_knob_inside_a_partition_is_bounded_by_the_partition() {
+    let parts = partitions();
+    for knob in [2 * 1024 * 1024u64, 20 * 1024 * 1024, 16 * 1024 * 1024 + 1] {
+        let owner = parts
+            .iter()
+            .rev()
+            .find(|p| p.min_knob <= knob)
+            .copied()
+            .expect("every accepted knob lies in a partition");
+        assert_eq!(
+            plan_capacities(knob),
+            owner.capacities,
+            "knob {knob} must take its partition's reserved sizes"
+        );
+        assert_ne!(
+            owner.min_knob, knob,
+            "this leg is about a knob that is NOT a partition boundary"
+        );
+
+        let (index, resident) = resident_over(|| index_at(knob));
+        assert!(
+            index.bound_bytes() <= knob,
+            "knob {knob}: whole-index charge {} exceeds it",
+            index.bound_bytes()
+        );
+        assert!(
+            resident <= knob,
+            "knob {knob}: the allocator handed out {resident} bytes at construction"
+        );
+        assert_eq!(
+            resident,
+            index.bound_bytes() - registration_charge() * owner.capacities.waiters as u64,
+            "knob {knob}: construction must be the model's construction half"
+        );
+        drop(index);
+    }
+}
+
+/// How many claims each partition admits under the allocator. Large enough
+/// that a per-entry allocation of any plausible size is far above the
+/// zero this asserts, small enough that thirty-one partitions stay fast.
+const SAMPLE_ADMISSIONS: usize = 512;
+
+/// Admits `count` distinct claims, each with one target, sealed. Every
+/// value here is on the stack or inside the index's reserved collections,
+/// so a nonzero resident delta over this call is the index allocating.
+fn admit_n(index: &std::sync::Arc<PushDedup>, first: u128, count: usize) {
+    for i in 0..count as u128 {
+        let key = PushDigest::from_raw(first + i);
+        let id = PushIdentity {
+            key,
+            content: key,
+            declared_retry: false,
+        };
+        match index.admit(id, WaitMode::None) {
+            Admission::Admit(mut guard) => {
+                guard.note_target(true);
+                guard.seal();
+            }
+            other => panic!("claim {i} must admit, got {other:?}"),
+        }
+    }
+}
+
+/// **The table filled to the capacity it reports allocates nothing.**
+///
+/// The per-partition leg admits a fixed sample; this one fills the floor
+/// knob's table to its last slot and then asks for one more. Together they
+/// say: no admission allocates, and the reserved capacity is really the
+/// capacity — the table does not rehash at 7/8 load, and the next push
+/// past it sheds rather than growing.
+#[test]
+fn a_claim_table_filled_to_its_reported_capacity_allocates_nothing() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let (index, construction) = resident_over(|| index_at(knob));
+    let claims = index.capacities().claims;
+
+    let ((), filling) = resident_over(|| admit_n(&index, 0, claims));
+    assert_eq!(
+        filling, 0,
+        "filling the table to its reported capacity of {claims} allocated \
+         {filling} bytes"
+    );
+    assert!(
+        construction <= knob,
+        "and the whole thing stays inside the knob: {construction} against {knob}"
+    );
+
+    // One past capacity: the table sheds rather than growing, so the
+    // reserved figure is the real bound and not a soft target.
+    let over = PushDigest::from_raw(u128::MAX);
+    let ((), shedding) = resident_over(|| {
+        assert!(
+            matches!(
+                index.admit(
+                    PushIdentity {
+                        key: over,
+                        content: over,
+                        declared_retry: false,
+                    },
+                    WaitMode::None,
+                ),
+                Admission::Shed
+            ),
+            "a full table of unsettled claims must shed"
+        );
+    });
+    assert_eq!(shedding, 0, "and shedding allocates nothing either");
+    assert_eq!(index.snapshot().shed_total, 1);
+}
+
+/// One blocked sync caller, held exactly as the writer holds it: the guard
+/// owns the charge and the receiver is the caller's half of the wakeup.
+type HeldWaiter = (WaitGuard, oneshot::Receiver<ClaimOutcome>);
+
+/// Opens a claim with one target and seals it, so later admissions of the
+/// same identity are suppressed and register as waiters.
+fn open_claim(index: &std::sync::Arc<PushDedup>, key: u128) -> PushIdentity {
+    let id = PushIdentity {
+        key: PushDigest::from_raw(key),
+        content: PushDigest::from_raw(key),
+        declared_retry: false,
+    };
+    match index.admit(id, WaitMode::None) {
+        Admission::Admit(mut guard) => {
+            guard.note_target(true);
+            guard.seal();
+        }
+        other => panic!("the first push must admit, got {other:?}"),
+    }
+    id
+}
+
+fn register_waiter(index: &std::sync::Arc<PushDedup>, id: PushIdentity) -> HeldWaiter {
+    match index.admit(id, WaitMode::Register) {
+        Admission::SuppressedPending { guard, rx } => (guard, rx),
+        other => panic!("a suppressed sync caller must register, got {other:?}"),
+    }
+}
+
+/// Closes the model-to-allocator link on the half construction does not
+/// cover: what a live registration allocates, against what it is charged.
+///
+/// The charge must be an upper bound at every key shape, because a waiter
+/// vector grows by doubling and the charge is flat: one waiter per key is
+/// the worst case (a four-slot vector holding one element), and many
+/// waiters on one key is the best.
+#[test]
+fn registration_charge_is_an_upper_bound_at_every_key_shape() {
+    let charge = registration_charge();
+    assert!(charge > 0);
+
+    for waiters_per_key in [1usize, 2, 3, 4, 5, 17, 64] {
+        let index = index_at(16 * 1024 * 1024);
+        let keys = 64;
+        let total = keys * waiters_per_key;
+        assert!(total <= index.capacities().waiters);
+
+        // The claims are opened OUTSIDE the measured window: what this
+        // measures is registration, not admission.
+        let ids: Vec<PushIdentity> = (0..keys as u128)
+            .map(|key| open_claim(&index, key))
+            .collect();
+
+        let (held, resident) = resident_over(|| {
+            let mut held: Vec<HeldWaiter> = Vec::with_capacity(total);
+            for id in &ids {
+                for _ in 0..waiters_per_key {
+                    held.push(register_waiter(&index, *id));
+                }
+            }
+            held
+        });
+
+        // The `Vec` holding the guards is the test's own bookkeeping, not
+        // the index's; subtract exactly what it reserved.
+        let own = (held.capacity() * size_of::<HeldWaiter>()) as u64;
+        let registry = resident - own;
+        assert!(
+            registry <= charge * total as u64,
+            "{waiters_per_key} waiters per key: the registry allocated {registry} bytes \
+             for {total} registrations, charged {}",
+            charge * total as u64
+        );
+        drop(held);
+    }
+}
+
+/// The instrument measures what it claims to. A block that allocates and
+/// frees the same vector is resident-zero; a block that keeps it is not.
+#[test]
+fn the_counting_allocator_measures_what_is_kept() {
+    let ((), zero) = resident_over(|| {
+        let v: Vec<u64> = Vec::with_capacity(4096);
+        drop(v);
+    });
+    assert_eq!(zero, 0, "an allocation that is freed is not resident");
+
+    let (kept, held) = resident_over(|| Vec::<u64>::with_capacity(4096));
+    assert_eq!(held, 4096 * 8, "a kept allocation is resident, exactly");
+    drop(kept);
+}
+
+/// tokio's oneshot state is part of every registration's charge as an
+/// upper bound. This is the assertion that fails if that state grows.
+#[test]
+fn a_oneshot_channel_fits_inside_one_registrations_charge() {
+    let (channel, resident) = resident_over(oneshot::channel::<ClaimOutcome>);
+    assert!(
+        resident <= registration_charge(),
+        "one oneshot channel allocates {resident} bytes against a per-registration \
+         charge of {}",
+        registration_charge()
+    );
+    drop(channel);
+}
+
+// ---------------------------------------------------------------------
+// Criterion 19 — the waiter registry is bounded, measured by the allocator
+// ---------------------------------------------------------------------
+//
+// Every leg below asserts the ALLOCATOR's resident bytes, never a gauge.
+// A gauge that tracks the allocator is the thing in dispute, so it cannot
+// be the instrument: the round-7 review measured the two disagreeing on
+// one run — cancelling half moved resident by 480,000 bytes while the
+// gauge moved by 801,125.
+
+/// **(a) Mass waiters.** Block callers until the index refuses. The
+/// allocator's resident total stays at or below the knob throughout, the
+/// refusing caller is told `WaitShed` with `wait_shed_total` incremented,
+/// and its retry receives the original's outcome once the claim settles.
+#[test]
+fn blocking_callers_until_the_registry_refuses_stays_inside_the_knob() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let (index, construction) = resident_over(|| index_at(knob));
+    let id = open_claim(&index, 1);
+
+    let mut held: Vec<HeldWaiter> = Vec::new();
+    let (shed, registration_bytes) = resident_over(|| {
+        loop {
+            match index.admit(id, WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                Admission::WaitShed => break true,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    });
+    assert!(shed, "the registry must refuse rather than grow");
+    assert_eq!(
+        held.len(),
+        index.capacities().waiters,
+        "the registry holds exactly the capacity it reports"
+    );
+    assert_eq!(index.snapshot().wait_shed_total, 1);
+
+    // The test's own `Vec` of guards is not the index's memory.
+    let own = (held.capacity() * size_of::<HeldWaiter>()) as u64;
+    let resident = construction + registration_bytes - own;
+    assert!(
+        resident <= knob,
+        "a full registry holds {resident} bytes against a knob of {knob}"
+    );
+
+    // The refused caller's retry gets the original's outcome once the
+    // claim is terminal — it is never told the push was stored.
+    index.settle_target(id.key, pulsus_write::TargetOutcome::Committed, true);
+    assert!(
+        matches!(
+            index.admit(id, WaitMode::Register),
+            Admission::SuppressedSettled(ClaimOutcome::Ok)
+        ),
+        "the retry after a shed receives the original's answer"
+    );
+    drop(held);
+}
+
+/// **(b) Cancellation, then refill.** Block `n` callers, record resident
+/// bytes, cancel half, record again, then block `n/2` fresh callers and
+/// assert the index accepts them and resident returns to its earlier
+/// figure. The refill is what proves the budget was released rather than
+/// merely reported released.
+#[test]
+fn cancelling_half_the_waiters_releases_their_bytes_and_the_registry_refills() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let index = index_at(knob);
+    let id = open_claim(&index, 2);
+    let n = index.capacities().waiters;
+
+    let mut held: Vec<HeldWaiter> = Vec::with_capacity(n);
+    let ((), full) = resident_over(|| {
+        for _ in 0..n {
+            held.push(register_waiter(&index, id));
+        }
+    });
+    assert!(full > 0, "registrations allocate");
+
+    let keep = n / 2;
+    let ((), freed) = resident_over(|| {
+        held.truncate(keep);
+    });
+    assert!(
+        freed == 0,
+        "`resident_over` reports bytes KEPT; a block that only frees keeps none"
+    );
+
+    // Refill: the same number of fresh callers must be accepted, and the
+    // registry's resident total must come back to where it was.
+    let ((), refilled) = resident_over(|| {
+        for _ in 0..(n - keep) {
+            match index.admit(id, WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                other => panic!("a cancelled registration must be reusable, got {other:?}"),
+            }
+        }
+    });
+    assert_eq!(held.len(), n, "the registry is full again");
+    assert!(
+        refilled <= full,
+        "the refill allocated {refilled} bytes where the original fill allocated {full}"
+    );
+    assert!(
+        matches!(index.admit(id, WaitMode::Register), Admission::WaitShed),
+        "and the bound is where it was"
+    );
+    drop(held);
+}
+
+/// **(c) Async registers nothing.** The same duplicate pushes in async
+/// mode leave the allocator's resident total unchanged — asserted as a
+/// delta of zero, not as a gauge reading zero.
+#[test]
+fn an_async_suppressed_caller_allocates_nothing() {
+    let index = index_at(16 * 1024 * 1024);
+    let id = open_claim(&index, 3);
+
+    let ((), delta) = resident_over(|| {
+        for _ in 0..10_000 {
+            match index.admit(id, WaitMode::None) {
+                Admission::SuppressedSettled(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    });
+    assert_eq!(
+        delta, 0,
+        "ten thousand async suppressed pushes allocated {delta} bytes"
+    );
+    assert_eq!(
+        index.snapshot().wait_bytes,
+        0,
+        "and nothing is charged to the waiter budget"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The bound holds across the WHOLE lifecycle, not only at admission
+// ---------------------------------------------------------------------
+
+/// `ClaimEntry: Copy` refuses a field that OWNS an allocation, because
+/// owning one means freeing it and freeing it needs `Drop`. It does not
+/// refuse a raw pointer or a reference — a `Copy` field can be a
+/// `&'static [u8]` filled in by `Box::leak` at any point in a claim's life,
+/// and round 2 of this issue's code review measured one planted in
+/// **settlement** that left every other test in this file green.
+///
+/// A measurement taken only at admission cannot see that, so this one is
+/// taken around the whole lifecycle. Every route that mutates the index is
+/// exercised inside one window:
+///
+/// ```text
+///   admit ─ seal ─ settle(Committed) ─ settle(NotCommitted) ─ settle(Uncertain)
+///     │       │                                                      │
+///     │       └─ rollback: a guard dropped un-sealed                  │
+///     │                                                              │
+///     ├─ wait: register ─ settle ─ drop the guard                     │
+///     ├─ tick: age an open claim to a tombstone                       │
+///     ├─ tick: expire a settled claim once its window elapses         │
+///     ├─ evict: admit into a full table of settled claims             │
+///     └─ shed:  admit into a full table of tombstones                 │
+/// ```
+///
+/// The index reserves everything it needs at construction and every
+/// registration returns its bytes when its guard drops, so the whole
+/// sequence must allocate **exactly nothing** net. A leak on any route is
+/// a nonzero delta here whatever the type bound says about it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn no_lifecycle_route_allocates_beyond_what_it_returns() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let window = Duration::from_secs(60);
+    let deadline = Duration::from_secs(30);
+    let index = PushDedup::new(knob, window, deadline);
+    let caps = index.capacities();
+    let id = |n: u128| PushIdentity {
+        key: PushDigest::from_raw(n),
+        content: PushDigest::from_raw(n),
+        declared_retry: false,
+    };
+
+    let ((), resident) = resident_over(|| {
+        // -- admit, seal, and settle each of the three fates ----------
+        for (i, outcome) in [
+            TargetOutcome::Committed,
+            TargetOutcome::NotCommitted,
+            TargetOutcome::Uncertain,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = i as u128;
+            match index.admit(id(n), WaitMode::None) {
+                Admission::Admit(mut guard) => {
+                    guard.note_target(true);
+                    guard.note_target(false);
+                    guard.seal();
+                }
+                other => panic!("must admit, got {other:?}"),
+            }
+            index.settle_target(id(n).key, outcome, true);
+            index.settle_target(id(n).key, outcome, false);
+        }
+
+        // -- rollback: a guard dropped before `seal` ------------------
+        match index.admit(id(100), WaitMode::None) {
+            Admission::Admit(guard) => drop(guard),
+            other => panic!("must admit, got {other:?}"),
+        }
+
+        // -- the keyed wait: register, settle, drop -------------------
+        match index.admit(id(200), WaitMode::None) {
+            Admission::Admit(mut guard) => {
+                guard.note_target(true);
+                guard.seal();
+            }
+            other => panic!("must admit, got {other:?}"),
+        }
+        let mut held: Vec<HeldWaiter> = Vec::new();
+        for _ in 0..16 {
+            match index.admit(id(200), WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                other => panic!("must register, got {other:?}"),
+            }
+        }
+        index.settle_target(id(200).key, TargetOutcome::Committed, true);
+        drop(held);
+
+        // -- fill the table, then evict and shed ----------------------
+        // Everything admitted so far is terminal or gone, so filling to
+        // capacity with settled claims exercises eviction; filling with
+        // claims that never settle exercises the shed.
+        let base = 1_000u128;
+        for i in 0..caps.claims as u128 {
+            match index.admit(id(base + i), WaitMode::None) {
+                Admission::Admit(mut guard) => {
+                    guard.note_target(true);
+                    guard.seal();
+                }
+                other => panic!("claim {i} must admit, got {other:?}"),
+            }
+            index.settle_target(id(base + i).key, TargetOutcome::Committed, true);
+        }
+        match index.admit(id(u128::MAX), WaitMode::None) {
+            Admission::Admit(guard) => guard.seal(),
+            other => panic!("a full table of settled claims evicts, got {other:?}"),
+        }
+    });
+    assert_eq!(
+        resident, 0,
+        "the lifecycle allocated {resident} bytes it did not return — a \\
+         claim, a registration or the index itself is holding memory the \\
+         model does not charge"
+    );
+
+    // -- ageing and expiry, which need the clock ----------------------
+    // One claim that never settles, so there is something to age. The
+    // table is full of settled claims, so this admission evicts one.
+    let ((), opening) = resident_over(|| match index.admit(id(500), WaitMode::None) {
+        Admission::Admit(mut guard) => {
+            guard.note_target(true);
+            guard.seal();
+        }
+        other => panic!("must admit, got {other:?}"),
+    });
+    assert_eq!(opening, 0, "admitting into a full table allocates");
+
+    tokio::time::sleep(deadline + Duration::from_secs(1)).await;
+    let ((), aging) = resident_over(|| index.tick());
+    assert_eq!(aging, 0, "ageing an open claim to a tombstone allocates");
+    assert!(index.snapshot().unknown_total > 0, "a claim did age");
+
+    // An admission into a full table evicts the oldest settled claim.
+    // Shedding — the same walk finding nothing evictable — is measured by
+    // `a_claim_table_filled_to_its_reported_capacity_allocates_nothing`,
+    // whose table is full of claims that never settled.
+    let ((), evicting) = resident_over(|| {
+        match index.admit(
+            PushIdentity {
+                key: PushDigest::from_raw(u128::MAX - 1),
+                content: PushDigest::from_raw(u128::MAX - 1),
+                declared_retry: false,
+            },
+            WaitMode::None,
+        ) {
+            Admission::Admit(guard) => guard.seal(),
+            other => panic!("a full table of settled claims evicts, got {other:?}"),
+        }
+    });
+    assert_eq!(evicting, 0, "evicting allocates");
+
+    tokio::time::sleep(window + Duration::from_secs(1)).await;
+    let ((), expiry) = resident_over(|| index.tick());
+    assert_eq!(expiry, 0, "expiring a claim allocates");
+
+    // And the whole index gives its memory back when it is dropped.
+    let (index, built) = resident_over(|| index_at(knob));
+    let ((), freed) = resident_over(move || drop(index));
+    assert_eq!(freed, 0, "dropping the index frees what it reserved");
+    assert!(built > 0);
+}

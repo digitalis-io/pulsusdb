@@ -81,6 +81,8 @@ docs/query-to-sql.md	plan.rs:3750	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3774	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3778	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3779	ambiguous_basename
+docs/query-to-sql.md	query_lowering_doc_gate.rs:472	ambiguous_basename
+docs/query-to-sql.md	query_lowering_doc_gate.rs:545	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1036	ambiguous_basename
 docs/query-to-sql.md	sql.rs:105	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1085	ambiguous_basename

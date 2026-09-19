@@ -238,7 +238,35 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Refuses to start when `port` is already in use, and says so.
+///
+/// Issue #494's code review round 1 measured what happens without this: a
+/// cancelled run left a server of its own listening on this suite's fixed
+/// port, the next run's `/ready` probe was answered by THAT server — which
+/// was pointed at a different database — and the suite reported a count
+/// mismatch. A wrong count reads as a defect in the branch under review;
+/// an occupied port is a fact about the machine, and the two must not look
+/// the same.
+///
+/// The bind is released immediately, so there is a window between this
+/// check and the child's own bind. That window is not what this closes:
+/// what it closes is a port occupied for the whole run by something that
+/// was never this test's child.
+fn assert_port_free(port: u16) {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => drop(listener),
+        Err(e) => panic!(
+            "port {port} is already in use ({e}). A previous run's server is \
+             probably still listening — this suite binds fixed ports, so it \
+             cannot start beside one. Find it with `ss -ltnp` and stop that \
+             process before re-running; do not kill by program name, other \
+             work on this machine shares it."
+        ),
+    }
+}
+
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {
+    assert_port_free(port);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")
@@ -254,9 +282,14 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
         .env("CLICKHOUSE_SERVER", ch_host())
         .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
         .env("CLICKHOUSE_DB", db);
-    let guard = ChildGuard(command.spawn().expect("spawn pulsusdb"));
+    let mut guard = ChildGuard(command.spawn().expect("spawn pulsusdb"));
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
+        // A child that exited is reported now, rather than after the full
+        // sixty seconds of probing a port nobody is listening on.
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            panic!("pulsusdb exited before becoming ready ({status}) on port {port}");
+        }
         if http_request(port, "GET", "/ready", None, &[]).is_some_and(|r| r.status == 200) {
             return guard;
         }
@@ -908,6 +941,14 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     // consequence. No restart: the stream row is already there and this
     // state is about the sample, which a plain `MergeTree` stores twice.
     // `A`'s line count must not move while `B`'s doubles.
+    //
+    // Issue #494 does not change this, and the reason is worth stating
+    // rather than leaving to be rediscovered: the suppression added there
+    // matches a WHOLE push by its content, and this third push is not a
+    // repeat of either earlier one. The first body carries streams A and B
+    // together; this one carries B alone. Two different pushes, so two
+    // different identities, so nothing is suppressed and the second row is
+    // still written.
     let res = http_request(
         ANSWERS_PORT,
         "POST",

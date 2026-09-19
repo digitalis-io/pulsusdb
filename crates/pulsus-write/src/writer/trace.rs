@@ -170,6 +170,9 @@ impl TraceWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
+            // Traces are out of scope for issue #494: no suppression
+            // index, so no claim, no ticket, no tick.
+            dedup: None,
         };
         let attrs_ctx = TableContext {
             table: tables.attrs,
@@ -182,6 +185,9 @@ impl TraceWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: Some(on_attrs_flush_poisoned),
+            // Traces are out of scope for issue #494: no suppression
+            // index, so no claim, no ticket, no tick.
+            dedup: None,
         };
 
         let spans_task = table::spawn(spans_ctx, shutdown_rx.clone());
@@ -262,40 +268,44 @@ impl TraceWriter {
 
         if !span_rows.is_empty() {
             if with_waiters {
-                let (should_notify, rx) = self.shared.spans.append_and_wait(
+                let (should_notify, _generation, rx) = self.shared.spans.append_and_wait(
                     span_rows,
                     span_bytes,
                     self.shared.runtime.batch_bytes,
+                    None,
                 );
                 receivers.push(rx);
                 if should_notify {
                     self.shared.spans_notify.notify_one();
                 }
-            } else if self.shared.spans.append(
-                span_rows,
-                span_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+            } else if self
+                .shared
+                .spans
+                .append(span_rows, span_bytes, self.shared.runtime.batch_bytes, None)
+                .0
+            {
                 self.shared.spans_notify.notify_one();
             }
         }
 
         if !attr_rows.is_empty() {
             if with_waiters {
-                let (should_notify, rx) = self.shared.attrs.append_and_wait(
+                let (should_notify, _generation, rx) = self.shared.attrs.append_and_wait(
                     attr_rows,
                     attr_bytes,
                     self.shared.runtime.batch_bytes,
+                    None,
                 );
                 receivers.push(rx);
                 if should_notify {
                     self.shared.attrs_notify.notify_one();
                 }
-            } else if self.shared.attrs.append(
-                attr_rows,
-                attr_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+            } else if self
+                .shared
+                .attrs
+                .append(attr_rows, attr_bytes, self.shared.runtime.batch_bytes, None)
+                .0
+            {
                 self.shared.attrs_notify.notify_one();
             }
         }

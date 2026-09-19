@@ -15,7 +15,7 @@ pub use ingest::metrics::{
     HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
 };
 pub use ingest::traces::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceSink};
-pub use ingest::{Backpressure, FlushWait, LogSink};
+pub use ingest::{AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders};
 pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{
     decode_protobuf as decode_loki_protobuf, parse_json as parse_loki_json,
@@ -34,9 +34,11 @@ pub use protocols::zipkin::{
     decode as decode_zipkin, to_otlp as zipkin_to_otlp,
 };
 pub use writer::{
-    LogPatternRow, LogWriter, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, MetricWriter, MetricWriterTables, TraceAttrRow, TraceSpanRow, TraceWriter,
-    TraceWriterTables, WriteError, WriterTables,
+    Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetricsSnapshot, LogPatternRow,
+    LogWriter, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
+    MetricWriter, MetricWriterTables, PushDedup, PushDigest, PushIdentity, TargetOutcome,
+    TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables, WaitGuard, WaitMode, WriteError,
+    WriterTables, index_bytes, log_identity, metric_identity, plan_capacities,
 };
 
 #[cfg(test)]

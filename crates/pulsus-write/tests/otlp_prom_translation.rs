@@ -41,7 +41,7 @@ use prost::Message as _;
 use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
 use pulsus_model::Fingerprint;
 use pulsus_write::protocols::otlp_metrics::{self, MetricIngestSettings};
-use pulsus_write::{Backpressure, FlushWait, MetricSink, ParsedMetrics};
+use pulsus_write::{AdmitRefusal, FlushWait, MetricSink, ParsedMetrics, PushHeaders};
 use serde_json::{Value, json};
 
 /// The fixed `timeUnixNano` every committed payload carries, and the base
@@ -257,12 +257,16 @@ struct CountingSink {
 }
 
 impl MetricSink for CountingSink {
-    fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure> {
+    fn admit(&self, batch: ParsedMetrics, _push: PushHeaders) -> Result<(), AdmitRefusal> {
         self.admitted.lock().expect("sink lock").push(batch);
         Ok(())
     }
 
-    fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure> {
+    fn admit_flush(
+        &self,
+        batch: ParsedMetrics,
+        _push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
         self.admitted.lock().expect("sink lock").push(batch);
         Ok(FlushWait::new(async { Ok(()) }))
     }
