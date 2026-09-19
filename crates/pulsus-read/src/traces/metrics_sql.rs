@@ -46,10 +46,17 @@
 //! **A filter carrying an attribute condition loses that projection**,
 //! because `service_time` holds 14 named columns and not the attribute
 //! arrays (migration id 45, `crates/pulsus-schema/src/catalog.rs:986-995`).
-//! Measured on a 2,000,000-span corpus, ClickHouse 26.3.29.7:
-//! `{ resource.service.name = "checkout" && span.http.status_code >= 500 }
-//! | rate()` reads through `service_time` at `Granules: 31/245` before
-//! and through `trace_spans` at `245/245` after. Recorded in
+//! Measured on a 2,000,000-span corpus — 8 attributes per span, 50
+//! services with `checkout` 1 in 50, ClickHouse 26.3.29.7 at
+//! `max_block_size = 65409`, `use_query_condition_cache = 0`,
+//! `optimize_move_to_prewhere = 1`: `{ resource.service.name = "checkout" }
+//! | rate()` reads `ReadFromMergeTree (service_time)` at `Granules: 7/245`
+//! and 1,892,563 bytes; `{ resource.service.name = "checkout" &&
+//! span.http.status_code >= 500 } | rate()` reads
+//! `ReadFromMergeTree (trace_spans)` at `245/245` and 290,003,920 bytes,
+//! with `query_log.projections` empty. Granule and byte counts are
+//! layout-specific; the identity of the table read is what is gated.
+//! Recorded in
 //! `docs/benchmarks/traces-differential-ledger.md`
 //! (`traceql-attribute-resolves-to-one-element`) and gated by
 //! `tests/traces_metrics_explain.rs`'s

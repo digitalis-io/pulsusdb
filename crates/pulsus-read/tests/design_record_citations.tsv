@@ -75,7 +75,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5651	crates/pulsus-
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:801	crates/pulsus-read/src/traces/exec.rs	801		prose	map_trace_generator_error
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:895	crates/pulsus-read/src/traces/filter.rs	895		prose	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql
-docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:1337	crates/pulsus-read/src/traces/metrics_sql.rs	1337		line	pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:1337	crates/pulsus-read/src/traces/metrics_sql.rs	1337		line	/// Builds the compare() SQL trio. The cross-tab enumerates the present
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:183	crates/pulsus-read/src/traces/search_eval.rs	183		line	pub fn from_stored(s: &str) -> Self {
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:2436	crates/pulsus-read/src/traces/search_eval.rs	2436		line	ProjectionValue::SelectValue { field_idx } => env
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1111	crates/pulsus-read/src/traces/search_plan.rs	1111		line	Ok(parts.join(" AND "))
@@ -105,10 +105,10 @@ docs/query-lowering.md	filter.rs:2666	crates/pulsus-read/src/traces/filter.rs	26
 docs/query-lowering.md	filter.rs:409	crates/pulsus-read/src/traces/filter.rs	409		line	/// Unary negation.
 docs/query-lowering.md	logql/compile.rs:314-317	crates/pulsus-read/src/logql/compile.rs	314	317	line	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	metrics_plan.rs:666	crates/pulsus-read/src/traces/metrics_plan.rs	666		line	metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
-docs/query-lowering.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	fn date_clause(w: SnappedWindow) -> String {
-docs/query-lowering.md	metrics_sql.rs:1536	crates/pulsus-read/src/traces/metrics_sql.rs	1536		prose	metrics_compare_exemplar_range_sql
-docs/query-lowering.md	metrics_sql.rs:546	crates/pulsus-read/src/traces/metrics_sql.rs	546		line	LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
-docs/query-lowering.md	metrics_sql.rs:562	crates/pulsus-read/src/traces/metrics_sql.rs	562		line	// `filter::compile_leaf` (gated, see the doc comment above), so
+docs/query-lowering.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	/// be mistaken for the other.
+docs/query-lowering.md	metrics_sql.rs:1536	crates/pulsus-read/src/traces/metrics_sql.rs	1536		line	/// part layout the read walks is not identical even though the rows are.
+docs/query-lowering.md	metrics_sql.rs:546	crates/pulsus-read/src/traces/metrics_sql.rs	546		line	// exact per-span SQL form; everything else in the family keeps a
+docs/query-lowering.md	metrics_sql.rs:562	crates/pulsus-read/src/traces/metrics_sql.rs	562		line	// The lowering is the one this file already applies to the
 docs/query-lowering.md	model.rs:557	crates/pulsus-config/src/model.rs	557		line	traceql_scan_budget_rows: 50_000_000,
 docs/query-lowering.md	model.rs:561	crates/pulsus-config/src/model.rs	561		line	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-lowering.md	pipeline.rs:1117	crates/pulsus-read/src/logql/pipeline.rs	1117		line	&& super::plan::is_pushable_line_filter(lf)
@@ -243,15 +243,14 @@ docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
 docs/query-to-sql.md	metrics_plan.rs:398	crates/pulsus-read/src/traces/metrics_plan.rs	398		line	pub fn plan_trace_metrics(
 docs/query-to-sql.md	metrics_plan.rs:968	crates/pulsus-read/src/traces/metrics_plan.rs	968		line	PipelineStage::MetricSecondStage(second),
-docs/query-to-sql.md	metrics_sql.rs:1036	crates/pulsus-read/src/traces/metrics_sql.rs	1036		line	pub fn metrics_log2_bucket_range_sql(
-docs/query-to-sql.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	fn date_clause(w: SnappedWindow) -> String {
-docs/query-to-sql.md	metrics_sql.rs:116	crates/pulsus-read/src/traces/metrics_sql.rs	116		line	fn time_clause(w: SnappedWindow) -> String {
-docs/query-to-sql.md	metrics_sql.rs:357	crates/pulsus-read/src/traces/metrics_sql.rs	357		prose	filter::probe_column
-docs/query-to-sql.md	metrics_sql.rs:562	crates/pulsus-read/src/traces/metrics_sql.rs	562		line	// `filter::compile_leaf` (gated, see the doc comment above), so
-docs/query-to-sql.md	metrics_sql.rs:826	crates/pulsus-read/src/traces/metrics_sql.rs	826		line	pub fn metrics_count_range_sql(
-docs/query-to-sql.md	metrics_sql.rs:874	crates/pulsus-read/src/traces/metrics_sql.rs	874		line	pub fn metrics_agg_range_sql(
-docs/query-to-sql.md	metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	/// hundred lines below — changes the row bound too and moves every
-docs/query-to-sql.md	metrics_sql.rs:951	crates/pulsus-read/src/traces/metrics_sql.rs	951		line	pub fn metrics_quantile_range_sql(
+docs/query-to-sql.md	metrics_sql.rs:1036	crates/pulsus-read/src/traces/metrics_sql.rs	1036		line	///
+docs/query-to-sql.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	/// be mistaken for the other.
+docs/query-to-sql.md	metrics_sql.rs:116	crates/pulsus-read/src/traces/metrics_sql.rs	116		line	/// The `trace_attrs_idx` daily-partition pruning clause for the
+docs/query-to-sql.md	metrics_sql.rs:357	crates/pulsus-read/src/traces/metrics_sql.rs	357		line	/// Renders one attribute leaf's span-row test and records its
+docs/query-to-sql.md	metrics_sql.rs:562	crates/pulsus-read/src/traces/metrics_sql.rs	562		line	// The lowering is the one this file already applies to the
+docs/query-to-sql.md	metrics_sql.rs:826	crates/pulsus-read/src/traces/metrics_sql.rs	826		line	(select, group_by, order_by)
+docs/query-to-sql.md	metrics_sql.rs:874	crates/pulsus-read/src/traces/metrics_sql.rs	874		line	}
+docs/query-to-sql.md	metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	/// the window and the last nanosecond it contains is `end_ns - 1`.
 docs/query-to-sql.md	model.rs:400	crates/pulsus-config/src/model.rs	400		line	pub logql_pipeline_scan_factor: u32,
 docs/query-to-sql.md	model.rs:412	crates/pulsus-config/src/model.rs	412		line	pub traceql_max_candidates: u64,
 docs/query-to-sql.md	model.rs:472	crates/pulsus-config/src/model.rs	472		line	pub logql_read_max_memory_bytes: u64,
@@ -356,7 +355,7 @@ docs/query-to-sql.md	traces/exec.rs:164	crates/pulsus-read/src/traces/exec.rs	16
 docs/query-to-sql.md	traces/exec.rs:1847	crates/pulsus-read/src/traces/exec.rs	1847		line	.dispatch
 docs/query-to-sql.md	traces/exec.rs:222	crates/pulsus-read/src/traces/exec.rs	222		line	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:2978	crates/pulsus-read/src/traces/exec.rs	2978		line	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
-docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	/// hundred lines below — changes the row bound too and moves every
+docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	/// the window and the last nanosecond it contains is `end_ns - 1`.
 docs/query-to-sql.md	traces/search_plan.rs:1111	crates/pulsus-read/src/traces/search_plan.rs	1111		line	Ok(parts.join(" AND "))
 docs/query-to-sql.md	traces/search_sql.rs:110-112	crates/pulsus-read/src/traces/search_sql.rs	110	112	line	/// returns, which is what keeps the day-partition prune agreeing with /// the row bound. Changing the constructor here
 docs/query-to-sql.md	traces/search_sql.rs:152	crates/pulsus-read/src/traces/search_sql.rs	152		line	for b in id {

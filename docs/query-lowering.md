@@ -5518,20 +5518,20 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 689 |
-| of those, citing a bare basename | 537 |
+| citation occurrences in the five artefacts | 690 |
+| of those, citing a bare basename | 538 |
 | of those, written as a continuation of a citation earlier on the line | 44 |
-| `(document, token)` pairs the rule resolves | 363 |
-| occurrences those resolved pairs cover | 504 |
-| `(document, token)` pairs it cannot resolve | 98 |
-| occurrences those frozen pairs cover | 185 |
-| resolved rows anchored on a token the citing prose prints | 173 |
-| resolved rows anchored on a snapshot of the cited line | 190 |
+| `(document, token)` pairs the rule resolves | 362 |
+| occurrences those resolved pairs cover | 503 |
+| `(document, token)` pairs it cannot resolve | 100 |
+| occurrences those frozen pairs cover | 187 |
+| resolved rows anchored on a token the citing prose prints | 171 |
+| resolved rows anchored on a snapshot of the cited line | 191 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
 | `ambiguous_basename` | 92 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `blank_target_line` | 6 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
 | the reviewed verdict on a fallback disagreement | cases |
@@ -5545,11 +5545,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 689 citation occurrences the five artefacts make, 537 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 363 `(document, token)` pairs covering 504 occurrences, and cannot resolve 98 covering 185. Of the resolved rows, 173 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
+Of the 690 citation occurrences the five artefacts make, 538 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 503 occurrences, and cannot resolve 100 covering 187. Of the resolved rows, 171 are anchored on a token the citing prose prints and 191 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:2068` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:2068` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `traces/exec.rs:117` (cited from 2 documents).
 
 The citations the rule answers differently for two occurrences of are .
 
