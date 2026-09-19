@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::writer::push_dedup::DedupMetricsSnapshot;
 use crate::writer::spool::SpoolCounters;
 
 /// Per-table counters (one instance each for `log_samples`/`log_streams`).
@@ -179,6 +180,10 @@ pub struct WriterMetricsSnapshot {
     pub backfill_healed_total: u64,
     pub backfill_abandoned_total: u64,
     pub backfill_pending: u64,
+    /// Issue #494's push-suppression counters. All zero — and the two
+    /// gauges zero with them — while `PULSUS_INGEST_DEDUP` is off, because
+    /// no index exists to report.
+    pub dedup: DedupMetricsSnapshot,
 }
 
 impl SpoolCounters for WriterMetrics {
@@ -192,8 +197,9 @@ impl SpoolCounters for WriterMetrics {
 }
 
 impl WriterMetrics {
-    pub fn snapshot(&self, queue_bytes: u64) -> WriterMetricsSnapshot {
+    pub fn snapshot(&self, queue_bytes: u64, dedup: DedupMetricsSnapshot) -> WriterMetricsSnapshot {
         WriterMetricsSnapshot {
+            dedup,
             samples: self.samples.snapshot(),
             streams: self.streams.snapshot(),
             patterns: self.patterns.snapshot(),
@@ -275,6 +281,9 @@ pub struct MetricWriterMetricsSnapshot {
     pub series_backfill: BackfillMetricsSnapshot,
     /// `metric_metadata` registration-backfill counters (issue #139).
     pub metadata_backfill: BackfillMetricsSnapshot,
+    /// Issue #494's push-suppression counters, all zero while
+    /// `PULSUS_INGEST_DEDUP` is off.
+    pub dedup: DedupMetricsSnapshot,
 }
 
 impl SpoolCounters for MetricWriterMetrics {
@@ -288,8 +297,13 @@ impl SpoolCounters for MetricWriterMetrics {
 }
 
 impl MetricWriterMetrics {
-    pub fn snapshot(&self, queue_bytes: u64) -> MetricWriterMetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        queue_bytes: u64,
+        dedup: DedupMetricsSnapshot,
+    ) -> MetricWriterMetricsSnapshot {
         MetricWriterMetricsSnapshot {
+            dedup,
             samples: self.samples.snapshot(),
             series: self.series.snapshot(),
             metadata: self.metadata.snapshot(),
@@ -390,7 +404,7 @@ mod tests {
     #[test]
     fn writer_metrics_snapshot_carries_the_passed_in_queue_bytes() {
         let metrics = WriterMetrics::default();
-        let snap = metrics.snapshot(4096);
+        let snap = metrics.snapshot(4096, DedupMetricsSnapshot::default());
         assert_eq!(snap.queue_bytes, 4096);
     }
 
@@ -402,7 +416,7 @@ mod tests {
         metrics
             .spool_uncertain_total
             .fetch_add(3, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.spool_poison_total, 1);
         assert_eq!(snap.spool_uncertain_total, 3);
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn metric_writer_metrics_snapshot_carries_the_passed_in_queue_bytes() {
         let metrics = MetricWriterMetrics::default();
-        let snap = metrics.snapshot(4096);
+        let snap = metrics.snapshot(4096, DedupMetricsSnapshot::default());
         assert_eq!(snap.queue_bytes, 4096);
     }
 
@@ -463,7 +477,7 @@ mod tests {
             .healed_total
             .fetch_add(3, Ordering::Relaxed);
         metrics.backfill.pending.store(4, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.backfill_enqueued_total, 7);
         assert_eq!(snap.backfill_healed_total, 3);
         assert_eq!(snap.backfill_pending, 4);
@@ -481,7 +495,7 @@ mod tests {
             .metadata_backfill
             .abandoned_total
             .fetch_add(2, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.series_backfill.healed_total, 1);
         assert_eq!(snap.metadata_backfill.abandoned_total, 2);
 
@@ -508,7 +522,7 @@ mod tests {
         metrics
             .metadata_upserts_total
             .fetch_add(3, Ordering::Relaxed);
-        let snap = metrics.snapshot(0);
+        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
         assert_eq!(snap.series_registrations_total, 2);
         assert_eq!(snap.series_lru_hits_total, 1);
         assert_eq!(snap.series_lru_misses_total, 2);

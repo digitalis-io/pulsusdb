@@ -1,0 +1,32 @@
+# Issue #494. The frozen revision every range below is taken in: the
+# merge base this change was written against. It never moves, because the
+# rows are claims ABOUT that revision's sentences — a `leave` row says its
+# text is still there, and a `rewrite` row says its text is gone.
+# base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
+rewrite docs/schemas.md:174-174
+rewrite docs/schemas.md:1089-1089
+rewrite docs/architecture.md:378-378
+rewrite docs/116.md:64-64
+rewrite docs/116.md:75-75
+rewrite crates/pulsus-clickhouse/src/client.rs:156-164
+rewrite crates/pulsus-clickhouse/src/lib.rs:6-10
+rewrite docs/decisions/0006-log-pattern-extraction.md:52-62
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
+leave docs/116.md:76-76
+leave docs/traceql-schema-migration.md:2289-2289
+leave docs/architecture.md:337-342
+leave docs/architecture.md:196-196
+leave docs/configuration.md:126-126
+leave crates/pulsus-schema/src/catalog.rs:195-195
+leave crates/pulsus-schema/src/catalog.rs:254-254
+leave crates/pulsus-write/src/writer/mod.rs:36-40
+leave crates/pulsus-write/src/writer/mod.rs:566-568
+leave crates/pulsus-write/src/writer/backfill.rs:23-28
+leave crates/pulsus-write/src/protocols/otlp_logs.rs:111-113
+leave crates/pulsus-write/src/ingest/metrics.rs:94-97
+leave crates/pulsus-write/src/writer/trace.rs:5-5
+leave crates/pulsus-write/src/writer/trace.rs:159-159
+leave crates/pulsus-server/tests/logs_api_live.rs:1404-1404
+leave crates/pulsus-server/tests/fingerprint_collision_live.rs:676-682
+leave crates/pulsus-server/tests/fingerprint_collision_live.rs:909-909
+leave crates/pulsus-write/tests/log_patterns_fidelity.rs:13-14

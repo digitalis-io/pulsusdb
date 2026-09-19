@@ -14,6 +14,12 @@
 //! — pinning the documented `log_metrics`-parity best-effort-approximate
 //! semantics.
 //!
+//! Issue #494 does not change that, and the reason is structural rather
+//! than incidental: `admit_and_drain` builds a NEW `LogWriter` for every
+//! admit, so its two admits are the cross-writer case, which the
+//! suppression added there declares out of reach. A re-send to the writer
+//! that accepted the original is suppressed; this one is not.
+//!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`.
 //!
 //! Run locally:
@@ -25,6 +31,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use pulsus_write::PushHeaders;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,7 +205,7 @@ async fn admit_and_drain(db: &str, batch: ParsedLogs) {
         &WriterConfig::default(),
         WriterTables::logs_default(),
     );
-    pulsus_write::LogSink::admit(&writer, batch).expect("queue has room");
+    pulsus_write::LogSink::admit(&writer, batch, PushHeaders::default()).expect("queue has room");
     writer.shutdown(Duration::from_secs(10)).await;
 }
 

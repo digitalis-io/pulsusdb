@@ -73,6 +73,36 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: ci/no-premature-close.sh
 
+      # Issue #494: the documentation sites the suppression change
+      # falsifies are a committed manifest, and both halves of it are
+      # checked — a `rewrite` row that did not change fails, and a `leave`
+      # row that did fails. The self-test runs the five attacks the plan
+      # names against the committed artifacts, so a bare pass on a clean
+      # tree is never the only evidence the matcher still works.
+      #
+      # **The base commit is passed in from here, and is not derived
+      # inside the repository.** The check asks which lines THIS CHANGE
+      # added, which has no answer without a base. Three revisions tried
+      # to work the base out from inside the tree — the frozen manifest
+      # base, a revision recorded in the manifest, then the commit graph
+      # — and a code review steered all three; a contributor controls
+      # parent order, merge topology and commit dates. The base branch of
+      # a pull request is a fact this system knows and the repository
+      # cannot forge. On a scheduled or manually dispatched run there is
+      # no pull request and so no change under review: the checked-out
+      # commit is passed instead, the added-line set is empty, and the
+      # revision used is printed on the check's own output line so a run
+      # that measured nothing says so.
+      - name: Documentation sites manifest self-test
+        env:
+          PULSUSDB_DOC_SITES_UPSTREAM: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: ci/checks/doc_sites_self_test.sh
+
+      - name: Documentation sites manifest
+        env:
+          PULSUSDB_DOC_SITES_UPSTREAM: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: ci/checks/doc_sites.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -99,6 +129,44 @@ jobs:
       # per-suite results land in the run summary. A failing test fails
       # this step exactly as before (ci/test-summary.sh propagates
       # nextest's exit code untouched).
+      #
+      # **This job exports no `PULSUS_TEST_*` variable, and that is part of
+      # the invocation rather than an omission.** The live suites gate on
+      # `PULSUS_TEST_CLICKHOUSE`, and several of them — `live_spreading`,
+      # `live_cluster`, `live_metrics_cluster_fallback`,
+      # `live_metrics_grouped_cluster` — need a MULTI-NODE ClickHouse whose
+      # shard variables no single-node run sets. Export the gate here and
+      # they wake up, fail to connect, and take the run with them: measured
+      # on issue #494, `13 failed` against a single-node server where the
+      # same tree gives `7480 passed` with the gate absent. Run the
+      # workspace without the gate, and the live suites in their own steps
+      # below, which is what this file does.
+      #
+      # **The working directory must be writable**, which is the other half
+      # of the same sentence. The writer's spool root is `./spool`,
+      # relative to the process working directory, and the committed writer
+      # tests create it: in a read-only tree this command printed
+      # `7200 passed, 1 failed` where a writable copy of the same source
+      # printed `7486 passed`. Issue #558 traced the same failure to the
+      # same place.
+      #
+      # **A shared build directory can carry another clone's paths.** Two
+      # clones pointed at one `CARGO_TARGET_DIR` reuse each other's
+      # artefacts, and a test that embeds a path at compile time then
+      # reads the other clone's. Measured on issue #494: a first run in a
+      # clean workspace printed `217 passed, 2 failed`, both
+      # `chart_surface`, both `repo root: No such file or directory`,
+      # because a scratch clone that had since been removed shared the
+      # warm tree. `cargo clean -p pulsus-config` cleared it and the rerun
+      # printed `7500 passed, 39 skipped`. CI gets a fresh tree per job,
+      # so this is a local-run hazard; it is recorded here because this is
+      # where the other two invocation constraints are.
+      #
+      # **The documentation-sites self-test writes to the git object
+      # store**, building throwaway commits and temporary refs for its
+      # commit-graph tests. A read-only object store makes it refuse and
+      # say so. It also needs the base branch commit passed in; the two
+      # steps that run it are above.
       - name: Test
         run: ci/test-summary.sh run workspace --workspace
 
@@ -625,6 +693,22 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test fingerprint_collision_live
+
+      # Issue #494: a client that retries a push after a network timeout
+      # used to store its entries or samples twice, so counting queries
+      # doubled while `rate` looked right. The check is the answer, on
+      # every reader — the raw range, the rollup, the volume endpoint and
+      # the pattern counts — plus a control with `PULSUS_INGEST_DEDUP=false`
+      # that must show the doubling. Reuses this job's 26.3 container.
+      #
+      # `--test-threads=1`: the suite spawns a server per test on fixed
+      # loopback ports, and one of its tests restarts a server on the same
+      # port with different settings.
+      - name: Live retried-push suppression answers (logs + metrics)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test push_dedup_live -- --test-threads=1
 
       # Issue #11: docs/schemas.md §9's "EXPLAIN indexes = 1 output for the
       # canonical queries is snapshot-tested" gate for the LogQL read path —

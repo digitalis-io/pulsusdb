@@ -49,23 +49,24 @@ use std::time::{Duration, Instant};
 use pulsus_clickhouse::ChClient;
 use pulsus_config::WriterConfig;
 use pulsus_model::{Fingerprint, floor_to_activity_bucket};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricSink, ParsedMetrics, SeriesRef};
-use crate::ingest::{Backpressure, FlushWait};
+use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 use crate::writer::backfill::{self, BackfillHealedHook, RegistrationBacklog};
 use crate::writer::buffer;
 use crate::writer::config::WriterRuntime;
-use crate::writer::error::WriteError;
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
+use crate::writer::push_dedup::{self, Admission, ClaimGuard, PushDedup};
 use crate::writer::registration::{MetadataCache, SeriesKey, SeriesLru};
 use crate::writer::rows::{
     MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
 };
 use crate::writer::spool;
 use crate::writer::table::{self, BlockInserter, ChBlockInserter, ShutdownSignal, TableContext};
+use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
 const SAMPLES_TABLE: &str = "metric_samples";
 const SERIES_TABLE: &str = "metric_series";
@@ -119,6 +120,9 @@ struct Shared {
     series: Arc<buffer::TableBuffer<MetricSeriesRow>>,
     metadata: Arc<buffer::TableBuffer<MetricMetadataRow>>,
     hist_samples: Arc<buffer::TableBuffer<MetricHistSampleRow>>,
+    /// Issue #494's per-signal push-suppression index. `None` while
+    /// `PULSUS_INGEST_DEDUP` is off.
+    dedup: Option<Arc<PushDedup>>,
     samples_notify: Arc<Notify>,
     series_notify: Arc<Notify>,
     metadata_notify: Arc<Notify>,
@@ -262,10 +266,22 @@ impl MetricWriter {
             runtime.metadata_lru_capacity,
         )));
 
-        let samples = Arc::new(buffer::TableBuffer::new());
-        let series = Arc::new(buffer::TableBuffer::new());
-        let metadata = Arc::new(buffer::TableBuffer::new());
-        let hist_samples = Arc::new(buffer::TableBuffer::new());
+        // Issue #494: one index per signal. All four metric tables join the
+        // sync durability ack, so all four count toward what a suppressed
+        // caller is told — unlike the log path, where `log_patterns` does
+        // not.
+        let dedup = runtime.ingest_dedup.then(|| {
+            PushDedup::new(
+                runtime.ingest_dedup_max_bytes,
+                runtime.ingest_dedup_window,
+                runtime.claim_deadline,
+            )
+        });
+
+        let samples = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let series = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let metadata = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let hist_samples = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
         let samples_notify = Arc::new(Notify::new());
         let series_notify = Arc::new(Notify::new());
         let metadata_notify = Arc::new(Notify::new());
@@ -388,6 +404,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
+            dedup: dedup.clone(),
         };
         let series_ctx = TableContext {
             table: tables.series,
@@ -400,6 +417,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_series_flush_success),
             on_flush_poisoned: Some(on_series_flush_poisoned),
+            dedup: dedup.clone(),
         };
         let metadata_ctx = TableContext {
             table: tables.metadata,
@@ -412,6 +430,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_metadata_flush_success),
             on_flush_poisoned: Some(on_metadata_flush_poisoned),
+            dedup: dedup.clone(),
         };
         // `metric_hist_samples` (M7-A4, issue #120): no flush-success hook —
         // `metric_series` registration (the only success-gated cache) is
@@ -429,6 +448,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
+            dedup: dedup.clone(),
         };
 
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
@@ -459,6 +479,7 @@ impl MetricWriter {
             series,
             metadata,
             hist_samples,
+            dedup,
             samples_notify,
             series_notify,
             metadata_notify,
@@ -483,15 +504,155 @@ impl MetricWriter {
     }
 
     /// Admits `batch`, appending to the samples/series/metadata buffers
-    /// under one atomic byte reservation. `with_waiters` selects sync- vs
+    /// under one atomic byte reservation. `mode` selects sync- vs
     /// async-mode admission, mirroring `LogWriter::admit_batch`.
     fn admit_batch(
         &self,
         batch: ParsedMetrics,
-        with_waiters: bool,
-    ) -> Result<Vec<oneshot::Receiver<Result<(), WriteError>>>, Backpressure> {
+        mode: AdmitMode,
+        push: PushHeaders,
+    ) -> Result<Admitted, AdmitRefusal> {
         if self.shared.shutting_down.load(Ordering::Acquire) {
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
+        }
+
+        // Issue #494: the claim, taken before the byte reservation so a
+        // request refused by backpressure leaves no claim behind.
+        //
+        // **One claim per content, with no exception.** An earlier revision
+        // excepted a push that emits a `metric_metadata` descriptor, and
+        // the exception reopened the defect for exactly the traffic it was
+        // protecting: two CONCURRENT identical bodies carrying a descriptor
+        // and samples both admitted, and the table then held two sample
+        // rows. Excepting a class of push was not the mechanism.
+        //
+        // What is asymmetric is not the push, it is the two row families.
+        // A duplicate `metric_samples` row inflates every counting query,
+        // which is the defect this issue exists for. A duplicate
+        // `metric_metadata` row is a no-op by construction — the table is a
+        // `ReplacingMergeTree` keyed on `metric_name`, so a second row
+        // carrying the same descriptor collapses onto the first. The cost
+        // runs the other way: NOT writing a descriptor can be wrong,
+        // because the table is versioned by a receiver clock the push
+        // identity deliberately excludes, so
+        //
+        // ```text
+        //   counter at t1    emitted, wins
+        //   gauge   at t2    emitted, wins
+        //   counter at t3    same content as t1 -> suppressed
+        // ```
+        //
+        // would leave `gauge` winning for a metric that is a counter. The
+        // A/B/A test in `tests/live_metric_writer.rs` measured exactly that.
+        //
+        // So suppression applies to the rows where duplication is harmful
+        // and not to the one where omission is: **a suppressed push stores
+        // no sample, series or histogram row, and still offers its
+        // descriptor to the cache gate below.** Both concurrent identical
+        // pushes share one claim, one of them stores the samples, and the
+        // descriptor is written whichever of them wins the race.
+        let mut suppressed: Option<Suppressed> = None;
+        //
+        // The claim is taken EITHER way: a push that emits a descriptor is
+        // stored, but it still registers, so its own retry — which by then
+        // emits no descriptor, because this push's flush promoted the
+        // cache — finds it and is suppressed. Only the two suppression
+        // verdicts are overridden; a reused key is still a client error
+        // and a full table still sheds, because neither is about what this
+        // push stores.
+        let mut guard = match &self.shared.dedup {
+            Some(dedup) => {
+                let id = push_dedup::metric_identity(&batch, &push);
+                let rows = (batch.samples.len() + batch.hist_samples.len()) as u64;
+                match dedup.admit(id, mode.wait_mode()) {
+                    Admission::Admit(guard) => Some(guard),
+                    Admission::SuppressedSettled(outcome) => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Settled(outcome));
+                        None
+                    }
+                    Admission::SuppressedPending { guard, rx } => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Pending(guard, rx));
+                        None
+                    }
+                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
+                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
+                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
+                }
+            }
+            None => None,
+        };
+        let claim = guard.as_ref().map(ClaimGuard::key);
+
+        // `metric_metadata`: local-dedup (last occurrence per metric_name
+        // wins within one request), then gate on the last-*emitted* value
+        // (architect plan amendment 1, finding 2) — emit iff it differs
+        // from what `MetadataCache` last confirmed-flushed for this name.
+        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
+        for meta in &batch.metadata {
+            last_by_name.insert(&meta.metric_name, meta);
+        }
+        let mut new_metadata: Vec<&MetricMetadata> = Vec::new();
+        {
+            let cache = self
+                .shared
+                .metadata_cache
+                .lock()
+                .expect("metadata cache mutex poisoned");
+            for meta in last_by_name.into_values() {
+                let emit = match cache.get(&meta.metric_name) {
+                    Some((t, h, u)) => t != &meta.metric_type || h != &meta.help || u != &meta.unit,
+                    None => true,
+                };
+                if emit {
+                    new_metadata.push(meta);
+                }
+            }
+        }
+        let metadata_bytes: u64 = new_metadata
+            .iter()
+            .map(|m| MetricMetadataRow::est_source_bytes(m))
+            .sum();
+
+        // The suppressed push stops here: its samples are already stored
+        // by the push it repeats, and the only thing it still owes is the
+        // descriptor above. That append is ASYNC and carries no claim —
+        // the caller is answered with the ORIGINAL push's outcome, exactly
+        // as the contract says, and a `metric_metadata` flush never joins
+        // a durability acknowledgement it was not part of.
+        if let Some(suppressed) = suppressed {
+            if !new_metadata.is_empty() {
+                super::reserve_queued_bytes(
+                    &self.shared.queued_bytes,
+                    &self.shared.metrics.backpressure_total,
+                    metadata_bytes,
+                    self.shared.runtime.queue_bytes_limit,
+                )
+                .map_err(AdmitRefusal::from)?;
+                let metadata_rows: Vec<MetricMetadataRow> = new_metadata
+                    .iter()
+                    .map(|m| MetricMetadataRow::from(*m))
+                    .collect();
+                self.shared
+                    .metrics
+                    .metadata_upserts_total
+                    .fetch_add(metadata_rows.len() as u64, Ordering::Relaxed);
+                if self
+                    .shared
+                    .metadata
+                    .append(
+                        metadata_rows,
+                        metadata_bytes,
+                        self.shared.runtime.batch_bytes,
+                        None,
+                    )
+                    .0
+                {
+                    self.shared.metadata_notify.notify_one();
+                }
+            }
+            return Ok(Admitted::Suppressed(suppressed));
         }
 
         self.shared
@@ -597,36 +758,6 @@ impl MetricWriter {
             .map(|(s, _, _)| MetricSeriesRow::est_source_bytes(s))
             .sum();
 
-        // `metric_metadata`: local-dedup (last occurrence per metric_name
-        // wins within one request), then gate on the last-*emitted* value
-        // (architect plan amendment 1, finding 2) — emit iff it differs
-        // from what `MetadataCache` last confirmed-flushed for this name.
-        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
-        for meta in &batch.metadata {
-            last_by_name.insert(&meta.metric_name, meta);
-        }
-        let mut new_metadata: Vec<&MetricMetadata> = Vec::new();
-        {
-            let cache = self
-                .shared
-                .metadata_cache
-                .lock()
-                .expect("metadata cache mutex poisoned");
-            for meta in last_by_name.into_values() {
-                let emit = match cache.get(&meta.metric_name) {
-                    Some((t, h, u)) => t != &meta.metric_type || h != &meta.help || u != &meta.unit,
-                    None => true,
-                };
-                if emit {
-                    new_metadata.push(meta);
-                }
-            }
-        }
-        let metadata_bytes: u64 = new_metadata
-            .iter()
-            .map(|m| MetricMetadataRow::est_source_bytes(m))
-            .sum();
-
         let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
 
         // Atomic reservation (mirrors `LogWriter::admit_batch`): reserve
@@ -636,13 +767,16 @@ impl MetricWriter {
             &self.shared.metrics.backpressure_total,
             total_bytes,
             self.shared.runtime.queue_bytes_limit,
-        )?;
+        )
+        // The guard is still un-sealed, so returning drops it and removes
+        // the claim: the same body sent again is stored (issue #494).
+        .map_err(AdmitRefusal::from)?;
 
         if self.shared.shutting_down.load(Ordering::Acquire) {
             self.shared
                 .queued_bytes
                 .fetch_sub(total_bytes, Ordering::AcqRel);
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
         }
 
         // Reservation secured: only now materialize the target rows.
@@ -667,21 +801,28 @@ impl MetricWriter {
         let mut receivers = Vec::new();
 
         if !sample_rows.is_empty() {
-            if with_waiters {
-                let (should_notify, rx) = self.shared.samples.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.samples.append_and_wait(
                     sample_rows,
                     sample_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.samples_notify.notify_one();
-                }
-            } else if self.shared.samples.append(
-                sample_rows,
-                sample_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .samples
+                    .append(
+                        sample_rows,
+                        sample_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.samples_notify.notify_one();
             }
         }
@@ -691,21 +832,28 @@ impl MetricWriter {
                 .metrics
                 .series_registrations_total
                 .fetch_add(series_rows.len() as u64, Ordering::Relaxed);
-            if with_waiters {
-                let (should_notify, rx) = self.shared.series.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.series.append_and_wait(
                     series_rows,
                     series_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.series_notify.notify_one();
-                }
-            } else if self.shared.series.append(
-                series_rows,
-                series_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .series
+                    .append(
+                        series_rows,
+                        series_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.series_notify.notify_one();
             }
         }
@@ -715,53 +863,84 @@ impl MetricWriter {
                 .metrics
                 .metadata_upserts_total
                 .fetch_add(metadata_rows.len() as u64, Ordering::Relaxed);
-            if with_waiters {
-                let (should_notify, rx) = self.shared.metadata.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.metadata.append_and_wait(
                     metadata_rows,
                     metadata_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.metadata_notify.notify_one();
-                }
-            } else if self.shared.metadata.append(
-                metadata_rows,
-                metadata_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .metadata
+                    .append(
+                        metadata_rows,
+                        metadata_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.metadata_notify.notify_one();
             }
         }
 
         if !hist_sample_rows.is_empty() {
-            if with_waiters {
-                let (should_notify, rx) = self.shared.hist_samples.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.hist_samples.append_and_wait(
                     hist_sample_rows,
                     hist_sample_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.hist_samples_notify.notify_one();
-                }
-            } else if self.shared.hist_samples.append(
-                hist_sample_rows,
-                hist_sample_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .hist_samples
+                    .append(
+                        hist_sample_rows,
+                        hist_sample_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.hist_samples_notify.notify_one();
             }
         }
 
-        Ok(receivers)
+        // Arms the claim: from here a drop no longer removes it, and the
+        // target set is closed.
+        if let Some(guard) = guard {
+            guard.seal();
+        }
+        Ok(Admitted::Stored(receivers))
+    }
+
+    /// This writer's push-suppression index (issue #494), or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off — see
+    /// [`LogWriter::dedup`](crate::writer::LogWriter::dedup).
+    pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
+        self.shared.dedup.as_ref()
     }
 
     /// A point-in-time metrics snapshot.
     pub fn metrics(&self) -> MetricWriterMetricsSnapshot {
-        self.shared
-            .metrics
-            .snapshot(self.shared.queued_bytes.load(Ordering::Relaxed))
+        self.shared.metrics.snapshot(
+            self.shared.queued_bytes.load(Ordering::Relaxed),
+            self.shared
+                .dedup
+                .as_ref()
+                .map(|d| d.snapshot())
+                .unwrap_or_default(),
+        )
     }
 
     /// Graceful shutdown, mirroring [`crate::writer::LogWriter::shutdown`]
@@ -851,17 +1030,23 @@ impl MetricWriter {
 }
 
 impl MetricSink for MetricWriter {
-    fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure> {
-        self.admit_batch(batch, false).map(|_| ())
+    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        self.admit_batch(batch, AdmitMode::Async, push).map(|_| ())
     }
 
-    fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure> {
-        let receivers = self.admit_batch(batch, true)?;
-        Ok(FlushWait::new(async move {
-            super::join_generations(receivers)
-                .await
-                .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
-        }))
+    fn admit_flush(
+        &self,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
+        match self.admit_batch(batch, AdmitMode::Sync, push)? {
+            Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
+                super::join_generations(receivers)
+                    .await
+                    .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
+            })),
+            Admitted::Suppressed(suppressed) => Ok(FlushWait::new(suppressed.into_answer())),
+        }
     }
 }
 

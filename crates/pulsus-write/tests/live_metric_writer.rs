@@ -15,6 +15,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use pulsus_write::PushHeaders;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,7 +158,10 @@ async fn metric_metadata_a_to_b_to_a_collapses_to_the_latest_value_on_final_read
     let metric_name = "http_requests_total";
     for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
         let wait = writer
-            .admit_flush(metadata(metric_name, metric_type, updated_ns))
+            .admit_flush(
+                metadata(metric_name, metric_type, updated_ns),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         tokio::time::timeout(Duration::from_secs(10), wait)
             .await
@@ -216,7 +220,7 @@ async fn metric_metadata_repeated_identical_descriptor_is_idempotent() {
 
     let metric_name = "up";
     let wait = writer
-        .admit_flush(metadata(metric_name, "gauge", 1))
+        .admit_flush(metadata(metric_name, "gauge", 1), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -227,7 +231,7 @@ async fn metric_metadata_repeated_identical_descriptor_is_idempotent() {
     // now holds the first flush's value, so this must be suppressed at
     // admission — never even reach a `metric_metadata` insert.
     writer
-        .admit(metadata(metric_name, "gauge", 2))
+        .admit(metadata(metric_name, "gauge", 2), PushHeaders::default())
         .expect("queue has room");
 
     writer.shutdown(Duration::from_secs(5)).await;
@@ -311,7 +315,9 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(batch).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")
@@ -412,7 +418,9 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
         ..Default::default()
     };
 
-    let wait = writer.admit_flush(batch).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")

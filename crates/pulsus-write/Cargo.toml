@@ -24,6 +24,9 @@ snap.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "fs"] }
 tracing.workspace = true
+# Issue #494: `xxh3`'s 128-bit streaming digest is the push-suppression
+# index's key. Same crate the model already uses, one more feature.
+xxhash-rust.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

@@ -66,6 +66,20 @@ const REGISTRATION_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// [`REGISTRATION_BACKFILL_RETRY_INTERVAL`].
 const REGISTRATION_BACKFILL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// How long past its buffers' age-flush trigger a claim may stay open
+/// before the suppression index gives up on it and writes a tombstone
+/// (issue #494). Added to `PULSUS_BATCH_MS`, so at the defaults a claim
+/// ages at `120.2 s`: the age-flush trigger plus the bound on the insert
+/// it triggers.
+///
+/// This is `PULSUS_QUERY_TIMEOUT`'s documented default (`2m`,
+/// docs/configuration.md §1) written as a constant rather than read from
+/// the knob, because the writer's construction seam takes a
+/// [`WriterConfig`] and that knob is not in it. Same documented-constant
+/// precedent as [`LRU_CAPACITY`]; promote both together if a deployment
+/// needs to tune it.
+const CLAIM_INSERT_BOUND: Duration = Duration::from_secs(120);
+
 /// The resolved set of tunables a `LogWriter` and its per-table flush
 /// tasks read from on every admit/flush — computed once at construction,
 /// never re-read from the environment afterward.
@@ -103,6 +117,19 @@ pub struct WriterRuntime {
     /// `log_patterns` appends; the read endpoint stays mounted and serves
     /// empty data.
     pub log_patterns: bool,
+    /// `PULSUS_INGEST_DEDUP` (issue #494): retried-push suppression.
+    /// `false` ⇒ no index is built at all and every push is admitted, which
+    /// is the pre-#494 behaviour.
+    pub ingest_dedup: bool,
+    /// `PULSUS_INGEST_DEDUP_WINDOW`: how long a writer remembers an
+    /// accepted push.
+    pub ingest_dedup_window: Duration,
+    /// `PULSUS_INGEST_DEDUP_MAX_BYTES`: the whole per-signal index's byte
+    /// bound.
+    pub ingest_dedup_max_bytes: u64,
+    /// How long a claim may stay open before it becomes a tombstone —
+    /// derived, not a knob (see [`CLAIM_INSERT_BOUND`]).
+    pub claim_deadline: Duration,
 }
 
 impl WriterRuntime {
@@ -120,6 +147,10 @@ impl WriterRuntime {
             backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
             backfill_max_bytes: REGISTRATION_BACKFILL_MAX_BYTES,
             log_patterns: cfg.log_patterns,
+            ingest_dedup: cfg.ingest_dedup,
+            ingest_dedup_window: cfg.ingest_dedup_window.0,
+            ingest_dedup_max_bytes: cfg.ingest_dedup_max_bytes.0,
+            claim_deadline: Duration::from_millis(cfg.batch_ms) + CLAIM_INSERT_BOUND,
         }
     }
 }
@@ -144,6 +175,37 @@ mod tests {
         let runtime = WriterRuntime::from_config(&cfg);
         assert_eq!(runtime.batch_bytes, cfg.batch_bytes.0);
         assert_eq!(runtime.queue_bytes_limit, cfg.ingest_queue_bytes.0);
+    }
+
+    /// Issue #494: the claim deadline is the age-flush trigger plus the
+    /// bound on the insert it triggers — `120.2 s` at the defaults.
+    #[test]
+    fn claim_deadline_is_the_flush_trigger_plus_the_insert_bound() {
+        let runtime = WriterRuntime::from_config(&WriterConfig::default());
+        assert_eq!(runtime.claim_deadline, Duration::from_millis(120_200));
+        let slow = WriterConfig {
+            batch_ms: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            WriterRuntime::from_config(&slow).claim_deadline,
+            Duration::from_secs(125)
+        );
+    }
+
+    /// Issue #494: a claim must never outlive the window that decides
+    /// whether a retry is still suppressible, or an open claim would age
+    /// into a tombstone only after the entry it belongs to was already
+    /// forgotten. At the smallest accepted window the deadline is longer,
+    /// which is why the index treats whichever comes first as the end of
+    /// the claim — the window sweep runs before the age sweep in `tick`.
+    #[test]
+    fn the_accepted_window_range_brackets_the_derived_deadline() {
+        let runtime = WriterRuntime::from_config(&WriterConfig::default());
+        assert!(runtime.claim_deadline < runtime.ingest_dedup_window);
+        assert_eq!(runtime.ingest_dedup_window, Duration::from_secs(300));
+        assert_eq!(runtime.ingest_dedup_max_bytes, 16 * 1024 * 1024);
+        assert!(runtime.ingest_dedup);
     }
 
     #[test]

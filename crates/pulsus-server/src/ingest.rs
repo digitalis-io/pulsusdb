@@ -31,8 +31,8 @@ use pulsus_write::writer::{
     MetricWriterMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
 };
 use pulsus_write::{
-    Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
-    ParsedMetrics, ParsedTraces, TraceSink, TraceWriter,
+    AdmitRefusal, Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter,
+    ParsedLogs, ParsedMetrics, ParsedTraces, PushHeaders, TraceSink, TraceWriter,
 };
 
 use crate::app::AppState;
@@ -87,17 +87,17 @@ impl WriterSink {
 }
 
 impl LogSink for WriterSink {
-    fn admit(&self, batch: ParsedLogs) -> Result<(), Backpressure> {
+    fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit(batch, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 
-    fn admit_flush(&self, batch: ParsedLogs) -> Result<FlushWait, Backpressure> {
+    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit_flush(batch, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 }
@@ -143,17 +143,21 @@ impl MetricWriterSink {
 }
 
 impl MetricSink for MetricWriterSink {
-    fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure> {
+    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit(batch, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 
-    fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure> {
+    fn admit_flush(
+        &self,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit_flush(batch, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 }
@@ -366,13 +370,16 @@ mod tests {
     #[test]
     fn admit_is_backpressure_while_the_slot_is_empty() {
         let sink = WriterSink::new(Arc::new(OnceLock::new()));
-        assert_eq!(sink.admit(batch()), Err(Backpressure));
+        assert_eq!(
+            sink.admit(batch(), PushHeaders::default()),
+            Err(AdmitRefusal::Backpressure)
+        );
     }
 
     #[test]
     fn admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = WriterSink::new(Arc::new(OnceLock::new()));
-        assert!(sink.admit_flush(batch()).is_err());
+        assert!(sink.admit_flush(batch(), PushHeaders::default()).is_err());
     }
 
     fn metrics_batch() -> ParsedMetrics {
@@ -390,13 +397,19 @@ mod tests {
     #[test]
     fn metric_admit_is_backpressure_while_the_slot_is_empty() {
         let sink = MetricWriterSink::new(Arc::new(OnceLock::new()));
-        assert_eq!(sink.admit(metrics_batch()), Err(Backpressure));
+        assert_eq!(
+            sink.admit(metrics_batch(), PushHeaders::default()),
+            Err(AdmitRefusal::Backpressure)
+        );
     }
 
     #[test]
     fn metric_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = MetricWriterSink::new(Arc::new(OnceLock::new()));
-        assert!(sink.admit_flush(metrics_batch()).is_err());
+        assert!(
+            sink.admit_flush(metrics_batch(), PushHeaders::default())
+                .is_err()
+        );
     }
 
     fn traces_batch() -> ParsedTraces {

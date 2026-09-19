@@ -82,6 +82,7 @@ mod config;
 mod error;
 mod metric;
 mod metrics;
+mod push_dedup;
 mod registration;
 pub(crate) mod rows;
 mod spool;
@@ -106,6 +107,11 @@ pub use metrics::{
     TableMetricsSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot, WriterMetrics,
     WriterMetricsSnapshot,
 };
+pub use push_dedup::{
+    Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
+    PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
+    metric_identity, plan_capacities,
+};
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
     LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricMetadataRow,
@@ -115,7 +121,7 @@ pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};
 
 use crate::error::LogsIngestError;
-use crate::ingest::{Backpressure, FlushWait, LogSink};
+use crate::ingest::{AdmitRefusal, Backpressure, FlushWait, LogSink, PushHeaders};
 use crate::patterns::{
     AGG_BASE_OVERHEAD, MAX_DISTINCT_PATTERNS_PER_BATCH, PATTERN_ROW_OVERHEAD, aggregate_patterns,
     est_template_bound,
@@ -199,6 +205,10 @@ struct Shared {
     runtime: Arc<WriterRuntime>,
     metrics: Arc<WriterMetrics>,
     lru: Arc<Mutex<StreamLru>>,
+    /// Issue #494's per-signal push-suppression index. `None` while
+    /// `PULSUS_INGEST_DEDUP` is off, which restores the pre-#494 behaviour
+    /// exactly: no index is built, no digest is computed, no claim is taken.
+    dedup: Option<Arc<PushDedup>>,
     shutdown: ShutdownSignal,
     shutting_down: AtomicBool,
     samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -274,9 +284,22 @@ impl LogWriter {
         let (shutdown, shutdown_rx) = ShutdownSignal::new();
         let lru = Arc::new(Mutex::new(StreamLru::new(runtime.lru_capacity)));
 
-        let samples = Arc::new(buffer::TableBuffer::new());
-        let streams = Arc::new(buffer::TableBuffer::new());
-        let patterns = Arc::new(buffer::TableBuffer::new());
+        // Issue #494: one index per signal, reserved once from the knob.
+        // `log_patterns` is a target of a claim but never joins the sync
+        // durability ack (`:566-568` below), so its buffer reports with
+        // `counts_for_ack = false` — a pattern-only failure must reproduce
+        // the original caller's success, not turn it into one.
+        let dedup = runtime.ingest_dedup.then(|| {
+            PushDedup::new(
+                runtime.ingest_dedup_max_bytes,
+                runtime.ingest_dedup_window,
+                runtime.claim_deadline,
+            )
+        });
+
+        let samples = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let streams = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let patterns = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), false));
         let samples_notify = Arc::new(Notify::new());
         let streams_notify = Arc::new(Notify::new());
         let patterns_notify = Arc::new(Notify::new());
@@ -334,6 +357,7 @@ impl LogWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
+            dedup: dedup.clone(),
         };
         let streams_ctx = TableContext {
             table: tables.streams.clone(),
@@ -346,6 +370,7 @@ impl LogWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_stream_flush_success),
             on_flush_poisoned: Some(on_stream_flush_poisoned),
+            dedup: dedup.clone(),
         };
 
         // `log_patterns` (M7-C3, issue #171): a fourth generic flush task,
@@ -363,6 +388,7 @@ impl LogWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
+            dedup: dedup.clone(),
         };
 
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
@@ -389,6 +415,7 @@ impl LogWriter {
             runtime,
             metrics,
             lru,
+            dedup,
             shutdown,
             shutting_down: AtomicBool::new(false),
             samples_task: Mutex::new(Some(samples_task)),
@@ -401,18 +428,48 @@ impl LogWriter {
     }
 
     /// Admits `batch`, appending to the samples/streams buffers under one
-    /// atomic byte reservation. `with_waiters` selects sync- vs
-    /// async-mode admission: `true` registers a waiter per touched
+    /// atomic byte reservation. `mode` selects sync- vs async-mode
+    /// admission: [`AdmitMode::Sync`] registers a waiter per touched
     /// generation and returns their receivers for the caller to join;
-    /// `false` (async mode) registers none.
+    /// [`AdmitMode::Async`] registers none.
+    ///
+    /// Issue #494: the claim is taken **before** the byte reservation, so
+    /// a request refused by backpressure leaves no claim behind and the
+    /// same body sent again is stored.
     fn admit_batch(
         &self,
         batch: ParsedLogs,
-        with_waiters: bool,
-    ) -> Result<Vec<oneshot::Receiver<Result<(), WriteError>>>, Backpressure> {
+        mode: AdmitMode,
+        push: PushHeaders,
+    ) -> Result<Admitted, AdmitRefusal> {
         if self.shared.shutting_down.load(Ordering::Acquire) {
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
         }
+
+        // A parse that failed a stream's label bounds is never claimed: its
+        // admitted subset is not the whole request, so a later identical
+        // request is not the same push.
+        let mut guard = match (&self.shared.dedup, batch.stream_errors.is_empty()) {
+            (Some(dedup), true) => {
+                let id = push_dedup::log_identity(&batch, &push);
+                match dedup.admit(id, mode.wait_mode()) {
+                    Admission::Admit(guard) => Some(guard),
+                    Admission::SuppressedSettled(outcome) => {
+                        dedup.count_suppressed(id.declared_retry, batch.rows.len() as u64);
+                        return Ok(Admitted::Suppressed(Suppressed::Settled(outcome)));
+                    }
+                    Admission::SuppressedPending { guard, rx } => {
+                        dedup.count_suppressed(id.declared_retry, batch.rows.len() as u64);
+                        return Ok(Admitted::Suppressed(Suppressed::Pending(guard, rx)));
+                    }
+                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
+                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
+                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
+                }
+            }
+            _ => None,
+        };
+        let claim = guard.as_ref().map(ClaimGuard::key);
 
         self.shared
             .metrics
@@ -494,7 +551,10 @@ impl LogWriter {
             &self.shared.metrics.backpressure_total,
             total_bytes,
             self.shared.runtime.queue_bytes_limit,
-        )?;
+        )
+        // The guard is still un-sealed here, so returning drops it and the
+        // claim is removed: the same body sent again is stored (issue #494).
+        .map_err(AdmitRefusal::from)?;
 
         if self.shared.shutting_down.load(Ordering::Acquire) {
             // Lost the race with `shutdown()`: give the bytes back rather
@@ -504,7 +564,7 @@ impl LogWriter {
             self.shared
                 .queued_bytes
                 .fetch_sub(total_bytes, Ordering::AcqRel);
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
         }
 
         // Reservation secured: only now materialize the target rows
@@ -520,21 +580,28 @@ impl LogWriter {
         let mut receivers = Vec::new();
 
         if !sample_rows.is_empty() {
-            if with_waiters {
-                let (should_notify, rx) = self.shared.samples.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.samples.append_and_wait(
                     sample_rows,
                     sample_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.samples_notify.notify_one();
-                }
-            } else if self.shared.samples.append(
-                sample_rows,
-                sample_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .samples
+                    .append(
+                        sample_rows,
+                        sample_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.samples_notify.notify_one();
             }
         }
@@ -544,21 +611,28 @@ impl LogWriter {
                 .metrics
                 .stream_registrations_total
                 .fetch_add(stream_rows.len() as u64, Ordering::Relaxed);
-            if with_waiters {
-                let (should_notify, rx) = self.shared.streams.append_and_wait(
+            note_target(&mut guard, true);
+            let should_notify = if mode == AdmitMode::Sync {
+                let (should_notify, _generation, rx) = self.shared.streams.append_and_wait(
                     stream_rows,
                     stream_bytes,
                     self.shared.runtime.batch_bytes,
+                    claim,
                 );
                 receivers.push(rx);
-                if should_notify {
-                    self.shared.streams_notify.notify_one();
-                }
-            } else if self.shared.streams.append(
-                stream_rows,
-                stream_bytes,
-                self.shared.runtime.batch_bytes,
-            ) {
+                should_notify
+            } else {
+                self.shared
+                    .streams
+                    .append(
+                        stream_rows,
+                        stream_bytes,
+                        self.shared.runtime.batch_bytes,
+                        claim,
+                    )
+                    .0
+            };
+            if should_notify {
                 self.shared.streams_notify.notify_one();
             }
         }
@@ -593,26 +667,51 @@ impl LogWriter {
                     .queued_bytes
                     .fetch_sub(surplus, Ordering::AcqRel);
             }
-            if !agg.rows.is_empty()
-                && self
+            if !agg.rows.is_empty() {
+                // A claim target, but never one that joins the durability
+                // ack: the buffer was built with `counts_for_ack = false`,
+                // so a pattern-only failure reproduces the original
+                // caller's success rather than turning it into a failure.
+                note_target(&mut guard, false);
+                if self
                     .shared
                     .patterns
-                    .append(agg.rows, charge, self.shared.runtime.batch_bytes)
-            {
-                self.shared.patterns_notify.notify_one();
+                    .append(agg.rows, charge, self.shared.runtime.batch_bytes, claim)
+                    .0
+                {
+                    self.shared.patterns_notify.notify_one();
+                }
             }
         }
 
-        Ok(receivers)
+        // Arms the claim: from here a drop no longer removes it, and the
+        // target set is closed.
+        if let Some(guard) = guard {
+            guard.seal();
+        }
+        Ok(Admitted::Stored(receivers))
+    }
+
+    /// This writer's push-suppression index (issue #494), or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off. The writer is the only production
+    /// caller; the accessor exists so a test can read the index's state
+    /// rather than inferring it from row counts.
+    pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
+        self.shared.dedup.as_ref()
     }
 
     /// A point-in-time metrics snapshot (`/metrics` exposition is the
     /// server's job, architect plan "out of scope"; this crate only
     /// maintains the atomics).
     pub fn metrics(&self) -> WriterMetricsSnapshot {
-        self.shared
-            .metrics
-            .snapshot(self.shared.queued_bytes.load(Ordering::Relaxed))
+        self.shared.metrics.snapshot(
+            self.shared.queued_bytes.load(Ordering::Relaxed),
+            self.shared
+                .dedup
+                .as_ref()
+                .map(|d| d.snapshot())
+                .unwrap_or_default(),
+        )
     }
 
     /// Graceful shutdown (architect plan amendment 2): stops admitting
@@ -684,17 +783,91 @@ impl LogWriter {
 }
 
 impl LogSink for LogWriter {
-    fn admit(&self, batch: ParsedLogs) -> Result<(), Backpressure> {
-        self.admit_batch(batch, false).map(|_| ())
+    fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        self.admit_batch(batch, AdmitMode::Async, push).map(|_| ())
     }
 
-    fn admit_flush(&self, batch: ParsedLogs) -> Result<FlushWait, Backpressure> {
-        let receivers = self.admit_batch(batch, true)?;
-        Ok(FlushWait::new(async move {
-            join_generations(receivers)
-                .await
-                .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
-        }))
+    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
+        match self.admit_batch(batch, AdmitMode::Sync, push)? {
+            Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
+                join_generations(receivers)
+                    .await
+                    .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
+            })),
+            Admitted::Suppressed(suppressed) => Ok(FlushWait::new(suppressed.into_answer())),
+        }
+    }
+}
+
+/// Which admission mode a request asked for (`X-Pulsus-Async`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitMode {
+    /// Buffer and return; the handler answers `202`.
+    Async,
+    /// Buffer and wait for the flush; the handler answers `200`/`204`.
+    Sync,
+}
+
+impl AdmitMode {
+    pub(crate) fn wait_mode(self) -> push_dedup::WaitMode {
+        match self {
+            AdmitMode::Async => push_dedup::WaitMode::None,
+            AdmitMode::Sync => push_dedup::WaitMode::Register,
+        }
+    }
+}
+
+/// What an admission did with a request's rows (issue #494).
+#[derive(Debug)]
+pub(crate) enum Admitted {
+    /// Rows were buffered. Empty in async mode, one receiver per touched
+    /// generation in sync mode.
+    Stored(Vec<oneshot::Receiver<Result<(), WriteError>>>),
+    /// This writer already accepted this push and still remembers it, so
+    /// nothing was stored and the answer is the original push's.
+    Suppressed(Suppressed),
+}
+
+/// How a suppressed caller learns the original push's outcome.
+#[derive(Debug)]
+pub(crate) enum Suppressed {
+    /// Already known: the claim had settled, or the caller is async and is
+    /// answered without waiting.
+    Settled(ClaimOutcome),
+    /// The original is still in flight. The guard holds this caller's
+    /// registration — and its bytes — for exactly as long as the wait.
+    Pending(push_dedup::WaitGuard, oneshot::Receiver<ClaimOutcome>),
+}
+
+impl Suppressed {
+    /// The answer a suppressed sync caller receives, byte-identical in the
+    /// success case to the one this body received when it was fresh.
+    pub(crate) async fn into_answer(self) -> Result<(), LogsIngestError> {
+        let outcome = match self {
+            Suppressed::Settled(outcome) => outcome,
+            Suppressed::Pending(guard, rx) => {
+                let outcome = rx.await.unwrap_or(ClaimOutcome::Failed);
+                // The guard is held across the await deliberately: its drop
+                // is what returns this caller's bytes to the waiter budget,
+                // and a cancelled future drops it at exactly the right
+                // moment.
+                drop(guard);
+                outcome
+            }
+        };
+        match outcome {
+            ClaimOutcome::Ok => Ok(()),
+            ClaimOutcome::Failed => Err(LogsIngestError::FlushFailed(
+                "the identical push this one repeats did not become durable".to_string(),
+            )),
+        }
+    }
+}
+
+/// Records one appended target on a claim, if there is a claim.
+pub(crate) fn note_target(guard: &mut Option<ClaimGuard>, counts_for_ack: bool) {
+    if let Some(guard) = guard {
+        guard.note_target(counts_for_ack);
     }
 }
 

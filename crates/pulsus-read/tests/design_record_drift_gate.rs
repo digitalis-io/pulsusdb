@@ -580,14 +580,37 @@ fn regenerate_the_count_site_lines() {
 // stayed green. That is how `docs/query-to-sql.md`'s TraceQL row came to
 // cite two call sites that did not exist. The rule is narrow and stated
 // in full: a `` `:<line>` `` or `` `:<line>-<line>` `` is a citation when
-// it sits **on the same line as, and after**, a `<file>.rs:<line>`
-// occurrence, and it is attributed to the nearest such occurrence before
-// it. Its token is synthesised as `<that file>:<its line>`, so it
-// resolves, is frozen and is checked by exactly the same rules as a
-// written-out citation.
+// it sits **after** a `<file>.rs:<line>` occurrence **in the same
+// paragraph**, and it is attributed to the nearest such occurrence
+// before it — on its own line if there is one there, otherwise the last
+// one on an earlier line of the paragraph. A blank line ends a
+// paragraph and a continuation never reaches past one. Its token is
+// synthesised as `<that file>:<its line>`, so it resolves, is frozen and
+// is checked by exactly the same rules as a written-out citation.
+//
+// **The paragraph half was added in round 3 of issue #494's code
+// review**, which found a citation written across a line break —
+// `` `catalog.rs:2180` asserts … `` on one line and `` and `:2231` the
+// same for `scope_name` `` on the next. The same-line rule never scanned
+// it, so it could name any number and every check here stayed green. It
+// was a wrong number when it was found. The census in
+// `docs/query-lowering.md` §12.3 states how many continuations are of
+// each kind, so the size of what the earlier rule missed is a figure
+// rather than a description.
+//
+// **A citation whose target carries no identifier is refused**
+// ([`Resolution::TargetLineHasNoIdentifier`]). A `line` anchor is a
+// snapshot of the cited text, so a citation that has gone stale is
+// frozen as its own evidence and passes forever. Most of that class
+// cannot be told apart from a correct citation by any rule this file
+// could carry — the census states how many rows are anchored that way —
+// but the part that can is: a line holding only `}`, `///` or `//!` is
+// nothing a sentence can be citing. Every row this refused when it was
+// added had a target that had moved, and all but two were corrected
+// rather than frozen.
 //
 // **What it still does not read**, named rather than left to be found: a
-// continuation on a LATER line than the citation it continues, and a
+// continuation separated from its citation by a blank line, and a
 // continuation of a citation into a file that is not a `.rs` file.
 // Neither is scanned, so neither is checked.
 // ---------------------------------------------------------------------
@@ -628,6 +651,11 @@ struct CitationRow {
     line: u32,
     end_line: Option<u32>,
     kind: AnchorKind,
+    /// The most distinctive name the cited range carries, from
+    /// [`target_symbol`]. Recorded so that repointing a citation changes
+    /// a short name in the diff rather than only a line number and a
+    /// long snapshot.
+    symbol: String,
     anchor: String,
 }
 
@@ -637,7 +665,7 @@ fn citation_rows() -> Vec<CitationRow> {
     for (n, line) in text.lines().enumerate() {
         if n == 0 {
             assert_eq!(
-                line, "doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor",
+                line, "doc\ttoken\tpath\tline\tend_line\tanchor_kind\tsymbol\tanchor",
                 "{CITATIONS_TSV} header"
             );
             continue;
@@ -645,8 +673,8 @@ fn citation_rows() -> Vec<CitationRow> {
         if line.trim().is_empty() {
             continue;
         }
-        let f: Vec<&str> = line.splitn(7, '\t').collect();
-        assert_eq!(f.len(), 7, "{CITATIONS_TSV}:{}: seven columns", n + 1);
+        let f: Vec<&str> = line.splitn(8, '\t').collect();
+        assert_eq!(f.len(), 8, "{CITATIONS_TSV}:{}: eight columns", n + 1);
         out.push(CitationRow {
             doc: f[0].to_string(),
             token: f[1].to_string(),
@@ -663,7 +691,8 @@ fn citation_rows() -> Vec<CitationRow> {
                 "line" => AnchorKind::Line,
                 other => panic!("{CITATIONS_TSV}:{}: unknown anchor_kind {other:?}", n + 1),
             },
-            anchor: f[6].to_string(),
+            symbol: f[6].to_string(),
+            anchor: f[7].to_string(),
         });
     }
     out
@@ -690,7 +719,8 @@ fn unresolvable() -> BTreeSet<(String, String, String)> {
                 "not_a_tracked_file",
                 "blank_target_line",
                 "line_beyond_end_of_file",
-                "occurrences_disagree"
+                "occurrences_disagree",
+                "target_line_has_no_identifier"
             ]
             .contains(&f[2]),
             "{UNRESOLVABLE_TSV}:{}: unknown reason {:?}",
@@ -733,6 +763,18 @@ struct Occurrence {
     /// by whether the cited line carries an identifier this line prints.
     citing_line: String,
     form: CitationForm,
+    /// For a continuation, whether the citation it continues sits on the
+    /// SAME document line. Round 3 of issue #494's code review found a
+    /// continuation on the line after its antecedent, which the
+    /// same-line-only rule never scanned; the paragraph rule below reads
+    /// it, and this records which rule was needed.
+    same_line_antecedent: bool,
+    /// Every line of the paragraph the citation sits in, joined. The
+    /// corroboration rule reads the paragraph rather than the one line:
+    /// "LogQL's `fetch_until_limit` keyset paging (`plan.rs:1658`, field
+    /// at `:80`)" names the symbol on the line before the citation as
+    /// often as on it.
+    citing_paragraph: String,
 }
 
 /// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts,
@@ -744,8 +786,35 @@ fn citation_occurrences() -> Vec<Occurrence> {
     let mut out = Vec::new();
     for doc in DESIGN_ARTEFACTS {
         let text = read(doc);
+        // `paragraph_of[i]` is every line of the paragraph line `i`
+        // belongs to, joined. A paragraph is a run of non-blank lines.
+        let lines: Vec<&str> = text.lines().collect();
+        let mut paragraph_of: Vec<String> = vec![String::new(); lines.len()];
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                i += 1;
+            }
+            let joined = lines[start..i].join(" ");
+            for slot in paragraph_of.iter_mut().take(i).skip(start) {
+                slot.clone_from(&joined);
+            }
+        }
+        // The last file a written-out citation named in the CURRENT
+        // paragraph. A blank line ends a paragraph and clears it: a
+        // continuation never reaches back past one.
+        let mut paragraph_last: Option<String> = None;
         for (doc_line, line) in text.lines().enumerate() {
+            let para = paragraph_of[doc_line].clone();
             let doc_line = doc_line as u32 + 1;
+            if line.trim().is_empty() {
+                paragraph_last = None;
+            }
             let bytes = line.as_bytes();
             // `(byte offset of the citation, the file part of its
             // token)`, in the order they occur, so a continuation can be
@@ -789,6 +858,8 @@ fn citation_occurrences() -> Vec<Occurrence> {
                         last: last.parse().expect("digits"),
                         citing_line: line.to_string(),
                         form: CitationForm::WrittenOut,
+                        same_line_antecedent: true,
+                        citing_paragraph: para.clone(),
                     });
                 }
                 i = (dot + 4).max(j);
@@ -797,8 +868,19 @@ fn citation_occurrences() -> Vec<Occurrence> {
             // increasing offset order, so the nearest citation before a
             // continuation is the last entry whose offset is smaller.
             for (at, first, last) in continuations(line) {
-                let Some((_, path)) = written_out.iter().rev().find(|(o, _)| *o < at) else {
-                    continue;
+                let same_line = written_out.iter().rev().find(|(o, _)| *o < at);
+                let same_line_antecedent = same_line.is_some();
+                let path = match same_line {
+                    Some((_, p)) => p.clone(),
+                    // The antecedent is on an earlier line of the same
+                    // paragraph. Without this a citation written as
+                    // "`x.rs:10` asserts … and `:20` the same for y"
+                    // across a line break was invisible to every check
+                    // below.
+                    None => match &paragraph_last {
+                        Some(p) => p.clone(),
+                        None => continue,
+                    },
                 };
                 let token = if first == last {
                     format!("{path}:{first}")
@@ -813,7 +895,12 @@ fn citation_occurrences() -> Vec<Occurrence> {
                     last,
                     citing_line: line.to_string(),
                     form: CitationForm::Continuation,
+                    same_line_antecedent,
+                    citing_paragraph: para.clone(),
                 });
+            }
+            if let Some((_, p)) = written_out.last() {
+                paragraph_last = Some(p.clone());
             }
         }
     }
@@ -895,6 +982,18 @@ enum Resolution {
     /// it is frozen with this reason rather than silently taking
     /// whichever occurrence came first.
     OccurrencesDisagree,
+    /// It resolves, and the cited range carries **no identifier at all**
+    /// — only punctuation or a bare comment marker such as `}`, `///` or
+    /// `//!`.
+    ///
+    /// Round 3 of issue #494's code review: a `line` anchor is a
+    /// snapshot of whatever text the cited range holds, so a stale
+    /// citation is frozen as its own evidence and passes forever. Most
+    /// of that class cannot be separated mechanically from a correct
+    /// citation, but this part can: a line with no identifier on it is
+    /// nothing a sentence can be citing, and every row this refused when
+    /// it was added was a citation whose target had moved.
+    TargetLineHasNoIdentifier,
 }
 
 impl Resolution {
@@ -907,6 +1006,7 @@ impl Resolution {
             Resolution::BlankTargetLine => Some("blank_target_line"),
             Resolution::AmbiguousBasename => Some("ambiguous_basename"),
             Resolution::OccurrencesDisagree => Some("occurrences_disagree"),
+            Resolution::TargetLineHasNoIdentifier => Some("target_line_has_no_identifier"),
         }
     }
 }
@@ -993,6 +1093,53 @@ fn needles(token: &str) -> BTreeSet<String> {
     out
 }
 
+/// The most distinctive name in a cited range: the longest run of
+/// `[A-Za-z0-9_]` in it, preferring one that carries a letter or an
+/// underscore over a bare number, ties broken alphabetically so the
+/// choice does not move.
+///
+/// **What it is for.** Round 4 of issue #494's code review repointed a
+/// citation to an unrelated line that happened to carry an identifier,
+/// regenerated the dataset, and every check stayed green with the two
+/// anchor counts unmoved: the snapshot anchor is regenerated from
+/// whatever the citation now names, so the record certified its own
+/// input. Recording the NAME as well as the line number does not make
+/// that fail — no rule here can, and the measurement for why is in
+/// [`audit_citation_forms`] — but it makes it **visible**: repointing
+/// changes a short name in a committed dataset, which a diff shows and a
+/// hundred-character line snapshot does not.
+fn target_symbol(body: &str) -> String {
+    let mut best: Option<String> = None;
+    let mut best_worded: Option<String> = None;
+    let mut cur = String::new();
+    let flush = |cur: &mut String, best: &mut Option<String>, worded: &mut Option<String>| {
+        if cur.is_empty() {
+            return;
+        }
+        let worded_now = cur.chars().any(|c| c.is_ascii_alphabetic() || c == '_');
+        let better = |slot: &Option<String>, t: &str| match slot {
+            None => true,
+            Some(s) => (t.len(), t) > (s.len(), s.as_str()),
+        };
+        if better(best, cur) {
+            *best = Some(cur.clone());
+        }
+        if worded_now && better(worded, cur) {
+            *worded = Some(cur.clone());
+        }
+        cur.clear();
+    };
+    for c in body.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            flush(&mut cur, &mut best, &mut best_worded);
+        }
+    }
+    flush(&mut cur, &mut best, &mut best_worded);
+    best_worded.or(best).unwrap_or_default()
+}
+
 /// The backticked tokens on one line.
 fn backticked(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1065,8 +1212,11 @@ fn resolve_citation(occ: &Occurrence, tracked: &[String]) -> Resolution {
     match picked {
         None => Resolution::AmbiguousBasename,
         Some(p) => {
-            if ws(&range_of(&p)).is_empty() {
+            let body = range_of(&p);
+            if ws(&body).is_empty() {
                 Resolution::BlankTargetLine
+            } else if !body.chars().any(|c| c.is_ascii_alphanumeric() || c == '_') {
+                Resolution::TargetLineHasNoIdentifier
             } else {
                 Resolution::To(p)
             }
@@ -1114,6 +1264,16 @@ fn every_design_record_citation_still_points_at_what_it_names() {
             row.path,
             row.line,
             row.anchor
+        );
+        assert!(
+            !row.symbol.is_empty() && body.contains(&row.symbol),
+            "{}:{} does not carry the name the dataset records for it, {:?}. The name is \
+             the most distinctive identifier at the cited range; a citation that has been \
+             repointed carries a different one, which is what the diff of this dataset \
+             shows",
+            row.path,
+            row.line,
+            row.symbol
         );
         match row.kind {
             AnchorKind::Prose => prose += 1,
@@ -1527,7 +1687,8 @@ fn regenerate_the_citation_datasets() {
             (k.clone(), (v, occ))
         })
         .collect();
-    let mut resolved = String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor\n");
+    let mut resolved =
+        String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tsymbol\tanchor\n");
     let mut frozen = String::from("doc\ttoken\treason\n");
     for ((doc, token), (r, occ)) in &verdict {
         match r {
@@ -1564,8 +1725,9 @@ fn regenerate_the_citation_datasets() {
                 } else {
                     occ.last.to_string()
                 };
+                let symbol = target_symbol(&body);
                 resolved.push_str(&format!(
-                    "{doc}\t{token}\t{path}\t{}\t{end}\t{kind}\t{anchor}\n",
+                    "{doc}\t{token}\t{path}\t{}\t{end}\t{kind}\t{symbol}\t{anchor}\n",
                     occ.first
                 ));
             }
@@ -1891,6 +2053,10 @@ fn census_block() -> String {
         .iter()
         .filter(|o| o.form == CitationForm::Continuation)
         .count();
+    let cross_line = occurrences
+        .iter()
+        .filter(|o| o.form == CitationForm::Continuation && !o.same_line_antecedent)
+        .count();
     let covered = |keys: &BTreeSet<(String, String)>| {
         occurrences
             .iter()
@@ -1911,8 +2077,12 @@ fn census_block() -> String {
         ),
         ("of those, citing a bare basename", bare),
         (
-            "of those, written as a continuation of a citation earlier on the line",
+            "of those, written as a continuation of a citation earlier in the paragraph",
             continuations,
+        ),
+        (
+            "of those continuations, on a later line than the citation they continue",
+            cross_line,
         ),
         (
             "`(document, token)` pairs the rule resolves",
@@ -2742,4 +2912,102 @@ fn every_cross_document_line_citation_names_the_line_it_quotes() {
         "cross-document line citations that no longer name what they quote:\n  {}",
         wrong.join("\n  ")
     );
+}
+
+// ---------------------------------------------------------------------
+// Round 3 of issue #494's code review: the sizing measurement behind the
+// two rules added below. Ignored — it prints, it does not assert.
+// ---------------------------------------------------------------------
+
+/// Counts the citation forms, where each one's antecedent is found, and
+/// what kind of anchor each resolved row would carry.
+///
+/// ```text
+/// cargo test -p pulsus-read --test design_record_drift_gate -- \
+///   --ignored audit_citation_forms --nocapture
+/// ```
+#[test]
+#[ignore = "prints a census; asserts nothing"]
+fn audit_citation_forms() {
+    let tracked = tracked_rust_files();
+    let occ = citation_occurrences();
+    let mut written = 0usize;
+    let mut cont_same = 0usize;
+    let mut cont_cross = 0usize;
+    for o in &occ {
+        match o.form {
+            CitationForm::WrittenOut => written += 1,
+            CitationForm::Continuation => {
+                if o.same_line_antecedent {
+                    cont_same += 1
+                } else {
+                    cont_cross += 1
+                }
+            }
+        }
+    }
+    println!(
+        "occurrences={} written_out={written} continuation_same_line={cont_same} continuation_cross_line={cont_cross}",
+        occ.len()
+    );
+
+    let by_key = resolutions_by_key(&occ, &tracked);
+    // The two anchor counts come from the COMMITTED dataset, which is
+    // what the census renders. An earlier version of this audit
+    // recomputed them here and printed 168/225 against the census's
+    // 178/215, because it counted over every occurrence of a token where
+    // the regeneration counts over the one that resolved. A second
+    // implementation of a rule beside the rule is what this file exists
+    // to catch.
+    let rows = citation_rows();
+    let prose = rows.iter().filter(|r| r.kind == AnchorKind::Prose).count();
+    let line_kind = rows.iter().filter(|r| r.kind == AnchorKind::Line).count();
+    let mut no_para = 0usize;
+    let mut contentless: Vec<String> = Vec::new();
+    let mut cont_line_kind: Vec<String> = Vec::new();
+    for ((doc, token), group) in &by_key {
+        let v = key_verdict(&group.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+        let Resolution::To(path) = &v else { continue };
+        let o = &group[0].0;
+        let body: String = read(path)
+            .lines()
+            .skip(o.first as usize - 1)
+            .take((o.last - o.first + 1) as usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = ws(&body);
+
+        let has_para = group.iter().any(|(o, _)| {
+            backticked(&o.citing_paragraph)
+                .iter()
+                .flat_map(|t| needles(t))
+                .any(|n| body.contains(n.as_str()))
+        });
+        if !body.chars().any(|c| c.is_ascii_alphanumeric() || c == '_') {
+            contentless.push(format!("{doc}\t{token}\t{body}"));
+        }
+        if !has_para {
+            no_para += 1;
+            if group
+                .iter()
+                .any(|(o, _)| o.form == CitationForm::Continuation)
+            {
+                cont_line_kind.push(format!("{doc}\t{token}\t{body}"));
+            }
+        }
+    }
+    println!(
+        "resolved_prose={prose} resolved_line={line_kind} no_paragraph_corroboration={no_para}"
+    );
+    println!(
+        "continuation_rows_with_no_paragraph_corroboration={}",
+        cont_line_kind.len()
+    );
+    println!(
+        "rows_whose_target_line_carries_no_identifier={}",
+        contentless.len()
+    );
+    for s in &contentless {
+        println!("  CONTENTLESS {s}");
+    }
 }

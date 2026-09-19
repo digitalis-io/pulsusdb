@@ -1751,6 +1751,80 @@ mod tests {
         assert!(static_tmpl(23).contains("INTERVAL {{retention_days}} DAY DELETE"));
     }
 
+    /// Issue #494, criterion 2: the three sample tables stay **plain**
+    /// `MergeTree`.
+    ///
+    /// The engine route to duplicate suppression was ruled out on two
+    /// measured grounds, and this test is what stops it being reintroduced
+    /// by an edit nobody notices:
+    ///
+    /// 1. `log_metrics_<res>` is an `AggregatingMergeTree` fed by a
+    ///    materialized view over `log_samples`. A duplicate INSERT fires the
+    ///    view and adds to the bucket; collapsing the source row afterwards
+    ///    never subtracts from that sum, so `count_over_time` would stay
+    ///    doubled whatever the engine did.
+    /// 2. Neither sort key identifies a duplicate — `body` sits outside
+    ///    `log_samples`' key and `value` outside `metric_samples`' — so
+    ///    collapsing on those keys would delete distinct rows.
+    ///
+    /// Asserted on the template each table actually ships, not on a
+    /// constant: an engine changed in the catalog changes this string.
+    #[test]
+    fn the_sample_tables_stay_plain_merge_tree() {
+        for (id, table, order_by) in [
+            (
+                5u32,
+                "metric_samples",
+                "ORDER BY (metric_name, fingerprint, unix_milli)",
+            ),
+            (
+                8,
+                "log_samples",
+                "ORDER BY (service, fingerprint, timestamp_ns)",
+            ),
+            (
+                23,
+                "metric_hist_samples",
+                "ORDER BY (metric_name, fingerprint, unix_milli)",
+            ),
+        ] {
+            let ddl = static_tmpl(id);
+            assert!(
+                ddl.contains(&format!("CREATE TABLE IF NOT EXISTS {{{{db}}}}.{table}")),
+                "migration {id} must be {table}'s CREATE"
+            );
+            assert!(
+                ddl.contains("ENGINE = MergeTree\n"),
+                "{table} must stay a plain MergeTree: a Replacing/Collapsing \
+                 engine cannot repair the rollup and would delete distinct \
+                 rows on these keys (issue #494)"
+            );
+            for engine in [
+                "ReplacingMergeTree",
+                "CollapsingMergeTree",
+                "VersionedCollapsingMergeTree",
+                "AggregatingMergeTree",
+                "SummingMergeTree",
+            ] {
+                assert!(
+                    !ddl.contains(engine),
+                    "{table} must not be a {engine} (issue #494)"
+                );
+            }
+            assert!(
+                ddl.contains(order_by),
+                "{table}'s sort key is the one the engine ruling was measured \
+                 against"
+            );
+        }
+        // The value column each engine route would have had to collapse on
+        // is outside its table's sort key — ground (b) of the ruling.
+        assert!(static_tmpl(8).contains("body          String"));
+        assert!(!static_tmpl(8).contains("ORDER BY (service, fingerprint, timestamp_ns, body)"));
+        assert!(static_tmpl(5).contains("value        Float64"));
+        assert!(!static_tmpl(5).contains("ORDER BY (metric_name, fingerprint, unix_milli, value)"));
+    }
+
     /// Issue #113: the `metric_hist_samples` `_dist` wrapper (id 24) carries
     /// the Metrics family, so `dist_ddl_template` renders the byte-identical
     /// `cityHash64(metric_name, fingerprint)` co-shard expression it shares

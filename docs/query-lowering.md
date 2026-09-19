@@ -598,7 +598,7 @@ greedy lowering costs more than one generator's read. §2.7.5 gives the argument
 with the two measurements that looked like counterexamples and are not, and what would falsify it.
 
 **LogQL's paging belongs to LogQL's own compiler, not to the core.** LogQL's `fetch_until_limit`
-keyset paging (`crates/pulsus-read/src/logql/plan.rs:1658`, field at `:80`) means compiling a
+keyset paging (`crates/pulsus-read/src/logql/plan.rs:1658`, field at `:83`) means compiling a
 dropping stage changes the *paging strategy*, not only the byte count — and what decides that is
 whether the compiled predicate is **equivalent** to the stage or merely **wider** than it. LogQL's
 compiler is separate and is not to be merged into the core (owner decision, #507); it decides this
@@ -1205,8 +1205,8 @@ are rejected whole rather than by payload and are already "not in the chain" bel
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
-`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1074`, whose rule is
-`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1071` to `:1074`. **An unreachability
+`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1887`, whose rule is
+`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1884` to `:1886`. **An unreachability
 claim is a universal over inputs**, so each of the four was re-checked by constructing the input
 that would defeat it rather than by reading the lexer: three spellings each for the regex-operator,
 `count()`-with-field and one-arity-without-field rows, and ten for the numeric threshold, including
@@ -1223,7 +1223,7 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `AggValues(i)` (synthesised, `:175`) | any → same shape | **lowers** (`Yes`, `Fidelity::Equivalent`) since [#558](https://github.com/digitalis-io/pulsusdb/issues/558) — `i` indexes `SearchPlan::agg_fields`, and the operand's number and stored kind are a projected slot on the hydration statement rather than a read of their own | **none — the identity** | always lowers | *none* — it reads no source of its own, so the core sees no handoff |
 | `SelectValues(i)` (synthesised, `:178`) | any → same shape | **lowers** (`Yes`, `Fidelity::Equivalent`) since #558 — `i` indexes `SearchPlan::select_attrs`, and the field's byte-capped value and stored kind are a projected slot on the same statement. It is a separate link from `AggValues` because a `by()` key is interned into both vectors and each gets its own slot | **none — the identity** | always lowers | *none* |
 | `EventSet(i)` (synthesised, `:181`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::event_sets`: one span-event / span-link value-set batch read, which `arrayJoin` expands one row per value and so cannot be a column | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_spans` (event sets), key `trace_id`, `SeedBound::Config` |
-| `TraceCtx` (synthesised, `:183`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
+| `TraceCtx` (synthesised, `:197`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
 | `ChildCount` (synthesised, `:185`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, same reason: `span:childCount` is counted over the whole trace, not over the window | **none — the identity** | never lowers, in any state | **`Cut::SourceHandoff`** — source `trace_spans` (child counts), key `trace_id`, `SeedBound::Config` |
 | `Structural` (synthesised, `:187`) | any → same shape | **`Never(StructuralRelation)`** — the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it | **clears `exact`** — the generators are the superset union of both operands' sets and the relation is applied afterwards, so the SQL means strictly more than the query | never lowers, in any state | *none* — the link reads no new source, so there is no handoff and no second part |
 | `NestedSet` (synthesised, `:189`) | any → same shape | **`Never(NestedSetNumbering)`** — a modified-preorder numbering computed per trace at query time; no stored column carries it | **clears `exact`** | never lowers, in any state | *none* — same reason |
@@ -2504,8 +2504,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2106` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2152` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2180` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2231` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -3152,7 +3152,7 @@ Same answers on both tables — 1,666,667 and 10,000 matching rows — at 722x a
 So this is a second copy of the attribute rows, not a re-ordering of the existing one.
 
 **The budget it needs alongside.** `reader.traceql_scan_budget_rows`, raised from 50,000,000
-(`crates/pulsus-config/src/model.rs:557`) to cover the window's attribute rows; **200,000,000** was
+(`crates/pulsus-config/src/model.rs:578`) to cover the window's attribute rows; **200,000,000** was
 measured. Without it every one of the five classes returns
 `Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
 current rows: …` — the trailing figure is where the read had got when the limit tripped and varies
@@ -4958,7 +4958,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 
 Wave 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:168`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:391`) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **wave 1** at base, none of them there then; all six exist today
@@ -4968,8 +4968,8 @@ to be that argument as tests: the model must reproduce **each** walk, not just t
 measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
-(`crates/pulsus-read/src/logql/plan.rs:3763`) and `has_unpushed_dropping_stage` (`:1685`) and
-`metric_pipeline_construct` (`:1698`) are private — an integration test cannot call any of them.
+(`crates/pulsus-read/src/logql/plan.rs:3763`) and `has_unpushed_dropping_stage` (`:1688`) and
+`metric_pipeline_construct` (`:1722`) are private — an integration test cannot call any of them.
 **They go in `plan.rs`'s existing `mod tests` (`plan.rs:4243`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
 directly, and again through its `use super::*` (`plan.rs:4500`). An earlier version of this section
@@ -5362,7 +5362,7 @@ and left the check to be run by hand. **That claim was false.** The workspace al
 the form this repository uses for exactly this purpose: rustdoc `compile_fail` fences, in
 `crates/pulsus-read/src/logql/predicate.rs` (`:257`, `:295`, `:332`, `:373`) and
 `crates/pulsus-read/src/logql/sql.rs` (`:453`, `:467`), with a module doc that sets the bar for them
-— *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:92`) — and a measured
+— *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:93`) — and a measured
 caveat that the annotated error code is not checked at all (`predicate.rs:87-91`, issue #286).
 Doctests are not run by `nextest`; CI runs them separately as `cargo test --workspace --doc`
 (`.github/workflows/ci.yml:126`, whose own comment says *"nextest never runs doctests"*). Re-run on
@@ -5518,20 +5518,21 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 690 |
-| of those, citing a bare basename | 538 |
-| of those, written as a continuation of a citation earlier on the line | 44 |
-| `(document, token)` pairs the rule resolves | 362 |
-| occurrences those resolved pairs cover | 503 |
-| `(document, token)` pairs it cannot resolve | 100 |
-| occurrences those frozen pairs cover | 187 |
-| resolved rows anchored on a token the citing prose prints | 171 |
-| resolved rows anchored on a snapshot of the cited line | 191 |
+| citation occurrences in the five artefacts | 723 |
+| of those, citing a bare basename | 550 |
+| of those, written as a continuation of a citation earlier in the paragraph | 77 |
+| of those continuations, on a later line than the citation they continue | 33 |
+| `(document, token)` pairs the rule resolves | 393 |
+| occurrences those resolved pairs cover | 534 |
+| `(document, token)` pairs it cannot resolve | 101 |
+| occurrences those frozen pairs cover | 189 |
+| resolved rows anchored on a token the citing prose prints | 178 |
+| resolved rows anchored on a snapshot of the cited line | 215 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 92 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 6 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `ambiguous_basename` | 94 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 5 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
 | the reviewed verdict on a fallback disagreement | cases |
@@ -5545,7 +5546,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 690 citation occurrences the five artefacts make, 538 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 503 occurrences, and cannot resolve 100 covering 187. Of the resolved rows, 171 are anchored on a token the citing prose prints and 191 on a snapshot of the cited line.
+Of the 723 citation occurrences the five artefacts make, 550 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 393 `(document, token)` pairs covering 534 occurrences, and cannot resolve 101 covering 189. Of the resolved rows, 178 are anchored on a token the citing prose prints and 215 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

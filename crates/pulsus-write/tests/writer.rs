@@ -5,6 +5,7 @@
 //! [`BlockInserter`] — no real ClickHouse (architect plan: "no real
 //! ClickHouse in unit tests").
 
+use pulsus_write::PushHeaders;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +16,7 @@ use pulsus_clickhouse::{ChError, ChRow};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_write::writer::{BlockInserter, LogSampleRow, LogWriter};
-use pulsus_write::{Backpressure, LogRow, LogSink, ParsedLogs, StreamRow};
+use pulsus_write::{AdmitRefusal, LogRow, LogSink, ParsedLogs, StreamRow};
 
 /// Scriptable mock [`BlockInserter`]: every call is recorded (row count),
 /// and its outcome is whatever [`MockInserter::new`]/[`MockInserter::
@@ -258,9 +259,14 @@ async fn concurrent_admit_never_exceeds_the_queue_bytes_limit() {
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..admits {
         let writer = writer.clone();
-        tasks.spawn(async move { writer.admit(batch_for(u128::from(i), "svc", 0, false)) });
+        tasks.spawn(async move {
+            writer.admit(
+                batch_for(u128::from(i), "svc", 0, false),
+                PushHeaders::default(),
+            )
+        });
     }
-    let results: Vec<Result<(), Backpressure>> = tasks.join_all().await;
+    let results: Vec<Result<(), AdmitRefusal>> = tasks.join_all().await;
 
     let ok_count = results.iter().filter(|r| r.is_ok()).count() as u64;
     let backpressure_count = results.iter().filter(|r| r.is_err()).count() as u64;
@@ -295,7 +301,10 @@ async fn sync_admit_flush_resolves_err_when_streams_flush_fails_even_though_samp
     let writer = writer_with(cfg, samples.clone(), streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(1, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(1, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -324,7 +333,10 @@ async fn sync_admit_flush_resolves_err_and_spools_uncertain_on_insert_uncertain(
     let writer = writer_with(cfg, samples, streams);
 
     let wait = writer
-        .admit_flush(batch_for(2, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(2, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -355,10 +367,21 @@ async fn duplicate_admit_race_before_the_first_stream_flush_settles_is_harmless(
     // the flush task cannot have run — both land in the same still-open
     // generation, exactly the "before the first flush settles" race.
     writer
-        .admit(batch_for(7, "svc", 1_700_000_000_000_000_000, true))
+        .admit(
+            batch_for(7, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(7, "svc", 1_700_000_000_000_000_000, true))
+        .admit(
+            batch_for(7, "svc", 1_700_000_000_000_000_001, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     assert_eq!(
@@ -401,7 +424,10 @@ async fn shutdown_settles_inflight_waiters() {
     let writer = writer_with(cfg, samples, streams);
 
     let wait = writer
-        .admit_flush(batch_for(9, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(9, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     // Shutdown before anything has flushed: the flush tasks have not even
@@ -440,8 +466,8 @@ async fn admission_is_rejected_once_shutdown_has_begun() {
 
     writer.shutdown(Duration::from_secs(1)).await;
 
-    let result = writer.admit(batch_for(1, "svc", 0, false));
-    assert_eq!(result, Err(Backpressure));
+    let result = writer.admit(batch_for(1, "svc", 0, false), PushHeaders::default());
+    assert_eq!(result, Err(AdmitRefusal::Backpressure));
 }
 
 /// Required test (architect plan amendment 3, code-review FAIL finding
@@ -463,7 +489,10 @@ async fn shutdown_force_settles_a_normal_path_flush_already_in_progress() {
     let writer = writer_with(cfg, samples.clone(), streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(11, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(11, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     // Wait until the normal-path flush task has actually entered the
@@ -524,7 +553,7 @@ async fn retryable_pre_send_failure_resends_the_whole_batch_before_succeeding() 
     let writer = writer_with(cfg, samples.clone(), streams);
 
     let wait = writer
-        .admit_flush(batch_for(42, "svc", 0, false))
+        .admit_flush(batch_for(42, "svc", 0, false), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -562,7 +591,10 @@ async fn age_trigger_flushes_both_tables_after_batch_ms_even_below_the_size_thre
     let writer = writer_with(cfg, samples.clone(), streams.clone());
 
     writer
-        .admit(batch_for(5, "svc", 1_700_000_000_000_000_000, true))
+        .admit(
+            batch_for(5, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     for _ in 0..200 {
@@ -614,13 +646,13 @@ async fn retryable_pre_send_failure_resends_the_whole_multi_row_batch_before_suc
     // the flush task. The last call uses `admit_flush` so the test gets a
     // waiter for the generation carrying all three rows.
     writer
-        .admit(batch_for(101, "svc", 0, false))
+        .admit(batch_for(101, "svc", 0, false), PushHeaders::default())
         .expect("queue has room");
     writer
-        .admit(batch_for(102, "svc", 0, false))
+        .admit(batch_for(102, "svc", 0, false), PushHeaders::default())
         .expect("queue has room");
     let wait = writer
-        .admit_flush(batch_for(103, "svc", 0, false))
+        .admit_flush(batch_for(103, "svc", 0, false), PushHeaders::default())
         .expect("queue has room");
 
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
@@ -664,7 +696,10 @@ async fn post_flush_admit_of_the_same_stream_key_is_suppressed_by_the_lru() {
     // success-only LRU promotion hook runs (inside `finish_generation`)
     // strictly before this wait resolves.
     let wait = writer
-        .admit_flush(batch_for(21, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(21, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -680,8 +715,16 @@ async fn post_flush_admit_of_the_same_stream_key_is_suppressed_by_the_lru() {
 
     // Second admit: the identical `(fingerprint, month)` key, now
     // durably known via the confirmed-flush LRU promotion.
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(21, "svc", 1_700_000_000_000_000_000, true))
+        .admit(
+            batch_for(21, "svc", 1_700_000_000_000_000_001, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     let metrics = writer.metrics();
@@ -739,7 +782,10 @@ async fn backfill_reinserts_a_failed_stream_registration_until_durable() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(31, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(31, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -792,7 +838,10 @@ async fn backfill_heal_promotes_the_stream_lru() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(32, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(32, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -807,8 +856,16 @@ async fn backfill_heal_promotes_the_stream_lru() {
 
     // Re-admit the identical `(fingerprint, month)`: promoted by the
     // confirmed heal, it must hit the LRU — no new StreamRow.
+    // The second admission's timestamp differs by one nanosecond (issue
+    // #494). The stream key is `(fingerprint, month)`, so a nanosecond does
+    // not change it — but it does make this a different PUSH, which the
+    // suppression index would otherwise answer with the first push's
+    // outcome instead of admitting.
     writer
-        .admit(batch_for(32, "svc", 1_700_000_000_000_000_000, true))
+        .admit(
+            batch_for(32, "svc", 1_700_000_000_000_000_001, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     let metrics = writer.metrics();
@@ -835,7 +892,10 @@ async fn uncertain_generation_failure_is_never_enqueued_or_replayed() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(33, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(33, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -868,7 +928,10 @@ async fn uncertain_backfill_outcome_is_terminally_abandoned_never_retried() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(34, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(34, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -915,7 +978,10 @@ async fn deterministic_backfill_failure_abandons_without_spinning() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(35, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(35, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1050,7 +1116,7 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_success(
 
     let t1 = 1_700_000_000_000_000_000i64;
     let wait = writer
-        .admit_flush(batch_for(41, "svc", t1, true))
+        .admit_flush(batch_for(41, "svc", t1, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1067,7 +1133,7 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_success(
     // While it is in flight: a newer Poisoned flush for the SAME key
     // (same fingerprint/month, larger updated_ns) replaces the entry.
     let wait = writer
-        .admit_flush(batch_for(41, "svc", t1 + 1, true))
+        .admit_flush(batch_for(41, "svc", t1 + 1, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1128,7 +1194,7 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_failure(
 
     let t1 = 1_700_000_000_000_000_000i64;
     let wait = writer
-        .admit_flush(batch_for(42, "svc", t1, true))
+        .admit_flush(batch_for(42, "svc", t1, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1141,7 +1207,7 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_failure(
     .await;
 
     let wait = writer
-        .admit_flush(batch_for(42, "svc", t1 + 1, true))
+        .admit_flush(batch_for(42, "svc", t1 + 1, true), PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1186,7 +1252,10 @@ async fn shutdown_completes_with_a_hanging_backfill_insert_in_flight() {
     let writer = writer_with(cfg, samples, streams.clone());
 
     let wait = writer
-        .admit_flush(batch_for(36, "svc", 1_700_000_000_000_000_000, true))
+        .admit_flush(
+            batch_for(36, "svc", 1_700_000_000_000_000_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -1259,12 +1328,10 @@ async fn kill_switch_off_appends_no_pattern_rows() {
     let writer = LogWriter::with_inserters(samples.clone(), streams, patterns.clone(), &cfg);
 
     writer
-        .admit(pattern_batch(
-            1,
-            "svc",
-            0,
-            &["user 1 login", "user 2 login"],
-        ))
+        .admit(
+            pattern_batch(1, "svc", 0, &["user 1 login", "user 2 login"]),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1297,12 +1364,15 @@ async fn identical_lines_aggregate_to_one_summed_pattern_row_and_balance_queue_b
     let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
 
     writer
-        .admit(pattern_batch(
-            7,
-            "svc",
-            0,
-            &["user 1 login", "user 2 login", "user 3 login"],
-        ))
+        .admit(
+            pattern_batch(
+                7,
+                "svc",
+                0,
+                &["user 1 login", "user 2 login", "user 3 login"],
+            ),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1338,7 +1408,7 @@ async fn all_distinct_template_batch_balances_queue_bytes_to_zero() {
         .collect();
     let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
     writer
-        .admit(pattern_batch(9, "svc", 0, &refs))
+        .admit(pattern_batch(9, "svc", 0, &refs), PushHeaders::default())
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1368,7 +1438,10 @@ async fn patterns_flush_failure_does_not_fail_admit_flush() {
     let writer = writer_with_patterns(cfg, samples, streams, patterns);
 
     let wait = writer
-        .admit_flush(pattern_batch(1, "svc", 0, &["user 1 login"]))
+        .admit_flush(
+            pattern_batch(1, "svc", 0, &["user 1 login"]),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1396,12 +1469,15 @@ async fn patterns_pre_send_retry_then_success_is_exactly_once() {
     let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
 
     writer
-        .admit(pattern_batch(
-            7,
-            "svc",
-            0,
-            &["user 1 login", "user 2 login", "user 3 login"],
-        ))
+        .admit(
+            pattern_batch(
+                7,
+                "svc",
+                0,
+                &["user 1 login", "user 2 login", "user 3 login"],
+            ),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(5)).await;
 
@@ -1437,7 +1513,10 @@ async fn patterns_uncertain_flush_is_spooled_never_replayed() {
     let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
 
     writer
-        .admit(pattern_batch(1, "svc", 0, &["user 1 login"]))
+        .admit(
+            pattern_batch(1, "svc", 0, &["user 1 login"]),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(2)).await;
 
