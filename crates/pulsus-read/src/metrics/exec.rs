@@ -33,7 +33,7 @@
 //! per-chunk explain entries would be O(chunks) noise for no new
 //! information).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 use futures::future::{join, join_all};
@@ -2425,6 +2425,45 @@ macro_rules! same_stored_histogram {
     };
 }
 
+/// The 128-bit digest behind [`HistPoint::identity`], over the same
+/// columns [`same_stored_histogram`] compares and in the same order.
+/// Floats enter as `to_bits()`, so `0.0` and `-0.0` digest differently
+/// exactly as they compare differently.
+macro_rules! stored_histogram_identity {
+    ($h:expr) => {{
+        use xxhash_rust::xxh3::Xxh3;
+        let mut d = Xxh3::new();
+        d.update(&($h.schema as i64).to_le_bytes());
+        d.update(&$h.zero_threshold.to_bits().to_le_bytes());
+        d.update(&$h.zero_count.to_le_bytes());
+        d.update(&$h.count.to_le_bytes());
+        d.update(&$h.sum.to_bits().to_le_bytes());
+        d.update(&[$h.counter_reset_hint]);
+        for v in &$h.pos_span_offsets {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.pos_span_lengths {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.pos_bucket_deltas {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_span_offsets {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_span_lengths {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_bucket_deltas {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.custom_values {
+            d.update(&v.to_bits().to_le_bytes());
+        }
+        d.digest128()
+    }};
+}
+
 trait HistPoint {
     fn unix_milli(&self) -> i64;
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError>;
@@ -2434,6 +2473,11 @@ trait HistPoint {
     /// that decode to equal histograms from different stored columns are
     /// two samples.
     fn same_stored_value(&self, other: &Self) -> bool;
+    /// A 128-bit digest of the same stored columns, so a long run can be
+    /// indexed instead of scanned. Equal values digest equally; unequal
+    /// ones are verified with [`Self::same_stored_value`] on a hit, so the
+    /// digest is an index and never the decision.
+    fn identity(&self) -> u128;
 }
 
 impl FloatPoint for SampleRow {
@@ -2464,6 +2508,9 @@ impl HistPoint for HistSampleRow {
     fn same_stored_value(&self, other: &Self) -> bool {
         same_stored_histogram!(self, other)
     }
+    fn identity(&self) -> u128 {
+        stored_histogram_identity!(self)
+    }
 }
 
 impl HistPoint for MultiHistSampleRow {
@@ -2475,6 +2522,9 @@ impl HistPoint for MultiHistSampleRow {
     }
     fn same_stored_value(&self, other: &Self) -> bool {
         same_stored_histogram!(self, other)
+    }
+    fn identity(&self) -> u128 {
+        stored_histogram_identity!(self)
     }
 }
 
@@ -2504,8 +2554,32 @@ fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
     t_ms: i64,
     floats: &[F],
     hists: &[H],
+    run: &mut RunDedup,
 ) -> Result<(), ReadError> {
     if !hists.is_empty() {
+        emit_histogram_run(out, t_ms, hists)?;
+        return Ok(());
+    }
+    for f in floats {
+        run.push_float(out, t_ms, f.value());
+    }
+    Ok(())
+}
+
+/// One timestamp run's histograms: each distinct stored value once, in
+/// arrival order.
+///
+/// Linear while the run is short, which is every run a well-formed store
+/// produces — one histogram per `(series, millisecond)` is the invariant.
+/// Past that the run indexes by a 128-bit digest of the stored columns and
+/// **verifies structurally on a hit**, so a digest collision cannot drop a
+/// sample the client sent; it can only cost one extra comparison.
+fn emit_histogram_run<H: HistPoint>(
+    out: &mut Vec<Sample>,
+    t_ms: i64,
+    hists: &[H],
+) -> Result<(), ReadError> {
+    if hists.len() <= RUN_LINEAR_MAX {
         for (k, h) in hists.iter().enumerate() {
             if hists[..k].iter().any(|prev| prev.same_stored_value(h)) {
                 continue;
@@ -2514,34 +2588,87 @@ fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
         }
         return Ok(());
     }
-    for (k, f) in floats.iter().enumerate() {
-        let bits = f.value().to_bits();
-        if floats[..k]
-            .iter()
-            .any(|prev| prev.value().to_bits() == bits)
-        {
+    let mut by_identity: HashMap<u128, Vec<usize>> = HashMap::new();
+    for (k, h) in hists.iter().enumerate() {
+        let identity = h.identity();
+        let seen = by_identity.entry(identity).or_default();
+        if seen.iter().any(|&j| hists[j].same_stored_value(h)) {
             continue;
         }
-        out.push(Sample::float(t_ms, f.value()));
+        seen.push(k);
+        out.push(Sample::hist(t_ms, h.decode()?));
     }
     Ok(())
 }
 
-/// Appends one float to a series' samples under [`emit_timestamp_run`]'s
-/// rule, for the float-only read paths that have no histogram stream to
-/// merge. The scan walks back only over the run already at the tail, which
-/// is one element in the ordinary case.
-fn push_float_in_run(samples: &mut Vec<Sample>, t_ms: i64, value: f64) {
-    let bits = value.to_bits();
-    for existing in samples.iter().rev() {
-        if existing.t_ms != t_ms {
-            break;
+/// How many samples a timestamp run may hold before [`RunDedup`] stops
+/// scanning the run it has already emitted and indexes it instead.
+///
+/// A run is one sample long in the ordinary case, so the scan is one
+/// comparison and a set would be pure overhead. The threshold is what
+/// keeps that true while bounding the pathological case: round 2 of this
+/// issue's code review measured the unbounded scan at `49,995,000`
+/// comparisons for ten thousand samples at one millisecond and
+/// `199,990,000` for twenty thousand — four times the work for twice the
+/// input, on a read path that is not allowed to regress.
+const RUN_LINEAR_MAX: usize = 8;
+
+/// First-seen-order deduplication inside ONE timestamp run, shared by every
+/// path that applies issue #494 §7's rule.
+///
+/// Held across a whole grouping rather than per run, so the set behind it
+/// is allocated at most once for a call and reused by every later run.
+#[derive(Default)]
+pub(super) struct RunDedup {
+    t_ms: i64,
+    /// Samples of the current run already in the output. A repeat does not
+    /// count: a run of ten thousand identical values stays at one.
+    len: usize,
+    /// The run's value bits, populated only once the run outgrows
+    /// [`RUN_LINEAR_MAX`].
+    seen: HashSet<u64>,
+}
+
+impl RunDedup {
+    /// Appends `value` unless the run at `t_ms` already holds a sample with
+    /// the same bits. A different `t_ms` starts a new run.
+    fn push_float(&mut self, out: &mut Vec<Sample>, t_ms: i64, value: f64) {
+        if self.len == 0 || self.t_ms != t_ms {
+            self.t_ms = t_ms;
+            self.len = 0;
+            self.seen.clear();
         }
-        if existing.h.is_none() && existing.v.to_bits() == bits {
+        let bits = value.to_bits();
+        let duplicate = if self.len > RUN_LINEAR_MAX {
+            if self.seen.is_empty() {
+                // One-time promotion: the run already in `out` moves into
+                // the set, and every later sample costs one lookup.
+                for sample in out.iter().rev().take(self.len) {
+                    if sample.h.is_none() {
+                        self.seen.insert(sample.v.to_bits());
+                    }
+                }
+            }
+            !self.seen.insert(bits)
+        } else {
+            out.iter()
+                .rev()
+                .take(self.len)
+                .any(|sample| sample.h.is_none() && sample.v.to_bits() == bits)
+        };
+        if duplicate {
             return;
         }
+        out.push(Sample::float(t_ms, value));
+        self.len += 1;
     }
-    samples.push(Sample::float(t_ms, value));
+
+    /// Ends the current run. Two series can start at the same millisecond,
+    /// and the second must not be read against the first's samples.
+    fn end_run(&mut self) {
+        self.len = 0;
+        self.seen.clear();
+    }
 }
 
 /// Per-series merge by `unix_milli` under [`emit_timestamp_run`]'s rule.
@@ -2553,6 +2680,18 @@ fn merge_series<F: FloatPoint, H: HistPoint>(
     float: &[F],
     hist: &[H],
 ) -> Result<Vec<Sample>, ReadError> {
+    let mut run = RunDedup::default();
+    merge_series_with(float, hist, &mut run)
+}
+
+/// [`merge_series`] against a `RunDedup` the caller owns, so a grouping
+/// walking many series allocates the set at most once.
+fn merge_series_with<F: FloatPoint, H: HistPoint>(
+    float: &[F],
+    hist: &[H],
+    run: &mut RunDedup,
+) -> Result<Vec<Sample>, ReadError> {
+    run.end_run();
     let mut out = Vec::with_capacity(float.len() + hist.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < float.len() || j < hist.len() {
@@ -2570,7 +2709,7 @@ fn merge_series<F: FloatPoint, H: HistPoint>(
         while j < hist.len() && hist[j].unix_milli() == t_ms {
             j += 1;
         }
-        emit_timestamp_run(&mut out, t_ms, &float[f_start..i], &hist[h_start..j])?;
+        emit_timestamp_run(&mut out, t_ms, &float[f_start..i], &hist[h_start..j], run)?;
     }
     Ok(out)
 }
@@ -2589,14 +2728,16 @@ fn group_rows(
     metric_name: &str,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
+    let mut run = RunDedup::default();
     for row in rows {
         match out.last_mut() {
             // Issue #494 §7: two rows identical in
             // `(fingerprint, unix_milli, value bits)` are one sample.
             Some(last) if last.fingerprint == row.fingerprint => {
-                push_float_in_run(&mut last.samples, row.unix_milli, row.value);
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
             _ => {
+                run.end_run();
                 let labels = labels_by_fp
                     .get(&row.fingerprint)
                     .cloned()
@@ -2605,9 +2746,13 @@ fn group_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(metric_name.to_string()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![Sample::float(row.unix_milli, row.value)],
+                    samples: Vec::new(),
                     start_ts: None,
                 });
+                // Through `RunDedup` like every other row, so the run it
+                // starts is one the next row can be read against.
+                let last = out.last_mut().expect("just pushed");
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
         }
     }
@@ -2639,6 +2784,7 @@ fn group_multi_rows(
     labels_by_fp: &HashMap<Fingerprint, LabelSet>,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
+    let mut run = RunDedup::default();
     let mut current: Option<(String, Fingerprint)> = None;
     // Whether `current` produced an output series (false = the pair was
     // skipped, so its remaining rows must not attach to `out.last_mut()`,
@@ -2651,10 +2797,11 @@ fn group_multi_rows(
         if same {
             // Issue #494 §7, as in `group_rows`.
             if current_kept && let Some(last) = out.last_mut() {
-                push_float_in_run(&mut last.samples, row.unix_milli, row.value);
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
             continue;
         }
+        run.end_run();
         let key = (row.metric_name, row.fingerprint);
         let labels = labels_by
             .get(&key)
@@ -2666,9 +2813,11 @@ fn group_multi_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(key.0.clone()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![Sample::float(row.unix_milli, row.value)],
+                    samples: Vec::new(),
                     start_ts: None,
                 });
+                let last = out.last_mut().expect("just pushed");
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
                 true
             }
             None => false,
@@ -2696,6 +2845,7 @@ fn group_merged_rows(
     if hist.is_empty() {
         return Ok(group_rows(float, labels_by_fp, metric_name));
     }
+    let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
     let (mut fi, mut hi) = (0usize, 0usize);
     while fi < float.len() || hi < hist.len() {
@@ -2716,7 +2866,7 @@ fn group_merged_rows(
         while hi < hist.len() && hist[hi].fingerprint == next_fp {
             hi += 1;
         }
-        let samples = merge_series(&float[f_start..fi], &hist[h_start..hi])?;
+        let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
         let labels = labels_by_fp.get(&next_fp).cloned().unwrap_or_default();
         out.push(FetchedSeries {
             fingerprint: next_fp,
@@ -2746,6 +2896,7 @@ fn group_merged_multi_rows(
     if hist.is_empty() {
         return Ok(group_multi_rows(float, labels_by, labels_by_fp));
     }
+    let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
     let (mut fi, mut hi) = (0usize, 0usize);
     while fi < float.len() || hi < hist.len() {
@@ -2782,7 +2933,7 @@ fn group_merged_multi_rows(
         else {
             continue;
         };
-        let samples = merge_series(&float[f_start..fi], &hist[h_start..hi])?;
+        let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
         out.push(FetchedSeries {
             fingerprint: key.1,
             metric_name: Some(key.0),
@@ -4561,6 +4712,129 @@ mod tests {
         match value_to_query_result(matrix) {
             QueryResult::Matrix(m) => assert_eq!(m[0].points, vec![(0, 1.0)]),
             other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_run_cost {
+    //! Issue #494, round 2 of the code review: the §7 timestamp-run rule
+    //! scanned the run it had already emitted, once per input row, so the
+    //! work grew with the square of the run. Measured there under
+    //! `rustc 1.93.0`:
+    //!
+    //! ```text
+    //!   n=10000  elapsed=410.202961ms   comparisons=49995000
+    //!   n=20000  elapsed=1.648571537s   comparisons=199990000
+    //! ```
+    //!
+    //! Four times the comparisons for twice the input, on a read path that
+    //! is not allowed to regress.
+    //!
+    //! **The gate below counts, it does not time.** A wall-clock assertion
+    //! would flake on a shared machine and says nothing scale-invariant;
+    //! the count is the thing that was quadratic, and it is read through
+    //! the production function by a `FloatPoint` that counts every read of
+    //! its own value.
+
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// A sample whose value cannot be read without being counted.
+    struct CountedFloat {
+        unix_milli: i64,
+        value: f64,
+    }
+
+    impl FloatPoint for CountedFloat {
+        fn unix_milli(&self) -> i64 {
+            self.unix_milli
+        }
+        fn value(&self) -> f64 {
+            READS.with(|c| c.set(c.get() + 1));
+            self.value
+        }
+    }
+
+    /// Reads of sample values while emitting one run of `n` samples at one
+    /// millisecond, `distinct` of them carrying different values.
+    fn reads_for(n: usize, distinct: usize) -> u64 {
+        let floats: Vec<CountedFloat> = (0..n)
+            .map(|i| CountedFloat {
+                unix_milli: 1,
+                value: (i % distinct) as f64,
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut run = RunDedup::default();
+        READS.with(|c| c.set(0));
+        emit_timestamp_run::<CountedFloat, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+            .expect("float-only run");
+        assert_eq!(out.len(), distinct, "the rule's answer is unchanged");
+        READS.with(Cell::get)
+    }
+
+    /// Doubling the run must not quadruple the work.
+    ///
+    /// The bound is deliberately loose — three times, not two — because
+    /// the promotion from scan to set costs a constant that is visible at
+    /// these sizes. What it refuses is the shape the review measured: four
+    /// times the work for twice the input, and sixteen times for four
+    /// times.
+    #[test]
+    fn a_long_timestamp_run_costs_no_more_than_linear() {
+        for distinct in [1usize, 2, 1_000] {
+            let a = reads_for(10_000, distinct);
+            let b = reads_for(20_000, distinct);
+            assert!(
+                b <= a * 3,
+                "distinct={distinct}: {a} reads for 10,000 samples and {b} for \
+                 20,000 — doubling the run more than tripled the work"
+            );
+            let c = reads_for(40_000, distinct);
+            assert!(
+                c <= a * 6,
+                "distinct={distinct}: {a} reads for 10,000 samples and {c} for \
+                 40,000"
+            );
+        }
+    }
+
+    /// The figures themselves, for the record. Not an assertion: run with
+    /// `--nocapture` to see them.
+    #[test]
+    fn print_the_timestamp_run_cost() {
+        for n in [10_000usize, 20_000] {
+            let reads = reads_for(n, n / 2);
+            println!("issue #494 timestamp-run cost: n={n} value_reads={reads}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn zz_timing() {
+        for n in [10_000usize, 20_000] {
+            let floats: Vec<CountedFloat> = (0..n)
+                .map(|i| CountedFloat {
+                    unix_milli: 1,
+                    value: i as f64,
+                })
+                .collect();
+            let mut out = Vec::new();
+            let mut run = RunDedup::default();
+            READS.with(|c| c.set(0));
+            let t = std::time::Instant::now();
+            emit_timestamp_run::<CountedFloat, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+                .unwrap();
+            let elapsed = t.elapsed();
+            println!(
+                "TIMING n={n} elapsed={elapsed:?} comparisons={}",
+                READS.with(Cell::get) - n as u64
+            );
         }
     }
 }
