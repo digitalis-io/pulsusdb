@@ -1540,6 +1540,72 @@ mod tests {
         assert_eq!(status.code, 8);
     }
 
+    /// Issue #494, criterion 11: a reused `Idempotency-Key` carrying
+    /// different content is a CLIENT error on the OTLP logs receiver — its
+    /// own container, `400` with `google.rpc.Status.code = 3`, not the
+    /// `429` the two byte-bound refusals share.
+    #[tokio::test]
+    async fn a_reused_idempotency_key_returns_400_with_status_code_3() {
+        let sink = MockSink::new(Outcome::KeyReused);
+        let res = post_body(router(sink), valid_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(
+            status.message.contains("Idempotency-Key"),
+            "the message names the header: {:?}",
+            status.message
+        );
+    }
+
+    /// The same refusal in async mode: the header is read before the mode
+    /// is, so `X-Pulsus-Async: 1` does not turn a client error into a `202`.
+    #[tokio::test]
+    async fn async_mode_reused_idempotency_key_also_returns_400() {
+        let sink = MockSink::new(Outcome::KeyReused);
+        let res = post_body(
+            router(sink),
+            valid_request_body(),
+            &[("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(decode_status_body(res).await.code, 3);
+    }
+
+    /// And the two headers reach the sink verbatim — the handler reads
+    /// them and decides nothing.
+    #[tokio::test]
+    async fn the_push_identity_headers_reach_the_sink() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(
+            router(sink.clone()),
+            valid_request_body(),
+            &[("idempotency-key", " k-7 "), ("retry-attempt", "2")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let pushes = sink.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(
+            pushes[0].idempotency_key.as_deref(),
+            Some("k-7"),
+            "the key is trimmed and passed through"
+        );
+        assert!(pushes[0].declared_retry);
+    }
+
+    /// Absent, neither header invents a value.
+    #[tokio::test]
+    async fn no_push_identity_headers_means_no_key_and_no_declared_retry() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), valid_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let pushes = sink.pushes.lock().unwrap();
+        assert_eq!(pushes[0].idempotency_key, None);
+        assert!(!pushes[0].declared_retry);
+    }
+
     #[tokio::test]
     async fn flush_failure_returns_500_with_status_code_13() {
         let sink = MockSink::new(Outcome::FlushFails);
@@ -1968,6 +2034,17 @@ mod tests {
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
         let status = decode_status_body(res).await;
         assert_eq!(status.code, 8);
+    }
+
+    /// Issue #494, criterion 11 on the OTLP metrics receiver.
+    #[tokio::test]
+    async fn metrics_reused_idempotency_key_returns_400_with_status_code_3() {
+        let sink = MockMetricSink::new(Outcome::KeyReused);
+        let res = post_metrics_body(metrics_router(sink), valid_metrics_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(status.message.contains("Idempotency-Key"));
     }
 
     #[tokio::test]
@@ -2799,6 +2876,20 @@ mod tests {
         let res =
             call_remote_write(&sink, valid_remote_write_body(), &[("x-pulsus-async", "1")]).await;
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Issue #494, criterion 11 on the remote-write receiver: the same
+    /// refusal, in THAT endpoint's single plain-text error container —
+    /// never the `google.rpc.Status` protobuf, which a Prometheus sender
+    /// would have to guess at.
+    #[tokio::test]
+    async fn remote_write_reused_idempotency_key_returns_400_plain_text() {
+        let sink = MockMetricSink::new(Outcome::KeyReused);
+        let res = call_remote_write(&sink, valid_remote_write_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = plain_text_body(res).await;
+        assert!(body.contains("Idempotency-Key"), "{body:?}");
+        assert!(body.ends_with('\n'), "the endpoint's terminator: {body:?}");
     }
 
     #[tokio::test]
@@ -3666,6 +3757,22 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    /// Issue #494, criterion 11 on the Loki push receiver.
+    #[tokio::test]
+    async fn loki_reused_idempotency_key_returns_400_plain_text() {
+        let sink = MockSink::new(Outcome::KeyReused);
+        let res = call_loki(
+            &sink,
+            valid_loki_protobuf_body(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = plain_text_body(res).await;
+        assert!(body.contains("Idempotency-Key"), "{body:?}");
+        assert!(body.ends_with('\n'), "the endpoint's terminator: {body:?}");
     }
 
     /// The LF terminator belongs to the ENDPOINT, not to one error variant:
