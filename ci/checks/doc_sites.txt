@@ -11,7 +11,7 @@ rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164
 rewrite crates/pulsus-clickhouse/src/lib.rs:6-10
 rewrite docs/decisions/0006-log-pattern-extraction.md:52-62
-rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
 leave docs/architecture.md:337-342

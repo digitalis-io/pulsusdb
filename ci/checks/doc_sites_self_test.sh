@@ -109,9 +109,50 @@ awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up #999999)"; next } { p
 mv "$work/patched" "$work/tree/$rewrite_file"
 expect_fail "new issue number #999999"
 
+echo "self-test: an issue number that is elsewhere in the base file"
+# Round 1 of this issue's code review walked through the earlier guard with
+# exactly this: a reference that occurs SOMEWHERE in the frozen base file,
+# but not inside the block the row protects. The number is picked from the
+# base file itself, so the attack cannot go stale.
+copy_tree
+elsewhere=$(
+  git show "$BASE:$rewrite_file" \
+    | grep -oE '#[0-9]+' \
+    | LC_ALL=C sort -u \
+    | while IFS= read -r ref; do
+        git show "$BASE:$rewrite_file" \
+          | sed -n "${rewrite_start},${rewrite_start}p" \
+          | grep -qF -- "$ref" || { echo "$ref"; break; }
+      done
+)
+[ -n "$elsewhere" ] || fail "the base file carries no reference outside the protected row"
+awk -v n="$rewrite_start" -v ref="$elsewhere" \
+  'NR == n { print $0 " (follow-up " ref ")"; next } { print }' \
+  "$work/tree/$rewrite_file" > "$work/patched"
+mv "$work/patched" "$work/tree/$rewrite_file"
+expect_fail "new issue number $elsewhere"
+
+echo "self-test: a refs= column does not license a different number"
+# The explicit allowlist is per number, not a switch that turns the rule
+# off for the file it appears on.
+copy_tree
+refs_file=$(awk '$1 == "rewrite" && $3 ~ /^refs=/ { split($2, s, ":"); print s[1]; exit }' \
+  "$REPO/ci/checks/doc_sites.txt")
+if [ -n "$refs_file" ]; then
+  refs_start=$(awk -v f="$refs_file" \
+    '$1 == "rewrite" && $3 ~ /^refs=/ { split($2, s, ":"); if (s[1] == f) { split(s[2], r, "-"); print r[1]; exit } }' \
+    "$REPO/ci/checks/doc_sites.txt")
+  awk -v n="$refs_start" 'NR == n { print $0 " (follow-up #888888)"; next } { print }' \
+    "$work/tree/$refs_file" > "$work/patched"
+  mv "$work/patched" "$work/tree/$refs_file"
+  expect_fail "new issue number #888888"
+else
+  fail "no row carries a refs= column, so this attack cannot be run"
+fi
+
 echo "self-test: an empty manifest"
 copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-echo "doc-sites-self-test: six attacks caught, the clean copy passed"
+echo "doc-sites-self-test: eight attacks caught, the clean copy passed"

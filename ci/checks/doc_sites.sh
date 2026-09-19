@@ -63,28 +63,44 @@ if ! printf '%s\n' "$sites" | LC_ALL=C cmp -s - "$EXPECTED"; then
 fi
 
 # Whether file `$2` contains the exact block of lines in file `$1`.
+#
+# One `awk` process rather than a `sed | cmp` per candidate window.
+# `grep -F -f` cannot do this — a multi-line pattern file matches each line
+# independently — and the loop this replaces piped `sed` into a `cmp -s`
+# that exits at the first differing byte, so `sed` was killed by EPIPE on
+# nearly every window and printed `couldn't flush stdout: Broken pipe` to
+# stderr thousands of times while the check passed.
 contains_block() {
-  # `grep -F -f` with a multi-line pattern file matches each line
-  # independently, which is not what is wanted; compare windows instead.
-  block_lines=$(wc -l < "$1")
-  total=$(wc -l < "$2")
-  [ "$block_lines" -gt 0 ] || return 1
-  last=$((total - block_lines + 1))
-  [ "$last" -ge 1 ] || return 1
-  i=1
-  while [ "$i" -le "$last" ]; do
-    if sed -n "${i},$((i + block_lines - 1))p" "$2" | cmp -s - "$1"; then
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  return 1
+  awk -v blockfile="$1" '
+    BEGIN {
+      n = 0
+      while ((getline line < blockfile) > 0) { block[++n] = line }
+      if (n == 0) { exit 1 }
+    }
+    { buf[NR] = $0 }
+    END {
+      for (i = 1; i + n - 1 <= NR; i++) {
+        ok = 1
+        for (j = 1; j <= n; j++) {
+          if (buf[i + j - 1] != block[j]) { ok = 0; break }
+        }
+        if (ok) { exit 0 }
+      }
+      exit 1
+    }
+  ' "$2"
 }
 
 n=0
-while read -r verdict site; do
+while read -r verdict site rest; do
   [ -n "${verdict:-}" ] || continue
   [ "$verdict" != "#" ] || continue
+  # `rest` is the optional `refs=#a,#b` column, read by
+  # `check_issue_references` from the manifest directly.
+  case "${rest:-}" in
+    "" | refs=*) ;;
+    *) fail "unknown trailing column ${rest:?} for $site" ;;
+  esac
   file=${site%%:*}; range=${site#*:}
   start=${range%%-*}; end=${range#*-}
   case "$start$end" in *[!0-9]*) fail "bad range: $site" ;; esac
@@ -111,17 +127,79 @@ while read -r verdict site; do
       if grep -qF -- "$(cat "$tmp_a.n")" "$tmp_b.n"; then
         fail "rewrite row changed only in whitespace: $site"
       fi
-      # R2: no follow-up issue number is invented. An issue number the
-      # base text already carried may stay, and this issue's own number
-      # may be added; anything else is a number nobody agreed to.
-      for ref in $(grep -oE '#[0-9]+' "$ROOT/$file" | LC_ALL=C sort -u); do
-        [ "$ref" = "#494" ] && continue
-        grep -qF -- "$ref" "$tmp_base" || fail "new issue number $ref in rewrite row: $site"
-      done ;;
+      # The issue-reference rule is checked per FILE after this loop, in
+      # `check_issue_references`: it needs every rewrite row's base block
+      # for that file at once, and it needs the lines the change ADDED.
+      ;;
     *) fail "unknown verdict '$verdict' for $site" ;;
   esac
   n=$((n + 1))
 done < "$MANIFEST"
 
 [ "$n" -gt 0 ] || fail "empty list"
+
+# R2: no follow-up issue number is invented.
+#
+# The rule is about the text a rewrite PUT THERE, so it is checked against
+# the lines the change added and against the protected blocks — not
+# against the file as a whole. An earlier version allowed any reference
+# that occurred anywhere in the base file, and round 1 of this issue's code
+# review walked straight through it: `follow-up #1` inserted into a rewrite
+# row passed, because `#1` occurs elsewhere in that file. The reference was
+# invented; the guard had simply looked in the wrong place.
+#
+# Allowed, per file: every reference already inside one of that file's
+# protected base blocks, plus `#494` — this issue, which the rewrites are
+# for and which the manifest's frozen base names — plus whatever that
+# file's rows list in an explicit third column, `refs=#a,#b`.
+#
+# The third column exists because a correction sometimes has to cite the
+# issue that explains the code it is correcting: `plan.rs`'s stale reason
+# is replaced by the real one, which names the two branches issue #507
+# added. Listing it in the manifest turns that from a reference the guard
+# happened to allow into a recorded decision — which is R2's actual
+# content. An invented follow-up number is one nobody wrote down.
+check_issue_references() {
+  files=$(awk '$1 == "rewrite" { print $2 }' "$MANIFEST" \
+    | sed 's/:.*//' | LC_ALL=C sort -u)
+  for file in $files; do
+    git show "$BASE:$file" > "$tmp_base" 2>/dev/null \
+      || fail "path absent at merge base: $file"
+
+    # The references the protected blocks of THIS file already carried.
+    : > "$tmp_a"
+    awk -v want="$file" '$1 == "rewrite" { print $2 }' "$MANIFEST" \
+      | while IFS= read -r site; do
+          [ "${site%%:*}" = "$file" ] || continue
+          range=${site#*:}; start=${range%%-*}; end=${range#*-}
+          sed -n "${start},${end}p" "$tmp_base" >> "$tmp_a"
+        done
+    awk -v want="$file" '
+      $1 == "rewrite" {
+        split($2, s, ":")
+        if (s[1] != want) { next }
+        for (i = 3; i <= NF; i++) {
+          if ($i ~ /^refs=/) {
+            sub(/^refs=/, "", $i)
+            m = split($i, r, ",")
+            for (k = 1; k <= m; k++) { print r[k] }
+          }
+        }
+      }
+    ' "$MANIFEST" >> "$tmp_a"
+    grep -oE '#[0-9]+' "$tmp_a" 2>/dev/null | LC_ALL=C sort -u > "$tmp_a.n" || true
+
+    # The lines this change ADDED to the file.
+    diff --unchanged-line-format= --old-line-format= --new-line-format='%L' \
+      "$tmp_base" "$ROOT/$file" > "$tmp_b" || true
+
+    for ref in $(grep -oE '#[0-9]+' "$tmp_b" 2>/dev/null | LC_ALL=C sort -u); do
+      [ "$ref" = "#494" ] && continue
+      grep -qx -- "$ref" "$tmp_a.n" \
+        || fail "new issue number $ref in rewrite row: $file"
+    done
+  done
+}
+check_issue_references
+
 echo "doc-sites: checked $n sites"
