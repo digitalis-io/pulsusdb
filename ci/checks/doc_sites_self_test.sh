@@ -150,9 +150,18 @@ else
   fail "no row carries a refs= column, so this attack cannot be run"
 fi
 
+echo "self-test: an issue reference with no hash"
+# Round 2 of this issue's code review: `follow-up issue 999999` names an
+# issue to every reader and matched a hash-only guard not at all.
+copy_tree
+awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up issue 999999)"; next } { print }' \
+  "$work/tree/$rewrite_file" > "$work/patched"
+mv "$work/patched" "$work/tree/$rewrite_file"
+expect_fail "new issue number #999999"
+
 echo "self-test: an empty manifest"
 copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-echo "doc-sites-self-test: eight attacks caught, the clean copy passed"
+echo "doc-sites-self-test: nine attacks caught, the clean copy passed"

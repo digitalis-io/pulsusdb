@@ -41,6 +41,19 @@ EXPECTED=${EXPECTED:-$REPO/ci/checks/doc_sites.expected}
 
 fail() { echo "doc-sites: $1" >&2; exit 1; }
 
+# Every issue reference in `$1`, normalised to `#N`, one per line, sorted.
+#
+# Both spellings, because a guard that reads only one is a guard with a
+# door beside it. Round 2 of this issue's code review walked through the
+# hash-only version by writing `follow-up issue 999999`, which names an
+# issue to every reader and matched nothing.
+issue_refs() {
+  grep -ioE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+' "$1" 2>/dev/null \
+    | grep -oE '[0-9]+' \
+    | sed 's/^/#/' \
+    | LC_ALL=C sort -u
+}
+
 [ -s "$MANIFEST" ] || fail "empty or missing manifest"
 [ -s "$EXPECTED" ] || fail "empty or missing expected set"
 # The revision the ranges are taken in is frozen IN the manifest, not
@@ -187,13 +200,13 @@ check_issue_references() {
         }
       }
     ' "$MANIFEST" >> "$tmp_a"
-    grep -oE '#[0-9]+' "$tmp_a" 2>/dev/null | LC_ALL=C sort -u > "$tmp_a.n" || true
+    issue_refs "$tmp_a" > "$tmp_a.n" || true
 
     # The lines this change ADDED to the file.
     diff --unchanged-line-format= --old-line-format= --new-line-format='%L' \
       "$tmp_base" "$ROOT/$file" > "$tmp_b" || true
 
-    for ref in $(grep -oE '#[0-9]+' "$tmp_b" 2>/dev/null | LC_ALL=C sort -u); do
+    for ref in $(issue_refs "$tmp_b"); do
       [ "$ref" = "#494" ] && continue
       grep -qx -- "$ref" "$tmp_a.n" \
         || fail "new issue number $ref in rewrite row: $file"
