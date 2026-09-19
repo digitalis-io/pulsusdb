@@ -295,6 +295,17 @@ fn an_arithmetic_comparison_is_refused_by_metrics_and_is_not_claimed_to_render()
 /// refuses an empty list and reads standard input from `/dev/null`, so it
 /// cannot silently answer over a subdirectory or hang.
 ///
+/// **It scans `crates/*/src/` only, and that is the domain the criterion
+/// is about**: a second IMPLEMENTATION of the lowering is production
+/// code. Two consequences, both stated rather than left to be found.
+/// A test that called the helper would not be counted — which is right,
+/// since a test caller is not a second lowering. And this file itself is
+/// excluded by the same rule, which it has to be: the search string
+/// occurs in the line below, so a tree-wide scan matches the scanner and
+/// reports three callers where there are two. Measured — with the file
+/// untracked the scan passed, and it failed `left: 3, right: 2` the
+/// moment the file was committed.
+///
 /// *RED when:* a caller is added or removed. Measured with an identical
 /// private copy in `metrics_sql`: 4a stayed green and this failed
 /// `left: 1, right: 2`.
@@ -307,7 +318,12 @@ fn the_span_row_attribute_column_has_exactly_two_non_test_callers() {
     let tracked = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "--", "*.rs"])
+        .args([
+            "ls-files",
+            "--",
+            "crates/*/src/*.rs",
+            "crates/*/src/**/*.rs",
+        ])
         .stdin(std::process::Stdio::null())
         .output()
         .expect("git ls-files");
@@ -319,8 +335,8 @@ fn the_span_row_attribute_column_has_exactly_two_non_test_callers() {
         .collect();
     assert!(
         files.len() > 100,
-        "the tracked-file list is {} entries, which is not this repository — a search over an \
-         empty or partial list reports green and means nothing",
+        "the production source list is {} entries, which is not this repository — a search \
+         over an empty or partial list reports green and means nothing",
         files.len()
     );
 
@@ -340,7 +356,7 @@ fn the_span_row_attribute_column_has_exactly_two_non_test_callers() {
             "crates/pulsus-read/src/traces/metrics_sql.rs".to_string(),
             "crates/pulsus-read/src/traces/search_plan.rs".to_string(),
         ],
-        "filter::probe_column must have exactly these two calling files"
+        "filter::probe_column must have exactly these two calling files under crates/*/src/"
     );
 }
 

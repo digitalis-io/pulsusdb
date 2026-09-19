@@ -1686,28 +1686,28 @@ enum ReviewedVerdict {
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2995",
+        "exec.rs:3014",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2995",
+        "exec.rs:3014",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2955-2961",
+        "exec.rs:2974-2980",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:782",
+        "exec.rs:801",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",

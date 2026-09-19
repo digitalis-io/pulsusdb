@@ -66,13 +66,13 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:120	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:148	crates/pulsus-read/src/traces/exec.rs	148		line	/// release and grow across batches, where no per-query server setting
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:155-163	crates/pulsus-read/src/traces/exec.rs	155	163	prose	max_result_bytes
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:176	crates/pulsus-read/src/traces/exec.rs	176		line	pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1774	crates/pulsus-read/src/traces/exec.rs	1774		line	let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2995	crates/pulsus-read/src/traces/exec.rs	2995		prose	generator_settings
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3058	crates/pulsus-read/src/traces/exec.rs	3058		line	/// #460, two different arbitrary sets from the same input shape.
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:439	crates/pulsus-read/src/traces/exec.rs	439		line	/// The ROOT SPAN's own metadata. `service`/`name` are the reference's
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:440	crates/pulsus-read/src/traces/exec.rs	440		line	/// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5623	crates/pulsus-read/src/traces/exec.rs	5623		line	fn search_settings_pin_the_layer_1_budget_contract() {
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:782	crates/pulsus-read/src/traces/exec.rs	782		prose	map_trace_generator_error
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1793	crates/pulsus-read/src/traces/exec.rs	1793		line	let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3014	crates/pulsus-read/src/traces/exec.rs	3014		prose	generator_settings
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3086	crates/pulsus-read/src/traces/exec.rs	3086		line	/// #460, two different arbitrary sets from the same input shape.
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:458	crates/pulsus-read/src/traces/exec.rs	458		line	/// The ROOT SPAN's own metadata. `service`/`name` are the reference's
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:459	crates/pulsus-read/src/traces/exec.rs	459		line	/// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5651	crates/pulsus-read/src/traces/exec.rs	5651		line	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:801	crates/pulsus-read/src/traces/exec.rs	801		prose	map_trace_generator_error
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:895	crates/pulsus-read/src/traces/filter.rs	895		prose	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:1337	crates/pulsus-read/src/traces/metrics_sql.rs	1337		line	pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
@@ -96,9 +96,9 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
 docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:752	crates/pulsus-write/src/protocols/otlp_traces.rs	752		prose	numeric_val_num
-docs/query-lowering.md	exec.rs:2955-2961	crates/pulsus-read/src/traces/exec.rs	2955	2961	prose	read_overflow_mode
-docs/query-lowering.md	exec.rs:2995	crates/pulsus-read/src/traces/exec.rs	2995		prose	generator_settings
-docs/query-lowering.md	exec.rs:782	crates/pulsus-read/src/traces/exec.rs	782		prose	map_trace_generator_error
+docs/query-lowering.md	exec.rs:2974-2980	crates/pulsus-read/src/traces/exec.rs	2974	2980	prose	read_overflow_mode
+docs/query-lowering.md	exec.rs:3014	crates/pulsus-read/src/traces/exec.rs	3014		prose	generator_settings
+docs/query-lowering.md	exec.rs:801	crates/pulsus-read/src/traces/exec.rs	801		prose	map_trace_generator_error
 docs/query-lowering.md	filter.rs:100	crates/pulsus-read/src/traces/filter.rs	100		prose	AttrKeyScan
 docs/query-lowering.md	filter.rs:107	crates/pulsus-read/src/traces/filter.rs	107		prose	TimeRange
 docs/query-lowering.md	filter.rs:2666	crates/pulsus-read/src/traces/filter.rs	2666		prose	spans_generator_for
@@ -106,7 +106,7 @@ docs/query-lowering.md	filter.rs:409	crates/pulsus-read/src/traces/filter.rs	409
 docs/query-lowering.md	logql/compile.rs:314-317	crates/pulsus-read/src/logql/compile.rs	314	317	line	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	metrics_plan.rs:666	crates/pulsus-read/src/traces/metrics_plan.rs	666		line	metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
 docs/query-lowering.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	fn date_clause(w: SnappedWindow) -> String {
-docs/query-lowering.md	metrics_sql.rs:1533	crates/pulsus-read/src/traces/metrics_sql.rs	1533		prose	metrics_compare_exemplar_range_sql
+docs/query-lowering.md	metrics_sql.rs:1536	crates/pulsus-read/src/traces/metrics_sql.rs	1536		prose	metrics_compare_exemplar_range_sql
 docs/query-lowering.md	metrics_sql.rs:546	crates/pulsus-read/src/traces/metrics_sql.rs	546		line	LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
 docs/query-lowering.md	metrics_sql.rs:562	crates/pulsus-read/src/traces/metrics_sql.rs	562		line	// `filter::compile_leaf` (gated, see the doc comment above), so
 docs/query-lowering.md	model.rs:557	crates/pulsus-config/src/model.rs	557		line	traceql_scan_budget_rows: 50_000_000,
@@ -204,7 +204,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3041	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		line	/// canonical shape: `SELECT fingerprint, service, labels FROM log_streams
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
-docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2995	crates/pulsus-read/src/traces/exec.rs	2995		prose	generator_settings
+docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2995	crates/pulsus-read/src/traces/exec.rs	2995		line	}
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1111	crates/pulsus-read/src/traces/search_plan.rs	1111		line	Ok(parts.join(" AND "))
 docs/query-to-sql.md	crates/pulsus-schema/src/catalog.rs:245-258	crates/pulsus-schema/src/catalog.rs	245	258	prose	log_samples
 docs/query-to-sql.md	crates/pulsus-schema/src/controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	if (major, minor) < (26, 3) {
@@ -226,7 +226,7 @@ docs/query-to-sql.md	escape.rs:93	crates/pulsus-read/src/logql/escape.rs	93		lin
 docs/query-to-sql.md	escape.rs:93-105	crates/pulsus-read/src/logql/escape.rs	93	105	line	pub fn ch_like_contains(needle: &str) -> String { let mut pattern = String::with_capacity(needle.len() + 2); pattern.pus
 docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		prose	\\%
 docs/query-to-sql.md	exec.rs:2470	crates/pulsus-read/src/logql/exec.rs	2470		prose	vector_aggs
-docs/query-to-sql.md	exec.rs:3547	crates/pulsus-read/src/traces/exec.rs	3547		prose	reduce
+docs/query-to-sql.md	exec.rs:3575	crates/pulsus-read/src/traces/exec.rs	3575		prose	reduce
 docs/query-to-sql.md	filter.rs:1206	crates/pulsus-read/src/traces/filter.rs	1206		prose	AttrScope::Unscoped => None
 docs/query-to-sql.md	filter.rs:78-81	crates/pulsus-read/src/traces/filter.rs	78	81	prose	unsupported field:
 docs/query-to-sql.md	filter.rs:833	crates/pulsus-read/src/traces/filter.rs	833		line	PhysicalPredicate::Status { op, code } => {
@@ -353,9 +353,9 @@ docs/query-to-sql.md	sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		prose	l
 docs/query-to-sql.md	traces/exec.rs:122	crates/pulsus-read/src/traces/exec.rs	122		line	/// Per-trace hydration span cap; the `+1` probe detects overflow, which
 docs/query-to-sql.md	traces/exec.rs:147	crates/pulsus-read/src/traces/exec.rs	147		line	/// (and merge tuples / root summaries) survive the per-batch charge
 docs/query-to-sql.md	traces/exec.rs:164	crates/pulsus-read/src/traces/exec.rs	164		line	/// server-side before the driver materializes anything; the
-docs/query-to-sql.md	traces/exec.rs:1828	crates/pulsus-read/src/traces/exec.rs	1828		line	.dispatch
-docs/query-to-sql.md	traces/exec.rs:200	crates/pulsus-read/src/traces/exec.rs	200		line	/// than this many attribute rows is a `422 query_too_broad`, never an
-docs/query-to-sql.md	traces/exec.rs:2959	crates/pulsus-read/src/traces/exec.rs	2959		line	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
+docs/query-to-sql.md	traces/exec.rs:1847	crates/pulsus-read/src/traces/exec.rs	1847		line	.dispatch
+docs/query-to-sql.md	traces/exec.rs:222	crates/pulsus-read/src/traces/exec.rs	222		line	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
+docs/query-to-sql.md	traces/exec.rs:2978	crates/pulsus-read/src/traces/exec.rs	2978		line	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
 docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	/// hundred lines below — changes the row bound too and moves every
 docs/query-to-sql.md	traces/search_plan.rs:1111	crates/pulsus-read/src/traces/search_plan.rs	1111		line	Ok(parts.join(" AND "))
 docs/query-to-sql.md	traces/search_sql.rs:110-112	crates/pulsus-read/src/traces/search_sql.rs	110	112	line	/// returns, which is what keeps the day-partition prune agreeing with /// the row bound. Changing the constructor here
