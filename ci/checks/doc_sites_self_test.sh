@@ -83,8 +83,17 @@ REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
 upstream=$(git -C "$REPO" rev-list --merges --max-count=1 "$BASE..HEAD" | head -1)
 if [ -n "$upstream" ]; then
   upstream=$(git -C "$REPO" rev-parse "$upstream^2")
-  synthetic=$(git -C "$REPO" commit-tree "HEAD^{tree}" -p "$upstream" -p HEAD \
-    -m "self-test: a pull-request-shaped merge, unreferenced")
+  # The identity is supplied per command rather than taken from config:
+  # a CI runner has none, and `commit-tree` refuses without one. It never
+  # reaches a branch — the object is unreferenced and only its parents
+  # are read — so the name is a label, not authorship.
+  synthetic=$(GIT_AUTHOR_NAME="doc-sites self-test" \
+    GIT_AUTHOR_EMAIL="self-test@invalid" \
+    GIT_COMMITTER_NAME="doc-sites self-test" \
+    GIT_COMMITTER_EMAIL="self-test@invalid" \
+    git -C "$REPO" commit-tree "HEAD^{tree}" -p "$upstream" -p HEAD \
+    -m "self-test: a pull-request-shaped merge, unreferenced") \
+    || fail "could not build the pull-request-shaped merge commit"
   out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
         EXPECTED="$work/expected.txt" HEADREV="$synthetic" \
         sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
