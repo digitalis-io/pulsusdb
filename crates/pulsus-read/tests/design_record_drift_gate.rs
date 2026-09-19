@@ -651,6 +651,11 @@ struct CitationRow {
     line: u32,
     end_line: Option<u32>,
     kind: AnchorKind,
+    /// The most distinctive name the cited range carries, from
+    /// [`target_symbol`]. Recorded so that repointing a citation changes
+    /// a short name in the diff rather than only a line number and a
+    /// long snapshot.
+    symbol: String,
     anchor: String,
 }
 
@@ -660,7 +665,7 @@ fn citation_rows() -> Vec<CitationRow> {
     for (n, line) in text.lines().enumerate() {
         if n == 0 {
             assert_eq!(
-                line, "doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor",
+                line, "doc\ttoken\tpath\tline\tend_line\tanchor_kind\tsymbol\tanchor",
                 "{CITATIONS_TSV} header"
             );
             continue;
@@ -668,8 +673,8 @@ fn citation_rows() -> Vec<CitationRow> {
         if line.trim().is_empty() {
             continue;
         }
-        let f: Vec<&str> = line.splitn(7, '\t').collect();
-        assert_eq!(f.len(), 7, "{CITATIONS_TSV}:{}: seven columns", n + 1);
+        let f: Vec<&str> = line.splitn(8, '\t').collect();
+        assert_eq!(f.len(), 8, "{CITATIONS_TSV}:{}: eight columns", n + 1);
         out.push(CitationRow {
             doc: f[0].to_string(),
             token: f[1].to_string(),
@@ -686,7 +691,8 @@ fn citation_rows() -> Vec<CitationRow> {
                 "line" => AnchorKind::Line,
                 other => panic!("{CITATIONS_TSV}:{}: unknown anchor_kind {other:?}", n + 1),
             },
-            anchor: f[6].to_string(),
+            symbol: f[6].to_string(),
+            anchor: f[7].to_string(),
         });
     }
     out
@@ -1087,6 +1093,53 @@ fn needles(token: &str) -> BTreeSet<String> {
     out
 }
 
+/// The most distinctive name in a cited range: the longest run of
+/// `[A-Za-z0-9_]` in it, preferring one that carries a letter or an
+/// underscore over a bare number, ties broken alphabetically so the
+/// choice does not move.
+///
+/// **What it is for.** Round 4 of issue #494's code review repointed a
+/// citation to an unrelated line that happened to carry an identifier,
+/// regenerated the dataset, and every check stayed green with the two
+/// anchor counts unmoved: the snapshot anchor is regenerated from
+/// whatever the citation now names, so the record certified its own
+/// input. Recording the NAME as well as the line number does not make
+/// that fail — no rule here can, and the measurement for why is in
+/// [`audit_citation_forms`] — but it makes it **visible**: repointing
+/// changes a short name in a committed dataset, which a diff shows and a
+/// hundred-character line snapshot does not.
+fn target_symbol(body: &str) -> String {
+    let mut best: Option<String> = None;
+    let mut best_worded: Option<String> = None;
+    let mut cur = String::new();
+    let mut flush = |cur: &mut String, best: &mut Option<String>, worded: &mut Option<String>| {
+        if cur.is_empty() {
+            return;
+        }
+        let worded_now = cur.chars().any(|c| c.is_ascii_alphabetic() || c == '_');
+        let better = |slot: &Option<String>, t: &str| match slot {
+            None => true,
+            Some(s) => (t.len(), t) > (s.len(), s.as_str()),
+        };
+        if better(best, cur) {
+            *best = Some(cur.clone());
+        }
+        if worded_now && better(worded, cur) {
+            *worded = Some(cur.clone());
+        }
+        cur.clear();
+    };
+    for c in body.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            flush(&mut cur, &mut best, &mut best_worded);
+        }
+    }
+    flush(&mut cur, &mut best, &mut best_worded);
+    best_worded.or(best).unwrap_or_default()
+}
+
 /// The backticked tokens on one line.
 fn backticked(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1211,6 +1264,16 @@ fn every_design_record_citation_still_points_at_what_it_names() {
             row.path,
             row.line,
             row.anchor
+        );
+        assert!(
+            !row.symbol.is_empty() && body.contains(&row.symbol),
+            "{}:{} does not carry the name the dataset records for it, {:?}. The name is \
+             the most distinctive identifier at the cited range; a citation that has been \
+             repointed carries a different one, which is what the diff of this dataset \
+             shows",
+            row.path,
+            row.line,
+            row.symbol
         );
         match row.kind {
             AnchorKind::Prose => prose += 1,
@@ -1624,7 +1687,8 @@ fn regenerate_the_citation_datasets() {
             (k.clone(), (v, occ))
         })
         .collect();
-    let mut resolved = String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor\n");
+    let mut resolved =
+        String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tsymbol\tanchor\n");
     let mut frozen = String::from("doc\ttoken\treason\n");
     for ((doc, token), (r, occ)) in &verdict {
         match r {
@@ -1661,8 +1725,9 @@ fn regenerate_the_citation_datasets() {
                 } else {
                     occ.last.to_string()
                 };
+                let symbol = target_symbol(&body);
                 resolved.push_str(&format!(
-                    "{doc}\t{token}\t{path}\t{}\t{end}\t{kind}\t{anchor}\n",
+                    "{doc}\t{token}\t{path}\t{}\t{end}\t{kind}\t{symbol}\t{anchor}\n",
                     occ.first
                 ));
             }
@@ -2887,8 +2952,16 @@ fn audit_citation_forms() {
     );
 
     let by_key = resolutions_by_key(&occ, &tracked);
-    let mut prose = 0usize;
-    let mut line_kind = 0usize;
+    // The two anchor counts come from the COMMITTED dataset, which is
+    // what the census renders. An earlier version of this audit
+    // recomputed them here and printed 168/225 against the census's
+    // 178/215, because it counted over every occurrence of a token where
+    // the regeneration counts over the one that resolved. A second
+    // implementation of a rule beside the rule is what this file exists
+    // to catch.
+    let rows = citation_rows();
+    let prose = rows.iter().filter(|r| r.kind == AnchorKind::Prose).count();
+    let line_kind = rows.iter().filter(|r| r.kind == AnchorKind::Line).count();
     let mut no_para = 0usize;
     let mut contentless: Vec<String> = Vec::new();
     let mut cont_line_kind: Vec<String> = Vec::new();
@@ -2903,39 +2976,31 @@ fn audit_citation_forms() {
             .collect::<Vec<_>>()
             .join(" ");
         let body = ws(&body);
-        let has_prose = backticked(&o.citing_line)
-            .iter()
-            .flat_map(|t| needles(t))
-            .any(|n| body.contains(n.as_str()));
+
         let has_para = group.iter().any(|(o, _)| {
             backticked(&o.citing_paragraph)
                 .iter()
                 .flat_map(|t| needles(t))
                 .any(|n| body.contains(n.as_str()))
         });
-        if has_prose {
-            prose += 1;
-        } else {
-            line_kind += 1;
+        if !body.chars().any(|c| c.is_ascii_alphanumeric() || c == '_') {
+            contentless.push(format!("{doc}\t{token}\t{body}"));
+        }
+        if !has_para {
+            no_para += 1;
             if group
                 .iter()
                 .any(|(o, _)| o.form == CitationForm::Continuation)
             {
                 cont_line_kind.push(format!("{doc}\t{token}\t{body}"));
             }
-            if !body.chars().any(|c| c.is_ascii_alphanumeric() || c == '_') {
-                contentless.push(format!("{doc}\t{token}\t{body}"));
-            }
-        }
-        if !has_para {
-            no_para += 1;
         }
     }
     println!(
         "resolved_prose={prose} resolved_line={line_kind} no_paragraph_corroboration={no_para}"
     );
     println!(
-        "continuation_rows_with_no_prose_corroboration={}",
+        "continuation_rows_with_no_paragraph_corroboration={}",
         cont_line_kind.len()
     );
     println!(
