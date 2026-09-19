@@ -913,13 +913,16 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
          series and histogram rows and still offers the descriptor to the cache gate, and \
          the gate emits a row unless the descriptor equals the one last CONFIRMED-flushed. \
          Under this barrier none of the four has confirmed anything yet, so all four emit. \
-         Nothing user-visible duplicates: `metric_metadata` is a ReplacingMergeTree whose \
-         sorting key excludes the receiver-injected `updated_ns`, so the four collapse to \
-         one row — `a_concurrent_descriptor_race_leaves_one_visible_row` in \
-         `crates/pulsus-server/tests/push_dedup_live.rs` reads that count back from a live \
-         table. This is an exact figure rather than `>= 1` because round 4 of this issue's \
-         code review measured it and the notes claimed it; a claim with `>= 1` behind it is \
-         not the claim."
+         **This is a figure of THIS fixture, and the live path gives one.** \
+         `a_concurrent_descriptor_race_leaves_one_visible_row` in \
+         `crates/pulsus-server/tests/push_dedup_live.rs` sends four content-identical \
+         descriptor-bearing writes over HTTP at once and measures ONE row in \
+         `metric_metadata`, with and without `FINAL`, from the first read — so nothing is \
+         collapsed there, because nothing beyond one row is written. Four HTTP requests are \
+         not released together the way a barrier releases four admissions in one process. \
+         Which of them confirms its flush first is not measured; the row counts are. Both \
+         figures are asserted, each on its own path, because round 4 of this issue's code \
+         review found the notes claiming both and the tests establishing neither."
     );
 }
 

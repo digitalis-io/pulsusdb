@@ -976,24 +976,33 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
 // ---------------------------------------------------------------------
 
 /// **M3.** Four content-identical, descriptor-bearing writes sent at once
-/// each enqueue their descriptor, and one row is visible.
+/// store one push's samples and **one** descriptor row — one row written,
+/// not four rows collapsed.
 ///
-/// **Why both halves are asserted somewhere.** Suppression drops the
-/// sample, series and histogram rows of the three it suppresses, and
-/// still offers each descriptor to the cache gate; the gate emits unless
-/// the descriptor equals the one last CONFIRMED-flushed, and under a
-/// barrier none of the four has confirmed anything, so all four emit.
+/// **This corrects a claim, and the difference is worth stating.** Round
+/// 4 of this issue's code review reported four descriptors enqueued for
+/// one push's samples, and an earlier version of this test's comment
+/// explained the single visible row as `metric_metadata`'s
+/// `ReplacingMergeTree(updated_ns)` collapsing the four. Measured here,
+/// that explanation is wrong on this path: reading the table six times at
+/// one-second intervals, starting immediately after the four writes are
+/// acknowledged, `count()` without `FINAL` is **1** every time. Nothing
+/// is collapsed because nothing beyond one row is ever inserted.
+///
+/// The four is a figure of the WRITER-level fixture, and both figures are
+/// right about their own path.
 /// `concurrent_identical_descriptor_bearing_pushes_store_one_copy` in
-/// `crates/pulsus-write/tests/a494_push_dedup.rs` asserts that count is
-/// exactly four. What a reader sees is one row, because `metric_metadata`
-/// is a `ReplacingMergeTree(updated_ns)` ordered by `metric_name` alone —
-/// the receiver-injected `updated_ns` is excluded from the key, so the
-/// four collapse. This test reads that back from a live table, which the
-/// writer-level one cannot.
+/// `crates/pulsus-write/tests/a494_push_dedup.rs` admits four pushes that
+/// are released by a barrier inside one process, so none of them has
+/// confirmed a flush when the others reach the descriptor cache gate, and
+/// the gate emits unless the descriptor equals the one last
+/// confirmed-flushed — so all four emit and its mock inserter records
+/// four. Four HTTP requests are not simultaneous in that sense. **Which
+/// of them confirms first, and how much of the gap the flush needs, is
+/// not measured here**; what is measured is the row count, and it is one.
 ///
-/// Round 4 of this issue's code review found the pair established visible
-/// retry correctness but neither of these two figures; the notes claimed
-/// them anyway. They are assertions now.
+/// So the user-visible claim is asserted on the visible thing: three
+/// sample rows and one descriptor row, both before and after `FINAL`.
 #[tokio::test]
 async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
     if !should_run() {
@@ -1043,9 +1052,24 @@ async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
         "SELECT count() AS n FROM metric_metadata FINAL \
          WHERE metric_name = 'dedup_descriptor_race_total'",
         1,
-        "M3: one descriptor row is visible however many were enqueued",
+        "M3: one descriptor row is visible",
     )
     .await;
+    // Without `FINAL` as well. A row count that is only right after the
+    // replacing merge has run would be a timing claim; this one is right
+    // from the first read, which is what says one row was WRITTEN rather
+    // than four written and later collapsed.
+    let raw: Vec<CountRow> = collect(
+        &client,
+        "SELECT count() AS n FROM metric_metadata \
+         WHERE metric_name = 'dedup_descriptor_race_total'",
+    )
+    .await;
+    assert_eq!(
+        raw[0].n, 1,
+        "M3: one descriptor row is STORED, so the single visible row is not a merge \
+         having collapsed four"
+    );
 }
 
 // ---------------------------------------------------------------------
