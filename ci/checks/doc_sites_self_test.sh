@@ -54,6 +54,49 @@ expect_fail() {
   esac
 }
 
+# Runs the check with NO upstream revision supplied and requires it to
+# refuse. Used by the graph-shape tests below: a check that derives a
+# revision from anywhere answers here, and answering is the failure.
+expect_refusal_without_upstream() {
+  what=$1
+  set +e
+  out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
+        EXPECTED="$work/expected.txt" PULSUSDB_DOC_SITES_UPSTREAM= \
+        sh "$REPO/ci/checks/doc_sites.sh" 2>&1)
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] \
+    || fail "$what: the check answered with no upstream supplied, so something derives one"
+  case "$out" in
+    *"no upstream revision supplied"*) echo "  refused: $what" ;;
+    *) fail "$what: refused for the wrong reason: $out" ;;
+  esac
+}
+
+# Builds a commit object, given a tree-ish and any number of `-p` parents
+# after it. The identity is per command because a CI runner has none, and
+# the objects are unreferenced: only their shape is ever read.
+throwaway_commit() {
+  GIT_AUTHOR_NAME="doc-sites self-test" GIT_AUTHOR_EMAIL="self-test@invalid" \
+  GIT_COMMITTER_NAME="doc-sites self-test" GIT_COMMITTER_EMAIL="self-test@invalid" \
+  GIT_AUTHOR_DATE="${THROWAWAY_DATE:-}" GIT_COMMITTER_DATE="${THROWAWAY_DATE:-}" \
+    git -C "$REPO" commit-tree "$@" -m "doc-sites self-test, unreferenced"
+}
+
+# **This script writes to the git object store**: the graph-shape tests
+# below build throwaway commits and temporary refs. A read-only object
+# store — a checkout mounted read-only, or one owned by another user —
+# makes it refuse here rather than midway through with a `git` error.
+probe=$(throwaway_commit "HEAD^{tree}" -p HEAD 2>/dev/null) \
+  || fail "the git object store is not writable, and this script writes to it:
+  the graph-shape tests build throwaway commits and temporary refs. Run it in a
+  checkout you can write to."
+[ -n "$probe" ] || fail "the git object store is not writable"
+
+[ -n "${PULSUSDB_DOC_SITES_UPSTREAM:-}" ] || fail "set PULSUSDB_DOC_SITES_UPSTREAM to the
+  base branch commit this change is measured against, the same value the workflow passes
+  to the check. The self-test runs the check, and the check refuses without it."
+
 BASE=$(awk '$1 == "#" && $2 == "base" { print $3; exit }' "$REPO/ci/checks/doc_sites.txt")
 [ -n "$BASE" ] || fail "the manifest carries no frozen base revision"
 
@@ -75,68 +118,12 @@ leave_start=${first_leave#*:}; leave_start=${leave_start%%-*}
 # shipped wrong once by being green in the first shape and picking this
 # change itself in the second. The object is unreferenced and costs one
 # loose object per run.
-echo "self-test: the clean copy must pass, in both checkout shapes"
+echo "self-test: the clean copy must pass"
 copy_tree
-REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
-  EXPECTED="$work/expected.txt" sh "$REPO/ci/checks/doc_sites.sh"
-
-# The upstream parent of the FIXTURE. Taken from the manifest's record,
-# which is a fixture input here and not the thing under test: this leg
-# checks that the derivation picks the right PARENT given the shape, and
-# the attacks below check the record. Deriving it here instead would
-# duplicate the rule under test — and the first version did, which made
-# the leg build a merge with this change on both sides when CI's own HEAD
-# was already a merge.
-upstream=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$REPO/ci/checks/doc_sites.txt")
-# `HEAD` on a developer clone; a merge commit in CI. Overridable so the
-# CI shape can be reproduced locally, which is what was missing.
-selftest_head=$(git -C "$REPO" rev-parse "${SELFTEST_HEAD:-HEAD}")
-if [ -n "$upstream" ]; then
-  # The identity is supplied per command rather than taken from config:
-  # a CI runner has none, and `commit-tree` refuses without one. It never
-  # reaches a branch — the object is unreferenced and only its parents
-  # are read — so the name is a label, not authorship.
-  synthetic=$(GIT_AUTHOR_NAME="doc-sites self-test" \
-    GIT_AUTHOR_EMAIL="self-test@invalid" \
-    GIT_COMMITTER_NAME="doc-sites self-test" \
-    GIT_COMMITTER_EMAIL="self-test@invalid" \
-    git -C "$REPO" commit-tree "$selftest_head^{tree}" -p "$upstream" -p "$selftest_head" \
-    -m "self-test: a pull-request-shaped merge, unreferenced") \
-    || fail "could not build the pull-request-shaped merge commit"
-  out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
-        EXPECTED="$work/expected.txt" HEADREV="$synthetic" \
-        sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
-    || fail "the pull-request checkout shape must pass: $out"
-  echo "  $out (pull-request shape, HEAD is a merge whose FIRST parent is upstream)"
-
-  # And the same shape with the base branch moved on past the revision
-  # the manifest records, which is what a pull-request checkout looks
-  # like a few days later. The record has to be an ANCESTOR of the
-  # derived revision, not equal to it; an equality test passed the day it
-  # was written and would have failed on the first commit to the base
-  # branch after that.
-  ahead=$(GIT_AUTHOR_NAME="doc-sites self-test" \
-    GIT_AUTHOR_EMAIL="self-test@invalid" \
-    GIT_COMMITTER_NAME="doc-sites self-test" \
-    GIT_COMMITTER_EMAIL="self-test@invalid" \
-    git -C "$REPO" commit-tree "$upstream^{tree}" -p "$upstream" \
-    -m "self-test: the base branch moved on, unreferenced") \
-    || fail "could not build the moved-base commit"
-  moved_base=$(GIT_AUTHOR_NAME="doc-sites self-test" \
-    GIT_AUTHOR_EMAIL="self-test@invalid" \
-    GIT_COMMITTER_NAME="doc-sites self-test" \
-    GIT_COMMITTER_EMAIL="self-test@invalid" \
-    git -C "$REPO" commit-tree "$selftest_head^{tree}" -p "$ahead" -p "$selftest_head" \
-    -m "self-test: a pull-request merge onto a moved base, unreferenced") \
-    || fail "could not build the moved-base merge commit"
-  out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
-        EXPECTED="$work/expected.txt" HEADREV="$moved_base" \
-        sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
-    || fail "the pull-request shape with a moved base must pass: $out"
-  echo "  $out (pull-request shape, base branch ahead of the recorded revision)"
-else
-  fail "the manifest records no upstream revision, so the two shapes cannot be told apart"
-fi
+out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
+      EXPECTED="$work/expected.txt" sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
+  || fail "the clean copy must pass: $out"
+echo "  $out"
 
 echo "self-test: a rewrite changed only in whitespace"
 copy_tree
@@ -236,8 +223,8 @@ echo "self-test: a number the merged upstream head introduced is still not licen
 # The number is derived — present in the rewrite file at the merged head
 # and absent from it at the base — so the attack cannot go stale.
 copy_tree
-MERGEDREV=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$REPO/ci/checks/doc_sites.txt")
-if [ -n "$MERGEDREV" ] && [ "$MERGEDREV" != "$BASE" ]; then
+MERGEDREV=$(git -C "$REPO" rev-parse "$PULSUSDB_DOC_SITES_UPSTREAM^{commit}")
+if [ "$MERGEDREV" != "$(git -C "$REPO" rev-parse "$BASE^{commit}")" ]; then
   git show "$BASE:$rewrite_file" | grep -oE '#[0-9]+' \
     | LC_ALL=C sort -u > "$work/base.refs"
   git show "$MERGEDREV:$rewrite_file" | grep -oE '#[0-9]+' \
@@ -250,39 +237,57 @@ if [ -n "$MERGEDREV" ] && [ "$MERGEDREV" != "$BASE" ]; then
   mv "$work/patched" "$work/tree/$rewrite_file"
   expect_fail "new issue number $from_main"
 else
-  fail "the manifest carries no merged upstream revision, so this attack cannot be run"
+  fail "the supplied upstream revision is the frozen base, so this attack cannot be run"
 fi
 
-echo "self-test: moving the comparison pin alongside the protected text"
-# Round 3 of issue #494's code review ran exactly this and the check
-# passed: inserting a reference into a protected row AND repointing the
-# manifest's `# merged` revision in one edit hid the insertion, because
-# the comparison revision was whatever the manifest said. The revision is
-# now derived from the commit graph and the manifest only records it, so
-# a moved pin is a disagreement rather than a new comparison.
+# ---------------------------------------------------------------------
+# The three commit-graph shapes round 4 of issue #494's code review built
+# against a DERIVED comparison revision. Two of them made the check exit
+# 0 against the wrong revision, and one of those hid protected text added
+# to that revision's parent — the thing the check exists to catch. The
+# third steered the "newest merge" choice with commit dates, which a
+# contributor sets.
+#
+# The revision is no longer derived, so none of these can select
+# anything. They are kept as NEGATIVE tests: with no revision supplied
+# the check must refuse, and it must refuse **with these shapes present
+# in the repository**. A future revision that derives again answers here
+# instead of refusing, whatever it derives from, and that is the failure.
+#
+# **What they cannot do**, stated rather than left to be found: they
+# cannot put a shape on `HEAD`, because the self-test does not move the
+# working tree. They are reachable objects and temporary refs, so they
+# reach a derivation that scans refs or `--all`; a derivation that reads
+# only `$BASE..HEAD` would not see them, and is caught by the refusal
+# itself rather than by the shape.
+# ---------------------------------------------------------------------
+echo "self-test: a change already merged to the base branch selects nothing"
 copy_tree
-awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up issue 777777)"; next } { print }' \
-  "$work/tree/$rewrite_file" > "$work/patched"
-mv "$work/patched" "$work/tree/$rewrite_file"
-moved=$(git -C "$REPO" rev-parse HEAD)
-awk -v r="$moved" '$1 == "#" && $2 == "merged" { print "# merged " r; next } { print }' \
-  "$work/manifest.txt" > "$work/manifest.patched"
-mv "$work/manifest.patched" "$work/manifest.txt"
-expect_fail "the commit graph says"
+absorbed=$(throwaway_commit "HEAD^{tree}" -p "$BASE" -p HEAD)
+git -C "$REPO" update-ref refs/doc-sites-self-test/absorbed "$absorbed"
+expect_refusal_without_upstream "the change already merged to the base"
 
-echo "self-test: deleting the comparison pin"
-# The other half of the same hole: with no pin at all an earlier revision
-# of this check fell back to the frozen base, which is the comparison the
-# merge made wrong. A merge that happened and a manifest that records
-# none is a disagreement too.
+echo "self-test: a later unrelated feature merge selects nothing"
 copy_tree
-grep -v '^# merged ' "$work/manifest.txt" > "$work/manifest.patched"
-mv "$work/manifest.patched" "$work/manifest.txt"
-expect_fail "the manifest records none"
+feature=$(throwaway_commit "$BASE^{tree}" -p "$BASE")
+later=$(throwaway_commit "HEAD^{tree}" -p HEAD -p "$feature")
+git -C "$REPO" update-ref refs/doc-sites-self-test/feature "$later"
+expect_refusal_without_upstream "a later unrelated feature merge"
+
+echo "self-test: a merge back-dated ahead of its own ancestor selects nothing"
+copy_tree
+THROWAWAY_DATE="2030-01-01T00:00:00+0000" older=$(throwaway_commit "HEAD^{tree}" -p HEAD -p "$BASE")
+newer=$(THROWAWAY_DATE="2001-01-01T00:00:00+0000" throwaway_commit "HEAD^{tree}" -p "$older" -p "$feature")
+git -C "$REPO" update-ref refs/doc-sites-self-test/backdated "$newer"
+expect_refusal_without_upstream "a descendant merge dated before its ancestor"
+
+git -C "$REPO" update-ref -d refs/doc-sites-self-test/absorbed
+git -C "$REPO" update-ref -d refs/doc-sites-self-test/feature
+git -C "$REPO" update-ref -d refs/doc-sites-self-test/backdated
 
 echo "self-test: an empty manifest"
 copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-echo "doc-sites-self-test: twelve attacks caught, the clean copy passed"
+echo "doc-sites-self-test: ten attacks caught, three graph shapes refused, the clean copy passed"

@@ -69,6 +69,14 @@
 //! cleared it and the rerun printed `7500 passed, 39 skipped`. A failure
 //! naming a path that is not in your tree is this, not a defect in the
 //! code under test.
+//!
+//! **The documentation-sites self-test writes to the git object store.**
+//! `ci/checks/doc_sites_self_test.sh` builds throwaway commits and
+//! temporary refs for its commit-graph tests, so a checkout whose object
+//! store is read-only makes it refuse, saying so, rather than fail
+//! midway with a `git` error. It also needs the base branch commit
+//! passed in — `PULSUSDB_DOC_SITES_UPSTREAM` — because the check it
+//! exercises refuses to guess one.
 
 #[path = "support/live_db.rs"]
 mod live_db;

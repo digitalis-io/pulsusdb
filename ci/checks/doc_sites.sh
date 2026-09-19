@@ -30,9 +30,9 @@
 #     not that it moved to something correct.
 #
 # Usage:
-#   REPO=<repository root> BASE=<revision> MERGED=<revision> \
-#   ROOT=<tree to check> MANIFEST=<path> EXPECTED=<path> \
-#   sh ci/checks/doc_sites.sh
+#   PULSUSDB_DOC_SITES_UPSTREAM=<base branch commit> \
+#   REPO=<repository root> BASE=<revision> ROOT=<tree to check> \
+#   MANIFEST=<path> EXPECTED=<path> sh ci/checks/doc_sites.sh
 set -eu
 REPO=${REPO:-$(git rev-parse --show-toplevel)}
 cd "$REPO"
@@ -66,70 +66,37 @@ BASE=${BASE:-$(awk '$1 == "#" && $2 == "base" { print $3; exit }' "$MANIFEST")}
 git cat-file -e "$BASE^{commit}" 2>/dev/null \
   || fail "the frozen base revision $BASE is not in this clone (fetch-depth)"
 
-# The upstream head this change has merged, used by ONE check —
-# `check_issue_references`, which asks which lines this change added. The
-# ranges every other check reads stay at `$BASE` whatever this says.
+# The revision the added-lines comparison is taken against: everything
+# that is NOT this change. It is **SUPPLIED, never derived**, and this is
+# the third shape of this rule — the first two were derived and both were
+# steered.
 #
-# **It is DERIVED from the commit graph, not read from the manifest.**
-# Round 3 of issue #494's code review moved the manifest's pin and the
-# protected text in one edit and the check passed: a comparison revision
-# the same diff can move is not a control. The manifest still records the
-# revision, and the two must agree — a pin that has been moved fails
-# here, loudly, instead of silently widening what the check ignores.
+#   round 2  compared against the frozen base, which predates the merge,
+#            so the base branch's own text read as this change's;
+#   round 3  read the revision from the manifest, and moving the manifest
+#            and the protected text in one edit hid the edit;
+#   round 4  derived it from the commit graph, and the review produced
+#            three shapes that select the wrong parent — a change already
+#            merged to the base, a later unrelated feature merge (whose
+#            parent then hid a protected addition), and a "newest merge"
+#            ordering steered by commit dates, which a contributor sets.
 #
-# The derivation, and why it identifies upstream in both checkout
-# shapes. Take the newest merge commit since the frozen base and try its
-# parents, second first. `git merge <upstream>` on this branch puts
-# upstream in the SECOND parent; a pull-request checkout builds a merge
-# whose FIRST parent is the base branch and whose second is this change.
-# The two are told apart by a fact neither can fake: **this manifest is
-# this change's own file, so no upstream commit has it.** The first
-# parent whose tree does not carry the manifest is upstream.
-HEADREV=${HEADREV:-HEAD}
-# The TRACKED path of the manifest, which is what the probe below asks
-# about. Deliberately NOT `$MANIFEST`: the self-test runs the check
-# against a copy in a temporary directory, and asking `git` for a path
-# outside the repository fails for every revision, which makes every
-# parent look like upstream and picks the first one tried. That is how
-# this derivation shipped wrong once — green locally, wrong in CI, where
-# the checkout puts this change in the second parent.
-MANIFEST_IN_TREE=ci/checks/doc_sites.txt
-
-derive_merged() {
-  newest=$(git rev-list --merges --max-count=1 "$BASE..$HEADREV" 2>/dev/null)
-  [ -n "$newest" ] || { echo "$BASE"; return; }
-  git cat-file -e "$HEADREV:$MANIFEST_IN_TREE" 2>/dev/null \
-    || fail "$MANIFEST_IN_TREE is not tracked at $HEADREV, so upstream cannot be told from this change"
-  for side in 2 1; do
-    parent=$(git rev-parse --verify --quiet "$newest^$side") || continue
-    if ! git cat-file -e "$parent:$MANIFEST_IN_TREE" 2>/dev/null; then
-      echo "$parent"
-      return
-    fi
-  done
-  fail "both parents of merge $newest carry $MANIFEST_IN_TREE, so neither can be identified as upstream"
-}
-MERGED=${MERGED:-$(derive_merged)}
-git cat-file -e "$MERGED^{commit}" 2>/dev/null \
-  || fail "the derived upstream revision $MERGED is not in this clone (fetch-depth)"
-
-# The manifest's record of it must agree with what the graph says.
-DECLARED=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$MANIFEST")
-if [ -n "$DECLARED" ]; then
-  git cat-file -e "$DECLARED^{commit}" 2>/dev/null \
-    || fail "the manifest records upstream revision $DECLARED, which is not in this clone"
-  # The record must be CONSISTENT with the derived revision, not equal to
-  # it. On a branch checkout the two are the same commit. On a
-  # pull-request checkout the derived revision is the base branch's
-  # current tip, which is at or ahead of the revision this change merged,
-  # because the base moves on without this branch. An ancestor test
-  # accepts that and still refuses the thing it is for: a record moved
-  # onto a commit of THIS change is not an ancestor of upstream.
-  git merge-base --is-ancestor "$DECLARED" "$MERGED" 2>/dev/null \
-    || fail "the manifest records upstream revision $DECLARED, which is not an ancestor of $MERGED; the commit graph says upstream is $MERGED"
-elif [ "$MERGED" != "$BASE" ]; then
-  fail "the commit graph says upstream $MERGED was merged; the manifest records none"
-fi
+# A contributor controls parent order, merge topology and commit dates,
+# so nothing inside the repository can say which commits are not theirs.
+# The base branch is a fact the CI system knows and the repository cannot
+# forge, so the CI system passes it in. Run by hand, it must be passed by
+# hand: the check refuses rather than guessing, because every guess so
+# far has been wrong.
+UPSTREAM=${PULSUSDB_DOC_SITES_UPSTREAM:-}
+[ -n "$UPSTREAM" ] || fail "no upstream revision supplied. Set
+  PULSUSDB_DOC_SITES_UPSTREAM to the base branch commit this change is measured
+  against. In CI that is the pull request's base commit, which the workflow
+  passes. By hand, pass the commit your branch is measured against, e.g.
+  PULSUSDB_DOC_SITES_UPSTREAM=\$(git merge-base HEAD origin/main).
+  It is deliberately NOT derived from the commit graph: a contributor controls
+  parent order and commit dates, so a derivation can be steered."
+git cat-file -e "$UPSTREAM^{commit}" 2>/dev/null \
+  || fail "the supplied upstream revision $UPSTREAM is not in this clone (fetch-depth)"
 
 tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp); tmp_up=$(mktemp)
 trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_up" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
@@ -269,14 +236,16 @@ check_issue_references() {
     issue_refs "$tmp_a" > "$tmp_a.n" || true
 
     # The lines this change ADDED to the file, measured against the
-    # upstream head it has merged rather than against the base. A line
-    # main wrote is not a line this change added, and before this
-    # distinction existed the first merge of main reported main's own
-    # `#556` as an invented reference on `docs/architecture.md`.
-    if git cat-file -e "$MERGED:$file" 2>/dev/null; then
-      git show "$MERGED:$file" > "$tmp_up"
+    # supplied upstream revision rather than against the frozen base. A
+    # line the base branch wrote is not a line this change added, and
+    # before this distinction existed the first merge of the base branch
+    # reported its own `#556` as an invented reference on
+    # `docs/architecture.md`. A file absent upstream is wholly new, so
+    # every line of it is this change's.
+    if git cat-file -e "$UPSTREAM:$file" 2>/dev/null; then
+      git show "$UPSTREAM:$file" > "$tmp_up"
     else
-      cp "$tmp_base" "$tmp_up"
+      : > "$tmp_up"
     fi
     diff --unchanged-line-format= --old-line-format= --new-line-format='%L' \
       "$tmp_up" "$ROOT/$file" > "$tmp_b" || true
@@ -290,4 +259,4 @@ check_issue_references() {
 }
 check_issue_references
 
-echo "doc-sites: checked $n sites"
+echo "doc-sites: checked $n sites (added lines measured against $UPSTREAM)"
