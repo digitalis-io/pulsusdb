@@ -4782,7 +4782,7 @@ mod timestamp_run_cost {
     /// Samples examined while emitting one run of `n` at one millisecond,
     /// `distinct` of them carrying different values — read from the
     /// production counter, not from a stand-in.
-    fn examined_for(n: usize, distinct: usize) -> u64 {
+    fn examined_for(n: usize, distinct: usize) -> (u64, usize) {
         let floats: Vec<SampleRow> = (0..n)
             .map(|i| SampleRow {
                 fingerprint: Fingerprint::from_raw(1),
@@ -4796,7 +4796,7 @@ mod timestamp_run_cost {
         emit_timestamp_run::<SampleRow, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
             .expect("float-only run");
         assert_eq!(out.len(), distinct, "the rule's answer is unchanged");
-        RUN_SAMPLES_EXAMINED.with(Cell::get)
+        (RUN_SAMPLES_EXAMINED.with(Cell::get), out.len())
     }
 
     /// The worst case: a run of `n` samples in which every one carries a
@@ -4807,7 +4807,14 @@ mod timestamp_run_cost {
     /// a list of distinctness values, because a list is what a later edit
     /// shortens. `distinct` is fixed to `n` in this one place.
     fn examined_all_distinct(n: usize) -> u64 {
-        examined_for(n, n)
+        let (examined, emitted) = examined_for(n, n);
+        assert_eq!(
+            emitted, n,
+            "this function measures the worst case, in which the emitted \
+             run grows with the input; a run of {n} that emitted {emitted} \
+             is a weaker fixture and cannot fail on a quadratic build"
+        );
+        examined
     }
 
     /// Doubling the run must not quadruple the work.
@@ -4824,14 +4831,20 @@ mod timestamp_run_cost {
     ///    loop and from no list**, through [`examined_all_distinct`],
     ///    which fixes `distinct = n` in one place. There is no
     ///    distinctness parameter here for an edit to lower.
-    /// 2. [`examined_for`] asserts the run it built really emitted
-    ///    `distinct` samples, so a fixture that stopped being all-distinct
-    ///    fails there instead of passing quietly.
+    /// 2. [`examined_all_distinct`] then asserts the run it measured
+    ///    really emitted `n` samples. Lowering the distinctness inside it
+    ///    — the exact edit that produced the gate that passed on a
+    ///    quadratic build — fails that assertion rather than quietly
+    ///    making the measurement cheap.
     /// 3. [`the_sizes_can_tell_the_two_shapes_apart`] computes what a
     ///    quadratic implementation would examine at `N1`, `N2` and `N4`
     ///    and asserts those figures breach these same two bounds.
     ///    Shrinking the sizes, or moving them closer together, reddens
     ///    that test.
+    ///
+    /// None of that survives deleting the assertions themselves. What it
+    /// removes is the quiet route: every way of weakening the fixture
+    /// short of deleting a named assertion turns some test red.
     ///
     /// The bound is deliberately loose — three times, not two — because
     /// the promotion from scan to set costs a constant that is visible at
@@ -4858,8 +4871,8 @@ mod timestamp_run_cost {
         // the gate: none of them can fail on a quadratic build, because
         // the run they emit never grows.
         for distinct in [1usize, 2, 1_000] {
-            let a = examined_for(N1, distinct);
-            let b = examined_for(N2, distinct);
+            let (a, _) = examined_for(N1, distinct);
+            let (b, _) = examined_for(N2, distinct);
             assert!(
                 b <= a * 3,
                 "distinct={distinct}: {a} samples examined for {N1} and {b} for {N2}"
@@ -4904,7 +4917,7 @@ mod timestamp_run_cost {
     #[test]
     fn print_the_timestamp_run_cost() {
         for n in [10_000usize, 20_000] {
-            let examined = examined_for(n, n / 2);
+            let (examined, _) = examined_for(n, n / 2);
             println!("issue #494 timestamp-run cost: n={n} samples_examined={examined}");
         }
     }
