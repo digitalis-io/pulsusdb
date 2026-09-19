@@ -111,6 +111,18 @@ async fn exec(client: &ChClient, sql: &str) {
 /// `CORPUS_SPANS` single-span traces over 47h, the dense `env=prod`
 /// resource prefix on every span (the time-pruning-isolation fixture),
 /// and the 1% `http.status_code=500` numeric target.
+///
+/// **Both stores carry both attributes** (issue #559). Until then this
+/// fixture wrote the two attributes into `trace_attrs_idx` only and left
+/// every span row's arrays EMPTY, which was invisible while the metrics
+/// filter read the index. It is not invisible now: the filter reads the
+/// span row, so a span with empty arrays matches nothing and every gate
+/// below would measure a query that returns no rows. `assert_stores_agree`
+/// at the end of the gate test is what keeps the two sides together.
+///
+/// `500`/`200` are integers far under 2^53, so the `Float64` element, the
+/// text `'500'`/`'200'` and the index row's `val_num` are three exact
+/// renderings of one value.
 async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
     let spread = WINDOW_NS / CORPUS_SPANS as i64;
     exec(
@@ -118,7 +130,8 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         &format!(
             "INSERT INTO {db}.trace_spans \
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -127,7 +140,12 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
                if(number % {CHECKOUT_EVERY} = 0, 'checkout', concat('svc-', toString(number % 8))), \
                {base_ns} + toInt64(number) * {spread}, \
                toInt64(number) * 10000, \
-               if(number % {ERROR_EVERY} = 0, 2, 0), 1, 1, 'p' \
+               if(number % {ERROR_EVERY} = 0, 2, 0), 1, 1, 'p', \
+               ['env','http.status_code'], \
+               ['resource','span'], \
+               ['prod', if(number % {ERROR_EVERY} = 0, '500', '200')], \
+               ['string','int'], \
+               [NULL, if(number % {ERROR_EVERY} = 0, 500., 200.)] \
              FROM numbers({CORPUS_SPANS})"
         ),
     )
@@ -136,10 +154,11 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
-               'env', 'prod', 'resource', NULL, \
+               'env', 'prod', 'resource', 'string', NULL, \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -152,11 +171,12 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
                'http.status_code', \
-               if(number % {ERROR_EVERY} = 0, '500', '200'), 'span', \
+               if(number % {ERROR_EVERY} = 0, '500', '200'), 'span', 'int', \
                if(number % {ERROR_EVERY} = 0, 500.0, 200.0), \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
@@ -258,34 +278,6 @@ fn table_primary_key_granules(raw: &str, table: &str) -> (u64, u64) {
         }
     }
     panic!("no PrimaryKey Granules line for table {table:?} in EXPLAIN output:\n{raw}");
-}
-
-/// Extracts the REAL embedded semi-join subquery (`SELECT trace_id,
-/// span_id FROM trace_attrs_idx …`) from a generated metrics SQL — byte
-/// identical to what ClickHouse executes under `CreatingSets`, whose
-/// child plan `EXPLAIN indexes = 1` does not render on 24.8 (verified
-/// live: the outer explain shows only "Create sets before main query
-/// execution"), so the subquery is explained standalone.
-fn extract_semi_join_subquery(sql: &str) -> String {
-    let start = sql
-        .find("IN (SELECT")
-        .unwrap_or_else(|| panic!("no semi-join in SQL:\n{sql}"))
-        + "IN (".len();
-    let bytes = sql.as_bytes();
-    let mut depth = 1usize;
-    for (offset, b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return sql[start..start + offset].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced semi-join parens in SQL:\n{sql}");
 }
 
 /// Isolates the DATE-BOUNDED base `trace_spans` scan (the `raw` inner
@@ -438,15 +430,33 @@ async fn metrics_explain_and_budget_gates() {
     let engine = TraceEngine::new(data_client().await, engine_config());
 
     // ---- AC3 gate 1: the service PREWHERE hoist selects service_time ---
+    //
+    // **Issue #559 retargeted this at a filter with NO attribute
+    // condition.** Until then it asked the combined shape
+    // `{ resource.service.name = "checkout" && span.http.status_code >= 500 }`,
+    // which no longer keeps the projection — `service_time` holds 14
+    // named columns and not the attribute arrays, so reading
+    // `attr_num[…]` forces the base table. That loss is REAL and is
+    // pinned, as an identity, by
+    // `metrics_attribute_filter_projection_loss_is_recorded` below. What
+    // this gate is for is the other half: a metrics query whose filter
+    // carries no attribute condition must keep every prune it had.
     let plan = plan_for(
         &engine,
-        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | rate()"#,
+        r#"{ resource.service.name = "checkout" } | rate()"#,
         base,
         now,
     );
     assert!(
         plan.range_sql().contains("PREWHERE service = 'checkout'"),
         "the hoist is in the generated SQL:\n{}",
+        plan.range_sql()
+    );
+    assert!(
+        !plan.range_sql().contains("arrayFirstIndex"),
+        "this gate's statement must declare NO attribute locator — a predicate that reads one \
+         is what costs the projection, and a gate measuring that case is measuring the other \
+         half:\n{}",
         plan.range_sql()
     );
     let raw = explain_raw(&client, plan.range_sql()).await;
@@ -467,41 +477,52 @@ async fn metrics_explain_and_budget_gates() {
     )
     .await
     .expect("the metrics query's QueryFinish row must exist");
+
     assert!(
         row.projections.iter().any(|p| p.contains("service_time")),
         "query_log.projections must name service_time, got {:?}",
         row.projections
     );
-    // read_rows covers BOTH reads: the semi-join's key prefix is the
-    // dense http.status_code key (~CORPUS_SPANS attr rows, the documented
-    // key-only-scan honesty note), so the spans side must contribute only
-    // the projection's small service prefix on top — without the
-    // projection the spans side alone would add another full CORPUS_SPANS.
+    // Issue #559: this statement now issues ONE read — the span table
+    // through `service_time` — where it used to issue two (the spans side
+    // plus the attribute semi-join's key prefix). So the bound is on the
+    // projection prefix alone.
     //
-    // Granule-aware bound — do NOT re-tighten (issue #60 CI flake, run
+    // Granule-aware, and do NOT re-tighten (issue #60 CI flake, run
     // 29469732884, on the sibling search suite's identical projection
-    // shape): both reads quantize to 8,192-row granules per part. The
-    // attr key prefix is CORPUS_SPANS rows plus up to ~6 padding
-    // granules across the layout's parts; the spans-side projection
-    // prefix is ~2,400 matched rows that CI layouts have realized as
-    // ~26k read rows (3-4 granules/parts' worth). The old
-    // CORPUS_SPANS / 4 (30,000) slop left only ~4k of headroom on that
-    // observed CI layout. CORPUS_SPANS / 2 (60,000 ≈ 7.3 granules)
-    // absorbs both quantization terms while an unprojected spans-side
-    // full scan (another whole CORPUS_SPANS → ≥ 240k total) still fails
-    // this gate by a wide margin.
+    // shape): the read quantizes to 8,192-row granules per part. The
+    // matched `checkout` prefix is ~2,400 rows, which CI layouts have
+    // realized as ~26k read rows — 3 to 4 granules across the layout's
+    // parts. CORPUS_SPANS / 2 (60,000 ≈ 7.3 granules) absorbs that while
+    // an unprojected full scan (a whole CORPUS_SPANS = 120,000) still
+    // fails this gate by a factor of two.
     assert!(
-        row.read_rows < CORPUS_SPANS + CORPUS_SPANS / 2,
-        "the spans side must be served by the service_time projection's prefix, not a \
-         full scan (read {} total; attr key prefix alone is ~{CORPUS_SPANS}, bound adds \
-         {} ≈ 7 granules of {GRANULE_ROWS} rows of quantization headroom)",
+        row.read_rows < CORPUS_SPANS / 2,
+        "the read must be served by the service_time projection's prefix, not a full scan \
+         (read {} rows; the matched prefix is ~{} rows and the bound allows {} ≈ 7 granules \
+         of {GRANULE_ROWS} rows of quantization headroom)",
         row.read_rows,
+        CORPUS_SPANS / CHECKOUT_EVERY,
         CORPUS_SPANS / 2
     );
 
-    // ---- AC3 gate 2: the attr semi-join subquery prunes on the
-    // (key, val) prefix, with time pruning isolated within the dense
-    // env=prod prefix (issue #53 AC3b pattern). --------------------------
+    // ---- Issue #559 criterion 6: the prune that IS lost, pinned -------
+    metrics_attribute_filter_projection_loss_is_recorded(&engine, &client, base, now).await;
+
+    // ---- AC3 gate 2: the attribute-filtered statement still prunes on
+    // TIME, and it prunes by the same rule the match-all control does
+    // (issue #53 AC3b pattern, retargeted by issue #559). ---------------
+    //
+    // Until issue #559 this gate took the semi-join subquery out of the
+    // statement and asserted the `trace_attrs_idx` `(key, val)` prefix
+    // pruned. There is no subquery any more: the attribute condition is a
+    // predicate over the span row's arrays, so the only index the
+    // statement can prune on is `trace_spans`'s own `timestamp_ns`. What
+    // is checked is that the attribute predicate did not COST that prune
+    // — the filtered statement selects the same granules its match-all
+    // control does over the same window, and a narrower window selects
+    // strictly fewer.
+    let control_full = plan_for(&engine, "{} | rate()", base, now);
     let full_plan = plan_for(&engine, r#"{ .env = "prod" } | rate()"#, base, now);
     let narrow_plan = plan_for(
         &engine,
@@ -509,39 +530,51 @@ async fn metrics_explain_and_budget_gates() {
         now - 30 * 60 * NS_PER_S,
         now,
     );
-    let (full_sel, full_total) = table_primary_key_granules(
-        &explain_raw(&client, &extract_semi_join_subquery(full_plan.range_sql())).await,
-        "trace_attrs_idx",
+    for plan in [&full_plan, &narrow_plan] {
+        assert!(
+            !plan.range_sql().contains("trace_attrs_idx"),
+            "the metrics filter reads the span row only:\n{}",
+            plan.range_sql()
+        );
+    }
+    let (control_sel, control_total) = table_primary_key_granules(
+        &explain_raw(&client, control_full.range_sql()).await,
+        "trace_spans",
     );
+    let (full_sel, full_total) =
+        table_primary_key_granules(&explain_raw(&client, full_plan.range_sql()).await, "trace_spans");
     let (narrow_sel, _) = table_primary_key_granules(
-        &explain_raw(
-            &client,
-            &extract_semi_join_subquery(narrow_plan.range_sql()),
-        )
-        .await,
-        "trace_attrs_idx",
+        &explain_raw(&client, narrow_plan.range_sql()).await,
+        "trace_spans",
     );
     assert!(
         full_sel <= full_total && full_sel > 0,
-        "the semi-join's prefix read must engage the attr primary key ({full_sel}/{full_total})"
+        "the filtered statement must engage the span primary key ({full_sel}/{full_total})"
+    );
+    assert_eq!(
+        (full_sel, full_total),
+        (control_sel, control_total),
+        "the attribute predicate must cost no granule on the span table: filtered \
+         {full_sel}/{full_total} against the match-all control {control_sel}/{control_total}"
     );
     assert!(
         narrow_sel < full_sel,
-        "the narrow window must prune strictly fewer granules within the SAME dense \
-         (key, val) prefix — time pruning isolated (narrow {narrow_sel} vs full {full_sel})"
+        "the narrow window must select strictly fewer granules — time pruning is intact \
+         (narrow {narrow_sel} vs full {full_sel})"
     );
-    // And the key-only numeric class prunes on its (key) prefix too.
+    // The key-only numeric class prunes on time the same way.
     let plan = plan_for(
         &engine,
         "{ span.http.status_code >= 500 } | rate()",
         base,
         now,
     );
-    let raw = explain_raw(&client, &extract_semi_join_subquery(plan.range_sql())).await;
-    let (sel, total) = table_primary_key_granules(&raw, "trace_attrs_idx");
-    assert!(
-        sel < total,
-        "the key-only numeric semi-join must prune on the (key) prefix ({sel}/{total}):\n{raw}"
+    let raw = explain_raw(&client, plan.range_sql()).await;
+    let (sel, total) = table_primary_key_granules(&raw, "trace_spans");
+    assert_eq!(
+        (sel, total),
+        (control_sel, control_total),
+        "the numeric attribute predicate must cost no granule either ({sel}/{total}):\n{raw}"
     );
 
     // ---- AC3 gate 3: the scan budget trips for real → 158 → 422 -------
@@ -560,20 +593,59 @@ async fn metrics_explain_and_budget_gates() {
         other => panic!("expected TraceScanBudgetRows, got {other:?}"),
     }
 
-    // ---- AC3 gate 4: the IN-set budget trips for real → code 191 → the
-    // dedicated TraceMetricsSetRows (plan v2 delta 3's code-confirmation
-    // mandate). Seed TRACE_METRICS_MAX_SET_ROWS + 50k in-window rows of
-    // one key: the semi-join's materialized set overflows. ---------------
+    // ---- Issue #559 criterion 9: a metrics attribute condition matching
+    // more spans than the old IN-set budget allowed now RETURNS THE
+    // ANSWER. -----------------------------------------------------------
+    //
+    // This replaces gate 4's metrics half, which asserted the opposite.
+    // Until issue #559 the attribute leaf built a
+    // `(trace_id, span_id) IN (SELECT …)` set under
+    // `max_rows_in_set = TRACE_METRICS_MAX_SET_ROWS` and
+    // `max_bytes_in_set = TRACE_METRICS_MAX_SET_BYTES`, both
+    // `set_overflow_mode = 'throw'`, so past the byte ceiling — measured
+    // at 524,289 matching spans, where 524,288 answered — the request was
+    // `Code: 191` → `TooBroadReason::TraceMetricsSetRows` → HTTP 422. The
+    // span-row form builds no set, so the binding limit becomes
+    // `max_rows_to_read = scan_budget_rows`, which is 50,000,000 by
+    // default and counted over span rows alone rather than span rows PLUS
+    // index rows. Strictly more permissive on both dimensions.
+    //
+    // The 191 mapping, the two constants and the 422 wording are
+    // unchanged and still reachable: the narrowed tag-values read builds
+    // its own `IN` set under the same settings, and
+    // `traces_tags_live::narrowed_tag_values_past_the_set_budget_are_422`
+    // is the live test for it.
     let bulk_rows = TRACE_METRICS_MAX_SET_ROWS + 50_000;
+    let bulk_spread = WINDOW_NS / bulk_rows as i64;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), \
+               'op', 'bulk-svc', \
+               {base} + toInt64(number) * {bulk_spread}, \
+               1000000, 0, 1, 1, 'p', \
+               ['bulk'], ['span'], ['x'], ['string'], [NULL] \
+             FROM numbers({bulk_rows})"
+        ),
+    )
+    .await;
     exec(
         &client,
         &format!(
             "INSERT INTO {DB}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
-               toDate(fromUnixTimestamp64Nano({base} + toInt64(number))), \
-               'bulk', 'x', 'span', NULL, \
-               {base} + toInt64(number), \
+               toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * {bulk_spread})), \
+               'bulk', 'x', 'span', 'string', NULL, \
+               {base} + toInt64(number) * {bulk_spread}, \
                toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                1000000 \
@@ -582,25 +654,31 @@ async fn metrics_explain_and_budget_gates() {
     )
     .await;
     let plan = plan_for(&engine, r#"{ span.bulk = "x" } | rate()"#, base, now);
-    let err = engine
+    let result = engine
         .metrics_range(&plan)
         .await
-        .expect_err("a semi-join set past max_rows_in_set must throw");
-    match err {
-        ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSetRows { max_set_rows }) => {
-            assert_eq!(max_set_rows, TRACE_METRICS_MAX_SET_ROWS);
-        }
-        other => panic!("expected TraceMetricsSetRows (code 191), got {other:?}"),
-    }
-    // The instant form carries the same settings — same rejection.
-    let err = engine
+        .expect("a condition matching more spans than the old set budget must answer");
+    let counted: f64 = result
+        .series
+        .iter()
+        .flat_map(|s| s.samples.iter())
+        .map(|(_, v)| *v)
+        .sum();
+    assert!(
+        counted > 0.0,
+        "the answer must carry the matched spans, not an empty series: {:?}",
+        result.series
+    );
+    // The instant form carries the same settings — same answer, not a
+    // refusal.
+    let instant = engine
         .metrics_instant(&plan)
         .await
-        .expect_err("the instant form carries the same set limits");
-    assert!(matches!(
-        err,
-        ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSetRows { .. })
-    ));
+        .expect("the instant form answers it too");
+    assert!(
+        !instant.series.is_empty(),
+        "the instant form must return a series: {instant:?}"
+    );
 
     // ---- Issue #182 gate: by(resource.service.name) grouping pushes the
     // GROUP BY down to ClickHouse (Aggregating step), keeps the service
@@ -936,14 +1014,21 @@ async fn metrics_explain_and_budget_gates() {
     // the same thresholds as gates 1 and 2 above. The quantile form
     // rides along: its SQL is unchanged by #252, and pinning it here is
     // what makes "unchanged" checkable rather than asserted. ----------
+    //
+    // **Issue #559 dropped the attribute conjunct from both queries.**
+    // The projection assertion below is about the service hoist, and a
+    // filter carrying an attribute condition no longer keeps
+    // `service_time` — it reads the span row's arrays, which that
+    // projection does not hold. The attribute half of this block was
+    // retargeted the same way gate 2 was.
     for (label, q) in [
         (
             "histogram",
-            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | histogram_over_time(duration)"#,
+            r#"{ resource.service.name = "checkout" } | histogram_over_time(duration)"#,
         ),
         (
             "quantile",
-            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | quantile_over_time(duration, 0.5, 0.9)"#,
+            r#"{ resource.service.name = "checkout" } | quantile_over_time(duration, 0.5, 0.9)"#,
         ),
     ] {
         let plan = plan_for(&engine, q, base, now);
@@ -985,32 +1070,42 @@ async fn metrics_explain_and_budget_gates() {
             row.read_rows
         );
 
-        // …and the attribute form's semi-join still prunes on the
-        // (key, val) prefix, with time pruning isolated inside the dense
-        // env=prod prefix (the gate-2 discriminator).
+        // …and the attribute form still prunes on TIME, by the same rule
+        // its match-all control does (the gate-2 discriminator, retargeted
+        // onto the span table by issue #559).
         let attr_q = q.replace(
-            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
+            r#"{ resource.service.name = "checkout" }"#,
             r#"{ .env = "prod" }"#,
         );
+        let control_q = q.replace(r#"{ resource.service.name = "checkout" }"#, "{}");
+        let control = plan_for(&engine, &control_q, base, now);
         let full = plan_for(&engine, &attr_q, base, now);
         let narrow = plan_for(&engine, &attr_q, now - 30 * 60 * NS_PER_S, now);
-        let (full_sel, full_total) = table_primary_key_granules(
-            &explain_raw(&client, &extract_semi_join_subquery(full.range_sql())).await,
-            "trace_attrs_idx",
+        let (control_sel, control_total) = table_primary_key_granules(
+            &explain_raw(&client, control.range_sql()).await,
+            "trace_spans",
         );
+        let (full_sel, full_total) =
+            table_primary_key_granules(&explain_raw(&client, full.range_sql()).await, "trace_spans");
         let (narrow_sel, _) = table_primary_key_granules(
-            &explain_raw(&client, &extract_semi_join_subquery(narrow.range_sql())).await,
-            "trace_attrs_idx",
+            &explain_raw(&client, narrow.range_sql()).await,
+            "trace_spans",
         );
         assert!(
             full_sel <= full_total && full_sel > 0,
-            "{label}: the semi-join's prefix read must engage the attr primary key \
+            "{label}: the filtered statement must engage the span primary key \
              ({full_sel}/{full_total})"
+        );
+        assert_eq!(
+            (full_sel, full_total),
+            (control_sel, control_total),
+            "{label}: the attribute predicate must cost no granule on the span table \
+             ({full_sel}/{full_total} against the control {control_sel}/{control_total})"
         );
         assert!(
             narrow_sel < full_sel,
-            "{label}: the narrow window must prune strictly fewer granules within the SAME \
-             dense (key, val) prefix (narrow {narrow_sel} vs full {full_sel})"
+            "{label}: the narrow window must select strictly fewer granules \
+             (narrow {narrow_sel} vs full {full_sel})"
         );
     }
 
@@ -1361,6 +1456,92 @@ async fn metrics_explain_and_budget_gates() {
     assert!(
         range_probe_granules >= instant_probe_granules,
         "the range probe covers a strictly wider window, so it can never prune MORE granules          ({range_probe_granules} < {instant_probe_granules})"
+    );
+
+    // Issue #559 criterion 11: every fixture that writes `trace_attrs_idx`
+    // writes the span row's arrays too. The metrics filter reads the span
+    // row now, so a fixture that seeds only the index produces a query
+    // that matches nothing — and every gate above would then be measuring
+    // an empty answer. Last, so it sees every insert this test made.
+    pulsus_testkit::assert_stores_agree(&DB.to_string());
+}
+
+/// **Issue #559 criterion 6: the prune this change LOSES, pinned as an
+/// identity.**
+///
+/// `service_time` (migration id 45,
+/// `crates/pulsus-schema/src/catalog.rs:986-995`) holds 14 named columns
+/// and not `attr_key`/`attr_scope`/`attr_val`/`attr_num`. A metrics
+/// filter that carries an attribute condition reads those arrays, so the
+/// statement cannot be served from that projection and falls back to the
+/// base table — even when the SAME filter also carries the
+/// `resource.service.name` equality that used to select it.
+///
+/// Measured on a 2,000,000-span corpus, ClickHouse 26.3.29.7, on
+/// `{ resource.service.name = "checkout" && span.http.status_code >= 500 }
+/// | rate()`: `ReadFromMergeTree (service_time)` at `Granules: 31/245`
+/// becomes `ReadFromMergeTree (trace_spans)` at `245/245`. **This gate
+/// asserts the IDENTITY of the table read, never a byte or granule
+/// count**, because both of those are layout-specific and this corpus is
+/// not that one.
+///
+/// The remedy space was enumerated and is with the owner; the divergence
+/// is recorded in `docs/benchmarks/traces-differential-ledger.md` under
+/// `traceql-attribute-resolves-to-one-element`, whose fenced block names
+/// this function and is checked by
+/// `traces_metrics_ledger::the_projection_loss_entry_names_a_test_that_exists`.
+///
+/// Not its own `#[tokio::test]`: the corpus above is seeded once for the
+/// whole gate sequence, and a second `#[tokio::test]` would seed
+/// `CORPUS_SPANS` rows again to read one `EXPLAIN`.
+async fn metrics_attribute_filter_projection_loss_is_recorded(
+    engine: &TraceEngine,
+    client: &ChClient,
+    base: i64,
+    now: i64,
+) {
+    let plan = plan_for(
+        engine,
+        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | rate()"#,
+        base,
+        now,
+    );
+    // The hoist is still there — the loss is not that the PREWHERE went
+    // away, it is that the projection cannot serve the arrays beside it.
+    assert!(
+        plan.range_sql().contains("PREWHERE service = 'checkout'"),
+        "the service hoist survives:\n{}",
+        plan.range_sql()
+    );
+    assert!(
+        plan.range_sql().contains("arrayFirstIndex"),
+        "the attribute condition is read from the span row:\n{}",
+        plan.range_sql()
+    );
+    let raw = explain_raw(client, plan.range_sql()).await;
+    assert!(
+        raw.contains("ReadFromMergeTree") && !raw.contains("service_time"),
+        "a metrics filter carrying an attribute condition reads the BASE table: the \
+         service_time projection holds 14 named columns and not the attribute arrays, so \
+         the arrays force the base table even beside the service equality. If this gate \
+         fails because `service_time` is selected again, the projection gained those \
+         columns — say so in the ledger entry rather than deleting this:\n{raw}"
+    );
+    // Executed, and corroborated through query_log: `EXPLAIN` and the
+    // executed plan can differ, and it is the executed one the ledger row
+    // is about.
+    engine
+        .metrics_range(&plan)
+        .await
+        .expect("the combined filter still answers");
+    exec(client, "SYSTEM FLUSH LOGS").await;
+    let row = query_log_like(client, &["arrayFirstIndex", "PREWHERE service = \\'checkout\\'"])
+        .await
+        .expect("the combined filter's QueryFinish row must exist");
+    assert!(
+        row.projections.is_empty(),
+        "the executed statement must name no projection, got {:?}",
+        row.projections
     );
 }
 
