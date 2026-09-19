@@ -118,8 +118,15 @@ DECLARED=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$MANIFEST")
 if [ -n "$DECLARED" ]; then
   git cat-file -e "$DECLARED^{commit}" 2>/dev/null \
     || fail "the manifest records upstream revision $DECLARED, which is not in this clone"
-  [ "$(git rev-parse "$DECLARED^{commit}")" = "$(git rev-parse "$MERGED^{commit}")" ] \
-    || fail "the manifest records upstream revision $DECLARED; the commit graph says $MERGED"
+  # The record must be CONSISTENT with the derived revision, not equal to
+  # it. On a branch checkout the two are the same commit. On a
+  # pull-request checkout the derived revision is the base branch's
+  # current tip, which is at or ahead of the revision this change merged,
+  # because the base moves on without this branch. An ancestor test
+  # accepts that and still refuses the thing it is for: a record moved
+  # onto a commit of THIS change is not an ancestor of upstream.
+  git merge-base --is-ancestor "$DECLARED" "$MERGED" 2>/dev/null \
+    || fail "the manifest records upstream revision $DECLARED, which is not an ancestor of $MERGED; the commit graph says upstream is $MERGED"
 elif [ "$MERGED" != "$BASE" ]; then
   fail "the commit graph says upstream $MERGED was merged; the manifest records none"
 fi

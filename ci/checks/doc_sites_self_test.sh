@@ -80,9 +80,18 @@ copy_tree
 REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
   EXPECTED="$work/expected.txt" sh "$REPO/ci/checks/doc_sites.sh"
 
-upstream=$(git -C "$REPO" rev-list --merges --max-count=1 "$BASE..HEAD" | head -1)
+# The upstream parent of the FIXTURE. Taken from the manifest's record,
+# which is a fixture input here and not the thing under test: this leg
+# checks that the derivation picks the right PARENT given the shape, and
+# the attacks below check the record. Deriving it here instead would
+# duplicate the rule under test — and the first version did, which made
+# the leg build a merge with this change on both sides when CI's own HEAD
+# was already a merge.
+upstream=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$REPO/ci/checks/doc_sites.txt")
+# `HEAD` on a developer clone; a merge commit in CI. Overridable so the
+# CI shape can be reproduced locally, which is what was missing.
+selftest_head=$(git -C "$REPO" rev-parse "${SELFTEST_HEAD:-HEAD}")
 if [ -n "$upstream" ]; then
-  upstream=$(git -C "$REPO" rev-parse "$upstream^2")
   # The identity is supplied per command rather than taken from config:
   # a CI runner has none, and `commit-tree` refuses without one. It never
   # reaches a branch — the object is unreferenced and only its parents
@@ -91,7 +100,7 @@ if [ -n "$upstream" ]; then
     GIT_AUTHOR_EMAIL="self-test@invalid" \
     GIT_COMMITTER_NAME="doc-sites self-test" \
     GIT_COMMITTER_EMAIL="self-test@invalid" \
-    git -C "$REPO" commit-tree "HEAD^{tree}" -p "$upstream" -p HEAD \
+    git -C "$REPO" commit-tree "$selftest_head^{tree}" -p "$upstream" -p "$selftest_head" \
     -m "self-test: a pull-request-shaped merge, unreferenced") \
     || fail "could not build the pull-request-shaped merge commit"
   out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
@@ -99,8 +108,34 @@ if [ -n "$upstream" ]; then
         sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
     || fail "the pull-request checkout shape must pass: $out"
   echo "  $out (pull-request shape, HEAD is a merge whose FIRST parent is upstream)"
+
+  # And the same shape with the base branch moved on past the revision
+  # the manifest records, which is what a pull-request checkout looks
+  # like a few days later. The record has to be an ANCESTOR of the
+  # derived revision, not equal to it; an equality test passed the day it
+  # was written and would have failed on the first commit to the base
+  # branch after that.
+  ahead=$(GIT_AUTHOR_NAME="doc-sites self-test" \
+    GIT_AUTHOR_EMAIL="self-test@invalid" \
+    GIT_COMMITTER_NAME="doc-sites self-test" \
+    GIT_COMMITTER_EMAIL="self-test@invalid" \
+    git -C "$REPO" commit-tree "$upstream^{tree}" -p "$upstream" \
+    -m "self-test: the base branch moved on, unreferenced") \
+    || fail "could not build the moved-base commit"
+  moved_base=$(GIT_AUTHOR_NAME="doc-sites self-test" \
+    GIT_AUTHOR_EMAIL="self-test@invalid" \
+    GIT_COMMITTER_NAME="doc-sites self-test" \
+    GIT_COMMITTER_EMAIL="self-test@invalid" \
+    git -C "$REPO" commit-tree "$selftest_head^{tree}" -p "$ahead" -p "$selftest_head" \
+    -m "self-test: a pull-request merge onto a moved base, unreferenced") \
+    || fail "could not build the moved-base merge commit"
+  out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
+        EXPECTED="$work/expected.txt" HEADREV="$moved_base" \
+        sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
+    || fail "the pull-request shape with a moved base must pass: $out"
+  echo "  $out (pull-request shape, base branch ahead of the recorded revision)"
 else
-  fail "this clone has no merge since the frozen base, so the two shapes cannot be told apart"
+  fail "the manifest records no upstream revision, so the two shapes cannot be told apart"
 fi
 
 echo "self-test: a rewrite changed only in whitespace"
