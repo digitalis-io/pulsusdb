@@ -15,6 +15,26 @@
 //! than silently suppressed. `Retry-Attempt` forms no identity and matches
 //! nothing — it only labels the duplicate counter.
 //!
+//! ## What a digest collision would cost, and how likely it is
+//!
+//! Two distinct pushes whose 128-bit digests collided would make the second
+//! a "retry" of the first: it would store nothing and be answered with the
+//! first's outcome. The cost is bounded — one push, on one writer, inside
+//! one window — and a client that constructs a collision can only suppress
+//! its own next push, because the key is a digest of its own content.
+//!
+//! The accidental rate is the birthday bound over the live population,
+//! `n^2 / 2^129`, and the population is bounded by the claim table's
+//! reserved capacity rather than by anything written here. At the largest
+//! capacity the accepted knob range reaches — `3,670,016` claims, which
+//! `tests/a494_dedup_charge.rs` enumerates and prints — that is
+//! `1.98e-26`:
+//!
+//! ```text
+//!   python3 -c "n = 3670016; print(n*n / 2**129)"
+//!   -> 1.9790942390184744e-26
+//! ```
+//!
 //! # Why the memory bound is a construction check rather than arithmetic
 //!
 //! Three review rounds computed a population from a per-entry constant and
