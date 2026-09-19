@@ -159,9 +159,37 @@ awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up issue 999999)"; next 
 mv "$work/patched" "$work/tree/$rewrite_file"
 expect_fail "new issue number #999999"
 
+echo "self-test: a number the merged upstream head introduced is still not licensed"
+# The added-lines comparison runs against the merged upstream head, not
+# the base, so that main's own issue numbers are not reported as ones
+# this change invented. The hole that would open is "any number main
+# mentions is allowed". It is not: the allowed set is still the base's
+# protected blocks plus the `refs=` column, and a number this change puts
+# on a NEW line is caught whatever main says elsewhere in the file.
+#
+# The number is derived — present in the rewrite file at the merged head
+# and absent from it at the base — so the attack cannot go stale.
+copy_tree
+MERGEDREV=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$REPO/ci/checks/doc_sites.txt")
+if [ -n "$MERGEDREV" ] && [ "$MERGEDREV" != "$BASE" ]; then
+  git show "$BASE:$rewrite_file" | grep -oE '#[0-9]+' \
+    | LC_ALL=C sort -u > "$work/base.refs"
+  git show "$MERGEDREV:$rewrite_file" | grep -oE '#[0-9]+' \
+    | LC_ALL=C sort -u > "$work/merged.refs"
+  from_main=$(LC_ALL=C comm -13 "$work/base.refs" "$work/merged.refs" | head -1)
+  [ -n "$from_main" ] || fail "the merged head introduced no reference into $rewrite_file"
+  awk -v n="$rewrite_start" -v ref="$from_main" \
+    'NR == n { print $0 " (follow-up " ref ")"; next } { print }' \
+    "$work/tree/$rewrite_file" > "$work/patched"
+  mv "$work/patched" "$work/tree/$rewrite_file"
+  expect_fail "new issue number $from_main"
+else
+  fail "the manifest carries no merged upstream revision, so this attack cannot be run"
+fi
+
 echo "self-test: an empty manifest"
 copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-echo "doc-sites-self-test: nine attacks caught, the clean copy passed"
+echo "doc-sites-self-test: ten attacks caught, the clean copy passed"

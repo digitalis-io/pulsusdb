@@ -30,8 +30,9 @@
 #     not that it moved to something correct.
 #
 # Usage:
-#   REPO=<repository root> BASE=<revision> ROOT=<tree to check> \
-#   MANIFEST=<path> EXPECTED=<path> sh ci/checks/doc_sites.sh
+#   REPO=<repository root> BASE=<revision> MERGED=<revision> \
+#   ROOT=<tree to check> MANIFEST=<path> EXPECTED=<path> \
+#   sh ci/checks/doc_sites.sh
 set -eu
 REPO=${REPO:-$(git rev-parse --show-toplevel)}
 cd "$REPO"
@@ -65,8 +66,17 @@ BASE=${BASE:-$(awk '$1 == "#" && $2 == "base" { print $3; exit }' "$MANIFEST")}
 git cat-file -e "$BASE^{commit}" 2>/dev/null \
   || fail "the frozen base revision $BASE is not in this clone (fetch-depth)"
 
-tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp)
-trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
+# The upstream head this branch has merged, used by ONE check —
+# `check_issue_references`, which asks which lines this change added.
+# Absent, it is the base, which is the state before any merge. The ranges
+# every other check reads stay at `$BASE` whatever this says.
+MERGED=${MERGED:-$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$MANIFEST")}
+MERGED=${MERGED:-$BASE}
+git cat-file -e "$MERGED^{commit}" 2>/dev/null \
+  || fail "the merged upstream revision $MERGED is not in this clone (fetch-depth)"
+
+tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp); tmp_up=$(mktemp)
+trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_up" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
 
 sites=$(awk '$1 != "#" && NF { print $2 }' "$MANIFEST" | LC_ALL=C sort)
 dups=$(printf '%s\n' "$sites" | LC_ALL=C uniq -d)
@@ -202,9 +212,18 @@ check_issue_references() {
     ' "$MANIFEST" >> "$tmp_a"
     issue_refs "$tmp_a" > "$tmp_a.n" || true
 
-    # The lines this change ADDED to the file.
+    # The lines this change ADDED to the file, measured against the
+    # upstream head it has merged rather than against the base. A line
+    # main wrote is not a line this change added, and before this
+    # distinction existed the first merge of main reported main's own
+    # `#556` as an invented reference on `docs/architecture.md`.
+    if git cat-file -e "$MERGED:$file" 2>/dev/null; then
+      git show "$MERGED:$file" > "$tmp_up"
+    else
+      cp "$tmp_base" "$tmp_up"
+    fi
     diff --unchanged-line-format= --old-line-format= --new-line-format='%L' \
-      "$tmp_base" "$ROOT/$file" > "$tmp_b" || true
+      "$tmp_up" "$ROOT/$file" > "$tmp_b" || true
 
     for ref in $(issue_refs "$tmp_b"); do
       [ "$ref" = "#494" ] && continue

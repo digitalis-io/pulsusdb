@@ -3,6 +3,15 @@
 # rows are claims ABOUT that revision's sentences — a `leave` row says its
 # text is still there, and a `rewrite` row says its text is gone.
 # base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
+#
+# The upstream head this branch has MERGED. It is a different question
+# from the base and it answers a different check: `check_issue_references`
+# asks which lines THIS CHANGE added, and after a merge the lines main
+# brought in are not this change's. Diffing them against the base would
+# report main's own issue numbers as ones this change invented — it did,
+# on `docs/architecture.md`, the moment main was merged. The ranges above
+# still belong to `base`, which never moves.
+# merged 114c5d1969ab175f01f9a85975046017e5e4b159
 rewrite docs/schemas.md:174-174
 rewrite docs/schemas.md:1089-1089
 rewrite docs/architecture.md:378-378
