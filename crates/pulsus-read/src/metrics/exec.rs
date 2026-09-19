@@ -4771,6 +4771,14 @@ mod timestamp_run_cost {
     use super::*;
     use std::cell::Cell;
 
+    /// The three run lengths the gate measures. They are constants
+    /// because `the_sizes_can_tell_the_two_shapes_apart` asserts a
+    /// quadratic build would breach the bounds AT THESE SIZES; a size
+    /// changed here changes both tests together.
+    const N1: usize = 10_000;
+    const N2: usize = 20_000;
+    const N4: usize = 40_000;
+
     /// Samples examined while emitting one run of `n` at one millisecond,
     /// `distinct` of them carrying different values — read from the
     /// production counter, not from a stand-in.
@@ -4791,15 +4799,39 @@ mod timestamp_run_cost {
         RUN_SAMPLES_EXAMINED.with(Cell::get)
     }
 
+    /// The worst case: a run of `n` samples in which every one carries a
+    /// different value, so the run the scan would walk grows with the
+    /// input.
+    ///
+    /// It is a named function taking one argument rather than an entry in
+    /// a list of distinctness values, because a list is what a later edit
+    /// shortens. `distinct` is fixed to `n` in this one place.
+    fn examined_all_distinct(n: usize) -> u64 {
+        examined_for(n, n)
+    }
+
     /// Doubling the run must not quadruple the work.
     ///
-    /// **`ALL_DISTINCT` is the case that matters, and a gate without it
-    /// passes on a quadratic build.** The scan walks the samples already
-    /// EMITTED, so a run of ten thousand samples carrying a thousand
-    /// distinct values only ever scans a thousand — the cost grows with
-    /// the input only when the distinct values do. A first version of this
-    /// gate used a fixed thousand and stayed green with the indexing
-    /// removed.
+    /// **Only the all-distinct run can fail on a quadratic build, and
+    /// three things stop that case being weakened back out.** The scan
+    /// walks the samples already EMITTED, so a run of ten thousand
+    /// samples carrying a thousand distinct values never scans more than
+    /// a thousand: the cost grows with the input only when the distinct
+    /// values do. The first version of this gate used a fixed thousand at
+    /// every size and stayed green with the indexing removed.
+    ///
+    /// 1. The three measurements that matter are taken **outside any
+    ///    loop and from no list**, through [`examined_all_distinct`],
+    ///    which fixes `distinct = n` in one place. There is no
+    ///    distinctness parameter here for an edit to lower.
+    /// 2. [`examined_for`] asserts the run it built really emitted
+    ///    `distinct` samples, so a fixture that stopped being all-distinct
+    ///    fails there instead of passing quietly.
+    /// 3. [`the_sizes_can_tell_the_two_shapes_apart`] computes what a
+    ///    quadratic implementation would examine at `N1`, `N2` and `N4`
+    ///    and asserts those figures breach these same two bounds.
+    ///    Shrinking the sizes, or moving them closer together, reddens
+    ///    that test.
     ///
     /// The bound is deliberately loose — three times, not two — because
     /// the promotion from scan to set costs a constant that is visible at
@@ -4808,31 +4840,63 @@ mod timestamp_run_cost {
     /// times.
     #[test]
     fn a_long_timestamp_run_costs_no_more_than_linear() {
-        /// Every sample carries a different value, so the run the scan
-        /// would walk grows with the input.
-        const ALL_DISTINCT: usize = 0;
-        for distinct in [ALL_DISTINCT, 1usize, 2, 1_000] {
-            let at = |n: usize| {
-                if distinct == ALL_DISTINCT {
-                    n
-                } else {
-                    distinct
-                }
-            };
-            let a = examined_for(10_000, at(10_000));
-            let b = examined_for(20_000, at(20_000));
+        let a = examined_all_distinct(N1);
+        let b = examined_all_distinct(N2);
+        assert!(
+            b <= a * 3,
+            "all distinct: {a} samples examined for {N1} and {b} for {N2} — \
+             doubling the run more than tripled the work"
+        );
+        let c = examined_all_distinct(N4);
+        assert!(
+            c <= a * 6,
+            "all distinct: {a} samples examined for {N1} and {c} for {N4}"
+        );
+
+        // The low-distinctness runs are kept because they pin the rule's
+        // ANSWER at the shapes a dashboard actually sends. They are not
+        // the gate: none of them can fail on a quadratic build, because
+        // the run they emit never grows.
+        for distinct in [1usize, 2, 1_000] {
+            let a = examined_for(N1, distinct);
+            let b = examined_for(N2, distinct);
             assert!(
                 b <= a * 3,
-                "distinct={distinct}: {a} samples examined for 10,000 and {b} \
-                 for 20,000 — doubling the run more than tripled the work"
-            );
-            let c = examined_for(40_000, at(40_000));
-            assert!(
-                c <= a * 6,
-                "distinct={distinct}: {a} samples examined for 10,000 and {c} \
-                 for 40,000"
+                "distinct={distinct}: {a} samples examined for {N1} and {b} for {N2}"
             );
         }
+    }
+
+    /// The sizes the gate measures at must be able to fail on a quadratic
+    /// build.
+    ///
+    /// A build that scans the emitted run once per input row examines
+    /// `n(n-1)/2` samples — 49,995,000 at `N1` and 199,990,000 at `N2`,
+    /// which are the two figures round 2 of this issue's code review
+    /// measured from the quadratic code itself. If those figures did not
+    /// breach the bounds
+    /// [`a_long_timestamp_run_costs_no_more_than_linear`] applies, that
+    /// gate could not fail however bad the code was, and lowering `N2`
+    /// towards `N1` is how someone would arrive there without touching
+    /// the assertion.
+    #[test]
+    fn the_sizes_can_tell_the_two_shapes_apart() {
+        const fn quadratic(n: u64) -> u64 {
+            n * (n - 1) / 2
+        }
+        let a = quadratic(N1 as u64);
+        let b = quadratic(N2 as u64);
+        let c = quadratic(N4 as u64);
+        assert!(
+            b > a * 3,
+            "a quadratic build examines {a} at {N1} and {b} at {N2}: the \
+             doubling bound could not fail at these sizes"
+        );
+        assert!(
+            c > a * 6,
+            "a quadratic build examines {a} at {N1} and {c} at {N4}: the \
+             quadrupling bound could not fail at these sizes"
+        );
     }
 
     /// The figures themselves, for the record. Not an assertion: run with

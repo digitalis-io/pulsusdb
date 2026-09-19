@@ -487,6 +487,18 @@ const fn waiter_side_bytes(waiters: usize) -> u64 {
 /// the allocator handed out nothing further — is what catches memory
 /// reached by any route, including one this bound cannot see.
 ///
+/// **What makes a raw pointer fail to build today is not this assertion,
+/// and it can move.** [`PushDedup`] keeps its state as `Arc<Mutex<Core>>`
+/// and the index is shared across tasks, so `Core` — and with it
+/// [`ClaimEntry`] — has to be `Send`. `*mut u8` is not `Send`, so a raw
+/// pointer planted in the entry is rejected for THAT reason, with this
+/// `Copy` bound still satisfied. It is a consequence of where the state
+/// lives, not a guarantee designed here: take `Core` out from behind the
+/// `Mutex`, or stop sharing the index between threads, and the
+/// raw-pointer route compiles again. A `&'static [u8]` from `Box::leak`
+/// is `Send` and `Copy` and compiles now. The runtime leg named above is
+/// what catches either of them, and it is the only thing that does.
+///
 /// The waiter side is deliberately **not** under this rule: its map value
 /// is a `Vec`, which does own heap, and every byte it owns is charged per
 /// registration through [`WAITER_CHARGE_BYTES`] and measured against the
