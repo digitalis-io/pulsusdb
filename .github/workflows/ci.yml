@@ -638,6 +638,22 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test fingerprint_collision_live
 
+      # Issue #494: a client that retries a push after a network timeout
+      # used to store its entries or samples twice, so counting queries
+      # doubled while `rate` looked right. The check is the answer, on
+      # every reader — the raw range, the rollup, the volume endpoint and
+      # the pattern counts — plus a control with `PULSUS_INGEST_DEDUP=false`
+      # that must show the doubling. Reuses this job's 26.3 container.
+      #
+      # `--test-threads=1`: the suite spawns a server per test on fixed
+      # loopback ports, and one of its tests restarts a server on the same
+      # port with different settings.
+      - name: Live retried-push suppression answers (logs + metrics)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test push_dedup_live -- --test-threads=1
+
       # Issue #11: docs/schemas.md §9's "EXPLAIN indexes = 1 output for the
       # canonical queries is snapshot-tested" gate for the LogQL read path —
       # reuses this job's ClickHouse 26.3 container verbatim.
