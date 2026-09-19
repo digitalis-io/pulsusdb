@@ -27,7 +27,7 @@ docs/query-lowering.md	ast.rs:977	crates/pulsus-logql/src/ast.rs	977		prose	Bina
 docs/query-lowering.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
 docs/query-lowering.md	ast.rs:992	crates/pulsus-logql/src/ast.rs	992		prose	Variants
 docs/query-lowering.md	ast.rs:994	crates/pulsus-traceql/src/ast.rs	994		prose	Aggregate
-docs/query-lowering.md	catalog.rs:2106	crates/pulsus-schema/src/catalog.rs	2106		line	!static_tmpl(16).contains("status_message"),
+docs/query-lowering.md	catalog.rs:2180	crates/pulsus-schema/src/catalog.rs	2180		line	!static_tmpl(16).contains("status_message"),
 docs/query-lowering.md	catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	compile/fold.rs:246	crates/pulsus-read/src/compile/fold.rs	246		prose	set_provenance
 docs/query-lowering.md	compile/fold.rs:627	crates/pulsus-read/src/compile/fold.rs	627		line	pub struct Relation<L: Lang + ?Sized> {
