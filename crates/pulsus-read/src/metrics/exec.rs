@@ -2629,11 +2629,11 @@ pub(super) struct RunDedup {
     seen: HashSet<u64>,
 }
 
-/// Samples [`RunDedup::push_float`] has examined, counted under `cfg(test)`
-/// so the cost gate can read the quantity that was quadratic rather than a
-/// stand-in for it. A gate over the INPUT reads cannot see this at all:
-/// the scan it replaced walked the OUTPUT, so the input was read once
-/// either way.
+// Samples `RunDedup::push_float` has examined, counted under `cfg(test)`
+// so the cost gate can read the quantity that was quadratic rather than a
+// stand-in for it. A gate over the INPUT reads cannot see this at all: the
+// scan it replaced walked the OUTPUT, so the input was read once either
+// way.
 #[cfg(test)]
 thread_local! {
     pub(super) static RUN_SAMPLES_EXAMINED: std::cell::Cell<u64> =
@@ -2702,6 +2702,11 @@ impl RunDedup {
 /// contract). Stale markers are PRESERVED here (not filtered) so
 /// `windowed_non_stale`/`staleness` own staleness exactly as the float path
 /// does today.
+///
+/// The one-shot form, used by the tests that exercise a single series.
+/// Production groups many series and threads one [`RunDedup`] through them
+/// all, which is [`merge_series_with`].
+#[cfg(test)]
 fn merge_series<F: FloatPoint, H: HistPoint>(
     float: &[F],
     hist: &[H],
