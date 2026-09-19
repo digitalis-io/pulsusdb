@@ -4764,9 +4764,31 @@ mod timestamp_run_cost {
     //!
     //! **The gate below counts, it does not time.** A wall-clock assertion
     //! would flake on a shared machine and says nothing scale-invariant;
-    //! the count is the thing that was quadratic, and it is read through
-    //! the production function by a `FloatPoint` that counts every read of
-    //! its own value.
+    //! the count is the thing that was quadratic. It is read from
+    //! [`RUN_SAMPLES_EXAMINED`], a `cfg(test)` counter [`RunDedup`]
+    //! increments on both of its branches. (An earlier version of this
+    //! paragraph said the count came from a value type that counted its
+    //! own reads. It never did: the scan walks the emitted [`Sample`]s,
+    //! which are production values the test cannot substitute.)
+    //!
+    //! **What the counter itself is checked against.** A counter is only
+    //! evidence if it counts everything, and nothing in the ratio
+    //! assertions would notice a missing `count_examined` call — deleting
+    //! one makes every figure smaller in the same proportion, which is
+    //! what those assertions compare. So
+    //! [`the_counter_matches_the_closed_form_the_two_branches_give`]
+    //! asserts the exact total, derived on paper from the two branches
+    //! rather than measured:
+    //!
+    //! ```text
+    //!   sample i (0-based), all values distinct, one millisecond:
+    //!     i = 0 ..= L        len = i <= L   linear branch, scans i
+    //!                                       -> sum = L(L+1)/2
+    //!     i = L+1            len > L, set empty: promotion scans len = L+1,
+    //!                                       then one lookup -> L+2
+    //!     i = L+2 ..= n-1    one lookup each  -> n - L - 2
+    //!   total = L(L+1)/2 + n,    L = RUN_LINEAR_MAX
+    //! ```
 
     use super::*;
     use std::cell::Cell;
@@ -4876,6 +4898,35 @@ mod timestamp_run_cost {
             assert!(
                 b <= a * 3,
                 "distinct={distinct}: {a} samples examined for {N1} and {b} for {N2}"
+            );
+        }
+    }
+
+    /// The counter counts every sample the rule examines.
+    ///
+    /// **This is the gate on the instrument, and the ratio assertions
+    /// cannot be it.** They compare three figures produced by the same
+    /// counter, so a `count_examined` call that is deleted, or a counter
+    /// that stops counting altogether, moves all three together and they
+    /// stay green: at zero, `0 <= 0 * 3` holds. The closed form above is
+    /// derived from the two branches of [`RunDedup::push_float`] and from
+    /// [`RUN_LINEAR_MAX`], so it pins the total rather than a ratio, and
+    /// it moves when the constant moves.
+    ///
+    /// Measured against it: 10,036 / 20,036 / 40,036 at the three
+    /// lengths, which is `8 * 9 / 2 + n`.
+    #[test]
+    fn the_counter_matches_the_closed_form_the_two_branches_give() {
+        let l = RUN_LINEAR_MAX as u64;
+        for n in [N1, N2, N4] {
+            let expected = l * (l + 1) / 2 + n as u64;
+            assert_eq!(
+                examined_all_distinct(n),
+                expected,
+                "a run of {n} all-distinct samples examines L(L+1)/2 + n with \
+                 L = RUN_LINEAR_MAX = {l}; a figure that is not this one means \
+                 a branch of RunDedup::push_float is not counted, and the ratio \
+                 assertions cannot see that"
             );
         }
     }
