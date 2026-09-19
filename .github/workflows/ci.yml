@@ -123,6 +123,14 @@ jobs:
       # same tree gives `7480 passed` with the gate absent. Run the
       # workspace without the gate, and the live suites in their own steps
       # below, which is what this file does.
+      #
+      # **The working directory must be writable**, which is the other half
+      # of the same sentence. The writer's spool root is `./spool`,
+      # relative to the process working directory, and the committed writer
+      # tests create it: in a read-only tree this command printed
+      # `7200 passed, 1 failed` where a writable copy of the same source
+      # printed `7486 passed`. Issue #558 traced the same failure to the
+      # same place.
       - name: Test
         run: ci/test-summary.sh run workspace --workspace
 

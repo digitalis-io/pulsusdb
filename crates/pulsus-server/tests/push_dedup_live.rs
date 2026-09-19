@@ -51,6 +51,12 @@
 //! the gate absent. `.github/workflows/ci.yml` encodes the same split, and
 //! `--test-threads=1` here because one test restarts a server on its own
 //! port with different settings.
+//!
+//! **And the working directory must be writable.** The writer's spool root
+//! is `./spool`, relative to the process working directory, so the
+//! committed writer tests create a directory: in a read-only tree the
+//! workspace command printed `7200 passed, 1 failed` where a writable copy
+//! of the same source printed `7486 passed`.
 
 #[path = "support/live_db.rs"]
 mod live_db;
