@@ -67,10 +67,32 @@ rewrite_start=${first_rewrite#*:}; rewrite_start=${rewrite_start%%-*}
 leave_file=${first_leave%%:*}
 leave_start=${first_leave#*:}; leave_start=${leave_start%%-*}
 
-echo "self-test: the clean copy must pass"
+# The two checkout shapes the derivation has to tell apart. A merge made
+# on the branch puts upstream in the SECOND parent; a pull-request
+# checkout builds a merge whose FIRST parent is the base branch and whose
+# second is this change. The first shape is whatever this clone is; the
+# second is built here with `git commit-tree`, because the derivation
+# shipped wrong once by being green in the first shape and picking this
+# change itself in the second. The object is unreferenced and costs one
+# loose object per run.
+echo "self-test: the clean copy must pass, in both checkout shapes"
 copy_tree
 REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
   EXPECTED="$work/expected.txt" sh "$REPO/ci/checks/doc_sites.sh"
+
+upstream=$(git -C "$REPO" rev-list --merges --max-count=1 "$BASE..HEAD" | head -1)
+if [ -n "$upstream" ]; then
+  upstream=$(git -C "$REPO" rev-parse "$upstream^2")
+  synthetic=$(git -C "$REPO" commit-tree "HEAD^{tree}" -p "$upstream" -p HEAD \
+    -m "self-test: a pull-request-shaped merge, unreferenced")
+  out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
+        EXPECTED="$work/expected.txt" HEADREV="$synthetic" \
+        sh "$REPO/ci/checks/doc_sites.sh" 2>&1) \
+    || fail "the pull-request checkout shape must pass: $out"
+  echo "  $out (pull-request shape, HEAD is a merge whose FIRST parent is upstream)"
+else
+  fail "this clone has no merge since the frozen base, so the two shapes cannot be told apart"
+fi
 
 echo "self-test: a rewrite changed only in whitespace"
 copy_tree

@@ -86,18 +86,28 @@ git cat-file -e "$BASE^{commit}" 2>/dev/null \
 # this change's own file, so no upstream commit has it.** The first
 # parent whose tree does not carry the manifest is upstream.
 HEADREV=${HEADREV:-HEAD}
+# The TRACKED path of the manifest, which is what the probe below asks
+# about. Deliberately NOT `$MANIFEST`: the self-test runs the check
+# against a copy in a temporary directory, and asking `git` for a path
+# outside the repository fails for every revision, which makes every
+# parent look like upstream and picks the first one tried. That is how
+# this derivation shipped wrong once — green locally, wrong in CI, where
+# the checkout puts this change in the second parent.
+MANIFEST_IN_TREE=ci/checks/doc_sites.txt
+
 derive_merged() {
   newest=$(git rev-list --merges --max-count=1 "$BASE..$HEADREV" 2>/dev/null)
   [ -n "$newest" ] || { echo "$BASE"; return; }
-  manifest_rel=${MANIFEST#"$REPO"/}
+  git cat-file -e "$HEADREV:$MANIFEST_IN_TREE" 2>/dev/null \
+    || fail "$MANIFEST_IN_TREE is not tracked at $HEADREV, so upstream cannot be told from this change"
   for side in 2 1; do
     parent=$(git rev-parse --verify --quiet "$newest^$side") || continue
-    if ! git cat-file -e "$parent:$manifest_rel" 2>/dev/null; then
+    if ! git cat-file -e "$parent:$MANIFEST_IN_TREE" 2>/dev/null; then
       echo "$parent"
       return
     fi
   done
-  echo "$BASE"
+  fail "both parents of merge $newest carry $MANIFEST_IN_TREE, so neither can be identified as upstream"
 }
 MERGED=${MERGED:-$(derive_merged)}
 git cat-file -e "$MERGED^{commit}" 2>/dev/null \
