@@ -1372,3 +1372,154 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {QM_DB}")).await;
 }
+
+// ============================================================================
+// Issue #559: the `IN`-set budget still bites, on the read that still
+// builds an `IN` set.
+//
+// Until this change the metrics FILTER lowered an attribute condition to
+// `(trace_id, span_id) IN (SELECT … FROM trace_attrs_idx …)` under
+// `max_rows_in_set` / `max_bytes_in_set` with `set_overflow_mode =
+// 'throw'`, and that is what `traces_metrics_explain`'s gate 4 exercised.
+// The filter now reads the span row and builds no set, so that gate's
+// subject is gone.
+//
+// The constants and the settings did NOT go with it. The NARROWED
+// tag-values read carries the same `metrics_settings` and keeps its own
+// `(trace_id, span_id) IN (…)` over the span table — deliberately, it is
+// out of issue #559's scope — so the refusal keeps a live test here.
+// ============================================================================
+
+static SET_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_setbudget_it");
+
+/// Spans the narrowing term admits, chosen to put the `IN` set past
+/// `TRACE_METRICS_MAX_SET_BYTES` (64 MiB) while staying well under
+/// `TRACE_METRICS_MAX_SET_ROWS` (1,000,000) — so the BYTE ceiling is what
+/// binds, which is what the metrics route's own boundary was measured at:
+/// 524,288 matching spans answered and 524,289 did not.
+const SET_BUDGET_SPANS: u64 = 700_000;
+
+fn set_budget_config() -> TraceReadConfig {
+    TraceReadConfig {
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+        spans_table: "trace_spans".to_string(),
+        attrs_table: "trace_attrs_idx".to_string(),
+        edges_table: "trace_edges".to_string(),
+        max_candidates: 100_000,
+        scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
+        max_series: 1_000,
+        generator_max_memory_bytes: 536_870_912,
+        distributed: false,
+        skip_unavailable_shards: false,
+    }
+}
+
+/// **Issue #559 criterion 10: the `IN`-set budget is still enforced, and
+/// still by code 191.**
+///
+/// The narrowed tag-values read builds its set from the span table under
+/// the same `metrics_settings` the metrics route carries. Seeding more
+/// matching spans than the byte ceiling admits must make the read FAIL
+/// rather than silently answer a subset — a truncated set would return
+/// values for some spans and not others with nothing saying so.
+///
+/// **What it asserts, and what it deliberately does not.** It asserts the
+/// server error and its code. It does not assert a
+/// `TooBroadReason::TraceMetricsSetRows`, because this read goes through
+/// `map_trace_read_error`, which does not map 191 — that mapping belongs
+/// to the metrics reads and issue #559 leaves both the mapper and this
+/// read alone. Asserting a reason this path does not produce would pin a
+/// claim the code does not keep.
+///
+/// *RED when:* the set limits stop being carried on this read. Verified
+/// by raising `max_bytes_in_set` past the set's size on the same corpus:
+/// the read then answers and the `expect_err` fails.
+#[tokio::test]
+async fn the_narrowed_tag_values_read_still_refuses_an_oversized_in_set() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see this file's module docs)");
+        return;
+    }
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {SET_DB}")).await;
+    run_init(&admin, &test_ctx(&SET_DB))
+        .await
+        .expect("run_init");
+
+    let mut cfg = test_config();
+    cfg.database = SET_DB.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+
+    let base_ns = span_base_ns();
+    // Every span carries the same service, so the narrowing term admits
+    // all of them and the set is the whole corpus.
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
+             SELECT reinterpretAsFixedString(cityHash64(number)), \
+                    reinterpretAsFixedString(toUInt64(number)), \
+                    reinterpretAsFixedString(toUInt64(0)), \
+                    'op', 'svc-wide', \
+                    {base_ns} + number * 100, 1500000, 1, 2, 0, '', \
+                    ['wide'], ['span'], [concat('v', toString(number % 1000))], \
+                    ['string'], [NULL] \
+             FROM numbers({SET_BUDGET_SPANS})",
+            db = &*SET_DB
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_attrs_idx \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
+             SELECT toDate(fromUnixTimestamp64Nano({base_ns})), \
+                    'wide', concat('v', toString(number % 1000)), 'span', 'string', NULL, \
+                    {base_ns}, \
+                    reinterpretAsFixedString(cityHash64(number)), \
+                    reinterpretAsFixedString(toUInt64(number)), \
+                    1500000 \
+             FROM numbers({SET_BUDGET_SPANS})",
+            db = &*SET_DB
+        ),
+    )
+    .await;
+
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = SET_DB.to_string();
+            ChClient::new(cfg).await.expect("connect engine client")
+        },
+        set_budget_config(),
+    );
+    let req = pulsus_read::TagValuesRequest {
+        q: Some(r#"{resource.service.name="svc-wide"}"#),
+        start_ns: base_ns,
+        end_ns: base_ns + (SET_BUDGET_SPANS as i64) * 100 + 1,
+    };
+    let err = engine
+        .list_tag_values("wide", Some("span"), req)
+        .await
+        .expect_err(
+            "the narrowed read builds an IN set over every admitted span; past \
+             max_bytes_in_set it must throw rather than answer a silent subset",
+        );
+    let ReadError::Clickhouse(pulsus_clickhouse::ChError::Server { code, .. }) = &err else {
+        panic!("expected a server error carrying the set-limit code, got {err:?}");
+    };
+    assert_eq!(
+        *code, 191,
+        "the refusal must be SET_SIZE_LIMIT_EXCEEDED — that code is what \
+         TRACE_METRICS_MAX_SET_ROWS/BYTES and set_overflow_mode = 'throw' produce, and it is \
+         the one this project's constants exist to raise. Got {err:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {SET_DB}")).await;
+}

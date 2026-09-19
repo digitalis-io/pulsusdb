@@ -612,10 +612,10 @@ async fn metrics_explain_and_budget_gates() {
     // default and counted over span rows alone rather than span rows PLUS
     // index rows. Strictly more permissive on both dimensions.
     //
-    // The 191 mapping, the two constants and the 422 wording are
-    // unchanged and still reachable: the narrowed tag-values read builds
-    // its own `IN` set under the same settings, and
-    // `traces_tags_live::narrowed_tag_values_past_the_set_budget_are_422`
+    // The 191 refusal, the two constants and the settings are unchanged
+    // and still reachable: the NARROWED tag-values read builds its own
+    // `IN` set under the same `metrics_settings`, and
+    // `traces_tags_explain::the_narrowed_tag_values_read_still_refuses_an_oversized_in_set`
     // is the live test for it.
     let bulk_rows = TRACE_METRICS_MAX_SET_ROWS + 50_000;
     let bulk_spread = WINDOW_NS / bulk_rows as i64;
