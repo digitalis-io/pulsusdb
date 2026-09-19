@@ -9,7 +9,8 @@ FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -22,7 +23,8 @@ FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -37,7 +39,8 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -56,7 +59,8 @@ SELECT t, countIf(is_sel = 0) AS base_total, countIf(is_sel) AS sel_total
 FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -75,7 +79,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
@@ -88,7 +93,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
@@ -103,7 +109,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
@@ -126,7 +133,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -139,7 +147,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -154,7 +163,8 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -175,7 +185,8 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
     FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
       FROM trace_spans
       PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -187,7 +198,8 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
     FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
       FROM trace_spans
       PREWHERE service = 'checkout'
   WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001

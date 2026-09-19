@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 27)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 28)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -388,7 +388,50 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 2
 /// move — `traces_search_explain.rs`'s
 /// `the_probe_columns_keep_the_hydration_reads_index_selection` gates
 /// that as an identity rather than leaving it as this sentence.
-const PINNED_SQL_CORPUS: u64 = 0x761b_5084_8cc7_3957;
+///
+/// **Moved on issue #559: 99 -> 100 entries. One `traces_metrics` golden
+/// ADDED, 13 `traces_metrics` goldens and 1 `traces_search` golden
+/// MODIFIED, none removed.** The metrics route's attribute condition
+/// stops being a semi-join against `trace_attrs_idx` and becomes the same
+/// locate-then-test column on the span row the search route's hydration
+/// statement already carried, so the two routes answer a span that
+/// repeats a key the same way:
+///
+/// ```text
+/// -  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx
+/// -      WHERE date >= … AND timestamp_ns >= … AND key = 'http.status_code'
+/// -        AND val_num >= 500 AND scope = 'span')
+///
+/// +WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span',
+/// +                     attr_key, attr_scope) AS pi0
+///  SELECT …
+///  FROM trace_spans
+///  WHERE timestamp_ns >= … AND timestamp_ns < …
+/// +  AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
+/// ```
+///
+/// The 13 metrics stems are every case whose filter carries an attribute
+/// condition; the 14 that do not are byte-identical, which is the check
+/// that the no-locator render is the pre-#559 statement rather than a
+/// statement that merely looks like it. The one search golden is
+/// `spanset_by_service.sql`, whose `== by() cardinality probe ==` section
+/// is built by `metrics_sql::compile_filter_bool`: it counts the spans a
+/// `| by()` search would return, so leaving it on the index would make
+/// the preflight disagree with the search it guards.
+///
+/// The added file is `traces_metrics/compare_outer_attr.sql`, the one
+/// shape whose outer filter and selection predicate both declare
+/// locators into a single statement (`pi0` and `cpi0`).
+///
+/// No `PREWHERE`, `GROUP BY`, `ORDER BY`, `LIMIT` or window bound moved
+/// in any of the 14 modified files — the `WITH` item is a declaration and
+/// the test replaces one `WHERE` conjunct with another. Part and granule
+/// selection DOES move for a filter carrying an attribute condition,
+/// because `service_time` does not hold the attribute arrays; that is
+/// gated as an identity by `traces_metrics_explain.rs`'s
+/// `metrics_attribute_filter_projection_loss_is_recorded` and recorded in
+/// the differential ledger, not left as this sentence.
+const PINNED_SQL_CORPUS: u64 = 0xd37b_c330_eec1_a16c;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -520,7 +563,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 99, "the frozen SQL corpus is 72 + 27 = 99 entries");
+    assert_eq!(total, 100, "the frozen SQL corpus is 72 + 28 = 100 entries");
 }
 
 #[test]
@@ -565,7 +608,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 99 frozen SQL corpus entries — 98 SQL files and one JSON file — changed. This is \
+        "the 100 frozen SQL corpus entries — 99 SQL files and one JSON file — changed. This is \
          not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
@@ -603,9 +646,14 @@ fn golden_root() -> PathBuf {
 /// The six committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a seventh file anywhere in the tree fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 7] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
+    // Issue #559 added this comparison golden; a comparison cross-tab
+    // joins the attribute enumeration onto the span rows, which is the
+    // same shape the two `compare_status*` goldens already carry and
+    // which this change does not touch.
+    "traces_metrics/compare_outer_attr.sql",
     "traces_metrics/compare_status.sql",
     "traces_metrics/compare_status_window.sql",
     "traces_metrics_base/compare_status.sql",
@@ -613,7 +661,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
 ];
 
 /// ADR 0008: **no statement the compile core plans may contain a join**,
-/// and the six committed goldens that carry one, pinned by name.
+/// and the seven committed goldens that carry one, pinned by name.
 ///
 /// # The ADR's rule sentence is wider than the decision it records, and this test does not change it
 ///
@@ -622,7 +670,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
 /// added on 2026-09-02 is written without that qualifier — "no emitted
 /// SQL may contain a join until this ADR is amended to name the clause"
 /// (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`,
-/// the same claim in the summary at line 11). Six committed goldens
+/// the same claim in the summary at line 11). Seven committed goldens
 /// carry a join today and **none is planned by the compile core**:
 ///
 /// ```text
@@ -630,14 +678,14 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
 /// traces_graph/clustered_local_join.sql          service_graph_sql                 current
 /// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN
 ///                                                at 109) — one join line each
-/// traces_metrics/compare_status.sql              metrics_compare_sql               current
-/// traces_metrics/compare_status_window.sql       (metrics_sql.rs:1189, LEFT JOIN
-///                                                at 1253 and INNER JOIN at 1257)
-///                                                for six of the seven join lines,
-///                                                and metrics_compare_exemplar_
-///                                                range_sql (metrics_sql.rs:1380,
-///                                                INNER JOIN at 1425) for the
-///                                                seventh
+/// traces_metrics/compare_outer_attr.sql          metrics_compare_sql               current
+/// traces_metrics/compare_status.sql              (metrics_sql.rs:1337, LEFT JOIN
+/// traces_metrics/compare_status_window.sql       at 1406 and INNER JOIN at 1410)
+///                                                for six of the seven join lines
+///                                                in each file, and
+///                                                metrics_compare_exemplar_range_
+///                                                sql (metrics_sql.rs:1533, INNER
+///                                                JOIN at 1583) for the seventh
 /// traces_metrics_base/compare_status.sql         metrics_compare_sql AS IT STOOD   HISTORIC
 /// traces_metrics_base/compare_status_window.sql  AT 2f78c53 — four join lines,
 ///                                                no exemplars section, so the
@@ -647,34 +695,39 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
 ///
 /// The two `traces_metrics_base/` files are the pre-#477 copies: each is
 /// byte-identical to `git show 2f78c53:crates/pulsus-read/tests/golden/
-/// traces_metrics/<same name>`, and no test regenerates them. They are
-/// not unmoored from today's builder, though:
-/// `every_instant_side_section_is_byte_identical_to_base` asserts the
-/// `compare series probe` section — two of their four join lines — is
-/// byte-identical to the current file's, and
-/// `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
-/// asserts the cross-tab section inverts to the base bytes under three
-/// timestamp substitutions, none of which touches a `JOIN` line.
+/// traces_metrics/<same name>`, and no test regenerates them.
 ///
-/// All six come from hand-written builders on routes the compile core
+/// **Since issue #559 nothing ties those two files to today's builder,
+/// and that is a loss, stated rather than glossed.** Until then
+/// `every_instant_side_section_is_byte_identical_to_base` and
+/// `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
+/// (`tests/traces_metrics_sql.rs`) held the comparison sections against
+/// the current file's. Issue #559 moves the metrics attribute filter onto
+/// the span row, so both comparison cases' statements move on both axes —
+/// which is the change — and both cases left those two tests' domain.
+/// `traces_metrics_base/` is not in `CORPORA`, so the digest above does
+/// not reach it either: **nothing pins those two files' bytes**, and this
+/// list is the record that they exist and why.
+///
+/// All seven come from hand-written builders on routes the compile core
 /// classifies `Never` — `NotASearchLinkLower::capability`
-/// (`crates/pulsus-read/src/traces/compile.rs:1188-1196`) — so they are
+/// (`crates/pulsus-read/src/traces/compile.rs:1369-1376`) — so they are
 /// not lowered pipelines and the decision never reached them.
-/// `service_graph_sql` is called at `traces/exec.rs:1693` and nowhere
+/// `service_graph_sql` is called at `traces/exec.rs:1774` and nowhere
 /// else; `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
-/// only at `traces/metrics_plan.rs:607/619/631/646`. The sentence
+/// only at `traces/metrics_plan.rs:627/639/651/666`. The sentence
 /// reaches further than the decision it records: a drafting fault in the
 /// record, not shipped code breaking a rule. **The wording belongs to
 /// the amendment round ADR 0008 already reserves.** This test enforces
 /// the rule the ADR can mean — zero joins in the corpus the compiled
-/// search route freezes — and pins the six by name so a seventh anywhere
-/// in the tree fails. `docs/query-lowering.md` §9.8 carries the same
-/// record.
+/// search route freezes — and pins the seven by name so an eighth
+/// anywhere in the tree fails. `docs/query-lowering.md` §9.8 carries the
+/// same record.
 ///
 /// # Why this walks the golden root and not `CORPORA`
 ///
 /// Written over `CORPORA` this gate would be red on day one:
-/// `traces_metrics/` holds two of the six. And two more sit in
+/// `traces_metrics/` holds three of the seven. And two more sit in
 /// `traces_metrics_base/`, which is not in `CORPORA` at all, so the
 /// digest gate above cannot see them either.
 ///
@@ -735,11 +788,11 @@ fn no_planned_search_statement_contains_a_join() {
     with_a_join.sort();
     assert_eq!(
         with_a_join, JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS,
-        "the joins outside the compiled search corpus are exactly these six; a seventh means a \
+        "the joins outside the compiled search corpus are exactly these seven; an eighth means a \
          builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 126,
+        scanned, 127,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
     assert!(
