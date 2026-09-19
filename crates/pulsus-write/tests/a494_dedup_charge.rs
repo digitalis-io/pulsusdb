@@ -253,6 +253,28 @@ fn every_reserved_size_the_accepted_range_produces_matches_the_allocator() {
             "{part:?}: the allocator handed out {resident} bytes at construction, \
              the model says {construction}"
         );
+
+        // **Admitting claims must allocate nothing at all.** Construction
+        // equality alone cannot see it: memory an ENTRY owns raises no slot
+        // count and moves no `size_of`, so a `Box<[u8]>` field would sit
+        // entirely outside the model with every figure above still exact.
+        // (Round 1 of this issue's code review measured that: knob
+        // 1,048,576, model 956,856, allocator 2,709,944.)
+        //
+        // A fixed sample of admissions at every partition is the right
+        // shape rather than a compromise: the table is reserved once and
+        // never rehashes, and `assert_owns_no_heap` makes the entry type
+        // heap-free, so "one admission allocates nothing" is a property of
+        // the TYPES, not of the capacity. The full-capacity fill below is
+        // what checks the other half — that the table really does not grow
+        // when filled to the capacity it reports.
+        let sample = SAMPLE_ADMISSIONS.min(claims);
+        let ((), admitting) = resident_over(|| admit_n(&index, 0, sample));
+        assert_eq!(
+            admitting, 0,
+            "{part:?}: admitting {sample} claims allocated {admitting} bytes — \
+             the claim table grew, or an entry owns memory the model cannot see"
+        );
         drop(index);
     }
     // Reported so a reader can see what the range actually contains, and
@@ -332,6 +354,79 @@ fn a_knob_inside_a_partition_is_bounded_by_the_partition() {
         );
         drop(index);
     }
+}
+
+/// How many claims each partition admits under the allocator. Large enough
+/// that a per-entry allocation of any plausible size is far above the
+/// zero this asserts, small enough that thirty-one partitions stay fast.
+const SAMPLE_ADMISSIONS: usize = 512;
+
+/// Admits `count` distinct claims, each with one target, sealed. Every
+/// value here is on the stack or inside the index's reserved collections,
+/// so a nonzero resident delta over this call is the index allocating.
+fn admit_n(index: &std::sync::Arc<PushDedup>, first: u128, count: usize) {
+    for i in 0..count as u128 {
+        let key = PushDigest::from_raw(first + i);
+        let id = PushIdentity {
+            key,
+            content: key,
+            declared_retry: false,
+        };
+        match index.admit(id, WaitMode::None) {
+            Admission::Admit(mut guard) => {
+                guard.note_target(true);
+                guard.seal();
+            }
+            other => panic!("claim {i} must admit, got {other:?}"),
+        }
+    }
+}
+
+/// **The table filled to the capacity it reports allocates nothing.**
+///
+/// The per-partition leg admits a fixed sample; this one fills the floor
+/// knob's table to its last slot and then asks for one more. Together they
+/// say: no admission allocates, and the reserved capacity is really the
+/// capacity — the table does not rehash at 7/8 load, and the next push
+/// past it sheds rather than growing.
+#[test]
+fn a_claim_table_filled_to_its_reported_capacity_allocates_nothing() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let (index, construction) = resident_over(|| index_at(knob));
+    let claims = index.capacities().claims;
+
+    let ((), filling) = resident_over(|| admit_n(&index, 0, claims));
+    assert_eq!(
+        filling, 0,
+        "filling the table to its reported capacity of {claims} allocated \
+         {filling} bytes"
+    );
+    assert!(
+        construction <= knob,
+        "and the whole thing stays inside the knob: {construction} against {knob}"
+    );
+
+    // One past capacity: the table sheds rather than growing, so the
+    // reserved figure is the real bound and not a soft target.
+    let over = PushDigest::from_raw(u128::MAX);
+    let ((), shedding) = resident_over(|| {
+        assert!(
+            matches!(
+                index.admit(
+                    PushIdentity {
+                        key: over,
+                        content: over,
+                        declared_retry: false,
+                    },
+                    WaitMode::None,
+                ),
+                Admission::Shed
+            ),
+            "a full table of unsettled claims must shed"
+        );
+    });
+    assert_eq!(shedding, 0, "and shedding allocates nothing either");
+    assert_eq!(index.snapshot().shed_total, 1);
 }
 
 /// One blocked sync caller, held exactly as the writer holds it: the guard
