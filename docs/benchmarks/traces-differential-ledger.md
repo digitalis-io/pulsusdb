@@ -1061,7 +1061,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
   honest, because element `0` of a `String` array reads `''` and
   `ifNull(attr_num[0], 0)` reads `0`. Frozen live by
   `a_metrics_attribute_condition_tests_the_element_the_span_resolves_to`
-  (`crates/pulsus-server/tests/traces_metrics_answer_live.rs`).
+  (`crates/pulsus-server/tests/traces_search_live.rs`), which asserts each row
+  on BOTH routes against one window.
 
 - **What issue #559 cost, and it is a cost rather than a wash.** The
   `service_time` projection holds 14 named columns and not the attribute
