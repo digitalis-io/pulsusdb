@@ -1080,6 +1080,10 @@ impl Core {
                 break;
             }
             self.open_order.pop_front();
+            // A tombstone is deliberately NOT counted as evictable: the
+            // counter and `ClaimState::is_evictable` must agree, or the
+            // cap-pressure walk short-circuits on a table it could in fact
+            // evict from.
             entry.state = ClaimState::Unknown;
             entry.outcome = Some(ClaimOutcome::Failed);
             aged += 1;

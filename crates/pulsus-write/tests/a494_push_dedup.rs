@@ -448,6 +448,33 @@ async fn a_lone_retry_attempt_header_is_stored() {
     );
 }
 
+/// Two DIFFERENT bodies, both carrying `Retry-Attempt: 1`, are two pushes.
+/// The header matches nothing, so it cannot make one body stand for
+/// another — which is what treating it as a key would do.
+#[tokio::test]
+async fn two_different_bodies_declaring_a_retry_are_two_pushes() {
+    let declared = || PushHeaders {
+        idempotency_key: None,
+        declared_retry: true,
+    };
+    let samples = MockInserter::new(Behavior::Ok);
+    let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
+
+    for body in ["first line", "second line"] {
+        let wait = writer
+            .admit_flush(batch(70, body, T, true), declared())
+            .expect("queue has room");
+        wait.await.expect("the flush settles");
+    }
+    writer.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(
+        samples.rows_inserted(),
+        2,
+        "the retry marker is never a suppression key"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_declared_total, 0);
+}
+
 /// And when a suppression really happens, the `declared` dimension is the
 /// one that moves.
 #[tokio::test]
