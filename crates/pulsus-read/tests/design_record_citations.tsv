@@ -28,6 +28,7 @@ docs/query-lowering.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	Span
 docs/query-lowering.md	ast.rs:992	crates/pulsus-logql/src/ast.rs	992		prose	Variants
 docs/query-lowering.md	ast.rs:994	crates/pulsus-traceql/src/ast.rs	994		prose	Aggregate
 docs/query-lowering.md	catalog.rs:2180	crates/pulsus-schema/src/catalog.rs	2180		line	!static_tmpl(16).contains("status_message"),
+docs/query-lowering.md	catalog.rs:2231	crates/pulsus-schema/src/catalog.rs	2231		line	!static_tmpl(16).contains("scope_name"),
 docs/query-lowering.md	catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	compile/fold.rs:245	crates/pulsus-read/src/compile/fold.rs	245		prose	set_provenance
 docs/query-lowering.md	compile/fold.rs:626	crates/pulsus-read/src/compile/fold.rs	626		line	pub struct Relation<L: Lang + ?Sized> {
@@ -45,13 +46,14 @@ docs/query-lowering.md	crates/pulsus-read/src/compile/plan.rs:550	crates/pulsus-
 docs/query-lowering.md	crates/pulsus-read/src/logql/error.rs:805-806	crates/pulsus-read/src/logql/error.rs	805	806	line	#[error("{reason}")] PipelineInvalid { reason: String },
 docs/query-lowering.md	crates/pulsus-read/src/logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1658	crates/pulsus-read/src/logql/plan.rs	1658		line	let fetch_until_limit = has_unpushed_dropping_stage(&log_expr.pipeline);
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1685	crates/pulsus-read/src/logql/plan.rs	1685		line	/// non-dropping (a parse failure keeps the line with an `__error__`
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1673	crates/pulsus-read/src/logql/plan.rs	1673		line	result_limit,
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1688	crates/pulsus-read/src/logql/plan.rs	1688		prose	has_unpushed_dropping_stage
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1722	crates/pulsus-read/src/logql/plan.rs	1722		prose	metric_pipeline_construct
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:174	crates/pulsus-read/src/logql/plan.rs	174		line	let translated = pulsus_promql::re2_pattern_to_rust(regex);
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2283	crates/pulsus-read/src/logql/plan.rs	2283		line	// Defense in depth: the parser only emits the pipeline
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:3763	crates/pulsus-read/src/logql/plan.rs	3763		prose	compile_line_filters
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:3797	crates/pulsus-read/src/logql/plan.rs	3797		prose	is_pushable_line_filter
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:80	crates/pulsus-read/src/logql/plan.rs	80		line	/// under-return), rather than truncating a single oversampled scan.
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:83	crates/pulsus-read/src/logql/plan.rs	83		prose	fetch_until_limit
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:83	crates/pulsus-read/src/logql/plan.rs	83		line	pub fetch_until_limit: bool,
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	crates/pulsus-read/src/logql/post_agg.rs	3307	3350	line	fn merge_matrix_collisions( items: Vec<MatrixSeries>, l: &Ledger<'_>, ) -> Result<Vec<MatrixSeries>, ReadError> { // Ent
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:484	crates/pulsus-read/src/logql/sql.rs	484		line	pub fn stage1(
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:521	crates/pulsus-read/src/logql/sql.rs	521		line	pub fn probe(
@@ -67,8 +69,9 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:148	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:155-163	crates/pulsus-read/src/traces/exec.rs	155	163	prose	max_result_bytes
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:176	crates/pulsus-read/src/traces/exec.rs	176		line	pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1774	crates/pulsus-read/src/traces/exec.rs	1774		line	let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2961	crates/pulsus-read/src/traces/exec.rs	2961		line	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2995	crates/pulsus-read/src/traces/exec.rs	2995		prose	generator_settings
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3058	crates/pulsus-read/src/traces/exec.rs	3058		line	/// #460, two different arbitrary sets from the same input shape.
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2996	crates/pulsus-read/src/traces/exec.rs	2996		line	search_settings(config)
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:439	crates/pulsus-read/src/traces/exec.rs	439		line	/// The ROOT SPAN's own metadata. `service`/`name` are the reference's
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:440	crates/pulsus-read/src/traces/exec.rs	440		line	/// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5623	crates/pulsus-read/src/traces/exec.rs	5623		line	fn search_settings_pin_the_layer_1_budget_contract() {
@@ -76,20 +79,24 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:782	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:895	crates/pulsus-read/src/traces/filter.rs	895		prose	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:1189	crates/pulsus-read/src/traces/metrics_sql.rs	1189		line	pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:607	crates/pulsus-read/src/traces/metrics_sql.rs	607		line	window: SnappedWindow,
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:619	crates/pulsus-read/src/traces/metrics_sql.rs	619		line	sql.push_str(&format!("\n AND {where_expr}"));
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:631	crates/pulsus-read/src/traces/metrics_sql.rs	631		line	let mut sql = format!("SELECT uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:183	crates/pulsus-read/src/traces/search_eval.rs	183		line	pub fn from_stored(s: &str) -> Self {
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:2436	crates/pulsus-read/src/traces/search_eval.rs	2436		line	ProjectionValue::SelectValue { field_idx } => env
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1111	crates/pulsus-read/src/traces/search_plan.rs	1111		line	Ok(parts.join(" AND "))
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:383	crates/pulsus-read/src/traces/search_sql.rs	383		line	pub fn hydration_sql(
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:480-490	crates/pulsus-read/src/traces/search_sql.rs	480	490	line	/// gated rather than asserted. /// /// **`SELECT DISTINCT` over one more column can return more rows.** A span /// carr
-docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:531	crates/pulsus-read/src/traces/search_sql.rs	531		line	///
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:613	crates/pulsus-read/src/traces/search_sql.rs	613		line	pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:71	crates/pulsus-read/src/traces/search_sql.rs	71		line	pub(crate) fn byte_cap_expr(col: &str) -> String {
-docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:168	crates/pulsus-read/tests/golden_sql_freeze.rs	168		line	///
+docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:391	crates/pulsus-read/tests/golden_sql_freeze.rs	391		prose	PINNED_SQL_CORPUS
 docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:359	crates/pulsus-schema/src/catalog.rs	359		prose	(trace_id, timestamp_ns)
 docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:814	crates/pulsus-schema/src/catalog.rs	814		line	id: 39,
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-157	crates/pulsus-server/src/logs_api/error.rs	147	157	line	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-212	crates/pulsus-server/src/logs_api/error.rs	147	212	line	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:212	crates/pulsus-server/src/logs_api/error.rs	212		line	| ReadError::PipelineInvalid { .. }
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:270-277	crates/pulsus-server/src/traces_api/error.rs	270	277	line	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:270-304	crates/pulsus-server/src/traces_api/error.rs	270	304	line	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/pulsus-server/src/traces_api/error.rs	304		line	ApiError::NotFound => (StatusCode::NOT_FOUND, "trace not found".to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
@@ -139,28 +146,48 @@ docs/query-lowering.md	plan.rs:4500	crates/pulsus-read/src/logql/plan.rs	4500		p
 docs/query-lowering.md	post_agg.rs:3008-3011	crates/pulsus-read/src/logql/post_agg.rs	3008	3011	prose	.rev()
 docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs	3307		prose	merge_matrix_collisions
 docs/query-lowering.md	predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
-docs/query-lowering.md	predicate.rs:92	crates/pulsus-read/src/logql/predicate.rs	92		line	//!
+docs/query-lowering.md	predicate.rs:93	crates/pulsus-read/src/logql/predicate.rs	93		line	//! **So a fence is only worth what its REMOVAL TEST is worth**, and the
 docs/query-lowering.md	search_eval.rs:1856	crates/pulsus-read/src/traces/search_eval.rs	1856		line	/// ancestor), the `reached` set terminates every cycle, and an
 docs/query-lowering.md	search_eval.rs:2439	crates/pulsus-read/src/traces/search_eval.rs	2439		line	.get(*field_idx)
 docs/query-lowering.md	search_eval.rs:2483	crates/pulsus-read/src/traces/search_eval.rs	2483		line	/// target. Only the physical sources can fill that target, so a typed
 docs/query-lowering.md	search_plan.rs:1011-1068	crates/pulsus-read/src/traces/search_plan.rs	1011	1068	line	/// Whether the plan issues the per-batch trace-level context co-load /// (issue #184 — `traceDuration`/`rootName`/`root
-docs/query-lowering.md	search_plan.rs:1071	crates/pulsus-read/src/traces/search_plan.rs	1071		line	/// The plan projected for the explain surface. Built only in
 docs/query-lowering.md	search_plan.rs:1074	crates/pulsus-read/src/traces/search_plan.rs	1074		line	self.compiled.shape(&self.stage_names)
 docs/query-lowering.md	search_plan.rs:1284	crates/pulsus-read/src/traces/search_plan.rs	1284		line	fn field_slot(field: &AttrFieldRef, alias_stem: &str, want: SlotValue) -> ProbeColumn {
-docs/query-lowering.md	search_plan.rs:1591	crates/pulsus-read/src/traces/search_plan.rs	1591		line	PhysicalPredicate::Status { op, code } => PhysicalEval::Status {
 docs/query-lowering.md	search_plan.rs:1648	crates/pulsus-read/src/traces/search_plan.rs	1648		line	TraceCtxPred::RootName { op, value } => {
 docs/query-lowering.md	search_plan.rs:1793-1794	crates/pulsus-read/src/traces/search_plan.rs	1793	1794	prose	select_attrs
+docs/query-lowering.md	search_plan.rs:1884	crates/pulsus-read/src/traces/search_plan.rs	1884		line	.parse::<f64>()
+docs/query-lowering.md	search_plan.rs:1886	crates/pulsus-read/src/traces/search_plan.rs	1886		prose	is_finite()
+docs/query-lowering.md	search_plan.rs:1887	crates/pulsus-read/src/traces/search_plan.rs	1887		line	.ok_or_else(|| PlanError::TypeMismatch(format!("not a finite number: {raw:?}"))),
+docs/query-lowering.md	search_plan.rs:1899	crates/pulsus-read/src/traces/search_plan.rs	1899		line	"aggregate comparisons require a numeric (or duration, for duration aggregates) \
 docs/query-lowering.md	search_plan.rs:208-209	crates/pulsus-read/src/traces/search_plan.rs	208	209	line	Eq, Neq,
+docs/query-lowering.md	search_plan.rs:2174	crates/pulsus-read/src/traces/search_plan.rs	2174		line	"by({key}) is not a group key this engine can execute: a grouping key \
+docs/query-lowering.md	search_plan.rs:2210	crates/pulsus-read/src/traces/search_plan.rs	2210		line	"aggregate filters do not support regex operators".to_string(),
+docs/query-lowering.md	search_plan.rs:2238	crates/pulsus-read/src/traces/search_plan.rs	2238		prose	count()
+docs/query-lowering.md	search_plan.rs:2242	crates/pulsus-read/src/traces/search_plan.rs	2242		line	return Err(PlanError::TypeMismatch(format!("{op}() requires a field")));
+docs/query-lowering.md	search_plan.rs:2249	crates/pulsus-read/src/traces/search_plan.rs	2249		line	"{other} is not numerically aggregatable"
+docs/query-lowering.md	search_plan.rs:2261	crates/pulsus-read/src/traces/search_plan.rs	2261		line	"{op}({expr}) is not an executable aggregation source: only a bare \
 docs/query-lowering.md	search_plan.rs:2291	crates/pulsus-read/src/traces/search_plan.rs	2291		prose	Metric
 docs/query-lowering.md	search_plan.rs:2298	crates/pulsus-read/src/traces/search_plan.rs	2298		prose	MetricSecondStage
 docs/query-lowering.md	search_plan.rs:2304	crates/pulsus-read/src/traces/search_plan.rs	2304		prose	Compare { .. }
+docs/query-lowering.md	search_plan.rs:2342	crates/pulsus-read/src/traces/search_plan.rs	2342		line	"select() of a nested-set intrinsic is not supported".to_string(),
+docs/query-lowering.md	search_plan.rs:2387	crates/pulsus-read/src/traces/search_plan.rs	2387		line	"select() of this intrinsic is not supported".to_string(),
+docs/query-lowering.md	search_plan.rs:2513	crates/pulsus-read/src/traces/search_plan.rs	2513		line	"by({field}): grouping by a span-event / span-link intrinsic is not supported \
 docs/query-lowering.md	search_plan.rs:3308	crates/pulsus-read/src/traces/search_plan.rs	3308		line	// same co-load its filter form does, even with no such filter leaf.
 docs/query-lowering.md	search_plan.rs:948	crates/pulsus-read/src/traces/search_plan.rs	948		line	.count()
 docs/query-lowering.md	search_response.rs:504	crates/pulsus-server/src/traces_api/search_response.rs	504		line	// one-entry list and is served by `group_json` above, so the
 docs/query-lowering.md	search_sql.rs:613	crates/pulsus-read/src/traces/search_sql.rs	613		line	pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 docs/query-lowering.md	sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		prose	fingerprint
+docs/query-lowering.md	traces/compile.rs:172	crates/pulsus-read/src/traces/compile.rs	172		line	/// D3).
+docs/query-lowering.md	traces/compile.rs:175	crates/pulsus-read/src/traces/compile.rs	175		line	/// which is why the computation landed with it.
+docs/query-lowering.md	traces/compile.rs:178	crates/pulsus-read/src/traces/compile.rs	178		line	/// The batch hydration read.
 docs/query-lowering.md	traces/compile.rs:179	crates/pulsus-read/src/traces/compile.rs	179		prose	Hydrate
+docs/query-lowering.md	traces/compile.rs:181	crates/pulsus-read/src/traces/compile.rs	181		line	/// hydration statement (issue #557); the index is into
+docs/query-lowering.md	traces/compile.rs:185	crates/pulsus-read/src/traces/compile.rs	185		line	/// it lowers into the statement [`TqlLink::Hydrate`] sends.
+docs/query-lowering.md	traces/compile.rs:187	crates/pulsus-read/src/traces/compile.rs	187		line	/// One aggregate operand's `val_num` batch read; the index is into
 docs/query-lowering.md	traces/compile.rs:1873	crates/pulsus-read/src/traces/compile.rs	1873		line	fn evaluator_owned(mut rel: Relation<Tql>, name: &str) -> Relation<Tql> {
+docs/query-lowering.md	traces/compile.rs:189	crates/pulsus-read/src/traces/compile.rs	189		line	AggValues(usize),
+docs/query-lowering.md	traces/compile.rs:192	crates/pulsus-read/src/traces/compile.rs	192		line	SelectValues(usize),
+docs/query-lowering.md	traces/compile.rs:197	crates/pulsus-read/src/traces/compile.rs	197		prose	TraceCtx
 docs/query-lowering.md	traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		prose	ReadError::QueryTooBroad(_)
 docs/query-lowering.md	traces_search_plan_parts.rs:48-54	crates/pulsus-read/tests/traces_search_plan_parts.rs	48	54	prose	148 = 25 + 123
 docs/query-to-sql.md	ast.rs:151	crates/pulsus-logql/src/ast.rs	151		prose	Vec<DropKeepElem>
@@ -182,6 +209,7 @@ docs/query-to-sql.md	catalog.rs:442	crates/pulsus-schema/src/catalog.rs	442		pro
 docs/query-to-sql.md	catalog.rs:986-992	crates/pulsus-schema/src/catalog.rs	986	992	prose	(service, timestamp_ns)
 docs/query-to-sql.md	client_agg.rs:2169	crates/pulsus-read/src/logql/client_agg.rs	2169		line	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
 docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	if (major, minor) < (26, 3) {
+docs/query-to-sql.md	controller.rs:76	crates/pulsus-schema/src/controller.rs	76		line	Some(Ok(row)) => Ok(row.v),
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:582	crates/pulsus-config/src/model.rs	582		line	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i
@@ -197,10 +225,14 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:628	crates/pulsus-r
 docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:630	crates/pulsus-read/src/logql/compile.rs	630		prose	BlockReason::NotYetLowered
 docs/query-to-sql.md	crates/pulsus-read/src/logql/error.rs:816-819	crates/pulsus-read/src/logql/error.rs	816	819	line	"pipeline error: '{error_type}' for series: '{series}'.\n\ Use a label filter to intentionally skip this error. (e.g | _
 docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:169	crates/pulsus-read/src/logql/ip.rs	169		prose	[0-9]{1,3}(?:\.[0-9]{1,3}){3}
+docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:197-210	crates/pulsus-read/src/logql/ip.rs	197	210	line	pub(crate) fn line_has_ip_in(matcher: &IpMatcher, line: &str) -> bool { match matcher { IpMatcher::V4 { .. } => ipv4_can
+docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:284-298	crates/pulsus-read/src/logql/ip.rs	284	298	line	assert!(contains("2001:db8::/32", "2001:db8::1")); assert!(!contains("2001:db8::/32", "2001:db9::1")); } // --- v6 range
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	structured_metadata
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:372-409	crates/pulsus-read/src/logql/labels.rs	372	409	line	fn merge_metadata_pairs( base_len: usize, pairs: impl Iterator<Item = (String, String)>, merge_buf: &mut Vec<(String, St
-docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:2898	crates/pulsus-read/src/logql/pipeline.rs	2898		line	let mut live: u32 = 0;
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3041	crates/pulsus-read/src/logql/pipeline.rs	3041		prose	DURATION_UNITS
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3049	crates/pulsus-read/src/logql/pipeline.rs	3049		line	("d", 86_400.0),
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3050	crates/pulsus-read/src/logql/pipeline.rs	3050		line	("w", 604_800.0),
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3101	crates/pulsus-read/src/logql/pipeline.rs	3101		line	.find(|c: char| !(c.is_ascii_digit() || c == '.'))
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:725	crates/pulsus-read/src/logql/sql.rs	725		line	/// canonical shape: `SELECT fingerprint, service, labels FROM log_streams
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
@@ -229,7 +261,6 @@ docs/query-to-sql.md	exec.rs:2470	crates/pulsus-read/src/logql/exec.rs	2470		pro
 docs/query-to-sql.md	exec.rs:3547	crates/pulsus-read/src/traces/exec.rs	3547		prose	reduce
 docs/query-to-sql.md	filter.rs:1019	crates/pulsus-read/src/traces/filter.rs	1019		prose	AttrScope::Unscoped => None
 docs/query-to-sql.md	filter.rs:78-81	crates/pulsus-read/src/traces/filter.rs	78	81	prose	unsupported field:
-docs/query-to-sql.md	filter.rs:833	crates/pulsus-read/src/traces/filter.rs	833		line	}
 docs/query-to-sql.md	filter.rs:843	crates/pulsus-read/src/traces/filter.rs	843		line	// (a raw comparison silently dropped any over-cap message
 docs/query-to-sql.md	filter.rs:961	crates/pulsus-read/src/traces/filter.rs	961		prose	ValuePred::KeyExists
 docs/query-to-sql.md	labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	structured_metadata
@@ -290,6 +321,7 @@ docs/query-to-sql.md	plan.rs:3763	crates/pulsus-read/src/logql/plan.rs	3763		pro
 docs/query-to-sql.md	plan.rs:3763-3781	crates/pulsus-read/src/logql/plan.rs	3763	3781	prose	_ => {}
 docs/query-to-sql.md	plan.rs:3797	crates/pulsus-read/src/logql/plan.rs	3797		prose	is_pushable_line_filter
 docs/query-to-sql.md	post_agg.rs:1041	crates/pulsus-read/src/logql/post_agg.rs	1041		line	if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
+docs/query-to-sql.md	post_agg.rs:1064-1079	crates/pulsus-read/src/logql/post_agg.rs	1064	1079	line	let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new(); for s in series { groups .entry(group_key(&
 docs/query-to-sql.md	post_agg.rs:1109	crates/pulsus-read/src/logql/post_agg.rs	1109		line	if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
 docs/query-to-sql.md	post_agg.rs:807	crates/pulsus-read/src/logql/post_agg.rs	807		prose	select_k_range
 docs/query-to-sql.md	post_agg.rs:858	crates/pulsus-read/src/logql/post_agg.rs	858		prose	select_k_instant
@@ -309,8 +341,6 @@ docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limit
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1053	crates/pulsus-read/src/logql/plan.rs	1053		line	pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	pulsus-server/src/logs_api/mod.rs:55-59	crates/pulsus-server/src/logs_api/mod.rs	55	59	line	fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> { router .route( &format!("{prefix
-docs/query-to-sql.md	query_lowering_doc_gate.rs:472	crates/pulsus-read/tests/query_lowering_doc_gate.rs	472		line	}
-docs/query-to-sql.md	query_lowering_doc_gate.rs:545	crates/pulsus-read/tests/query_lowering_doc_gate.rs	545		line	}
 docs/query-to-sql.md	search_eval.rs:2439	crates/pulsus-read/src/traces/search_eval.rs	2439		line	.get(*field_idx)
 docs/query-to-sql.md	search_eval.rs:3127	crates/pulsus-read/src/traces/search_eval.rs	3127		line	SpansetStage::Aggregate(agg) => {
 docs/query-to-sql.md	search_eval.rs:895	crates/pulsus-read/src/traces/search_eval.rs	895		line	/// happens in the compare (keeping it out of the per-span hot loop).

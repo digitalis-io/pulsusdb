@@ -3904,7 +3904,7 @@ implementation using the unanchored one matches `precheck.foo` and is wrong.
 { .a != nil }
 ```
 
-**SQL today** — the constant `1` stands in for the value test, leaving a pure `key` prefix scan (`filter.rs:833`).
+**SQL today** — the constant `1` stands in for the value test, leaving a pure `key` prefix scan (`filter.rs:961`).
 
 `crates/pulsus-read/tests/golden/traces_search/existence_present.sql`, phase1 generator[0]:
 
@@ -5247,9 +5247,9 @@ Four lines, `{"id":"…","v":"…"}`, queried as
 | `+5s` | dropped | `5` |
 
 The two answers are disjoint sets: every value one engine accepts, the other rejects. Ours reads
-`DURATION_UNITS` (`crates/pulsus-read/src/logql/pipeline.rs:3041`), which carries `d` at `:2898` and
-`w` at `:2899`, through a scanner whose first token must begin with an ASCII digit or `.`
-(`:2950`). The reference's conversion is Go's `time.ParseDuration`
+`DURATION_UNITS` (`crates/pulsus-read/src/logql/pipeline.rs:3041`), which carries `d` at `:3049` and
+`w` at `:3050`, through a scanner whose first token must begin with an ASCII digit or `.`
+(`:3101`). The reference's conversion is Go's `time.ParseDuration`
 (`pkg/logql/log/metrics_extraction.go:321` @ `v3.7.4`), which has neither `d` nor `w` and does take
 a leading `+` or `-`. A full port of the Go parser already exists in this tree —
 `go_parse_duration` (`crates/pulsus-read/src/logql/template/funcs.rs`), used by the `duration`
