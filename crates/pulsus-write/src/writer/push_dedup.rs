@@ -26,13 +26,13 @@
 //! The accidental rate is the birthday bound over the live population,
 //! `n^2 / 2^129`, and the population is bounded by the claim table's
 //! reserved capacity rather than by anything written here. At the largest
-//! capacity the accepted knob range reaches — `3,670,016` claims, which
+//! capacity the accepted knob range reaches — `1,835,008` claims, which
 //! `tests/a494_dedup_charge.rs` enumerates and prints — that is
-//! `1.98e-26`:
+//! `4.95e-27`:
 //!
 //! ```text
-//!   python3 -c "n = 3670016; print(n*n / 2**129)"
-//!   -> 1.9790942390184744e-26
+//!   python3 -c "n = 1835008; print(n*n / 2**129)"
+//!   -> 4.947735597546186e-27
 //! ```
 //!
 //! # Why the memory bound is a construction check rather than arithmetic
@@ -416,10 +416,38 @@ const WAITER_CHARGE_BYTES: u64 = 4 * size_of::<WaiterSlot>() as u64 + ONESHOT_ST
 /// The claim table's reserved footprint for `claims` entries: the map, plus
 /// the two creation-ordered key rings that make window expiry and open-claim
 /// aging amortized-constant instead of a scan.
+/// Slots the creation-order ring reserves for `claims` claims.
+///
+/// Twice the claim capacity, which is what makes compaction amortized
+/// constant: the table never holds more than `claims` live entries, so a
+/// full ring holds at least `claims` stale items and one compaction frees
+/// at least half of it.
+const fn order_ring_slots(claims: usize) -> usize {
+    2 * claims
+}
+
+/// Slots the claim table reserves for `claims` claims: **twice** what it
+/// will ever hold.
+///
+/// A hash table run at its own item capacity does not stay put. Erasing an
+/// entry leaves a tombstone rather than free space, so a table churning at
+/// capacity — which is exactly what this one does once the knob binds —
+/// exhausts its growth allowance and reallocates. Measured: filling to the
+/// reported capacity of 3,584 and then evicting-and-inserting grew the
+/// table from 4,096 to 8,192 buckets, `331,776` bytes the knob never
+/// accounted for.
+///
+/// At half load the table rehashes **in place** instead, which allocates
+/// nothing. The cost is that a given knob holds about half as many claims
+/// as the first version of this model claimed — the correct figure rather
+/// than a smaller one.
+const fn claim_table_slots(claims: usize) -> usize {
+    2 * claims
+}
+
 const fn claim_table_bytes(claims: usize) -> u64 {
-    hash_map_bytes::<PushDigest, ClaimEntry>(claims)
-        + vec_bytes::<PushDigest>(claims)
-        + vec_bytes::<PushDigest>(claims)
+    hash_map_bytes::<PushDigest, ClaimEntry>(claim_table_slots(claims))
+        + vec_bytes::<(u64, PushDigest)>(order_ring_slots(claims))
 }
 
 /// The waiter side's footprint at its bound: the map reserved at
@@ -624,6 +652,9 @@ pub(crate) struct ClaimEntry {
     /// The content digest, kept separately from the key so the same
     /// `Idempotency-Key` carrying different content is refused.
     content: PushDigest,
+    /// Which admission created this entry. A ring item naming this key
+    /// with a different sequence belongs to an admission that is gone.
+    seq: u64,
     created_ms: u64,
     state: ClaimState,
     outcome: Option<ClaimOutcome>,
@@ -708,13 +739,33 @@ pub struct DedupMetricsSnapshot {
 pub(crate) struct Core {
     /// Reserved once at construction; never grows, never rehashes.
     claims: HashMap<PushDigest, ClaimEntry>,
-    /// Every live claim's key in creation order. Window expiry pops the
-    /// front, so it is amortized constant rather than a scan.
-    order: VecDeque<PushDigest>,
-    /// Keys that were open, in creation order. Since the claim deadline is
-    /// a constant offset, creation order **is** deadline order, so aging
-    /// pops the front too; a key whose claim already settled is skipped.
-    open_order: VecDeque<PushDigest>,
+    /// Every admitted claim's `(sequence, key)` in creation order.
+    ///
+    /// **One ring, reserved at twice the claim capacity, and compacted
+    /// rather than grown.** The first version of this had two rings at one
+    /// times capacity and removed from neither: a claim rolled back,
+    /// evicted or re-admitted left its key behind, the ring grew past the
+    /// capacity it was reserved for, and the `VecDeque` reallocated —
+    /// memory outside the knob, found by the lifecycle measurement in
+    /// `tests/a494_dedup_charge.rs` at 446,464 bytes over one fill.
+    ///
+    /// At twice the capacity a full ring holds at least `capacity` stale
+    /// items, because the table itself never holds more than `capacity`
+    /// live claims. So a compaction always frees at least half the ring
+    /// and the cost is amortized constant.
+    ///
+    /// The sequence number is what makes a stale item recognisable. A key
+    /// removed and admitted again appears twice; without the sequence the
+    /// front walk would look the second one up, find it young, and stop —
+    /// leaving the stale item at the head for ever and stalling expiry for
+    /// everything behind it.
+    order: VecDeque<(u64, PushDigest)>,
+    next_seq: u64,
+    /// The sequence number through which [`Core::age_open_claims`] has
+    /// already walked. Ageing moves forward only, so the walk resumes
+    /// where it stopped instead of re-reading the claims between the
+    /// deadline and the window on every tick.
+    aged_seq: u64,
     /// Blocked sync callers, keyed. Reserved once at construction. Each
     /// registration carries its own [`RegistrationId`] so a guard removes
     /// only its own pair.
@@ -810,9 +861,14 @@ impl PushDedup {
         let bound_bytes = index_bytes(capacities.claims, capacities.waiters);
         let waiter_budget = capacities.waiters as u64 * WAITER_CHARGE_BYTES;
         let core = Core {
-            claims: HashMap::with_capacity(capacities.claims),
-            order: VecDeque::with_capacity(capacities.claims),
-            open_order: VecDeque::with_capacity(capacities.claims),
+            claims: HashMap::with_capacity(claim_table_slots(capacities.claims)),
+            order: VecDeque::with_capacity(order_ring_slots(capacities.claims)),
+            // Sequences start at one so that `aged_seq = 0` means "nothing
+            // walked yet" without needing a sentinel: the first claim's
+            // sequence is strictly greater, so the ageing cursor does not
+            // skip it.
+            next_seq: 1,
+            aged_seq: 0,
             waiters: HashMap::with_capacity(capacities.waiters),
             next_registration: 0,
             waiter_charge: 0,
@@ -926,6 +982,9 @@ impl PushDedup {
             id.key,
             ClaimEntry {
                 content: id.content,
+                // Replaced by `Core::insert`, which owns the sequence;
+                // zero is never a live one.
+                seq: 0,
                 created_ms: now_ms,
                 state: ClaimState::Open,
                 outcome: None,
@@ -1088,10 +1147,23 @@ impl Core {
         }
     }
 
-    fn insert(&mut self, key: PushDigest, entry: ClaimEntry) {
+    fn insert(&mut self, key: PushDigest, mut entry: ClaimEntry) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        entry.seq = seq;
         self.claims.insert(key, entry);
-        self.order.push_back(key);
-        self.open_order.push_back(key);
+        if self.order.len() == self.order.capacity() {
+            self.compact_order();
+        }
+        self.order.push_back((seq, key));
+    }
+
+    /// Drops every ring item whose admission is gone, in place. Called only
+    /// when the ring is full, where at least half its items are stale.
+    fn compact_order(&mut self) {
+        let claims = &self.claims;
+        self.order
+            .retain(|(seq, key)| claims.get(key).is_some_and(|e| e.seq == *seq));
     }
 
     fn remove(&mut self, key: &PushDigest) {
@@ -1109,8 +1181,13 @@ impl Core {
     /// in creation order, so this stops at the first live claim.
     fn expire(&mut self, now_ms: u64) {
         let window = self.limits.window_ms;
-        while let Some(key) = self.order.front().copied() {
+        while let Some((seq, key)) = self.order.front().copied() {
             match self.claims.get(&key) {
+                // A later admission owns this key now, so this item is the
+                // earlier one's and carries no claim of its own.
+                Some(entry) if entry.seq != seq => {
+                    self.order.pop_front();
+                }
                 Some(entry) if now_ms.saturating_sub(entry.created_ms) < window => break,
                 Some(_) => {
                     self.order.pop_front();
@@ -1130,19 +1207,32 @@ impl Core {
     fn age_open_claims(&mut self, now_ms: u64) -> u64 {
         let deadline = self.limits.claim_deadline_ms;
         let mut aged = 0u64;
-        while let Some(key) = self.open_order.front().copied() {
+        // The ring is sorted by sequence, so the walk resumes at the first
+        // item this sweep has not already read rather than at the front.
+        let mut i = self.order.partition_point(|(seq, _)| *seq <= self.aged_seq);
+        let mut woken: Vec<PushDigest> = Vec::new();
+        while i < self.order.len() {
+            let (seq, key) = self.order[i];
             let Some(entry) = self.claims.get_mut(&key) else {
-                self.open_order.pop_front();
+                self.aged_seq = seq;
+                i += 1;
                 continue;
             };
+            if entry.seq != seq {
+                self.aged_seq = seq;
+                i += 1;
+                continue;
+            }
             if entry.state.is_terminal() {
-                self.open_order.pop_front();
+                self.aged_seq = seq;
+                i += 1;
                 continue;
             }
             if now_ms.saturating_sub(entry.created_ms) < deadline {
                 break;
             }
-            self.open_order.pop_front();
+            self.aged_seq = seq;
+            i += 1;
             // A tombstone is deliberately NOT counted as evictable: the
             // counter and `ClaimState::is_evictable` must agree, or the
             // cap-pressure walk short-circuits on a table it could in fact
@@ -1150,6 +1240,9 @@ impl Core {
             entry.state = ClaimState::Unknown;
             entry.outcome = Some(ClaimOutcome::Failed);
             aged += 1;
+            woken.push(key);
+        }
+        for key in woken {
             if let Some(waiters) = self.waiters.remove(&key) {
                 for (_, tx) in waiters {
                     let _ = tx.send(ClaimOutcome::Failed);
@@ -1184,13 +1277,15 @@ impl Core {
             return false;
         }
         for i in 0..self.order.len() {
-            let key = self.order[i];
+            let (seq, key) = self.order[i];
             let evictable = self
                 .claims
                 .get(&key)
-                .is_some_and(|e| e.state.is_evictable());
+                .is_some_and(|e| e.seq == seq && e.state.is_evictable());
             if evictable {
-                self.order.remove(i);
+                // The ring item is left behind and compacted with the rest;
+                // removing from the middle of a ring is linear, and the
+                // sequence above is what makes the leftover recognisable.
                 self.remove(&key);
                 self.wake_absent(&key);
                 return true;

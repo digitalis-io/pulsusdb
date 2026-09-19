@@ -61,8 +61,8 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use pulsus_write::{
-    Admission, Capacities, ClaimOutcome, PushDedup, PushDigest, PushIdentity, WaitGuard, WaitMode,
-    index_bytes, plan_capacities,
+    Admission, Capacities, ClaimOutcome, PushDedup, PushDigest, PushIdentity, TargetOutcome,
+    WaitGuard, WaitMode, index_bytes, plan_capacities,
 };
 use tokio::sync::oneshot;
 
@@ -670,4 +670,169 @@ fn an_async_suppressed_caller_allocates_nothing() {
         0,
         "and nothing is charged to the waiter budget"
     );
+}
+
+// ---------------------------------------------------------------------
+// The bound holds across the WHOLE lifecycle, not only at admission
+// ---------------------------------------------------------------------
+
+/// `ClaimEntry: Copy` refuses a field that OWNS an allocation, because
+/// owning one means freeing it and freeing it needs `Drop`. It does not
+/// refuse a raw pointer or a reference — a `Copy` field can be a
+/// `&'static [u8]` filled in by `Box::leak` at any point in a claim's life,
+/// and round 2 of this issue's code review measured one planted in
+/// **settlement** that left every other test in this file green.
+///
+/// A measurement taken only at admission cannot see that, so this one is
+/// taken around the whole lifecycle. Every route that mutates the index is
+/// exercised inside one window:
+///
+/// ```text
+///   admit ─ seal ─ settle(Committed) ─ settle(NotCommitted) ─ settle(Uncertain)
+///     │       │                                                      │
+///     │       └─ rollback: a guard dropped un-sealed                  │
+///     │                                                              │
+///     ├─ wait: register ─ settle ─ drop the guard                     │
+///     ├─ tick: age an open claim to a tombstone                       │
+///     ├─ tick: expire a settled claim once its window elapses         │
+///     ├─ evict: admit into a full table of settled claims             │
+///     └─ shed:  admit into a full table of tombstones                 │
+/// ```
+///
+/// The index reserves everything it needs at construction and every
+/// registration returns its bytes when its guard drops, so the whole
+/// sequence must allocate **exactly nothing** net. A leak on any route is
+/// a nonzero delta here whatever the type bound says about it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn no_lifecycle_route_allocates_beyond_what_it_returns() {
+    let knob = pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR;
+    let window = Duration::from_secs(60);
+    let deadline = Duration::from_secs(30);
+    let index = PushDedup::new(knob, window, deadline);
+    let caps = index.capacities();
+    let id = |n: u128| PushIdentity {
+        key: PushDigest::from_raw(n),
+        content: PushDigest::from_raw(n),
+        declared_retry: false,
+    };
+
+    let ((), resident) = resident_over(|| {
+        // -- admit, seal, and settle each of the three fates ----------
+        for (i, outcome) in [
+            TargetOutcome::Committed,
+            TargetOutcome::NotCommitted,
+            TargetOutcome::Uncertain,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = i as u128;
+            match index.admit(id(n), WaitMode::None) {
+                Admission::Admit(mut guard) => {
+                    guard.note_target(true);
+                    guard.note_target(false);
+                    guard.seal();
+                }
+                other => panic!("must admit, got {other:?}"),
+            }
+            index.settle_target(id(n).key, outcome, true);
+            index.settle_target(id(n).key, outcome, false);
+        }
+
+        // -- rollback: a guard dropped before `seal` ------------------
+        match index.admit(id(100), WaitMode::None) {
+            Admission::Admit(guard) => drop(guard),
+            other => panic!("must admit, got {other:?}"),
+        }
+
+        // -- the keyed wait: register, settle, drop -------------------
+        match index.admit(id(200), WaitMode::None) {
+            Admission::Admit(mut guard) => {
+                guard.note_target(true);
+                guard.seal();
+            }
+            other => panic!("must admit, got {other:?}"),
+        }
+        let mut held: Vec<HeldWaiter> = Vec::new();
+        for _ in 0..16 {
+            match index.admit(id(200), WaitMode::Register) {
+                Admission::SuppressedPending { guard, rx } => held.push((guard, rx)),
+                other => panic!("must register, got {other:?}"),
+            }
+        }
+        index.settle_target(id(200).key, TargetOutcome::Committed, true);
+        drop(held);
+
+        // -- fill the table, then evict and shed ----------------------
+        // Everything admitted so far is terminal or gone, so filling to
+        // capacity with settled claims exercises eviction; filling with
+        // claims that never settle exercises the shed.
+        let base = 1_000u128;
+        for i in 0..caps.claims as u128 {
+            match index.admit(id(base + i), WaitMode::None) {
+                Admission::Admit(mut guard) => {
+                    guard.note_target(true);
+                    guard.seal();
+                }
+                other => panic!("claim {i} must admit, got {other:?}"),
+            }
+            index.settle_target(id(base + i).key, TargetOutcome::Committed, true);
+        }
+        match index.admit(id(u128::MAX), WaitMode::None) {
+            Admission::Admit(guard) => guard.seal(),
+            other => panic!("a full table of settled claims evicts, got {other:?}"),
+        }
+    });
+    assert_eq!(
+        resident, 0,
+        "the lifecycle allocated {resident} bytes it did not return — a \\
+         claim, a registration or the index itself is holding memory the \\
+         model does not charge"
+    );
+
+    // -- ageing and expiry, which need the clock ----------------------
+    // One claim that never settles, so there is something to age. The
+    // table is full of settled claims, so this admission evicts one.
+    let ((), opening) = resident_over(|| match index.admit(id(500), WaitMode::None) {
+        Admission::Admit(mut guard) => {
+            guard.note_target(true);
+            guard.seal();
+        }
+        other => panic!("must admit, got {other:?}"),
+    });
+    assert_eq!(opening, 0, "admitting into a full table allocates");
+
+    tokio::time::sleep(deadline + Duration::from_secs(1)).await;
+    let ((), aging) = resident_over(|| index.tick());
+    assert_eq!(aging, 0, "ageing an open claim to a tombstone allocates");
+    assert!(index.snapshot().unknown_total > 0, "a claim did age");
+
+    // An admission into a full table evicts the oldest settled claim.
+    // Shedding — the same walk finding nothing evictable — is measured by
+    // `a_claim_table_filled_to_its_reported_capacity_allocates_nothing`,
+    // whose table is full of claims that never settled.
+    let ((), evicting) = resident_over(|| {
+        match index.admit(
+            PushIdentity {
+                key: PushDigest::from_raw(u128::MAX - 1),
+                content: PushDigest::from_raw(u128::MAX - 1),
+                declared_retry: false,
+            },
+            WaitMode::None,
+        ) {
+            Admission::Admit(guard) => guard.seal(),
+            other => panic!("a full table of settled claims evicts, got {other:?}"),
+        }
+    });
+    assert_eq!(evicting, 0, "evicting allocates");
+
+    tokio::time::sleep(window + Duration::from_secs(1)).await;
+    let ((), expiry) = resident_over(|| index.tick());
+    assert_eq!(expiry, 0, "expiring a claim allocates");
+
+    // And the whole index gives its memory back when it is dropped.
+    let (index, built) = resident_over(|| index_at(knob));
+    let ((), freed) = resident_over(move || drop(index));
+    assert_eq!(freed, 0, "dropping the index frees what it reserved");
+    assert!(built > 0);
 }
