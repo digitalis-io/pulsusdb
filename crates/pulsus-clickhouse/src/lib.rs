@@ -3,11 +3,13 @@
 //! the `clickhouse` crate (HTTP + RowBinary) — the M0 spike winner. See
 //! docs/architecture.md §1.2 and docs/decisions/0001-clickhouse-client.md.
 //!
-//! `insert_block` is **never** auto-retried by this crate (append-only
-//! exactly-once via writer batch atomicity, docs/schemas.md §8; a retried
-//! partial insert duplicates rows and can permanently inflate tier
-//! aggregates, docs/schemas.md §2.2). `execute` retries only when the
-//! caller declares [`Idempotency::Idempotent`].
+//! `insert_block` is **never** auto-retried by this crate: a retried partial
+//! insert duplicates rows and can permanently inflate tier aggregates
+//! (docs/schemas.md §2.2), and nothing at this layer can tell a repeat from
+//! a first delivery. A *client's* retry is suppressed one layer up, by
+//! `pulsus-write`'s per-writer push index inside
+//! `PULSUS_INGEST_DEDUP_WINDOW` (issue #494). `execute` retries only when
+//! the caller declares [`Idempotency::Idempotent`].
 
 mod client;
 mod config;

@@ -29,6 +29,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use pulsus_write::PushHeaders;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,7 +142,9 @@ fn writer(client: Arc<ChClient>) -> MetricWriter {
 }
 
 async fn flush(writer: &MetricWriter, batch: ParsedMetrics) {
-    let wait = writer.admit_flush(batch).expect("queue has room");
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles within the test timeout")

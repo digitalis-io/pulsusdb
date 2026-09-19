@@ -598,7 +598,7 @@ greedy lowering costs more than one generator's read. §2.7.5 gives the argument
 with the two measurements that looked like counterexamples and are not, and what would falsify it.
 
 **LogQL's paging belongs to LogQL's own compiler, not to the core.** LogQL's `fetch_until_limit`
-keyset paging (`crates/pulsus-read/src/logql/plan.rs:1658`, field at `:80`) means compiling a
+keyset paging (`crates/pulsus-read/src/logql/plan.rs:1658`, field at `:83`) means compiling a
 dropping stage changes the *paging strategy*, not only the byte count — and what decides that is
 whether the compiled predicate is **equivalent** to the stage or merely **wider** than it. LogQL's
 compiler is separate and is not to be merged into the core (owner decision, #507); it decides this
@@ -847,7 +847,7 @@ measurement.
   (`crates/pulsus-read/src/logql/params.rs:121`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
   `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:440`,
-  `crates/pulsus-read/src/traces/search_sql.rs:531`). The seed is the winners' trace ids, bounded
+  `crates/pulsus-read/src/traces/search_sql.rs:613`). The seed is the winners' trace ids, bounded
   by the request `limit`.
 
 **This is the case §2.6's earlier form got structurally wrong.** `Emit` is `Never`, so §2.5's fold
@@ -1185,17 +1185,17 @@ cannot be reached by any request:
 
 | variant | rejected payload | `400` body, verbatim | reachable from a parsed+validated query |
 |---|---|---|---|
-| `Aggregate` | regex comparison operator (`search_plan.rs:1591`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
-| `Aggregate` | `count()` given a field (`:1189`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
-| `Aggregate` | a one-arity op given no field (`:1194`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
-| `Aggregate` | a non-numeric intrinsic argument (`:1200`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
-| `Aggregate` | a composite argument expression (`:1212`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
-| `Aggregate` | a duration threshold on a non-duration aggregate (`:1057`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
-| `Aggregate` | a non-finite numeric threshold (`:1046`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
-| `By` | a composite key expression (`:1125`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
-| `By` | a span-event / span-link intrinsic key (`:1435`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
-| `Select` | a nested-set intrinsic (`:1277`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
-| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:1322`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Aggregate` | regex comparison operator (`search_plan.rs:2210`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
+| `Aggregate` | `count()` given a field (`:2238`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
+| `Aggregate` | a one-arity op given no field (`:2242`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
+| `Aggregate` | a non-numeric intrinsic argument (`:2249`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
+| `Aggregate` | a composite argument expression (`:2261`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
+| `Aggregate` | a duration threshold on a non-duration aggregate (`:1899`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
+| `Aggregate` | a non-finite numeric threshold (`:1887`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
+| `By` | a composite key expression (`:2174`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
+| `By` | a span-event / span-link intrinsic key (`:2513`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
+| `Select` | a nested-set intrinsic (`:2342`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
+| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2387`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
 | `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
@@ -1205,8 +1205,8 @@ are rejected whole rather than by payload and are already "not in the chain" bel
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
-`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1074`, whose rule is
-`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1071` to `:1074`. **An unreachability
+`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1887`, whose rule is
+`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1884` to `:1886`. **An unreachability
 claim is a universal over inputs**, so each of the four was re-checked by constructing the input
 that would defeat it rather than by reading the lexer: three spellings each for the regex-operator,
 `count()`-with-field and one-arity-without-field rows, and ten for the numeric threshold, including
@@ -1223,7 +1223,7 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `AggValues(i)` (synthesised, `:175`) | any → same shape | **lowers** (`Yes`, `Fidelity::Equivalent`) since [#558](https://github.com/digitalis-io/pulsusdb/issues/558) — `i` indexes `SearchPlan::agg_fields`, and the operand's number and stored kind are a projected slot on the hydration statement rather than a read of their own | **none — the identity** | always lowers | *none* — it reads no source of its own, so the core sees no handoff |
 | `SelectValues(i)` (synthesised, `:178`) | any → same shape | **lowers** (`Yes`, `Fidelity::Equivalent`) since #558 — `i` indexes `SearchPlan::select_attrs`, and the field's byte-capped value and stored kind are a projected slot on the same statement. It is a separate link from `AggValues` because a `by()` key is interned into both vectors and each gets its own slot | **none — the identity** | always lowers | *none* |
 | `EventSet(i)` (synthesised, `:181`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::event_sets`: one span-event / span-link value-set batch read, which `arrayJoin` expands one row per value and so cannot be a column | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_spans` (event sets), key `trace_id`, `SeedBound::Config` |
-| `TraceCtx` (synthesised, `:183`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
+| `TraceCtx` (synthesised, `:197`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
 | `ChildCount` (synthesised, `:185`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, same reason: `span:childCount` is counted over the whole trace, not over the window | **none — the identity** | never lowers, in any state | **`Cut::SourceHandoff`** — source `trace_spans` (child counts), key `trace_id`, `SeedBound::Config` |
 | `Structural` (synthesised, `:187`) | any → same shape | **`Never(StructuralRelation)`** — the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it | **clears `exact`** — the generators are the superset union of both operands' sets and the relation is applied afterwards, so the SQL means strictly more than the query | never lowers, in any state | *none* — the link reads no new source, so there is no handoff and no second part |
 | `NestedSet` (synthesised, `:189`) | any → same shape | **`Never(NestedSetNumbering)`** — a modified-preorder numbering computed per trace at query time; no stored column carries it | **clears `exact`** | never lowers, in any state | *none* — same reason |
@@ -2223,8 +2223,8 @@ never treat it as zero cost.
 
 **A third trap, and it is the one that decided an architectural question.** Our reader sends
 `max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
-(`crates/pulsus-read/src/traces/exec.rs:176`), set in `search_settings` (`:3058`) and inherited by
-`generator_settings` (`:2869`). ClickHouse 26.3.29.7's own default is **65,409**
+(`crates/pulsus-read/src/traces/exec.rs:176`), set in `search_settings` (`:2961`) and inherited by
+`generator_settings` (`:2996`). ClickHouse 26.3.29.7's own default is **65,409**
 (`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
 A measurement taken at the server default is a measurement of a system we do not run, and the
 setting moves two different figures in opposite directions:
@@ -2392,9 +2392,9 @@ beside the figures they govern rather than once here, and this list is the index
 | `max_block_size` | **4096** | the shipped value (`exec.rs:178`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
-| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:561`), applied by `generator_settings` (`exec.rs:2995`) |
+| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:582`), applied by `generator_settings` (`exec.rs:2995`) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:2995`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:557`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2955-2961`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:578`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2955-2961`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2501,8 +2501,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2106` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2152` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2180` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2231` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -2923,7 +2923,7 @@ of them `String`, for the arithmetic form. Per span-group at the full window the
 1,129 / 1,116 / 1,104 / 454 / 571 bytes.
 
 Against that, `generator_settings` (`exec.rs:2995`) applies `max_memory_usage = 536870912` — the
-shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:561`) — with
+shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:582`) — with
 `max_bytes_before_external_group_by = 0`, so the statement throws rather than spilling:
 
 ```
@@ -3149,7 +3149,7 @@ Same answers on both tables — 1,666,667 and 10,000 matching rows — at 722x a
 So this is a second copy of the attribute rows, not a re-ordering of the existing one.
 
 **The budget it needs alongside.** `reader.traceql_scan_budget_rows`, raised from 50,000,000
-(`crates/pulsus-config/src/model.rs:557`) to cover the window's attribute rows; **200,000,000** was
+(`crates/pulsus-config/src/model.rs:578`) to cover the window's attribute rows; **200,000,000** was
 measured. Without it every one of the five classes returns
 `Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
 current rows: …` — the trailing figure is where the read had got when the limit tripped and varies
@@ -3191,7 +3191,7 @@ from an argument.
 **The finding first, because it is the one an amendment has to meet.** The per-query join form — the
 shape that justifies "replaces one statement per batch with one statement per query" — does not
 survive the shipped generator memory ceiling. At `max_memory_usage = 536870912`, the shipped
-`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:561`, applied by
+`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:582`, applied by
 `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:2995`), it refused on all three takes,
 `exception_code` 241, 721 marks selected, no rows out. **The refusal is asserted on `Code: 241` and
 `512.00 MiB`, and on nothing else.** Everything else in the message is a record, and the three
@@ -4955,7 +4955,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 
 Wave 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:168`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:391`) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **wave 1** at base, none of them there then; all six exist today
@@ -4965,8 +4965,8 @@ to be that argument as tests: the model must reproduce **each** walk, not just t
 measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
-(`crates/pulsus-read/src/logql/plan.rs:3763`) and `has_unpushed_dropping_stage` (`:1685`) and
-`metric_pipeline_construct` (`:1698`) are private — an integration test cannot call any of them.
+(`crates/pulsus-read/src/logql/plan.rs:3763`) and `has_unpushed_dropping_stage` (`:1688`) and
+`metric_pipeline_construct` (`:1722`) are private — an integration test cannot call any of them.
 **They go in `plan.rs`'s existing `mod tests` (`plan.rs:4243`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
 directly, and again through its `use super::*` (`plan.rs:4500`). An earlier version of this section
@@ -5359,7 +5359,7 @@ and left the check to be run by hand. **That claim was false.** The workspace al
 the form this repository uses for exactly this purpose: rustdoc `compile_fail` fences, in
 `crates/pulsus-read/src/logql/predicate.rs` (`:257`, `:295`, `:332`, `:373`) and
 `crates/pulsus-read/src/logql/sql.rs` (`:453`, `:467`), with a module doc that sets the bar for them
-— *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:92`) — and a measured
+— *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:93`) — and a measured
 caveat that the annotated error code is not checked at all (`predicate.rs:87-91`, issue #286).
 Doctests are not run by `nextest`; CI runs them separately as `cargo test --workspace --doc`
 (`.github/workflows/ci.yml:126`, whose own comment says *"nextest never runs doctests"*). Re-run on
@@ -5513,19 +5513,20 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 690 |
-| of those, citing a bare basename | 537 |
-| of those, written as a continuation of a citation earlier on the line | 44 |
-| `(document, token)` pairs the rule resolves | 363 |
-| occurrences those resolved pairs cover | 504 |
-| `(document, token)` pairs it cannot resolve | 99 |
-| occurrences those frozen pairs cover | 186 |
-| resolved rows anchored on a token the citing prose prints | 173 |
-| resolved rows anchored on a snapshot of the cited line | 190 |
+| citation occurrences in the five artefacts | 723 |
+| of those, citing a bare basename | 550 |
+| of those, written as a continuation of a citation earlier in the paragraph | 77 |
+| of those continuations, on a later line than the citation they continue | 33 |
+| `(document, token)` pairs the rule resolves | 393 |
+| occurrences those resolved pairs cover | 534 |
+| `(document, token)` pairs it cannot resolve | 101 |
+| occurrences those frozen pairs cover | 189 |
+| resolved rows anchored on a token the citing prose prints | 178 |
+| resolved rows anchored on a snapshot of the cited line | 215 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 92 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 94 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 5 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
@@ -5540,7 +5541,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 690 citation occurrences the five artefacts make, 537 name a bare basename and 44 are written as a continuation of a citation earlier on the same line. The rule resolves 363 `(document, token)` pairs covering 504 occurrences, and cannot resolve 99 covering 186. Of the resolved rows, 173 are anchored on a token the citing prose prints and 190 on a snapshot of the cited line.
+Of the 723 citation occurrences the five artefacts make, 550 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 393 `(document, token)` pairs covering 534 occurrences, and cannot resolve 101 covering 189. Of the resolved rows, 178 are anchored on a token the citing prose prints and 215 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

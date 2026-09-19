@@ -15,6 +15,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use pulsus_write::PushHeaders;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -289,7 +290,7 @@ async fn l1_lost_registration_backfill_resolves_the_stream_in_the_samples_month(
     let fingerprint = 77u128;
     let service = "backfill-l1-svc";
     let wait = writer
-        .admit_flush(batch_for(fingerprint, service))
+        .admit_flush(batch_for(fingerprint, service), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -359,7 +360,7 @@ async fn l2_false_poisoned_duplicate_reinsert_collapses_on_final_read() {
     let fingerprint = 88u128;
     let service = "backfill-l2-svc";
     let wait = writer
-        .admit_flush(batch_for(fingerprint, service))
+        .admit_flush(batch_for(fingerprint, service), PushHeaders::default())
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await

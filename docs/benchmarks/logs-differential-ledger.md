@@ -6919,3 +6919,78 @@ gated by
   (the decoded value out of a real response). **Neither pins the escape
   form itself** — no test asserts the raw bytes of this field, and the
   measurement above is the only record of them.
+
+### `identical-lines-in-one-push` (issue #494, deliberate divergence — a repeated event is a second event)
+
+- **What differs: two identical entries at ONE nanosecond, inside ONE
+  push.** We store both and return both; the reference stores one. This is
+  not what issue #494 changed — a retried push is a different case, and
+  both stores answer that one the same way after #494 — but #494 is where
+  the boundary was drawn, so the divergence is recorded here rather than
+  left to be rediscovered.
+
+- **Why ours is the answer we keep.** A log entry is an *event*. A service
+  that emits the same line twice inside one nanosecond emitted two events,
+  and a store that returns one of them has lost data the client sent, with
+  no error and no counter. The reference's rule drops the second, and it
+  does so in storage rather than at the API, so nothing in its response
+  says a line went missing.
+
+  The rule is explicit in the reference and is a *storage* rule, not a
+  push-level one: on appending to an unordered head block it walks the
+  entries already at that nanosecond and ignores the incoming line when
+  the line text and the structured-metadata symbols both match —
+  `pkg/chunkenc/unordered.go:140-148 @ v3.7.4`, with the comment "While we
+  support multiple entries at the same timestamp, we _do_ de-duplicate
+  entries at the same time with the same content".
+
+  The metric side of PulsusDB does collapse a repeat at one millisecond
+  (docs/schemas.md §2.1, issue #494 §7), and the difference is deliberate:
+  a metric sample is a *value at a time*, where a second identical row
+  carries no information the first does not; a log entry is an event,
+  where a repeat is a second event.
+
+- **Measured** 2026-09-19 on one machine, single node, against the pinned
+  oracle (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
+  `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`) with the
+  committed `ci/logql/config.yaml`, and against PulsusDB at `6c623a0f`
+  over ClickHouse `6c623a0f`. One push to each, through each side's own
+  `POST /loki/api/v1/push` with `Content-Type: application/json`, the same
+  body, `T = 1789804343000000000`:
+
+  ```
+  {"streams":[{"stream":{"service_name":"l2probe"},
+               "values":[["1789804343000000000","checkout failed order=1"],
+                         ["1789804343000000000","checkout failed order=1"]]}]}
+  ```
+
+  Both answered `204`. Both were then asked, at `time = T + 1s`:
+  `GET /loki/api/v1/query?query=count_over_time({service_name="l2probe"}[5m])`
+
+  ```
+  ours        "value":[1789804344.0,"2"]
+  reference   "value":[1789804344,"1"]
+  ```
+
+  And the raw entries, `GET /loki/api/v1/query_range` over `T-1h .. T+1h`,
+  `limit=100`, `direction=forward` — the `values` arrays, quoted:
+
+  ```
+  ours        [["1789804343000000000","checkout failed order=1"],
+               ["1789804343000000000","checkout failed order=1"]]
+  reference   [["1789804343000000000","checkout failed order=1"]]
+  ```
+
+  `SELECT count() FROM log_samples WHERE service = 'l2probe'` on our side:
+  `2`.
+
+- **Asserted:** the two entry counts above, on the two routes named, for a
+  single push carrying two byte-identical entries at one nanosecond in one
+  stream.
+
+- **Not asserted:** anything about two identical entries at *different*
+  nanoseconds (both stores keep both), about the same body sent as two
+  requests (issue #494: both stores keep one), or about entries whose
+  structured metadata differs (the reference's rule compares that too, and
+  we do not reach the rule at all).
+

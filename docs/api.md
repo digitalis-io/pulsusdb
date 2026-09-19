@@ -24,11 +24,43 @@ Conventions:
 | `X-Pulsus-Async` | ingest | `1` = enqueue and return `202`; `0` = confirm flush (default from config) |
 | `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and per-segment exactness (raw-exact vs tier-approximate) in the response envelope |
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
+| `Idempotency-Key` | log and metric ingest | issue #494. Namespaces a push's identity: two requests with **different** keys are two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is a client error — `400`, and nothing is stored. Absent, a push is identified by its own content. Not read on `/v1/traces` or the Zipkin receiver |
+| `Retry-Attempt` | log and metric ingest | issue #494. The attempt number, `1` upward. **Never a suppression key** — there is nothing stored to match a bare marker against, and suppressing on one would drop a push with no record of having accepted it. It sets the `declared` label on `pulsus_ingest_duplicate_pushes_total` and nothing else |
 | `Authorization` | all | Basic auth when `PULSUS_AUTH_USER` is set |
 
 ---
 
 ## 1. Ingestion
+
+### 1.0 A retried push is stored once (issue #494)
+
+A client that retries a push after a network timeout used to store its
+entries or samples twice: `count_over_time`/`sum_over_time` doubled while
+`rate` looked right, so two panels over the same data disagreed and neither
+reported an error.
+
+**A push a writer has already accepted, and still remembers, is not stored
+twice by that writer.** The window is `PULSUS_INGEST_DEDUP_WINDOW` (`5m`);
+`PULSUS_INGEST_DEDUP=false` restores the old behaviour.
+
+| what arrives | what happens |
+|---|---|
+| a content-identical push, **same writer process**, inside the window | nothing is stored; the response is the one the original push received |
+| the same push after the window has elapsed | stored — it is a new push |
+| the same push at a **different** writer process | stored. The index is per process; this is a declared limit, not an oversight |
+| two identical lines inside **one** push | both stored |
+| concurrent identical requests at one writer | exactly one is stored |
+| the same `Idempotency-Key` with different content | `400`, nothing stored |
+| the index is at its byte bound with nothing evictable | `429`, nothing stored, and the client's retry is answered normally once it drains |
+
+**What a suppressed caller is told.** In sync mode the response is the
+original push's outcome, which means a suppressed caller can receive the
+original's failure. In async mode the answer is `202` without waiting, as
+it is for any async push.
+
+**What it costs.** `PULSUS_INGEST_DEDUP_MAX_BYTES` (`16MiB` per signal)
+bounds the whole index. It is a hard bound rather than a target: the index
+reserves its collections once at construction and never grows them.
 
 ### 1.1 OTLP (primary)
 

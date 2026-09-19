@@ -5572,11 +5572,18 @@ mod tests {
     /// column pair.
     ///
     /// **Both reachable routes are covered, and the third is unreachable by
-    /// construction, not by omission:** `metric_plan` sets `client = Some(..)`
-    /// for every range query (issue #227 retired the range rollup fast path),
-    /// so `RouteChoice::Rollup` — and with it `MetricShape::Rollup*` — cannot
-    /// be reached from a plan at all today. `sql.rs`'s `metric_range` records
-    /// the same fact. The rollup half of the inverse is covered by
+    /// construction, not by omission:** no plan shape reaches
+    /// `RouteChoice::Rollup` — and with it `MetricShape::Rollup*` — today.
+    /// The reason is not one rule but three, and the first of them used to
+    /// be stated here alone, which was stale: issue #227 retired the range
+    /// rollup fast path, and issue #507 then added two branches that take
+    /// their own forced-raw route BEFORE the rollup eligibility test is
+    /// reached — a bucketed range with an extracted-field group key
+    /// (`:2669-2678`) and a bucketed range without one (`:2679-2690`).
+    /// Each clears `client` and returns `RouteChoice::Raw` regardless of
+    /// whether the step divides the resolution. `sql.rs`'s `metric_range`
+    /// records the same unreachability. The rollup half of the inverse is
+    /// covered by
     /// `sql::tests::metric_shape_round_trips_through_from_columns_for_every_variant`,
     /// which iterates `MetricShape::ALL`.
     #[test]

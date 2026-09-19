@@ -33,7 +33,7 @@
 //! per-chunk explain entries would be O(chunks) noise for no new
 //! information).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 use futures::future::{join, join_all};
@@ -2397,9 +2397,87 @@ trait FloatPoint {
 
 /// The histogram half of a mergeable sample row
 /// (`HistSampleRow`/`MultiHistSampleRow`).
+/// Compares two histogram rows column by column, floats by `to_bits()`.
+/// A macro rather than a generic function because the two row types share
+/// no trait carrying their columns, and cloning them through
+/// `to_columns()` to compare would allocate seven vectors per comparison
+/// on a read path.
+macro_rules! same_stored_histogram {
+    ($a:expr, $b:expr) => {
+        $a.schema == $b.schema
+            && $a.zero_threshold.to_bits() == $b.zero_threshold.to_bits()
+            && $a.zero_count == $b.zero_count
+            && $a.count == $b.count
+            && $a.sum.to_bits() == $b.sum.to_bits()
+            && $a.counter_reset_hint == $b.counter_reset_hint
+            && $a.pos_span_offsets == $b.pos_span_offsets
+            && $a.pos_span_lengths == $b.pos_span_lengths
+            && $a.pos_bucket_deltas == $b.pos_bucket_deltas
+            && $a.neg_span_offsets == $b.neg_span_offsets
+            && $a.neg_span_lengths == $b.neg_span_lengths
+            && $a.neg_bucket_deltas == $b.neg_bucket_deltas
+            && $a.custom_values.len() == $b.custom_values.len()
+            && $a
+                .custom_values
+                .iter()
+                .zip(&$b.custom_values)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+}
+
+/// The 128-bit digest behind [`HistPoint::identity`], over the same
+/// columns [`same_stored_histogram`] compares and in the same order.
+/// Floats enter as `to_bits()`, so `0.0` and `-0.0` digest differently
+/// exactly as they compare differently.
+macro_rules! stored_histogram_identity {
+    ($h:expr) => {{
+        use xxhash_rust::xxh3::Xxh3;
+        let mut d = Xxh3::new();
+        d.update(&($h.schema as i64).to_le_bytes());
+        d.update(&$h.zero_threshold.to_bits().to_le_bytes());
+        d.update(&$h.zero_count.to_le_bytes());
+        d.update(&$h.count.to_le_bytes());
+        d.update(&$h.sum.to_bits().to_le_bytes());
+        d.update(&[$h.counter_reset_hint]);
+        for v in &$h.pos_span_offsets {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.pos_span_lengths {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.pos_bucket_deltas {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_span_offsets {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_span_lengths {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.neg_bucket_deltas {
+            d.update(&v.to_le_bytes());
+        }
+        for v in &$h.custom_values {
+            d.update(&v.to_bits().to_le_bytes());
+        }
+        d.digest128()
+    }};
+}
+
 trait HistPoint {
     fn unix_milli(&self) -> i64;
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError>;
+    /// Whether two rows at one `(series, millisecond)` carry the same
+    /// stored histogram, compared bitwise on every value column — issue
+    /// #494 §7's identity for the histogram half. Never a decode: two rows
+    /// that decode to equal histograms from different stored columns are
+    /// two samples.
+    fn same_stored_value(&self, other: &Self) -> bool;
+    /// A 128-bit digest of the same stored columns, so a long run can be
+    /// indexed instead of scanned. Equal values digest equally; unequal
+    /// ones are verified with [`Self::same_stored_value`] on a hit, so the
+    /// digest is an index and never the decision.
+    fn identity(&self) -> u128;
 }
 
 impl FloatPoint for SampleRow {
@@ -2427,6 +2505,12 @@ impl HistPoint for HistSampleRow {
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
+    fn same_stored_value(&self, other: &Self) -> bool {
+        same_stored_histogram!(self, other)
+    }
+    fn identity(&self) -> u128 {
+        stored_histogram_identity!(self)
+    }
 }
 
 impl HistPoint for MultiHistSampleRow {
@@ -2436,44 +2520,227 @@ impl HistPoint for MultiHistSampleRow {
     fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
+    fn same_stored_value(&self, other: &Self) -> bool {
+        same_stored_histogram!(self, other)
+    }
+    fn identity(&self) -> u128 {
+        stored_histogram_identity!(self)
+    }
 }
 
-/// Per-series 2-way merge by `unix_milli` with the histogram-wins tie-break
-/// (M7-A5a). Both inputs are ascending by `unix_milli` (the fetch `ORDER
-/// BY` contract). At `f < h` emit the float; at `f > h` emit the (decoded)
-/// histogram; at `f == h` emit the HISTOGRAM and advance BOTH cursors — a
-/// same-`(name, fp, unix_milli)` collision is a data error (one value type
-/// per timestamp is the A1 v5 invariant), resolved deterministically in
-/// the histogram's favour. Stale markers are PRESERVED here (not filtered)
-/// so `windowed_non_stale`/`staleness` own staleness exactly as the float
-/// path does today — keeping float output byte-identical.
+/// Issue #494 §7, the rule this read path implements at one
+/// `(series, millisecond)`:
+///
+/// > **If any histogram is present the answer is a histogram and no float
+/// > survives; otherwise the answer is each distinct float value-bit
+/// > identity, in arrival order.**
+///
+/// The comparison is over the whole timestamp RUN, not the previous row.
+/// Rows arrive ordered by `(fingerprint, unix_milli)` (the fetch `ORDER BY`
+/// contract), so a run is contiguous, and in the ordinary case a run is one
+/// row long and the loops below do one comparison each.
+///
+/// Two floats and one histogram at one millisecond used to leave a stray
+/// float behind — the tie-break consumed ONE float and one histogram, and
+/// the tail loop then emitted the second float, so `count_over_time`
+/// answered `"2"` where the histogram alone is the answer.
+///
+/// Identity is bits, never `==`: `0.0` and `-0.0` are equal under `==` and
+/// are two different samples the client sent, while `NaN != NaN` would make
+/// a repeated stale marker two samples. Histogram identity is likewise the
+/// stored columns compared bitwise.
+fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
+    out: &mut Vec<Sample>,
+    t_ms: i64,
+    floats: &[F],
+    hists: &[H],
+    run: &mut RunDedup,
+) -> Result<(), ReadError> {
+    if !hists.is_empty() {
+        emit_histogram_run(out, t_ms, hists)?;
+        return Ok(());
+    }
+    for f in floats {
+        run.push_float(out, t_ms, f.value());
+    }
+    Ok(())
+}
+
+/// One timestamp run's histograms: each distinct stored value once, in
+/// arrival order.
+///
+/// Linear while the run is short, which is every run a well-formed store
+/// produces — one histogram per `(series, millisecond)` is the invariant.
+/// Past that the run indexes by a 128-bit digest of the stored columns and
+/// **verifies structurally on a hit**, so a digest collision cannot drop a
+/// sample the client sent; it can only cost one extra comparison.
+fn emit_histogram_run<H: HistPoint>(
+    out: &mut Vec<Sample>,
+    t_ms: i64,
+    hists: &[H],
+) -> Result<(), ReadError> {
+    if hists.len() <= RUN_LINEAR_MAX {
+        for (k, h) in hists.iter().enumerate() {
+            if hists[..k].iter().any(|prev| prev.same_stored_value(h)) {
+                continue;
+            }
+            out.push(Sample::hist(t_ms, h.decode()?));
+        }
+        return Ok(());
+    }
+    let mut by_identity: HashMap<u128, Vec<usize>> = HashMap::new();
+    for (k, h) in hists.iter().enumerate() {
+        let identity = h.identity();
+        let seen = by_identity.entry(identity).or_default();
+        if seen.iter().any(|&j| hists[j].same_stored_value(h)) {
+            continue;
+        }
+        seen.push(k);
+        out.push(Sample::hist(t_ms, h.decode()?));
+    }
+    Ok(())
+}
+
+/// How many samples a timestamp run may hold before [`RunDedup`] stops
+/// scanning the run it has already emitted and indexes it instead.
+///
+/// A run is one sample long in the ordinary case, so the scan is one
+/// comparison and a set would be pure overhead. The threshold is what
+/// keeps that true while bounding the pathological case: round 2 of this
+/// issue's code review measured the unbounded scan at `49,995,000`
+/// comparisons for ten thousand samples at one millisecond and
+/// `199,990,000` for twenty thousand — four times the work for twice the
+/// input, on a read path that is not allowed to regress.
+const RUN_LINEAR_MAX: usize = 8;
+
+/// First-seen-order deduplication inside ONE timestamp run, shared by every
+/// path that applies issue #494 §7's rule.
+///
+/// Held across a whole grouping rather than per run, so the set behind it
+/// is allocated at most once for a call and reused by every later run.
+#[derive(Default)]
+pub(super) struct RunDedup {
+    t_ms: i64,
+    /// Samples of the current run already in the output. A repeat does not
+    /// count: a run of ten thousand identical values stays at one.
+    len: usize,
+    /// The run's value bits, populated only once the run outgrows
+    /// [`RUN_LINEAR_MAX`].
+    seen: HashSet<u64>,
+}
+
+// Samples `RunDedup::push_float` has examined, counted under `cfg(test)`
+// so the cost gate can read the quantity that was quadratic rather than a
+// stand-in for it. A gate over the INPUT reads cannot see this at all: the
+// scan it replaced walked the OUTPUT, so the input was read once either
+// way.
+#[cfg(test)]
+thread_local! {
+    pub(super) static RUN_SAMPLES_EXAMINED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_examined(n: u64) {
+    RUN_SAMPLES_EXAMINED.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(not(test))]
+fn count_examined(_n: u64) {}
+
+impl RunDedup {
+    /// Appends `value` unless the run at `t_ms` already holds a sample with
+    /// the same bits. A different `t_ms` starts a new run.
+    fn push_float(&mut self, out: &mut Vec<Sample>, t_ms: i64, value: f64) {
+        if self.len == 0 || self.t_ms != t_ms {
+            self.t_ms = t_ms;
+            self.len = 0;
+            self.seen.clear();
+        }
+        let bits = value.to_bits();
+        let duplicate = if self.len > RUN_LINEAR_MAX {
+            if self.seen.is_empty() {
+                // One-time promotion: the run already in `out` moves into
+                // the set, and every later sample costs one lookup.
+                count_examined(self.len as u64);
+                for sample in out.iter().rev().take(self.len) {
+                    if sample.h.is_none() {
+                        self.seen.insert(sample.v.to_bits());
+                    }
+                }
+            }
+            count_examined(1);
+            !self.seen.insert(bits)
+        } else {
+            let mut examined = 0u64;
+            let found = out
+                .iter()
+                .rev()
+                .take(self.len)
+                .inspect(|_| examined += 1)
+                .any(|sample| sample.h.is_none() && sample.v.to_bits() == bits);
+            count_examined(examined);
+            found
+        };
+        if duplicate {
+            return;
+        }
+        out.push(Sample::float(t_ms, value));
+        self.len += 1;
+    }
+
+    /// Ends the current run. Two series can start at the same millisecond,
+    /// and the second must not be read against the first's samples.
+    fn end_run(&mut self) {
+        self.len = 0;
+        self.seen.clear();
+    }
+}
+
+/// Per-series merge by `unix_milli` under [`emit_timestamp_run`]'s rule.
+/// Both inputs are ascending by `unix_milli` (the fetch `ORDER BY`
+/// contract). Stale markers are PRESERVED here (not filtered) so
+/// `windowed_non_stale`/`staleness` own staleness exactly as the float path
+/// does today.
+///
+/// The one-shot form, used by the tests that exercise a single series.
+/// Production groups many series and threads one [`RunDedup`] through them
+/// all, which is [`merge_series_with`].
+#[cfg(test)]
 fn merge_series<F: FloatPoint, H: HistPoint>(
     float: &[F],
     hist: &[H],
 ) -> Result<Vec<Sample>, ReadError> {
+    let mut run = RunDedup::default();
+    merge_series_with(float, hist, &mut run)
+}
+
+/// [`merge_series`] against a `RunDedup` the caller owns, so a grouping
+/// walking many series allocates the set at most once.
+fn merge_series_with<F: FloatPoint, H: HistPoint>(
+    float: &[F],
+    hist: &[H],
+    run: &mut RunDedup,
+) -> Result<Vec<Sample>, ReadError> {
+    run.end_run();
     let mut out = Vec::with_capacity(float.len() + hist.len());
     let (mut i, mut j) = (0usize, 0usize);
-    while i < float.len() && j < hist.len() {
-        let (ft, ht) = (float[i].unix_milli(), hist[j].unix_milli());
-        if ft < ht {
-            out.push(Sample::float(ft, float[i].value()));
+    while i < float.len() || j < hist.len() {
+        let t_ms = match (float.get(i), hist.get(j)) {
+            (Some(f), Some(h)) => f.unix_milli().min(h.unix_milli()),
+            (Some(f), None) => f.unix_milli(),
+            (None, Some(h)) => h.unix_milli(),
+            (None, None) => break,
+        };
+        let f_start = i;
+        while i < float.len() && float[i].unix_milli() == t_ms {
             i += 1;
-        } else if ft > ht {
-            out.push(Sample::hist(ht, hist[j].decode()?));
-            j += 1;
-        } else {
-            out.push(Sample::hist(ht, hist[j].decode()?));
-            i += 1;
+        }
+        let h_start = j;
+        while j < hist.len() && hist[j].unix_milli() == t_ms {
             j += 1;
         }
-    }
-    while i < float.len() {
-        out.push(Sample::float(float[i].unix_milli(), float[i].value()));
-        i += 1;
-    }
-    while j < hist.len() {
-        out.push(Sample::hist(hist[j].unix_milli(), hist[j].decode()?));
-        j += 1;
+        emit_timestamp_run(&mut out, t_ms, &float[f_start..i], &hist[h_start..j], run)?;
     }
     Ok(out)
 }
@@ -2492,13 +2759,16 @@ fn group_rows(
     metric_name: &str,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
+    let mut run = RunDedup::default();
     for row in rows {
-        let sample = Sample::float(row.unix_milli, row.value);
         match out.last_mut() {
+            // Issue #494 §7: two rows identical in
+            // `(fingerprint, unix_milli, value bits)` are one sample.
             Some(last) if last.fingerprint == row.fingerprint => {
-                last.samples.push(sample);
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
             _ => {
+                run.end_run();
                 let labels = labels_by_fp
                     .get(&row.fingerprint)
                     .cloned()
@@ -2507,9 +2777,13 @@ fn group_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(metric_name.to_string()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![sample],
+                    samples: Vec::new(),
                     start_ts: None,
                 });
+                // Through `RunDedup` like every other row, so the run it
+                // starts is one the next row can be read against.
+                let last = out.last_mut().expect("just pushed");
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
         }
     }
@@ -2541,22 +2815,24 @@ fn group_multi_rows(
     labels_by_fp: &HashMap<Fingerprint, LabelSet>,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
+    let mut run = RunDedup::default();
     let mut current: Option<(String, Fingerprint)> = None;
     // Whether `current` produced an output series (false = the pair was
     // skipped, so its remaining rows must not attach to `out.last_mut()`,
     // which belongs to an earlier pair).
     let mut current_kept = false;
     for row in rows {
-        let sample = Sample::float(row.unix_milli, row.value);
         let same = current
             .as_ref()
             .is_some_and(|(name, fp)| *name == row.metric_name && *fp == row.fingerprint);
         if same {
+            // Issue #494 §7, as in `group_rows`.
             if current_kept && let Some(last) = out.last_mut() {
-                last.samples.push(sample);
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
             continue;
         }
+        run.end_run();
         let key = (row.metric_name, row.fingerprint);
         let labels = labels_by
             .get(&key)
@@ -2568,9 +2844,11 @@ fn group_multi_rows(
                     fingerprint: row.fingerprint,
                     metric_name: Some(key.0.clone()),
                     labels: to_promql_labels(&labels),
-                    samples: vec![sample],
+                    samples: Vec::new(),
                     start_ts: None,
                 });
+                let last = out.last_mut().expect("just pushed");
+                run.push_float(&mut last.samples, row.unix_milli, row.value);
                 true
             }
             None => false,
@@ -2598,6 +2876,7 @@ fn group_merged_rows(
     if hist.is_empty() {
         return Ok(group_rows(float, labels_by_fp, metric_name));
     }
+    let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
     let (mut fi, mut hi) = (0usize, 0usize);
     while fi < float.len() || hi < hist.len() {
@@ -2618,7 +2897,7 @@ fn group_merged_rows(
         while hi < hist.len() && hist[hi].fingerprint == next_fp {
             hi += 1;
         }
-        let samples = merge_series(&float[f_start..fi], &hist[h_start..hi])?;
+        let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
         let labels = labels_by_fp.get(&next_fp).cloned().unwrap_or_default();
         out.push(FetchedSeries {
             fingerprint: next_fp,
@@ -2648,6 +2927,7 @@ fn group_merged_multi_rows(
     if hist.is_empty() {
         return Ok(group_multi_rows(float, labels_by, labels_by_fp));
     }
+    let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
     let (mut fi, mut hi) = (0usize, 0usize);
     while fi < float.len() || hi < hist.len() {
@@ -2684,7 +2964,7 @@ fn group_merged_multi_rows(
         else {
             continue;
         };
-        let samples = merge_series(&float[f_start..fi], &hist[h_start..hi])?;
+        let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
         out.push(FetchedSeries {
             fingerprint: key.1,
             metric_name: Some(key.0),
@@ -4022,6 +4302,15 @@ mod tests {
         }
     }
 
+    fn multi_float_row(name: &str, fp: Fingerprint, t: i64, v: f64) -> MultiSampleRow {
+        MultiSampleRow {
+            metric_name: name.to_string(),
+            fingerprint: fp,
+            unix_milli: t,
+            value: v,
+        }
+    }
+
     fn hist_row(fp: Fingerprint, t: i64, h: &NativeHistogram) -> HistSampleRow {
         let c = h.to_columns().expect("to_columns");
         HistSampleRow {
@@ -4103,6 +4392,124 @@ mod tests {
             merged[0].h.as_deref().unwrap().sum.to_bits(),
             STALE_NAN_BITS
         );
+    }
+
+    // -- Issue #494 §7: one answer per `(series, millisecond)` --
+
+    /// `5.0, 7.0, 5.0` at one millisecond is two samples, `5.0` and `7.0`:
+    /// the identity is the value's bits, and the comparison is over the
+    /// whole run rather than the previous row, so the repeat two places
+    /// later is still the repeat.
+    #[test]
+    fn group_rows_keeps_one_sample_per_distinct_value_at_one_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            float_row(fp, 1, 5.0),
+            float_row(fp, 1, 7.0),
+            float_row(fp, 1, 5.0),
+        ];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        assert_eq!(series.len(), 1);
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![5.0, 7.0], "arrival order, one per identity");
+    }
+
+    #[test]
+    fn group_rows_collapses_a_repeat_and_keeps_the_next_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            float_row(fp, 1, 5.0),
+            float_row(fp, 1, 5.0),
+            float_row(fp, 2, 7.0),
+        ];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let got: Vec<(i64, f64)> = series[0].samples.iter().map(|s| (s.t_ms, s.v)).collect();
+        assert_eq!(got, vec![(1, 5.0), (2, 7.0)]);
+    }
+
+    /// Two different values at one millisecond are left exactly as stored —
+    /// the read path does not resolve a contradiction it cannot resolve.
+    #[test]
+    fn group_rows_leaves_two_different_values_at_one_millisecond_alone() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![float_row(fp, 1, 1.0), float_row(fp, 1, 2.0)];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![1.0, 2.0]);
+    }
+
+    /// `0.0` and `-0.0` are equal under `==` and are two samples the client
+    /// sent. An `==`-keyed collapse would drop one of them.
+    #[test]
+    fn group_rows_keeps_negative_zero_beside_zero() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![float_row(fp, 1, -0.0), float_row(fp, 1, 0.0)];
+        let series = group_rows(rows, &HashMap::new(), "m");
+        let bits: Vec<u64> = series[0].samples.iter().map(|s| s.v.to_bits()).collect();
+        assert_eq!(bits, vec![0x8000_0000_0000_0000, 0x0000_0000_0000_0000]);
+    }
+
+    #[test]
+    fn group_multi_rows_keeps_one_sample_per_distinct_value_at_one_millisecond() {
+        let fp = Fingerprint::from_raw(1);
+        let rows = vec![
+            multi_float_row("m", fp, 1, 5.0),
+            multi_float_row("m", fp, 1, 7.0),
+            multi_float_row("m", fp, 1, 5.0),
+        ];
+        let mut by_fp = HashMap::new();
+        by_fp.insert(fp, ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &HashMap::new(), &by_fp);
+        let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
+        assert_eq!(values, vec![5.0, 7.0]);
+    }
+
+    /// The defect this replaces: the old tie-break consumed ONE float and
+    /// one histogram, and the tail loop then emitted the second float. The
+    /// histogram consumes the WHOLE float run.
+    #[test]
+    fn two_floats_and_one_histogram_at_one_millisecond_leave_the_histogram_alone() {
+        let fp = Fingerprint::from_raw(1);
+        let hist = single_histogram();
+        let float = [float_row(fp, 1, 5.0), float_row(fp, 1, 7.0)];
+        let h = [hist_row(fp, 1, &hist)];
+        let merged = merge_series(&float, &h).unwrap();
+        assert_eq!(merged.len(), 1, "no float survives the histogram");
+        assert!(merged[0].h.as_deref().unwrap().bits_eq(&hist.to_float()));
+    }
+
+    #[test]
+    fn two_bit_identical_histograms_at_one_millisecond_are_one_sample() {
+        let fp = Fingerprint::from_raw(1);
+        let hist = single_histogram();
+        let h = [hist_row(fp, 1, &hist), hist_row(fp, 1, &hist)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn two_differing_histograms_at_one_millisecond_are_two_samples() {
+        let fp = Fingerprint::from_raw(1);
+        let a = single_histogram();
+        let mut b = single_histogram();
+        b.count += 1;
+        let h = [hist_row(fp, 1, &a), hist_row(fp, 1, &b)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 2, "different stored columns are two samples");
+    }
+
+    /// Bits, not a decode: two rows whose `sum` carries a different NaN
+    /// payload decode to histograms a value comparison would call equal.
+    #[test]
+    fn two_histograms_differing_only_in_a_nan_payload_are_two_samples() {
+        let fp = Fingerprint::from_raw(1);
+        let mut a = single_histogram();
+        a.sum = f64::from_bits(0x7ff8_0000_0000_0001);
+        let mut b = single_histogram();
+        b.sum = f64::from_bits(0x7ff8_0000_0000_0002);
+        let h = [hist_row(fp, 1, &a), hist_row(fp, 1, &b)];
+        let merged = merge_series::<SampleRow, _>(&[], &h).unwrap();
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
@@ -4336,6 +4743,262 @@ mod tests {
         match value_to_query_result(matrix) {
             QueryResult::Matrix(m) => assert_eq!(m[0].points, vec![(0, 1.0)]),
             other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_run_cost {
+    //! Issue #494, round 2 of the code review: the §7 timestamp-run rule
+    //! scanned the run it had already emitted, once per input row, so the
+    //! work grew with the square of the run. Measured there under
+    //! `rustc 1.93.0`:
+    //!
+    //! ```text
+    //!   n=10000  elapsed=410.202961ms   comparisons=49995000
+    //!   n=20000  elapsed=1.648571537s   comparisons=199990000
+    //! ```
+    //!
+    //! Four times the comparisons for twice the input, on a read path that
+    //! is not allowed to regress.
+    //!
+    //! **The gate below counts, it does not time.** A wall-clock assertion
+    //! would flake on a shared machine and says nothing scale-invariant;
+    //! the count is the thing that was quadratic. It is read from
+    //! [`RUN_SAMPLES_EXAMINED`], a `cfg(test)` counter [`RunDedup`]
+    //! increments on both of its branches. (An earlier version of this
+    //! paragraph said the count came from a value type that counted its
+    //! own reads. It never did: the scan walks the emitted [`Sample`]s,
+    //! which are production values the test cannot substitute.)
+    //!
+    //! **What the counter itself is checked against.** A counter is only
+    //! evidence if it counts everything, and nothing in the ratio
+    //! assertions would notice a missing `count_examined` call — deleting
+    //! one makes every figure smaller in the same proportion, which is
+    //! what those assertions compare. So
+    //! [`the_counter_matches_the_closed_form_the_two_branches_give`]
+    //! asserts the exact total, derived on paper from the two branches
+    //! rather than measured:
+    //!
+    //! ```text
+    //!   sample i (0-based), all values distinct, one millisecond:
+    //!     i = 0 ..= L        len = i <= L   linear branch, scans i
+    //!                                       -> sum = L(L+1)/2
+    //!     i = L+1            len > L, set empty: promotion scans len = L+1,
+    //!                                       then one lookup -> L+2
+    //!     i = L+2 ..= n-1    one lookup each  -> n - L - 2
+    //!   total = L(L+1)/2 + n,    L = RUN_LINEAR_MAX
+    //! ```
+
+    use super::*;
+    use std::cell::Cell;
+
+    /// The three run lengths the gate measures. They are constants
+    /// because `the_sizes_can_tell_the_two_shapes_apart` asserts a
+    /// quadratic build would breach the bounds AT THESE SIZES; a size
+    /// changed here changes both tests together.
+    const N1: usize = 10_000;
+    const N2: usize = 20_000;
+    const N4: usize = 40_000;
+
+    /// Samples examined while emitting one run of `n` at one millisecond,
+    /// `distinct` of them carrying different values — read from the
+    /// production counter, not from a stand-in.
+    fn examined_for(n: usize, distinct: usize) -> (u64, usize) {
+        let floats: Vec<SampleRow> = (0..n)
+            .map(|i| SampleRow {
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli: 1,
+                value: (i % distinct) as f64,
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut run = RunDedup::default();
+        RUN_SAMPLES_EXAMINED.with(|c| c.set(0));
+        emit_timestamp_run::<SampleRow, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+            .expect("float-only run");
+        assert_eq!(out.len(), distinct, "the rule's answer is unchanged");
+        (RUN_SAMPLES_EXAMINED.with(Cell::get), out.len())
+    }
+
+    /// The worst case: a run of `n` samples in which every one carries a
+    /// different value, so the run the scan would walk grows with the
+    /// input.
+    ///
+    /// It is a named function taking one argument rather than an entry in
+    /// a list of distinctness values, because a list is what a later edit
+    /// shortens. `distinct` is fixed to `n` in this one place.
+    fn examined_all_distinct(n: usize) -> u64 {
+        let (examined, emitted) = examined_for(n, n);
+        assert_eq!(
+            emitted, n,
+            "this function measures the worst case, in which the emitted \
+             run grows with the input; a run of {n} that emitted {emitted} \
+             is a weaker fixture and cannot fail on a quadratic build"
+        );
+        examined
+    }
+
+    /// Doubling the run must not quadruple the work.
+    ///
+    /// **Only the all-distinct run can fail on a quadratic build, and
+    /// three things stop that case being weakened back out.** The scan
+    /// walks the samples already EMITTED, so a run of ten thousand
+    /// samples carrying a thousand distinct values never scans more than
+    /// a thousand: the cost grows with the input only when the distinct
+    /// values do. The first version of this gate used a fixed thousand at
+    /// every size and stayed green with the indexing removed.
+    ///
+    /// 1. The three measurements that matter are taken **outside any
+    ///    loop and from no list**, through [`examined_all_distinct`],
+    ///    which fixes `distinct = n` in one place. There is no
+    ///    distinctness parameter here for an edit to lower.
+    /// 2. [`examined_all_distinct`] then asserts the run it measured
+    ///    really emitted `n` samples. Lowering the distinctness inside it
+    ///    — the exact edit that produced the gate that passed on a
+    ///    quadratic build — fails that assertion rather than quietly
+    ///    making the measurement cheap.
+    /// 3. [`the_sizes_can_tell_the_two_shapes_apart`] computes what a
+    ///    quadratic implementation would examine at `N1`, `N2` and `N4`
+    ///    and asserts those figures breach these same two bounds.
+    ///    Shrinking the sizes, or moving them closer together, reddens
+    ///    that test.
+    ///
+    /// None of that survives deleting the assertions themselves. What it
+    /// removes is the quiet route: every way of weakening the fixture
+    /// short of deleting a named assertion turns some test red.
+    ///
+    /// The bound is deliberately loose — three times, not two — because
+    /// the promotion from scan to set costs a constant that is visible at
+    /// these sizes. What it refuses is the shape the review measured: four
+    /// times the work for twice the input, and sixteen times for four
+    /// times.
+    #[test]
+    fn a_long_timestamp_run_costs_no_more_than_linear() {
+        let a = examined_all_distinct(N1);
+        let b = examined_all_distinct(N2);
+        assert!(
+            b <= a * 3,
+            "all distinct: {a} samples examined for {N1} and {b} for {N2} — \
+             doubling the run more than tripled the work"
+        );
+        let c = examined_all_distinct(N4);
+        assert!(
+            c <= a * 6,
+            "all distinct: {a} samples examined for {N1} and {c} for {N4}"
+        );
+
+        // The low-distinctness runs are kept because they pin the rule's
+        // ANSWER at the shapes a dashboard actually sends. They are not
+        // the gate: none of them can fail on a quadratic build, because
+        // the run they emit never grows.
+        for distinct in [1usize, 2, 1_000] {
+            let (a, _) = examined_for(N1, distinct);
+            let (b, _) = examined_for(N2, distinct);
+            assert!(
+                b <= a * 3,
+                "distinct={distinct}: {a} samples examined for {N1} and {b} for {N2}"
+            );
+        }
+    }
+
+    /// The counter counts every sample the rule examines.
+    ///
+    /// **This is the gate on the instrument, and the ratio assertions
+    /// cannot be it.** They compare three figures produced by the same
+    /// counter, so a `count_examined` call that is deleted, or a counter
+    /// that stops counting altogether, moves all three together and they
+    /// stay green: at zero, `0 <= 0 * 3` holds. The closed form above is
+    /// derived from the two branches of [`RunDedup::push_float`] and from
+    /// [`RUN_LINEAR_MAX`], so it pins the total rather than a ratio, and
+    /// it moves when the constant moves.
+    ///
+    /// Measured against it: 10,036 / 20,036 / 40,036 at the three
+    /// lengths, which is `8 * 9 / 2 + n`.
+    #[test]
+    fn the_counter_matches_the_closed_form_the_two_branches_give() {
+        let l = RUN_LINEAR_MAX as u64;
+        for n in [N1, N2, N4] {
+            let expected = l * (l + 1) / 2 + n as u64;
+            assert_eq!(
+                examined_all_distinct(n),
+                expected,
+                "a run of {n} all-distinct samples examines L(L+1)/2 + n with \
+                 L = RUN_LINEAR_MAX = {l}; a figure that is not this one means \
+                 a branch of RunDedup::push_float is not counted, and the ratio \
+                 assertions cannot see that"
+            );
+        }
+    }
+
+    /// The sizes the gate measures at must be able to fail on a quadratic
+    /// build.
+    ///
+    /// A build that scans the emitted run once per input row examines
+    /// `n(n-1)/2` samples — 49,995,000 at `N1` and 199,990,000 at `N2`,
+    /// which are the two figures round 2 of this issue's code review
+    /// measured from the quadratic code itself. If those figures did not
+    /// breach the bounds
+    /// [`a_long_timestamp_run_costs_no_more_than_linear`] applies, that
+    /// gate could not fail however bad the code was, and lowering `N2`
+    /// towards `N1` is how someone would arrive there without touching
+    /// the assertion.
+    #[test]
+    fn the_sizes_can_tell_the_two_shapes_apart() {
+        const fn quadratic(n: u64) -> u64 {
+            n * (n - 1) / 2
+        }
+        let a = quadratic(N1 as u64);
+        let b = quadratic(N2 as u64);
+        let c = quadratic(N4 as u64);
+        assert!(
+            b > a * 3,
+            "a quadratic build examines {a} at {N1} and {b} at {N2}: the \
+             doubling bound could not fail at these sizes"
+        );
+        assert!(
+            c > a * 6,
+            "a quadratic build examines {a} at {N1} and {c} at {N4}: the \
+             quadrupling bound could not fail at these sizes"
+        );
+    }
+
+    /// The figures themselves, for the record. Not an assertion: run with
+    /// `--nocapture` to see them.
+    #[test]
+    fn print_the_timestamp_run_cost() {
+        for n in [10_000usize, 20_000] {
+            let (examined, _) = examined_for(n, n / 2);
+            println!("issue #494 timestamp-run cost: n={n} samples_examined={examined}");
+        }
+    }
+
+    /// The wall-clock figures, for the record. `#[ignore]` because a timing
+    /// is not a gate on a shared machine —
+    /// `a_long_timestamp_run_costs_no_more_than_linear` is the gate, and it
+    /// counts rather than times.
+    #[test]
+    #[ignore]
+    fn the_wall_clock_figures_for_the_record() {
+        for n in [10_000usize, 20_000] {
+            let floats: Vec<SampleRow> = (0..n)
+                .map(|i| SampleRow {
+                    fingerprint: Fingerprint::from_raw(1),
+                    unix_milli: 1,
+                    value: i as f64,
+                })
+                .collect();
+            let mut out = Vec::new();
+            let mut run = RunDedup::default();
+            RUN_SAMPLES_EXAMINED.with(|c| c.set(0));
+            let t = std::time::Instant::now();
+            emit_timestamp_run::<SampleRow, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+                .expect("float-only run");
+            let elapsed = t.elapsed();
+            println!(
+                "TIMING n={n} elapsed={elapsed:?} samples_examined={}",
+                RUN_SAMPLES_EXAMINED.with(Cell::get)
+            );
         }
     }
 }
