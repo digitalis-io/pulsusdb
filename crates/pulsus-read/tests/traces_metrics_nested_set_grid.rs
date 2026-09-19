@@ -248,8 +248,8 @@ fn actual(field: NsField, op: ComparisonOp, raw: &str) -> Cell {
         lhs: Box::new(FieldExpr::Field(Field::Intrinsic(field.intrinsic()))),
         rhs: Box::new(FieldExpr::Literal(Value::Number(raw.to_string()))),
     };
-    match compile_filter_bool(Some(&expr), ATTRS_TABLE, WINDOW) {
-        Ok(sql) => Cell::Sql(sql),
+    match compile_filter_bool(Some(&expr), ATTRS_TABLE, WINDOW, "") {
+        Ok(b) => Cell::Sql(b.expr),
         Err(PlanError::TypeMismatch(msg)) => Cell::Err(msg),
         Err(other) => panic!("{} {op} {raw}: unexpected error {other:?}", field.name()),
     }

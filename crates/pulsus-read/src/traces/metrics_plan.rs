@@ -30,6 +30,20 @@ pub const MAX_METRICS_POINTS: i64 = 11_000;
 const NS_PER_S: i64 = 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
 
+/// The alias prefix `compare()`'s SELECTION predicate compiles under
+/// (issue #559).
+///
+/// `compare()` is the one shape whose outer filter and selection
+/// predicate render into ONE statement — the cross-tab's innermost
+/// `SELECT` — and each numbers its attribute leaves from `0`. The outer
+/// filter keeps the empty prefix, so every statement that carries only
+/// one filter renders exactly the aliases issue #557 shipped; the
+/// selection takes a distinct one. Sharing a prefix is not a silent
+/// mis-pick: measured on 26.3.29.7, two `WITH` items with one name and
+/// two expressions give `Code: 179 … MULTIPLE_EXPRESSIONS_FOR_ALIAS` and
+/// the request fails.
+const COMPARE_SELECTION_ALIAS_PREFIX: &str = "c";
+
 /// The caller-validated request window, step and exemplar budget.
 /// `step_ms` is whole milliseconds (issue #477 (d)), already defaulted by
 /// the server's derivation formula when the request omitted `step`.
@@ -570,10 +584,15 @@ pub fn plan_trace_metrics(
                 .and_then(|f| f.body.as_ref()),
             ctx.filter.attrs_table,
             window,
+            COMPARE_SELECTION_ALIAS_PREFIX,
         )?;
-        // The selection predicate embeds the window's own date/time
-        // pruning too (visible as the `trace_attrs_idx … timestamp_ns >= …`
-        // clause inside `is_sel`), so the range form needs its own.
+        // Compiled twice, once per window, because the two forms used to
+        // embed their own date/time pruning inside the selection's
+        // attribute semi-joins. Issue #559 moved the attribute leaves onto
+        // the span row and with them that pruning, so the two
+        // compilations now render the same text; the pair is kept because
+        // nothing else guarantees that, and a future window-dependent
+        // leaf would silently take the wrong window otherwise.
         let range_inner_bool = metrics_sql::compile_filter_bool(
             analysis
                 .compare_selection
@@ -581,6 +600,7 @@ pub fn plan_trace_metrics(
                 .and_then(|f| f.body.as_ref()),
             ctx.filter.attrs_table,
             range_window,
+            COMPARE_SELECTION_ALIAS_PREFIX,
         )?;
         // The fixed well-known-absent-attribute set contributes 4 series
         // per key on top of the data-driven cross-tab; fold it into the
