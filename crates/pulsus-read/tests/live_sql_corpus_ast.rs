@@ -189,8 +189,24 @@ const CONTROL: &str = "with_binding_control.txt";
 /// and 378 at the head. `split_sql` falls back to one part for a `.sql`
 /// golden carrying no header at all, and there are two such files, which
 /// is the constant's `+ 2`.
-const SQL_FILES: usize = 126;
-const SQL_STATEMENTS: usize = 380;
+///
+/// **Issue #559 moves `SQL_FILES` 126 -> 127 and `SQL_STATEMENTS`
+/// 380 -> 385: ONE golden added, no section of any existing file gained
+/// or lost.** The addition is
+/// `crates/pulsus-read/tests/golden/traces_metrics/compare_outer_attr.sql`,
+/// a comparison whose OUTER filter is an attribute condition — the one
+/// shape whose outer filter and selection predicate both declare locator
+/// aliases into a single statement. A comparison golden carries five
+/// sections (cross-tab, totals, the two cap probes and exemplars), which
+/// is the whole of the `+5`.
+///
+/// It is also what this test exists for: thirteen metrics goldens gained
+/// a `WITH` clause on that change, and every item in every one of them is
+/// `arrayFirstIndex(…) AS <alias>` — a scalar/array alias, which the
+/// parser reports as ZERO `WithElement` binding nodes. Section 2 below
+/// measures that rather than assuming it.
+const SQL_FILES: usize = 127;
+const SQL_STATEMENTS: usize = 385;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;
