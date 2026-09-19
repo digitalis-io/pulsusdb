@@ -10,6 +10,9 @@ docs/query-lowering.md	ast.rs:251	ambiguous_basename
 docs/query-lowering.md	ast.rs:939	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1655	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2068	blank_target_line
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:627	blank_target_line
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:531	ambiguous_basename
+docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:391	ambiguous_basename
 docs/query-lowering.md	exec.rs:124	ambiguous_basename
 docs/query-lowering.md	exec.rs:148	ambiguous_basename
 docs/query-lowering.md	exec.rs:178	ambiguous_basename
@@ -48,8 +51,13 @@ docs/query-lowering.md	plan.rs:3388	ambiguous_basename
 docs/query-lowering.md	plan.rs:3393	ambiguous_basename
 docs/query-lowering.md	plan.rs:3402	ambiguous_basename
 docs/query-lowering.md	plan.rs:3750	ambiguous_basename
+docs/query-lowering.md	search_plan.rs:1194	blank_target_line
+docs/query-lowering.md	search_plan.rs:1322	blank_target_line
+docs/query-lowering.md	search_plan.rs:1435	ambiguous_basename
+docs/query-lowering.md	search_plan.rs:1884	blank_target_line
 docs/query-lowering.md	sql.rs:774	ambiguous_basename
 docs/query-lowering.md	traces/exec.rs:117	blank_target_line
+docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2995	ambiguous_basename
 docs/query-to-sql.md	exec.rs:119	ambiguous_basename
 docs/query-to-sql.md	exec.rs:122	ambiguous_basename
 docs/query-to-sql.md	exec.rs:124	ambiguous_basename
@@ -63,6 +71,8 @@ docs/query-to-sql.md	exec.rs:5534	ambiguous_basename
 docs/query-to-sql.md	exec.rs:744	ambiguous_basename
 docs/query-to-sql.md	exec.rs:843	ambiguous_basename
 docs/query-to-sql.md	fold.rs:547	ambiguous_basename
+docs/query-to-sql.md	metrics_sql.rs:1036	ambiguous_basename
+docs/query-to-sql.md	metrics_sql.rs:874	ambiguous_basename
 docs/query-to-sql.md	metrics_sql.rs:951	blank_target_line
 docs/query-to-sql.md	plan.rs:1534	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1649	ambiguous_basename

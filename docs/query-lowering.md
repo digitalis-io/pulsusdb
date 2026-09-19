@@ -1076,7 +1076,7 @@ figure in §9 and ADR 0008 was taken on; only the regex semantics below were tak
 than everything.
 
 **Which leaves are exposed, and which are not.** An **attribute** regex is evaluated only in
-ClickHouse, through `match(val, …)` (`crates/pulsus-read/src/traces/filter.rs:895`), so it has one
+ClickHouse, through `match(val, …)` (`crates/pulsus-read/src/traces/filter.rs:898`), so it has one
 dialect and one reading. The exposed set is the leaves `plan_physical` and `plan_trace_ctx` compile
 a `StrOp::Re`/`Nre` for (`search_plan.rs:1011-1068`) — `name`, `service`, `statusMessage`,
 `span:id`, `span:parentID`, `instrumentation:name`, `instrumentation:version`, `rootName` and
@@ -4034,28 +4034,34 @@ ADR 0008 is titled "SQL composition for lowered query pipelines" and its three r
 lowered pipeline composes. The rule added on 2026-09-02 is written without that qualifier — "no
 emitted SQL may contain a join until this ADR is amended to name the clause"
 (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`, the same claim in the summary
-at line 11). Six committed goldens carry a join today and **none is planned by the compile core**:
+at line 11). Seven committed goldens carry a join today and **none is planned by the compile core**:
 
 - `traces_graph/clustered_local_join.sql` and `traces_graph/single_node.sql`, one join line each,
   from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
   called from `crates/pulsus-read/src/traces/exec.rs:1793` and nowhere else.
-- `traces_metrics/compare_status.sql` and `traces_metrics/compare_status_window.sql`, seven join
-  lines each. Six of the seven come from `metrics_compare_sql`
-  (`crates/pulsus-read/src/traces/metrics_sql.rs:1337`, `LEFT JOIN` at 1253 and `INNER JOIN` at
-  1257), which builds one string holding both joins and feeds it to the cross-tab and the probe,
-  and which `metrics_plan.rs` calls three times (`:607`, `:619`, `:631`). The seventh comes from
-  `metrics_compare_exemplar_range_sql` (`metrics_sql.rs:1536`, `INNER JOIN` at 1425, called at
+- `traces_metrics/compare_outer_attr.sql`, `traces_metrics/compare_status.sql` and
+  `traces_metrics/compare_status_window.sql`, seven join lines each. The first was added by issue
+  [#559](https://github.com/digitalis-io/pulsusdb/issues/559) — a comparison whose OUTER filter is
+  an attribute condition, the one shape whose outer filter and selection predicate both declare
+  attribute locators into a single statement. Six of the seven come from `metrics_compare_sql`
+  (`crates/pulsus-read/src/traces/metrics_sql.rs:1344`, `LEFT JOIN` at 1416 and `INNER JOIN` at
+  1420), which builds one string holding both joins and feeds it to the cross-tab and the probe,
+  and which `metrics_plan.rs` calls three times (`:627`, `:639`, `:651`). The seventh comes from
+  `metrics_compare_exemplar_range_sql` (`metrics_sql.rs:1543`, `INNER JOIN` at 1593, called at
   `metrics_plan.rs:666`).
 - `traces_metrics_base/compare_status.sql` and `traces_metrics_base/compare_status_window.sql`,
   four join lines each. These are **historic**: each is byte-identical to
   `git show 2f78c53:crates/pulsus-read/tests/golden/traces_metrics/` at the same file name, they carry no
-  exemplars section, and no test regenerates them. They are not unmoored from today's builder —
-  `every_instant_side_section_is_byte_identical_to_base` ties two of their four join lines to the
-  current file's bytes, and `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
-  inverts the cross-tab section under three timestamp substitutions, none of which touches a `JOIN`
-  line.
+  exemplars section, and no test regenerates them. **Since issue #559 nothing ties them to today's
+  builder, and that is a loss rather than a detail.** Until then
+  `every_instant_side_section_is_byte_identical_to_base` tied two of their four join lines to the
+  current file's bytes and `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
+  inverted the cross-tab section. That change moves the metrics attribute filter onto the span row,
+  so both comparison cases' statements move on both axes — which is the change — and both left
+  those two tests' domain. `traces_metrics_base/` is not in `golden_sql_freeze`'s `CORPORA` either,
+  so nothing pins their bytes; this list is the record that they exist and why.
 
-All six come from hand-written builders on routes the compile core classifies `Never` —
+All seven come from hand-written builders on routes the compile core classifies `Never` —
 `NotASearchLinkLower::capability`, `crates/pulsus-read/src/traces/compile.rs:1369-1377` — so they
 are not lowered pipelines and the decision never reached them. The sentence reaches further than the
 decision it records: a drafting fault in the record, not shipped code breaking a rule. **The wording
@@ -5518,21 +5524,21 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 723 |
-| of those, citing a bare basename | 550 |
+| citation occurrences in the five artefacts | 727 |
+| of those, citing a bare basename | 554 |
 | of those, written as a continuation of a citation earlier in the paragraph | 77 |
 | of those continuations, on a later line than the citation they continue | 33 |
-| `(document, token)` pairs the rule resolves | 393 |
-| occurrences those resolved pairs cover | 534 |
-| `(document, token)` pairs it cannot resolve | 101 |
-| occurrences those frozen pairs cover | 189 |
-| resolved rows anchored on a token the citing prose prints | 178 |
-| resolved rows anchored on a snapshot of the cited line | 215 |
+| `(document, token)` pairs the rule resolves | 383 |
+| occurrences those resolved pairs cover | 523 |
+| `(document, token)` pairs it cannot resolve | 112 |
+| occurrences those frozen pairs cover | 204 |
+| resolved rows anchored on a token the citing prose prints | 174 |
+| resolved rows anchored on a snapshot of the cited line | 209 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 94 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 5 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `ambiguous_basename` | 100 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 10 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
 | the reviewed verdict on a fallback disagreement | cases |
@@ -5546,11 +5552,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 723 citation occurrences the five artefacts make, 550 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 393 `(document, token)` pairs covering 534 occurrences, and cannot resolve 101 covering 189. Of the resolved rows, 178 are anchored on a token the citing prose prints and 215 on a snapshot of the cited line.
+Of the 727 citation occurrences the five artefacts make, 554 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 383 `(document, token)` pairs covering 523 occurrences, and cannot resolve 112 covering 204. Of the resolved rows, 174 are anchored on a token the citing prose prints and 209 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:2068` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `traces/exec.rs:117` (cited from 2 documents).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/exec.rs:2068` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `search_plan.rs:1194` (in `docs/query-lowering.md`), `search_plan.rs:1322` (in `docs/query-lowering.md`), `search_plan.rs:1884` (in `docs/query-lowering.md`), `traces/exec.rs:117` (cited from 2 documents).
 
 The citations the rule answers differently for two occurrences of are .
 

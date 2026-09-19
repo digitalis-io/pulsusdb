@@ -3910,7 +3910,7 @@ implementation using the unanchored one matches `precheck.foo` and is wrong.
 { .a != nil }
 ```
 
-**SQL today** — the constant `1` stands in for the value test, leaving a pure `key` prefix scan (`filter.rs:961`).
+**SQL today** — the constant `1` stands in for the value test, leaving a pure `key` prefix scan (`filter.rs:964`).
 
 `crates/pulsus-read/tests/golden/traces_search/existence_present.sql`, phase1 generator[0]:
 
@@ -4624,7 +4624,7 @@ difference is the whole of what part 2 changes for it.
 Each of these is refused by `plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1111`)
 before any statement is built, and mapped to `400` at
 `crates/pulsus-server/src/traces_api/error.rs:303`. `PlanError` renders with the prefix
-`type mismatch: ` or `unsupported field: ` (`filter.rs:78-81`).
+`type mismatch: ` or `unsupported field: ` (`filter.rs:81-84`).
 
 **A query the shipped planner refuses must still be refused.** This work must not turn a refused
 payload into a stage evaluated after the read and then answer it.
