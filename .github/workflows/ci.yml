@@ -111,6 +111,18 @@ jobs:
       # per-suite results land in the run summary. A failing test fails
       # this step exactly as before (ci/test-summary.sh propagates
       # nextest's exit code untouched).
+      #
+      # **This job exports no `PULSUS_TEST_*` variable, and that is part of
+      # the invocation rather than an omission.** The live suites gate on
+      # `PULSUS_TEST_CLICKHOUSE`, and several of them — `live_spreading`,
+      # `live_cluster`, `live_metrics_cluster_fallback`,
+      # `live_metrics_grouped_cluster` — need a MULTI-NODE ClickHouse whose
+      # shard variables no single-node run sets. Export the gate here and
+      # they wake up, fail to connect, and take the run with them: measured
+      # on issue #494, `13 failed` against a single-node server where the
+      # same tree gives `7480 passed` with the gate absent. Run the
+      # workspace without the gate, and the live suites in their own steps
+      # below, which is what this file does.
       - name: Test
         run: ci/test-summary.sh run workspace --workspace
 

@@ -40,6 +40,17 @@
 //!     PULSUS_TEST_CH_DATABASE_PREFIX=<yours> \
 //!     cargo test -p pulsus-server --test push_dedup_live
 //! ```
+//!
+//! **Run the workspace suite WITHOUT the live gate, and this suite with
+//! it.** Exporting `PULSUS_TEST_CLICKHOUSE` for a `cargo nextest run
+//! --workspace` also wakes the multi-node suites — `live_spreading`,
+//! `live_cluster`, `live_metrics_cluster_fallback`,
+//! `live_metrics_grouped_cluster` — whose shard variables a single-node
+//! server does not set. They fail to connect and take the run down:
+//! measured at `13 failed` where the same tree gives `7480 passed` with
+//! the gate absent. `.github/workflows/ci.yml` encodes the same split, and
+//! `--test-threads=1` here because one test restarts a server on its own
+//! port with different settings.
 
 #[path = "support/live_db.rs"]
 mod live_db;
