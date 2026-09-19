@@ -249,6 +249,7 @@ fn engine_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
         max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
@@ -449,6 +450,15 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
             pulsus_read::GroupValue::Str("500".to_string())
         )]
     );
+
+    // Issue #558: once the backfill has healed the withheld index row,
+    // the two stores must agree element for element — this fixture is
+    // the one place in the tree where they start out disagreeing on
+    // PRESENCE, and the heal is what closes it. A heal that wrote the
+    // row with a different kind or number would still make the search
+    // answer, because the candidate only needs `(key, val, scope)`, and
+    // would then render the wrong kind from the span row.
+    pulsus_testkit::assert_stores_agree(db);
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, db).await;

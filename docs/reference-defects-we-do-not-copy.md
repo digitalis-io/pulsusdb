@@ -1152,12 +1152,40 @@ individually queryable, so the data is present and indexed.
 
 ### What PulsusDB does
 
-The reference's **own designed** multi-value rule, the one it applies to
-arrays elsewhere: `matchAll` is set for `!=` and `!~` and the result is
-`matchCount == elemCount`; otherwise it is `matchCount > 0`
-(`pkg/traceql/ast_execute.go:553-627`). So a span matches if **any** of
-its events satisfies the comparison, and `!=` matches only when every one
-does.
+A span matches if **any** of its events satisfies the comparison, and
+`!=`/`!~` match only when every one does — so a span with no such key is
+returned.
+
+**Where that rule comes from, corrected on 2026-09-18 (issue #558).** It
+used to be stated as the reference's own designed multi-value rule, the
+one it applies to arrays elsewhere: `matchAll` is set for `!=` and `!~`
+and the result is `matchCount == elemCount`, otherwise `matchCount > 0`
+(`pkg/traceql/ast_execute.go:553-627`). That rule is the reference's
+**array** rule, and measurement at the pinned digest shows its event and
+link ATTRIBUTE path does not apply it: for the attribute-versus-literal
+form the reference returns a span one of whose events differs, and it does
+not return spans with no events. **The correction is scoped to that
+form**; the field-versus-field form keeps the reading the ledger row
+already carries, because the reference behaves differently there.
+
+**The rule we ship does not move, because it is the correct one.** Under
+the reference's reading:
+
+```text
+  span emits three events
+    event.level = "info"     connection acquired
+    event.level = "warn"     slow query
+    event.level = "error"    query failed
+
+  { event.level != "error" }
+    ours       span not returned   -- it errored
+    reference  span returned       -- "info" and "warn" are not "error"
+```
+
+A span that errored comes back when the query asked for spans that did
+not, and any span with two or more events always carries something that
+differs — which makes it impossible to filter out spans holding a
+particular event, the ordinary use of a negated condition.
 
 Copying the first-event behaviour is also not implementable on our
 storage without a breaking schema change: event rows carry the span's
@@ -1167,8 +1195,9 @@ destroyed by construction rather than merely unrecorded.
 
 ### Evidence
 
-Ledger row: `traceql-event-link-operand-any-match`. Owner ruling,
-2026-08-05.
+Ledger rows: `traceql-event-link-operand-any-match` and
+`2026-07-16-negation-matches-missing-key`. Owner rulings, 2026-08-05 and
+2026-09-18.
 
 ---
 

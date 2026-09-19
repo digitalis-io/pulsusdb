@@ -20,7 +20,7 @@ WITH arrayFirstIndex((k, s) -> k = 'a' AND s = 'span', attr_key, attr_scope) AS 
      arrayFirstIndex((k, s, v) -> k = 'a' AND s = 'event' AND v = '1', attr_key, attr_scope, attr_val) AS pm0e,
      arrayFirstIndex((k, s, v) -> k = 'a' AND s = 'link' AND v = '1', attr_key, attr_scope, attr_val) AS pm0l
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version,
-       [if(pi0s != 0, attr_val[pi0s] = '1', if(pi0r != 0, attr_val[pi0r] = '1', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = '1', 0)))))] AS attr_probe
+       [if(pi0s != 0, attr_val[pi0s] = '1', if(pi0r != 0, attr_val[pi0r] = '1', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = '1', 0)))))] AS attr_slot
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000

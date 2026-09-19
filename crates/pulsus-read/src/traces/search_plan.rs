@@ -5,8 +5,11 @@
 //! Phase-1 candidate SQL (deduped, order-preserving), registers the
 //! distinct attribute probes (each a predicate column on the batch
 //! hydration statement since issue #557) and the aggregate / `select()`
-//! value reads Phase 2 needs, and validates the pipeline stages — every
+//! / `by()` value locators (each a projected SLOT on that same statement
+//! since issue #558), and validates the pipeline stages — every
 //! rejection here is a caller error ([`PlanError`] → `400 bad_data`).
+
+use std::ops::Range;
 
 use pulsus_traceql::{
     AggregateOp, ComparisonOp, Field, FieldExpr, FieldOp, HintValue, Intrinsic, PipelineStage,
@@ -160,10 +163,11 @@ pub(crate) enum ProjectionValue {
     ProbeValue {
         probe_idx: usize,
     },
-    /// The value fused into `select_attrs[field_idx]`'s per-span value
-    /// read — the existing `select()` attribute path (`attr_values_sql`),
-    /// which issues its own statement and is index-aligned with
-    /// [`SearchPlan::select_attrs`].
+    /// `select_attrs[field_idx]`'s per-span value — a projected SLOT on
+    /// the batch hydration statement since issue #558, index-aligned
+    /// with [`SearchPlan::select_attrs`] and read at the one element the
+    /// field's locator landed on. It issued a statement of its own
+    /// against `trace_attrs_idx` before.
     SelectValue {
         field_idx: usize,
     },
@@ -670,11 +674,16 @@ pub struct SearchPlan {
     /// fragment byte for byte, and by [`Self::membership_sql_for`],
     /// which has no production caller since issue #557.
     pub(crate) probe_predicates: Vec<String>,
-    /// Each probe's span-row predicate column (issue #557), index-aligned
-    /// with [`Self::probes`] and rendered AT PLAN TIME for the same reason
-    /// [`Self::probe_predicates`] is: rendering a regex is what validates
-    /// it, so it has to happen where a rejection is still a `400`.
-    pub(crate) probe_columns: Vec<ProbeColumn>,
+    /// The hydration statement's whole slot space (issue #557 for the
+    /// probes, #558 for the projected fields and the set widths),
+    /// rendered AT PLAN TIME for the reason [`Self::probe_predicates`]
+    /// is: rendering a regex is what validates it, so it has to happen
+    /// where a rejection is still a `400`.
+    ///
+    /// [`SlotLayout`] is the only thing that knows the order, and it
+    /// hands the renderer a column list and the decoder [`SlotId`]s, so
+    /// the two cannot disagree about which array element is whose.
+    pub(crate) slots: SlotLayout,
     /// Whether each probe's predicate column must also carry the matched
     /// `val` and its stored kind (issue #479, moved onto the hydration
     /// statement by issue #557), index-aligned with [`Self::probes`].
@@ -945,13 +954,20 @@ impl SearchPlan {
     /// calls this same method on this same plan, so the statement and the
     /// row type cannot disagree about what is projected.
     pub fn hydration_shape(&self) -> HydrationShape {
-        if self.probe_columns.is_empty() {
+        let slots = self.slots.columns();
+        if slots.is_empty() {
             HydrationShape::Plain
-        } else if self.probe_columns.iter().any(|p| p.value.is_some()) {
+        } else if slots.iter().any(|p| p.value.is_some()) {
             HydrationShape::ProbesAndValues
         } else {
             HydrationShape::Probes
         }
+    }
+
+    /// The slot space this plan's hydration statement renders (issue
+    /// #558) — the executor's decoder reads every array through it.
+    pub(crate) fn slots(&self) -> &SlotLayout {
+        &self.slots
     }
 
     /// The batch hydration SQL (exposed for the golden suite), carrying
@@ -963,7 +979,7 @@ impl SearchPlan {
             self.window,
             super::exec::MAX_SPANS_PER_TRACE,
             self.hydration_shape(),
-            &self.probe_columns,
+            self.slots.columns(),
         )
     }
 
@@ -1017,43 +1033,21 @@ impl SearchPlan {
         search_sql::child_count_sql(&self.spans_table, trace_ids)
     }
 
-    /// One aggregate field's `val_num` batch read (exposed for the
-    /// golden suite; `exec` drives the same builder).
-    pub fn agg_values_sql_for(&self, field_idx: usize, trace_ids: &[[u8; 16]]) -> String {
-        let field = &self.agg_fields[field_idx];
-        search_sql::attr_values_sql(
-            &self.attrs_table,
-            &escape::ch_string(&field.key),
-            field.scope.map(escape::ch_string).as_deref(),
-            true,
-            trace_ids,
-            self.window,
-        )
-    }
-
-    /// One `select()` field's `val` batch read (exposed for the golden
-    /// suite; `exec` drives the same builder).
-    pub fn select_values_sql_for(&self, field_idx: usize, trace_ids: &[[u8; 16]]) -> String {
-        let field = &self.select_attrs[field_idx];
-        search_sql::attr_values_sql(
-            &self.attrs_table,
-            &escape::ch_string(&field.key),
-            field.scope.map(escape::ch_string).as_deref(),
-            false,
-            trace_ids,
-            self.window,
-        )
-    }
-
     /// One event/link intrinsic's per-span VALUE SET batch read (issue
-    /// #351; exposed for the golden suite, `exec` drives the same
-    /// builder).
+    /// #351, moved onto the span row by #558; exposed for the golden
+    /// suite, `exec` drives the same builder).
+    ///
+    /// It expands the rows the reader RETAINED — the same `ORDER BY` and
+    /// per-trace cap the hydration statement carries, without the
+    /// overflow probe row — so its physical row count is the sum of the
+    /// width slots the hydration statement already returned.
     pub fn event_set_sql_for(&self, set_idx: usize, trace_ids: &[[u8; 16]]) -> String {
         search_sql::event_set_sql(
-            &self.attrs_table,
+            &self.spans_table,
             self.event_sets[set_idx],
             trace_ids,
             self.window,
+            super::exec::MAX_SPANS_PER_TRACE,
         )
     }
 
@@ -1128,14 +1122,122 @@ fn membership_predicate(probe: &AttrProbe) -> Result<String, PlanError> {
 pub enum HydrationShape {
     /// No attribute condition: the pre-#557 statement and row.
     Plain,
-    /// One `Array(UInt8)` column, `attr_probe`.
+    /// One `Array(UInt8)` column, `attr_slot`.
     Probes,
-    /// `attr_probe` plus `attr_probe_val` and `attr_probe_type`, both
+    /// `attr_slot` plus `attr_slot_val` and `attr_slot_type`, both
     /// `Array(String)` and both indexed BY PROBE, carrying the literal
     /// `''` for a probe no projection needs a value from — so no probe's
     /// column is read for a probe that does not need it, and no second
     /// index mapping exists to get wrong.
     ProbesAndValues,
+}
+
+/// Which part of a slot's value something needs — decided at plan time by
+/// which interned vector the field came from (issue #558), so a slot
+/// renders only the arrays its consumers read and no column is read for
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotValue {
+    /// A `select()` field, an operand's text, a `by()` key's text: the
+    /// value and the kind; the number renders `NULL`.
+    Text,
+    /// An aggregate argument, an operand's number, a `by()` key's number:
+    /// the number and the kind; the value renders `''`.
+    Number,
+}
+
+/// An index into the hydration statement's slot space (issue #558).
+/// Opaque: the only way to obtain one is from [`SlotLayout`], so a raw
+/// count cannot be passed where a slot index is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotId(usize);
+
+impl SlotId {
+    /// The array subscript this slot occupies, 0-based for the decoder.
+    pub fn index(self) -> usize {
+        self.0
+    }
+    /// The 1-based subscript the SQL renderer writes.
+    pub fn sql_subscript(self) -> usize {
+        self.0 + 1
+    }
+}
+
+/// The hydration statement's slot space (issue #557 for the probes, #558
+/// for the rest). **This type is the only thing that knows the order.**
+///
+/// The renderer takes [`Self::columns`]; the decoder takes [`SlotId`]s;
+/// both come from one [`SlotLayout::build`], so a reordering is an edit
+/// to this type and cannot silently renumber one side. That is the
+/// failure shape the change is against: the renderer walks the slot
+/// vector while the decoder derives offsets from counts, so reordering
+/// the construction produces wrong VALUES with both accessors unchanged
+/// and every test still green.
+///
+/// The order `build` establishes, stated so a reader does not have to
+/// infer it from a parameter list:
+///
+/// ```text
+///   [probe slots] ++ [select slots] ++ [agg slots] ++ [width slots]
+///      SearchPlan      select_attrs     agg_fields     event_sets
+///      ::probes        order            order          order
+///      order
+/// ```
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SlotLayout {
+    slots: Vec<ProbeColumn>,
+    probes: Range<usize>,
+    selects: Range<usize>,
+    aggs: Range<usize>,
+    widths: Range<usize>,
+}
+
+impl SlotLayout {
+    /// The ONE place the four classes become one index space.
+    fn build(
+        probes: Vec<ProbeColumn>,
+        selects: Vec<ProbeColumn>,
+        aggs: Vec<ProbeColumn>,
+        widths: Vec<ProbeColumn>,
+    ) -> Self {
+        let (np, ns, na, nw) = (probes.len(), selects.len(), aggs.len(), widths.len());
+        let mut slots = probes;
+        slots.extend(selects);
+        slots.extend(aggs);
+        slots.extend(widths);
+        SlotLayout {
+            slots,
+            probes: 0..np,
+            selects: np..np + ns,
+            aggs: np + ns..np + ns + na,
+            widths: np + ns + na..np + ns + na + nw,
+        }
+    }
+
+    /// Every slot, in render order — the renderer's only input.
+    pub(crate) fn columns(&self) -> &[ProbeColumn] {
+        &self.slots
+    }
+
+    /// Attribute condition `i`'s probe slot.
+    pub(crate) fn probe(&self, i: usize) -> SlotId {
+        SlotId(self.probes.start + i)
+    }
+
+    /// `select_attrs[j]`'s slot.
+    pub(crate) fn select(&self, j: usize) -> SlotId {
+        SlotId(self.selects.start + j)
+    }
+
+    /// `agg_fields[k]`'s slot.
+    pub(crate) fn agg(&self, k: usize) -> SlotId {
+        SlotId(self.aggs.start + k)
+    }
+
+    /// `event_sets[e]`'s width slot.
+    pub(crate) fn width(&self, e: usize) -> SlotId {
+        SlotId(self.widths.start + e)
+    }
 }
 
 /// The span row's own attribute arrays, subscripted at one located
@@ -1165,6 +1267,112 @@ const LAMBDA_COLS: filter::ValueCols<'static> = filter::ValueCols {
 /// The unscoped chain's per-scope alias suffixes, index-aligned with
 /// [`filter::UNSCOPED_SCOPE_CHAIN`] (issue #557).
 const UNSCOPED_ALIAS_SUFFIX: [&str; 5] = ["s", "r", "e", "l", "i"];
+
+/// Assembles one PROJECTED attribute field's span-row slot (issue #558).
+///
+/// **A field is LOCATED, never matched.** A condition's probe over a
+/// multi-valued scope folds its value test into the locate, because the
+/// rule there is any-element-matches; a projection has no test to fold,
+/// so every arity uses [`search_sql::locate_item`] and the element the
+/// value comes from is the FIRST one carrying the key at the
+/// highest-precedence scope present.
+///
+/// `want` decides which arrays this slot renders into: a `select()`
+/// field reads text and kind, an aggregate argument reads the number and
+/// the kind, and the other array carries the class's own literal. A
+/// `by()` key is interned into BOTH vectors, so it gets both slots.
+fn field_slot(field: &AttrFieldRef, alias_stem: &str, want: SlotValue) -> ProbeColumn {
+    let key_lit = escape::ch_string(&field.key);
+    match field.scope {
+        Some(scope) => {
+            let scope_lit = escape::ch_string(scope);
+            let (value, num, kind) = search_sql::probe_value_exprs(alias_stem);
+            ProbeColumn {
+                with_items: vec![search_sql::locate_item(alias_stem, &key_lit, &scope_lit)],
+                test: search_sql::probe_test(alias_stem, None),
+                value: Some(slot_value_triple(want, value, num, kind)),
+            }
+        }
+        None => {
+            // The five-scope chain, span → resource → event → link →
+            // instrumentation, resolving to the first scope PRESENT —
+            // the same walk the unscoped condition makes, so a value and
+            // a condition on the same unscoped name resolve to the same
+            // element.
+            let mut presence = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut test_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut value_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut num_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut kind_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            for (scope, suffix) in filter::UNSCOPED_SCOPE_CHAIN
+                .iter()
+                .zip(UNSCOPED_ALIAS_SUFFIX)
+            {
+                let scope_lit = escape::ch_string(scope);
+                let present = format!("{alias_stem}{suffix}");
+                presence.push(search_sql::locate_item(&present, &key_lit, &scope_lit));
+                let (value, num, kind) = search_sql::probe_value_exprs(&present);
+                test_arms.push((format!("{present} != 0"), "1".to_string()));
+                value_arms.push((format!("{present} != 0"), value));
+                num_arms.push((format!("{present} != 0"), num));
+                kind_arms.push((format!("{present} != 0"), kind));
+            }
+            ProbeColumn {
+                with_items: presence,
+                test: search_sql::probe_chain(&test_arms, "0"),
+                value: Some(slot_value_triple(
+                    want,
+                    search_sql::probe_chain(&value_arms, "''"),
+                    search_sql::probe_chain(&num_arms, "NULL"),
+                    search_sql::probe_chain(&kind_arms, "''"),
+                )),
+            }
+        }
+    }
+}
+
+/// Blanks the member the slot's class does not read, so no column is
+/// read for nothing: a `select()` slot renders `NULL` in the numeric
+/// array, an aggregate slot renders `''` in the value array, and both
+/// render the kind, because the kind must come from the SAME element as
+/// whichever of the two the consumer reads.
+fn slot_value_triple(
+    want: SlotValue,
+    value: String,
+    num: String,
+    kind: String,
+) -> (String, String, String) {
+    match want {
+        SlotValue::Text => (value, "NULL".to_string(), kind),
+        SlotValue::Number => ("''".to_string(), num, kind),
+    }
+}
+
+/// One event/link value set's WIDTH slot (issue #558) — how many values
+/// this span will contribute when [`search_sql::event_set_sql`] expands
+/// its array.
+///
+/// It renders no `WITH` item and reads `attr_key`/`attr_scope` only: its
+/// bit is `<count> != 0`, its numeric member carries the count as a
+/// `Float64`, and its value and kind members are the literals `''`. The
+/// reader sums the counts over the batch's hydrated rows and refuses
+/// before issuing the value statement, so an over-budget set is never
+/// expanded.
+fn width_slot(set: filter::EventSetField) -> ProbeColumn {
+    let count = search_sql::set_width_expr(
+        &escape::ch_string(set.key()),
+        &escape::ch_string(set.scope()),
+    );
+    ProbeColumn {
+        with_items: Vec::new(),
+        test: format!("{count} != 0"),
+        value: Some((
+            "''".to_string(),
+            format!("toFloat64({count})"),
+            "''".to_string(),
+        )),
+    }
+}
 
 /// Assembles one attribute condition's span-row predicate column
 /// (issue #557).
@@ -1240,6 +1448,7 @@ fn probe_column(probe: &AttrProbe, idx: usize) -> Result<ProbeColumn, PlanError>
             let mut matching = Vec::new();
             let mut test_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
             let mut value_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
+            let mut num_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
             let mut kind_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
             for (scope, suffix) in filter::UNSCOPED_SCOPE_CHAIN
                 .iter()
@@ -1282,8 +1491,9 @@ fn probe_column(probe: &AttrProbe, idx: usize) -> Result<ProbeColumn, PlanError>
                         matched
                     }
                 };
-                let (value, kind) = search_sql::probe_value_exprs(&at);
+                let (value, num, kind) = search_sql::probe_value_exprs(&at);
                 value_arms.push((format!("{present} != 0"), value));
+                num_arms.push((format!("{present} != 0"), num));
                 kind_arms.push((format!("{present} != 0"), kind));
             }
             presence.append(&mut matching);
@@ -1292,6 +1502,10 @@ fn probe_column(probe: &AttrProbe, idx: usize) -> Result<ProbeColumn, PlanError>
                 test: search_sql::probe_chain(&test_arms, "0"),
                 value: Some((
                     search_sql::probe_chain(&value_arms, "''"),
+                    // The numeric chain's fallback is `NULL`, not `0`: a
+                    // span the chain resolves to no scope for has NO
+                    // number, and `0` is a number a stored value can be.
+                    search_sql::probe_chain(&num_arms, "NULL"),
                     search_sql::probe_chain(&kind_arms, "''"),
                 )),
             })
@@ -2561,7 +2775,7 @@ fn projection_value(
         // is NOT in the probe's set — since issue #557 that is the set
         // the hydration column filled — so it has no value to project.
         // A false bit supplies no value either way: the decoder inserts
-        // nothing for a span whose `attr_probe[i]` is 0.
+        // nothing for a span whose `attr_slot[i]` is 0.
         PlannedLeafEval::Attr { negated: true, .. } => None,
         PlannedLeafEval::Attr {
             probe_idx,
@@ -3193,16 +3407,33 @@ pub fn plan_search(
     }
 
     // Issue #557: a probe no projection reads a value from carries no
-    // value expression, so `HydrationShape::ProbesAndValues` is issued
-    // only for a plan that has one. `probe_values` is what decides, and
-    // it is not settled until the projection groups above are built —
-    // which is why the columns are interned with their value expressions
-    // and the unused ones are dropped here rather than rebuilt.
+    // value expression, so it reads no value array at all. `probe_values`
+    // is what decides, and it is not settled until the projection groups
+    // above are built — which is why the columns are interned with their
+    // value expressions and the unused ones are dropped here rather than
+    // rebuilt.
     for (column, fuses) in probe_columns.iter_mut().zip(probe_values.iter()) {
         if !fuses {
             column.value = None;
         }
     }
+
+    // Issue #558: the projected fields and the event/link set widths join
+    // the probes in ONE index space. `SlotLayout::build` is the only
+    // place the order is decided; everything downstream asks it for a
+    // `SlotId`.
+    let select_slots: Vec<ProbeColumn> = select_attrs
+        .iter()
+        .enumerate()
+        .map(|(j, field)| field_slot(field, &format!("fs{j}"), SlotValue::Text))
+        .collect();
+    let agg_slots: Vec<ProbeColumn> = agg_fields
+        .iter()
+        .enumerate()
+        .map(|(k, field)| field_slot(field, &format!("fa{k}"), SlotValue::Number))
+        .collect();
+    let width_slots: Vec<ProbeColumn> = event_sets.iter().copied().map(width_slot).collect();
+    let slots = SlotLayout::build(probe_columns, select_slots, agg_slots, width_slots);
 
     // A trailing `with(most_recent=true)` search hint (issue #185): keeps
     // the response's default recency ordering (most-recent first).
@@ -3369,7 +3600,7 @@ pub fn plan_search(
         child_count,
         probes,
         probe_predicates,
-        probe_columns,
+        slots,
         probe_values,
         projections,
         agg_fields,
@@ -3472,6 +3703,96 @@ mod tests {
 
     fn plan(q: &str) -> SearchPlan {
         plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    // ---- issue #558: the slot index space is a guarantee ---------------
+
+    /// **Every `SlotId` names the column it was built from.**
+    ///
+    /// The failure this is against: the SQL renderer walks the slot
+    /// vector while the decoder derives offsets from counts, so
+    /// reordering the construction produces wrong VALUES with both
+    /// accessors unchanged and every other test still green. That is the
+    /// shape `traces::exec`'s own chain-walk comment warns about.
+    ///
+    /// The query plans two probes, two distinct `select()` fields, two
+    /// distinct aggregate fields and one event/link set, so every class
+    /// carries more than one member and a swap between two classes is
+    /// observable. Each class's `n`-th accessor must index the column
+    /// built from that class's `n`-th entry, compared by the rendered
+    /// `with_items` and `value` rather than by position.
+    ///
+    /// **Break:** swap `selects` and `aggs` in `SlotLayout::build`; this
+    /// reddens naming the class that moved.
+    ///
+    /// It also pins the identity `traces::compile::MembershipLower::apply`
+    /// depends on: probes occupy the layout's FIRST range, so probe `i`'s
+    /// 1-based SQL subscript is `i + 1`. The fold has no access to the
+    /// layout, so that arithmetic lives there and is checked here.
+    #[test]
+    fn every_slot_id_names_the_column_it_was_built_from() {
+        let p = plan(
+            r#"{ span.p1 = "a" && span.p2 = "b" } | select(span.s1) | select(span.s2) | avg(span.a1) > 1 | avg(span.a2) > 1 | { .z = event:name }"#,
+        );
+        assert_eq!(p.probes_len(), 2, "two probes");
+        assert!(
+            p.select_attrs_len() >= 2 && p.agg_fields_len() >= 2,
+            "two select fields and two aggregate fields: {} / {}",
+            p.select_attrs_len(),
+            p.agg_fields_len()
+        );
+        assert_eq!(p.event_sets_len(), 1, "one event set");
+        let layout = p.slots();
+        let columns = layout.columns();
+        // Every class, rebuilt from the plan's own vectors and compared
+        // with the column the layout's accessor points at.
+        for i in 0..p.probes_len() {
+            let id = layout.probe(i);
+            assert_eq!(
+                columns[id.index()].with_items,
+                probe_column(&p.probes[i], i)
+                    .expect("probe column")
+                    .with_items,
+                "probe {i} does not index the column built from probes[{i}]"
+            );
+            assert_eq!(
+                id.sql_subscript(),
+                i + 1,
+                "probes occupy the FIRST range, which is what MembershipLower::apply renders"
+            );
+        }
+        for (j, field) in p.select_attrs.iter().enumerate() {
+            let id = layout.select(j);
+            assert_eq!(
+                columns[id.index()],
+                field_slot(field, &format!("fs{j}"), SlotValue::Text),
+                "select {j} does not index the column built from select_attrs[{j}]"
+            );
+        }
+        for (k, field) in p.agg_fields.iter().enumerate() {
+            let id = layout.agg(k);
+            assert_eq!(
+                columns[id.index()],
+                field_slot(field, &format!("fa{k}"), SlotValue::Number),
+                "agg {k} does not index the column built from agg_fields[{k}]"
+            );
+        }
+        for (e, set) in p.event_sets.iter().enumerate() {
+            let id = layout.width(e);
+            assert_eq!(
+                columns[id.index()],
+                width_slot(*set),
+                "width {e} does not index the column built from event_sets[{e}]"
+            );
+        }
+        // The four ranges partition the slot space: nothing is unnamed
+        // and nothing is named twice.
+        let named = p.probes_len() + p.select_attrs_len() + p.agg_fields_len() + p.event_sets_len();
+        assert_eq!(
+            columns.len(),
+            named,
+            "the layout holds exactly the four classes' members"
+        );
     }
 
     // ---- issue #492 item 9: the mid-pipeline `{...}` stage ------------
@@ -4475,14 +4796,14 @@ mod tests {
                 "{q}"
             );
             let sql = p.hydration_sql_for(&[[0u8; 16]]);
-            assert_eq!(sql.contains("AS attr_probe_val"), want, "{q}:\n{sql}");
+            assert_eq!(sql.contains("AS attr_slot_val"), want, "{q}:\n{sql}");
             // Every one of the five carries its predicate column, so the
             // value assertion above is not a statement about a statement
             // with no probe at all. The alias is matched with the
-            // delimiter that follows it, because `attr_probe` is a prefix
-            // of `attr_probe_val`.
+            // delimiter that follows it, because `attr_slot` is a prefix
+            // of `attr_slot_val`.
             assert!(
-                sql.contains("] AS attr_probe,\n") || sql.contains("] AS attr_probe\n"),
+                sql.contains("] AS attr_slot,\n") || sql.contains("] AS attr_slot\n"),
                 "{q}:\n{sql}"
             );
             // A probe that fuses nothing costs the pre-#557 statement
@@ -4490,7 +4811,7 @@ mod tests {
             // the string-equality class is an SQL IDENTITY, not a granule
             // measurement.
             if !want {
-                assert!(!sql.contains("attr_probe_type"), "{q}:\n{sql}");
+                assert!(!sql.contains("attr_slot_type"), "{q}:\n{sql}");
             }
         }
     }

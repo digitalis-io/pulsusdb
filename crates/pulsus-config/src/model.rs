@@ -432,6 +432,23 @@ pub struct ReaderConfig {
     pub template_timezone: TemplateTimezone,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES` (issue #558, default
+    /// 1,000,000): how many values one batch's event/link value set may
+    /// expand to.
+    ///
+    /// The reader sums the per-span widths the hydration statement
+    /// projected and refuses at `422 query_too_broad` BEFORE issuing the
+    /// value statement, so an over-budget set is never materialised.
+    ///
+    /// **Not [`Self::traceql_scan_budget_rows`].** That one is
+    /// `max_rows_to_read` on every trace-search read and bounds physical
+    /// rows a statement reads; this bounds the values one set holds. The
+    /// two coincided only while the set came from an index storing one
+    /// value per row, and issue #558 is what ended that.
+    ///
+    /// **The number is CHOSEN, not derived.** See
+    /// `crate::validate::TRACEQL_EVENT_SET_MAX_VALUES_CEILING`.
+    pub traceql_event_set_max_values: u64,
     /// Issue #478: the window a §4.3 tag-value read covers when the
     /// client sends no usable `start`/`end`.
     ///
@@ -559,6 +576,7 @@ impl Default for ReaderConfig {
             template_timezone: TemplateTimezone::UTC,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            traceql_event_set_max_values: 1_000_000,
             traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
             traceql_max_series: 1_000,
             traceql_generator_max_memory_bytes: 536_870_912,

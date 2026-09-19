@@ -102,13 +102,13 @@ use super::rows::{
     MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
     MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
     NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
-    TagValueRow, TraceCtxRow, TypedNumValueRow, TypedStrValueRow,
+    TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
     SpanSetGroup, SpanSummary, StoredType, TraceCtxInfo, TraceMatch, TraceSpans,
 };
-use super::search_plan::{HydrationShape, SearchCtx, SearchPlan};
+use super::search_plan::{HydrationShape, SearchCtx, SearchPlan, SlotLayout};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
 use super::tags_sql::DaySpan;
 use crate::compile::plan::{Cut, LinkShape, Part, PartShape};
@@ -248,6 +248,28 @@ struct BatchCharge<'a> {
     charged: &'a mut usize,
 }
 
+/// Everything one batch's hydration statement answered besides the spans
+/// (issue #557 for the memberships, #558 for the rest).
+///
+/// Every vector is index-aligned with the plan vector its slot class came
+/// from — `membership[i]` answers `plan.probes[i]`, `select_values[j]`
+/// answers `plan.select_attrs[j]`, and so on — because
+/// `group_hydrated_rows` fills each through the `SlotLayout`'s own
+/// accessor rather than through an index it computed.
+#[derive(Debug, Default)]
+pub(super) struct BatchSlots {
+    pub membership: Vec<ProbeMembership>,
+    pub select_values: Vec<HashMap<SpanKey, String>>,
+    pub select_types: Vec<HashMap<SpanKey, StoredType>>,
+    pub agg_values: Vec<HashMap<SpanKey, f64>>,
+    pub agg_types: Vec<HashMap<SpanKey, StoredType>>,
+    /// Per event set, how many values this batch's hydrated spans hold —
+    /// summed as the rows are walked. The `EventSet` arm refuses on it
+    /// BEFORE issuing a statement, so an over-budget set is never
+    /// expanded.
+    pub set_widths: Vec<u64>,
+}
+
 /// A destination for streamed rows that can PRICE a row before accepting
 /// it (issue #351 review 2).
 ///
@@ -322,9 +344,10 @@ pub struct TraceReadConfig {
     /// applies the same `_dist` rule as every other read engine's config).
     pub spans_table: String,
     /// `trace_attrs_idx{_dist}` — the index the phase-1 search
-    /// generators and the retained aggregate / `select()` value reads
-    /// target. The phase-2 attribute CONDITION stopped reading it in
-    /// issue #557.
+    /// generators target. The phase-2 attribute CONDITION stopped reading
+    /// it in issue #557 and the aggregate / `select()` / `by()` value
+    /// reads and the event/link value sets stopped in issue #558, so on
+    /// the search route no phase-2 statement reads it at all.
     pub attrs_table: String,
     /// `trace_edges{_dist}` — the service-graph half-row ledger the
     /// `service_graph` read targets (issue #173). `_dist`-suffixed when
@@ -338,6 +361,19 @@ pub struct TraceReadConfig {
     /// every search query; breach → 422 (code 158 →
     /// [`TooBroadReason::TraceScanBudgetRows`]).
     pub scan_budget_rows: u64,
+    /// `reader.traceql_event_set_max_values` — how many values one
+    /// batch's event/link value set may expand to (issue #558). Compared
+    /// against the widths the hydration statement returned, BEFORE the
+    /// value statement is issued, so an over-budget set is refused rather
+    /// than materialised; breach → 422
+    /// ([`TooBroadReason::TraceEventSetValues`]).
+    ///
+    /// **Not [`Self::scan_budget_rows`], and the two bound different
+    /// quantities.** The row budget is `max_rows_to_read` on every
+    /// trace-search read and counts physical rows a statement reads; this
+    /// counts the values one batch's set will hold. They coincided only
+    /// while the set came from an index storing one value per row.
+    pub event_set_max_values: u64,
     /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
     /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
@@ -702,6 +738,33 @@ fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
         }
     }
     ReadError::Clickhouse(e)
+}
+
+/// Maps a ClickHouse error on the **event/link value statement** only
+/// (issue #558): code 396 on THAT statement is its own result bound,
+/// which the code cannot attribute to rows or bytes, so it reports the
+/// value budget without a count. Everything else delegates to
+/// [`map_trace_read_error`], so the row scan budget, the read-byte
+/// ceiling and the memory ceiling keep reporting their own reasons.
+fn map_trace_event_set_error(e: ChError, config: &TraceReadConfig) -> ReadError {
+    if let ChError::Server {
+        code: CODE_TOO_MANY_ROWS_OR_BYTES,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::TraceEventSetValues {
+            values: None,
+            budget_values: config.event_set_max_values,
+        });
+    }
+    map_trace_read_error(e, config)
+}
+
+/// Moves one slot map out of the batch's answers, leaving an empty map
+/// behind (issue #558) — the `select_values` "moved, never copied"
+/// precedent, applied to the maps the hydration statement filled.
+fn take_slot_map<K, V>(slot: Option<&mut HashMap<K, V>>) -> HashMap<K, V> {
+    slot.map(std::mem::take).unwrap_or_default()
 }
 
 /// Maps a ClickHouse error on the **phase-1 candidate-generator** read
@@ -2456,8 +2519,9 @@ impl TraceEngine {
 
     /// Hydrates one batch's spans, groups them per trace, dedups by
     /// `span_id`, detects per-trace overflow via the `+1` probe, and
-    /// fills the probe memberships from the statement's own predicate
-    /// columns (issue #557).
+    /// fills every slot the statement answered: the probe memberships
+    /// (issue #557), the `select()` and aggregate values with their
+    /// stored kinds, and the event/link set widths (issue #558).
     ///
     /// The statement's shape comes from `SearchPlan::hydration_shape()`,
     /// which is also what rendered it, so the row type this decodes into
@@ -2470,7 +2534,7 @@ impl TraceEngine {
         budget: &mut ByteBudget,
         batch_charged: &mut usize,
         explain: &mut Option<&mut PlanExplain>,
-    ) -> Result<(Vec<TraceSpans>, bool, Vec<ProbeMembership>), ReadError> {
+    ) -> Result<(Vec<TraceSpans>, bool, BatchSlots), ReadError> {
         let sql = plan.hydration_sql_for(batch_ids);
         charge_explain(explain, budget, "phase2_hydration", &sql, None)?;
         // Issue #479's two shapes, decided by the plan and not here: a
@@ -2480,16 +2544,24 @@ impl TraceEngine {
         let fuses: Vec<bool> = (0..plan.probes_len())
             .map(|i| plan.probe_fuses_value(i))
             .collect();
-        let mut membership: Vec<ProbeMembership> = fuses
-            .iter()
-            .map(|&f| {
-                if f {
-                    ProbeMembership::Values(HashMap::new())
-                } else {
-                    ProbeMembership::Keys(HashSet::new())
-                }
-            })
-            .collect();
+        let layout = plan.slots();
+        let mut slots = BatchSlots {
+            membership: fuses
+                .iter()
+                .map(|&f| {
+                    if f {
+                        ProbeMembership::Values(HashMap::new())
+                    } else {
+                        ProbeMembership::Keys(HashSet::new())
+                    }
+                })
+                .collect(),
+            select_values: vec![HashMap::new(); plan.select_attrs_len()],
+            select_types: vec![HashMap::new(); plan.select_attrs_len()],
+            agg_values: vec![HashMap::new(); plan.agg_fields_len()],
+            agg_types: vec![HashMap::new(); plan.agg_fields_len()],
+            set_widths: vec![0u64; plan.event_sets_len()],
+        };
         // Charged per row DURING streaming (unbounded String columns are
         // exactly what the Layer-2 counter must bind — `max_result_bytes`
         // does not throw on streamed SELECT shapes).
@@ -2510,7 +2582,7 @@ impl TraceEngine {
                         },
                     )
                     .await?;
-                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
             }
             HydrationShape::Probes => {
                 let rows: Vec<HydrationProbeRow> = self
@@ -2525,11 +2597,11 @@ impl TraceEngine {
                                 + RETAINED_ENTRY_OVERHEAD
                                 + row.service.len()
                                 + row.name.len()
-                                + row.attr_probe.len()
+                                + row.attr_slot.len()
                         },
                     )
                     .await?;
-                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
             }
             HydrationShape::ProbesAndValues => {
                 let rows: Vec<HydrationProbeValueRow> = self
@@ -2544,27 +2616,30 @@ impl TraceEngine {
                                 + RETAINED_ENTRY_OVERHEAD
                                 + row.service.len()
                                 + row.name.len()
-                                + row.attr_probe.len()
-                                + row.attr_probe_val.iter().map(String::len).sum::<usize>()
-                                + row.attr_probe_type.iter().map(String::len).sum::<usize>()
+                                + row.attr_slot.len()
+                                + row.attr_slot_val.iter().map(String::len).sum::<usize>()
+                                + row.attr_slot_type.iter().map(String::len).sum::<usize>()
+                                + row.attr_slot_num.len() * std::mem::size_of::<Option<f64>>()
                         },
                     )
                     .await?;
-                group_hydrated_rows(rows, &fuses, &mut membership, budget, batch_charged)?
+                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
             }
         };
-        Ok((traces, overflowed, membership))
+        Ok((traces, overflowed, slots))
     }
 
-    /// Runs the batch's attribute aggregate / `select()` / event-set
-    /// value reads, and places the probe memberships the hydration
-    /// statement already answered (issue #557).
+    /// Places everything the hydration statement already answered — the
+    /// probe memberships (issue #557), the `select()` and aggregate
+    /// values with their kinds, and the event/link set widths (issue
+    /// #558) — and runs the one phase-2 attribute statement left, the
+    /// event/link value sets, only when their widths are within budget.
     async fn batch_attrs(
         &self,
         plan: &SearchPlan,
         batch_ids: &[[u8; 16]],
         settings: &QuerySettings,
-        membership: &mut [ProbeMembership],
+        slots: &mut BatchSlots,
         charge: BatchCharge<'_>,
         explain: &mut Option<&mut PlanExplain>,
     ) -> Result<BatchAttrs, ReadError> {
@@ -2581,11 +2656,11 @@ impl TraceEngine {
         // `BatchAttrs` vector is index-aligned with the plan vector it
         // came from — `attrs.membership[i]` answers `plan.probes[i]` —
         // and six `for i in 0..n` loops guaranteed that by construction.
-        // For the memberships the alignment now comes from the hydration
-        // statement's rendered column order, which
-        // `group_hydrated_rows` walks (issue #557); for the value reads
-        // it still comes from one statement per entry. The chain
-        // guarantees the walk either way: it carries
+        // Since issue #558 the memberships, the `select()` values and the
+        // aggregate values all arrive from the hydration statement's own
+        // slot space, which `group_hydrated_rows` fills through the
+        // `SlotLayout`'s accessors. The chain guarantees the walk: it
+        // carries
         // `Membership(0..probes)`, `AggValues(0..agg_fields)` and so on
         // in exactly that order, and each arm pushes in walk order. A
         // chain that dropped one link would misalign the vectors and
@@ -2614,76 +2689,36 @@ impl TraceEngine {
                 // `attrs.membership[i]` answering `plan.probes[i]`.
                 TqlLink::Membership(probe_idx) => {
                     let empty = ProbeMembership::Keys(HashSet::new());
-                    let filled = match membership.get_mut(*probe_idx) {
+                    let filled = match slots.membership.get_mut(*probe_idx) {
                         Some(slot) => std::mem::replace(slot, empty),
                         None => empty,
                     };
                     attrs.membership.push(filled);
                 }
+                // Issue #558: the field's value, its numeric reading and
+                // its stored kind all arrived on the hydration row, read
+                // at ONE located element, so this link issues NO
+                // statement. The maps `group_hydrated_rows` filled are
+                // MOVED into place here, in the same walk order the reads
+                // used to be issued in, which is what keeps
+                // `attrs.agg_values[k]` answering `plan.agg_fields[k]`.
                 TqlLink::AggValues(field_idx) => {
                     let field_idx = *field_idx;
-                    let sql = plan.agg_values_sql_for(field_idx, batch_ids);
-                    charge_explain(
-                        explain,
-                        budget,
-                        "phase2_attr_values",
-                        &sql,
-                        Some(("aggregate field = ", &plan.agg_fields[field_idx].key)),
-                    )?;
-                    let rows: Vec<TypedNumValueRow> = self
-                        .collect_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_read_error,
-                            |_| NUM_VALUE_ENTRY_BYTES,
-                        )
-                        .await?;
-                    // Issue #510: the stored kind rides the SAME read. Both maps
-                    // are keyed on the same span, so a value with no type (a row
-                    // written before the column existed) still lands in
-                    // `agg_values` and reads back as `StoredType::Unknown`.
-                    let mut values = HashMap::with_capacity(rows.len());
-                    let mut types = HashMap::with_capacity(rows.len());
-                    for row in rows {
-                        let Some(v) = row.v else { continue };
-                        let key = (row.trace_id, row.span_id);
-                        values.insert(key, v);
-                        types.insert(key, StoredType::from_stored(&row.t));
-                    }
-                    attrs.agg_values.push(values);
-                    attrs.agg_types.push(types);
+                    attrs
+                        .agg_values
+                        .push(take_slot_map(slots.agg_values.get_mut(field_idx)));
+                    attrs
+                        .agg_types
+                        .push(take_slot_map(slots.agg_types.get_mut(field_idx)));
                 }
                 TqlLink::SelectValues(field_idx) => {
                     let field_idx = *field_idx;
-                    let sql = plan.select_values_sql_for(field_idx, batch_ids);
-                    charge_explain(
-                        explain,
-                        budget,
-                        "phase2_attr_values",
-                        &sql,
-                        Some(("select field = ", &plan.select_attrs[field_idx].key)),
-                    )?;
-                    let rows: Vec<TypedStrValueRow> = self
-                        .collect_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_read_error,
-                            |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
-                        )
-                        .await?;
-                    let mut map = HashMap::with_capacity(rows.len());
-                    let mut types = HashMap::with_capacity(rows.len());
-                    for row in rows {
-                        let key = (row.trace_id, row.span_id);
-                        types.insert(key, StoredType::from_stored(&row.t));
-                        map.insert(key, row.v);
-                    }
-                    attrs.select_values.push(map);
-                    attrs.select_types.push(types);
+                    attrs
+                        .select_values
+                        .push(take_slot_map(slots.select_values.get_mut(field_idx)));
+                    attrs
+                        .select_types
+                        .push(take_slot_map(slots.select_types.get_mut(field_idx)));
                 }
                 // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
                 // VALUE, on the same `(key, scope)` index prefix the literal form
@@ -2738,6 +2773,24 @@ impl TraceEngine {
                 // exists to hold anything a second time.
                 TqlLink::EventSet(set_idx) => {
                     let set_idx = *set_idx;
+                    // Issue #558: the bound fires HERE, before the
+                    // statement exists, from the widths the hydration
+                    // statement returned. `max_result_rows` cannot do
+                    // this: it is checked per BLOCK and `arrayJoin` emits
+                    // one span's whole set as one block, so a span with
+                    // 400 values produced `current rows: 400.00` under a
+                    // 50-row cap — a refusal only after the expansion it
+                    // was meant to prevent.
+                    let values = slots.set_widths.get(set_idx).copied().unwrap_or(0);
+                    let budget_values = self.config.event_set_max_values;
+                    if values > budget_values {
+                        return Err(ReadError::QueryTooBroad(
+                            TooBroadReason::TraceEventSetValues {
+                                values: Some(values),
+                                budget_values,
+                            },
+                        ));
+                    }
                     let sql = plan.event_set_sql_for(set_idx, batch_ids);
                     charge_explain(
                         explain,
@@ -2746,6 +2799,15 @@ impl TraceEngine {
                         &sql,
                         Some(("event/link set = ", plan.event_sets[set_idx].display())),
                     )?;
+                    // The value statement carries its own result bound as
+                    // a backstop against a row arriving between the two
+                    // statements. It is set on THIS statement alone, by
+                    // cloning what `search_settings` built and overriding
+                    // one key, so no other read's settings move.
+                    let set_settings = settings
+                        .clone()
+                        .set("max_result_rows", self.config.scan_budget_rows);
+                    let settings = &set_settings;
                     let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
                     if plan.event_sets[set_idx].is_numeric() {
                         let mut sink = FnRowSink {
@@ -2768,7 +2830,7 @@ impl TraceEngine {
                             settings,
                             budget,
                             batch_charged,
-                            map_trace_read_error,
+                            map_trace_event_set_error,
                             &mut sink,
                         )
                         .await?;
@@ -2790,7 +2852,7 @@ impl TraceEngine {
                             settings,
                             budget,
                             batch_charged,
-                            map_trace_read_error,
+                            map_trace_event_set_error,
                             &mut sink,
                         )
                         .await?;
@@ -3553,6 +3615,10 @@ pub(super) trait HydrationRowParts {
     fn probe_bits(&self) -> &[u8];
     /// Moved out, never copied — the `select_values` precedent.
     fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)>;
+    /// The slot's numeric reading (issue #558). `None` for a slot the
+    /// statement rendered `NULL` into, and for a span carrying no element
+    /// there.
+    fn slot_num(&self, i: usize) -> Option<f64>;
     fn into_span(self) -> HydratedSpan;
 }
 
@@ -3567,6 +3633,9 @@ impl HydrationRowParts for HydrationRow {
         &[]
     }
     fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
+        None
+    }
+    fn slot_num(&self, _i: usize) -> Option<f64> {
         None
     }
     fn into_span(self) -> HydratedSpan {
@@ -3594,9 +3663,12 @@ impl HydrationRowParts for HydrationProbeRow {
         self.span_id
     }
     fn probe_bits(&self) -> &[u8] {
-        &self.attr_probe
+        &self.attr_slot
     }
     fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
+        None
+    }
+    fn slot_num(&self, _i: usize) -> Option<f64> {
         None
     }
     fn into_span(self) -> HydratedSpan {
@@ -3624,16 +3696,15 @@ impl HydrationRowParts for HydrationProbeValueRow {
         self.span_id
     }
     fn probe_bits(&self) -> &[u8] {
-        &self.attr_probe
+        &self.attr_slot
     }
     fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)> {
-        let value = std::mem::take(self.attr_probe_val.get_mut(i)?);
-        let kind = self
-            .attr_probe_type
-            .get(i)
-            .map(String::as_str)
-            .unwrap_or("");
+        let value = std::mem::take(self.attr_slot_val.get_mut(i)?);
+        let kind = self.attr_slot_type.get(i).map(String::as_str).unwrap_or("");
         Some((value, StoredType::from_stored(kind)))
+    }
+    fn slot_num(&self, i: usize) -> Option<f64> {
+        self.attr_slot_num.get(i).copied().flatten()
     }
     fn into_span(self) -> HydratedSpan {
         HydratedSpan {
@@ -3654,9 +3725,10 @@ impl HydrationRowParts for HydrationProbeValueRow {
 
 /// Groups a batch's (already per-row-charged) hydration rows into
 /// per-trace span lists, deduping `span_id` replays, detecting the
-/// per-trace overflow probe, AND filling the probe memberships
-/// (issue #557) — pure, so the accounting is unit-testable (code review
-/// round 5).
+/// per-trace overflow probe, AND filling every slot the statement
+/// answered — the probe memberships (issue #557), the projected field
+/// values with their kinds, and the event/link set widths (issue #558).
+/// Pure, so the accounting is unit-testable (code review round 5).
 ///
 /// Charge model (all BEFORE the allocation they cover):
 /// - first group: the outer Vec's initial reservation
@@ -3674,9 +3746,25 @@ impl HydrationRowParts for HydrationProbeValueRow {
 /// - per MEMBERSHIP ENTRY: [`MEMBERSHIP_ENTRY_BYTES`] (+ the fused
 ///   value's length), charged before the insert — the same bytes the
 ///   membership read charged before issue #557 moved the test onto this
-///   statement, so the Layer-2 counter sees what it saw before.
+///   statement, so the Layer-2 counter sees what it saw before;
+/// - per SELECT-VALUE entry: [`MEMBERSHIP_ENTRY_BYTES`] + the value's
+///   length, and per AGGREGATE-VALUE entry [`NUM_VALUE_ENTRY_BYTES`] —
+///   exactly what the two value reads charged before issue #558 moved
+///   them onto this statement, for the same reason;
+/// - per WIDTH: nothing. A width adds a `u64` to a fixed-length vector
+///   and allocates nothing.
 ///
-/// **Only a span whose `attr_probe[i]` is 1 enters `membership[i]`.** The
+/// **A width is summed AFTER the overflow-probe skip and BEFORE the
+/// `span_id` dedup skip**, and both halves are load-bearing. The value
+/// statement expands the rows the reader retained — the same `ORDER BY`
+/// and per-trace cap without the `+ 1` probe row — so the probe row's
+/// values are not in it, and a replayed row's values ARE, because
+/// `trace_spans` is a plain MergeTree and the replay occupies a slot
+/// inside the cap. Summed in that position the widths equal the value
+/// statement's physical row count exactly, which is what makes the
+/// pre-expansion bound exact rather than approximate.
+///
+/// **Only a span whose `attr_slot[i]` is 1 enters `membership[i]`.** The
 /// projected columns carry a value for EVERY span, including one the
 /// probe did not match; inserting that span would make the attribute leaf
 /// match it, because the evaluator asks the set (`search_eval`'s
@@ -3692,7 +3780,8 @@ impl HydrationRowParts for HydrationProbeValueRow {
 pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
     rows: Vec<R>,
     probe_fuses_value: &[bool],
-    membership: &mut [ProbeMembership],
+    layout: &SlotLayout,
+    slots: &mut BatchSlots,
     budget: &mut ByteBudget,
     batch_charged: &mut usize,
 ) -> Result<(Vec<TraceSpans>, bool), ReadError> {
@@ -3722,9 +3811,18 @@ pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
         raw_count += 1;
         if raw_count == MAX_SPANS_PER_TRACE + 1 {
             // The overflow probe row: this trace was truncated at
-            // hydration — evaluate the truncated set, mark partial.
+            // hydration — evaluate the truncated set, mark partial. The
+            // value statement does not return this row, so its widths are
+            // not counted either.
             overflowed = true;
             continue;
+        }
+        // The event/link set widths, summed BEFORE the dedup skip: the
+        // value statement expands `trace_spans`, a plain MergeTree, so a
+        // replayed row contributes its values to that statement too.
+        for (e, width) in slots.set_widths.iter_mut().enumerate() {
+            let n = row.slot_num(layout.width(e).index()).unwrap_or(0.0);
+            *width = width.saturating_add(n as u64);
         }
         if seen.contains(&span_id) {
             continue; // at-least-once replay — no allocation, no charge
@@ -3738,19 +3836,20 @@ pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
         // The probe bits, before the row is consumed. A `0` bit inserts
         // nothing at all — not the key, and not the value the column
         // carries for it.
-        for (i, slot) in membership.iter_mut().enumerate() {
-            if row.probe_bits().get(i).copied().unwrap_or(0) == 0 {
+        for (i, membership) in slots.membership.iter_mut().enumerate() {
+            let slot = layout.probe(i).index();
+            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
                 continue;
             }
             let value = if probe_fuses_value.get(i).copied().unwrap_or(false) {
-                row.take_probe_value(i)
+                row.take_probe_value(slot)
             } else {
                 None
             };
             let charge = MEMBERSHIP_ENTRY_BYTES + value.as_ref().map_or(0, |(v, _)| v.len());
             budget.charge(charge)?;
             *batch_charged += charge;
-            match (slot, value) {
+            match (membership, value) {
                 (ProbeMembership::Keys(set), _) => {
                     set.insert((trace_id, span_id));
                 }
@@ -3761,6 +3860,45 @@ pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
                     map.insert((trace_id, span_id), (String::new(), StoredType::Unknown));
                 }
             }
+        }
+        // Issue #558: a `select()` field's text and its kind, both read at
+        // the ONE element the locator landed on. A `0` bit is the field
+        // having no value at all — the span carries no such key at any
+        // scope the chain reaches — and inserts nothing.
+        for j in 0..slots.select_values.len() {
+            let slot = layout.select(j).index();
+            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let Some((value, kind)) = row.take_probe_value(slot) else {
+                continue;
+            };
+            let charge = MEMBERSHIP_ENTRY_BYTES + value.len();
+            budget.charge(charge)?;
+            *batch_charged += charge;
+            slots.select_types[j].insert((trace_id, span_id), kind);
+            slots.select_values[j].insert((trace_id, span_id), value);
+        }
+        // Issue #558: an aggregate argument's number and its kind, from
+        // the same element. A located element whose `attr_num` is NULL
+        // has NO numeric value — the case a span storing `span.n = "abc"`
+        // before `span.n = 5` produces — so neither map gains an entry,
+        // exactly as the old read's `isNotNull(val_num)` filter meant.
+        for k in 0..slots.agg_values.len() {
+            let slot = layout.agg(k).index();
+            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let Some(v) = row.slot_num(slot) else {
+                continue;
+            };
+            let kind = row
+                .take_probe_value(slot)
+                .map_or(StoredType::Unknown, |(_, t)| t);
+            budget.charge(NUM_VALUE_ENTRY_BYTES)?;
+            *batch_charged += NUM_VALUE_ENTRY_BYTES;
+            slots.agg_values[k].insert((trace_id, span_id), v);
+            slots.agg_types[k].insert((trace_id, span_id), kind);
         }
         traces
             .last_mut()
@@ -3776,17 +3914,14 @@ pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
 /// The seed statement, the hydration read and the winners' root read are
 /// issued elsewhere, and the engine links issue nothing.
 ///
-/// Issue #557 removed `Membership` from this set: the attribute
-/// condition is a predicate column on the hydration statement, so the
-/// link stays in the chain and sends nothing of its own.
+/// Issue #557 removed `Membership` from this set and issue #558 removed
+/// `AggValues` and `SelectValues`: the attribute condition and every
+/// projected field value are columns on the hydration statement, so those
+/// links stay in the chain and send nothing of their own.
 fn is_phase_two_read(link: &TqlLink) -> bool {
     matches!(
         link,
-        TqlLink::AggValues(_)
-            | TqlLink::SelectValues(_)
-            | TqlLink::EventSet(_)
-            | TqlLink::TraceCtx
-            | TqlLink::ChildCount
+        TqlLink::EventSet(_) | TqlLink::TraceCtx | TqlLink::ChildCount
     )
 }
 
@@ -4154,6 +4289,7 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
+            event_set_max_values: 1_000_000,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
@@ -4173,6 +4309,7 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
+            event_set_max_values: 1_000_000,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
@@ -5403,8 +5540,15 @@ mod tests {
         }
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
-        let (traces, overflowed) =
-            group_hydrated_rows(rows, &[], &mut [], &mut budget, &mut charged).expect("in budget");
+        let (traces, overflowed) = group_hydrated_rows(
+            rows,
+            &[],
+            &SlotLayout::default(),
+            &mut BatchSlots::default(),
+            &mut budget,
+            &mut charged,
+        )
+        .expect("in budget");
         assert!(!overflowed);
         assert_eq!(traces.len(), 3);
         assert!(traces.iter().all(|t| t.spans.len() == 5), "deduped");
@@ -5427,9 +5571,15 @@ mod tests {
         // reservations.
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
-        let (traces, _) =
-            group_hydrated_rows(vec![hyd_row(1, 1)], &[], &mut [], &mut budget, &mut charged)
-                .expect("fits");
+        let (traces, _) = group_hydrated_rows(
+            vec![hyd_row(1, 1)],
+            &[],
+            &SlotLayout::default(),
+            &mut BatchSlots::default(),
+            &mut budget,
+            &mut charged,
+        )
+        .expect("fits");
         assert_eq!(charged, expected_group_cost(1, 1));
         // The charge covers what was actually reserved.
         assert!(
@@ -5446,8 +5596,15 @@ mod tests {
         let rows: Vec<HydrationRow> = (0..200u8).map(|n| hyd_row(1, n)).collect();
         let mut budget = ByteBudget::new(usize::MAX);
         let mut charged = 0usize;
-        let (traces, _) =
-            group_hydrated_rows(rows, &[], &mut [], &mut budget, &mut charged).expect("fits");
+        let (traces, _) = group_hydrated_rows(
+            rows,
+            &[],
+            &SlotLayout::default(),
+            &mut BatchSlots::default(),
+            &mut budget,
+            &mut charged,
+        )
+        .expect("fits");
         assert_eq!(charged, expected_group_cost(1, 200));
         assert!(
             charged

@@ -9,8 +9,8 @@ docs/query-lowering.md	ast.rs:248	ambiguous_basename
 docs/query-lowering.md	ast.rs:251	ambiguous_basename
 docs/query-lowering.md	ast.rs:939	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1655	blank_target_line
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1969	blank_target_line
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1986	blank_target_line
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2032	blank_target_line
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2049	blank_target_line
 docs/query-lowering.md	exec.rs:124	ambiguous_basename
 docs/query-lowering.md	exec.rs:148	ambiguous_basename
 docs/query-lowering.md	exec.rs:178	ambiguous_basename
@@ -53,6 +53,7 @@ docs/query-lowering.md	traces/exec.rs:117	blank_target_line
 docs/query-to-sql.md	exec.rs:119	ambiguous_basename
 docs/query-to-sql.md	exec.rs:122	ambiguous_basename
 docs/query-to-sql.md	exec.rs:124	ambiguous_basename
+docs/query-to-sql.md	exec.rs:1528	ambiguous_basename
 docs/query-to-sql.md	exec.rs:1770	ambiguous_basename
 docs/query-to-sql.md	exec.rs:1858	ambiguous_basename
 docs/query-to-sql.md	exec.rs:1909	ambiguous_basename
@@ -60,6 +61,7 @@ docs/query-to-sql.md	exec.rs:2285	ambiguous_basename
 docs/query-to-sql.md	exec.rs:428	ambiguous_basename
 docs/query-to-sql.md	exec.rs:5534	ambiguous_basename
 docs/query-to-sql.md	exec.rs:744	ambiguous_basename
+docs/query-to-sql.md	exec.rs:843	ambiguous_basename
 docs/query-to-sql.md	fold.rs:547	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1534	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1649	ambiguous_basename

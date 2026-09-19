@@ -155,8 +155,42 @@ const CONTROL: &str = "with_binding_control.txt";
 /// (`every_committed_statement_binds_no_relational_cte`) measures rather
 /// than assumes. That loop runs before the count assertions in the same
 /// test.
+///
+/// **Issue #558 moves `SQL_STATEMENTS` from 396 to 380, and the sixteen
+/// are named rather than inferred from the arithmetic.** A `select()`
+/// field, an aggregate argument and a `by()` key are projected slots on
+/// the hydration statement now, so neither of their two reads is issued
+/// and neither renders a section. Enumerated with
+/// `git ls-tree -r --name-only <rev> -- crates/pulsus-read/tests/golden`
+/// filtered to `.sql`, every `^== ` header taken from each file with its
+/// `[i]` index normalised, and the two revisions' sorted lists compared
+/// with `comm` (Git 2.53.0, GNU grep 3.12, GNU sed 4.9):
+///
+/// ```text
+///   present at 4ebb3e48 and absent at the head          16
+///     == phase2 aggregate values[i] ==                   8
+///     == phase2 select values[i] ==                      8
+///   present at the head and absent at 4ebb3e48           0
+///
+///   over eight files, of which rhs_attr.sql carries two of each because
+///   a field-vs-field leaf interns both operands into BOTH vectors:
+///     agg_and_select, event_name_vs_attr,
+///     event_time_since_start_vs_attr, issue492_attr_eq_with_max_attr,
+///     issue492_by_attr_then_count, issue492_select_span_attr,
+///     rhs_attr, spanset_by_attr
+/// ```
+///
+/// No section of any other kind moved and none was added, so the count
+/// falls by exactly those sixteen. `SQL_FILES` stays at 126: the same
+/// enumeration reports 126 `.sql` goldens at both revisions.
+///
+/// **A note on the two numbers, because they do not match the header
+/// count.** The enumeration above counts `== ` HEADERS — 394 at the base
+/// and 378 at the head. `split_sql` falls back to one part for a `.sql`
+/// golden carrying no header at all, and there are two such files, which
+/// is the constant's `+ 2`.
 const SQL_FILES: usize = 126;
-const SQL_STATEMENTS: usize = 396;
+const SQL_STATEMENTS: usize = 380;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;

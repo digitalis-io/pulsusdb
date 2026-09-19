@@ -18,35 +18,19 @@ WITH arrayFirstIndex((k, s) -> k = 'a' AND s = 'span', attr_key, attr_scope) AS 
      arrayFirstIndex((k, s) -> k = 'a' AND s = 'link', attr_key, attr_scope) AS pi0l,
      arrayFirstIndex((k, s) -> k = 'a' AND s = 'instrumentation', attr_key, attr_scope) AS pi0i,
      arrayFirstIndex((k, s, v) -> k = 'a' AND s = 'event' AND v = '1', attr_key, attr_scope, attr_val) AS pm0e,
-     arrayFirstIndex((k, s, v) -> k = 'a' AND s = 'link' AND v = '1', attr_key, attr_scope, attr_val) AS pm0l
+     arrayFirstIndex((k, s, v) -> k = 'a' AND s = 'link' AND v = '1', attr_key, attr_scope, attr_val) AS pm0l,
+     arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope) AS fs0,
+     arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope) AS fa0
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version,
-       [if(pi0s != 0, attr_val[pi0s] = '1', if(pi0r != 0, attr_val[pi0r] = '1', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = '1', 0)))))] AS attr_probe
+       [if(pi0s != 0, attr_val[pi0s] = '1', if(pi0r != 0, attr_val[pi0r] = '1', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = '1', 0))))), fs0 != 0, fa0 != 0] AS attr_slot,
+       ['', if(length(attr_val[fs0]) <= 8192, attr_val[fs0], substringUTF8(attr_val[fs0], 1, 2048)), ''] AS attr_slot_val,
+       ['', attr_type[fs0], attr_type[fa0]] AS attr_slot_type,
+       CAST([NULL, NULL, attr_num[fa0]] AS Array(Nullable(Float64))) AS attr_slot_num
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
-
-== phase2 aggregate values[0] ==
-SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
-FROM trace_attrs_idx
-WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND key = 'foo'
-  AND scope = 'span'
-  AND isNotNull(val_num)
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
-  AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
-GROUP BY trace_id, span_id
-
-== phase2 select values[0] ==
-SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v, any(val_type) AS t
-FROM trace_attrs_idx
-WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND key = 'foo'
-  AND scope = 'span'
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
-  AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
-GROUP BY trace_id, span_id
 
 == root hydration (sample winners) ==
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns
