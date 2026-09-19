@@ -428,6 +428,46 @@ const fn waiter_side_bytes(waiters: usize) -> u64 {
     hash_map_bytes::<PushDigest, WaiterVec>(waiters) + waiters as u64 * WAITER_CHARGE_BYTES
 }
 
+/// **A value the claim table stores must own no heap.**
+///
+/// The capacity model above bounds what the *containers* reserve. It
+/// cannot see memory an entry **owns**: a `Box<[u8]>` field allocating two
+/// megabytes per admitted claim raises no slot count and moves no
+/// `size_of`, so every byte of it would sit outside the knob with the
+/// oracle green. Round 1 of this issue's code review measured exactly that
+/// — `knob=1048576 model=956856 allocator_resident=2709944`, a bound
+/// breached by 2.6x with nine passing tests.
+///
+/// The fix is the design, not another case in the oracle: **make the
+/// capacity model complete** by guaranteeing the entry type cannot own
+/// heap at all. `Copy` is the compiler-checked form of that guarantee. A
+/// type that manages an allocation must free it, which needs `Drop`; a
+/// `Copy` type may implement neither `Drop` nor hold a field that does.
+/// So `Box`, `Vec`, `String`, `Arc`, `Rc` and every container built on
+/// them are refused at compile time, and adding one to [`ClaimEntry`] is a
+/// build error rather than a silent breach.
+///
+/// The alternative — charging what each entry owns — was rejected: it
+/// reintroduces the per-entry constant §0 removed, and it makes the bound
+/// depend on runtime content, so the construction check would stop being
+/// sufficient and the knob would stop being a hard bound.
+///
+/// **What this does not cover, stated rather than implied.** A `Copy` type
+/// can hold a raw pointer into an allocation nobody frees. Nothing in the
+/// type system refuses that, and this assertion does not pretend to: the
+/// runtime leg in `tests/a494_dedup_charge.rs` — fill the table and assert
+/// the allocator handed out nothing further — is what catches memory
+/// reached by any route, including one this bound cannot see.
+///
+/// The waiter side is deliberately **not** under this rule: its map value
+/// is a `Vec`, which does own heap, and every byte it owns is charged per
+/// registration through [`WAITER_CHARGE_BYTES`] and measured against the
+/// allocator at several key shapes.
+const fn assert_owns_no_heap<T: Copy>() {}
+
+const _: () = assert_owns_no_heap::<ClaimEntry>();
+const _: () = assert_owns_no_heap::<PushDigest>();
+
 /// The whole index's footprint at its bound — the figure the knob bounds.
 ///
 /// Three fixed allocations sit beside the two collections and are charged
@@ -576,7 +616,10 @@ pub(crate) struct RegistrationId(u64);
 /// One claim. Times are milliseconds since the index's own epoch, not
 /// `Instant`s: an `Instant` is sixteen bytes on Linux, and this struct is
 /// multiplied by the claim table's reserved capacity.
-#[derive(Debug)]
+///
+/// **`Copy`, and that is the memory bound rather than a convenience** —
+/// see [`assert_owns_no_heap`].
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ClaimEntry {
     /// The content digest, kept separately from the key so the same
     /// `Idempotency-Key` carrying different content is refused.
