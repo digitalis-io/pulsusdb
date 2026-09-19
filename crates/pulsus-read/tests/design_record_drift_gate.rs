@@ -1112,7 +1112,7 @@ fn target_symbol(body: &str) -> String {
     let mut best: Option<String> = None;
     let mut best_worded: Option<String> = None;
     let mut cur = String::new();
-    let mut flush = |cur: &mut String, best: &mut Option<String>, worded: &mut Option<String>| {
+    let flush = |cur: &mut String, best: &mut Option<String>, worded: &mut Option<String>| {
         if cur.is_empty() {
             return;
         }
