@@ -289,9 +289,20 @@ fn table_primary_key_granules(raw: &str, table: &str) -> (u64, u64) {
 /// window pruning. The extracted scan explains cleanly standalone (its
 /// `is_sel` semi-join is a `CreatingSets` child).
 fn extract_compare_base_scan(cross: &str) -> String {
-    let start = cross
+    let select = cross
         .find("SELECT toUnixTimestamp64Milli")
         .unwrap_or_else(|| panic!("no base scan in compare SQL:\n{cross}"));
+    // Issue #559: the base scan may open with a `WITH` clause declaring
+    // the outer filter's and the selection's attribute locators, and the
+    // `SELECT` list references them. Starting at the `SELECT` and
+    // explaining that alone gives `Code: 47 … Unknown expression or
+    // function identifier 'cpi0'` — measured, on the very first
+    // comparison case with an attribute selection. So the extraction
+    // starts at the `WITH` when there is one.
+    let start = cross[..select]
+        .rfind("WITH ")
+        .filter(|w| !cross[*w..select].contains("FROM "))
+        .unwrap_or(select);
     let rel_end = cross[start..]
         .find("\n  )\n  GROUP BY t, trace_id, span_id")
         .unwrap_or_else(|| panic!("no base-scan terminator in compare SQL:\n{cross}"));
@@ -594,93 +605,6 @@ async fn metrics_explain_and_budget_gates() {
         }
         other => panic!("expected TraceScanBudgetRows, got {other:?}"),
     }
-
-    // ---- Issue #559 criterion 9: a metrics attribute condition matching
-    // more spans than the old IN-set budget allowed now RETURNS THE
-    // ANSWER. -----------------------------------------------------------
-    //
-    // This replaces gate 4's metrics half, which asserted the opposite.
-    // Until issue #559 the attribute leaf built a
-    // `(trace_id, span_id) IN (SELECT …)` set under
-    // `max_rows_in_set = TRACE_METRICS_MAX_SET_ROWS` and
-    // `max_bytes_in_set = TRACE_METRICS_MAX_SET_BYTES`, both
-    // `set_overflow_mode = 'throw'`, so past the byte ceiling — measured
-    // at 524,289 matching spans, where 524,288 answered — the request was
-    // `Code: 191` → `TooBroadReason::TraceMetricsSetRows` → HTTP 422. The
-    // span-row form builds no set, so the binding limit becomes
-    // `max_rows_to_read = scan_budget_rows`, which is 50,000,000 by
-    // default and counted over span rows alone rather than span rows PLUS
-    // index rows. Strictly more permissive on both dimensions.
-    //
-    // The 191 refusal, the two constants and the settings are unchanged
-    // and still reachable: the NARROWED tag-values read builds its own
-    // `IN` set under the same `metrics_settings`, and
-    // `traces_tags_explain::the_narrowed_tag_values_read_still_refuses_an_oversized_in_set`
-    // is the live test for it.
-    let bulk_rows = TRACE_METRICS_MAX_SET_ROWS + 50_000;
-    let bulk_spread = WINDOW_NS / bulk_rows as i64;
-    exec(
-        &client,
-        &format!(
-            "INSERT INTO {DB}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload, \
-              attr_key, attr_scope, attr_val, attr_type, attr_num) \
-             SELECT \
-               toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
-               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
-               toFixedString(unhex('0000000000000000'), 8), \
-               'op', 'bulk-svc', \
-               {base} + toInt64(number) * {bulk_spread}, \
-               1000000, 0, 1, 1, 'p', \
-               ['bulk'], ['span'], ['x'], ['string'], [NULL] \
-             FROM numbers({bulk_rows})"
-        ),
-    )
-    .await;
-    exec(
-        &client,
-        &format!(
-            "INSERT INTO {DB}.trace_attrs_idx \
-             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
-              duration_ns) \
-             SELECT \
-               toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * {bulk_spread})), \
-               'bulk', 'x', 'span', 'string', NULL, \
-               {base} + toInt64(number) * {bulk_spread}, \
-               toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
-               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
-               1000000 \
-             FROM numbers({bulk_rows})"
-        ),
-    )
-    .await;
-    let plan = plan_for(&engine, r#"{ span.bulk = "x" } | rate()"#, base, now);
-    let result = engine
-        .metrics_range(&plan)
-        .await
-        .expect("a condition matching more spans than the old set budget must answer");
-    let counted: f64 = result
-        .series
-        .iter()
-        .flat_map(|s| s.samples.iter())
-        .map(|(_, v)| *v)
-        .sum();
-    assert!(
-        counted > 0.0,
-        "the answer must carry the matched spans, not an empty series: {:?}",
-        result.series
-    );
-    // The instant form carries the same settings — same answer, not a
-    // refusal.
-    let instant = engine
-        .metrics_instant(&plan)
-        .await
-        .expect("the instant form answers it too");
-    assert!(
-        !instant.series.is_empty(),
-        "the instant form must return a series: {instant:?}"
-    );
 
     // ---- Issue #182 gate: by(resource.service.name) grouping pushes the
     // GROUP BY down to ClickHouse (Aggregating step), keeps the service
@@ -1460,6 +1384,101 @@ async fn metrics_explain_and_budget_gates() {
     assert!(
         range_probe_granules >= instant_probe_granules,
         "the range probe covers a strictly wider window, so it can never prune MORE granules          ({range_probe_granules} < {instant_probe_granules})"
+    );
+
+    // ---- Issue #559 criterion 9: a metrics attribute condition matching
+    // more spans than the old IN-set budget allowed now RETURNS THE
+    // ANSWER. -----------------------------------------------------------
+    //
+    // **Last in the sequence, because it multiplies the corpus by nine.**
+    // It seeds TRACE_METRICS_MAX_SET_ROWS + 50,000 span rows on top of
+    // the CORPUS_SPANS the gates above measure, and `compare()`'s roots
+    // CTE builds a `trace_id IN (SELECT DISTINCT trace_id FROM base)` set
+    // over whatever the window holds — which, seeded earlier, overflows
+    // that set's own budget and reddens the comparison gates for a reason
+    // that has nothing to do with what they check.
+    //
+    // This replaces gate 4's metrics half, which asserted the opposite.
+    // Until issue #559 the attribute leaf built a
+    // `(trace_id, span_id) IN (SELECT …)` set under
+    // `max_rows_in_set = TRACE_METRICS_MAX_SET_ROWS` and
+    // `max_bytes_in_set = TRACE_METRICS_MAX_SET_BYTES`, both
+    // `set_overflow_mode = 'throw'`, so past the byte ceiling — measured
+    // at 524,289 matching spans, where 524,288 answered — the request was
+    // `Code: 191` → `TooBroadReason::TraceMetricsSetRows` → HTTP 422. The
+    // span-row form builds no set, so the binding limit becomes
+    // `max_rows_to_read = scan_budget_rows`, which is 50,000,000 by
+    // default and counted over span rows alone rather than span rows PLUS
+    // index rows. Strictly more permissive on both dimensions.
+    //
+    // The 191 refusal, the two constants and the settings are unchanged
+    // and still reachable: the NARROWED tag-values read builds its own
+    // `IN` set under the same `metrics_settings`, and
+    // `traces_tags_explain::the_narrowed_tag_values_read_still_refuses_an_oversized_in_set`
+    // is the live test for it.
+    let bulk_rows = TRACE_METRICS_MAX_SET_ROWS + 50_000;
+    let bulk_spread = WINDOW_NS / bulk_rows as i64;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), \
+               'op', 'bulk-svc', \
+               {base} + toInt64(number) * {bulk_spread}, \
+               1000000, 0, 1, 1, 'p', \
+               ['bulk'], ['span'], ['x'], ['string'], [NULL] \
+             FROM numbers({bulk_rows})"
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_attrs_idx \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
+             SELECT \
+               toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * {bulk_spread})), \
+               'bulk', 'x', 'span', 'string', NULL, \
+               {base} + toInt64(number) * {bulk_spread}, \
+               toFixedString(unhex(leftPad(lower(hex(number + 5000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               1000000 \
+             FROM numbers({bulk_rows})"
+        ),
+    )
+    .await;
+    let plan = plan_for(&engine, r#"{ span.bulk = "x" } | rate()"#, base, now);
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("a condition matching more spans than the old set budget must answer");
+    let counted: f64 = result
+        .series
+        .iter()
+        .flat_map(|s| s.samples.iter())
+        .map(|(_, v)| *v)
+        .sum();
+    assert!(
+        counted > 0.0,
+        "the answer must carry the matched spans, not an empty series: {:?}",
+        result.series
+    );
+    // The instant form carries the same settings — same answer, not a
+    // refusal.
+    let instant = engine
+        .metrics_instant(&plan)
+        .await
+        .expect("the instant form answers it too");
+    assert!(
+        !instant.series.is_empty(),
+        "the instant form must return a series: {instant:?}"
     );
 
     // Issue #559 criterion 11: every fixture that writes `trace_attrs_idx`
