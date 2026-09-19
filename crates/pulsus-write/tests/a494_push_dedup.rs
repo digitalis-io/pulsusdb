@@ -14,7 +14,9 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChError, ChRow};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
-use pulsus_write::writer::{BlockInserter, LogWriter};
+use pulsus_write::MetricSink;
+use pulsus_write::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef};
+use pulsus_write::writer::{BlockInserter, LogWriter, MetricWriter};
 use pulsus_write::{AdmitRefusal, LogRow, LogSink, ParsedLogs, PushHeaders, StreamRow, WaitMode};
 
 // ---------------------------------------------------------------------
@@ -120,6 +122,40 @@ fn writer_with(
         ..cfg
     };
     LogWriter::with_inserters(samples, streams, MockInserter::new(Behavior::Ok), &cfg)
+}
+
+fn metric_writer_with(cfg: WriterConfig, metadata: Arc<MockInserter>) -> MetricWriter {
+    metric_writer_with_samples(cfg, MockInserter::new(Behavior::Ok), metadata)
+}
+
+fn metric_writer_with_samples(
+    cfg: WriterConfig,
+    samples: Arc<MockInserter>,
+    metadata: Arc<MockInserter>,
+) -> MetricWriter {
+    MetricWriter::with_inserters(
+        samples,
+        MockInserter::new(Behavior::Ok),
+        metadata,
+        MockInserter::new(Behavior::Ok),
+        &cfg,
+        pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS,
+    )
+}
+
+fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetrics {
+    ParsedMetrics {
+        metadata: vec![MetricMetadata {
+            metric_name: Arc::from(name),
+            metric_type: metric_type.to_string(),
+            help: String::new(),
+            unit: String::new(),
+            // Receiver-injected in production (`now_ns`); named here so the
+            // A/B/A sequence is legible.
+            updated_ns,
+        }],
+        ..Default::default()
+    }
 }
 
 /// Flush on the very next append, so a sync admit settles promptly.
@@ -756,6 +792,102 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
         "and nothing was suppressed the second time"
     );
     writer.shutdown(Duration::from_secs(2)).await;
+}
+
+// ---------------------------------------------------------------------
+// A descriptor that comes back is not a retry
+// ---------------------------------------------------------------------
+
+/// `metric_metadata` rows carry a receiver-injected `updated_ns` and the
+/// table is a `ReplacingMergeTree` versioned by it, so the field is
+/// outside the push identity — it changes on every retry, and a retry that
+/// matched nothing would defeat the whole mechanism.
+///
+/// That leaves one sequence the content digest cannot read correctly:
+///
+/// ```text
+///   counter at t1    emitted, wins
+///   gauge   at t2    emitted, wins
+///   counter at t3    byte-identical content to t1
+/// ```
+///
+/// Suppressing the third leaves `gauge` as the stored type of a metric
+/// that is a counter — a wrong answer, not a lost duplicate. So a push
+/// that emits a descriptor is never suppressed, and this is that rule.
+#[tokio::test]
+async fn a_descriptor_that_comes_back_is_stored_again() {
+    let metadata = MockInserter::new(Behavior::Ok);
+    let writer = metric_writer_with(eager(), metadata.clone());
+
+    for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
+        let wait = writer
+            .admit_flush(
+                metadata_batch("http_requests_total", metric_type, updated_ns),
+                PushHeaders::default(),
+            )
+            .expect("queue has room");
+        wait.await.expect("the flush settles");
+    }
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        metadata.rows_inserted(),
+        3,
+        "all three descriptors reach the table: the third is the current \
+         value of the metric, and the version column is what decides the \
+         winner"
+    );
+    assert_eq!(
+        writer.metrics().dedup.duplicate_pushes_total,
+        0,
+        "and none of the three was suppressed"
+    );
+}
+
+/// The rule costs nothing on a genuine retry: the descriptor cache emits a
+/// row only when it differs from the one last confirmed-flushed, so the
+/// retry carries none, stays claimable, and is suppressed.
+#[tokio::test]
+async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
+    let samples = MockInserter::new(Behavior::Ok);
+    let metadata = MockInserter::new(Behavior::Ok);
+    let writer = metric_writer_with_samples(eager(), samples.clone(), metadata.clone());
+
+    let body = || {
+        let mut batch = metadata_batch("http_requests_total", "counter", 1);
+        batch.samples.push(MetricPoint {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(9),
+            unix_milli: 1_700_000_000_000,
+            value: 1.0,
+        });
+        batch.series.push(SeriesRef {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(9),
+            labels: labels_with_service("svc"),
+        });
+        batch
+    };
+
+    for _ in 0..2 {
+        let wait = writer
+            .admit_flush(body(), PushHeaders::default())
+            .expect("queue has room");
+        wait.await.expect("the flush settles");
+    }
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        metadata.rows_inserted(),
+        1,
+        "the descriptor is emitted once; the retry's is already cached"
+    );
+    assert_eq!(
+        samples.rows_inserted(),
+        1,
+        "and the retry's sample is suppressed, which is the point"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
 }
 
 // ---------------------------------------------------------------------

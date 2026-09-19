@@ -65,7 +65,13 @@ use pulsus_write::writer::{MetricHistSampleRow, MetricSampleRow, MetricSeriesRow
 /// because `live_port_uniqueness.rs` reads them and a port built by
 /// arithmetic is invisible to it.
 const LOGS_PORT: u16 = 31_630;
-const LOGS_SECOND_WRITER_PORT: u16 = 31_631;
+/// The two-writer test binds TWO, and neither may be another test's: the
+/// suites here run in parallel, so a port shared between two tests in one
+/// file collides exactly as one shared between two files would. The first
+/// version of this suite gave this test `LOGS_PORT`, and the occupied-port
+/// guard below is what found it.
+const TWO_WRITERS_FIRST_PORT: u16 = 31_637;
+const TWO_WRITERS_SECOND_PORT: u16 = 31_631;
 const BUCKETS_PORT: u16 = 31_632;
 const METRICS_PORT: u16 = 31_633;
 const COLLAPSE_PORT: u16 = 31_634;
@@ -626,11 +632,11 @@ async fn the_same_body_to_a_second_writer_is_stored_again() {
         return;
     }
     let db = ScopedDb::fresh(pulsus_testkit::test_db("a494_two_writers")).await;
-    let first = spawn_ready(LOGS_PORT, &db, &[]);
+    let first = spawn_ready(TWO_WRITERS_FIRST_PORT, &db, &[]);
     let client = client_for(db.name()).await;
     let body = logs_body("dupCross", T_NS);
 
-    assert_eq!(push_logs(LOGS_PORT, &body, &[]).status, 204);
+    assert_eq!(push_logs(TWO_WRITERS_FIRST_PORT, &body, &[]).status, 204);
     wait_for_scalar(
         &client,
         "SELECT count() AS n FROM log_samples WHERE service = 'dupCross'",
@@ -641,8 +647,8 @@ async fn the_same_body_to_a_second_writer_is_stored_again() {
 
     // A second process against the same database — the deployment shape
     // the chart ships in split mode (`replicaCount: 2`).
-    let second = spawn_ready(LOGS_SECOND_WRITER_PORT, &db, &[]);
-    assert_eq!(push_logs(LOGS_SECOND_WRITER_PORT, &body, &[]).status, 204);
+    let second = spawn_ready(TWO_WRITERS_SECOND_PORT, &db, &[]);
+    assert_eq!(push_logs(TWO_WRITERS_SECOND_PORT, &body, &[]).status, 204);
     wait_for_scalar(
         &client,
         "SELECT count() AS n FROM log_samples WHERE service = 'dupCross'",
