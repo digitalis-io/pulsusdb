@@ -73,6 +73,18 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: ci/no-premature-close.sh
 
+      # Issue #494: the documentation sites the suppression change
+      # falsifies are a committed manifest, and both halves of it are
+      # checked — a `rewrite` row that did not change fails, and a `leave`
+      # row that did fails. The self-test runs the five attacks the plan
+      # names against the committed artifacts, so a bare pass on a clean
+      # tree is never the only evidence the matcher still works.
+      - name: Documentation sites manifest self-test
+        run: ci/checks/doc_sites_self_test.sh
+
+      - name: Documentation sites manifest
+        run: ci/checks/doc_sites.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

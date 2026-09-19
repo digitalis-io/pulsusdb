@@ -38,16 +38,24 @@ cd "$REPO"
 ROOT=${ROOT:-$REPO}
 MANIFEST=${MANIFEST:-$REPO/ci/checks/doc_sites.txt}
 EXPECTED=${EXPECTED:-$REPO/ci/checks/doc_sites.expected}
-BASE=${BASE:?set BASE to the merge-base revision}
 
-tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp)
-trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
 fail() { echo "doc-sites: $1" >&2; exit 1; }
 
 [ -s "$MANIFEST" ] || fail "empty or missing manifest"
 [ -s "$EXPECTED" ] || fail "empty or missing expected set"
+# The revision the ranges are taken in is frozen IN the manifest, not
+# passed by the caller: the rows are claims about that revision's
+# sentences, so a moving base would quietly change what they assert. A
+# caller may override it, which is what the self-test does.
+BASE=${BASE:-$(awk '$1 == "#" && $2 == "base" { print $3; exit }' "$MANIFEST")}
+[ -n "$BASE" ] || fail "no frozen base revision in $MANIFEST"
+git cat-file -e "$BASE^{commit}" 2>/dev/null \
+  || fail "the frozen base revision $BASE is not in this clone (fetch-depth)"
 
-sites=$(awk '{print $2}' "$MANIFEST" | LC_ALL=C sort)
+tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp)
+trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
+
+sites=$(awk '$1 != "#" && NF { print $2 }' "$MANIFEST" | LC_ALL=C sort)
 dups=$(printf '%s\n' "$sites" | LC_ALL=C uniq -d)
 [ -z "$dups" ] || fail "duplicate site rows: $(printf '%s' "$dups" | tr '\n' ' ')"
 if ! printf '%s\n' "$sites" | LC_ALL=C cmp -s - "$EXPECTED"; then
@@ -76,6 +84,7 @@ contains_block() {
 n=0
 while read -r verdict site; do
   [ -n "${verdict:-}" ] || continue
+  [ "$verdict" != "#" ] || continue
   file=${site%%:*}; range=${site#*:}
   start=${range%%-*}; end=${range#*-}
   case "$start$end" in *[!0-9]*) fail "bad range: $site" ;; esac
