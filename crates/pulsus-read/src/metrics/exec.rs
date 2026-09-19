@@ -2629,6 +2629,25 @@ pub(super) struct RunDedup {
     seen: HashSet<u64>,
 }
 
+/// Samples [`RunDedup::push_float`] has examined, counted under `cfg(test)`
+/// so the cost gate can read the quantity that was quadratic rather than a
+/// stand-in for it. A gate over the INPUT reads cannot see this at all:
+/// the scan it replaced walked the OUTPUT, so the input was read once
+/// either way.
+#[cfg(test)]
+thread_local! {
+    pub(super) static RUN_SAMPLES_EXAMINED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_examined(n: u64) {
+    RUN_SAMPLES_EXAMINED.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(not(test))]
+fn count_examined(_n: u64) {}
+
 impl RunDedup {
     /// Appends `value` unless the run at `t_ms` already holds a sample with
     /// the same bits. A different `t_ms` starts a new run.
@@ -2643,18 +2662,25 @@ impl RunDedup {
             if self.seen.is_empty() {
                 // One-time promotion: the run already in `out` moves into
                 // the set, and every later sample costs one lookup.
+                count_examined(self.len as u64);
                 for sample in out.iter().rev().take(self.len) {
                     if sample.h.is_none() {
                         self.seen.insert(sample.v.to_bits());
                     }
                 }
             }
+            count_examined(1);
             !self.seen.insert(bits)
         } else {
-            out.iter()
+            let mut examined = 0u64;
+            let found = out
+                .iter()
                 .rev()
                 .take(self.len)
-                .any(|sample| sample.h.is_none() && sample.v.to_bits() == bits)
+                .inspect(|_| examined += 1)
+                .any(|sample| sample.h.is_none() && sample.v.to_bits() == bits);
+            count_examined(examined);
+            found
         };
         if duplicate {
             return;
@@ -4740,45 +4766,35 @@ mod timestamp_run_cost {
     use super::*;
     use std::cell::Cell;
 
-    thread_local! {
-        static READS: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// A sample whose value cannot be read without being counted.
-    struct CountedFloat {
-        unix_milli: i64,
-        value: f64,
-    }
-
-    impl FloatPoint for CountedFloat {
-        fn unix_milli(&self) -> i64 {
-            self.unix_milli
-        }
-        fn value(&self) -> f64 {
-            READS.with(|c| c.set(c.get() + 1));
-            self.value
-        }
-    }
-
-    /// Reads of sample values while emitting one run of `n` samples at one
-    /// millisecond, `distinct` of them carrying different values.
-    fn reads_for(n: usize, distinct: usize) -> u64 {
-        let floats: Vec<CountedFloat> = (0..n)
-            .map(|i| CountedFloat {
+    /// Samples examined while emitting one run of `n` at one millisecond,
+    /// `distinct` of them carrying different values — read from the
+    /// production counter, not from a stand-in.
+    fn examined_for(n: usize, distinct: usize) -> u64 {
+        let floats: Vec<SampleRow> = (0..n)
+            .map(|i| SampleRow {
+                fingerprint: Fingerprint::from_raw(1),
                 unix_milli: 1,
                 value: (i % distinct) as f64,
             })
             .collect();
         let mut out = Vec::new();
         let mut run = RunDedup::default();
-        READS.with(|c| c.set(0));
-        emit_timestamp_run::<CountedFloat, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+        RUN_SAMPLES_EXAMINED.with(|c| c.set(0));
+        emit_timestamp_run::<SampleRow, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
             .expect("float-only run");
         assert_eq!(out.len(), distinct, "the rule's answer is unchanged");
-        READS.with(Cell::get)
+        RUN_SAMPLES_EXAMINED.with(Cell::get)
     }
 
     /// Doubling the run must not quadruple the work.
+    ///
+    /// **`ALL_DISTINCT` is the case that matters, and a gate without it
+    /// passes on a quadratic build.** The scan walks the samples already
+    /// EMITTED, so a run of ten thousand samples carrying a thousand
+    /// distinct values only ever scans a thousand — the cost grows with
+    /// the input only when the distinct values do. A first version of this
+    /// gate used a fixed thousand and stayed green with the indexing
+    /// removed.
     ///
     /// The bound is deliberately loose — three times, not two — because
     /// the promotion from scan to set costs a constant that is visible at
@@ -4787,19 +4803,29 @@ mod timestamp_run_cost {
     /// times.
     #[test]
     fn a_long_timestamp_run_costs_no_more_than_linear() {
-        for distinct in [1usize, 2, 1_000] {
-            let a = reads_for(10_000, distinct);
-            let b = reads_for(20_000, distinct);
+        /// Every sample carries a different value, so the run the scan
+        /// would walk grows with the input.
+        const ALL_DISTINCT: usize = 0;
+        for distinct in [ALL_DISTINCT, 1usize, 2, 1_000] {
+            let at = |n: usize| {
+                if distinct == ALL_DISTINCT {
+                    n
+                } else {
+                    distinct
+                }
+            };
+            let a = examined_for(10_000, at(10_000));
+            let b = examined_for(20_000, at(20_000));
             assert!(
                 b <= a * 3,
-                "distinct={distinct}: {a} reads for 10,000 samples and {b} for \
-                 20,000 — doubling the run more than tripled the work"
+                "distinct={distinct}: {a} samples examined for 10,000 and {b} \
+                 for 20,000 — doubling the run more than tripled the work"
             );
-            let c = reads_for(40_000, distinct);
+            let c = examined_for(40_000, at(40_000));
             assert!(
                 c <= a * 6,
-                "distinct={distinct}: {a} reads for 10,000 samples and {c} for \
-                 40,000"
+                "distinct={distinct}: {a} samples examined for 10,000 and {c} \
+                 for 40,000"
             );
         }
     }
@@ -4809,31 +4835,36 @@ mod timestamp_run_cost {
     #[test]
     fn print_the_timestamp_run_cost() {
         for n in [10_000usize, 20_000] {
-            let reads = reads_for(n, n / 2);
-            println!("issue #494 timestamp-run cost: n={n} value_reads={reads}");
+            let examined = examined_for(n, n / 2);
+            println!("issue #494 timestamp-run cost: n={n} samples_examined={examined}");
         }
     }
 
+    /// The wall-clock figures, for the record. `#[ignore]` because a timing
+    /// is not a gate on a shared machine —
+    /// `a_long_timestamp_run_costs_no_more_than_linear` is the gate, and it
+    /// counts rather than times.
     #[test]
     #[ignore]
-    fn zz_timing() {
+    fn the_wall_clock_figures_for_the_record() {
         for n in [10_000usize, 20_000] {
-            let floats: Vec<CountedFloat> = (0..n)
-                .map(|i| CountedFloat {
+            let floats: Vec<SampleRow> = (0..n)
+                .map(|i| SampleRow {
+                    fingerprint: Fingerprint::from_raw(1),
                     unix_milli: 1,
                     value: i as f64,
                 })
                 .collect();
             let mut out = Vec::new();
             let mut run = RunDedup::default();
-            READS.with(|c| c.set(0));
+            RUN_SAMPLES_EXAMINED.with(|c| c.set(0));
             let t = std::time::Instant::now();
-            emit_timestamp_run::<CountedFloat, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
-                .unwrap();
+            emit_timestamp_run::<SampleRow, HistSampleRow>(&mut out, 1, &floats, &[], &mut run)
+                .expect("float-only run");
             let elapsed = t.elapsed();
             println!(
-                "TIMING n={n} elapsed={elapsed:?} comparisons={}",
-                READS.with(Cell::get) - n as u64
+                "TIMING n={n} elapsed={elapsed:?} samples_examined={}",
+                RUN_SAMPLES_EXAMINED.with(Cell::get)
             );
         }
     }
