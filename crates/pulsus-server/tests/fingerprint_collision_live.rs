@@ -908,6 +908,14 @@ async fn the_recorded_colliding_pairs_answer_as_two_streams_and_two_series() {
     // consequence. No restart: the stream row is already there and this
     // state is about the sample, which a plain `MergeTree` stores twice.
     // `A`'s line count must not move while `B`'s doubles.
+    //
+    // Issue #494 does not change this, and the reason is worth stating
+    // rather than leaving to be rediscovered: the suppression added there
+    // matches a WHOLE push by its content, and this third push is not a
+    // repeat of either earlier one. The first body carries streams A and B
+    // together; this one carries B alone. Two different pushes, so two
+    // different identities, so nothing is suppressed and the second row is
+    // still written.
     let res = http_request(
         ANSWERS_PORT,
         "POST",
