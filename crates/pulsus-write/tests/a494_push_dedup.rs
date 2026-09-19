@@ -692,6 +692,72 @@ async fn the_flush_task_drives_the_index_tick() {
     assert_eq!(index.snapshot().unknown_total, 1);
 }
 
+/// **The window is a real one, through the writer.** A body pushed twice
+/// inside `PULSUS_INGEST_DEDUP_WINDOW` stores one copy; the same body
+/// pushed again after the window has elapsed stores a second, because it
+/// is a new push and not a retry of anything the writer still remembers.
+///
+/// ```text
+///   t = 0s    push, push        1 copy stored — the second is suppressed
+///   t = 61s   push              2 copies stored — the window elapsed
+/// ```
+///
+/// The clock is the runtime's, advanced rather than waited out: the
+/// shipped default window is five minutes and the smallest accepted one is
+/// a second, and neither is something a test should sit through. The
+/// window here is sixty seconds, far enough above the flush task's 200 ms
+/// cadence that the auto-advance between the two early pushes cannot
+/// cross it.
+#[tokio::test(start_paused = true)]
+async fn a_push_after_the_window_elapses_is_stored_again() {
+    let window = Duration::from_secs(60);
+    let cfg = WriterConfig {
+        ingest_dedup_window: pulsus_config::HumanDuration(window),
+        ..eager()
+    };
+    let samples = MockInserter::new(Behavior::Ok);
+    let writer = writer_with(cfg, samples.clone(), MockInserter::new(Behavior::Ok));
+
+    for _ in 0..2 {
+        let wait = writer
+            .admit_flush(
+                batch(80, "inside the window", T, true),
+                PushHeaders::default(),
+            )
+            .expect("queue has room");
+        wait.await.expect("the flush settles");
+    }
+    assert_eq!(
+        samples.rows_inserted(),
+        1,
+        "inside the window the retry stores nothing"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
+
+    tokio::time::sleep(window + Duration::from_secs(1)).await;
+    // The flush task drives `tick`, which is what drops the expired claim.
+    tokio::task::yield_now().await;
+
+    let wait = writer
+        .admit_flush(
+            batch(80, "inside the window", T, true),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
+    wait.await.expect("the flush settles");
+    assert_eq!(
+        samples.rows_inserted(),
+        2,
+        "past the window the same body is a new push and is stored"
+    );
+    assert_eq!(
+        writer.metrics().dedup.duplicate_pushes_total,
+        1,
+        "and nothing was suppressed the second time"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+}
+
 // ---------------------------------------------------------------------
 // Criterion 18 — the keyed wait has no check-then-wait window
 // ---------------------------------------------------------------------

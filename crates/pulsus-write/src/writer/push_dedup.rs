@@ -1645,6 +1645,57 @@ mod tests {
         assert_eq!(d.lock().waiter_charge, 0);
     }
 
+    /// **Settling an already-terminal claim changes nothing.** A target
+    /// that reports twice — a disposal path that settles and then a ticket
+    /// that drops, a retry of a flush — must not deliver a second outcome,
+    /// must not move the claim's state, and must not touch the waiter
+    /// charge. The charge belongs to the guard, so it stays until the
+    /// guard drops however many times settlement runs.
+    #[tokio::test]
+    async fn settling_an_already_terminal_claim_is_a_no_op() {
+        let d = index();
+        let id = identity(42);
+        let Admission::Admit(mut guard) = admit(&d, id) else {
+            panic!("must admit");
+        };
+        guard.note_target(true);
+        guard.seal();
+
+        let Some(WaitStart::Registered { guard: g, rx }) = d.begin_wait(id.key) else {
+            panic!("must register");
+        };
+
+        d.settle_target(id.key, TargetOutcome::Committed, true);
+        // Two more reports, one of them contradicting the first.
+        d.settle_target(id.key, TargetOutcome::Committed, true);
+        d.settle_target(id.key, TargetOutcome::NotCommitted, true);
+
+        assert_eq!(
+            rx.await.expect("exactly one outcome is delivered"),
+            ClaimOutcome::Ok,
+            "the first settlement decided the answer and the later ones did not"
+        );
+        assert!(
+            matches!(
+                d.begin_wait(id.key),
+                Some(WaitStart::Settled(ClaimOutcome::Ok))
+            ),
+            "and the claim is still CONFIRMED with the original's outcome"
+        );
+        assert_eq!(
+            d.snapshot().mixed_outcome_total,
+            0,
+            "a repeat is not a disagreement between targets"
+        );
+        assert_eq!(
+            d.lock().waiter_charge,
+            WAITER_CHARGE_BYTES,
+            "settlement never releases the charge, however often it runs"
+        );
+        drop(g);
+        assert_eq!(d.lock().waiter_charge, 0, "the guard releases it, once");
+    }
+
     #[test]
     fn settling_then_dropping_releases_the_charge_exactly_once() {
         let d = index();
@@ -1755,13 +1806,24 @@ mod tests {
         assert_eq!(d.snapshot().shed_total, 0);
     }
 
-    #[test]
-    fn a_claim_is_forgotten_once_its_window_elapses() {
-        let d = PushDedup::new(
-            16 * 1024 * 1024,
-            Duration::from_millis(0),
-            Duration::from_secs(120),
-        );
+    /// A settled claim is forgotten once its window elapses, and the
+    /// window is a **real one**: sixty seconds, crossed by advancing the
+    /// runtime clock rather than by configuring the window to zero.
+    ///
+    /// A zero window proves nothing about expiry — every claim is already
+    /// past it at the first `tick`, so a build that never compared the
+    /// window to anything would pass. The three instants below are the
+    /// test:
+    ///
+    /// ```text
+    ///   t = 0s    admit, seal, settle          the claim is remembered
+    ///   t = 59s   tick, retry                  SUPPRESSED
+    ///   t = 61s   tick, retry                  ADMITTED
+    /// ```
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_is_forgotten_once_its_window_elapses() {
+        let window = Duration::from_secs(60);
+        let d = PushDedup::new(16 * 1024 * 1024, window, Duration::from_secs(120));
         let id = identity(61);
         let Admission::Admit(mut guard) = admit(&d, id) else {
             panic!("must admit");
@@ -1769,10 +1831,50 @@ mod tests {
         guard.note_target(true);
         guard.seal();
         d.settle_target(id.key, TargetOutcome::Committed, true);
+
+        tokio::time::sleep(window - Duration::from_secs(1)).await;
+        d.tick();
+        assert!(
+            is_suppressed(&admit(&d, id)),
+            "one second inside the window, the retry is still suppressed"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
         d.tick();
         assert!(
             matches!(admit(&d, id), Admission::Admit(_)),
-            "a byte-identical push after the window is a new push"
+            "one second past the window, a byte-identical push is a new push"
+        );
+    }
+
+    /// The claim is dropped by the window sweep itself, not merely
+    /// re-admitted over: an expired claim leaves the table, so the
+    /// capacity it occupied comes back.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_claim_releases_its_slot() {
+        let window = Duration::from_secs(60);
+        let d = PushDedup::new(
+            pulsus_config::INGEST_DEDUP_MAX_BYTES_FLOOR,
+            window,
+            Duration::from_secs(120),
+        );
+        let capacity = d.capacities().claims;
+        for i in 0..capacity as u128 {
+            let Admission::Admit(mut guard) = admit(&d, identity(i)) else {
+                panic!("claim {i} must admit");
+            };
+            guard.note_target(true);
+            guard.seal();
+        }
+        // Every claim is open, so nothing is evictable and the table is
+        // full: the next admission sheds.
+        assert!(matches!(admit(&d, identity(u128::MAX)), Admission::Shed));
+
+        tokio::time::sleep(window + Duration::from_secs(1)).await;
+        d.tick();
+        assert!(
+            matches!(admit(&d, identity(u128::MAX)), Admission::Admit(_)),
+            "the window sweep freed the slots, so a new push fits"
         );
     }
 
