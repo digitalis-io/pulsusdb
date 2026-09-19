@@ -711,18 +711,9 @@ fn composite(case: &Case) -> String {
         "\n== phase2 hydration (sample batch) ==\n{}\n",
         plan.hydration_sql_for(&BATCH)
     ));
-    for field_idx in 0..plan.agg_fields_len() {
-        out.push_str(&format!(
-            "\n== phase2 aggregate values[{field_idx}] ==\n{}\n",
-            plan.agg_values_sql_for(field_idx, &BATCH)
-        ));
-    }
-    for field_idx in 0..plan.select_attrs_len() {
-        out.push_str(&format!(
-            "\n== phase2 select values[{field_idx}] ==\n{}\n",
-            plan.select_values_sql_for(field_idx, &BATCH)
-        ));
-    }
+    // Issue #558: the aggregate and `select()` value reads are gone —
+    // the value, its numeric reading and its stored kind are projected
+    // slots on the hydration statement above.
     // Issue #351: the multi-valued event/link SET co-loads, only when a
     // leaf compares one against another field.
     for set_idx in 0..plan.event_sets_len() {
@@ -812,7 +803,7 @@ fn worked_example_pins_the_documented_fragments() {
         "arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) \
          AS pi0"
     ));
-    assert!(hydration.contains("[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_probe"));
+    assert!(hydration.contains("[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_slot"));
     assert!(
         hydration.contains("LIMIT 10001 BY trace_id"),
         "the per-trace overflow probe (MAX_SPANS_PER_TRACE + 1)"
@@ -1773,7 +1764,7 @@ fn plan_of(q: &str) -> SearchPlan {
 /// The aliases one statement's SELECT list emits, in order.
 ///
 /// **The splitter tracks `(` and `[` together.** A probe projection is
-/// `[a, b] AS attr_probe` — a comma inside brackets at paren depth zero —
+/// `[a, b] AS attr_slot` — a comma inside brackets at paren depth zero —
 /// so the paren-only splitter this is modelled on
 /// (`crates/pulsus-read/src/logql/sql.rs`'s
 /// `the_bucketed_row_type_is_named_for_the_statements_own_columns`) would
@@ -1903,10 +1894,14 @@ fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
     let array_of = |alias: &str| -> Vec<String> {
         let line = sql
             .lines()
-            .find(|l| l.trim_end_matches(',').ends_with(&format!("] AS {alias}")))
+            .find(|l| l.trim_end_matches(',').ends_with(&format!(" AS {alias}")))
             .unwrap_or_else(|| panic!("no {alias} column:\n{sql}"));
-        let inner = line
-            .trim()
+        // `attr_slot_num` is wrapped — `CAST([…] AS Array(Nullable(Float64)))`
+        // — because an all-`NULL` literal types as
+        // `Array(Nullable(Nothing))`, which does not decode. The other
+        // three are the bare array literal.
+        let body = line.trim().trim_start_matches("CAST(");
+        let inner = body
             .trim_start_matches('[')
             .split_once("] AS ")
             .expect("an array column")
@@ -1928,7 +1923,12 @@ fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
         items.push(inner[start..].trim().to_string());
         items
     };
-    for alias in ["attr_probe", "attr_probe_val", "attr_probe_type"] {
+    for alias in [
+        "attr_slot",
+        "attr_slot_val",
+        "attr_slot_type",
+        "attr_slot_num",
+    ] {
         assert_eq!(
             array_of(alias).len(),
             p.probes_len(),
@@ -1936,19 +1936,111 @@ fn a_mixed_probe_plan_fills_every_array_slot_by_probe_index() {
         );
     }
     assert_eq!(
-        array_of("attr_probe_val")[1],
+        array_of("attr_slot_val")[1],
         "''",
         "the non-fusing probe's value slot is the literal empty string:\n{sql}"
     );
     assert_eq!(
-        array_of("attr_probe_type")[1],
+        array_of("attr_slot_type")[1],
         "''",
         "the non-fusing probe's kind slot is the literal empty string:\n{sql}"
     );
     assert_ne!(
-        array_of("attr_probe_val")[0],
+        array_of("attr_slot_val")[0],
         "''",
         "the fusing probe's value slot reads the located element"
+    );
+}
+
+/// Issue #558 — **a field slot's value, its numeric reading and its kind
+/// subscript ONE alias.**
+///
+/// The failure this is against is the one criterion 3 asserts end to end:
+/// a span whose two elements carry different kinds must never render one
+/// element's value with the other's kind. At the SQL level that is the
+/// statement reading all three from the same `arrayFirstIndex` alias.
+///
+/// A `by()` key is interned into BOTH the `select()` and the aggregate
+/// vector, so this query plans one of each for the same field and the two
+/// slots read two aliases — `fs0` and `fa0` — each internally consistent.
+#[test]
+fn a_field_slots_value_number_and_kind_subscript_the_same_alias() {
+    let p = plan_of(r#"{ } | by(span.k)"#);
+    assert_eq!(p.select_attrs_len(), 1, "one select slot for the by() key");
+    assert_eq!(p.agg_fields_len(), 1, "one agg slot for the same key");
+    let sql = p.hydration_sql_for(&BATCH);
+    assert!(
+        sql.contains(
+            "arrayFirstIndex((k, s) -> k = 'k' AND s = 'span', attr_key, attr_scope) AS fs0"
+        ) && sql.contains(
+            "arrayFirstIndex((k, s) -> k = 'k' AND s = 'span', attr_key, attr_scope) AS fa0"
+        ),
+        "both slots locate the element with their own alias:\n{sql}"
+    );
+    // The TEXT slot reads `attr_val[fs0]` and `attr_type[fs0]` and puts
+    // `NULL` in the numeric array; the NUMBER slot reads `attr_num[fa0]`
+    // and `attr_type[fa0]` and puts `''` in the value array. Neither ever
+    // crosses to the other's alias.
+    assert!(
+        sql.contains(
+            "[if(length(attr_val[fs0]) <= 8192, attr_val[fs0], \
+                      substringUTF8(attr_val[fs0], 1, 2048)), ''] AS attr_slot_val"
+        ),
+        "the value array reads the select slot's alias and nothing else:\n{sql}"
+    );
+    assert!(
+        sql.contains("[attr_type[fs0], attr_type[fa0]] AS attr_slot_type"),
+        "each slot's kind comes from ITS OWN alias:\n{sql}"
+    );
+    assert!(
+        sql.contains("CAST([NULL, attr_num[fa0]] AS Array(Nullable(Float64))) AS attr_slot_num"),
+        "the numeric array reads the aggregate slot's alias, and is CAST because an \
+         all-NULL literal types as Array(Nullable(Nothing)):\n{sql}"
+    );
+}
+
+/// Issue #558 — **the event/link value statement expands the RETAINED
+/// rows, and nothing else.**
+///
+/// The hazard, measured: expanding the whole window returns values for
+/// spans the search never evaluated, and on one trace of 10,002 stored
+/// spans that meant 10,002 values where the reader evaluated 10,000 — a
+/// false refusal at a 10,000-row result cap. The subquery carries the
+/// hydration statement's own `ORDER BY` and per-trace cap, WITHOUT the
+/// `+ 1` overflow probe row the reader discards.
+///
+/// That identity is also what makes the pre-expansion bound exact: the
+/// widths the hydration statement returned sum to this statement's
+/// physical row count.
+#[test]
+fn the_event_set_statement_expands_only_the_rows_the_reader_retained() {
+    let p = plan_of(r#"{ name != event:name }"#);
+    assert_eq!(p.event_sets_len(), 1, "one event set");
+    let sql = p.event_set_sql_for(0, &BATCH);
+    let hydration = p.hydration_sql_for(&BATCH);
+    assert!(
+        sql.contains(
+            "FROM (\n  SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n  \
+                      FROM trace_spans\n"
+        ),
+        "the expansion sits over a subquery of the SPAN table:\n{sql}"
+    );
+    assert!(
+        sql.contains(
+            "\n  ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n  \
+                      LIMIT 10000 BY trace_id\n)"
+        ),
+        "the subquery carries the hydration statement's ordering and its per-trace cap \
+         WITHOUT the overflow probe row:\n{sql}"
+    );
+    assert!(
+        hydration.contains("LIMIT 10001 BY trace_id"),
+        "the hydration statement keeps the `+ 1` probe, which is why the two differ by \
+         exactly one row per trace:\n{hydration}"
+    );
+    assert!(
+        !sql.contains("trace_attrs_idx"),
+        "the set no longer reads the attribute index at all:\n{sql}"
     );
 }
 
@@ -2019,7 +2111,7 @@ fn every_numeric_probe_arm_is_wrapped_against_a_null_element() {
         let sql = plan_of(q).hydration_sql_for(&BATCH);
         let probe_line = sql
             .lines()
-            .find(|l| l.contains("] AS attr_probe"))
+            .find(|l| l.contains("] AS attr_slot"))
             .unwrap_or_else(|| panic!("{q}: no probe column:\n{sql}"));
         let numeric_reads = probe_line.matches("attr_num[").count();
         assert!(numeric_reads > 0, "{q}: no numeric arm rendered:\n{sql}");

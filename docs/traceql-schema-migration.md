@@ -37,6 +37,18 @@ product ships with. §8 says what that means in practice.
                          digest; §7 lists what is not measured, including the figures
                          whose corpus is not published
 
+**2026-09-18, issue #558 — one part of what this document proposes has shipped, and
+this record is left as it was written.** The `select()`, aggregate and `by()` value
+reads named throughout §4 are gone: the value, its numeric reading and its stored kind
+are three projected expressions on the batch hydration statement, subscripted at one
+located element of the span row's own arrays. `event_set_sql` moved to `trace_spans`
+too, though not as this document's `ARRAY JOIN` row predicts — it expands with
+`arrayJoin` over a subquery carrying the hydration statement's own ordering and
+per-trace cap, so it returns exactly the rows the reader retained. Every line number
+and every quoted range below is pinned at the revision named above and is not
+re-pointed; `docs/query-lowering.md` and `docs/query-to-sql.md` are the records kept
+current.
+
 ---
 
 ## 0. The change in one page

@@ -992,6 +992,248 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
     );
 }
 
+/// Asserts that the attribute index and the span row hold the same
+/// attributes, for **every trace in `db`** (issue #558).
+///
+/// # Why a live suite needs this
+///
+/// A TraceQL search generates its candidates from `trace_attrs_idx` and
+/// then reads the value out of `trace_spans`'s own attribute arrays. A
+/// fixture that writes only one of the two stores produces a candidate
+/// that matches nothing, or a value read that finds nothing — a defect in
+/// the FIXTURE that reads exactly like a defect in the code.
+///
+/// **It takes no trace-id list, and that is the point.** It reads the
+/// WHOLE database, so a fixture cannot be left out of it by a caller that
+/// forgot to name its ids. The only way past it is to seed after the last
+/// call, which is why each target calls it as the last thing it does
+/// before dropping its database.
+///
+/// **The subset this was written for, stated exactly.** Thirteen raw
+/// `INSERT INTO … trace_attrs_idx` statements in the three LIVE SEARCH
+/// fixtures issue #558 touched — `traces_search_explain.rs` (7),
+/// `traces_search_pushdown_live.rs` (5) and `query_log_gates.rs` (1) —
+/// named no `val_type`, so it took the catalog default `''`
+/// (`crates/pulsus-schema/src/catalog.rs`) while the span row beside it
+/// stored one of the writer's four spellings. Issue #558 made the kind a
+/// response renders come from the span row, so the two stores disagreeing
+/// became an answer difference rather than a latent one.
+///
+/// **That is not the repository's whole set, and here is the whole set.**
+/// Measured with
+/// `git grep -n 'INSERT INTO .*trace_attrs_idx' <rev> -- '*.rs'`, excluding
+/// this file (Git 2.53.0, GNU grep 3.12 by explicit path): **27 statements
+/// at this branch's head and 26 at its base `4ebb3e48`** — the one added
+/// is the retained-row event-set fixture. Every site at the head, by
+/// file, from that same search:
+///
+/// ```text
+///   1  crates/pulsus-read/tests/compare_arity_differential.rs
+///   1  crates/pulsus-read/tests/query_log_gates.rs            <- covered
+///   3  crates/pulsus-read/tests/traces_metrics_explain.rs
+///   2  crates/pulsus-read/tests/traces_metrics_live.rs
+///   1  crates/pulsus-read/tests/traces_metrics_nested_set_live.rs
+///   7  crates/pulsus-read/tests/traces_search_explain.rs      <- covered
+///   6  crates/pulsus-read/tests/traces_search_pushdown_live.rs <- covered
+///   1  crates/pulsus-read/tests/traces_tags_explain.rs
+///   3  crates/pulsus-schema/tests/live_traces.rs
+///   1  xtask/src/bench/traces_lowering.rs
+///   1  xtask/src/bench/traces_read.rs
+/// ```
+///
+/// So the uncovered classes are **five**, not three: the `compare()`
+/// arity differential, the trace-metrics fixtures, the trace-tags
+/// fixtures, the schema live suite, and the two benchmark modules. None of
+/// them reads the span row's attribute arrays, which is why nothing here
+/// covers them; a fixture author on any of those paths gets no help from
+/// this helper.
+///
+/// # What it checks
+///
+/// **1. The two stores hold the same DISTINCT elements**, both ways: one
+/// `EXCEPT` for elements the index holds and the span row does not, one
+/// for the reverse, over
+/// `(trace_id, span_id, key, scope, val, val_type, val_num)`. A missing
+/// element and an extra one are distinguished, and the panic prints the
+/// differing rows.
+///
+/// **2. No span row's arrays hold the same element twice.** That is a
+/// separate assertion because **check 1 compares DISTINCT tuples on both
+/// sides**, so it answers a question about SETS and cannot see
+/// multiplicity in either direction. That is a property of the
+/// comparison, not of the store.
+///
+/// Check 1 is distinct because index-side duplicates are real and
+/// deliberate: an at-least-once REPLAY writes the index rows twice to
+/// reproduce what a `ReplacingMergeTree` read without `FINAL` sees, and
+/// repetition there is inert for every index read (the phase-1 generator
+/// aggregates under `GROUP BY trace_id`; the metrics and tag reads use
+/// `IN`/`DISTINCT`).
+///
+/// **What the index store actually does, measured rather than reasoned**
+/// (ClickHouse 26.3.29.7):
+///
+/// * `trace_attrs_idx` is ordered by
+///   `(key, val, scope, timestamp_ns, trace_id, span_id)`, which covers
+///   **five of the seven columns check 1 compares**. `val_type` and
+///   `val_num` are outside it — `system.columns` reports
+///   `is_in_sorting_key = 0` for both.
+/// * **Duplicate index rows are visible until a merge.** With merges
+///   stopped, two identical inserts read `2` raw and `1` under `FINAL`.
+///   An earlier revision of this comment said the store "cannot represent
+///   a duplicate at all"; that is false, and the replay corpora depend on
+///   it being false.
+/// * After a merge, two rows identical on those five columns collapse to
+///   one even when they differ in `val_type`/`val_num`, and the survivor
+///   is decided by insertion order: a `string` row followed by an `int`
+///   row leaves `int`. So the index cannot be trusted to hold two
+///   different KINDS for one element either.
+///
+/// **And span-side multiplicity is response-affecting**, which is why it
+/// is checked rather than described. The event/link value-set WIDTH is
+/// `arrayCount` over `(attr_key, attr_scope)` — it counts array ELEMENTS —
+/// and the reader compares that sum against
+/// `reader.traceql_event_set_max_values` before expanding anything. A span
+/// row holding one event element twice therefore raises the width by one
+/// and can turn a search into `422` while both stores hold the same SET.
+/// Checked per ROW with `arrayDistinct(arrayZip(…))` rather than by
+/// grouping across rows, so an at-least-once redelivery of the whole span
+/// row — two rows carrying identical arrays — is not mistaken for a
+/// duplicated element inside one row.
+///
+/// # What it still cannot check
+///
+/// **Array ORDER.** `trace_attrs_idx` carries no element ordinal, so the
+/// index cannot say what order a span's attributes were written in, and no
+/// comparison against it can check the order that decides which element is
+/// "first". A fixture that needs order asserts it by the expected value
+/// instead.
+///
+/// **Index-side multiplicity.** An at-least-once REPLAY writes the index
+/// rows twice on purpose, to reproduce what a `ReplacingMergeTree` read
+/// without `FINAL` sees, so check 1 compares DISTINCT tuples. Repetition
+/// on that side is inert for every index read: the phase-1 generator
+/// aggregates with `GROUP BY trace_id`, and the metrics and tag reads use
+/// `IN`/`DISTINCT`.
+///
+/// `db` is a database name composed into SQL, so it must come from the
+/// suite's own fixtures and never from anything a user supplies — this is
+/// test support, not a query builder.
+pub fn assert_stores_agree(db: &str) {
+    let index_side = format!(
+        "SELECT DISTINCT trace_id, span_id, key, scope, val, val_type, val_num \
+         FROM {db}.trace_attrs_idx"
+    );
+    let span_side = format!(
+        "SELECT DISTINCT trace_id, span_id, k, s, v, t, n FROM {db}.trace_spans \
+         ARRAY JOIN attr_key AS k, attr_scope AS s, attr_val AS v, attr_type AS t, attr_num AS n"
+    );
+    let sql = format!(
+        "SELECT 'index_only' AS side, * FROM ({index_side} EXCEPT {span_side}) \
+         UNION ALL \
+         SELECT 'span_only', * FROM ({span_side} EXCEPT {index_side}) \
+         FORMAT TSV"
+    );
+    let body = clickhouse_query(&sql);
+    assert!(
+        body.trim().is_empty(),
+        "the attribute index and the span row disagree in {db}. Rows below are \
+         `side, trace_id, span_id, key, scope, val, val_type, val_num`; `index_only` means the \
+         index holds an element the span row does not, `span_only` the reverse. A search \
+         generates candidates from the index and reads the value from the span row, so a \
+         fixture whose two stores disagree produces a candidate that matches nothing or a kind \
+         the response renders wrong:\n{body}"
+    );
+
+    // Check 2. Per ROW, so a replayed span row is not read as a duplicated
+    // element inside one row.
+    //
+    // **`attr_num` is `Nullable(Float64)` and a tuple holding a NULL does
+    // not compare equal to itself** — `x = y` is NULL there, and a NULL
+    // predicate inside `arrayCount` is false, so a count over the raw zip
+    // reports 0 for every element and finds nothing. The nullable member
+    // is rendered to a non-null string first, which makes both
+    // `arrayDistinct` and the equality well defined. Measured: without
+    // it, the row-selecting `WHERE` fired and the element column was
+    // empty, so the statement returned no rows at all.
+    let zip = "arrayZip(attr_key, attr_scope, attr_val, attr_type, \
+               arrayMap(x -> ifNull(toString(x), '<null>'), attr_num))";
+    let dupes = clickhouse_query(&format!(
+        "SELECT lower(hex(trace_id)) AS trace, lower(hex(span_id)) AS span, \
+                length(attr_key) AS elements, \
+                length(arrayDistinct({zip})) AS distinct_elements, \
+                arrayFilter(e -> arrayCount(y -> y = e, {zip}) > 1, \
+                            arrayDistinct({zip})) AS repeated \
+         FROM {db}.trace_spans \
+         WHERE length(attr_key) != length(arrayDistinct({zip})) \
+         FORMAT TSV"
+    ));
+    assert!(
+        dupes.trim().is_empty(),
+        "a span row in {db} holds the same attribute element more than once. Rows below are \
+         `trace, span, elements, distinct_elements, [the repeated elements]`. The two stores \
+         can still hold the same SET, and the check above compares DISTINCT tuples, so it \
+         cannot see this — but the event/link value-set width is `arrayCount` over these \
+         arrays, so the duplicate raises the width and can turn a search into `422` at the \
+         value budget:\n{dupes}"
+    );
+}
+
+/// Runs one statement against the ClickHouse this run's suites use and
+/// returns its body, panicking on any transport failure or non-200.
+///
+/// `PULSUS_TEST_CH_HOST` / `PULSUS_TEST_CH_HTTP_PORT`, the same pair every
+/// live suite reads, with the same defaults. `pub` since issue #558, for
+/// the suites that read `system.query_log` to say which statements a
+/// request sent.
+pub fn clickhouse_query(sql: &str) -> String {
+    let host = std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port = std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string());
+    let url = format!("http://{host}:{port}/");
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--max-time",
+            "60",
+            "--data-binary",
+            "@-",
+        ])
+        .arg(&url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(sql.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap_or_else(|e| panic!("curl {url} could not be run: {e}"));
+    assert!(
+        out.status.success(),
+        "curl {url} exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (payload, status) = body
+        .rsplit_once('\n')
+        .unwrap_or_else(|| panic!("curl {url} wrote no status line: {body:?}"));
+    assert_eq!(
+        status.trim(),
+        "200",
+        "ClickHouse answered HTTP {} for:\n{sql}\n{payload}",
+        status.trim()
+    );
+    payload.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -332,6 +332,14 @@ const ROWS: &[Row] = &[
         value: "12345",
         check: |c| c.reader.traceql_scan_budget_rows == 12_345,
     },
+    // Issue #558: the event/link value-set budget. Its boundary cases
+    // are the accepted floor and the accepted ceiling — `1` and
+    // 10,000,000 — and `validate.rs` rejects `0` and anything above.
+    Row {
+        var: "PULSUS_TRACEQL_EVENT_SET_MAX_VALUES",
+        value: "2500",
+        check: |c| c.reader.traceql_event_set_max_values == 2_500,
+    },
     Row {
         var: "PULSUS_TRACEQL_MAX_SERIES",
         value: "250",
@@ -442,8 +450,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        78,
-        "docs/configuration.md §§1-8 document exactly 78 variables"
+        79,
+        "docs/configuration.md §§1-8 document exactly 79 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

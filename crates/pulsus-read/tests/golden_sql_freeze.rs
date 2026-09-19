@@ -345,7 +345,7 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 2
 ///
 /// **Moved on issue #557: 45 of the 72 `traces_search` goldens changed
 /// and the other 27 are byte-identical. No file was added or removed**,
-/// so the entry count stays at 91 and
+/// so the entry count stays at 99 and
 /// [`the_sql_golden_corpus_has_exactly_its_committed_membership`] is
 /// green at its unchanged `99`.
 ///
@@ -375,13 +375,20 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 2
 /// pre-#557 statement byte for byte rather than a statement that merely
 /// looks the same.
 ///
+/// **2026-09-18, issue #558**: the three aliases quoted in the block
+/// above are what issue #557 rendered and are left as that record. They
+/// are spelled `attr_slot`, `attr_slot_val` and `attr_slot_type` at the
+/// head, because a slot is now a condition's probe, a projected field's
+/// locator or an event/link set's width, and `probe` named only the
+/// first of the three.
+///
 /// The `WHERE` clause, the `ORDER BY`, the `LIMIT … BY trace_id` and the
 /// `trace_id IN` restriction are untouched in all 45: the probe
 /// expressions are projections, so part and granule selection cannot
 /// move — `traces_search_explain.rs`'s
 /// `the_probe_columns_keep_the_hydration_reads_index_selection` gates
 /// that as an identity rather than leaving it as this sentence.
-const PINNED_SQL_CORPUS: u64 = 0x881c_4028_6497_a255;
+const PINNED_SQL_CORPUS: u64 = 0x761b_5084_8cc7_3957;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -558,7 +565,8 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 91 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 99 frozen SQL corpus entries — 98 SQL files and one JSON file — changed. This is \
+         not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \

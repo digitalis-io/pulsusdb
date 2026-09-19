@@ -315,14 +315,40 @@ re-decide from the evidence rather than re-derive it.
   | `{ event.code != "c3" }` | the evX/evY/evZ span and the no-`code` span | the c1/c2/c3 span | ALL-match against any-differs |
   | `{ event.code != "zz" }` | all three spans | the c1/c2/c3 span | our absent-key rule (`2026-07-16-negation-matches-missing-key`), reaching the event scope |
 
-  **Both rows are pending the issue
-  [#558](https://github.com/digitalis-io/pulsusdb/issues/558) ruling**, and
-  say so in the assertion's own message. #558's criterion 4 asks for the
-  opposite answer on the first of them and calls it the rule already in
-  the tree, which the shipped
-  `regex-all-match-excludes-the-span-with-a-matching-event` contradicts.
-  A later change there is an application of that ruling, not a regression
-  here.
+  **Ruled on 2026-09-18: today's answer stands, and the BASIS is what
+  changed.** `!=` and `!~` on an event or link attribute are all-match — a
+  span is returned only when none of its events satisfies the positive
+  condition, and a span carrying no such key is returned.
+
+  ```text
+    span emits three events
+      event.level = "info"     connection acquired
+      event.level = "warn"     slow query
+      event.level = "error"    query failed
+
+    { event.level != "error" }
+      ours       span not returned   -- it errored
+      reference  span returned       -- "info" and "warn" are not "error"
+  ```
+
+  Under the reference's reading a span that errored comes back when the
+  query asked for spans that did not, and any span with two or more events
+  always carries something that differs — which makes it impossible to
+  filter out spans holding a particular event. That is the ordinary use of
+  a negated condition, so we are correct here and the reference is not.
+
+  The 2026-08-05 ruling said all-match was the reference's own designed
+  multi-value rule. Measurement at the pinned digest shows it is not, for
+  the **attribute-versus-literal** form: the rule cited there is the
+  reference's ARRAY rule, and its event/link attribute path does not apply
+  it. **The correction is scoped to that form** — the field-versus-field
+  entry `traceql-event-link-operand-any-match` above keeps its measured
+  rows and its own no-events sentence, because the reference behaves
+  differently there.
+
+  The second row's basis is unchanged: it is our absent-key rule
+  (`2026-07-16-negation-matches-missing-key`) reaching the event scope,
+  and the reference does not return spans with no events in this form.
 
 - **One reading withdrawn.** An earlier revision recorded that the
   reference answers `{ event:timeSinceStart > 0 }` with nothing on this
@@ -1010,15 +1036,25 @@ when we are asking it to slow down, so we keep `429`; recorded as
   instrumentation. One value per span per attribute, and **every** operation
   uses it — the filter, the negation, `select()`, `avg()` and a `by()` key.
 
-- **Status, by operation.** Issue #557 shipped the rule for the phase-2
-  CONDITION and for the value a matching condition projects (issue #479's
-  fused value): both read the element `arrayFirstIndex` over the span row's
-  `(attr_key, attr_scope)` arrays lands on. The independent value reads —
-  `select()`, `avg()`, and a `by()` key — still go to `trace_attrs_idx` and
-  still take whichever row the aggregate reaches; issue
-  [#558](https://github.com/digitalis-io/pulsusdb/issues/558) is the part that
-  moves them. Until it lands, `select(span.k)` on a span that repeats `k` may
-  render a different element from the one the condition matched.
+- **Status, by operation: shipped for all of them.** Issue #557 shipped the
+  rule for the phase-2 CONDITION and for the value a matching condition
+  projects (issue #479's fused value); issue
+  [#558](https://github.com/digitalis-io/pulsusdb/issues/558) shipped it for
+  the independent value reads — `select()`, the aggregates and a `by()` key.
+  Every one of them reads the element `arrayFirstIndex` over the span row's
+  `(attr_key, attr_scope)` arrays lands on, and the value, its numeric
+  reading and its stored kind all come from that one element.
+
+  **The answer this moved**, measured both ways: a span storing
+  `span.dup = 7` then `span.dup = 5` renders `7` under `select(span.dup)`,
+  is returned by `{ } | avg(span.dup) > 6`, and produces the single group
+  `7` under `by(span.dup)`. All four answered `5` before, because the value
+  read took `any(val)` / `any(val_num)` over a `GROUP BY` — arbitrary, and
+  not stable across merges. A span storing `span.n = "abc"` then
+  `span.n = 5` renders `{"stringValue":"abc"}` and is **not** returned by
+  `{ } | avg(span.n) > 0`: the element the rule resolves to has no numeric
+  value, where the old numeric read filtered on `isNotNull(val_num)` and so
+  saw the second element while the text read could see the first.
 
 - **The arity carve-out, which the rule above does not state on its own.**
   `span`, `resource` and `instrumentation` are maps: one entry per key per
@@ -1097,7 +1133,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   computed. **Its assertion does not move**; its doc comment does, and says the
   unscoped chain resolves to one element, span scope first.
 
-### `traceql-unscoped-attribute-scope-reach` (issue #557) — **we are wider than the reference, deliberately**
+### `traceql-unscoped-attribute-scope-reach` (issues #557, #558) — **we are wider than the reference, deliberately**
 
 - **What an unscoped condition reaches.** `{ .k = "x" }` resolves through the
   five attribute scopes in precedence order — span, resource, event, link,
@@ -1117,6 +1153,18 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `{ event:name = "evQ" }`. **This is a change of ours against our own
   pre-#557 answer**: the unscoped probe had no scope clause at all, so it
   reached every scope the writer emits, reserved ones included.
+
+- **Issue #558 extends the same chain to the unscoped VALUE reads**, and that
+  is an answer change the issue body does not name. `{ } | select(.name)` on a
+  span whose only stored `name` element sits at `event:intrinsic` returns the
+  trace with **no** `name` entry; before, it rendered
+  `{"key":"name","value":{"stringValue":"evQ"}}`, because the old value read
+  rendered no scope clause and `any()` reached every scope the key appeared at.
+  Measured both ways, and asserted by
+  `an_unscoped_value_read_skips_the_reserved_intrinsic_scopes`
+  (`crates/pulsus-server/tests/traces_search_live.rs`). The condition and the
+  value read now walk the same five-scope chain, so a value and a condition on
+  one unscoped name resolve to the same element.
 
 - **The evidence, measured on our side.** One span carrying one key at each of
   the five attribute scopes, plus one event named `evQ`, ingested through

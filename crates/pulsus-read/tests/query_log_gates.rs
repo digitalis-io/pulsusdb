@@ -1829,8 +1829,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         ),
         format!(
             "INSERT INTO {run_db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-             SELECT toDate({date_days}), 'http.status_code', '500', 'span', NULL, \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
+             SELECT toDate({date_days}), 'http.status_code', '500', 'span', 'int', 500., \
                     {ts_ns} + number, unhex('{trace_hex}'), \
                     reinterpretAsFixedString(toUInt64(number + 1)), 1000000 \
              FROM numbers(64)"
@@ -1844,6 +1845,13 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             .await
             .unwrap_or_else(|e| panic!("seed failed: {e}\nSQL:\n{sql}"));
     }
+    // Issue #558: the two stores must hold the same elements. Phase 1
+    // generates candidates from the index and phase 2 reads the value,
+    // its number and its stored kind off the span row, so a fixture whose
+    // two stores disagree produces a candidate that matches nothing, or a
+    // kind the response renders wrong — and either reads as a defect in
+    // the code rather than in the seed.
+    pulsus_testkit::assert_stores_agree(&run_db);
 
     let config = pulsus_read::TraceReadConfig {
         spans_table: "trace_spans".to_string(),
@@ -1851,6 +1859,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
         max_series: 1_000,
         generator_max_memory_bytes: MEM_CEILING,
         // The surface-wide ceiling under test. Set equal to the generator's

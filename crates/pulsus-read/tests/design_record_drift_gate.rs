@@ -1686,28 +1686,28 @@ enum ReviewedVerdict {
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2933",
+        "exec.rs:2995",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2933",
+        "exec.rs:2995",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2893-2899",
+        "exec.rs:2955-2961",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:719",
+        "exec.rs:782",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
@@ -2688,7 +2688,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 /// ```text
 ///   citing document        cites                 times   the cited line must carry
 ///   --------------------   -------------------   -----   -------------------------
-///   docs/query-to-sql.md   docs/schemas.md:835       2   never a `UNION ALL`
+///   docs/query-to-sql.md   docs/schemas.md:851       2   never a `UNION ALL`
 /// ```
 ///
 /// **The count is not decoration, and leaving it out was the same defect
@@ -2707,7 +2707,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 fn every_cross_document_line_citation_names_the_line_it_quotes() {
     const CROSS_DOC_CITATIONS: &[(&str, &str, usize, &str)] = &[(
         "docs/query-to-sql.md",
-        "docs/schemas.md:835",
+        "docs/schemas.md:851",
         2,
         "never a `UNION ALL`",
     )];

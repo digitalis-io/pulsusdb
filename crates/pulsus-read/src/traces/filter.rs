@@ -1150,7 +1150,7 @@ fn compile_attr_leaf(
     op: ComparisonOp,
     value: &Value,
 ) -> Result<CompiledLeaf, PlanError> {
-    compile_attr_probe_leaf(attr_scope_literal(scope), key, op, value)
+    compile_attr_slot_leaf(attr_scope_literal(scope), key, op, value)
 }
 
 /// The attribute-leaf core over an already-resolved `(scope_lit, key)` —
@@ -1160,7 +1160,7 @@ fn compile_attr_leaf(
 /// column. The value classification (string/bool eq, regex, numeric,
 /// duration, and their `!=`/`!~` absent-key negations) is identical either
 /// way — a span-event intrinsic is just a reserved-key attribute.
-fn compile_attr_probe_leaf(
+fn compile_attr_slot_leaf(
     scope_lit: Option<&'static str>,
     key: &str,
     op: ComparisonOp,
@@ -1650,9 +1650,9 @@ pub fn compile_leaf(
         // rather than the first element). Criterion 8's live assertions
         // freeze those answers.
         Field::Intrinsic(Intrinsic::EventName) => {
-            compile_attr_probe_leaf(Some(SCOPE_EVENT_INTRINSIC), EVENT_NAME_KEY, op, value)
+            compile_attr_slot_leaf(Some(SCOPE_EVENT_INTRINSIC), EVENT_NAME_KEY, op, value)
         }
-        Field::Intrinsic(Intrinsic::EventTimeSinceStart) => compile_attr_probe_leaf(
+        Field::Intrinsic(Intrinsic::EventTimeSinceStart) => compile_attr_slot_leaf(
             Some(SCOPE_EVENT_INTRINSIC),
             EVENT_TIME_SINCE_START_KEY,
             op,
@@ -1667,11 +1667,11 @@ pub fn compile_leaf(
         // lowercase-hex value rather than silently missing.
         Field::Intrinsic(Intrinsic::LinkSpanId) => {
             let value = lowercase_hex_literal(op, value);
-            compile_attr_probe_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_SPAN_ID_KEY, op, &value)
+            compile_attr_slot_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_SPAN_ID_KEY, op, &value)
         }
         Field::Intrinsic(Intrinsic::LinkTraceId) => {
             let value = lowercase_hex_literal(op, value);
-            compile_attr_probe_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_TRACE_ID_KEY, op, &value)
+            compile_attr_slot_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_TRACE_ID_KEY, op, &value)
         }
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {

@@ -180,13 +180,12 @@ fn section_source(
             .expect("one FROM per generator section");
         return Some(table.trim_end_matches("_dist").to_string());
     }
-    if section.starts_with("phase2 aggregate values[")
-        || section.starts_with("phase2 select values[")
-    {
-        return Some("trace_attrs_idx:values".to_string());
-    }
+    // Issue #558: `phase2 aggregate values[i]` and
+    // `phase2 select values[i]` are gone — a projected field's value, its
+    // numeric reading and its stored kind are slots on the hydration
+    // statement, so those links send no statement and render no section.
     if section.starts_with("phase2 event set[") {
-        return Some("trace_attrs_idx:event_sets".to_string());
+        return Some("trace_spans:event_sets".to_string());
     }
     match section {
         "phase2 hydration (sample batch)" => Some("trace_spans:hydration".to_string()),
@@ -298,9 +297,14 @@ fn the_generator_fan_out_exception_is_exactly_these_three() {
 /// on the hydration statement, so a query with one plans ONE FEWER SQL
 /// part. The three that moved are the ones carrying an attribute
 /// condition: `span.http.method = "GET"` twice, and the disjunction's
-/// second branch. `resource.service.name` is a physical column and plans
-/// no probe, and a `select()` field is a value read this change does not
-/// touch, so those three counts stand.
+/// second branch.
+///
+/// **Issue #558 moved the fifth.** `select(span.http.method)` used to
+/// send a value read against the attribute index; the value, its numeric
+/// reading and its stored kind are now three projected expressions on the
+/// hydration statement, subscripted at one located element, so that query
+/// plans 4 parts no longer — it plans 3, the same three every flat search
+/// sends: the generator, the hydration read, the winners' root read.
 const NAMED_QUERIES: [(&str, usize); 6] = [
     (r#"{ span.http.method = "GET" }"#, 3),
     (r#"{ span.http.method = "GET" } | max(duration) > 1s"#, 3),
@@ -314,7 +318,7 @@ const NAMED_QUERIES: [(&str, usize); 6] = [
     ),
     (
         r#"{ resource.service.name = "checkout" } | select(span.http.method)"#,
-        4,
+        3,
     ),
     (
         r#"{ resource.service.name = "checkout" || span.http.method = "GET" }"#,
@@ -431,9 +435,11 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
         let statements = plan.generator_sqls.len()
             + 1                                                 // hydration
             // Issue #557: the probes send NO statement — each is a
-            // predicate column on the hydration read above.
-            + plan.agg_fields_len()
-            + plan.select_attrs_len()
+            // predicate column on the hydration read above. Issue #558:
+            // nor do the aggregate and `select()` fields, whose value,
+            // number and kind are slots on that same statement. They
+            // stay on the LINK side of the identity below, because the
+            // chain still carries one link each.
             + plan.event_sets_len()
             + usize::from(plan.needs_trace_ctx())
             + usize::from(plan.needs_child_counts())
@@ -475,8 +481,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
     }
     assert_eq!(
         (total_statements, total_sections),
-        (251, 251),
-        "the committed corpus renders 251 statements and the plans account for all of them"
+        (235, 235),
+        "the committed corpus renders 235 statements and the plans account for all of them"
     );
     assert_eq!(
         preflight_cases,
@@ -538,7 +544,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
             *kinds.entry(kind).or_insert(0) += 1;
         }
     }
-    assert_eq!(total, 251, "the committed corpus renders 251 statements");
+    assert_eq!(total, 235, "the committed corpus renders 235 statements");
     assert_eq!(
         kinds.get("by() cardinality probe").copied().unwrap_or(0),
         1,
@@ -547,7 +553,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
     );
     assert_eq!(
         kinds.len(),
-        9,
+        7,
         "the section vocabulary this target maps: {kinds:?}"
     );
 }

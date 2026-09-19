@@ -120,6 +120,7 @@ fn engine_config(max_candidates: u64, generator_max_memory_bytes: u64) -> TraceR
         edges_table: "trace_edges".to_string(),
         max_candidates,
         scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
         max_series: 1_000,
         generator_max_memory_bytes,
         distributed: false,
@@ -354,8 +355,8 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
                 continue;
             }
             attrs.push(format!(
-                "(toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', NULL, \
-                 {ts}, unhex('{tid}'), unhex('{sid}'), {dur})",
+                "(toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', \
+                 'string', NULL, {ts}, unhex('{tid}'), unhex('{sid}'), {dur})",
                 ts = r.ts_ns,
                 tid = hex32(&trace_id(r.trace)),
                 sid = span_id(r.trace, r.span)
@@ -371,14 +372,27 @@ async fn seed(client: &ChClient, db: &str, rows: &[Seeded], attr_repeats: usize)
             exec(
                 client,
                 &format!(
-                    "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, \
-                     timestamp_ns, trace_id, span_id, duration_ns) VALUES {}",
+                    "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, \
+                     val_num, timestamp_ns, trace_id, span_id, duration_ns) VALUES {}",
                     chunk.join(", ")
                 ),
             )
             .await;
         }
     }
+    // Issue #558 criterion 13: the two stores must hold the same
+    // elements. Phase 1 generates candidates from the index and phase 2
+    // reads the value, its number and its stored kind off the span row,
+    // so a fixture whose two stores disagree produces a candidate that
+    // matches nothing, or a kind the response renders wrong — and either
+    // reads as a defect in the code rather than in the seed. Called
+    // inside the seeder, so a NEW caller cannot forget it.
+    //
+    // `assert_stores_agree` compares DISTINCT elements, which is what
+    // lets the replay pass above be covered too: that pass writes the
+    // index rows twice on purpose, and a multiset comparison would report
+    // the deliberate duplicate.
+    pulsus_testkit::assert_stores_agree(db);
 }
 
 /// One TraceQL query, the fragment it must compile to, and the predicate
@@ -565,6 +579,15 @@ fn read_lines(raw: &str) -> Vec<String> {
 /// is about 62 granules at the default `index_granularity` of 8,192, so a
 /// prefix predicate prunes to a strict subset and the test can tell a
 /// pruning statement from a scanning one.
+///
+/// **It writes the INDEX only, and that is why issue #558's
+/// `pulsus_testkit::assert_stores_agree` is not called on it.** Granule
+/// selection over `trace_attrs_idx` is the whole subject here; a matching
+/// `trace_spans` corpus would add 500,000 span rows that no assertion in
+/// this fixture reads. The two stores are asymmetric on purpose, so the
+/// comparison would report the asymmetry the fixture exists to create.
+/// Every fixture in this file that writes BOTH stores is checked, inside
+/// `seed` and `seed_u`.
 const G_METHOD_ROWS: u64 = 200_000;
 const G_DECOY_ROWS: u64 = 200_000;
 const G_K_ROWS: u64 = 100_000;
@@ -579,10 +602,10 @@ async fn seed_granule_corpus(client: &ChClient, db: &str, base_ns: i64) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, \
+                "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, val_num, \
                  timestamp_ns, trace_id, span_id, duration_ns) SELECT \
                    toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {G_STEP_NS})), \
-                   '{key}', '{val}', '{scope}', NULL, \
+                   '{key}', '{val}', '{scope}', 'string', NULL, \
                    {base_ns} + toInt64(number) * {G_STEP_NS}, \
                    toFixedString(unhex(leftPad(lower(hex(number % 100000)), 32, '0')), 16), \
                    toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -1057,6 +1080,15 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
 /// control query below fills its heap on the first batch and stops on the
 /// threshold rule instead of walking every candidate two statements at a
 /// time.
+///
+/// **The two stores are deliberately unequal — 1,000,000 index rows
+/// against 64 span rows — which is why issue #558's
+/// `pulsus_testkit::assert_stores_agree` is not called on it.** The
+/// subject is the phase-1 generator's `GROUP BY trace_id` state at a
+/// million distinct trace ids; seeding a million spans to match would
+/// measure something else and would take the corpus out of the size this
+/// gate can be run at. Every fixture in this file that writes both stores
+/// for the same spans is checked, inside `seed` and `seed_u`.
 const M1_ROWS: u64 = 1_000_000;
 const M1_SPANS: u64 = 64;
 const M1_STEP_NS: i64 = 1_000;
@@ -1077,10 +1109,10 @@ async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
     exec(
         client,
         &format!(
-            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, timestamp_ns, \
-             trace_id, span_id, duration_ns) SELECT \
+            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, val_num, \
+             timestamp_ns, trace_id, span_id, duration_ns) SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {M1_STEP_NS})), \
-               'http.method', 'GET', 'span', NULL, \
+               'http.method', 'GET', 'span', 'string', NULL, \
                {base_ns} + toInt64(number) * {M1_STEP_NS}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -1666,8 +1698,8 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
             r.name, r.service, r.duration_ns
         ));
         attrs.push(format!(
-            "(toDate(fromUnixTimestamp64Nano({ts})), 'http.method', 'GET', 'span', NULL, {ts}, \
-             unhex('{tid}'), unhex('{sid}'), {})",
+            "(toDate(fromUnixTimestamp64Nano({ts})), 'http.method', 'GET', 'span', 'string', \
+             NULL, {ts}, unhex('{tid}'), unhex('{sid}'), {})",
             r.duration_ns
         ));
     }
@@ -1688,14 +1720,27 @@ async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeat
             exec(
                 client,
                 &format!(
-                    "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, \
-                     timestamp_ns, trace_id, span_id, duration_ns) VALUES {}",
+                    "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, \
+                     val_num, timestamp_ns, trace_id, span_id, duration_ns) VALUES {}",
                     chunk.join(", ")
                 ),
             )
             .await;
         }
     }
+    // Issue #558 criterion 13: the two stores must hold the same
+    // elements. Phase 1 generates candidates from the index and phase 2
+    // reads the value, its number and its stored kind off the span row,
+    // so a fixture whose two stores disagree produces a candidate that
+    // matches nothing, or a kind the response renders wrong — and either
+    // reads as a defect in the code rather than in the seed. Called
+    // inside the seeder, so a NEW caller cannot forget it.
+    //
+    // `assert_stores_agree` compares DISTINCT elements, which is what
+    // lets the replay pass above be covered too: that pass writes the
+    // index rows twice on purpose, and a multiset comparison would report
+    // the deliberate duplicate.
+    pulsus_testkit::assert_stores_agree(db);
 }
 
 /// The eighteen (aggregate, operator) cells, and which six the six-cell
@@ -1953,10 +1998,11 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
     exec(
         &client,
         &format!(
-            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, timestamp_ns, \
-             trace_id, span_id, duration_ns) SELECT \
+            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, val_num, \
+             timestamp_ns, trace_id, span_id, duration_ns) SELECT \
                toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * 1000)), \
-               'http.method', 'GET', 'span', NULL, {base} + toInt64(number) * 1000, \
+               'http.method', 'GET', 'span', 'string', NULL, \
+               {base} + toInt64(number) * 1000, \
                toFixedString(unhex('{tid}'), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), 1000000000 \
              FROM numbers({CAP_SPANS})",
@@ -1964,6 +2010,9 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
         ),
     )
     .await;
+    // Issue #558 criterion 13: this corpus is seeded by hand rather than
+    // through `seed`, so the store-agreement check is called here.
+    pulsus_testkit::assert_stores_agree(db);
 
     let engine = TraceEngine::new(
         ChClient::new(conn(db)).await.expect("connect (engine)"),
@@ -2040,6 +2089,125 @@ async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
         vec![hex32(&trace_id(1))],
         "the trace the evaluator counts 10 000 spans in and the statement counts 10 002"
     );
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #558 — the event/link value statement expands the RETAINED rows
+// ---------------------------------------------------------------------
+
+/// **The value statement returns exactly the rows the reader evaluated.**
+///
+/// One trace of `MAX_SPANS_PER_TRACE + 2` spans, each carrying one event
+/// name. The hydration statement retains `MAX_SPANS_PER_TRACE` of them
+/// (its `+ 1` probe row is discarded), so the value statement must return
+/// `MAX_SPANS_PER_TRACE` rows and not 10 002.
+///
+/// **Why this identity and not a refusal threshold.** Expanding the whole
+/// window returns values for spans the search never evaluated, and the
+/// measured consequence was a false refusal: at a 10 000-row result cap
+/// the unconstrained shape answered code 396 where the retained-row shape
+/// answered 200 with exactly 10 000 rows. It is also what makes the
+/// pre-expansion bound EXACT rather than approximate — the widths the
+/// hydration statement returns sum to this statement's physical row
+/// count, which is the number the budget is compared against.
+///
+/// **Break:** remove the `LIMIT … BY trace_id` from the subquery in
+/// `search_sql::event_set_sql`; the row count below reads 10 002.
+#[tokio::test]
+async fn the_event_set_statement_returns_exactly_the_retained_rows() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_event_set_retained");
+    let client = fresh_db(db).await;
+    /// Two more than `exec::MAX_SPANS_PER_TRACE`, the narrowest
+    /// separation this mechanism admits: one more span would be inside
+    /// the `+ 1` overflow probe.
+    const CAP_SPANS: u64 = 10_002;
+    const RETAINED: u64 = 10_000;
+    let base = now_ns() - (CAP_SPANS as i64) * 1_000 - 3_600_000_000_000;
+    let tid = hex32(&trace_id(1));
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+             timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
+             attr_key, attr_scope, attr_val, attr_type, attr_num) SELECT \
+               toFixedString(unhex('{tid}'), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), 'op', 'svc', \
+               {base} + toInt64(number) * 1000, 1000000000, 0, 1, 1, '', \
+               ['name'], ['event:intrinsic'], [concat('ev-', toString(number))], ['string'], \
+               [NULL]::Array(Nullable(Float64)) \
+             FROM numbers({CAP_SPANS})"
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_type, val_num, \
+             timestamp_ns, trace_id, span_id, duration_ns) SELECT \
+               toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * 1000)), \
+               'name', concat('ev-', toString(number)), 'event:intrinsic', 'string', NULL, \
+               {base} + toInt64(number) * 1000, \
+               toFixedString(unhex('{tid}'), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), 1000000000 \
+             FROM numbers({CAP_SPANS})"
+        ),
+    )
+    .await;
+    pulsus_testkit::assert_stores_agree(db);
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = params(base, (CAP_SPANS as i64) * 1_000 + 1_000_000_000);
+    let plan = plan_for(&engine, r#"{ name != event:name }"#, &p);
+    assert_eq!(plan.event_sets_len(), 1, "one event set");
+
+    // The identity, asked of the database: the rendered statement's own
+    // physical row count.
+    let batch = [trace_id(1)];
+    let sql = plan.event_set_sql_for(0, &batch);
+    let rows = scalar(&client, &format!("SELECT count() AS v FROM ({sql})")).await;
+    assert_eq!(
+        rows, RETAINED,
+        "the value statement expands the rows the reader RETAINED, not the {CAP_SPANS} the \
+         window holds:\n{sql}"
+    );
+    // The control that makes the number discriminating: the same
+    // statement with the per-trace cap removed returns all of them, so a
+    // build that dropped the clause would read {CAP_SPANS} here.
+    let uncapped = sql.replace(&format!("\n  LIMIT {RETAINED} BY trace_id"), "");
+    assert_ne!(uncapped, sql, "the control must differ:\n{sql}");
+    let uncapped_rows = scalar(&client, &format!("SELECT count() AS v FROM ({uncapped})")).await;
+    assert_eq!(
+        uncapped_rows, CAP_SPANS,
+        "without the cap the expansion covers every span in the window, which is the false \
+         refusal this clause exists to prevent:\n{uncapped}"
+    );
+
+    // …and the request itself is served, at a value budget equal to the
+    // retained count: the widths the hydration statement returns sum to
+    // RETAINED, and the comparison is `values > budget`.
+    let mut cfg = engine_config(100_000, 536_870_912);
+    cfg.event_set_max_values = RETAINED;
+    let bounded = TraceEngine::new(ChClient::new(conn(db)).await.expect("connect"), cfg);
+    let plan = plan_for(&bounded, r#"{ name != event:name }"#, &p);
+    let out = bounded
+        .search(&plan)
+        .await
+        .expect("a batch whose widths equal the budget is served");
+    assert_eq!(
+        out.traces
+            .iter()
+            .map(|t| hex32(&t.trace_id))
+            .collect::<Vec<_>>(),
+        vec![tid.clone()],
+        "the span's own name differs from every one of its event names, so ALL-match returns it"
+    );
+
     exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
 

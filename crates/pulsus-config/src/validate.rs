@@ -154,6 +154,34 @@ pub const TRACEQL_MAX_CANDIDATES_CEILING: u64 = 1_000_000;
 /// the default of 50_000_000.
 pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
 
+/// `reader.traceql_event_set_max_values` (issue #558) — how many values
+/// one batch's event/link value set may expand to.
+///
+/// **This number and the 1,000,000 default are CHOSEN, and that is the
+/// whole claim.** The default is the same order as the Layer-2 retention
+/// budget (`traces::exec::HYDRATION_BYTE_BUDGET`, 256 MiB), so the two
+/// bounds sit near each other rather than one being decorative; the
+/// ceiling is an order of magnitude above it and bounds what an operator
+/// can configure. Neither is derived from the byte budget: which of the
+/// two bounds fires first depends on the payload lengths and on what the
+/// request has already charged, and three attempts to derive a number
+/// from `HYDRATION_BYTE_BUDGET / EVENT_VALUE_ENTRY_BYTES` were each
+/// refuted by measurement.
+///
+/// **The ceiling is not a claim about what happens above it.** The width
+/// is compared before the set is expanded, so a set wider than whatever
+/// value is configured is refused by this knob and the retention budget
+/// never comes into it — measured at `configured=1242757 values=1242758`,
+/// where the width refused.
+///
+/// `0` is rejected, and NOT because it means unlimited. Its siblings read
+/// `0` that way because they are ClickHouse SERVER settings
+/// (`max_rows_to_read`, `max_memory_usage`), where ClickHouse gives it
+/// that meaning. This comparison is `values > budget` in our own process,
+/// so a budget of zero would refuse every event/link set comparison
+/// outright.
+pub const TRACEQL_EVENT_SET_MAX_VALUES_CEILING: u64 = 10_000_000;
+
 /// `reader.traceql_generator_max_memory_bytes` — the phase-1 candidate
 /// generator's `max_memory_usage` (throw-not-OOM) ceiling. ClickHouse
 /// treats `0` as *unlimited*, so zero is rejected too. 1024x the
@@ -509,6 +537,21 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             TRACEQL_SCAN_BUDGET_ROWS_CEILING,
             1,
             "the trace row scan budget",
+        ));
+    }
+    // Issue #558: a budget of zero would refuse every event/link set
+    // comparison outright — the comparison is `values > budget` in our
+    // own process, so zero is not an unlimited sentinel here.
+    positive_u64(
+        "reader.traceql_event_set_max_values",
+        cfg.reader.traceql_event_set_max_values,
+    )?;
+    if cfg.reader.traceql_event_set_max_values > TRACEQL_EVENT_SET_MAX_VALUES_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_event_set_max_values",
+            TRACEQL_EVENT_SET_MAX_VALUES_CEILING,
+            1,
+            "the event/link value-set budget",
         ));
     }
     // Issue #133: previously unvalidated. ClickHouse treats
@@ -1230,6 +1273,33 @@ mod tests {
             |c, v| c.reader.traceql_scan_budget_rows = v,
             u64::MAX,
             TRACEQL_SCAN_BUDGET_ROWS_CEILING,
+        );
+    }
+
+    /// Issue #558: the event/link value-set budget. `0` is rejected for a
+    /// DIFFERENT reason from its siblings — it never reaches ClickHouse,
+    /// so "unlimited" is not what it would mean; the comparison is
+    /// `values > budget` in our own process, so a budget of zero refuses
+    /// every event/link set comparison outright.
+    #[test]
+    fn traceql_event_set_max_values_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.traceql_event_set_max_values = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.traceql_event_set_max_values");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        // The accepted floor is 1, one above the rejected zero.
+        let mut cfg = Config::default();
+        cfg.reader.traceql_event_set_max_values = 1;
+        assert!(validate(&cfg).is_ok(), "1 is the accepted floor");
+        assert_ceiling_boundary(
+            "reader.traceql_event_set_max_values",
+            |c, v| c.reader.traceql_event_set_max_values = v,
+            u64::MAX,
+            TRACEQL_EVENT_SET_MAX_VALUES_CEILING,
         );
     }
 

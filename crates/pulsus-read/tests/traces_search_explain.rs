@@ -198,10 +198,11 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
-               'env', 'prod', 'resource', NULL, \
+               'env', 'prod', 'resource', 'string', NULL, \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -214,11 +215,12 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
                'http.status_code', \
-               if(number % {ERROR_EVERY} = 0, '500', '200'), 'span', \
+               if(number % {ERROR_EVERY} = 0, '500', '200'), 'span', 'int', \
                if(number % {ERROR_EVERY} = 0, 500.0, 200.0), \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
@@ -232,12 +234,13 @@ async fn seed_corpus(client: &ChClient, db: &str, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
                'service.name', \
                if(number % {CHECKOUT_EVERY} = 0, 'checkout', concat('svc-', toString(number % 8))), \
-               'resource', NULL, \
+               'resource', 'string', NULL, \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -414,6 +417,7 @@ fn engine_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        event_set_max_values: 1_000_000,
         max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
@@ -478,13 +482,21 @@ fn matched_span_hex(span: &pulsus_read::SpanSummary) -> String {
 
 /// Issue #510 — the granule-identity gate for the `val_type` projection.
 ///
-/// The three attribute VALUE reads each gained `val_type` in their SELECT
-/// list and nothing else: the `WHERE` clause, the `(key, scope)` index
-/// prefix, the date/time pruning and the `trace_id IN` restriction are
+/// The attribute VALUE reads each gained `val_type` in their SELECT list
+/// and nothing else: the `WHERE` clause, the `(key, scope)` index prefix,
+/// the date/time pruning and the `trace_id IN` restriction are
 /// byte-identical. Adding a projected column to rows already being read
 /// cannot move part or granule selection — so this runs `EXPLAIN indexes
 /// = 1` on the real statement and on the SAME string with the projection
 /// removed, and asserts the two index-selection blocks are byte-identical.
+///
+/// **Issue #558 leaves ONE statement in this gate.** The aggregate and
+/// `select()` value reads are gone: the value, its numeric reading and
+/// its stored kind are projected slots on the batch hydration statement,
+/// and `the_probe_columns_keep_the_hydration_reads_index_selection` is
+/// the granule identity for those. What remains is the value-fusing
+/// membership builder, retained as the reproduction path for the frozen
+/// issue #492 evidence.
 ///
 /// **A pinned granule COUNT would be the wrong gate**: it moves with the
 /// corpus and says nothing about the projection. An identity between two
@@ -529,40 +541,24 @@ async fn attr_value_reads_keep_their_index_selection(
     }
 
     let ids = [[0u8; 16], [1u8; 16]];
-    // One query per read shape: a numeric aggregate read, a `select()`
-    // string read, and the retained membership builder's value-fusing
-    // arm — which has no production caller since issue #557.
-    let agg = plan_for(engine, r#"{ } | avg(span.http.status_code) > 1"#, base, now);
-    let sel = plan_for(engine, r#"{ } | select(span.http.method)"#, base, now);
+    // The one statement left that projects `val_type` beside a value read
+    // from the attribute index: the membership builder's value-fusing
+    // arm, which has had no production caller since issue #557 and is
+    // retained as the reproduction path for the frozen issue #492
+    // evidence. The aggregate and `select()` value reads issue #510 also
+    // covered are gone — issue #558 made them slots on the hydration
+    // statement, whose granule identity
+    // `the_probe_columns_keep_the_hydration_reads_index_selection` gates.
     let probe = plan_for(engine, r#"{ span.http.status_code >= 500 }"#, base, now);
     assert!(
         probe.probe_fuses_value(0),
         "the range probe must fuse a value, or this leg tests nothing"
     );
-    let cases: [(&str, String, &str); 3] = [
-        (
-            "aggregate val_num read",
-            agg.agg_values_sql_for(0, &ids),
-            ", any(val_type) AS t",
-        ),
-        (
-            "select() val read",
-            sel.select_values_sql_for(0, &ids),
-            ", any(val_type) AS t",
-        ),
-        (
-            // Issue #557 moved the attribute CONDITION onto the span
-            // row, so this statement has no production caller; the
-            // builder survives as the reproduction path for the frozen
-            // issue #492 evidence. The question issue #510 asked of it —
-            // does projecting the stored kind move granule selection? —
-            // is asked of the hydration statement's own value columns by
-            // `the_probe_columns_keep_the_hydration_reads_index_selection`.
-            "fused membership read (the retained reproduction builder)",
-            probe.membership_sql_for(0, &ids),
-            ", val_type AS t",
-        ),
-    ];
+    let cases: [(&str, String, &str); 1] = [(
+        "fused membership read (the retained reproduction builder)",
+        probe.membership_sql_for(0, &ids),
+        ", val_type AS t",
+    )];
     for (label, sql, projection) in cases {
         assert!(
             sql.contains(projection),
@@ -824,12 +820,12 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
     assert_eq!(rows_c.len(), 32, "10b: C decodes one row per batch id");
     assert_eq!(rows_d.len(), 32, "10b: D decodes one row per batch id");
     assert_eq!(
-        rows_a.iter().filter(|r| r.attr_probe[0] == 1).count(),
+        rows_a.iter().filter(|r| r.attr_slot[0] == 1).count(),
         32,
         "10b: every seeded span carries env=prod at resource scope"
     );
     assert_eq!(
-        rows_b.iter().filter(|r| r.attr_probe[1] == 1).count(),
+        rows_b.iter().filter(|r| r.attr_slot[1] == 1).count(),
         16,
         "10b: half the batch carries http.status_code=500"
     );
@@ -866,12 +862,26 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
     );
 }
 
-/// Criterion 4(b) — **the probe column's type, asked of the database.**
+/// Criterion 4(b), widened by issue #558's criterion 12 — **the slot
+/// columns' types, asked of the database.**
 ///
 /// A Rust assertion cannot establish a ClickHouse expression's type, and
-/// this one decides whether the row decodes at all: without the `ifNull`
-/// wrapper a numeric arm is `Nullable(UInt8)` and `Vec<u8>` refuses it.
+/// these decide whether the row decodes at all: without the `ifNull`
+/// wrapper a numeric probe arm is `Nullable(UInt8)` and `Vec<u8>` refuses
+/// it, and without the `CAST` an all-`NULL` numeric array is
+/// `Array(Nullable(Nothing))`, which `Vec<Option<f64>>` refuses.
 /// `DESCRIBE` answers without executing the read.
+///
+/// **Five slot classes**, so no class is described by a statement another
+/// class's render would satisfy: probes only (which renders no value
+/// array at all); a fusing probe with no field; fields only; a mixed
+/// plan; and a plan carrying a width slot.
+///
+/// The `CAST` control runs on the class where EVERY numeric slot is the
+/// literal `NULL`, which is a `select()`-only plan: a text slot puts
+/// `NULL` in the numeric array, and with no other slot beside it the
+/// whole literal is `[NULL]`. A fusing PROBE is not that class — it reads
+/// `attr_num` at its own alias, because the value test may be numeric.
 async fn the_probe_column_types_are_what_the_row_structs_decode(
     client: &ChClient,
     engine: &TraceEngine,
@@ -879,6 +889,111 @@ async fn the_probe_column_types_are_what_the_row_structs_decode(
     now: i64,
 ) {
     let batch = [[0u8; 16], [1u8; 16]];
+    // Issue #558: the four slot classes beyond the probe-only ones, each
+    // described in full. `probes_len` differs between them, so the loop
+    // below — which asserts exactly one probe — cannot carry them.
+    for (label, q, want_num) in [
+        (
+            "a fusing probe and no field",
+            r#"{ span.http.status_code >= 500 }"#,
+            "Array(Nullable(Float64))",
+        ),
+        (
+            "fields only, no probe",
+            r#"{ } | select(span.foo) | avg(span.retries) > 1"#,
+            "Array(Nullable(Float64))",
+        ),
+        (
+            "a mixed plan",
+            r#"{ span.http.status_code >= 500 } | select(span.foo) | avg(span.retries) > 1"#,
+            "Array(Nullable(Float64))",
+        ),
+        (
+            "a width slot",
+            r#"{ name != event:name }"#,
+            "Array(Nullable(Float64))",
+        ),
+    ] {
+        let p = plan_for(engine, q, base, now);
+        let sql = p.hydration_sql_for(&batch);
+        assert_eq!(
+            p.hydration_shape(),
+            HydrationShape::ProbesAndValues,
+            "{label}: this class renders all four arrays:\n{sql}"
+        );
+        let described: Vec<DescribeRow> =
+            drain_tagged_rows(client, &format!("DESCRIBE ({sql})"), &QuerySettings::new()).await;
+        let ty = |name: &str| -> String {
+            described
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{label}: no column {name}:\n{sql}"))
+                .ty
+                .clone()
+        };
+        assert_eq!(ty("attr_slot"), "Array(UInt8)", "{label}:\n{sql}");
+        assert_eq!(ty("attr_slot_val"), "Array(String)", "{label}:\n{sql}");
+        assert_eq!(ty("attr_slot_type"), "Array(String)", "{label}:\n{sql}");
+        assert_eq!(ty("attr_slot_num"), want_num, "{label}:\n{sql}");
+    }
+    // The probes-only class renders NO value array at all, which is what
+    // keeps a string-equality condition reading one `UInt8` element and
+    // nothing else.
+    {
+        let p = plan_for(engine, r#"{ .env = "prod" }"#, base, now);
+        let sql = p.hydration_sql_for(&batch);
+        assert_eq!(
+            p.hydration_shape(),
+            HydrationShape::Probes,
+            "probes only:\n{sql}"
+        );
+        let described: Vec<DescribeRow> =
+            drain_tagged_rows(client, &format!("DESCRIBE ({sql})"), &QuerySettings::new()).await;
+        assert!(
+            described.iter().any(|r| r.name == "attr_slot"),
+            "probes only: the predicate column is there:\n{sql}"
+        );
+        for absent in ["attr_slot_val", "attr_slot_type", "attr_slot_num"] {
+            assert!(
+                !described.iter().any(|r| r.name == absent),
+                "probes only: {absent} is not rendered:\n{sql}"
+            );
+        }
+    }
+    // The `CAST` control, on the class where every numeric slot is the
+    // literal `NULL`. Without it, "attr_slot_num is
+    // Array(Nullable(Float64))" would be satisfied by a build that never
+    // produced the untyped literal in the first place.
+    {
+        let p = plan_for(engine, r#"{ } | select(span.foo)"#, base, now);
+        let sql = p.hydration_sql_for(&batch);
+        assert!(
+            sql.contains("CAST([NULL] AS Array(Nullable(Float64))) AS attr_slot_num"),
+            "a select()-only plan renders an all-NULL numeric array:\n{sql}"
+        );
+        let uncast = sql.replace(
+            "CAST([NULL] AS Array(Nullable(Float64))) AS attr_slot_num",
+            "[NULL] AS attr_slot_num",
+        );
+        assert_ne!(uncast, sql, "the control must differ");
+        let raw: Vec<DescribeRow> = drain_tagged_rows(
+            client,
+            &format!("DESCRIBE ({uncast})"),
+            &QuerySettings::new(),
+        )
+        .await;
+        let raw_ty = raw
+            .iter()
+            .find(|r| r.name == "attr_slot_num")
+            .expect("the control describes attr_slot_num")
+            .ty
+            .clone();
+        assert_eq!(
+            raw_ty, "Array(Nullable(Nothing))",
+            "without the CAST the column IS untyped, which is why the CAST is not \
+             optional:\n{uncast}"
+        );
+    }
     for (label, q) in [
         ("numeric comparison", r#"{ span.http.status_code >= 500 }"#),
         (
@@ -902,18 +1017,18 @@ async fn the_probe_column_types_are_what_the_row_structs_decode(
                 .clone()
         };
         assert_eq!(
-            ty("attr_probe"),
+            ty("attr_slot"),
             "Array(UInt8)",
             "{label}: an unwrapped NULL comparison would make this Array(Nullable(UInt8)), \
              which does not decode into Vec<u8>:\n{sql}"
         );
         if p.hydration_shape() == HydrationShape::ProbesAndValues {
-            assert_eq!(ty("attr_probe_val"), "Array(String)", "{label}");
-            assert_eq!(ty("attr_probe_type"), "Array(String)", "{label}");
+            assert_eq!(ty("attr_slot_val"), "Array(String)", "{label}");
+            assert_eq!(ty("attr_slot_type"), "Array(String)", "{label}");
         }
         // The control: the same statement with the wrapper removed
         // describes the type this criterion exists to refuse. Without it,
-        // an assertion that `attr_probe` is `Array(UInt8)` would be
+        // an assertion that `attr_slot` is `Array(UInt8)` would be
         // satisfied by any build that never produced a NULL.
         if sql.contains("ifNull(") {
             let unwrapped = strip_ifnull(&sql);
@@ -926,8 +1041,8 @@ async fn the_probe_column_types_are_what_the_row_structs_decode(
             .await;
             let raw_ty = raw
                 .iter()
-                .find(|r| r.name == "attr_probe")
-                .expect("the control describes attr_probe")
+                .find(|r| r.name == "attr_slot")
+                .expect("the control describes attr_slot")
                 .ty
                 .clone();
             assert_eq!(
@@ -988,6 +1103,14 @@ async fn two_phase_search_explain_and_budget_gates() {
     let base = now - WINDOW_NS;
     let client = data_client().await;
     seed_corpus(&client, &DB, base).await;
+    // Issue #558: phase 1 generates candidates from the attribute index
+    // and phase 2 reads the value from the span row, so a fixture whose
+    // two stores disagree produces a candidate that matches nothing, or a
+    // kind the response renders wrong. Called here for fast feedback on
+    // the AC2 corpus, and AGAIN as this target's last statement, because
+    // the fixtures below seed more data into the same database and the
+    // check reads the whole store rather than a list of ids.
+    pulsus_testkit::assert_stores_agree(&DB);
 
     let engine = TraceEngine::new(data_client().await, engine_config());
 
@@ -1990,8 +2113,10 @@ async fn two_phase_search_explain_and_budget_gates() {
             client,
             &format!(
                 "INSERT INTO {DB}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-                 SELECT toDate(fromUnixTimestamp64Nano({ts})), 'foo', 'x', 'span', NULL, {ts}, \
+                 (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+                  duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), 'foo', 'x', 'span', 'string', \
+                        NULL, {ts}, \
                         toFixedString(unhex('{trace_hex}'), 16), \
                         toFixedString(unhex('{span_hex}'), 8), 1000"
             ),
@@ -2236,8 +2361,10 @@ async fn two_phase_search_explain_and_budget_gates() {
             client,
             &format!(
                 "INSERT INTO {DB}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', NULL, {ts}, \
+                 (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+                  duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', \
+                        'string', NULL, {ts}, \
                         toFixedString(unhex('{trace_hex}'), 16), \
                         toFixedString(unhex('{span_hex}'), 8), 1000"
             ),
@@ -2366,95 +2493,118 @@ async fn two_phase_search_explain_and_budget_gates() {
     // cross-type rule is Tempo-verified and correct HERE.
     let fc_st = now + 36 * 3_600_000_000_000;
     const FC_T: &str = "00000000000000000000000000fc0001";
-    // Issue #557: these spans carry NO span-row arrays, deliberately. A
-    // field-vs-field comparison plans no membership probe — both operands
-    // are interned into the `val`/`val_num` value reads, which still go to
-    // `trace_attrs_idx` — so the index rows below are the whole fixture.
-    for spec in [
-        (
-            "00000000000000f1",
-            ZERO8,
-            "fc-eq",
-            "svc",
-            fc_st,
-            0,
-            NO_ATTRS,
-        ),
-        (
-            "00000000000000f2",
-            ZERO8,
-            "fc-ne",
-            "svc",
-            fc_st + 10,
-            0,
-            NO_ATTRS,
-        ),
-        (
-            "00000000000000f3",
-            ZERO8,
-            "fc-xt",
-            "svc",
-            fc_st + 20,
-            0,
-            NO_ATTRS,
-        ),
-        (
-            "00000000000000f4",
-            ZERO8,
-            "fc-ab",
-            "svc",
-            fc_st + 30,
-            0,
-            NO_ATTRS,
-        ),
-        (
-            "00000000000000f5",
-            ZERO8,
-            "fc-sx",
-            "svc",
-            fc_st + 40,
-            0,
-            NO_ATTRS,
-        ),
-    ] {
-        insert_structural_span(&client, FC_T, spec).await;
-    }
-    // fc-eq: a=5, b=5 (val_num set → numeric-comparable, and equal).
-    async fn insert_num_attr(
+    // Issue #558: these spans carry their attributes in BOTH stores. A
+    // field-vs-field comparison plans no membership probe, and until #558
+    // both operands were read from `trace_attrs_idx`, so index rows alone
+    // were the whole fixture. The operand's value, its numeric reading
+    // and its stored kind now come from the span row's own arrays at one
+    // located element, so a span with no arrays has no operand value at
+    // all and every assertion below would compare two absences.
+    /// One field-compare span's attributes: `(key, value, val_num)` —
+    /// `val_num` is a SQL fragment, `"NULL"` for a text-only attribute,
+    /// and it decides the stored kind on BOTH sides.
+    type FcAttr<'a> = (&'a str, &'a str, &'a str);
+    /// Inserts one field-compare span and its attributes into both
+    /// stores from ONE list, which is what the OTLP writer does.
+    async fn insert_fc_span(
         client: &ChClient,
-        trace_hex: &str,
         span_hex: &str,
-        key: &str,
-        val: &str,
-        num: f64,
+        name: &str,
         ts: i64,
+        attrs: &[FcAttr<'_>],
     ) {
+        let lit = |items: Vec<String>| format!("[{}]", items.join(", "));
+        let keys = lit(attrs.iter().map(|a| format!("'{}'", a.0)).collect());
+        let vals = lit(attrs.iter().map(|a| format!("'{}'", a.1)).collect());
+        let scopes = lit(attrs.iter().map(|_| "'span'".to_string()).collect());
+        let kind = |num: &str| if num == "NULL" { "string" } else { "int" };
+        let types = lit(attrs.iter().map(|a| format!("'{}'", kind(a.2))).collect());
+        let nums = format!(
+            "[{}]::Array(Nullable(Float64))",
+            attrs
+                .iter()
+                .map(|a| a.2.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         exec(
             client,
             &format!(
-                "INSERT INTO {DB}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', {num}, {ts}, \
-                        toFixedString(unhex('{trace_hex}'), 16), \
-                        toFixedString(unhex('{span_hex}'), 8), 1000"
+                "INSERT INTO {DB}.trace_spans \
+                 (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                  status_code, kind, payload_type, payload, \
+                  attr_key, attr_scope, attr_val, attr_type, attr_num) \
+                 SELECT toFixedString(unhex('{FC_T}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), \
+                        toFixedString(unhex('{ZERO8}'), 8), \
+                        '{name}', 'svc', {ts}, 1000, 0, 1, 1, 'p', \
+                        {keys}, {scopes}, {vals}, {types}, {nums}"
             ),
         )
         .await;
+        for (key, val, num) in attrs {
+            let t = kind(num);
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO {DB}.trace_attrs_idx \
+                     (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, \
+                      span_id, duration_ns) \
+                     SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', \
+                            '{t}', {num}, {ts}, \
+                            toFixedString(unhex('{FC_T}'), 16), \
+                            toFixedString(unhex('{span_hex}'), 8), 1000"
+                ),
+            )
+            .await;
+        }
     }
-    insert_num_attr(&client, FC_T, "00000000000000f1", "a", "5", 5.0, fc_st).await;
-    insert_num_attr(&client, FC_T, "00000000000000f1", "b", "5", 5.0, fc_st).await;
-    insert_num_attr(&client, FC_T, "00000000000000f2", "a", "9", 9.0, fc_st + 10).await;
-    insert_num_attr(&client, FC_T, "00000000000000f2", "b", "1", 1.0, fc_st + 10).await;
+    // fc-eq: a=5, b=5 (val_num set → numeric-comparable, and equal).
+    insert_fc_span(
+        &client,
+        "00000000000000f1",
+        "fc-eq",
+        fc_st,
+        &[("a", "5", "5"), ("b", "5", "5")],
+    )
+    .await;
+    insert_fc_span(
+        &client,
+        "00000000000000f2",
+        "fc-ne",
+        fc_st + 10,
+        &[("a", "9", "9"), ("b", "1", "1")],
+    )
+    .await;
     // fc-xt: a is a STRING "5" (val_num NULL), b is numeric 5 — the
     // adversarial COINCIDENT-text cross-type case; Tempo type-gates ⇒ no
     // match under `=` or `!=`.
-    insert_ac6_attr(&client, FC_T, "00000000000000f3", "a", "5", fc_st + 20).await;
-    insert_num_attr(&client, FC_T, "00000000000000f3", "b", "5", 5.0, fc_st + 20).await;
+    insert_fc_span(
+        &client,
+        "00000000000000f3",
+        "fc-xt",
+        fc_st + 20,
+        &[("a", "5", "NULL"), ("b", "5", "5")],
+    )
+    .await;
     // fc-ab: a present, b absent ⇒ no match (absent key).
-    insert_num_attr(&client, FC_T, "00000000000000f4", "a", "5", 5.0, fc_st + 30).await;
+    insert_fc_span(
+        &client,
+        "00000000000000f4",
+        "fc-ab",
+        fc_st + 30,
+        &[("a", "5", "5")],
+    )
+    .await;
     // fc-sx: two string attrs for lexical ordering (apple < banana).
-    insert_ac6_attr(&client, FC_T, "00000000000000f5", "g", "apple", fc_st + 40).await;
-    insert_ac6_attr(&client, FC_T, "00000000000000f5", "h", "banana", fc_st + 40).await;
+    insert_fc_span(
+        &client,
+        "00000000000000f5",
+        "fc-sx",
+        fc_st + 40,
+        &[("g", "apple", "NULL"), ("h", "banana", "NULL")],
+    )
+    .await;
     let (fc_start, fc_end) = (fc_st - 1, fc_st + 3_600_000_000_000);
     let plan = plan_for(&engine, r#"{ .a = .b }"#, fc_start, fc_end);
     let output = engine.search(&plan).await.expect("field-compare eq search");
@@ -3015,14 +3165,20 @@ async fn two_phase_search_explain_and_budget_gates() {
         )
         .await;
         for (key, val, scope, val_num) in attrs {
+            // Issue #558: the index row stores the SAME kind the span
+            // array's element carries, decided by the same expression
+            // `types` above uses. The two stores disagreed before,
+            // because `val_type` took the catalog default `''`.
+            let kind = if *val_num == "NULL" { "string" } else { "int" };
             exec(
                 client,
                 &format!(
                     "INSERT INTO {DB}.trace_attrs_idx \
-                     (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, \
-                      duration_ns) \
+                     (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, \
+                      span_id, duration_ns) \
                      SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', \
-                            {val_num}, {ts}, toFixedString(unhex('{trace_hex}'), 16), \
+                            '{kind}', {val_num}, {ts}, \
+                            toFixedString(unhex('{trace_hex}'), 16), \
                             toFixedString(unhex('{span_hex}'), 8), 1000"
                 ),
             )
@@ -3314,11 +3470,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         let plain = p.hydration_sql_without_probes_for(&batch);
         assert_ne!(probed, plain, "{label}: the two renders must differ");
         assert!(
-            probed.contains("AS attr_probe_val"),
+            probed.contains("AS attr_slot_val"),
             "{label}: the fusing render must project the matched value:\n{probed}"
         );
         assert!(
-            !plain.contains("attr_probe"),
+            !plain.contains("attr_slot"),
             "{label}: the control render must carry no probe column at all:\n{plain}"
         );
         let raw_probed = explain_raw(&client, &probed).await;
@@ -3345,15 +3501,19 @@ async fn two_phase_search_explain_and_budget_gates() {
             "{label}: a narrower batch must select fewer granules, or this comparison cannot \
              tell two selections apart\nnarrowed:\n{raw_narrowed}\nprobed:\n{raw_probed}"
         );
-        // The separate `select()` value read this fusion replaces still
-        // goes to the attribute index and prunes on `key` alone. It is
-        // named here so the reader can see which read the fused column
-        // stands in for; issue #558 is the part that moves it.
+        // Issue #558: the separate `select()` value read this fusion
+        // replaced is gone. The whole plan now sends no statement against
+        // the attribute index in phase 2 — the value is a slot on the
+        // statement above.
         let sep = plan_for(&engine, select_q, base, now);
+        assert_eq!(
+            sep.select_attrs_len(),
+            1,
+            "{label}: the select() field is still planned as its own slot"
+        );
         assert!(
-            sep.select_values_sql_for(0, &batch)
-                .contains("FROM trace_attrs_idx"),
-            "{label}: the select() value read still reads the attribute index"
+            !sep.hydration_sql_for(&batch).contains("trace_attrs_idx"),
+            "{label}: the hydration statement reads the span table only"
         );
     }
     // `StringEq` fuses nothing — its projected value is the query's own
@@ -3364,14 +3524,14 @@ async fn two_phase_search_explain_and_budget_gates() {
     let eq_plan = plan_for(&engine, r#"{ .env = "prod" }"#, base, now);
     assert!(!eq_plan.probe_fuses_value(0));
     let eq_sql = eq_plan.hydration_sql_for(&[[0u8; 16]]);
-    // `attr_probe` is a prefix of `attr_probe_val`, so the alias is
+    // `attr_slot` is a prefix of `attr_slot_val`, so the alias is
     // matched with the delimiter that follows it.
     assert!(
-        eq_sql.contains("] AS attr_probe,\n") || eq_sql.contains("] AS attr_probe\n"),
+        eq_sql.contains("] AS attr_slot,\n") || eq_sql.contains("] AS attr_slot\n"),
         "a string-equality probe still renders its predicate column:\n{eq_sql}"
     );
     assert!(
-        !eq_sql.contains("attr_probe_val"),
+        !eq_sql.contains("attr_slot_val"),
         "a string-equality probe fuses no value, so it reads no value array:\n{eq_sql}"
     );
 
@@ -3402,18 +3562,24 @@ async fn two_phase_search_explain_and_budget_gates() {
             .collect::<Vec<_>>()
             .join("\n")
     }
-    // (label, query, does it fuse a value?)
+    // (label, query, does its hydration statement project a slot VALUE?)
+    //
+    // **Issue #558 widened the third column.** It used to mean "does a
+    // probe fuse its matched value"; it now means "does any slot project
+    // a value at all", because a `select()` field, an aggregate argument
+    // and a `by()` key are slots on this same statement and each projects
+    // the located element's value, number and kind.
     let ac6: &[(&str, &str, bool)] = &[
         ("physical-only", r#"{ status = error }"#, false),
-        // Issue #510: a query that issues an attribute VALUE read, so the
-        // `phase2_attr_values` identity below is over a non-zero count.
-        // Without one, `agg_fields_len()` and `select_attrs_len()` were
-        // both 0 for every row of this table and a second read on the
-        // aggregate path could not move the census.
+        // Issue #510: a query that reads an attribute VALUE, so the
+        // zero-statement identity below is over a plan that HAS one.
+        // Without it, `agg_fields_len()` and `select_attrs_len()` were
+        // both 0 for every row of this table and "this link sends no
+        // statement" would be vacuous.
         (
             "aggregate-value-read",
             r#"{ } | avg(span.http.status_code) > 1"#,
-            false,
+            true,
         ),
         ("string-equality", r#"{ .env = "prod" }"#, false),
         ("nested-set", r#"{ nestedSetLeft > 0 }"#, false),
@@ -3480,12 +3646,12 @@ async fn two_phase_search_explain_and_budget_gates() {
         if *fuses {
             fusing_seen += 1;
             assert!(
-                sa.contains("AS attr_probe_val"),
+                sa.contains("AS attr_slot_val"),
                 "{label}: a fusing class must project its matched value:\n{sa}"
             );
         } else {
             assert!(
-                !sa.contains("attr_probe_val"),
+                !sa.contains("attr_slot_val"),
                 "{label}: nothing to fuse, so no value array is read:\n{sa}"
             );
         }
@@ -3496,15 +3662,22 @@ async fn two_phase_search_explain_and_budget_gates() {
         // no probe column at all.
         match *label {
             "string-equality" => assert!(
-                sa.contains("] AS attr_probe,\n") || sa.contains("] AS attr_probe\n"),
+                sa.contains("] AS attr_slot,\n") || sa.contains("] AS attr_slot\n"),
                 "{label}: one probe, one predicate column:\n{sa}"
             ),
-            "physical-only" | "nested-set" | "aggregate-value-read" => {
-                assert!(
-                    !sa.contains("attr_probe"),
-                    "{label}: this query plans no attribute condition:\n{sa}"
-                )
-            }
+            // Issue #558: the aggregate-value query plans no CONDITION
+            // but one field slot, so it leaves this list — its statement
+            // carries an `attr_slot` element for that field.
+            "physical-only" | "nested-set" => assert!(
+                !sa.contains("attr_slot"),
+                "{label}: this query plans no attribute condition and no attribute \
+                 projection:\n{sa}"
+            ),
+            "aggregate-value-read" => assert!(
+                sa.contains("attr_num[fa0]"),
+                "{label}: the aggregate argument is a slot on this statement, read at one \
+                 located element:\n{sa}"
+            ),
             _ => {}
         }
 
@@ -3536,20 +3709,21 @@ async fn two_phase_search_explain_and_budget_gates() {
         }
         assert_eq!(
             ma.get("phase2_attr_values").copied().unwrap_or(0),
-            value_reads * batches,
-            "{label}: the projection adds NO phase2_attr_values statement, and issue #510's \
-             stored-type column adds none either — it rides the read that was already issued"
+            0,
+            "{label}: issue #558 — the plan's {value_reads} value read(s) send NO statement \
+             of their own; the value, its numeric reading and its stored kind are projected \
+             slots on the hydration statement above"
         );
     }
     assert_eq!(
-        fusing_seen, 4,
-        "exactly four of the eight AC6 queries fuse a value; a table that no longer says so \
-         would accept an implementation that fuses nothing"
+        fusing_seen, 5,
+        "exactly five of the eight AC6 queries project a slot value; a table that no longer \
+         says so would accept an implementation that projects nothing"
     );
     assert_eq!(
         value_read_seen, 1,
-        "exactly one AC6 query issues an attribute VALUE read; without it the \
-         phase2_attr_values identity is 0 == 0 on every row and a second read is invisible"
+        "exactly one AC6 query plans an attribute VALUE read; without it the \
+         zero-statement identity above holds over plans that have nothing to send"
     );
 
     // ---- AC5 (issue #193): a `by()` query adds NO new scan --------------
@@ -3689,6 +3863,23 @@ async fn two_phase_search_explain_and_budget_gates() {
 
     // ---- issue #557 criterion 4(b): the probe column's type ------------
     the_probe_column_types_are_what_the_row_structs_decode(&client, &engine, base, now).await;
+
+    // ---- issue #558 criterion 13, and it is the LAST statement ---------
+    //
+    // **This target seeds eight fixtures into one database, in one test
+    // function, and a check placed beside any of them covers only what
+    // was written before it.** The AC2 corpus is checked above for fast
+    // feedback; the structural T1/T2 spans, the AC6 matrix, the
+    // field-comparison spans and the event spans are all seeded AFTER
+    // that point, and a check there would have left them out — which is
+    // exactly what round 2 found.
+    //
+    // `assert_stores_agree` takes no trace-id list: it reads the whole
+    // database, so it covers every fixture this function seeded and any
+    // fixture a later change adds, without the author having to remember
+    // to name it. Placed last, so the only way past it is to write more
+    // data after it, and there is nothing after it.
+    pulsus_testkit::assert_stores_agree(&DB);
 }
 
 /// Issue #492 part 5 criterion 14 — **the granule-identity gate for the
