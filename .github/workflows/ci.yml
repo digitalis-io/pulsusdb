@@ -131,6 +131,18 @@ jobs:
       # `7200 passed, 1 failed` where a writable copy of the same source
       # printed `7486 passed`. Issue #558 traced the same failure to the
       # same place.
+      #
+      # **A shared build directory can carry another clone's paths.** Two
+      # clones pointed at one `CARGO_TARGET_DIR` reuse each other's
+      # artefacts, and a test that embeds a path at compile time then
+      # reads the other clone's. Measured on issue #494: a first run in a
+      # clean workspace printed `217 passed, 2 failed`, both
+      # `chart_surface`, both `repo root: No such file or directory`,
+      # because a scratch clone that had since been removed shared the
+      # warm tree. `cargo clean -p pulsus-config` cleared it and the rerun
+      # printed `7500 passed, 39 skipped`. CI gets a fresh tree per job,
+      # so this is a local-run hazard; it is recorded here because this is
+      # where the other two invocation constraints are.
       - name: Test
         run: ci/test-summary.sh run workspace --workspace
 

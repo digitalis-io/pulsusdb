@@ -57,6 +57,18 @@
 //! committed writer tests create a directory: in a read-only tree the
 //! workspace command printed `7200 passed, 1 failed` where a writable copy
 //! of the same source printed `7486 passed`.
+//!
+//! **A shared build directory can carry another clone's paths.** Two
+//! clones pointed at one `CARGO_TARGET_DIR` reuse each other's compiled
+//! artefacts, and a test that embeds a path at compile time then reads
+//! the OTHER clone's. Round 3 of issue #494's code review hit it: a first
+//! run in a clean workspace printed `217 passed, 2 failed`, both
+//! `chart_surface`, both `repo root: No such file or directory`, because
+//! a scratch clone that had since been removed shared the warm tree and
+//! its manifest directory was baked in. `cargo clean -p pulsus-config`
+//! cleared it and the rerun printed `7500 passed, 39 skipped`. A failure
+//! naming a path that is not in your tree is this, not a defect in the
+//! code under test.
 
 #[path = "support/live_db.rs"]
 mod live_db;
