@@ -187,9 +187,36 @@ else
   fail "the manifest carries no merged upstream revision, so this attack cannot be run"
 fi
 
+echo "self-test: moving the comparison pin alongside the protected text"
+# Round 3 of issue #494's code review ran exactly this and the check
+# passed: inserting a reference into a protected row AND repointing the
+# manifest's `# merged` revision in one edit hid the insertion, because
+# the comparison revision was whatever the manifest said. The revision is
+# now derived from the commit graph and the manifest only records it, so
+# a moved pin is a disagreement rather than a new comparison.
+copy_tree
+awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up issue 777777)"; next } { print }' \
+  "$work/tree/$rewrite_file" > "$work/patched"
+mv "$work/patched" "$work/tree/$rewrite_file"
+moved=$(git -C "$REPO" rev-parse HEAD)
+awk -v r="$moved" '$1 == "#" && $2 == "merged" { print "# merged " r; next } { print }' \
+  "$work/manifest.txt" > "$work/manifest.patched"
+mv "$work/manifest.patched" "$work/manifest.txt"
+expect_fail "the commit graph says"
+
+echo "self-test: deleting the comparison pin"
+# The other half of the same hole: with no pin at all an earlier revision
+# of this check fell back to the frozen base, which is the comparison the
+# merge made wrong. A merge that happened and a manifest that records
+# none is a disagreement too.
+copy_tree
+grep -v '^# merged ' "$work/manifest.txt" > "$work/manifest.patched"
+mv "$work/manifest.patched" "$work/manifest.txt"
+expect_fail "the manifest records none"
+
 echo "self-test: an empty manifest"
 copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-echo "doc-sites-self-test: ten attacks caught, the clean copy passed"
+echo "doc-sites-self-test: twelve attacks caught, the clean copy passed"

@@ -66,14 +66,53 @@ BASE=${BASE:-$(awk '$1 == "#" && $2 == "base" { print $3; exit }' "$MANIFEST")}
 git cat-file -e "$BASE^{commit}" 2>/dev/null \
   || fail "the frozen base revision $BASE is not in this clone (fetch-depth)"
 
-# The upstream head this branch has merged, used by ONE check —
-# `check_issue_references`, which asks which lines this change added.
-# Absent, it is the base, which is the state before any merge. The ranges
-# every other check reads stay at `$BASE` whatever this says.
-MERGED=${MERGED:-$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$MANIFEST")}
-MERGED=${MERGED:-$BASE}
+# The upstream head this change has merged, used by ONE check —
+# `check_issue_references`, which asks which lines this change added. The
+# ranges every other check reads stay at `$BASE` whatever this says.
+#
+# **It is DERIVED from the commit graph, not read from the manifest.**
+# Round 3 of issue #494's code review moved the manifest's pin and the
+# protected text in one edit and the check passed: a comparison revision
+# the same diff can move is not a control. The manifest still records the
+# revision, and the two must agree — a pin that has been moved fails
+# here, loudly, instead of silently widening what the check ignores.
+#
+# The derivation, and why it identifies upstream in both checkout
+# shapes. Take the newest merge commit since the frozen base and try its
+# parents, second first. `git merge <upstream>` on this branch puts
+# upstream in the SECOND parent; a pull-request checkout builds a merge
+# whose FIRST parent is the base branch and whose second is this change.
+# The two are told apart by a fact neither can fake: **this manifest is
+# this change's own file, so no upstream commit has it.** The first
+# parent whose tree does not carry the manifest is upstream.
+HEADREV=${HEADREV:-HEAD}
+derive_merged() {
+  newest=$(git rev-list --merges --max-count=1 "$BASE..$HEADREV" 2>/dev/null)
+  [ -n "$newest" ] || { echo "$BASE"; return; }
+  manifest_rel=${MANIFEST#"$REPO"/}
+  for side in 2 1; do
+    parent=$(git rev-parse --verify --quiet "$newest^$side") || continue
+    if ! git cat-file -e "$parent:$manifest_rel" 2>/dev/null; then
+      echo "$parent"
+      return
+    fi
+  done
+  echo "$BASE"
+}
+MERGED=${MERGED:-$(derive_merged)}
 git cat-file -e "$MERGED^{commit}" 2>/dev/null \
-  || fail "the merged upstream revision $MERGED is not in this clone (fetch-depth)"
+  || fail "the derived upstream revision $MERGED is not in this clone (fetch-depth)"
+
+# The manifest's record of it must agree with what the graph says.
+DECLARED=$(awk '$1 == "#" && $2 == "merged" { print $3; exit }' "$MANIFEST")
+if [ -n "$DECLARED" ]; then
+  git cat-file -e "$DECLARED^{commit}" 2>/dev/null \
+    || fail "the manifest records upstream revision $DECLARED, which is not in this clone"
+  [ "$(git rev-parse "$DECLARED^{commit}")" = "$(git rev-parse "$MERGED^{commit}")" ] \
+    || fail "the manifest records upstream revision $DECLARED; the commit graph says $MERGED"
+elif [ "$MERGED" != "$BASE" ]; then
+  fail "the commit graph says upstream $MERGED was merged; the manifest records none"
+fi
 
 tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp); tmp_up=$(mktemp)
 trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_up" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM

@@ -4,13 +4,19 @@
 # text is still there, and a `rewrite` row says its text is gone.
 # base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
 #
-# The upstream head this branch has MERGED. It is a different question
-# from the base and it answers a different check: `check_issue_references`
-# asks which lines THIS CHANGE added, and after a merge the lines main
-# brought in are not this change's. Diffing them against the base would
-# report main's own issue numbers as ones this change invented — it did,
-# on `docs/architecture.md`, the moment main was merged. The ranges above
-# still belong to `base`, which never moves.
+# The upstream head this change has MERGED. It answers a different
+# question from the base: `check_issue_references` asks which lines THIS
+# CHANGE added, and after a merge the lines main brought in are not this
+# change's. Diffing them against the base reported main's own issue
+# numbers as ones this change invented, on `docs/architecture.md`, the
+# moment main was merged.
+#
+# **This line is a RECORD, not the control.** The check derives the
+# revision from the commit graph and requires this line to agree with it;
+# editing it makes the check fail rather than changing what it compares
+# against. Round 3 of issue #494's code review moved it and the protected
+# text in one edit and the check passed, which is what that separation is
+# for. The ranges above still belong to `base`, which never moves.
 # merged 114c5d1969ab175f01f9a85975046017e5e4b159
 rewrite docs/schemas.md:174-174
 rewrite docs/schemas.md:1089-1089
