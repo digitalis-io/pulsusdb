@@ -13,9 +13,18 @@
 # a throwaway directory: the attacks edit files, and nothing they edit may
 # be the tree CI is about to build.
 #
-# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Every attack
-# here edits the protected CONTENT and leaves the workflow alone. That is
-# the shape of an accident, and accidents are what the check is for. It is
+# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Ten attacks,
+# and they divide in two. **Seven edit the protected CONTENT**: the
+# whitespace-only rewrite, the changed `leave` row, and the five
+# issue-number attacks. **Three edit the MANIFEST and leave the content
+# alone**: the duplicate row, the swapped site, and the empty manifest.
+# (An earlier version of this paragraph said every attack edits the
+# content. Three of its own ten contradicted it, which is the defect this
+# file's own subject is — a claim wider than its evidence.)
+#
+# **None of the ten touches the workflow**, and that is the division that
+# decides what a green run means. Editing content or manifest is the
+# shape of an accident, and accidents are what the check is for. It is
 # not the shape of a determined author, who would edit the content and the
 # step that supplies the comparison base together — the base is assigned
 # in `.github/workflows/ci.yml`, which ships in the tree under review, and
