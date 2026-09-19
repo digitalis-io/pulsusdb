@@ -190,6 +190,12 @@ async fn seed_nested_set_corpus(client: &ChClient, base_ns: i64) {
 /// `'false'`) — the storage convention `{ .a }`'s equality lowering
 /// reads. The two populations differ (300 / 700) so an inverted lowering
 /// answers a different number.
+///
+/// **Both stores carry the attribute** (issue #559). Until then `flag`
+/// went into `trace_attrs_idx` only and the span rows' arrays were EMPTY,
+/// which was invisible while the metrics filter read the index; measured
+/// with the filter on the span row and the fixture unchanged, the
+/// bare-truthiness total returned `0.0` against an expected `300.0`.
 async fn seed_flag_corpus(client: &ChClient, base_ns: i64) {
     let spread = WINDOW_NS / FLAG_SPANS as i64;
     exec(
@@ -197,14 +203,17 @@ async fn seed_flag_corpus(client: &ChClient, base_ns: i64) {
         &format!(
             "INSERT INTO {DB}.trace_spans \
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+              status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number + 100000)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number + 100000)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), \
                'op', 'flags', \
                {base_ns} + toInt64(number) * {spread}, \
-               1000000, 0, 1, 1, 'p' \
+               1000000, 0, 1, 1, 'p', \
+               ['flag'], ['span'], [if(number < {FLAG_TRUE}, 'true', 'false')], \
+               ['bool'], [NULL] \
              FROM numbers({FLAG_SPANS})"
         ),
     )
@@ -213,10 +222,11 @@ async fn seed_flag_corpus(client: &ChClient, base_ns: i64) {
         client,
         &format!(
             "INSERT INTO {DB}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {spread})), \
-               'flag', if(number < {FLAG_TRUE}, 'true', 'false'), 'span', NULL, \
+               'flag', if(number < {FLAG_TRUE}, 'true', 'false'), 'span', 'bool', NULL, \
                {base_ns} + toInt64(number) * {spread}, \
                toFixedString(unhex(leftPad(lower(hex(number + 100000)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number + 100000)), 16, '0')), 8), \
@@ -429,6 +439,11 @@ async fn nested_set_and_bare_truthiness_answers_match_the_seeded_corpus() {
     )
     .await;
     assert_eq!(absent, 0.0, "an absent key is no match");
+
+    // Issue #559 criterion 11: the metrics filter reads the span row, so
+    // a fixture that seeds only `trace_attrs_idx` answers 0 to every
+    // attribute query above. Before the drop, so it sees every insert.
+    pulsus_testkit::assert_stores_agree(&DB.to_string());
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
 }

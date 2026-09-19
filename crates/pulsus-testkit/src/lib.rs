@@ -1028,11 +1028,11 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// file, from that same search:
 ///
 /// ```text
-///   1  crates/pulsus-read/tests/compare_arity_differential.rs
+///   1  crates/pulsus-read/tests/compare_arity_differential.rs  <- covered (#559)
 ///   1  crates/pulsus-read/tests/query_log_gates.rs            <- covered
-///   3  crates/pulsus-read/tests/traces_metrics_explain.rs
-///   2  crates/pulsus-read/tests/traces_metrics_live.rs
-///   1  crates/pulsus-read/tests/traces_metrics_nested_set_live.rs
+///   3  crates/pulsus-read/tests/traces_metrics_explain.rs     <- covered (#559)
+///   2  crates/pulsus-read/tests/traces_metrics_live.rs        <- covered (#559)
+///   1  crates/pulsus-read/tests/traces_metrics_nested_set_live.rs <- covered (#559)
 ///   7  crates/pulsus-read/tests/traces_search_explain.rs      <- covered
 ///   6  crates/pulsus-read/tests/traces_search_pushdown_live.rs <- covered
 ///   1  crates/pulsus-read/tests/traces_tags_explain.rs
@@ -1041,12 +1041,21 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 ///   1  xtask/src/bench/traces_read.rs
 /// ```
 ///
-/// So the uncovered classes are **five**, not three: the `compare()`
-/// arity differential, the trace-metrics fixtures, the trace-tags
-/// fixtures, the schema live suite, and the two benchmark modules. None of
-/// them reads the span row's attribute arrays, which is why nothing here
-/// covers them; a fixture author on any of those paths gets no help from
-/// this helper.
+/// **Issue #559 brought the four metrics-route fixtures under it**, and
+/// not for tidiness: that change moved the metrics attribute filter onto
+/// the span row, so a fixture seeding only the index answers `0` to every
+/// attribute query. Measured before the fixtures were fixed,
+/// `traces_metrics_live::metrics_internal_consistency_identities` returned
+/// `0` against an expected `30`, and
+/// `traces_metrics_nested_set_live::nested_set_and_bare_truthiness_answers_match_the_seeded_corpus`
+/// returned `0.0` against `300.0`.
+///
+/// **The uncovered classes are now three**: the trace-tags fixtures
+/// (`traces_tags_explain.rs`), the schema live suite
+/// (`pulsus-schema/tests/live_traces.rs`) and the two benchmark modules
+/// (`xtask/src/bench/traces_lowering.rs` reads the index alone;
+/// `traces_read.rs` writes span arrays already). A fixture author on any
+/// of those paths gets no help from this helper.
 ///
 /// # What it checks
 ///
