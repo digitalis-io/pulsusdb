@@ -102,6 +102,18 @@ fn base_s() -> i64 {
 /// One span per second for 10 minutes.
 const CORPUS_SPANS: i64 = 600;
 
+/// Which of the three seeded attribute elements each span carries (issue
+/// #559): `http.status_code` always, `env` at resource scope every third
+/// span, `env` at span scope every seventh.
+///
+/// One mask, applied to all five span-row arrays, so they cannot fall out
+/// of alignment with each other. The element ORDER is
+/// `http.status_code`, `env`@resource, `env`@span, and the unscoped
+/// chain resolves `.env` through the SCOPE precedence rather than the
+/// array position, so a span carrying both `env` elements answers from
+/// the span-scoped one whichever order they sit in.
+const ATTR_MASK: &str = "[1, number % 3 = 0, number % 7 = 0]";
+
 const NS: i64 = 1_000_000_000;
 
 /// Extreme-epoch bucket labels (issue #59 re-audit): pre-1970
@@ -131,6 +143,16 @@ async fn exec(client: &ChClient, sql: &str) {
 /// SPAN scope every 7th (the dual-scope negation fixture — spans with no
 /// `env` row in either scope are the absent-key population). Running it
 /// twice is the at-least-once replay fixture: every row is a duplicate.
+///
+/// **Both stores carry every attribute** (issue #559). Until then the
+/// three attributes went into `trace_attrs_idx` only and every span row's
+/// arrays were EMPTY. That was invisible while the metrics filter read
+/// the index; with the filter on the span row it is not — measured, the
+/// identities below returned `0` against an expected `30`. The span-row
+/// arrays are built by masking one fixed element list, so the five arrays
+/// cannot fall out of alignment with each other or with the index rows,
+/// and `assert_stores_agree` at the end of the identities test is what
+/// checks that against the database rather than against this comment.
 async fn seed_corpus(client: &ChClient, db: &str) {
     let base_ns = base_s() * NS;
     exec(
@@ -138,7 +160,8 @@ async fn seed_corpus(client: &ChClient, db: &str) {
         &format!(
             "INSERT INTO {db}.trace_spans \
              (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
-              duration_ns, status_code, kind, payload_type, payload) \
+              duration_ns, status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -148,7 +171,14 @@ async fn seed_corpus(client: &ChClient, db: &str) {
                if(number % 6 = 0, 'deadline exceeded', ''), \
                {base_ns} + toInt64(number) * {NS}, \
                1000000, \
-               0, 1, 1, 'p' \
+               0, 1, 1, 'p', \
+               arrayFilter((x, k) -> k, ['http.status_code', 'env', 'env'], {ATTR_MASK}), \
+               arrayFilter((x, k) -> k, ['span', 'resource', 'span'], {ATTR_MASK}), \
+               arrayFilter((x, k) -> k, \
+                           [if(number % 4 = 0, '500', '200'), 'prod', 'prod'], {ATTR_MASK}), \
+               arrayFilter((x, k) -> k, ['int', 'string', 'string'], {ATTR_MASK}), \
+               arrayFilter((x, k) -> k, \
+                           [if(number % 4 = 0, 500., 200.), NULL, NULL], {ATTR_MASK}) \
              FROM numbers({CORPUS_SPANS})"
         ),
     )
@@ -157,11 +187,12 @@ async fn seed_corpus(client: &ChClient, db: &str) {
         client,
         &format!(
             "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+              duration_ns) \
              SELECT \
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {NS})), \
                'http.status_code', \
-               if(number % 4 = 0, '500', '200'), 'span', \
+               if(number % 4 = 0, '500', '200'), 'span', 'int', \
                if(number % 4 = 0, 500.0, 200.0), \
                {base_ns} + toInt64(number) * {NS}, \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
@@ -176,10 +207,11 @@ async fn seed_corpus(client: &ChClient, db: &str) {
             client,
             &format!(
                 "INSERT INTO {db}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                 (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+                  duration_ns) \
                  SELECT \
                    toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {NS})), \
-                   'env', 'prod', '{scope}', NULL, \
+                   'env', 'prod', '{scope}', 'string', NULL, \
                    {base_ns} + toInt64(number) * {NS}, \
                    toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                    toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
@@ -1722,6 +1754,13 @@ async fn metrics_internal_consistency_identities() {
         "post-2106 bucket labels must be the exact >UInt32-max millisecond values, not wrapped \
          mod 2^32"
     );
+
+    // Issue #559 criterion 11: the metrics filter reads the span row, so a
+    // fixture that seeds only `trace_attrs_idx` produces queries that
+    // match nothing and every count above would be an assertion about an
+    // empty answer. Last, so it sees every insert this test made —
+    // including the replay seed, which writes every row a second time.
+    pulsus_testkit::assert_stores_agree(&DB.to_string());
 }
 
 /// Isolated DB for the issue #237 ns→seconds ULP gate.

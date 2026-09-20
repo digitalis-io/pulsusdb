@@ -375,3 +375,70 @@ fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
         "the entry must state what changed, not only what is true now"
     );
 }
+
+/// **Issue #559 criterion 6: the ledger entry naming the lost prune must
+/// name a test that EXISTS, and that test must be in the file the entry
+/// says it is in.**
+///
+/// The prune this change gives up — `service_time` cannot serve a metrics
+/// filter that reads the span row's attribute arrays — is recorded in
+/// `traceql-attribute-resolves-to-one-element`, and the only thing
+/// stopping that record becoming a sentence about a test somebody deleted
+/// is this binding.
+///
+/// **Anchored on a FENCE, not on wording.** The entry's prose describes
+/// the test in English, so a scan for a phrase would match the prose and
+/// pass whatever the code holds. The fenced block is a marker the
+/// surrounding prose cannot contain.
+///
+/// *RED when:* the fence is missing, names a file that is not there, or
+/// names a function the file does not define. Measured both ways: green
+/// with the function present, and
+/// `ledger guarding test "metrics_attribute_filter_projection_loss_is_recorded"
+/// is missing from crates/pulsus-read/tests/traces_metrics_explain.rs`
+/// when it is deleted.
+#[test]
+fn the_projection_loss_entry_names_a_test_that_exists() {
+    let ledger = ledger();
+    let body = entry_body(&ledger, "traceql-attribute-resolves-to-one-element");
+
+    let fence = body
+        .split("```")
+        .nth(1)
+        .expect("the entry must carry a fenced block declaring its guarding test");
+    let field = |name: &str| -> String {
+        fence
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{name}: ")))
+            .unwrap_or_else(|| {
+                panic!("the fenced block must carry a `{name}:` line, got:\n{fence}")
+            })
+            .trim()
+            .to_string()
+    };
+    let test_name = field("guarding-test");
+    let file = field("guarding-file");
+
+    let path = workspace_root().join(&file);
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("ledger guarding file {file} does not exist: {e}"));
+    assert!(
+        source.contains(&format!("fn {test_name}(")),
+        "ledger guarding test {test_name:?} is missing from {file}. The entry records a \
+         projection this change gives up; a record whose guard no longer exists is a claim \
+         nobody can check."
+    );
+    // The entry must also say what the loss IS, in the terms the guard
+    // asserts — the table read, not a byte count.
+    let squashed = squash(body);
+    assert!(
+        squashed.contains("ReadFromMergeTree (service_time)")
+            && squashed.contains("ReadFromMergeTree (trace_spans)"),
+        "the entry must state which table each side reads, since that identity is what the \
+         guard asserts"
+    );
+    assert!(
+        squashed.contains("/api/traces/v1/metrics/query_range"),
+        "a ledger row must name the endpoint it is about"
+    );
+}

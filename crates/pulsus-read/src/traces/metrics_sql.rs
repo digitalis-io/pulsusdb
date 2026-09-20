@@ -25,16 +25,44 @@
 //! client-side rate division always uses the full step.
 //!
 //! Leaf lowering reuses T5's shared compiler ([`super::filter`]):
-//! physical leaves inline on `trace_spans` columns; attribute leaves
-//! become index-served `(trace_id, span_id) [NOT] IN (SELECT … FROM
-//! trace_attrs_idx …)` semi-joins confined to the `(key[, val][, scope])`
-//! prefix plus date/time pruning (`NOT IN` with the positive predicate is
-//! the ratified `!=`/`!~` absent-key rule: a span with no positive index
-//! row is counted). A `resource.service.name = "…"` comparison sitting as
-//! a direct conjunct on the **root AND spine** — never inside or under
-//! any `||` — is hoisted to `PREWHERE service = '…'` to select the
+//! physical leaves inline on `trace_spans` columns; attribute leaves are
+//! answered ON THE SPAN ROW (issue #559) by the same locate-then-test
+//! column the search route's hydration statement carries —
+//! [`super::filter::probe_column`] — so a span that stores one key twice
+//! gets the same answer from a search and from a metric. Before #559 an
+//! attribute leaf lowered to `(trace_id, span_id) [NOT] IN (SELECT …
+//! FROM trace_attrs_idx …)`, which matches a span when ANY of its
+//! attribute rows matches; the index carries no element ordinal, so the
+//! one-element rule is expressible only on the span row. The locator is
+//! an expression alias declared in a `WITH` clause on the statement that
+//! reads the span table, and `NOT (…)` around the positive test is the
+//! ratified `!=`/`!~` absent-key rule (a span carrying no such element is
+//! counted). A `resource.service.name = "…"` comparison sitting as a
+//! direct conjunct on the **root AND spine** — never inside or under any
+//! `||` — is hoisted to `PREWHERE service = '…'` to select the
 //! `service_time` projection (plan v2 delta 4: `Or` nodes are opaque,
 //! rendered wholesale in `WHERE`, no hoist).
+//!
+//! **A filter carrying an attribute condition loses that projection**,
+//! because `service_time` holds 14 named columns and not the attribute
+//! arrays (migration id 45, `crates/pulsus-schema/src/catalog.rs:986-995`).
+//! Measured on a 2,000,000-span corpus — 8 attributes per span, 50
+//! services with `checkout` 1 in 50, ClickHouse 26.3.29.7 at
+//! `max_block_size = 65409`, `use_query_condition_cache = 0`,
+//! `optimize_move_to_prewhere = 1`: `{ resource.service.name = "checkout" }
+//! | rate()` reads `ReadFromMergeTree (service_time)` at `Granules: 7/245`
+//! and 1,892,563 bytes; `{ resource.service.name = "checkout" &&
+//! span.http.status_code >= 500 } | rate()` reads
+//! `ReadFromMergeTree (trace_spans)` at `245/245` and 290,003,920 bytes,
+//! with `query_log.projections` empty. Granule and byte counts are
+//! layout-specific; the identity of the table read is what is gated.
+//! Recorded in
+//! `docs/benchmarks/traces-differential-ledger.md`
+//! (`traceql-attribute-resolves-to-one-element`) and gated by
+//! `tests/traces_metrics_explain.rs`'s
+//! `metrics_attribute_filter_projection_loss_is_recorded`. A filter with
+//! no attribute condition declares no `WITH` item and keeps the
+//! projection.
 
 use pulsus_traceql::{AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, Value};
 
@@ -98,38 +126,108 @@ fn time_clause(w: SnappedWindow) -> String {
 
 /// One compiled spanset filter, rendered for the single-query metrics
 /// pushdown: an optional `PREWHERE` fragment (the hoisted root-AND-spine
-/// service equality) and an optional residual `WHERE` boolean expression.
+/// service equality), an optional residual `WHERE` boolean expression,
+/// and the attribute locators those fragments read (issue #559).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterSql {
     pub prewhere: Option<String>,
     pub where_expr: Option<String>,
+    /// `WITH` items, each already `<expr> AS <alias>`, in render order —
+    /// rendered on the (sub)SELECT that reads the span table, never on an
+    /// outer wrapper, and **not rendered at all when empty**.
+    ///
+    /// Empty is the common case and it is load-bearing, not tidiness: a
+    /// locator rendered into a predicate of a statement whose filter
+    /// carries no attribute condition costs the `service_time`
+    /// projection. Measured on a 2,000,000-span corpus, 26.3.29.7, on
+    /// `{ resource.service.name = "checkout" } | rate()`: `Granules:
+    /// 5/245` and 1,351,712 read bytes through the projection become
+    /// `245/245`, 102,001,952 bytes and `query_log.projections = []` when
+    /// the statement's predicate references a locator. An UNREFERENCED
+    /// `WITH` item costs nothing — the optimiser removes it, measured
+    /// identical both ways — so the property that matters is that no
+    /// predicate mentions a locator, which is what having no item at all
+    /// guarantees.
+    pub with_items: Vec<String>,
+}
+
+/// One compiled filter body as a single boolean expression plus the
+/// locators it reads (issue #559) — `compare()`'s selection predicate,
+/// and the search route's `| by()` cardinality preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoolSql {
+    pub expr: String,
+    /// See [`FilterSql::with_items`]. The caller renders these onto the
+    /// SAME statement its `expr` lands in.
+    pub with_items: Vec<String>,
+}
+
+/// The `WITH` prefix for a statement that reads the span table, or the
+/// empty string when there is nothing to declare (issue #559).
+///
+/// `indent` is the column the statement's own body sits at, so the item
+/// list and the `SELECT` after it line up with the builder that called
+/// this: `""` at the top level, `"  "` inside a dedup subquery, `"    "`
+/// and `"      "` inside `compare()`'s nested ones.
+///
+/// **This is an expression alias, not a common table expression.** The
+/// committed corpus is gated by `tests/live_sql_corpus_ast.rs`, which
+/// asks ClickHouse's own parser for the AST and refuses a `WithElement`
+/// node; measured on 26.3.29.7, this form yields 0 of them and
+/// `WITH q AS (SELECT 1 AS n) SELECT n FROM q` yields 1.
+/// The two filters' locator lists, in declaration order — the outer
+/// filter's first (issue #559). Only `compare()` renders two filters into
+/// one statement; every other builder passes one list straight to
+/// [`with_clause`].
+fn merge_with(outer: &[String], inner: &[String]) -> Vec<String> {
+    outer.iter().chain(inner.iter()).cloned().collect()
+}
+
+fn with_clause(items: &[String], indent: &str) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        "WITH {}\n{indent}",
+        items.join(&format!(",\n{indent}     "))
+    )
 }
 
 /// Compiles one `{...}` filter body into its metrics `PREWHERE`/`WHERE`
-/// fragments. `body: None` is the `{}` match-all (time-only) filter.
-/// Regexes are validated at plan time — since issue #282 by the act of
-/// rendering them (`filter.rs`'s checked escaper), not by a separate
-/// pre-check — so a bad pattern is a `400`, never a mid-query server
-/// error.
+/// fragments and the locators they read. `body: None` is the `{}`
+/// match-all (time-only) filter. Regexes are validated at plan time —
+/// since issue #282 by the act of rendering them (`filter.rs`'s checked
+/// escaper), not by a separate pre-check — so a bad pattern is a `400`,
+/// never a mid-query server error.
+///
+/// `attrs_table` and `window` are no longer read (issue #559 moved the
+/// attribute leaf off `trace_attrs_idx`, and with it the only date/time
+/// pruning this function rendered). The signature is kept so every call
+/// site and every builder input struct stays as it was; `metrics_sql`'s
+/// other consumers of both — `compare()`'s attribute enumeration and the
+/// window clauses — are unchanged.
 pub fn compile_filter_predicate(
     body: Option<&FieldExpr>,
-    attrs_table: &str,
-    window: SnappedWindow,
+    _attrs_table: &str,
+    _window: SnappedWindow,
 ) -> Result<FilterSql, PlanError> {
     let Some(body) = body else {
         return Ok(FilterSql {
             prewhere: None,
             where_expr: None,
+            with_items: Vec::new(),
         });
     };
     let (prewhere, remainder) = extract_root_service_eq(body);
+    let mut sink = LeafSink::new("");
     let where_expr = match &remainder {
-        Some(expr) => Some(render_expr(expr, attrs_table, window)?),
+        Some(expr) => Some(render_expr(expr, &mut sink)?),
         None => None,
     };
     Ok(FilterSql {
         prewhere,
         where_expr,
+        with_items: sink.with_items,
     })
 }
 
@@ -198,16 +296,78 @@ fn recombine(lhs: Option<FieldExpr>, rhs: Option<FieldExpr>) -> Option<FieldExpr
 /// Compiles a filter body into a single boolean SQL expression (issue
 /// #182, compare's `selection`): no `PREWHERE` hoisting — the whole filter
 /// renders as one per-span predicate (`service = '…'` inline, attribute
-/// leaves as `[NOT] IN` semi-joins). `None` (the `{}` match-all) is `1`.
-/// Regexes are validated at plan time.
+/// leaves as the span row's locate-then-test column). `None` (the `{}`
+/// match-all) is `1`. Regexes are validated at plan time.
+///
+/// `alias_prefix` namespaces every locator alias this compilation
+/// declares (issue #559). `compare()` renders its outer filter and its
+/// selection predicate into ONE statement, and each numbers its leaves
+/// from `0`, so the selection passes `"c"` and the outer filter passes
+/// `""`. Two compilations sharing a prefix in one statement is a hard
+/// server error, not a silent pick: measured on 26.3.29.7, two `WITH`
+/// items with the same name and different expressions give
+/// `Code: 179 … MULTIPLE_EXPRESSIONS_FOR_ALIAS`.
+///
+/// `attrs_table` and `window` are kept for the signature's sake and are
+/// no longer read — see [`compile_filter_predicate`].
 pub fn compile_filter_bool(
     body: Option<&FieldExpr>,
-    attrs_table: &str,
-    window: SnappedWindow,
-) -> Result<String, PlanError> {
+    _attrs_table: &str,
+    _window: SnappedWindow,
+    alias_prefix: &str,
+) -> Result<BoolSql, PlanError> {
     match body {
-        None => Ok("1".to_string()),
-        Some(expr) => render_expr(expr, attrs_table, window),
+        None => Ok(BoolSql {
+            expr: "1".to_string(),
+            with_items: Vec::new(),
+        }),
+        Some(expr) => {
+            let mut sink = LeafSink::new(alias_prefix);
+            let rendered = render_expr(expr, &mut sink)?;
+            Ok(BoolSql {
+                expr: rendered,
+                with_items: sink.with_items,
+            })
+        }
+    }
+}
+
+/// The per-compilation state one filter body's attribute leaves share
+/// (issue #559): the alias prefix, the next leaf ordinal, and the `WITH`
+/// items collected so far.
+///
+/// The ordinal is per COMPILATION and not per statement, so a filter's
+/// aliases are a function of that filter alone; distinctness across two
+/// filters in one statement is [`Self::prefix`]'s job.
+struct LeafSink<'a> {
+    prefix: &'a str,
+    next: usize,
+    with_items: Vec<String>,
+}
+
+impl<'a> LeafSink<'a> {
+    fn new(prefix: &'a str) -> Self {
+        Self {
+            prefix,
+            next: 0,
+            with_items: Vec::new(),
+        }
+    }
+
+    /// Renders one attribute leaf's span-row test and records its
+    /// locators. `negated` inverts the POSITIVE test — the ratified
+    /// absent-key rule: a span carrying no such element fails the
+    /// positive test and is therefore counted by the negation.
+    fn attr_leaf(&mut self, probe: &AttrProbe, negated: bool) -> Result<String, PlanError> {
+        let idx = self.next;
+        self.next += 1;
+        let mut column = filter::probe_column(probe, self.prefix, idx)?;
+        self.with_items.append(&mut column.with_items);
+        Ok(if negated {
+            format!("NOT ({})", column.test)
+        } else {
+            format!("({})", column.test)
+        })
     }
 }
 
@@ -220,12 +380,9 @@ fn static_bool_sql(value: bool) -> String {
 /// Renders one filter subtree as a boolean SQL expression: binary nodes
 /// are always parenthesized (`(lhs AND rhs)`), physical leaves render via
 /// the shared compiler's pre-escaped fragments, attribute leaves become
-/// `[NOT] IN` semi-joins.
-fn render_expr(
-    expr: &FieldExpr,
-    attrs_table: &str,
-    window: SnappedWindow,
-) -> Result<String, PlanError> {
+/// the span row's locate-then-test column with its locators recorded on
+/// `sink` (issue #559).
+fn render_expr(expr: &FieldExpr, sink: &mut LeafSink<'_>) -> Result<String, PlanError> {
     match expr {
         // The comparison arms, now dispatched on operand SHAPE (the
         // collapse moved this out of the parser). Only the
@@ -253,10 +410,12 @@ fn render_expr(
                 ));
             };
             let leaf = filter::compile_leaf(field, *op, value)?;
-            lower_leaf(&leaf, attrs_table, window)
+            lower_leaf(&leaf, sink)
         }
-        // Attribute existence (issue #185 `existence.*`): a key-only
-        // membership semi-join. `resource.service.name != nil` and the
+        // Attribute existence (issue #185 `existence.*`): the locator
+        // alone — `<alias> != 0` — because "some element carries this
+        // key" is exactly what the locate answers, with no value test
+        // beside it. `resource.service.name != nil` and the
         // like are answerable on the metrics surface (the grafana
         // `rate() by(service)` case). The absent form (`= nil`) parses to
         // `Not(Exists)` and is rejected below with the other negations.
@@ -283,16 +442,16 @@ fn render_expr(
                     ));
                 }
             };
-            semi_join_sql(&probe, false, attrs_table, window)
+            sink.attr_leaf(&probe, false)
         }
-        // `= nil` (absence) has no positive membership semi-join — the
+        // `= nil` (absence) has no positive form to negate here — the
         // same rejection the `Not(Exists)` shape used to take.
         FieldExpr::Exists { negated: true, .. } => Err(PlanError::TypeMismatch(
             "absence checks are not supported in metrics filters".to_string(),
         )),
         // Issue #458: `{ .a }` IS `.a = true` — plain equality against the
         // boolean literal, which `filter::compile_leaf` already lowers to
-        // the ordinary index-served attribute semi-join, so this arm
+        // the ordinary attribute leaf, so this arm
         // inherits that lowering rather than inventing one. `filter.rs`'s
         // `LeafEval::BoolTruth` doc records the measured asymmetry that
         // makes this sound: `{ .a }` is equality and only `{ !.a }` demands
@@ -306,7 +465,7 @@ fn render_expr(
         // changed.
         FieldExpr::Field(field @ Field::Attribute { .. }) => {
             let leaf = filter::compile_leaf(field, ComparisonOp::Eq, &Value::Bool(true))?;
-            lower_leaf(&leaf, attrs_table, window)
+            lower_leaf(&leaf, sink)
         }
         // A bare INTRINSIC at predicate position (`{ name }`) never reaches
         // here: `pulsus_traceql::validate` rejects it with the reference's
@@ -351,8 +510,8 @@ fn render_expr(
             lhs,
             rhs,
         } => {
-            let l = render_expr(lhs, attrs_table, window)?;
-            let r = render_expr(rhs, attrs_table, window)?;
+            let l = render_expr(lhs, sink)?;
+            let r = render_expr(rhs, sink)?;
             let sym = match op {
                 BoolOp::And => "AND",
                 BoolOp::Or => "OR",
@@ -375,18 +534,14 @@ fn render_expr(
 /// below enumerates the whole `Field × ComparisonOp × Value` product with
 /// exhaustive matches, so adding a variant to any of those enums fails to
 /// compile rather than silently narrowing the checked domain.
-fn lower_leaf(
-    leaf: &CompiledLeaf,
-    attrs_table: &str,
-    window: SnappedWindow,
-) -> Result<String, PlanError> {
+fn lower_leaf(leaf: &CompiledLeaf, sink: &mut LeafSink<'_>) -> Result<String, PlanError> {
     match &leaf.eval {
         // Issue #282: the renderers below validate every regex as they
         // escape it, so the two separate pre-render validators this arm
         // used to call are gone — one act, no second opinion to drift
         // from the emitted SQL.
         LeafEval::Physical(p) => filter::physical_sql(p),
-        LeafEval::Attr { probe, negated } => semi_join_sql(probe, *negated, attrs_table, window),
+        LeafEval::Attr { probe, negated } => sink.attr_leaf(probe, *negated),
         // Issue #458: the root/non-root region of `nestedSetParent` has an
         // exact per-span SQL form; everything else in the family keeps a
         // clean 400 (see `nested_set_metrics_sql`).
@@ -504,33 +659,6 @@ fn nested_set_metrics_sql(
     })
 }
 
-/// One attribute leaf's index-served membership semi-join, confined to
-/// its `(key[, val][, scope])` prefix plus the window's date/time
-/// pruning. `negated` renders `NOT IN` around the **positive** predicate
-/// — the ratified absent-key rule. Fallible since issue #282: the
-/// positive predicate is rendered by the checked escaper (a negated regex
-/// leaf still renders — and therefore still validates — its positive
-/// form).
-fn semi_join_sql(
-    probe: &AttrProbe,
-    negated: bool,
-    attrs_table: &str,
-    window: SnappedWindow,
-) -> Result<String, PlanError> {
-    let mut predicate = format!("key = {}", escape::ch_string(&probe.key));
-    predicate.push_str(&format!(" AND {}", filter::value_pred_sql(&probe.pred)?));
-    if let Some(scope) = probe.scope {
-        predicate.push_str(&format!(" AND scope = {}", escape::ch_string(scope)));
-    }
-    let membership = if negated { "NOT IN" } else { "IN" };
-    Ok(format!(
-        "(trace_id, span_id) {membership} (SELECT trace_id, span_id FROM {attrs_table} \
-         WHERE {} AND {} AND {predicate})",
-        date_clause(window),
-        time_clause(window)
-    ))
-}
-
 /// The right-closed RANGE bucket label, in epoch milliseconds: the
 /// smallest multiple of `step_ms` that is `>=` the span's instant.
 ///
@@ -607,8 +735,9 @@ pub fn metrics_range_sql(
     window: SnappedWindow,
     step_ms: i64,
 ) -> String {
+    let with = with_clause(&filter.with_items, "");
     let mut sql = format!(
-        "SELECT {} AS t,\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
+        "{with}SELECT {} AS t,\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
         range_bucket_expr(step_ms)
     );
     if let Some(prewhere) = &filter.prewhere {
@@ -628,7 +757,8 @@ pub fn metrics_range_sql(
 /// oracle). The rate division by the window width happens client-side at
 /// the encode boundary, like the range path's division by the step.
 pub fn metrics_instant_sql(spans_table: &str, filter: &FilterSql, window: SnappedWindow) -> String {
-    let mut sql = format!("SELECT uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
+    let with = with_clause(&filter.with_items, "");
+    let mut sql = format!("{with}SELECT uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
     if let Some(prewhere) = &filter.prewhere {
         sql.push_str(&format!("PREWHERE {prewhere}\n"));
     }
@@ -708,8 +838,9 @@ pub fn metrics_count_range_sql(
     keys: &[GroupKeySql],
 ) -> String {
     let (gsel, ggroup, gorder) = group_fragments(keys);
+    let with = with_clause(&filter.with_items, "");
     let mut sql = format!(
-        "SELECT {} AS t{gsel},\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
+        "{with}SELECT {} AS t{gsel},\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
         range_bucket_expr(step_ms)
     );
     push_prewhere_where(&mut sql, filter, window);
@@ -730,7 +861,9 @@ pub fn metrics_count_instant_sql(
         return metrics_instant_sql(spans_table, filter, window);
     }
     let cols = gsel.trim_start_matches(", ");
-    let mut sql = format!("SELECT {cols}, uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
+    let with = with_clause(&filter.with_items, "");
+    let mut sql =
+        format!("{with}SELECT {cols}, uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
     push_prewhere_where(&mut sql, filter, window);
     sql.push_str(&format!(
         "\nGROUP BY {}\nORDER BY {}",
@@ -755,8 +888,9 @@ pub fn metrics_agg_range_sql(
 ) -> String {
     let (gsel, ggroup, gorder) = group_fragments(keys);
     let mut inner = format!(
-        "SELECT {} AS t{gsel}, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+        "{}SELECT {} AS t{gsel}, trace_id, span_id,\n         any(duration_ns) AS val\n  \
          FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  "),
         range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
@@ -778,8 +912,10 @@ pub fn metrics_agg_instant_sql(
 ) -> String {
     let (gsel, ggroup, gorder) = group_fragments(keys);
     if keys.is_empty() {
-        let mut inner =
-            format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+        let mut inner = format!(
+            "{}SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ",
+            with_clause(&filter.with_items, "  ")
+        );
         push_prewhere_where_indented(&mut inner, filter, window);
         inner.push_str("\n  GROUP BY trace_id, span_id");
         return format!(
@@ -791,7 +927,8 @@ pub fn metrics_agg_instant_sql(
     let group = ggroup.trim_start_matches(", ");
     let order = gorder.trim_start_matches(", ");
     let mut inner = format!(
-        "SELECT {cols}, trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  "
+        "{}SELECT {cols}, trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  ")
     );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str(&format!("\n  GROUP BY {group}, trace_id, span_id"));
@@ -826,8 +963,9 @@ pub fn metrics_quantile_range_sql(
     quantiles: &[f64],
 ) -> String {
     let mut inner = format!(
-        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+        "{}SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
          FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  "),
         range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
@@ -846,8 +984,10 @@ pub fn metrics_quantile_instant_sql(
     window: SnappedWindow,
     quantiles: &[f64],
 ) -> String {
-    let mut inner =
-        format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+    let mut inner = format!(
+        "{}SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  ")
+    );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY trace_id, span_id");
     format!(
@@ -907,8 +1047,9 @@ pub fn metrics_log2_bucket_range_sql(
     step_ms: i64,
 ) -> String {
     let mut inner = format!(
-        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+        "{}SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
          FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  "),
         range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
@@ -926,8 +1067,10 @@ pub fn metrics_log2_bucket_instant_sql(
     filter: &FilterSql,
     window: SnappedWindow,
 ) -> String {
-    let mut inner =
-        format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+    let mut inner = format!(
+        "{}SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  ")
+    );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY trace_id, span_id");
     format!(
@@ -961,8 +1104,9 @@ pub fn metrics_exemplar_range_sql(
     keys: &[GroupKeySql],
 ) -> String {
     let (gsel, ggroup, gorder) = group_fragments(keys);
+    let with = with_clause(&filter.with_items, "");
     let mut sql = format!(
-        "SELECT {} AS t{gsel},\n       \
+        "{with}SELECT {} AS t{gsel},\n       \
          groupArraySample({k}, 1)(tuple(trace_id, timestamp_ns)) AS ex\nFROM {spans_table}\n",
         range_bucket_expr(step_ms)
     );
@@ -988,8 +1132,9 @@ fn exemplar_duration_inner(
     step_ms: i64,
 ) -> String {
     let mut inner = format!(
-        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val, \
+        "{}SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val, \
          any(timestamp_ns) AS ts\n  FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  "),
         range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
@@ -1091,7 +1236,11 @@ pub fn metrics_series_probe_sql(
         .map(|(i, k)| format!("{} AS g{i}", k.col_expr))
         .collect();
     let group: Vec<String> = (0..keys.len()).map(|i| format!("g{i}")).collect();
-    let mut inner = format!("SELECT {}\n  FROM {spans_table}\n  ", cols.join(", "));
+    let mut inner = format!(
+        "{}SELECT {}\n  FROM {spans_table}\n  ",
+        with_clause(&filter.with_items, "  "),
+        cols.join(", ")
+    );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str(&format!(
         "\n  GROUP BY {}\n  LIMIT {}",
@@ -1115,12 +1264,16 @@ pub fn search_by_probe_sql(
     group_col: &str,
     cap: u64,
 ) -> Result<String, PlanError> {
-    // `trace_spans` prunes on `timestamp_ns` only (no `date` column — that
-    // partition column lives on `trace_attrs_idx`, and each attr semi-join
-    // inside `filter_bool` carries its own date/time pruning internally).
-    let filter_bool = compile_filter_bool(body, attrs_table, window)?;
+    // `trace_spans` prunes on `timestamp_ns` only (no `date` column —
+    // that partition column lives on `trace_attrs_idx`, which since issue
+    // #559 this statement does not read at all: the attribute leaves are
+    // answered on the span row, by the same rule the search this preflight
+    // guards applies).
+    let filter_bool = compile_filter_bool(body, attrs_table, window, "")?;
+    let with = with_clause(&filter_bool.with_items, "  ");
+    let expr = &filter_bool.expr;
     let inner = format!(
-        "SELECT {group_col} AS g0\n  FROM {spans_table}\n  WHERE {} AND ({filter_bool})\
+        "{with}SELECT {group_col} AS g0\n  FROM {spans_table}\n  WHERE {} AND ({expr})\
          \n  GROUP BY g0\n  LIMIT {}",
         time_clause(window),
         cap + 1
@@ -1152,8 +1305,10 @@ pub struct CompareSqlInput<'a> {
     pub spans_table: &'a str,
     pub attrs_table: &'a str,
     pub outer: &'a FilterSql,
-    /// The pre-compiled selection predicate (`compile_filter_bool`).
-    pub inner_bool: &'a str,
+    /// The pre-compiled selection predicate (`compile_filter_bool`),
+    /// carrying its own locators. Issue #559: its aliases are prefixed
+    /// `c`, because they land in the SAME statement as `outer`'s.
+    pub inner_bool: &'a BoolSql,
     pub window: SnappedWindow,
     /// The bucket-start expression aliased `t` (the `toStartOfInterval`
     /// form for range, a literal ms for instant).
@@ -1201,18 +1356,26 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // `(start, end]` on the span's own start time, ANDed into the
     // selection predicate — never into the filter. See
     // [`CompareSqlInput::sel_window`].
+    let sel_expr = &inner_bool.expr;
     let is_sel = match sel_window {
         Some((start_ns, end_ns)) => {
             // Right-CLOSED, unlike this module's evaluation window: built
             // through the constructor named for its own operators so the
             // two conventions in this file cannot be confused (#525).
             let sel = WindowSql::start_open_end_closed(start_ns, end_ns);
-            format!("(({inner_bool}) AND {})", sel.time_clause())
+            format!("(({sel_expr}) AND {})", sel.time_clause())
         }
-        None => format!("({inner_bool})"),
+        None => format!("({sel_expr})"),
     };
+    // Both filters render into THIS statement, so both alias sets are
+    // declared here, outer first (issue #559). They cannot collide: the
+    // selection compiles under the `c` prefix.
+    let with = with_clause(
+        &merge_with(&outer.with_items, &inner_bool.with_items),
+        "    ",
+    );
     let mut raw = format!(
-        "SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
+        "{with}SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
          status_code AS i_status, service AS i_service, status_message AS i_status_message, \
          scope_name AS i_scope_name, scope_version AS i_scope_version, \
          {is_sel} AS is_sel\n    FROM {spans_table}\n    "
@@ -1321,8 +1484,8 @@ pub struct CompareExemplarSqlInput<'a> {
     pub attrs_table: &'a str,
     pub outer: &'a FilterSql,
     /// The pre-compiled selection predicate (`compile_filter_bool`) — the
-    /// same string [`CompareSqlInput::inner_bool`] carries.
-    pub inner_bool: &'a str,
+    /// same value [`CompareSqlInput::inner_bool`] carries.
+    pub inner_bool: &'a BoolSql,
     pub window: SnappedWindow,
     /// The range-form bucket expression aliased `t`.
     pub bucket_expr: &'a str,
@@ -1389,18 +1552,23 @@ pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -
         k,
     } = *input;
     // Byte-identical construction to `metrics_compare_sql`'s `is_sel`.
+    let sel_expr = &inner_bool.expr;
     let is_sel = match sel_window {
         Some((start_ns, end_ns)) => {
             // Right-CLOSED, unlike this module's evaluation window: built
             // through the constructor named for its own operators so the
             // two conventions in this file cannot be confused (#525).
             let sel = WindowSql::start_open_end_closed(start_ns, end_ns);
-            format!("(({inner_bool}) AND {})", sel.time_clause())
+            format!("(({sel_expr}) AND {})", sel.time_clause())
         }
-        None => format!("({inner_bool})"),
+        None => format!("({sel_expr})"),
     };
+    let with = with_clause(
+        &merge_with(&outer.with_items, &inner_bool.with_items),
+        "      ",
+    );
     let mut raw = format!(
-        "SELECT {bucket_expr} AS t, trace_id, span_id, timestamp_ns AS ts, \
+        "{with}SELECT {bucket_expr} AS t, trace_id, span_id, timestamp_ns AS ts, \
          {is_sel} AS is_sel\n      FROM {spans_table}\n      "
     );
     push_prewhere_where_indented(&mut raw, outer, window);
@@ -1602,29 +1770,43 @@ mod tests {
         );
     }
 
-    fn compile_bool(q: &str) -> String {
-        compile_filter_bool(Some(&body(q)), "trace_attrs_idx", W).expect("compiles")
+    fn compile_bool(q: &str) -> BoolSql {
+        compile_filter_bool(Some(&body(q)), "trace_attrs_idx", W, "").expect("compiles")
     }
 
     #[test]
-    fn attribute_existence_renders_a_key_only_semi_join_on_the_metrics_surface() {
+    fn attribute_existence_renders_the_locator_alone_on_the_span_row() {
         // Issue #185: `resource.service.name != nil` (the grafana
         // `rate() by(service)` idiom, the code path the replay-ledger
-        // deletion depends on) renders a key-only membership semi-join into
-        // the attr index — NOT a value predicate.
-        let sql = compile_bool(r#"{ resource.service.name != nil }"#);
-        assert!(sql.contains("(trace_id, span_id) IN"), "{sql}");
-        assert!(sql.contains("FROM trace_attrs_idx"), "{sql}");
-        assert!(sql.contains("key = 'service.name'"), "{sql}");
-        assert!(sql.contains("scope = 'resource'"), "{sql}");
-        assert!(
-            sql.contains("AND 1"),
-            "the key-only (no value) predicate: {sql}"
+        // deletion depends on) asks only whether the span carries the key.
+        // Issue #559: that is the locator's own `!= 0`, with no value test
+        // beside it and no read of `trace_attrs_idx` at all.
+        let b = compile_bool(r#"{ resource.service.name != nil }"#);
+        assert_eq!(
+            b.with_items,
+            vec![
+                "arrayFirstIndex((k, s) -> k = 'service.name' AND s = 'resource', \
+                 attr_key, attr_scope) AS pi0"
+                    .to_string()
+            ]
         );
-        // Unscoped existence: no scope predicate.
+        assert_eq!(b.expr, "(pi0 != 0)");
+        assert!(!b.expr.contains("trace_attrs_idx"), "{}", b.expr);
+        assert!(
+            !b.expr.contains(" AND 1"),
+            "key existence IS `pi0 != 0`; `AND 1` would say it twice: {}",
+            b.expr
+        );
+        // Unscoped existence: the five-scope chain, each arm the constant
+        // `1` because presence at a scope IS the answer.
         let unscoped = compile_bool(r#"{ .a != nil }"#);
-        assert!(unscoped.contains("key = 'a' AND 1"), "{unscoped}");
-        assert!(!unscoped.contains("scope ="), "{unscoped}");
+        assert_eq!(unscoped.with_items.len(), 5);
+        assert!(unscoped.with_items[0].contains("k = 'a' AND s = 'span'"));
+        assert_eq!(
+            unscoped.expr,
+            "(if(pi0s != 0, 1, if(pi0r != 0, 1, if(pi0e != 0, 1, \
+             if(pi0l != 0, 1, if(pi0i != 0, 1, 0))))))"
+        );
     }
 
     #[test]
@@ -1632,12 +1814,12 @@ mod tests {
         // `= nil` is `Not(Exists)` — negation is unsupported on the metrics
         // filter path (a clean 400).
         assert!(matches!(
-            compile_filter_bool(Some(&body(r#"{ .a = nil }"#)), "trace_attrs_idx", W),
+            compile_filter_bool(Some(&body(r#"{ .a = nil }"#)), "trace_attrs_idx", W, ""),
             Err(PlanError::TypeMismatch(_))
         ));
         // Intrinsic existence is not an attribute — rejected.
         assert!(matches!(
-            compile_filter_bool(Some(&body(r#"{ name != nil }"#)), "trace_attrs_idx", W),
+            compile_filter_bool(Some(&body(r#"{ name != nil }"#)), "trace_attrs_idx", W, ""),
             Err(PlanError::TypeMismatch(_))
         ));
     }
@@ -1671,30 +1853,60 @@ mod tests {
     }
 
     #[test]
-    fn an_attr_leaf_renders_an_index_served_semi_join() {
+    fn an_attr_leaf_locates_one_element_and_tests_that_element() {
+        // Issue #559: the leaf reads the span row's own arrays. The
+        // locator is a `WITH` item, the test subscripts the arrays at the
+        // element it landed on, and `ifNull` keeps a `NULL` numeric
+        // reading falsy on both sides of a negation.
         let f = compile("{ span.http.status_code >= 500 }");
-        let expr = f.where_expr.expect("where");
-        assert!(
-            expr.starts_with(
-                "(trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx"
-            )
+        assert_eq!(
+            f.with_items,
+            vec![
+                "arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', \
+                 attr_key, attr_scope) AS pi0"
+                    .to_string()
+            ]
         );
-        assert!(expr.contains("date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"));
-        assert!(expr.contains(
-            "timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
-        ));
-        assert!(expr.contains("key = 'http.status_code' AND val_num >= 500 AND scope = 'span'"));
+        assert_eq!(
+            f.where_expr.as_deref(),
+            Some("((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))")
+        );
+        // Nothing reaches the attribute index, and no date partition
+        // clause survives: this statement reads `trace_spans` only.
+        let expr = f.where_expr.expect("where");
+        assert!(!expr.contains("trace_attrs_idx"), "{expr}");
+        assert!(!expr.contains("IN (SELECT"), "{expr}");
+        assert!(!expr.contains("toDate("), "{expr}");
     }
 
     #[test]
-    fn a_negated_attr_renders_not_in_around_the_positive_predicate() {
+    fn a_negated_attr_renders_not_around_the_positive_test() {
+        // The ratified absent-key rule: `NOT` wraps the POSITIVE test, so
+        // a span the locator finds nothing for fails the positive test and
+        // is therefore counted.
         let f = compile(r#"{ .env != "prod" }"#);
         let expr = f.where_expr.expect("where");
-        assert!(expr.contains("(trace_id, span_id) NOT IN (SELECT"));
-        assert!(expr.contains("key = 'env' AND val = 'prod'"));
+        assert!(expr.starts_with("NOT (if(pi0s != 0, "), "{expr}");
+        assert!(expr.contains("attr_val[pi0s] = 'prod'"), "{expr}");
+        // The unscoped chain walks all five attribute scopes, in
+        // precedence order, and each arm tests its OWN element: five
+        // presence locates, then the two MATCHING locates the
+        // multi-valued `event` and `link` scopes need because a
+        // condition there is any-element.
+        assert_eq!(f.with_items.len(), 7);
+        for (item, scope) in f.with_items.iter().zip(filter::UNSCOPED_SCOPE_CHAIN) {
+            assert!(item.contains(&format!("s = '{scope}'")), "{item}");
+            assert!(item.contains("(k, s) ->"), "{item}");
+        }
         assert!(
-            !expr.contains("scope ="),
-            "the unscoped form carries no scope clause (dual-scope negation): {expr}"
+            f.with_items[5].contains("(k, s, v) -> k = 'env' AND s = 'event' AND v = 'prod'"),
+            "{}",
+            f.with_items[5]
+        );
+        assert!(
+            f.with_items[6].contains("(k, s, v) -> k = 'env' AND s = 'link' AND v = 'prod'"),
+            "{}",
+            f.with_items[6]
         );
     }
 
@@ -2120,10 +2332,6 @@ mod tests {
     /// This test calls the lowering directly so the gate is hermetic.
     #[test]
     fn a_cross_type_operand_on_an_untyped_field_lowers_to_a_constant() {
-        let window = SnappedWindow {
-            start_ns: 1_700_000_000_000_000_000,
-            end_ns: 1_700_010_800_000_000_000,
-        };
         for (field, name) in [
             (
                 Field::Attribute {
@@ -2147,7 +2355,8 @@ mod tests {
                 &Value::Number("12345".to_string()),
             )
             .unwrap_or_else(|e| panic!("{name} must compile: {e}"));
-            let sql = lower_leaf(&leaf, "trace_attrs_idx", window)
+            let mut sink = LeafSink::new("");
+            let sql = lower_leaf(&leaf, &mut sink)
                 .unwrap_or_else(|e| panic!("{name} must lower on the metrics route: {e}"));
             assert_eq!(sql, "0", "{name} must lower to the match-nothing constant");
         }

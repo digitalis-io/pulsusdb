@@ -56,7 +56,10 @@ use pulsus_traceql::{
 use crate::logql::escape;
 use crate::logql::pipeline::PipelineError;
 
-use super::search_sql::byte_cap_expr;
+use super::search_sql::{
+    ProbeColumn, byte_cap_expr, locate_item, locate_matching_item, probe_chain, probe_test,
+    probe_value_exprs,
+};
 
 /// Table-name context for one compilation — `trace_spans{_dist}` /
 /// `trace_attrs_idx{_dist}` exactly as `chconfig` derives them.
@@ -1011,6 +1014,190 @@ pub(crate) const UNSCOPED_SCOPE_CHAIN: [&str; 5] = [
     SCOPE_LINK,
     "instrumentation",
 ];
+
+/// The unscoped chain's per-scope alias suffixes, index-aligned with
+/// [`UNSCOPED_SCOPE_CHAIN`] (issue #557).
+pub(crate) const UNSCOPED_ALIAS_SUFFIX: [&str; 5] = ["s", "r", "e", "l", "i"];
+
+/// The span row's own attribute arrays, subscripted at one located
+/// element (issue #557).
+///
+/// `null_is_false` is `true` here and nowhere else: on the search route
+/// the fragment is a PROJECTED column, and an unwrapped `NULL` numeric
+/// comparison makes it `Nullable(UInt8)`, which does not decode into
+/// `Vec<u8>`. On the metrics route (issue #559) the same fragment lands
+/// in a `WHERE` clause under a `NOT (…)` for a negated leaf, where an
+/// unwrapped `NULL` would make `NOT NULL` falsy and DROP a span the
+/// absent-key rule must count. One binding, two reasons, and neither
+/// route may unwrap it.
+pub(crate) fn span_row_cols<'a>(text: &'a str, num: &'a str) -> ValueCols<'a> {
+    ValueCols {
+        text,
+        num,
+        null_is_false: true,
+    }
+}
+
+/// The lambda parameter names [`super::search_sql::locate_matching_item`]
+/// binds (issue #557). Inside `arrayFirstIndex` a `NULL` lambda result is
+/// false and the function still returns `UInt32`, so no `ifNull` wrapper
+/// belongs there.
+pub(crate) const LAMBDA_COLS: ValueCols<'static> = ValueCols {
+    text: "v",
+    num: "n",
+    null_is_false: false,
+};
+
+/// Assembles one attribute condition's span-row predicate column
+/// (issue #557; moved here from `search_plan` by issue #559 so the search
+/// route and the metrics route render ONE text).
+///
+/// **The SHAPE primitives live in `search_sql`; the assembly lives here**,
+/// because rendering a regex is what validates it and a rejection must
+/// stay a `400`. `search_sql` has never been fallible and does not become
+/// so.
+///
+/// Three forms, and the difference is the scope's ARITY:
+///
+/// * a single-valued scope (`span`, `resource`, `instrumentation`) locates
+///   the one element the attribute resolves to and applies the value test
+///   to THAT element;
+/// * a multi-valued scope (`event`, `link`, and their reserved intrinsic
+///   discriminators) locates the first element that MATCHES, which keeps
+///   the any-element rule the tree already applies there and makes the
+///   same alias serve the fused value;
+/// * the unscoped form walks the five attribute scopes in precedence
+///   order and applies each scope's own rule, resolving to the first
+///   scope PRESENT.
+///
+/// `prefix` namespaces every alias this column declares (issue #559). One
+/// statement can carry two independently compiled filters — `compare()`'s
+/// outer filter and its selection predicate both render into the
+/// cross-tab's innermost `SELECT` — and each numbers its leaves from `0`.
+/// Without distinct prefixes the two alias sets collide, which ClickHouse
+/// answers with `Code: 179 … MULTIPLE_EXPRESSIONS_FOR_ALIAS` rather than
+/// picking one silently (measured, 26.3.29.7). The search route and the
+/// metrics outer filter pass `""`, which keeps every rendered alias byte
+/// for byte what issue #557 shipped.
+pub(crate) fn probe_column(
+    probe: &AttrProbe,
+    prefix: &str,
+    idx: usize,
+) -> Result<ProbeColumn, PlanError> {
+    let key_lit = escape::ch_string(&probe.key);
+    match probe.scope {
+        Some(scope) => {
+            let scope_lit = escape::ch_string(scope);
+            match scope_arity(scope) {
+                ScopeArity::Single => {
+                    let alias = format!("{prefix}pi{idx}");
+                    let (text, num) = (format!("attr_val[{alias}]"), format!("attr_num[{alias}]"));
+                    let frag = value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?;
+                    let test = if probe.pred.matches_any_value() {
+                        // Key existence IS `<alias> != 0`; rendering
+                        // `AND 1` beside it says the same thing twice.
+                        probe_test(&alias, None)
+                    } else {
+                        probe_test(&alias, Some(&frag))
+                    };
+                    Ok(ProbeColumn {
+                        with_items: vec![locate_item(&alias, &key_lit, &scope_lit)],
+                        test,
+                        value: Some(probe_value_exprs(&alias)),
+                    })
+                }
+                ScopeArity::Multi => {
+                    let alias = format!("{prefix}pm{idx}");
+                    let item = if probe.pred.matches_any_value() {
+                        // "Some element carries this key" is what the
+                        // two-array locate already answers, so the
+                        // matching form would read a third array to
+                        // decide something it has already decided.
+                        locate_item(&alias, &key_lit, &scope_lit)
+                    } else {
+                        let frag = value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
+                        locate_matching_item(
+                            &alias,
+                            &key_lit,
+                            &scope_lit,
+                            &frag,
+                            probe.pred.reads_numeric_column(),
+                        )
+                    };
+                    Ok(ProbeColumn {
+                        with_items: vec![item],
+                        test: probe_test(&alias, None),
+                        value: Some(probe_value_exprs(&alias)),
+                    })
+                }
+            }
+        }
+        None => {
+            let mut presence = Vec::with_capacity(UNSCOPED_SCOPE_CHAIN.len());
+            let mut matching = Vec::new();
+            let mut test_arms = Vec::with_capacity(UNSCOPED_SCOPE_CHAIN.len());
+            let mut value_arms = Vec::with_capacity(UNSCOPED_SCOPE_CHAIN.len());
+            let mut num_arms = Vec::with_capacity(UNSCOPED_SCOPE_CHAIN.len());
+            let mut kind_arms = Vec::with_capacity(UNSCOPED_SCOPE_CHAIN.len());
+            for (scope, suffix) in UNSCOPED_SCOPE_CHAIN.iter().zip(UNSCOPED_ALIAS_SUFFIX) {
+                let scope_lit = escape::ch_string(scope);
+                let present = format!("{prefix}pi{idx}{suffix}");
+                presence.push(locate_item(&present, &key_lit, &scope_lit));
+                // The element the fused value and the stored kind are
+                // read at — the same one the arm's test resolved to.
+                let at = match scope_arity(scope) {
+                    ScopeArity::Single => {
+                        let (text, num) = (
+                            format!("attr_val[{present}]"),
+                            format!("attr_num[{present}]"),
+                        );
+                        test_arms.push((
+                            format!("{present} != 0"),
+                            value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?,
+                        ));
+                        present.clone()
+                    }
+                    ScopeArity::Multi if probe.pred.matches_any_value() => {
+                        // Present at this scope means matched, so the arm
+                        // is the constant the value test renders to.
+                        test_arms.push((format!("{present} != 0"), "1".to_string()));
+                        present.clone()
+                    }
+                    ScopeArity::Multi => {
+                        let matched = format!("{prefix}pm{idx}{suffix}");
+                        let frag = value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
+                        matching.push(locate_matching_item(
+                            &matched,
+                            &key_lit,
+                            &scope_lit,
+                            &frag,
+                            probe.pred.reads_numeric_column(),
+                        ));
+                        test_arms.push((format!("{present} != 0"), format!("{matched} != 0")));
+                        matched
+                    }
+                };
+                let (value, num, kind) = probe_value_exprs(&at);
+                value_arms.push((format!("{present} != 0"), value));
+                num_arms.push((format!("{present} != 0"), num));
+                kind_arms.push((format!("{present} != 0"), kind));
+            }
+            presence.append(&mut matching);
+            Ok(ProbeColumn {
+                with_items: presence,
+                test: probe_chain(&test_arms, "0"),
+                value: Some((
+                    probe_chain(&value_arms, "''"),
+                    // The numeric chain's fallback is `NULL`, not `0`: a
+                    // span the chain resolves to no scope for has NO
+                    // number, and `0` is a number a stored value can be.
+                    probe_chain(&num_arms, "NULL"),
+                    probe_chain(&kind_arms, "''"),
+                )),
+            })
+        }
+    }
+}
 
 fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
     match scope {

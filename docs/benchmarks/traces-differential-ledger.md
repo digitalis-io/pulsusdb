@@ -1036,6 +1036,69 @@ when we are asking it to slow down, so we keep `429`; recorded as
   instrumentation. One value per span per attribute, and **every** operation
   uses it — the filter, the negation, `select()`, `avg()` and a `by()` key.
 
+- **Status, by route: shipped on the search route AND on the metrics routes.**
+  Issue [#559](https://github.com/digitalis-io/pulsusdb/issues/559) moved the
+  metrics filter onto the span row, so `/api/traces/v1/metrics/query_range`,
+  `/api/traces/v1/metrics/query` and the search route's `| by()` cardinality
+  preflight now answer a duplicated key the same way a search does. Until then
+  the metrics filter lowered an attribute condition to
+  `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)`, which
+  matches a span when **any** of its attribute rows matches — so a search and a
+  metric disagreed about which spans matched one filter. Measured on the
+  eight-span fixture below, six of eight conditions moved:
+
+  | the span's stored attributes | the query, as `\| count_over_time()` | before #559 | after |
+  |---|---|---|---|
+  | eight spans, three of them carrying `span.k` | `{ span.k = "x" }` | `3` | `2` |
+  | the same eight | `{ span.k != "x" }` | `5` | `6` |
+  | the same eight | `{ .k = "x" }` | `4` | `3` |
+  | the same eight | `{ span.n = 400 }` | `2` | `1` |
+  | the same eight | `{ span.n >= 400 }` | `2` | `1` |
+  | the same eight | `{ span.n != 400 }` | `6` | `7` |
+
+  The two that do **not** move are `{ span.k = "" }` and `{ span.n = 0 }`, both
+  `0` on either lowering: they are what keeps the `<locator> != 0` guard
+  honest, because element `0` of a `String` array reads `''` and
+  `ifNull(attr_num[0], 0)` reads `0`. Frozen live by
+  `a_metrics_attribute_condition_tests_the_element_the_span_resolves_to`
+  (`crates/pulsus-server/tests/traces_search_live.rs`), which asserts each row
+  on BOTH routes against one window.
+
+- **What issue #559 cost, and it is a cost rather than a wash.** The
+  `service_time` projection holds 14 named columns and not the attribute
+  arrays (migration id 45, `crates/pulsus-schema/src/catalog.rs:986-995`), so a
+  metrics filter carrying an attribute condition can no longer be served from
+  it. Measured on a 2,000,000-span corpus — 8 attributes per span, 50
+  services with `checkout` 1 in 50, `http.status_code = 500` on 1 span in 100,
+  ClickHouse 26.3.29.7 at `max_block_size = 65409`,
+  `use_query_condition_cache = 0`, `optimize_move_to_prewhere = 1`,
+  rebuilt by `docs/benchmarks/issue559-metrics-filter-bytes.sh`'s corpus rules —
+  `/api/traces/v1/metrics/query_range` with
+  `{ resource.service.name = "checkout" } | rate()` reads
+  `ReadFromMergeTree (service_time)` at `Granules: 7/245`, 57,344 rows and
+  1,892,563 bytes; adding `&& span.http.status_code >= 500` to the same filter
+  reads `ReadFromMergeTree (trace_spans)` at `245/245`, 2,000,000 rows and
+  290,003,920 bytes, with `query_log.projections` empty. **Granule and byte
+  counts are layout-specific**; what the gate asserts is the identity of the
+  table read. Whether the attribute arrays
+  should get a service-sorted path of their own is with the owner and is not
+  scheduled. The guarding test names itself here so it cannot be deleted
+  quietly:
+
+  ```
+  guarding-test: metrics_attribute_filter_projection_loss_is_recorded
+  guarding-file: crates/pulsus-read/tests/traces_metrics_explain.rs
+  ```
+
+- **One refusal went away with it.** Before #559 a metrics attribute condition
+  matching more spans than the semi-join's `max_bytes_in_set` allowed was
+  `Code: 191` → `TooBroadReason::TraceMetricsSetRows` → HTTP 422 on
+  `/api/traces/v1/metrics/query_range`; measured, 524,288 matching spans
+  answered and 524,289 did not. The span-row form builds no set, so both
+  answer. The constants, the 191 mapping and the 422 wording are unchanged and
+  still reachable through the narrowed tag-values read, which keeps its own
+  `IN` set.
+
 - **Status, by operation: shipped for all of them.** Issue #557 shipped the
   rule for the phase-2 CONDITION and for the value a matching condition
   projects (issue #479's fused value); issue

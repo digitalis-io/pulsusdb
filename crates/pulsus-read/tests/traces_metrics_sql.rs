@@ -248,11 +248,25 @@ const CASES: &[Case] = &[
     },
     Case {
         // Issue #458: bare attribute truthiness. `{ .flag }` IS
-        // `.flag = true`, so it renders the ordinary index-served
-        // attribute semi-join against the stored `'true'` text — the
-        // literal `val = 'true'` is the byte an inverted lowering moves.
+        // `.flag = true`, so it renders the ordinary attribute leaf
+        // against the stored `'true'` text — the literal
+        // `attr_val[...] = 'true'` is the byte an inverted lowering moves.
         name: "bare_attr_truthiness",
         q: "{ .flag } | rate()",
+        distributed: false,
+    },
+    Case {
+        // Issue #559: the one shape whose OUTER filter and SELECTION
+        // predicate both declare locators into the SAME statement. The
+        // outer filter is `{ span.env = "prod" }`, which is an attribute
+        // condition and therefore NOT hoistable to `PREWHERE`, so both
+        // alias sets land in the cross-tab's innermost `SELECT`. The
+        // golden freezes that they are disjoint: `pi0` for the outer
+        // filter, `cpi0` for the selection. One prefix for both is
+        // `Code: 179 … MULTIPLE_EXPRESSIONS_FOR_ALIAS` from the server,
+        // not a silent pick.
+        name: "compare_outer_attr",
+        q: r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#,
         distributed: false,
     },
 ];
@@ -368,8 +382,13 @@ fn every_case_matches_its_committed_golden_byte_for_byte() {
 fn worked_example_pins_the_documented_fragments() {
     let plan = plan_for(&CASES[0]);
     let range = plan.range_sql();
+    // Issue #559: the statement opens with the attribute condition's
+    // locator, declared as an expression alias, and the bucket/count
+    // header follows it unchanged.
     assert!(range.starts_with(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns \
+        "WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, \
+         attr_scope) AS pi0\n\
+         SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns \
          - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,\n       \
          uniqExact(trace_id, span_id) AS n\n"
     ));
@@ -384,11 +403,19 @@ fn worked_example_pins_the_documented_fragments() {
     assert!(plan.instant_sql().contains(
         "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
     ));
-    assert!(range.contains(
-        "(trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE \
-         date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
-    ));
-    assert!(range.contains("key = 'http.status_code' AND val_num >= 500 AND scope = 'span'"));
+    // The attribute condition is answered on the span row: the located
+    // element is tested, and nothing reads `trace_attrs_idx` (issue
+    // #559). `ifNull` keeps a `NULL` numeric reading falsy under the
+    // `NOT (…)` a negated leaf renders.
+    assert!(range.contains("((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))"));
+    assert!(
+        !range.contains("trace_attrs_idx"),
+        "the metrics filter reads the span row only: {range}"
+    );
+    assert!(
+        !range.contains("IN (SELECT"),
+        "no semi-join survives on the metrics filter path: {range}"
+    );
     assert!(range.contains("duration_ns > 2000000000"));
     assert!(range.ends_with("GROUP BY t\nORDER BY t ASC"));
     assert!(
@@ -406,7 +433,10 @@ fn worked_example_pins_the_documented_fragments() {
     );
     // The instant form is the same body without bucketing.
     let instant = plan.instant_sql();
-    assert!(instant.starts_with("SELECT uniqExact(trace_id, span_id) AS n\n"));
+    assert!(instant.starts_with(
+        "WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, \
+         attr_scope) AS pi0\nSELECT uniqExact(trace_id, span_id) AS n\n"
+    ));
     assert!(!instant.contains("GROUP BY"));
     assert_eq!(plan.snapped_end_ms(), 1_700_010_840_000);
 }
@@ -478,11 +508,24 @@ fn the_nested_set_root_lowering_pins_its_sql_and_its_prewhere_placement() {
         "the root test is the residual WHERE conjunct: {hoisted}"
     );
 
-    // Bare truthiness is plain equality against the stored boolean text.
+    // Bare truthiness is plain equality against the stored boolean text,
+    // now read at the located element of the span row (issue #559). The
+    // query is unscoped, so it is the five-scope chain and the span arm
+    // is the one a `span.flag` would resolve to first.
     let flag = plan_for(case("bare_attr_truthiness"))
         .range_sql()
         .to_string();
-    assert!(flag.contains("key = 'flag' AND val = 'true'"), "{flag}");
+    assert!(
+        flag.contains(
+            "arrayFirstIndex((k, s) -> k = 'flag' AND s = 'span', attr_key, attr_scope) AS pi0s"
+        ),
+        "{flag}"
+    );
+    assert!(
+        flag.contains("if(pi0s != 0, attr_val[pi0s] = 'true', "),
+        "{flag}"
+    );
+    assert!(!flag.contains("trace_attrs_idx"), "{flag}");
 }
 
 #[test]
@@ -508,9 +551,36 @@ fn clustered_case_targets_the_dist_tables_everywhere() {
             .expect("clustered case"),
     );
     assert!(plan.range_sql().contains("FROM trace_spans_dist\n"));
-    assert!(plan.range_sql().contains("FROM trace_attrs_idx_dist WHERE"));
     assert!(plan.instant_sql().contains("FROM trace_spans_dist\n"));
     assert!(plan.distributed());
+    // Issue #559: the clustered worked example's FILTER no longer names
+    // `trace_attrs_idx_dist` — the attribute condition is answered on the
+    // span row, on every node the same way. The remaining clustered
+    // reader of the attribute index on this route is `compare()`'s
+    // attribute ENUMERATION, which this change does not touch, so the
+    // `_dist`-on-both-tables assertion moves onto a comparison rather
+    // than being dropped.
+    //
+    // Built here rather than added to `CASES` because it needs no golden:
+    // `compare_status.sql` already freezes this statement's bytes on the
+    // single-node tables, and what is asserted here is only which table
+    // names the clustered context substitutes.
+    let clustered_compare = Case {
+        name: "clustered_compare_status",
+        q: r#"{ resource.service.name = "checkout" } | compare({ span.http.status_code = "500" })"#,
+        distributed: true,
+    };
+    let compare = plan_for(&clustered_compare);
+    let (cross_tab, totals) = compare
+        .compare_range()
+        .expect("a comparison plan renders the cross-tab");
+    assert!(compare.distributed());
+    assert!(
+        cross_tab.contains("FROM trace_attrs_idx_dist WHERE"),
+        "{cross_tab}"
+    );
+    assert!(cross_tab.contains("FROM trace_spans_dist\n"), "{cross_tab}");
+    assert!(totals.contains("FROM trace_spans_dist\n"), "{totals}");
 }
 
 /// Doc-consistency gate (the search suite's AC8 pattern): every shipped
@@ -623,7 +693,52 @@ fn regenerate_goldens() {
 
 /// Every golden this corpus holds, by file stem. The set equality below is
 /// what makes this a domain and not a sample.
-const GOLDEN_SQL: [&str; 26] = [
+const GOLDEN_SQL: [&str; 27] = [
+    "attr_semi_join",
+    "avg_over_time_duration",
+    "bare_attr_truthiness",
+    "clustered_worked_example",
+    "compare_outer_attr",
+    "compare_status",
+    "compare_status_window",
+    "count_over_time_worked_example",
+    "docs_histogram_worked_example",
+    "docs_quantile_worked_example",
+    "histogram_over_time_duration",
+    "match_all_rate",
+    "mixed_boolean",
+    "negated_attr",
+    "nested_or_service_no_hoist",
+    "nested_set_constant_false",
+    "nested_set_constant_true",
+    "nested_set_nonroot_rate",
+    "nested_set_root_rate",
+    "quantile_over_time_multi",
+    "rate_by_service",
+    "rate_with_exemplars",
+    "rate_worked_example",
+    "service_and_nested_set_root",
+    "sum_over_time_by_service",
+    "sum_over_time_duration",
+    "unscoped_negated_attr",
+];
+
+/// The one stem added after the base snapshot was taken (issue #559).
+///
+/// `golden/traces_metrics_base/` is a byte-for-byte copy of the corpus at
+/// `2f78c53` and is **never regenerated** — regenerating it would make
+/// every comparison below pass by redefining what it compares against,
+/// which is what makes it evidence. A golden added after that snapshot
+/// therefore has no counterpart there, and the tests that compare against
+/// the base run over [`GOLDEN_SQL_WITH_A_BASE`] instead.
+const ADDED_SINCE_THE_BASE_SNAPSHOT: [&str; 1] = ["compare_outer_attr"];
+
+/// The stems that have a counterpart in `golden/traces_metrics_base/`.
+/// Checked against [`GOLDEN_SQL`] and
+/// [`ADDED_SINCE_THE_BASE_SNAPSHOT`] by
+/// [`the_three_declared_stem_lists_partition_the_corpus`], so this cannot
+/// quietly drop a stem the base directory holds.
+const GOLDEN_SQL_WITH_A_BASE: [&str; 26] = [
     "attr_semi_join",
     "avg_over_time_duration",
     "bare_attr_truthiness",
@@ -647,6 +762,60 @@ const GOLDEN_SQL: [&str; 26] = [
     "rate_with_exemplars",
     "rate_worked_example",
     "service_and_nested_set_root",
+    "sum_over_time_by_service",
+    "sum_over_time_duration",
+    "unscoped_negated_attr",
+];
+
+/// The stems whose filter carries **no attribute condition** (issue
+/// #559) — the domain the two issue #477 identity tests now run over.
+///
+/// Issue #559 moves the attribute leaf from a semi-join against
+/// `trace_attrs_idx` onto the span row, so both SIDES of every case whose
+/// filter carries one move: the instant side is no longer byte-identical
+/// to the base, and the range side no longer inverts under issue #477's
+/// three substitutions. That is the point of the change, not a
+/// regression, so those 13 stems leave the two identity tests rather than
+/// the base copy being regenerated (task-manager ruling on the plan's
+/// open question 3).
+///
+/// **What the 13 excluded stems still have**, and what is lost: their
+/// range and instant sections stay pinned byte-for-byte by
+/// [`every_case_matches_its_committed_golden_byte_for_byte`] and by
+/// `golden_sql_freeze::PINNED_SQL_CORPUS`. What is no longer covered for
+/// them is the issue #477 property that the instant axis did not move —
+/// which for these 13 is no longer true.
+const NO_ATTRIBUTE_CONDITION: [&str; 13] = [
+    "avg_over_time_duration",
+    "docs_histogram_worked_example",
+    "docs_quantile_worked_example",
+    "match_all_rate",
+    "nested_or_service_no_hoist",
+    "nested_set_constant_false",
+    "nested_set_constant_true",
+    "nested_set_nonroot_rate",
+    "nested_set_root_rate",
+    "quantile_over_time_multi",
+    "rate_by_service",
+    "rate_with_exemplars",
+    "service_and_nested_set_root",
+];
+
+/// The stems whose filter DOES carry an attribute condition — the 13 the
+/// two identity tests no longer run over. Named rather than described, so
+/// [`the_three_declared_stem_lists_partition_the_corpus`] can check the
+/// two halves against the corpus instead of against each other.
+const WITH_AN_ATTRIBUTE_CONDITION: [&str; 13] = [
+    "attr_semi_join",
+    "bare_attr_truthiness",
+    "clustered_worked_example",
+    "compare_status",
+    "compare_status_window",
+    "count_over_time_worked_example",
+    "histogram_over_time_duration",
+    "mixed_boolean",
+    "negated_attr",
+    "rate_worked_example",
     "sum_over_time_by_service",
     "sum_over_time_duration",
     "unscoped_negated_attr",
@@ -738,30 +907,91 @@ fn sql_stems(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// AC7(a): the domain is exactly these 26 names, in both directories.
+/// AC7(a): the domain is exactly these names, in both directories —
+/// 27 in the live corpus and the 26 of them the base snapshot predates.
 #[test]
-fn the_golden_domain_is_exactly_the_committed_twenty_six() {
+fn the_golden_domain_is_exactly_the_committed_stems() {
     let declared: std::collections::BTreeSet<String> =
         GOLDEN_SQL.iter().map(|s| s.to_string()).collect();
-    assert_eq!(declared.len(), 26, "GOLDEN_SQL has a duplicate");
+    assert_eq!(declared.len(), 27, "GOLDEN_SQL has a duplicate");
     assert_eq!(
         sql_stems(&golden_dir()),
         declared,
         "the committed corpus is not the declared domain"
     );
+    let with_a_base: std::collections::BTreeSet<String> = GOLDEN_SQL_WITH_A_BASE
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        with_a_base.len(),
+        26,
+        "GOLDEN_SQL_WITH_A_BASE has a duplicate"
+    );
     assert_eq!(
         sql_stems(&golden_base_dir()),
-        declared,
-        "the base copy is not the declared domain"
+        with_a_base,
+        "the base copy is not the declared pre-snapshot domain"
     );
-    // The corpus root holds the 26 plus the one committed capture, and
+    // The corpus root holds the 27 plus the one committed capture, and
     // nothing else — the floor that keeps the set equality above from
     // passing over an emptied directory.
     let entries: Vec<String> = std::fs::read_dir(golden_dir())
         .expect("read_dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(entries.len(), 27, "26 .sql + log2_reference_capture.json");
+    assert_eq!(entries.len(), 28, "27 .sql + log2_reference_capture.json");
+}
+
+/// Issue #559: the four declared stem lists are consistent with each
+/// other and with the corpus on disk, so no test below can be narrowed by
+/// editing one list alone.
+///
+/// Three relations, each checked against a DIFFERENT source, so agreement
+/// between two hand-written lists is never the evidence:
+///
+/// ```text
+/// GOLDEN_SQL                    == the .sql stems in golden/traces_metrics/
+/// GOLDEN_SQL_WITH_A_BASE        == the .sql stems in golden/traces_metrics_base/
+/// GOLDEN_SQL_WITH_A_BASE ∪ ADDED_SINCE_THE_BASE_SNAPSHOT == GOLDEN_SQL
+/// NO_ATTRIBUTE_CONDITION ⊍ WITH_AN_ATTRIBUTE_CONDITION   == GOLDEN_SQL_WITH_A_BASE
+/// ```
+#[test]
+fn the_three_declared_stem_lists_partition_the_corpus() {
+    let set = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    };
+    let all = set(&GOLDEN_SQL);
+    let with_base = set(&GOLDEN_SQL_WITH_A_BASE);
+    let added = set(&ADDED_SINCE_THE_BASE_SNAPSHOT);
+    assert_eq!(
+        with_base
+            .union(&added)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        all,
+        "GOLDEN_SQL_WITH_A_BASE plus the added stems must be the whole corpus"
+    );
+    assert!(
+        with_base.is_disjoint(&added),
+        "a stem cannot both predate the base snapshot and be added after it"
+    );
+    let no_attr = set(&NO_ATTRIBUTE_CONDITION);
+    let with_attr = set(&WITH_AN_ATTRIBUTE_CONDITION);
+    assert!(
+        no_attr.is_disjoint(&with_attr),
+        "a case's filter either carries an attribute condition or it does not"
+    );
+    assert_eq!(
+        no_attr
+            .union(&with_attr)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        with_base,
+        "the two halves must cover exactly the stems the base snapshot holds"
+    );
+    assert_eq!(no_attr.len(), 13);
+    assert_eq!(with_attr.len(), 13);
 }
 
 /// AC7(b): each file's section-name set is its BASE set plus the declared
@@ -769,7 +999,7 @@ fn the_golden_domain_is_exactly_the_committed_twenty_six() {
 /// the four structural shapes are covered by one rule.
 #[test]
 fn every_golden_section_name_set_is_its_base_set_plus_the_declared_additions() {
-    for stem in GOLDEN_SQL {
+    for stem in GOLDEN_SQL_WITH_A_BASE {
         let base = read_golden(&golden_base_dir(), stem);
         let new = read_golden(&golden_dir(), stem);
         let base_names = section_names(&base);
@@ -836,7 +1066,7 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
         "compare totals (query_range)",
     ];
     let mut checked = 0usize;
-    for stem in GOLDEN_SQL {
+    for stem in NO_ATTRIBUTE_CONDITION {
         let base = read_golden(&golden_base_dir(), stem);
         let new = read_golden(&golden_dir(), stem);
         for name in MOVED {
@@ -878,10 +1108,16 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
             checked += 1;
         }
     }
-    // 24 range + 2 compare cross-tab + 2 compare totals + 1 exemplars.
+    // 13 range sections + `rate_with_exemplars`'s pre-existing exemplars
+    // section. Issue #559 narrowed this from 29: the 13 stems whose
+    // filter carries an attribute condition left the domain, taking with
+    // them 13 range sections and the two compare cross-tab and two
+    // compare totals sections (both comparison cases filter on an
+    // attribute).
     assert_eq!(
-        checked, 29,
-        "the inverse must be applied to every moved section"
+        checked, 14,
+        "the inverse must be applied to every moved section of every case \
+         whose filter carries no attribute condition"
     );
 }
 
@@ -914,7 +1150,7 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
 fn every_instant_side_section_is_byte_identical_to_base() {
     const FROZEN: [&str; 3] = ["instant (query)", "series probe", "compare series probe"];
     let mut checked = 0usize;
-    for stem in GOLDEN_SQL {
+    for stem in NO_ATTRIBUTE_CONDITION {
         let base = read_golden(&golden_base_dir(), stem);
         let new = read_golden(&golden_dir(), stem);
         for name in FROZEN {
@@ -927,10 +1163,15 @@ fn every_instant_side_section_is_byte_identical_to_base() {
             checked += 1;
         }
     }
-    // 24 instant + 2 grouped probes + 2 compare probes.
+    // 13 instant sections + `rate_by_service`'s series probe. Narrowed
+    // from 28 by issue #559 for the reason above: the attribute leaf now
+    // renders on the span row on BOTH axes, so the instant side of a case
+    // that carries one is no longer the base bytes, and that is the
+    // change rather than a regression.
     assert_eq!(
-        checked, 28,
-        "the frozen half must cover every instant section"
+        checked, 14,
+        "the frozen half must cover every instant section of every case \
+         whose filter carries no attribute condition"
     );
 }
 
@@ -1183,7 +1424,7 @@ fn the_log2_reference_capture_is_byte_identical_to_base() {
 /// directory gained or lost a name.
 #[test]
 fn the_golden_corpus_differs_from_its_base_copy_in_every_file() {
-    for stem in GOLDEN_SQL {
+    for stem in GOLDEN_SQL_WITH_A_BASE {
         let base = read_golden(&golden_base_dir(), stem);
         let new = read_golden(&golden_dir(), stem);
         assert_ne!(
@@ -1191,7 +1432,7 @@ fn the_golden_corpus_differs_from_its_base_copy_in_every_file() {
             "{stem}: this golden did not move, and issue #477 moves all 26"
         );
     }
-    assert_eq!(GOLDEN_SQL.len(), 26);
+    assert_eq!(GOLDEN_SQL_WITH_A_BASE.len(), 26);
 }
 
 // ---------------------------------------------------------------------------

@@ -1723,8 +1723,11 @@ full-window scan. §3.5 prices the exact rollup that would change that — built
 C1, same answer, duplicate-safe, 16.30 B/span — and says why this design does not
 take it.
 
-A metrics query with an attribute filter is a semi-join today
-(`crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql`); the attribute test becomes inline:
+A metrics query with an attribute filter **was** a semi-join; issue
+[#559](https://github.com/digitalis-io/pulsusdb/issues/559) shipped the inline form, and
+`crates/pulsus-read/tests/golden/traces_metrics/attr_semi_join.sql` now holds the second block
+below (the golden keeps its name, because the stem is a key into the frozen pre-issue-#477 copy
+beside it):
 
 ```sql
 -- today
@@ -1732,11 +1735,14 @@ A metrics query with an attribute filter is a semi-join today
       WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
         AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
         AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
--- new: the same locate-then-test column as the search batch, so the metrics
---      filter and the search filter answer a duplicated key the same way
-WITH arrayFirstIndex((key, scope) -> key = 'http.status_code' AND scope = 'span',
-                     attr_key, attr_scope) AS i0
-… AND ((i0 != 0) AND ifNull(attr_num[i0] >= 500, 0))
+-- shipped (issue #559): the same locate-then-test column as the search batch,
+--      so the metrics filter and the search filter answer a duplicated key the
+--      same way. The lambda parameters and the alias are what the shared
+--      renderer emits, which is why they are `k`/`s` and `pi0` rather than the
+--      longer names this record first sketched.
+WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span',
+                     attr_key, attr_scope) AS pi0
+… AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
 ```
 
 **The 20,000,000-span pair that stood here — "3.9× more bytes … 1.7–2.3× faster

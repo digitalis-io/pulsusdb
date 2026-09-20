@@ -1240,34 +1240,6 @@ impl SlotLayout {
     }
 }
 
-/// The span row's own attribute arrays, subscripted at one located
-/// element (issue #557).
-///
-/// `null_is_false` is `true` here and nowhere else: this fragment is a
-/// PROJECTED column, and an unwrapped `NULL` numeric comparison makes it
-/// `Nullable(UInt8)`, which does not decode into `Vec<u8>`.
-fn span_row_cols<'a>(text: &'a str, num: &'a str) -> filter::ValueCols<'a> {
-    filter::ValueCols {
-        text,
-        num,
-        null_is_false: true,
-    }
-}
-
-/// The lambda parameter names [`search_sql::locate_matching_item`]
-/// binds (issue #557). Inside `arrayFirstIndex` a `NULL` lambda result is
-/// false and the function still returns `UInt32`, so no `ifNull` wrapper
-/// belongs there.
-const LAMBDA_COLS: filter::ValueCols<'static> = filter::ValueCols {
-    text: "v",
-    num: "n",
-    null_is_false: false,
-};
-
-/// The unscoped chain's per-scope alias suffixes, index-aligned with
-/// [`filter::UNSCOPED_SCOPE_CHAIN`] (issue #557).
-const UNSCOPED_ALIAS_SUFFIX: [&str; 5] = ["s", "r", "e", "l", "i"];
-
 /// Assembles one PROJECTED attribute field's span-row slot (issue #558).
 ///
 /// **A field is LOCATED, never matched.** A condition's probe over a
@@ -1306,7 +1278,7 @@ fn field_slot(field: &AttrFieldRef, alias_stem: &str, want: SlotValue) -> ProbeC
             let mut kind_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
             for (scope, suffix) in filter::UNSCOPED_SCOPE_CHAIN
                 .iter()
-                .zip(UNSCOPED_ALIAS_SUFFIX)
+                .zip(filter::UNSCOPED_ALIAS_SUFFIX)
             {
                 let scope_lit = escape::ch_string(scope);
                 let present = format!("{alias_stem}{suffix}");
@@ -1371,145 +1343,6 @@ fn width_slot(set: filter::EventSetField) -> ProbeColumn {
             format!("toFloat64({count})"),
             "''".to_string(),
         )),
-    }
-}
-
-/// Assembles one attribute condition's span-row predicate column
-/// (issue #557).
-///
-/// **The SHAPE primitives live in `search_sql`; the assembly lives here**,
-/// because rendering a regex is what validates it and a rejection must
-/// stay a `400`. `search_sql` has never been fallible and does not become
-/// so.
-///
-/// Three forms, and the difference is the scope's ARITY:
-///
-/// * a single-valued scope (`span`, `resource`, `instrumentation`) locates
-///   the one element the attribute resolves to and applies the value test
-///   to THAT element;
-/// * a multi-valued scope (`event`, `link`, and their reserved intrinsic
-///   discriminators) locates the first element that MATCHES, which keeps
-///   the any-element rule the tree already applies there and makes the
-///   same alias serve the fused value;
-/// * the unscoped form walks the five attribute scopes in precedence
-///   order and applies each scope's own rule, resolving to the first
-///   scope PRESENT.
-fn probe_column(probe: &AttrProbe, idx: usize) -> Result<ProbeColumn, PlanError> {
-    let key_lit = escape::ch_string(&probe.key);
-    match probe.scope {
-        Some(scope) => {
-            let scope_lit = escape::ch_string(scope);
-            match filter::scope_arity(scope) {
-                filter::ScopeArity::Single => {
-                    let alias = format!("pi{idx}");
-                    let (text, num) = (format!("attr_val[{alias}]"), format!("attr_num[{alias}]"));
-                    let frag = filter::value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?;
-                    let test = if probe.pred.matches_any_value() {
-                        // Key existence IS `<alias> != 0`; rendering
-                        // `AND 1` beside it says the same thing twice.
-                        search_sql::probe_test(&alias, None)
-                    } else {
-                        search_sql::probe_test(&alias, Some(&frag))
-                    };
-                    Ok(ProbeColumn {
-                        with_items: vec![search_sql::locate_item(&alias, &key_lit, &scope_lit)],
-                        test,
-                        value: Some(search_sql::probe_value_exprs(&alias)),
-                    })
-                }
-                filter::ScopeArity::Multi => {
-                    let alias = format!("pm{idx}");
-                    let item = if probe.pred.matches_any_value() {
-                        // "Some element carries this key" is what the
-                        // two-array locate already answers, so the
-                        // matching form would read a third array to
-                        // decide something it has already decided.
-                        search_sql::locate_item(&alias, &key_lit, &scope_lit)
-                    } else {
-                        let frag = filter::value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
-                        search_sql::locate_matching_item(
-                            &alias,
-                            &key_lit,
-                            &scope_lit,
-                            &frag,
-                            probe.pred.reads_numeric_column(),
-                        )
-                    };
-                    Ok(ProbeColumn {
-                        with_items: vec![item],
-                        test: search_sql::probe_test(&alias, None),
-                        value: Some(search_sql::probe_value_exprs(&alias)),
-                    })
-                }
-            }
-        }
-        None => {
-            let mut presence = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
-            let mut matching = Vec::new();
-            let mut test_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
-            let mut value_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
-            let mut num_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
-            let mut kind_arms = Vec::with_capacity(filter::UNSCOPED_SCOPE_CHAIN.len());
-            for (scope, suffix) in filter::UNSCOPED_SCOPE_CHAIN
-                .iter()
-                .zip(UNSCOPED_ALIAS_SUFFIX)
-            {
-                let scope_lit = escape::ch_string(scope);
-                let present = format!("pi{idx}{suffix}");
-                presence.push(search_sql::locate_item(&present, &key_lit, &scope_lit));
-                // The element the fused value and the stored kind are
-                // read at — the same one the arm's test resolved to.
-                let at = match filter::scope_arity(scope) {
-                    filter::ScopeArity::Single => {
-                        let (text, num) = (
-                            format!("attr_val[{present}]"),
-                            format!("attr_num[{present}]"),
-                        );
-                        test_arms.push((
-                            format!("{present} != 0"),
-                            filter::value_pred_sql_on(&probe.pred, span_row_cols(&text, &num))?,
-                        ));
-                        present.clone()
-                    }
-                    filter::ScopeArity::Multi if probe.pred.matches_any_value() => {
-                        // Present at this scope means matched, so the arm
-                        // is the constant the value test renders to.
-                        test_arms.push((format!("{present} != 0"), "1".to_string()));
-                        present.clone()
-                    }
-                    filter::ScopeArity::Multi => {
-                        let matched = format!("pm{idx}{suffix}");
-                        let frag = filter::value_pred_sql_on(&probe.pred, LAMBDA_COLS)?;
-                        matching.push(search_sql::locate_matching_item(
-                            &matched,
-                            &key_lit,
-                            &scope_lit,
-                            &frag,
-                            probe.pred.reads_numeric_column(),
-                        ));
-                        test_arms.push((format!("{present} != 0"), format!("{matched} != 0")));
-                        matched
-                    }
-                };
-                let (value, num, kind) = search_sql::probe_value_exprs(&at);
-                value_arms.push((format!("{present} != 0"), value));
-                num_arms.push((format!("{present} != 0"), num));
-                kind_arms.push((format!("{present} != 0"), kind));
-            }
-            presence.append(&mut matching);
-            Ok(ProbeColumn {
-                with_items: presence,
-                test: search_sql::probe_chain(&test_arms, "0"),
-                value: Some((
-                    search_sql::probe_chain(&value_arms, "''"),
-                    // The numeric chain's fallback is `NULL`, not `0`: a
-                    // span the chain resolves to no scope for has NO
-                    // number, and `0` is a number a stored value can be.
-                    search_sql::probe_chain(&num_arms, "NULL"),
-                    search_sql::probe_chain(&kind_arms, "''"),
-                )),
-            })
-        }
     }
 }
 
@@ -1684,7 +1517,7 @@ fn intern_probe(
         // Issue #557: the span-row form of the SAME probe, rendered at
         // the same moment and through the same checked escaper, so a
         // pattern either both forms carry or neither does.
-        columns.push(probe_column(probe, idx)?);
+        columns.push(filter::probe_column(probe, "", idx)?);
     }
     Ok(idx)
 }
@@ -3750,7 +3583,7 @@ mod tests {
             let id = layout.probe(i);
             assert_eq!(
                 columns[id.index()].with_items,
-                probe_column(&p.probes[i], i)
+                filter::probe_column(&p.probes[i], "", i)
                     .expect("probe column")
                     .with_items,
                 "probe {i} does not index the column built from probes[{i}]"
@@ -5275,9 +5108,25 @@ mod tests {
             "cap+1 (max_series=1000): {probe}"
         );
         assert!(probe.contains("count() AS n"), "{probe}");
+        // The preflight carries the search's own filter, answered by the
+        // same rule the search answers it by (issue #559): the attribute
+        // condition is located on the span row, not counted out of the
+        // attribute index. A preflight that counted by a different rule
+        // would refuse searches that would have succeeded, and admit ones
+        // that will not.
         assert!(
-            probe.contains("key = 'a'"),
+            probe.contains(
+                "arrayFirstIndex((k, s) -> k = 'a' AND s = 'span', attr_key, attr_scope) AS pi0s"
+            ),
+            "carries the filter's locator: {probe}"
+        );
+        assert!(
+            probe.contains("if(pi0s != 0, attr_val[pi0s] = '1', "),
             "carries the filter predicate: {probe}"
+        );
+        assert!(
+            !probe.contains("trace_attrs_idx"),
+            "the preflight reads the span table only: {probe}"
         );
     }
 

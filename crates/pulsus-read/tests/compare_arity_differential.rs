@@ -264,10 +264,32 @@ fn counts_from(cells: &[(&str, &str, &str, i64)]) -> Counts {
 async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
     let mut rows = Vec::new();
     for s in spans {
+        // Issue #559: the same attribute goes onto the span row, because
+        // the metrics filter reads it there. A span with no attribute
+        // renders empty arrays, which is what the writer stores for it.
+        let (keys, scopes, vals, types) = match &s.attr {
+            Some((key, val)) => (
+                format!("['{key}']"),
+                "['span']".to_string(),
+                format!("['{val}']"),
+                "['string']".to_string(),
+            ),
+            None => (
+                "CAST([] AS Array(String))".to_string(),
+                "CAST([] AS Array(String))".to_string(),
+                "CAST([] AS Array(String))".to_string(),
+                "CAST([] AS Array(String))".to_string(),
+            ),
+        };
+        let nums = if s.attr.is_some() {
+            "CAST([NULL] AS Array(Nullable(Float64)))"
+        } else {
+            "CAST([] AS Array(Nullable(Float64)))"
+        };
         rows.push(format!(
             "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
              toFixedString(unhex('0000000000000000'),8), '{name}', '{service}', '{msg}', \
-             '', '', {ts}, 1000, 2, 1, 1, 'x')",
+             '', '', {ts}, 1000, 2, 1, 1, 'x', {keys}, {scopes}, {vals}, {types}, {nums})",
             tid = hex(&tid_bytes(nonce, s.idx)),
             sid = hex(&sid_bytes(s.idx)),
             name = s.name,
@@ -282,7 +304,8 @@ async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[S
             "INSERT INTO {db}.trace_spans \
              (trace_id, span_id, parent_id, name, service, status_message, \
               scope_name, scope_version, timestamp_ns, \
-              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+              duration_ns, status_code, kind, payload_type, payload, \
+              attr_key, attr_scope, attr_val, attr_type, attr_num) VALUES {}",
             rows.join(", ")
         ),
     )
@@ -293,7 +316,8 @@ async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[S
         .filter_map(|s| {
             let (key, val) = s.attr.as_ref()?;
             Some(format!(
-                "(toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', NULL, {ts}, \
+                "(toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', 'string', \
+                 NULL, {ts}, \
                  toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), 1000)",
                 ts = s.ts_ns,
                 tid = hex(&tid_bytes(nonce, s.idx)),
@@ -306,8 +330,8 @@ async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[S
             client,
             &format!(
                 "INSERT INTO {db}.trace_attrs_idx \
-                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
-                 VALUES {}",
+                 (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
+                  duration_ns) VALUES {}",
                 attr_rows.join(", ")
             ),
         )
@@ -956,6 +980,11 @@ async fn compare_arity_differential() {
             "PulsusDB emitted __meta_error for {q:?}: {leaked:?}"
         );
     }
+
+    // Issue #559 criterion 11: the metrics filter reads the span row, so
+    // a fixture that seeds only `trace_attrs_idx` would compare our empty
+    // answers against the reference's real ones. Before the drop.
+    pulsus_testkit::assert_stores_agree(&db);
 
     exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
 

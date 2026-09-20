@@ -3999,3 +3999,424 @@ async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more(
 
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #559: the METRICS routes answer an attribute condition the way a
+// SEARCH does.
+//
+// Until this change a metrics filter lowered an attribute condition to
+// `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)`, which
+// matches a span when ANY of its attribute rows matches, while a search
+// tested the ONE element the span resolves to. So the two routes gave
+// different answers to the same filter on a span that repeats a key.
+// ---------------------------------------------------------------------
+
+/// The total of every non-null sample a metrics range answer carries, over
+/// the whole window.
+///
+/// Bucketing-independent on purpose: what these tests are about is WHICH
+/// spans matched, and a count that had to agree on a bucket axis as well
+/// would fail for two reasons at once.
+fn metrics_total(port: u16, q: &str, start_s: i64, end_s: i64, ctx: &str) -> f64 {
+    let path = format!(
+        "/api/traces/v1/metrics/query_range?q={}&start={start_s}&end={end_s}&step=60",
+        enc(&format!("{q} | count_over_time()"))
+    );
+    let res = get(port, &path, ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: the metrics range route must answer 200, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    json["series"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a series array, body {json}"))
+        .iter()
+        .flat_map(|s| {
+            s["samples"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+        })
+        .filter_map(|sample| sample["value"].as_f64())
+        .sum()
+}
+
+/// **Criterion 2: where a span repeats a key, the metrics route answers
+/// what the search route answers.**
+///
+/// The fixture is eight traces of one span each, seeded through
+/// `POST /v1/traces` so the writer decides what both stores hold:
+///
+/// ```text
+/// trace  stored attributes, in array order
+///   1    (none)                        5    span.j = "x"
+///   2    span.k = "x"                  6    resource.k = "x"
+///   3    span.k = "x", span.k = "y"    7    span.n = "abc", span.n = 400
+///   4    span.k = "y", span.k = "x"    8    span.n = 400
+/// ```
+///
+/// Six of the eight conditions below moved with this change; the counts
+/// in the table are the ones this route answers now. The two that did NOT
+/// move are `{ span.k = "" }` and `{ span.n = 0 }`, and they are here
+/// because they are what keeps the `<locator> != 0` guard honest: element
+/// `0` of a `String` array reads `''` and `ifNull(attr_num[0], 0)` reads
+/// `0`, so a lowering that dropped the guard would match every span
+/// carrying no `k` and no `n` at all.
+///
+/// Trace 7 is the row the `ifNull` wrapper exists for. Its `n` resolves to
+/// the FIRST element, `"abc"`, which has no numeric reading at all — so
+/// `{ span.n = 400 }` does not count it, and `{ span.n != 400 }` does.
+/// Without the wrapper `NOT (NULL)` is `NULL`, which is falsy in a `WHERE`
+/// clause, and trace 7 would be DROPPED from the negation instead of
+/// counted.
+///
+/// **Every row is asserted on both routes**, against the same window: the
+/// search route's trace set and the metrics route's count. That is the
+/// claim — not that the metrics route answers some particular number, but
+/// that the two routes answer the same question the same way.
+#[tokio::test]
+async fn a_metrics_attribute_condition_tests_the_element_the_span_resolves_to() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_245;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m1");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    for (n, name, attrs) in [
+        (1u8, "no-k", vec![kv_str("other", "z")]),
+        (2u8, "k-x", vec![kv_str("k", "x")]),
+        (3u8, "k-x-then-y", vec![kv_str("k", "x"), kv_str("k", "y")]),
+        (4u8, "k-y-then-x", vec![kv_str("k", "y"), kv_str("k", "x")]),
+        (5u8, "j-x", vec![kv_str("j", "x")]),
+        (
+            7u8,
+            "n-abc-then-400",
+            vec![kv_str("n", "abc"), kv_int("n", 400)],
+        ),
+        (8u8, "n-400", vec![kv_int("n", 400)]),
+    ] {
+        let s = span(tid(n), sid(1), None, name, ts(base, n as i64), MS, attrs);
+        ingest(port, vec![s], checkout_resource(), name);
+    }
+    // Trace 6 carries `k` at RESOURCE scope, which is the only way to put
+    // it there.
+    let s6 = span(tid(6), sid(1), None, "res-k-x", ts(base, 6), MS, vec![]);
+    ingest(
+        port,
+        vec![s6],
+        vec![kv_str("service.name", "checkout"), kv_str("k", "x")],
+        "res-k-x",
+    );
+
+    for (q, expected, ctx) in [
+        (r#"{ span.k = "x" }"#, ids(&[2, 3]), "span-k-eq-x"),
+        (
+            r#"{ span.k != "x" }"#,
+            ids(&[1, 4, 5, 6, 7, 8]),
+            "span-k-neq-x",
+        ),
+        (r#"{ .k = "x" }"#, ids(&[2, 3, 6]), "unscoped-k-eq-x"),
+        (r#"{ span.k = "" }"#, BTreeSet::new(), "span-k-eq-empty"),
+        (r#"{ span.n = 400 }"#, ids(&[8]), "span-n-eq-400"),
+        (r#"{ span.n >= 400 }"#, ids(&[8]), "span-n-gte-400"),
+        (
+            r#"{ span.n != 400 }"#,
+            ids(&[1, 2, 3, 4, 5, 6, 7]),
+            "span-n-neq-400",
+        ),
+        (r#"{ span.n = 0 }"#, BTreeSet::new(), "span-n-eq-0"),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(res.status, 200, "{ctx}: {q} must answer 200 on search");
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            expected,
+            "{ctx}: the SEARCH route's trace set for {q}"
+        );
+        let total = metrics_total(port, q, w0, w1, ctx);
+        assert_eq!(
+            total,
+            expected.len() as f64,
+            "{ctx}: the METRICS route counted {total} spans for {q} where the search route \
+             returned {} traces — the two routes must answer one filter the same way",
+            expected.len()
+        );
+    }
+
+    drop_db(db).await;
+}
+
+/// **The `event` scope keeps the any-element rule, on both routes, before
+/// and after this change.**
+///
+/// A span carries one `exception.type` per EVENT, so `event` is not a map
+/// and a condition on it matches when ANY element matches. The span-row
+/// lowering keeps that by folding the value test into the locate
+/// (`arrayFirstIndex((k, s, v) -> …)`), which lands on the first MATCHING
+/// element rather than the first element carrying the key; its negation
+/// excludes exactly as the old `NOT IN` did.
+///
+/// The eight-span fixture above seeds no events, so it would answer `0`
+/// to both queries here and say nothing. This one span carries three.
+#[tokio::test]
+async fn an_event_condition_matches_any_event_on_the_metrics_route_too() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_246;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m2");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    let mut s = span(tid(1), sid(1), None, "evented", ts(base, 1), MS, vec![]);
+    s.events = (1..=3)
+        .map(|i| opentelemetry_proto::tonic::trace::v1::span::Event {
+            time_unix_nano: ts(base, 1) + i,
+            name: format!("ev{i}"),
+            attributes: vec![kv_str("exception.type", &format!("E{i}"))],
+            dropped_attributes_count: 0,
+        })
+        .collect();
+    ingest(port, vec![s], checkout_resource(), "evented");
+
+    for (q, expected, ctx) in [
+        (
+            r#"{ event.exception.type = "E2" }"#,
+            ids(&[1]),
+            "event-eq-E2",
+        ),
+        (
+            r#"{ event.exception.type != "E2" }"#,
+            BTreeSet::new(),
+            "event-neq-E2",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            expected,
+            "{ctx}: the SEARCH route's trace set for {q}"
+        );
+        let total = metrics_total(port, q, w0, w1, ctx);
+        assert_eq!(
+            total,
+            expected.len() as f64,
+            "{ctx}: the METRICS route counted {total} for {q} against the search route's {} \
+             traces",
+            expected.len()
+        );
+    }
+
+    drop_db(db).await;
+}
+
+/// **Criterion 4c, the live half: a comparison whose OUTER filter is
+/// itself an attribute condition answers 200.**
+///
+/// This is the one shape whose outer filter and selection predicate
+/// render into a single statement, so both declare locator aliases there.
+/// The outer filter is `{ span.env = "prod" }` rather than a service
+/// equality precisely because a service equality hoists to `PREWHERE` and
+/// declares nothing, which would make the collision unreachable.
+///
+/// A shared prefix is not a silent mis-pick: the server answers
+/// `Code: 179 … MULTIPLE_EXPRESSIONS_FOR_ALIAS`, which reaches the client
+/// as a failed request. So a `200` with a body is the assertion, and the
+/// hermetic half
+/// (`pulsus-read`'s
+/// `a_comparisons_two_filters_declare_disjoint_aliases_in_one_statement`)
+/// says which aliases they are.
+#[tokio::test]
+async fn a_comparison_whose_outer_filter_is_an_attribute_condition_answers() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_247;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m3");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // Four spans, all `env=prod` so the outer filter admits them; two
+    // carry `http.status_code=500`, which is the selection.
+    for (n, code) in [(1u8, "500"), (2u8, "500"), (3u8, "200"), (4u8, "200")] {
+        let s = span(
+            tid(n),
+            sid(1),
+            None,
+            "cmp",
+            ts(base, n as i64),
+            MS,
+            vec![kv_str("env", "prod"), kv_str("http.status_code", code)],
+        );
+        ingest(port, vec![s], checkout_resource(), "cmp");
+    }
+
+    let q = r#"{ span.env = "prod" } | compare({ span.http.status_code = "500" })"#;
+    let path = format!(
+        "/api/traces/v1/metrics/query_range?q={}&start={w0}&end={w1}&step=60",
+        enc(q)
+    );
+    let ctx = "compare-outer-attr";
+    let res = get(port, &path, ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: two filters in one statement must not collide on an alias — a collision is \
+         Code: 179 MULTIPLE_EXPRESSIONS_FOR_ALIAS and reaches the client as a failure. Body: \
+         {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    let series = json["series"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a series array, body {json}"));
+    assert!(
+        !series.is_empty(),
+        "{ctx}: the comparison must carry an answer, body {json}"
+    );
+    // The selection is the two `500` spans and the baseline the two
+    // `200`s, so the two totals are the split of the four spans the outer
+    // filter admitted.
+    let total_of = |meta: &str| -> f64 {
+        series
+            .iter()
+            .filter(|s| {
+                s["labels"].as_array().is_some_and(|labels| {
+                    labels.iter().any(|l| {
+                        l["key"].as_str() == Some("__meta_type")
+                            && l["value"]["stringValue"].as_str() == Some(meta)
+                    })
+                })
+            })
+            .filter(|s| {
+                s["labels"].as_array().is_some_and(|labels| {
+                    labels.iter().any(|l| {
+                        l["key"].as_str() == Some("span.http.status_code")
+                            && l["value"]["stringValue"].as_str() == Some("500")
+                    })
+                })
+            })
+            .flat_map(|s| {
+                s["samples"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or_default()
+            })
+            .filter_map(|sample| sample["value"].as_f64())
+            .sum()
+    };
+    assert_eq!(
+        total_of("selection"),
+        2.0,
+        "{ctx}: the two `500` spans are the selection, body {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// **The unscoped chain's ORDER, which the eight-span fixture above
+/// cannot see.**
+///
+/// That fixture puts `k` at the resource scope on trace 6 and at the span
+/// scope on traces 2, 3 and 4 — never both on ONE span. So reversing
+/// `filter::UNSCOPED_SCOPE_CHAIN` changes nothing there: every span
+/// resolves at the only scope it carries the key at, whatever order the
+/// chain walks. Measured — with the chain reversed the eight-span test
+/// passed `1 passed; 0 failed`. What that fixture DOES see is the chain's
+/// MEMBERSHIP: replacing `resource` with `instrumentation` dropped trace 6
+/// and it failed on `{ .k = "x" }`.
+///
+/// This one span carries `k` at BOTH scopes with different values, which
+/// is the only shape that makes the ORDER observable. Span scope has
+/// precedence, so `.k` is `y`:
+///
+/// ```text
+///   stored:  span.k = "y",  resource.k = "x"
+///   { .k = "y" }  -> the span, on both routes
+///   { .k = "x" }  -> nothing, on both routes
+/// ```
+///
+/// Both routes are asserted, because the claim is that they agree: the
+/// metrics filter and the search filter walk one chain.
+#[tokio::test]
+async fn an_unscoped_key_resolves_to_the_span_scope_on_both_routes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_248;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_m4");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    let s = span(
+        tid(1),
+        sid(1),
+        None,
+        "both-scopes",
+        ts(base, 1),
+        MS,
+        vec![kv_str("k", "y")],
+    );
+    ingest(
+        port,
+        vec![s],
+        vec![kv_str("service.name", "checkout"), kv_str("k", "x")],
+        "both-scopes",
+    );
+
+    for (q, expected, ctx) in [
+        (r#"{ .k = "y" }"#, ids(&[1]), "unscoped-span-scope-wins"),
+        (
+            r#"{ .k = "x" }"#,
+            BTreeSet::new(),
+            "unscoped-resource-loses",
+        ),
+        // The scoped forms are the control: each scope really does hold
+        // the value the chain is choosing between, so the pair above is a
+        // precedence answer and not an ingestion accident.
+        (r#"{ span.k = "y" }"#, ids(&[1]), "span-scope-holds-y"),
+        (
+            r#"{ resource.k = "x" }"#,
+            ids(&[1]),
+            "resource-scope-holds-x",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            expected,
+            "{ctx}: the SEARCH route's trace set for {q}"
+        );
+        let total = metrics_total(port, q, w0, w1, ctx);
+        assert_eq!(
+            total,
+            expected.len() as f64,
+            "{ctx}: the METRICS route counted {total} for {q} against the search route's {} \
+             traces",
+            expected.len()
+        );
+    }
+
+    drop_db(db).await;
+}

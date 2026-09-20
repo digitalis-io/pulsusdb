@@ -1,5 +1,5 @@
--- case: compare_status_window
--- q: { resource.service.name = "checkout" } | compare({ span.http.status_code = "500" }, 3, 1700000005000000000, 1700000008000000000)
+-- case: compare_outer_attr
+-- q: { span.env = "prod" } | compare({ span.http.status_code = "500" })
 
 == compare cross-tab (query_range) ==
 SELECT t, akey, aval, countIf(is_sel = 0) AS base_n, countIf(is_sel) AS sel_n
@@ -9,11 +9,12 @@ FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
     ) b
@@ -23,11 +24,12 @@ FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ))
@@ -39,11 +41,12 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ) b
@@ -59,11 +62,12 @@ SELECT t, countIf(is_sel = 0) AS base_total, countIf(is_sel) AS sel_total
 FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
 )
@@ -79,11 +83,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
     ) b
@@ -93,11 +98,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ))
@@ -109,11 +115,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ) b
@@ -133,11 +140,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
     ) b
@@ -147,11 +155,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   WHERE trace_id IN (SELECT DISTINCT trace_id FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ))
@@ -163,11 +172,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel
   FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+         arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
-    PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   )
   GROUP BY t, trace_id, span_id
   ) b
@@ -185,11 +195,12 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
     FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+           arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
       FROM trace_spans
-      PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+      WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
     )
     GROUP BY t, trace_id, span_id
   )
@@ -198,11 +209,12 @@ FROM (
   FROM (
   SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
     FROM (
-  WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
-      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, ((((cpi0 != 0) AND attr_val[cpi0] = '500')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+  WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0,
+           arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS cpi0
+      SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
       FROM trace_spans
-      PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+      WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
     )
     GROUP BY t, trace_id, span_id
   ) b
