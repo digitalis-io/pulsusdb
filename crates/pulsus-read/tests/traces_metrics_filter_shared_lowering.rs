@@ -32,14 +32,21 @@
 //! `the outer filter takes the empty prefix and the selection takes c: ["pi0", "xpi0"]`
 //! and `Summary … 5 tests run: 4 passed, 1 failed, 0 skipped`.
 //!
-//! So the three together pin, for the shapes in `CASES` and the
-//! comparison query in 4c: the rendered attribute column and its
-//! locators are byte-identical on the two routes (4a), one production
-//! implementation with exactly two calling files (4b), and both the
-//! disjointness and the literal spelling of the two filters' aliases in
-//! a comparison statement (4c). They read rendered SQL only — no
-//! statement here is sent to a server; the routes' ANSWERS are pinned by
-//! the live suites.
+//! What the three pin at this head, each over its own domain:
+//!
+//!   * 4a, over the 15 shapes in `CASES` — the metrics statement
+//!     contains the search statement's own attribute element and
+//!     declares the same locators, in the same order;
+//!   * 4b, over the tracked files under `crates/*/src/` —
+//!     `filter::probe_column` has exactly two calling files;
+//!   * 4c, for the one comparison query it builds — the two filters
+//!     declare two distinct aliases, spelled `pi0` and `cpi0`.
+//!
+//! None of the three sends a statement to a server. The two routes'
+//! ANSWERS are pinned elsewhere, by
+//! `pulsus-server --test traces_search_live`'s
+//! `a_metrics_attribute_condition_tests_the_element_the_span_resolves_to`,
+//! which drives every condition of its fixture through both HTTP routes.
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};
