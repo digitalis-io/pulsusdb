@@ -6,21 +6,40 @@
 //! Hermetic — renders SQL and reads the tree, runs no query and needs no
 //! container.
 //!
-//! Three checks, because each mutation defeats the other two. Measured on
-//! this branch, each break run on its own:
+//! Three checks, because each of the first three mutations defeats the
+//! other two checks. Measured on this branch, each break run on its own
+//! with
+//! `cargo nextest run -p pulsus-read --test traces_metrics_filter_shared_lowering --no-fail-fast`:
 //!
 //! ```text
-//! mutation                                   4a     4b     4c
-//! a private any-element copy in metrics_sql  RED    green  green
-//! an identical private copy in metrics_sql   green  RED    green
-//! the selection prefix hard-coded to ""      green  green  RED
+//! mutation                                       4a     4b     4c
+//! a private any-element copy in metrics_sql      RED    green  green
+//! an identical private copy in metrics_sql       green  RED    green
+//! the selection prefix hard-coded to ""          green  green  RED
+//! the selection prefix changed to "x" (distinct) green  green  RED
 //! ```
 //!
-//! **What none of the three catches:** a prefix changed to another
-//! DISTINCT value — `"x"` where the code says `"c"`. That renames the
-//! aliases without colliding them, so the statement is still valid, the
-//! server still answers, and nothing here sees it. Said plainly rather
-//! than attributed to a check that does not cover it.
+//! **A correction.** An earlier version of this note said none of the
+//! three catches a prefix changed to another DISTINCT value — `"x"`
+//! where `COMPARE_SELECTION_ALIAS_PREFIX` says `"c"` — on the reasoning
+//! that distinct names do not collide, so the statement stays valid.
+//! That is wrong, and the fourth row above is the measurement: 4c does
+//! not stop at the distinct-alias count. Its last assertion names the
+//! two aliases literally, `pi0` for the outer filter and `cpi0` for the
+//! selection, so a selection prefix other than `c` fails it whether or
+//! not it collides. With `"x"` in place of `"c"`, the run above printed
+//! the panic message
+//! `the outer filter takes the empty prefix and the selection takes c: ["pi0", "xpi0"]`
+//! and `Summary … 5 tests run: 4 passed, 1 failed, 0 skipped`.
+//!
+//! So the three together pin, for the shapes in `CASES` and the
+//! comparison query in 4c: the rendered attribute column and its
+//! locators are byte-identical on the two routes (4a), one production
+//! implementation with exactly two calling files (4b), and both the
+//! disjointness and the literal spelling of the two filters' aliases in
+//! a comparison statement (4c). They read rendered SQL only — no
+//! statement here is sent to a server; the routes' ANSWERS are pinned by
+//! the live suites.
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};
