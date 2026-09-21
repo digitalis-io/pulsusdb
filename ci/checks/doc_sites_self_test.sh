@@ -13,15 +13,17 @@
 # a throwaway directory: the attacks edit files, and nothing they edit may
 # be the tree CI is about to build.
 #
-# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Twenty-one
+# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Twenty-three
 # attacks, and they divide in three. **Seven edit the protected
 # CONTENT**: the whitespace-only rewrite, the changed `leave` row, and
 # the five issue-number attacks. **Thirteen edit the MANIFEST and leave
 # the protected content alone**: the duplicate row, the swapped site, the
 # empty manifest, and the ten `refs=`, record-shape and literal-edit
 # attacks. One of the thirteen also copies an extra file into the scratch
-# tree, which no record protects. **One edits both**: the final record
-# with no newline whose protected text was also replaced. (An earlier
+# tree, which no record protects. **Three edit both**: the final record
+# with no newline whose protected text was also replaced, and the two
+# that declare a reference and append a line carrying it only as the
+# start of a longer token, `#999999x` and `#999999_`. (An earlier
 # version of this paragraph said every attack edits the content. Three of
 # its own ten contradicted it, which is the defect this file's own
 # subject is — a claim wider than its evidence.)
@@ -40,7 +42,7 @@
 # line is printed, so deleting a test body fails the run rather than
 # quietly printing a smaller number.
 #
-# **None of the twenty-one touches the workflow**, and that is the division that
+# **None of the twenty-three touches the workflow**, and that is the division that
 # decides what a green run means. Editing content or manifest is the
 # shape of an accident, and accidents are what the check is for. It is
 # not the shape of a determined author, who would edit the content and the
@@ -490,6 +492,22 @@ copy_tree
 set_column "$refs_row_site" "$refs_row_col" "$refs_row_col,#999999"
 expect_fail "declared reference #999999 is absent"
 
+# The declared number occurs in the file only as the start of a longer
+# token. `#999999x` and `#999999_` are not issue references, so they do
+# not record `#999999`. The appended line also reaches the added-lines
+# rule, which reads `#999999` out of it and finds it licensed by the
+# declaration, so the refusal can only come from the presence rule.
+# Before the digit run had to end the token, both of these passed with
+# `checked 27 sites`.
+for suffix in x _; do
+  echo "self-test: a declared reference present only as #N followed by '$suffix'"
+  copy_tree
+  printf 'doc-sites self-test: not-an-issue #999999%s\n' "$suffix" \
+    >> "$work/tree/$refs_row_file"
+  set_column "$refs_row_site" "$refs_row_col" "$refs_row_col,#999999"
+  expect_fail "declared reference #999999 is absent from $refs_row_file"
+done
+
 echo "self-test: a refs= column on a leave row"
 # #494 is allowed on every file, so what is caught is the row the column
 # sits on, not the number in it.
@@ -593,6 +611,6 @@ copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-[ "$attacks" -eq 21 ] && [ "$must_pass" -eq 3 ] && [ "$refusals" -eq 3 ] \
-  || fail "the suite ran $attacks attacks, $must_pass must-pass runs and $refusals refusals; it must run 21, 3 and 3"
+[ "$attacks" -eq 23 ] && [ "$must_pass" -eq 3 ] && [ "$refusals" -eq 3 ] \
+  || fail "the suite ran $attacks attacks, $must_pass must-pass runs and $refusals refusals; it must run 23, 3 and 3"
 echo "doc-sites-self-test: $attacks attacks caught, $must_pass must-pass runs passed, $refusals graph shapes refused"

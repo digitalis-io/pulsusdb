@@ -138,8 +138,34 @@ fail() { echo "doc-sites: $1" >&2; exit 1; }
 # door beside it. Round 2 of this issue's code review walked through the
 # hash-only version by writing `follow-up issue 999999`, which names an
 # issue to every reader and matched nothing.
+#
+# This reading stops at the first non-digit, so it also reads `#987654`
+# out of `#987654x`. That is the safe side for the lines a change ADDED,
+# which is the one place it is used: a token that looks like a reference
+# is refused unless it is licensed.
 issue_refs() {
   grep -ioE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+' "$1" 2>/dev/null \
+    | grep -oE '[0-9]+' \
+    | sed 's/^/#/' \
+    | LC_ALL=C sort -u
+}
+
+# The same references, but only where the digit run ENDS the token: a
+# letter, digit or underscore after it makes the whole token something
+# else. Used for the two sets that SATISFY a rule — what a file carries,
+# for the presence rule, and what the protected blocks and declarations
+# allow — where reading too much would accept a reference nobody wrote.
+# The first `grep` takes the digits together with any word characters
+# after them, and the second keeps only the matches that stop at the
+# digits. With `issue_refs` here, `refs=#987654` was satisfied by a file
+# whose only match was `not-an-issue #987654x` — measured, `checked 27
+# sites`, exit 0. `#987654.`, `#987654,` and `(#987654)` still count.
+#
+# Only the END of the token is bounded. `tissue 987654` and `abc#987654`
+# are still read as #987654.
+standalone_issue_refs() {
+  grep -ioE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+[0-9A-Za-z_]*' "$1" 2>/dev/null \
+    | grep -ixE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+' \
     | grep -oE '[0-9]+' \
     | sed 's/^/#/' \
     | LC_ALL=C sort -u
@@ -411,7 +437,7 @@ check_issue_references() {
           sed -n "${start},${end}p" "$tmp_base" >> "$tmp_a"
         done
     declared_refs "$file" >> "$tmp_a"
-    issue_refs "$tmp_a" > "$tmp_a.n" || true
+    standalone_issue_refs "$tmp_a" > "$tmp_a.n" || true
 
     # The column licenses; it must also RECORD. Every reference it
     # declares has to be in the working-tree copy of the file the row
@@ -420,7 +446,7 @@ check_issue_references() {
     # given in the header. This runs before the added-lines comparison
     # below and does not depend on it, so it holds on a run whose
     # added-line set is empty.
-    issue_refs "$ROOT/$file" > "$tmp_have" || true
+    standalone_issue_refs "$ROOT/$file" > "$tmp_have" || true
     for ref in $(declared_refs "$file"); do
       grep -Fqx -- "$ref" "$tmp_have" \
         || fail "declared reference $ref is absent from $file"
