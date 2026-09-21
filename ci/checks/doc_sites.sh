@@ -150,22 +150,27 @@ issue_refs() {
     | LC_ALL=C sort -u
 }
 
-# The same references, but only where the digit run ENDS the token: a
-# letter, digit or underscore after it makes the whole token something
-# else. Used for the two sets that SATISFY a rule — what a file carries,
-# for the presence rule, and what the protected blocks and declarations
-# allow — where reading too much would accept a reference nobody wrote.
-# The first `grep` takes the digits together with any word characters
-# after them, and the second keeps only the matches that stop at the
-# digits. With `issue_refs` here, `refs=#987654` was satisfied by a file
-# whose only match was `not-an-issue #987654x` — measured, `checked 27
-# sites`, exit 0. `#987654.`, `#987654,` and `(#987654)` still count.
+# The same references, but only where the reference is a whole token:
+# it starts at the beginning of a line or after a character that is not
+# a letter, digit or underscore, and its digit run ENDS the token, with
+# no letter, digit or underscore after it. Used for the two sets that
+# SATISFY a rule — what a file carries, for the presence rule, and what
+# the protected blocks and declarations allow — where reading too much
+# would accept a reference nobody wrote.
 #
-# Only the END of the token is bounded. `tissue 987654` and `abc#987654`
-# are still read as #987654.
+# The first `grep` takes the one boundary character before the reference
+# (none at the start of a line) and the digits together with any word
+# characters after them; the second keeps only the matches that stop at
+# the digits. With `issue_refs` here, `refs=#987654` was satisfied by a
+# file whose only match was `not-an-issue #987654x`, and then by one
+# whose only match was `tissue 987654`, `abc#987654` or `x_#987654` —
+# measured, each `checked 27 sites`, exit 0. `#987654.`, `#987654,`,
+# `(#987654)`, `issue 987654` and `#987654` at the start of a line still
+# count. One consequence of consuming the boundary character: in
+# `#1#2` the second reference has `1` before it and is not counted.
 standalone_issue_refs() {
-  grep -ioE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+[0-9A-Za-z_]*' "$1" 2>/dev/null \
-    | grep -ixE '(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+' \
+  grep -ioE '(^|[^0-9A-Za-z_])(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+[0-9A-Za-z_]*' "$1" 2>/dev/null \
+    | grep -ixE '[^0-9A-Za-z_]?(#|issues?[[:space:]]+(number[[:space:]]+)?#?)[0-9]+' \
     | grep -oE '[0-9]+' \
     | sed 's/^/#/' \
     | LC_ALL=C sort -u

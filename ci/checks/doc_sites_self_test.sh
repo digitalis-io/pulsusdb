@@ -13,17 +13,19 @@
 # a throwaway directory: the attacks edit files, and nothing they edit may
 # be the tree CI is about to build.
 #
-# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Twenty-three
-# attacks, and they divide in three. **Seven edit the protected
+# **WHAT THESE ATTACKS ESTABLISH, AND WHAT THEY DO NOT.** Twenty-six
+# attacks, and they divide in four. **Seven edit the protected
 # CONTENT**: the whitespace-only rewrite, the changed `leave` row, and
 # the five issue-number attacks. **Thirteen edit the MANIFEST and leave
 # the protected content alone**: the duplicate row, the swapped site, the
 # empty manifest, and the ten `refs=`, record-shape and literal-edit
 # attacks. One of the thirteen also copies an extra file into the scratch
-# tree, which no record protects. **Three edit both**: the final record
-# with no newline whose protected text was also replaced, and the two
-# that declare a reference and append a line carrying it only as the
-# start of a longer token, `#999999x` and `#999999_`. (An earlier
+# tree, which no record protects. **Five edit both**: the final record
+# with no newline whose protected text was also replaced, and the four
+# that declare a reference and append a line carrying it only inside a
+# longer token, `#999999x`, `#999999_`, `abc#999999` and `x_#999999`.
+# **One edits the protected block ITSELF**, in a throwaway commit that
+# stands in for the frozen base, and adds a line to the tree. (An earlier
 # version of this paragraph said every attack edits the content. Three of
 # its own ten contradicted it, which is the defect this file's own
 # subject is — a claim wider than its evidence.)
@@ -42,7 +44,7 @@
 # line is printed, so deleting a test body fails the run rather than
 # quietly printing a smaller number.
 #
-# **None of the twenty-three touches the workflow**, and that is the division that
+# **None of the twenty-six touches the workflow**, and that is the division that
 # decides what a green run means. Editing content or manifest is the
 # shape of an accident, and accidents are what the check is for. It is
 # not the shape of a determined author, who would edit the content and the
@@ -167,12 +169,15 @@ expect_pass() {
 }
 
 # Runs the check against the scratch copy and requires it to fail with a
-# message containing `$1`.
+# message containing `$1`. `$base_override`, when set, is passed as the
+# check's `BASE`, standing in for the frozen base revision; empty, the
+# check reads the revision from the manifest as it always does.
+base_override=
 expect_fail() {
   want=$1
   set +e
   out=$(REPO="$REPO" ROOT="$work/tree" MANIFEST="$work/manifest.txt" \
-        EXPECTED="$work/expected.txt" \
+        EXPECTED="$work/expected.txt" BASE="$base_override" \
         sh "$REPO/ci/checks/doc_sites.sh" 2>&1)
   code=$?
   set -e
@@ -508,6 +513,45 @@ for suffix in x _; do
   expect_fail "declared reference #999999 is absent from $refs_row_file"
 done
 
+# The same at the START of the token: a letter or an underscore right
+# before the `#` makes `abc#999999` and `x_#999999` something other than
+# a reference to #999999. As above, the added-lines rule reads #999999
+# out of the appended line and finds it licensed, so the refusal can only
+# come from the presence rule. Before the reference had to start the
+# token, both of these passed with `checked 27 sites`.
+for prefix in abc x_; do
+  echo "self-test: a declared reference present only as #N preceded by '$prefix'"
+  copy_tree
+  printf 'doc-sites self-test: not-an-issue %s#999999\n' "$prefix" \
+    >> "$work/tree/$refs_row_file"
+  set_column "$refs_row_site" "$refs_row_col" "$refs_row_col,#999999"
+  expect_fail "declared reference #999999 is absent from $refs_row_file"
+done
+
+echo "self-test: a longer token in a protected block does not allow its number"
+# The allowed set is read from the protected blocks at the frozen base.
+# That revision cannot be edited, so this case builds a throwaway commit
+# identical to it except that the first rewrite row's protected line
+# also carries `#999999x`, and passes it as the check's `BASE`. A line
+# the change adds then cites #999999, with no declaration. `#999999x` is
+# not a reference to #999999, so nothing allows it and the check must
+# refuse. Read with the added-lines extractor instead, the protected
+# block would allow #999999 and the check would pass: measured, exit 0.
+copy_tree
+git show "$BASE:$rewrite_file" \
+  | awk -v n="$rewrite_start" 'NR == n { print $0 " not-an-issue #999999x"; next } { print }' \
+  > "$work/base_file"
+base_mode=$(git -C "$REPO" ls-tree "$BASE" -- "$rewrite_file" | cut -d' ' -f1)
+base_blob=$(git -C "$REPO" hash-object -w "$work/base_file")
+GIT_INDEX_FILE="$work/index" git -C "$REPO" read-tree "$BASE"
+GIT_INDEX_FILE="$work/index" git -C "$REPO" update-index \
+  --cacheinfo "$base_mode,$base_blob,$rewrite_file"
+base_tree=$(GIT_INDEX_FILE="$work/index" git -C "$REPO" write-tree)
+base_override=$(throwaway_commit "$base_tree" -p "$BASE")
+printf 'doc-sites self-test: follow-up #999999\n' >> "$work/tree/$rewrite_file"
+expect_fail "new issue number #999999 in rewrite row: $rewrite_file"
+base_override=
+
 echo "self-test: a refs= column on a leave row"
 # #494 is allowed on every file, so what is caught is the row the column
 # sits on, not the number in it.
@@ -611,6 +655,6 @@ copy_tree
 : > "$work/manifest.txt"
 expect_fail "empty or missing manifest"
 
-[ "$attacks" -eq 23 ] && [ "$must_pass" -eq 3 ] && [ "$refusals" -eq 3 ] \
-  || fail "the suite ran $attacks attacks, $must_pass must-pass runs and $refusals refusals; it must run 23, 3 and 3"
+[ "$attacks" -eq 26 ] && [ "$must_pass" -eq 3 ] && [ "$refusals" -eq 3 ] \
+  || fail "the suite ran $attacks attacks, $must_pass must-pass runs and $refusals refusals; it must run 26, 3 and 3"
 echo "doc-sites-self-test: $attacks attacks caught, $must_pass must-pass runs passed, $refusals graph shapes refused"
