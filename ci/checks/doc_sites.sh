@@ -40,6 +40,23 @@
 #     rounded up. (The `refs=` column came from the opposite case — a
 #     reference an earlier version of this rule ALLOWED, which a code
 #     review found and the column now records as a decision.)
+#   * a `refs=` column declaring a reference the named file does not
+#     carry. The column records a decision, and a decision naming a
+#     reference nobody wrote down is not one. Measured on the version
+#     before this rule: `refs=#25,#559,#999999` on
+#     `docs/schemas.md:174-174` printed `checked 27 sites` and exited 0.
+#   * a `refs=` column on a `leave` row, where nothing reads it, and a
+#     column whose text only looks like a declaration. `refs=#25, #559`
+#     declares two references and records one: the reader takes field 3,
+#     and `#559` lands in field 4, which nothing looks at.
+#   * a manifest this script's own parsers would read differently. Six
+#     of them read this file, and three disagreements were measured: the
+#     row loop skipped a final record with no newline after it while
+#     every `awk` reader read it; a carriage return survived into the
+#     last field of both and made the message quote text that looks
+#     correct; and a NUL byte inside `rewrite` was dropped by `read` and
+#     kept by `awk`, so the row loop checked a row every `awk` reader
+#     skipped, and the declaration on that row went unchecked.
 #
 # Citations that have drifted are a different check in a different file:
 # `every_design_record_citation_still_points_at_what_it_names` in
@@ -69,13 +86,38 @@
 # control. It is not one. Its value is that it fails when documentation
 # drifts away from the code by accident, which is what happens.
 #
-# Two other things it cannot see, stated rather than papered over:
+# Three other things it cannot see, stated rather than papered over:
 #
 #   * a site nobody put in the manifest. The set is derived by the search
 #     published beside it in `doc_sites.expected`, and re-derivable, but
 #     the check cannot invent a row.
 #   * whether a rewritten sentence is TRUE. It checks that the text moved,
 #     not that it moved to something correct.
+#   * whether a declared reference is cited in the PASSAGE the row names,
+#     rather than somewhere else in the same file. The `refs=` rule below
+#     is per FILE. Measured: `refs=#351` added to the
+#     `docs/schemas.md:1089-1089` row with no text change printed
+#     `checked 27 sites` and exited 0, because #351 is already elsewhere
+#     in that file. Two narrower rules were written and run rather than
+#     ruled out on paper, and both are worse:
+#
+#       - "inside the row's range in the working tree": the ranges are
+#         coordinates in the FROZEN BASE and the tree has moved. Line 174
+#         of `docs/schemas.md` in the tree carries neither #25 nor #559,
+#         so this rule refuses the committed manifest.
+#       - "among the lines this change added": it holds against the
+#         frozen base (#25 once, #559 three times, #507 once), but on a
+#         run with no pull request the workflow supplies the checked-out
+#         commit (`.github/workflows/ci.yml:98`), the added-line set is
+#         empty, and every declaration reads as unused. Declarations are
+#         cumulative too: a later change that adds lines to
+#         `docs/schemas.md` does not re-add #25.
+#
+#     One cost of the per-file rule, stated because it will be met: a
+#     change that removes a file's LAST mention of a declared reference
+#     must prune that entry from the column, and the message names the
+#     reference and the file. Removing one mention of several changes
+#     nothing.
 #
 # Usage:
 #   PULSUSDB_DOC_SITES_UPSTREAM=<base branch commit> \
@@ -105,6 +147,17 @@ issue_refs() {
 
 [ -s "$MANIFEST" ] || fail "empty or missing manifest"
 [ -s "$EXPECTED" ] || fail "empty or missing expected set"
+# A carriage return is read differently by every parser here: `read`
+# leaves it in the last field, `awk` leaves it inside the last field,
+# and neither treats it as a separator. The record then fails somewhere
+# downstream with a message quoting text that LOOKS correct, because a
+# carriage return does not print. Measured on the version before this
+# rule: a `rewrite` row carrying a column and ending CRLF passed, exit
+# 0. One check, once, over the whole file, naming the cause. It runs
+# before the frozen base is read, because a base revision with a
+# carriage return glued to it fails at `git cat-file` instead.
+! grep -Fq "$(printf '\r')" "$MANIFEST" \
+  || fail "the manifest has carriage returns; it must use Unix line endings"
 # The revision the ranges are taken in is frozen IN the manifest, not
 # passed by the caller: the rows are claims about that revision's
 # sentences, so a moving base would quietly change what they assert. A
@@ -147,7 +200,9 @@ git cat-file -e "$UPSTREAM^{commit}" 2>/dev/null \
   || fail "the supplied upstream revision $UPSTREAM is not in this clone (fetch-depth)"
 
 tmp_base=$(mktemp); tmp_a=$(mktemp); tmp_b=$(mktemp); tmp_up=$(mktemp)
-trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_up" "$tmp_a.n" "$tmp_b.n"' EXIT INT TERM
+tmp_have=$(mktemp); tmp_loop=$(mktemp); tmp_view=$(mktemp)
+trap 'rm -f "$tmp_base" "$tmp_a" "$tmp_b" "$tmp_up" "$tmp_a.n" "$tmp_b.n" \
+  "$tmp_have" "$tmp_loop" "$tmp_view"' EXIT INT TERM
 
 sites=$(awk '$1 != "#" && NF { print $2 }' "$MANIFEST" | LC_ALL=C sort)
 dups=$(printf '%s\n' "$sites" | LC_ALL=C uniq -d)
@@ -186,13 +241,29 @@ contains_block() {
 }
 
 n=0
-while read -r verdict site rest; do
+ln=0
+# `|| [ -n "${verdict:-}" ]` runs the body once more for a final record
+# with no newline after it. Without it the row loop skipped that record
+# entirely — its verdict, its range, its file's presence in the tree and
+# its column all unchecked — while every `awk` reader below still read
+# it. Measured on the version before this rule, with the last record's
+# protected text replaced: `checked 26 sites`, exit 0.
+while read -r verdict site rest || [ -n "${verdict:-}" ]; do
+  ln=$((ln + 1))
   [ -n "${verdict:-}" ] || continue
   [ "$verdict" != "#" ] || continue
   # `rest` is the optional `refs=#a,#b` column, read by
   # `check_issue_references` from the manifest directly.
+  #
+  # The column must say what it appears to say. `rest` is the whole
+  # remainder of the record with trailing blanks trimmed, so a second
+  # column and a space inside the column are both caught here, and a
+  # record with trailing spaces is not.
   case "${rest:-}" in
-    "" | refs=*) ;;
+    "") ;;
+    refs=*)
+      printf '%s\n' "$rest" | grep -qxE 'refs=#[0-9]+(,#[0-9]+)*' \
+        || fail "malformed refs= column for $site: '$rest' (want refs=#N or refs=#N,#M)" ;;
     *) fail "unknown trailing column ${rest:?} for $site" ;;
   esac
   file=${site%%:*}; range=${site#*:}
@@ -209,6 +280,12 @@ while read -r verdict site rest; do
 
   case "$verdict" in
     leave)
+      # Nothing reads a `refs=` column on a `leave` row: the declaration
+      # reader below takes `rewrite` rows only. A column here records a
+      # decision that has no effect, which is worse than none.
+      case "${rest:-}" in
+        refs=*) fail "refs= column on a leave row: $site" ;;
+      esac
       contains_block "$tmp_a" "$ROOT/$file" || fail "leave row changed: $site" ;;
     rewrite)
       if contains_block "$tmp_a" "$ROOT/$file"; then
@@ -227,10 +304,75 @@ while read -r verdict site rest; do
       ;;
     *) fail "unknown verdict '$verdict' for $site" ;;
   esac
+  # This loop's own view of the record, for the comparison after the
+  # loop. Written here rather than derived afterwards, because the
+  # point of the comparison is what THIS parser saw.
+  printf '%s %s %s %s\n' "$ln" "$verdict" "$site" "${rest:-}" >> "$tmp_loop"
   n=$((n + 1))
 done < "$MANIFEST"
 
 [ "$n" -gt 0 ] || fail "empty list"
+
+# Six parsers read this file: the frozen-base row above, the site set
+# above, the row loop above, and three `awk` readers in
+# `check_issue_references` below. They are different parsers, and a byte
+# one of them drops and another keeps makes a row checked by one and
+# skipped by the other. Measured on the version before this rule: a NUL
+# byte inside `rewrite` is dropped by `read` and kept by `awk`, so the
+# row loop checked the row while every `awk` reader skipped it, and
+# `refs=#25,#559,#999999` on that row passed with exit 0 although
+# `docs/schemas.md` carries no #999999.
+#
+# Enumerated over every byte value 0 to 255 in the verdict field, under
+# two locales, comparing the whole record view each family builds: NUL is
+# the only byte the two families read differently; the rule is
+# written against the parsers rather than against that byte, because the
+# next divergence will be a different byte. So: the row loop's view of
+# every record, compared byte for byte with the `awk` view of the same
+# records, before any `awk` reader below is consulted.
+awk '$1 != "#" && NF {
+  r = ""
+  for (i = 3; i <= NF; i++) { r = (i == 3 ? $i : r " " $i) }
+  printf "%s %s %s %s\n", NR, $1, $2, r
+}' "$MANIFEST" > "$tmp_view"
+if ! cmp -s "$tmp_loop" "$tmp_view"; then
+  k=$(awk 'NR == FNR { loop[FNR] = $0; ln = FNR; next }
+           { rn = FNR; if (!k && $0 != loop[FNR]) { k = FNR } }
+           END { if (!k) { k = (ln < rn ? ln : rn) + 1 }; print k }' \
+      "$tmp_loop" "$tmp_view")
+  show() { sed -n "${k}p" "$1" | cut -d' ' -f2- | tr -c '\11\12\40-\176' '?' | tr -d '\n'; }
+  # `FNR` and not `NR`: with two files `sed -n "${k}p"` would number the
+  # concatenation, so a short first file would print the wrong record.
+  where=$(awk -v k="$k" 'FNR == k { print $1; exit }' "$tmp_view" "$tmp_loop")
+  fail "the row loop and the manifest readers disagree about the record on
+  line ${where:-?} of $MANIFEST:
+  the row loop read      '$(show "$tmp_loop")'
+  the manifest reader    '$(show "$tmp_view")'
+  A byte one parser drops and another keeps makes a row checked by one and
+  skipped by the other. A '?' above stands for a byte outside tab, newline
+  and printable ASCII; a missing line means one parser saw fewer records."
+fi
+
+# Every reference listed in a `refs=` column on a `rewrite` row naming
+# file `$1`, one per line, in manifest order and exactly as written.
+# The body is the block that used to sit inline in
+# `check_issue_references`, wrapped in a function so the presence rule
+# below and the allowance feed read the same declarations.
+declared_refs() {
+  awk -v want="$1" '
+    $1 == "rewrite" {
+      split($2, s, ":")
+      if (s[1] != want) { next }
+      for (i = 3; i <= NF; i++) {
+        if ($i ~ /^refs=/) {
+          sub(/^refs=/, "", $i)
+          m = split($i, r, ",")
+          for (k = 1; k <= m; k++) { print r[k] }
+        }
+      }
+    }
+  ' "$MANIFEST"
+}
 
 # R2: no follow-up issue number is invented.
 #
@@ -268,20 +410,21 @@ check_issue_references() {
           range=${site#*:}; start=${range%%-*}; end=${range#*-}
           sed -n "${start},${end}p" "$tmp_base" >> "$tmp_a"
         done
-    awk -v want="$file" '
-      $1 == "rewrite" {
-        split($2, s, ":")
-        if (s[1] != want) { next }
-        for (i = 3; i <= NF; i++) {
-          if ($i ~ /^refs=/) {
-            sub(/^refs=/, "", $i)
-            m = split($i, r, ",")
-            for (k = 1; k <= m; k++) { print r[k] }
-          }
-        }
-      }
-    ' "$MANIFEST" >> "$tmp_a"
+    declared_refs "$file" >> "$tmp_a"
     issue_refs "$tmp_a" > "$tmp_a.n" || true
+
+    # The column licenses; it must also RECORD. Every reference it
+    # declares has to be in the working-tree copy of the file the row
+    # names, or the column is a decision about text nobody wrote. It is
+    # a rule about the FILE and not about the passage, for the reason
+    # given in the header. This runs before the added-lines comparison
+    # below and does not depend on it, so it holds on a run whose
+    # added-line set is empty.
+    issue_refs "$ROOT/$file" > "$tmp_have" || true
+    for ref in $(declared_refs "$file"); do
+      grep -Fqx -- "$ref" "$tmp_have" \
+        || fail "declared reference $ref is absent from $file"
+    done
 
     # The lines this change ADDED to the file, measured against the
     # supplied upstream revision rather than against the frozen base. A
@@ -300,7 +443,7 @@ check_issue_references() {
 
     for ref in $(issue_refs "$tmp_b"); do
       [ "$ref" = "#494" ] && continue
-      grep -qx -- "$ref" "$tmp_a.n" \
+      grep -Fqx -- "$ref" "$tmp_a.n" \
         || fail "new issue number $ref in rewrite row: $file"
     done
   done
