@@ -1122,8 +1122,9 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 
     // And the cardinality, so a NEW mutation of an allowed kind is a
     // decision somebody makes rather than a line nobody reads. The split
-    // measured on this base is seven `MATERIALIZE TTL` and four
-    // `PROJECTION` commands.
+    // measured on this base is nine `MATERIALIZE TTL` and four
+    // `PROJECTION` commands — issue #560 added two `MATERIALIZE TTL`, one
+    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`.
     let ttl = commands
         .iter()
         .filter(|c| *c == "(MATERIALIZE TTL)")
@@ -1131,7 +1132,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     let projection = commands.len() - ttl;
     assert_eq!(
         (commands.len(), ttl, projection),
-        (11, 7, 4),
+        (13, 9, 4),
         "the mutations a fresh database issues moved; read each one before repinning: \
          {commands:?}"
     );
