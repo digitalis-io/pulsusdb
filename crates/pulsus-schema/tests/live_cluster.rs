@@ -1171,8 +1171,8 @@ struct MetricSampleRow {
     value: f64,
 }
 
-/// The span columns this test writes; every other column takes its
-/// default.
+/// The span columns this test writes: every column without a default,
+/// the five attribute arrays empty. The rest take their defaults.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct SpanInsertRow {
     trace_id: [u8; 16],
@@ -1185,6 +1185,12 @@ struct SpanInsertRow {
     status_code: i8,
     kind: i8,
     payload_type: i8,
+    payload: String,
+    attr_key: Vec<String>,
+    attr_scope: Vec<String>,
+    attr_val: Vec<String>,
+    attr_type: Vec<String>,
+    attr_num: Vec<Option<f64>>,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1273,6 +1279,12 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         status_code: 2,
         kind: 2,
         payload_type: 1,
+        payload: String::new(),
+        attr_key: Vec::new(),
+        attr_scope: Vec::new(),
+        attr_val: Vec::new(),
+        attr_type: Vec::new(),
+        attr_num: Vec::new(),
     };
     for _ in 0..2 {
         as_user
