@@ -138,6 +138,16 @@ impl ChClient {
             .with_max_execution_time(timeout)
     }
 
+    /// Issue #560 tests-first stub — ignores `extra`; replaced in the
+    /// implementation.
+    fn insert_settings_with(
+        c: &ConsistencyConfig,
+        timeout: Duration,
+        _extra: &QuerySettings,
+    ) -> QuerySettings {
+        Self::insert_settings_of(c, timeout)
+    }
+
     /// The complete settings the read path attaches (issue #114): the
     /// caller's `base` settings, plus — when enabled —
     /// `select_sequential_consistency`, plus the stream deadline. Pool-free
@@ -176,6 +186,17 @@ impl ChClient {
     /// whose effect is uncertain. Genuine pre-commit poison (bad SQL,
     /// decode failure) is surfaced unchanged: nothing was committed, so it
     /// is not uncertain, merely wrong.
+    /// Issue #560 tests-first stub — ignores `extra`; replaced in the
+    /// implementation.
+    pub async fn insert_block_with<R: ChRow>(
+        &self,
+        table: &str,
+        rows: &[R],
+        _extra: &QuerySettings,
+    ) -> Result<(), ChError> {
+        self.insert_block(table, rows).await
+    }
+
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         let conn = self.pool.get().await?;
         // Issue #114: the whole attached set — the server deadline plus,
@@ -436,6 +457,22 @@ mod tests {
         assert_eq!(
             s.render_suffix(),
             " SETTINGS async_insert = 0, max_execution_time = 120.000"
+        );
+    }
+
+    /// Issue #560: the span inserts' two deduplication pins come after
+    /// `async_insert` and before the deadline, and nothing else moves.
+    #[test]
+    fn insert_settings_with_the_span_pins_emits_both_before_the_deadline() {
+        let s = ChClient::insert_settings_with(
+            &ConsistencyConfig::default(),
+            Duration::from_secs(120),
+            &QuerySettings::deduplicate_through_views(),
+        );
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS async_insert = 0, deduplicate_insert = enable, \
+             deduplicate_blocks_in_dependent_materialized_views = 1, max_execution_time = 120.000"
         );
     }
 

@@ -57,6 +57,11 @@ impl QuerySettings {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Issue #560 tests-first stub — replaced in the implementation.
+    pub fn deduplicate_through_views() -> Self {
+        Self::new()
+    }
+
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
     /// `optimize_skip_unused_shards`, `optimize_distributed_group_by_sharding_key`,
     /// `distributed_aggregation_memory_efficient`, `prefer_localhost_replica`

@@ -526,13 +526,22 @@ mod tests {
             .collect();
         assert_eq!(
             trace_ttl_stmts.len(),
-            3,
-            "exactly trace_spans + trace_attrs_idx + trace_edges carry a trace MODIFY TTL"
+            5,
+            "exactly trace_spans + trace_attrs_idx + trace_edges + trace_recent + \
+             trace_error_spans carry a trace MODIFY TTL"
         );
         for stmt in &trace_ttl_stmts {
+            // Issue #560: `trace_recent`'s TTL reads its newest span in the
+            // bucket, `ts_max`; every other trace table's reads its own
+            // `timestamp_ns`.
+            let column = if stmt.contains(".trace_recent ") {
+                "ts_max"
+            } else {
+                "timestamp_ns"
+            };
             assert!(
-                stmt.contains("least(intDiv(timestamp_ns, 1000000000) + "),
-                "trace TTL must use the clamped Int64-seconds form: {stmt}"
+                stmt.contains(&format!("least(intDiv({column}, 1000000000) + ")),
+                "trace TTL must use the clamped Int64-seconds form on {column}: {stmt}"
             );
             assert!(
                 stmt.contains(", 4294967295))"),
@@ -576,7 +585,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY TTL"))
             .collect();
-        assert_eq!(ttl_stmts.len(), 7, "seven retained tables carry a TTL");
+        assert_eq!(ttl_stmts.len(), 9, "nine retained tables carry a TTL");
         for stmt in &ttl_stmts {
             assert!(
                 stmt.contains("least(intDiv("),
@@ -629,7 +638,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY SETTING ttl_only_drop_parts = 1"))
             .collect();
-        assert_eq!(setting_stmts.len(), 7, "one MODIFY SETTING per table");
+        assert_eq!(setting_stmts.len(), 9, "one MODIFY SETTING per table");
         assert_eq!(
             ttl_stmts
                 .iter()

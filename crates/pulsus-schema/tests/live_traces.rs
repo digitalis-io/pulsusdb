@@ -2405,3 +2405,289 @@ async fn migration_41_alters_a_populated_pre_migration_catalog() {
 
     drop_database(&client, db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #560 — the two derived trace tables
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct EngineFullRow {
+    engine_full: String,
+}
+
+async fn engine_full(client: &ChClient, db: &str, table: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT engine_full FROM system.tables WHERE database = '{db}' AND name = '{table}'"
+    );
+    let mut stream = client
+        .query_stream::<EngineFullRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.tables engine_full");
+    stream
+        .next()
+        .await
+        .map(|r| r.expect("decode EngineFullRow").engine_full)
+}
+
+/// Issue #560 criterion 7: after `run_init` the two tables and their two
+/// views exist; a second `run_init` is a no-op leaving one bookkeeping row
+/// per new migration; both TTLs render the saturating form.
+///
+/// **The bookkeeping ids on a single node.** Migrations 61 and 63 are the
+/// `_dist` wrappers (`Ddl::Dist`), which a single node skips entirely —
+/// never attempted, never recorded (`controller.rs`, `is_cluster_only`) —
+/// so this suite, which runs single-node, holds rows for 60 and 62 and
+/// none for 61 and 63. The wrappers are asserted on the cluster leg
+/// (`live_cluster.rs`).
+#[tokio::test]
+async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_derived");
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+
+    run_init(&client, &ctx).await.expect("run_init");
+    apply_ttl(&client, &ctx).await.expect("apply_ttl");
+    let second = run_init(&client, &ctx).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let names = table_names(&client, db).await;
+    for object in [
+        "trace_recent",
+        "trace_recent_mv",
+        "trace_error_spans",
+        "trace_error_spans_mv",
+    ] {
+        if !names.iter().any(|n| n == object) {
+            failures.push(format!("{db}.{object} does not exist"));
+        }
+    }
+    if let Err(e) = &second {
+        failures.push(format!("the second run_init failed: {e}"));
+    }
+    for (id, expected) in [(60u32, 1u64), (61, 0), (62, 1), (63, 0)] {
+        let n = count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = {id}"),
+        )
+        .await;
+        if n != expected {
+            failures.push(format!(
+                "schema_migrations holds {n} rows for id {id}, expected {expected}"
+            ));
+        }
+    }
+    for (table, column) in [
+        ("trace_recent", "intDiv(ts_max, 1000000000)"),
+        ("trace_error_spans", "intDiv(timestamp_ns, 1000000000)"),
+    ] {
+        match engine_full(&client, db, table).await {
+            None => failures.push(format!("{db}.{table}: no engine_full (table absent)")),
+            Some(engine) => {
+                for needle in [column, "4294967295"] {
+                    if !engine.contains(needle) {
+                        failures.push(format!("{table}'s engine_full lacks {needle:?}: {engine}"));
+                    }
+                }
+            }
+        }
+    }
+
+    drop_database(&client, db).await;
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// One raw HTTP request to ClickHouse's own interface: the status and the
+/// body, whatever the status is. `ChClient` turns a failed insert into an
+/// error value; this test is about what the CALLER is told, so it reads
+/// the wire.
+fn clickhouse_http_post(body: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let host = std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("PULSUS_TEST_CH_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(19123);
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout");
+    let request = format!(
+        "POST / HTTP/1.0\r\nHost: {host}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status in {text:?}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The `Code: <n>` number in a ClickHouse error body.
+fn error_code(body: &str) -> Option<u32> {
+    let at = body.find("Code: ")? + "Code: ".len();
+    body[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn repo_file(rel: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// The `docs/schemas.md` paragraph beginning with the failing-view lead,
+/// up to the next blank line, every whitespace run collapsed.
+fn failing_view_paragraph() -> Option<String> {
+    let doc = repo_file("docs/schemas.md");
+    let lead = "**What a failing view leaves behind (#560).**";
+    let mut lines = doc.lines();
+    let first = lines.by_ref().find(|l| l.trim_start().starts_with(lead))?;
+    let mut out = vec![first.to_string()];
+    for l in lines {
+        if l.trim().is_empty() {
+            break;
+        }
+        out.push(l.to_string());
+    }
+    Some(
+        out.join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Issue #560 criterion 18: a view that throws fails the insert, and the
+/// documents say what the caller is told. Only the outcomes that held on
+/// every one of the design record's 300 trials are asserted — the
+/// response status, its code and the throwing view's empty target. The
+/// source's and the healthy targets' counts are printed, never asserted:
+/// they vary run to run (`docs/traceql-schema-migration.md` §6.3).
+#[tokio::test]
+async fn a_throwing_view_fails_the_insert_and_the_documents_say_so() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_throwing_view");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let exec = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("execute failed: {e}\nSQL:\n{sql}"));
+        }
+    };
+    let second_span = "0000000000000002";
+    exec(format!(
+        "CREATE TABLE {db}.throw_target (trace_id FixedString(16)) ENGINE = MergeTree ORDER BY trace_id"
+    ))
+    .await;
+    exec(format!(
+        "CREATE MATERIALIZED VIEW {db}.throw_mv TO {db}.throw_target AS \
+         SELECT trace_id FROM {db}.trace_spans \
+         WHERE throwIf(span_id = unhex('{second_span}'), 'issue 560') = 0"
+    ))
+    .await;
+
+    let ts = now_ns() - 3_600_000_000_000;
+    let insert = format!(
+        "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+         timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES \
+         (unhex('00000000000000000000000000000560'), unhex('0000000000000001'), \
+          unhex('0000000000000000'), 'op', 'svc', {ts}, 1000, 2, 2, 1, ''), \
+         (unhex('00000000000000000000000000000560'), unhex('{second_span}'), \
+          unhex('0000000000000000'), 'op', 'svc', {t2}, 1000, 2, 2, 1, '')",
+        t2 = ts + 1_000
+    );
+    let (status, body) = clickhouse_http_post(&insert);
+    let code = error_code(&body);
+
+    let mut printed: Vec<String> = Vec::new();
+    for table in ["trace_spans", "trace_recent", "trace_error_spans"] {
+        let sql = format!("SELECT count() AS n FROM {db}.{table}");
+        let got = match client
+            .query_stream::<CountRow>(&sql, &QuerySettings::new())
+            .await
+        {
+            Ok(mut s) => match s.next().await {
+                Some(Ok(r)) => r.n.to_string(),
+                Some(Err(e)) => format!("decode error: {e}"),
+                None => "no row".to_string(),
+            },
+            Err(e) => format!("query error: {e}"),
+        };
+        printed.push(format!("{table}={got}"));
+    }
+    let throw_target = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.throw_target"),
+    )
+    .await;
+    eprintln!(
+        "throwing view: status {status}, code {code:?}, {}, throw_target={throw_target}",
+        printed.join(", ")
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    if status != 500 {
+        failures.push(format!("status {status}, expected 500; body {body:?}"));
+    }
+    if code != Some(395) {
+        failures.push(format!("code {code:?}, expected 395; body {body:?}"));
+    }
+    if throw_target != 0 {
+        failures.push(format!(
+            "throw_target holds {throw_target} rows, expected 0"
+        ));
+    }
+    let sentence = format!(
+        "The insert fails: the caller receives `HTTP {status}` with `Code: {code}`,",
+        code = code.unwrap_or(0)
+    );
+    match failing_view_paragraph() {
+        None => failures.push(
+            "docs/schemas.md has no paragraph beginning \
+             `**What a failing view leaves behind (#560).**`"
+                .to_string(),
+        ),
+        Some(p) => {
+            if !p.contains(&sentence) {
+                failures.push(format!(
+                    "the failing-view paragraph does not say {sentence:?}:\n{p}"
+                ));
+            }
+        }
+    }
+
+    drop_database(&client, db).await;
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

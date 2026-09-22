@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 28)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 75), ("traces_metrics", 28)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -608,7 +608,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 100 frozen SQL corpus entries — 99 SQL files and one JSON file — changed. This is \
+        "the 103 frozen SQL corpus entries — 102 SQL files and one JSON file — changed. This is \
          not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
@@ -792,7 +792,7 @@ fn no_planned_search_statement_contains_a_join() {
          builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 127,
+        scanned, 130,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
     assert!(

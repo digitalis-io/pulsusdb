@@ -1534,6 +1534,8 @@ mod tests {
                 "log_metrics_{{log_rollup_suffix}}_mv",
                 "trace_tag_catalog_mv",
                 "trace_edges_mv",
+                "trace_recent_mv",
+                "trace_error_spans_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );

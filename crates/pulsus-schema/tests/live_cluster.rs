@@ -42,6 +42,13 @@ static TEST_DB_BOOKKEEPING: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_bookkeeping");
 static TEST_DB_SPAN_ARRAYS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_span_arrays");
+// Issue #560: the two derived trace tables, clustered.
+static TEST_DB_DERIVED: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived");
+static TEST_DB_DERIVED_REPLAY: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived_replay");
+static TEST_DB_DEDUP_PROFILE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dedup_profile");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -860,4 +867,505 @@ async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
         rows += 1;
     }
     assert_eq!(rows, 1, "the refused row must not be stored");
+}
+
+// ---------------------------------------------------------------------
+// Issue #560 — `trace_recent` and `trace_error_spans`, clustered
+// ---------------------------------------------------------------------
+
+/// The two trace ids issue #560's cluster tests write: measured,
+/// `cityHash64(toFixedString(unhex(id), 16)) % 2` is `0` for the first
+/// and `1` for the second, so the family's sharding key puts them on
+/// different shards.
+const DERIVED_TRACES: [&str; 2] = [
+    "00000000000000000000000000000001",
+    "00000000000000000000000000000003",
+];
+
+async fn exec_on(client: &ChClient, sql: &str) {
+    client
+        .execute(sql, &QuerySettings::new(), Idempotency::Idempotent)
+        .await
+        .unwrap_or_else(|e| panic!("execute failed: {e}\nSQL:\n{sql}"));
+}
+
+async fn fresh_cluster_db(shard1: &ChClient, db: &str) {
+    exec_on(
+        shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(shard1, &cluster_ctx(db))
+        .await
+        .expect("run_init (clustered)");
+}
+
+/// Every one of `tables` exists in `db` on both shards; the missing ones
+/// are listed together.
+async fn assert_clustered_tables(shard1: &ChClient, shard2: &ChClient, db: &str, tables: &[&str]) {
+    let mut missing = Vec::new();
+    for (shard, label) in [(shard1, "shard1"), (shard2, "shard2")] {
+        let names = table_names(shard, db).await;
+        for t in tables {
+            if !names.iter().any(|n| n == t) {
+                missing.push(format!("{label}:{t}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "missing clustered tables: {missing:?}");
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct HexRow {
+    id: String,
+}
+
+/// The sorted, lower-case hex trace ids `table` holds, read on `client`.
+async fn trace_ids(client: &ChClient, db: &str, table: &str) -> Vec<String> {
+    let sql = format!("SELECT DISTINCT lower(hex(trace_id)) AS id FROM {db}.{table} ORDER BY id");
+    let mut stream = client
+        .query_stream::<HexRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("read {db}.{table}: {e}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode HexRow").id);
+    }
+    out
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count_on(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("count failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").n
+}
+
+/// The `INSERT` that writes one error span on each of the two traces
+/// through the span table's wrapper.
+fn derived_insert(db: &str, ts_ns: i64) -> String {
+    let values: Vec<String> = DERIVED_TRACES
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                "(unhex('{id}'), unhex('000000000000000{}'), unhex('0000000000000000'), 'op', \
+                 'svc', {}, 1000, 2, 2, 1, '')",
+                i + 1,
+                ts_ns + i as i64
+            )
+        })
+        .collect();
+    format!(
+        "INSERT INTO {db}.trace_spans_dist (trace_id, span_id, parent_id, name, service, \
+         timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+        values.join(", ")
+    )
+}
+
+fn cluster_now_ns() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits i64")
+        - 3_600_000_000_000
+}
+
+/// Polls, 40 times at 250 ms, until every shard's local `trace_spans`
+/// holds at least one row (a `Distributed` insert forwards
+/// asynchronously; the flush before this makes it synchronous, and the
+/// poll covers the remainder).
+async fn wait_for_spans(shard1: &ChClient, shard2: &ChClient, db: &str) {
+    for _ in 0..40 {
+        let a = count_on(
+            shard1,
+            &format!("SELECT count() AS n FROM {db}.trace_spans"),
+        )
+        .await;
+        let b = count_on(
+            shard2,
+            &format!("SELECT count() AS n FROM {db}.trace_spans"),
+        )
+        .await;
+        if a > 0 && b > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Issue #560 criterion 13: both wrappers exist, a clustered write lands
+/// each trace's derived rows on the shard that holds its spans, and each
+/// wrapper reads the union.
+#[tokio::test]
+async fn the_derived_trace_tables_are_written_per_shard_and_read_through_their_wrappers() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    let db: &str = &TEST_DB_DERIVED;
+    fresh_cluster_db(&shard1, db).await;
+    assert_clustered_tables(
+        &shard1,
+        &shard2,
+        db,
+        &[
+            "trace_recent",
+            "trace_recent_dist",
+            "trace_error_spans",
+            "trace_error_spans_dist",
+        ],
+    )
+    .await;
+
+    exec_on(&shard1, &derived_insert(db, cluster_now_ns())).await;
+    exec_on(
+        &shard1,
+        &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
+    )
+    .await;
+    wait_for_spans(&shard1, &shard2, db).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut shard_sets: Vec<Vec<String>> = Vec::new();
+    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
+        let spans = trace_ids(shard, db, "trace_spans").await;
+        for table in ["trace_recent", "trace_error_spans"] {
+            let got = trace_ids(shard, db, table).await;
+            if got != spans {
+                failures.push(format!(
+                    "{label}: local {table} holds {got:?}, local trace_spans {spans:?}"
+                ));
+            }
+        }
+        shard_sets.push(spans);
+    }
+    let mut sorted = shard_sets.clone();
+    sorted.sort();
+    let want: Vec<Vec<String>> = DERIVED_TRACES
+        .iter()
+        .map(|id| vec![id.to_string()])
+        .collect();
+    if sorted != want {
+        failures.push(format!(
+            "the shards' local span sets are {shard_sets:?}, expected {want:?} in some order"
+        ));
+    }
+    let union: Vec<String> = DERIVED_TRACES.iter().map(|s| s.to_string()).collect();
+    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
+        for table in ["trace_recent_dist", "trace_error_spans_dist"] {
+            let got = trace_ids(shard, db, table).await;
+            if got != union {
+                failures.push(format!(
+                    "{label}: {table} reads {got:?}, expected {union:?}"
+                ));
+            }
+        }
+    }
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Issue #560 criterion 9, clustered: the same block written twice
+/// through the span table's wrapper leaves every shard's physical counts
+/// unchanged. Merges on both derived tables are stopped on each shard
+/// before the first write, so no merge can bring a duplicate back to one
+/// before the count is read.
+#[tokio::test]
+async fn the_same_block_twice_through_the_wrapper_leaves_every_shard_count_unchanged() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    let db: &str = &TEST_DB_DERIVED_REPLAY;
+    fresh_cluster_db(&shard1, db).await;
+    assert_clustered_tables(
+        &shard1,
+        &shard2,
+        db,
+        &[
+            "trace_recent",
+            "trace_recent_dist",
+            "trace_error_spans",
+            "trace_error_spans_dist",
+        ],
+    )
+    .await;
+    for shard in [&shard1, &shard2] {
+        for table in ["trace_recent", "trace_error_spans"] {
+            exec_on(shard, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+        }
+    }
+
+    let insert = derived_insert(db, cluster_now_ns());
+    let union: Vec<String> = DERIVED_TRACES.iter().map(|s| s.to_string()).collect();
+    let mut failures: Vec<String> = Vec::new();
+    for write in 1..=2 {
+        exec_on(&shard1, &insert).await;
+        exec_on(
+            &shard1,
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
+        )
+        .await;
+        wait_for_spans(&shard1, &shard2, db).await;
+        for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
+            let mut counts = Vec::new();
+            for table in ["trace_spans", "trace_recent", "trace_error_spans"] {
+                counts
+                    .push(count_on(shard, &format!("SELECT count() AS n FROM {db}.{table}")).await);
+            }
+            eprintln!("write {write}, {label}: trace_spans/recent/error = {counts:?}");
+            if counts != [1, 1, 1] {
+                failures.push(format!(
+                    "write {write}, {label}: local trace_spans/trace_recent/trace_error_spans \
+                     = {counts:?}, expected [1, 1, 1]"
+                ));
+            }
+        }
+        for table in ["trace_recent_dist", "trace_error_spans_dist"] {
+            let got = trace_ids(&shard1, db, table).await;
+            if got != union {
+                failures.push(format!(
+                    "write {write}: {table} reads {got:?}, expected {union:?}"
+                ));
+            }
+        }
+    }
+    for shard in [&shard1, &shard2] {
+        for table in ["trace_recent", "trace_error_spans"] {
+            exec_on(shard, &format!("SYSTEM START MERGES {db}.{table}")).await;
+        }
+    }
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct MetricSampleRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    value: f64,
+}
+
+/// The span columns this test writes; every other column takes its
+/// default.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct SpanInsertRow {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_id: [u8; 8],
+    name: String,
+    service: String,
+    timestamp_ns: i64,
+    duration_ns: i64,
+    status_code: i8,
+    kind: i8,
+    payload_type: i8,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SettingRow {
+    v: String,
+}
+
+/// Issue #560 criterion 22, clustered: under a user profile that disables
+/// `deduplicate_insert`, a repeated log block and a repeated metric block
+/// are both stored twice — `insert_block`, which the log and metric
+/// writers reach, carries no pin — while the repeated span block sent
+/// with the span inserter's pins is stored once, in the span table and in
+/// both derived tables.
+#[tokio::test]
+async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_repeated_span_block()
+ {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    let db: &str = &TEST_DB_DEDUP_PROFILE;
+    let user = format!("{db}_dedup_off");
+    fresh_cluster_db(&shard1, db).await;
+    assert_clustered_tables(
+        &shard1,
+        &shard2,
+        db,
+        &[
+            "trace_recent",
+            "trace_recent_dist",
+            "trace_error_spans",
+            "trace_error_spans_dist",
+        ],
+    )
+    .await;
+    // Users are local to each node.
+    for shard in [&shard1, &shard2] {
+        exec_on(shard, &format!("DROP USER IF EXISTS {user}")).await;
+        exec_on(
+            shard,
+            &format!(
+                "CREATE USER {user} IDENTIFIED WITH no_password \
+                 SETTINGS deduplicate_insert = 'disable'"
+            ),
+        )
+        .await;
+        exec_on(shard, &format!("GRANT ALL ON {db}.* TO {user}")).await;
+        for table in ["trace_recent", "trace_error_spans"] {
+            exec_on(shard, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+        }
+    }
+
+    let mut cfg = shard1_config();
+    cfg.database = db.to_string();
+    cfg.user = user.clone();
+    let as_user = ChClient::new(cfg)
+        .await
+        .expect("connect as the profile's user");
+    let now = cluster_now_ns();
+    let log = LogSampleRow {
+        service: "checkout".to_string(),
+        fingerprint: 0x0560_0560_0560_0560,
+        timestamp_ns: now,
+        severity: 9,
+        body: "issue 560 repeated log block".to_string(),
+    };
+    let metric = MetricSampleRow {
+        metric_name: "issue560_repeat".to_string(),
+        fingerprint: 0x0560_0560_0560_0561,
+        unix_milli: now / 1_000_000,
+        value: 1.0,
+    };
+    let mut trace_id = [0u8; 16];
+    trace_id[15] = 1;
+    let span = SpanInsertRow {
+        trace_id,
+        span_id: [0, 0, 0, 0, 0, 0, 0, 1],
+        parent_id: [0; 8],
+        name: "op".to_string(),
+        service: "svc".to_string(),
+        timestamp_ns: now,
+        duration_ns: 1_000,
+        status_code: 2,
+        kind: 2,
+        payload_type: 1,
+    };
+    for _ in 0..2 {
+        as_user
+            .insert_block("log_samples_dist", std::slice::from_ref(&log))
+            .await
+            .expect("insert the log block");
+        exec_on(
+            &shard1,
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.log_samples_dist"),
+        )
+        .await;
+        as_user
+            .insert_block("metric_samples_dist", std::slice::from_ref(&metric))
+            .await
+            .expect("insert the metric block");
+        exec_on(
+            &shard1,
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.metric_samples_dist"),
+        )
+        .await;
+        as_user
+            .insert_block_with(
+                "trace_spans_dist",
+                std::slice::from_ref(&span),
+                &QuerySettings::deduplicate_through_views(),
+            )
+            .await
+            .expect("insert the span block");
+        exec_on(
+            &shard1,
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
+        )
+        .await;
+    }
+
+    let tables = [
+        ("log_samples", 2u64),
+        ("metric_samples", 2),
+        ("trace_spans", 1),
+        ("trace_recent", 1),
+        ("trace_error_spans", 1),
+    ];
+    let mut counts = vec![0u64; tables.len()];
+    for _ in 0..40 {
+        for (i, (table, _)) in tables.iter().enumerate() {
+            counts[i] = count_on(&shard1, &format!("SELECT count() AS n FROM {db}.{table}")).await
+                + count_on(&shard2, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        }
+        if counts.iter().all(|n| *n > 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let mut settings = Vec::new();
+    for shard_cfg in [shard1_config(), shard2_config()] {
+        let mut cfg = shard_cfg;
+        cfg.user = user.clone();
+        let client = ChClient::new(cfg).await.expect("connect as the user");
+        let mut stream = client
+            .query_stream::<SettingRow>(
+                "SELECT toString(getSetting('deduplicate_insert')) AS v",
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("read the user's setting");
+        settings.push(stream.next().await.expect("a row").expect("decode").v);
+    }
+    eprintln!("T32 counts log/metric/span/recent/error={counts:?}; settings={settings:?}");
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for (i, (table, want)) in tables.iter().enumerate() {
+        if counts[i] != *want {
+            mismatches.push(format!("{table}: expected {want}, got {}", counts[i]));
+        }
+    }
+    for (i, got) in settings.iter().enumerate() {
+        if got != "disable" {
+            mismatches.push(format!(
+                "shard{}: the user's deduplicate_insert reads {got:?}",
+                i + 1
+            ));
+        }
+    }
+    for shard in [&shard1, &shard2] {
+        for table in ["trace_recent", "trace_error_spans"] {
+            exec_on(shard, &format!("SYSTEM START MERGES {db}.{table}")).await;
+        }
+        exec_on(shard, &format!("DROP USER IF EXISTS {user}")).await;
+    }
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(mismatches.is_empty(), "T32 mismatches: {mismatches:?}");
 }

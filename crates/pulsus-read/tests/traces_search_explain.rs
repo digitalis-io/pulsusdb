@@ -1292,24 +1292,32 @@ async fn two_phase_search_explain_and_budget_gates() {
     // the honest contract is a bounded time-window scan: the predicate
     // and top-K Limit are in the plan, and the executed read never
     // touches more than the window's rows. --------------------------------
+    //
+    // Issue #560: `{ status = error }` no longer scans the span table. Its
+    // generator reads `trace_error_spans`, whose view IS the predicate, so
+    // the statement carries no `status_code` term and reads fewer rows
+    // than the corpus holds spans.
     let plan = plan_for(&engine, "{ status = error }", base, now);
     let generator = &plan.generator_sqls[0];
-    assert!(generator.contains("status_code = 2"));
+    assert!(
+        generator.contains("FROM trace_error_spans") && !generator.contains("status_code"),
+        "`{{ status = error }}` must read the error table with no status term:\n{generator}"
+    );
     let raw = explain_raw(&client, generator).await;
     assert!(
         raw.contains("Limit"),
-        "the span-scan generator must carry the top-K Limit node:\n{raw}"
+        "the error-table generator must carry the top-K Limit node:\n{raw}"
     );
     let output = engine.search(&plan).await.expect("status search executes");
     assert!(output.returned > 0, "1% of the corpus is status=error");
     exec(&client, "SYSTEM FLUSH LOGS").await;
-    let row = generator_query_log(&client, &["status_code = 2", "bound_ts"])
+    let row = generator_query_log(&client, &["FROM trace_error_spans", "bound_ts"])
         .await
-        .expect("the span-scan generator's QueryFinish row must exist");
+        .expect("the error-table generator's QueryFinish row must exist");
     assert!(
-        row.read_rows <= CORPUS_SPANS,
-        "the span-scan generator is window-bounded — it must never read past the \
-         corpus window (read {} of {CORPUS_SPANS})",
+        row.read_rows < CORPUS_SPANS,
+        "the error-table generator reads the error rows, not the spans — it must read fewer \
+         rows than the corpus holds spans (read {} of {CORPUS_SPANS})",
         row.read_rows
     );
 

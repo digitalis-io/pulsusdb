@@ -2993,15 +2993,26 @@ mod tests {
         assert_eq!(compiled.generators[0].predicate, "duration_ns > 2000000000");
     }
 
+    /// Issue #560: `{ status = error }` reads `trace_error_spans`, whose
+    /// view IS the predicate, so its generator carries none; every other
+    /// status comparison keeps its `trace_spans` generator and its OTLP
+    /// wire code.
     #[test]
     fn status_and_kind_lower_to_the_otel_wire_codes() {
-        let f = first_filter("{ status = error }");
-        let compiled = compile_span_filter(&f).unwrap();
-        assert_eq!(compiled.generators[0].predicate, "status_code = 2");
-
-        let f = first_filter("{ kind = server }");
-        let compiled = compile_span_filter(&f).unwrap();
-        assert_eq!(compiled.generators[0].predicate, "kind = 2");
+        let mut wrong: Vec<String> = Vec::new();
+        for (q, expected) in [
+            ("{ status = error }", ""),
+            ("{ status != error }", "status_code != 2"),
+            ("{ status = ok }", "status_code = 1"),
+            ("{ kind = server }", "kind = 2"),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            let got = &compiled.generators[0].predicate;
+            if got != expected {
+                wrong.push(format!("{q}: expected {expected:?}, got {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]

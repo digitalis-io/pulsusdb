@@ -92,6 +92,9 @@ use super::search_sql::date_literal;
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
+/// Issue #560 tests-first stub — replaced in the implementation.
+pub const RECENT_BUCKET_NS: i64 = 0;
+
 /// Which nanoseconds a trace read's window contains — the ONE
 /// declaration [`WindowSql`] derives both its clauses from.
 ///
@@ -200,6 +203,11 @@ impl WindowSql {
             date_literal(start_days),
             date_literal(end_days)
         )
+    }
+
+    /// Issue #560 tests-first stub — replaced in the implementation.
+    pub fn bucket_clause(self) -> String {
+        String::new()
     }
 }
 
