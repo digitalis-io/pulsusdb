@@ -12,9 +12,9 @@ LIMIT 100001
 
 == phase1 generator[1] ==
 SELECT trace_id, max(timestamp_ns) AS bound_ts
-FROM trace_spans
-WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
-  AND (status_code = 2)
+FROM trace_error_spans
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001

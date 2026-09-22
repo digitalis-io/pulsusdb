@@ -118,6 +118,8 @@ fn engine_config(max_candidates: u64, generator_max_memory_bytes: u64) -> TraceR
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
         edges_table: "trace_edges".to_string(),
+        recent_table: "trace_recent".to_string(),
+        errors_table: "trace_error_spans".to_string(),
         max_candidates,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,

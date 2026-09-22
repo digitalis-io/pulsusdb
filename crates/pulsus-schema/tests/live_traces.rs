@@ -2510,11 +2510,8 @@ async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
 fn clickhouse_http_post(body: &str) -> (u16, String) {
     use std::io::{Read, Write};
     let host = std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port: u16 = std::env::var("PULSUS_TEST_CH_HTTP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(19123);
-    let mut stream = std::net::TcpStream::connect((host.as_str(), port)).expect("connect");
+    let http = test_config().http_port;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), http)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .expect("read timeout");

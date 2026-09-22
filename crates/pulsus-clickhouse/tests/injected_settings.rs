@@ -38,6 +38,8 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
 /// ```
 const INJECTED_SETTINGS: &[&str] = &[
     "async_insert",
+    "deduplicate_blocks_in_dependent_materialized_views",
+    "deduplicate_insert",
     "distributed_aggregation_memory_efficient",
     "distributed_foreground_insert",
     "distributed_product_mode",

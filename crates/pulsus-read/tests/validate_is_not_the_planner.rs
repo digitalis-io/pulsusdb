@@ -119,6 +119,8 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     let (filter, params) = search_ctx("pulsus.trace_spans", "pulsus.trace_attrs_idx");
     let ctx = SearchCtx {
         filter,
+        recent_table: "pulsus.trace_recent",
+        errors_table: "pulsus.trace_error_spans",
         max_candidates: 1000,
         max_series: 500,
         distributed: false,

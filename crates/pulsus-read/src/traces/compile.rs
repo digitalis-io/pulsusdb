@@ -94,9 +94,13 @@ pub const TRACE_SPANS_CTX: SourceRef = SourceRef("trace_spans:trace_ctx");
 /// The direct-child-count co-load (issue #184), same table, same
 /// trace-wide reach.
 pub const TRACE_SPANS_CHILD_COUNT: SourceRef = SourceRef("trace_spans:child_count");
-/// Issue #560 tests-first stub: the recency table.
+/// `trace_recent`, one row per (five-minute bucket, trace), written by a
+/// view over the span table: the time-range generator's source (issue
+/// #560).
 pub const TRACE_RECENT: SourceRef = SourceRef("trace_recent");
-/// Issue #560 tests-first stub: the error-span table.
+/// `trace_error_spans`, one row per span with `status_code = 2`, written
+/// by a view over the span table: the `{ status = error }` generator's
+/// source (issue #560).
 pub const TRACE_ERROR_SPANS: SourceRef = SourceRef("trace_error_spans");
 
 /// The name every slot link records on the hydration statement's
@@ -446,11 +450,26 @@ pub fn selector_fidelity(expr: &SpansetExpr) -> Fidelity {
 /// CANDIDATE set move under a byte-identical replay, which
 /// `duplicate_index_rows_do_not_move_a_pushed_min_max_or_count` exists
 /// to prevent. Considered and not taken.
+///
+/// # The source is an allowlist (issue #560)
+///
+/// `source` is the generator's source, and only the two tables whose
+/// columns this fragment names are accepted. `trace_recent` has neither
+/// `span_id` nor `duration_ns`, so a fragment pushed there is `Code: 47
+/// UNKNOWN_IDENTIFIER` (measured). `trace_error_spans` has both and a push
+/// there would be sound, but nothing reaches it today (`rel.exact` is
+/// false for `{}` and `{ status = error }`), and a refusal is always
+/// correct where soundness would need re-deriving on the next widening of
+/// the exact leaf families. An allowlist and not a carve-out: a source
+/// added later defaults to refusal.
 pub fn aggregate_having_sql(
     stage: &PipelineStage,
     group_key: Option<&str>,
-    _source: SourceRef,
+    source: SourceRef,
 ) -> Option<String> {
+    if source != TRACE_SPANS && source != TRACE_ATTRS_IDX {
+        return None;
+    }
     let PipelineStage::Aggregate {
         op,
         field,
@@ -1507,6 +1526,8 @@ pub fn generator_source(table: GenTable) -> SourceRef {
     match table {
         GenTable::Spans => TRACE_SPANS,
         GenTable::Attrs => TRACE_ATTRS_IDX,
+        GenTable::Recent => TRACE_RECENT,
+        GenTable::ErrorSpans => TRACE_ERROR_SPANS,
     }
 }
 
@@ -2307,6 +2328,8 @@ mod tests {
                     spans_table: "trace_spans",
                     attrs_table: "trace_attrs_idx",
                 },
+                recent_table: "trace_recent",
+                errors_table: "trace_error_spans",
                 max_candidates: 100_000,
                 max_series: 1_000,
                 distributed: false,
@@ -2411,6 +2434,8 @@ mod tests {
                             spans_table: "trace_spans",
                             attrs_table: "trace_attrs_idx",
                         },
+                        recent_table: "trace_recent",
+                        errors_table: "trace_error_spans",
                         max_candidates: 100_000,
                         max_series: 1_000,
                         distributed: false,
@@ -2575,6 +2600,8 @@ mod tests {
                     spans_table: "trace_spans",
                     attrs_table: "trace_attrs_idx",
                 },
+                recent_table: "trace_recent",
+                errors_table: "trace_error_spans",
                 max_candidates: 100_000,
                 max_series: 1_000,
                 distributed: false,

@@ -705,10 +705,20 @@ fn plan_for(case: &Case) -> SearchPlan {
 /// [`plan_for`] on a caller-chosen window (issue #560: the pre-epoch
 /// statement).
 fn plan_for_window(case: &Case, params: &SearchParams) -> SearchPlan {
-    let (spans, attrs) = if case.distributed {
-        ("trace_spans_dist", "trace_attrs_idx_dist")
+    let (spans, attrs, recent, errors) = if case.distributed {
+        (
+            "trace_spans_dist",
+            "trace_attrs_idx_dist",
+            "trace_recent_dist",
+            "trace_error_spans_dist",
+        )
     } else {
-        ("trace_spans", "trace_attrs_idx")
+        (
+            "trace_spans",
+            "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
+        )
     };
     let query = pulsus_traceql::parse(case.q).expect("case query parses");
     plan_search(
@@ -719,6 +729,8 @@ fn plan_for_window(case: &Case, params: &SearchParams) -> SearchPlan {
                 spans_table: spans,
                 attrs_table: attrs,
             },
+            recent_table: recent,
+            errors_table: errors,
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed: case.distributed,
@@ -1881,6 +1893,8 @@ fn plan_of(q: &str) -> SearchPlan {
                 spans_table: "trace_spans",
                 attrs_table: "trace_attrs_idx",
             },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed: false,

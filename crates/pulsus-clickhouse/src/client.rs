@@ -132,20 +132,24 @@ impl ChClient {
     /// `system.query_log` carries `Settings['async_insert'] = '0'`, while
     /// the rows that do NOT are test-fixture `execute()` seeding and
     /// migration bookkeeping, which are not this path.
+    #[cfg(test)]
     fn insert_settings_of(c: &ConsistencyConfig, timeout: Duration) -> QuerySettings {
-        c.insert_settings()
-            .set("async_insert", 0)
-            .with_max_execution_time(timeout)
+        Self::insert_settings_with(c, timeout, &QuerySettings::new())
     }
 
-    /// Issue #560 tests-first stub — ignores `extra`; replaced in the
-    /// implementation.
+    /// [`Self::insert_settings_of`] plus a caller's `extra` settings, placed
+    /// after `async_insert` and before the deadline (issue #560: the span
+    /// table's deduplication pins).
     fn insert_settings_with(
         c: &ConsistencyConfig,
         timeout: Duration,
-        _extra: &QuerySettings,
+        extra: &QuerySettings,
     ) -> QuerySettings {
-        Self::insert_settings_of(c, timeout)
+        let mut s = c.insert_settings().set("async_insert", 0);
+        for (k, v) in extra.entries() {
+            s = s.set(k, v);
+        }
+        s.with_max_execution_time(timeout)
     }
 
     /// The complete settings the read path attaches (issue #114): the
@@ -186,24 +190,25 @@ impl ChClient {
     /// whose effect is uncertain. Genuine pre-commit poison (bad SQL,
     /// decode failure) is surfaced unchanged: nothing was committed, so it
     /// is not uncertain, merely wrong.
-    /// Issue #560 tests-first stub — ignores `extra`; replaced in the
-    /// implementation.
+    pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
+        self.insert_block_with(table, rows, &QuerySettings::new())
+            .await
+    }
+
+    /// [`Self::insert_block`] with `extra` settings on this one insert
+    /// (issue #560).
     pub async fn insert_block_with<R: ChRow>(
         &self,
         table: &str,
         rows: &[R],
-        _extra: &QuerySettings,
+        extra: &QuerySettings,
     ) -> Result<(), ChError> {
-        self.insert_block(table, rows).await
-    }
-
-    pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         let conn = self.pool.get().await?;
         // Issue #114: the whole attached set — the server deadline plus,
         // when quorum is enabled, the quorum trio — is the single testable
         // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
         // has no typed settings helper).
-        let settings = Self::insert_settings_of(&self.consistency, self.default_timeout);
+        let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
         let fut = async {
             let mut insert = conn.client().insert::<R>(table).await?;
             for (k, v) in settings.iter() {

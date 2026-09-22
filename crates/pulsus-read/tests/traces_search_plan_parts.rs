@@ -28,8 +28,15 @@ const PARAMS: SearchParams = SearchParams {
 
 const MAX_CANDIDATES: u64 = 100_000;
 
-/// The three cases whose plan names ONE generator part where the golden
+/// The two cases whose plan names ONE generator part where the golden
 /// renders TWO statements — a frozen, named exception.
+///
+/// **Three until issue #560.** `structural_descendant`
+/// (`{ resource.service.name = "checkout" } >> { status = error }`) left
+/// the set when `{ status = error }` began reading `trace_error_spans`:
+/// its two generators now read different tables, so its plan names two
+/// generator parts and the second carries `Cut::DisjointSources`, like
+/// every other two-source case.
 ///
 /// Both of each case's phase-1 generators read the SAME table, so no
 /// `Cut` in the closed set of four explains the second statement:
@@ -65,11 +72,7 @@ const MAX_CANDIDATES: u64 = 100_000;
 ///
 /// The gate below asserts this list EQUALS the measured set, so it cannot
 /// grow silently.
-const SAME_SOURCE_GENERATOR_FAN_OUT: [&str; 3] = [
-    "nested_boolean",
-    "structural_descendant",
-    "structural_sibling",
-];
+const SAME_SOURCE_GENERATOR_FAN_OUT: [&str; 2] = ["nested_boolean", "structural_sibling"];
 
 /// One golden file, parsed.
 struct Golden {
@@ -137,15 +140,25 @@ fn goldens() -> Vec<Golden> {
             distributed,
         });
     }
-    assert_eq!(out.len(), 72, "the committed search corpus");
+    assert_eq!(out.len(), 75, "the committed search corpus");
     out
 }
 
 fn plan_query(q: &str, distributed: bool) -> SearchPlan {
-    let (spans, attrs) = if distributed {
-        ("trace_spans_dist", "trace_attrs_idx_dist")
+    let (spans, attrs, recent, errors) = if distributed {
+        (
+            "trace_spans_dist",
+            "trace_attrs_idx_dist",
+            "trace_recent_dist",
+            "trace_error_spans_dist",
+        )
     } else {
-        ("trace_spans", "trace_attrs_idx")
+        (
+            "trace_spans",
+            "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
+        )
     };
     let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
     plan_search(
@@ -156,6 +169,8 @@ fn plan_query(q: &str, distributed: bool) -> SearchPlan {
                 spans_table: spans,
                 attrs_table: attrs,
             },
+            recent_table: recent,
+            errors_table: errors,
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed,
@@ -261,10 +276,10 @@ fn the_plan_sql_parts_match_the_sections_each_golden_case_renders() {
 }
 
 /// Criterion 8: the same-source generator fan-out exception is exactly
-/// those three cases — asserted as an EQUALITY against the measured set,
-/// so a fourth case cannot join it silently.
+/// those two cases — asserted as an EQUALITY against the measured set,
+/// so a third case cannot join it silently (issue #560 took one out).
 #[test]
-fn the_generator_fan_out_exception_is_exactly_these_three() {
+fn the_generator_fan_out_exception_is_exactly_these_two() {
     let mut measured: Vec<String> = Vec::new();
     for g in goldens() {
         let plan = plan_query(&g.query, g.distributed);
@@ -426,7 +441,7 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
         let shape = plan.plan_shape();
         // The statements the plan's own counters say this request sends,
         // against the sections the golden renders. `generator_sqls` and
-        // not the generator PART count, because the three same-source
+        // not the generator PART count, because the two same-source
         // cases send two statements from one part.
         let by_probe = usize::from(plan.by_probe_sql().is_some());
         if by_probe == 1 {
@@ -481,8 +496,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
     }
     assert_eq!(
         (total_statements, total_sections),
-        (235, 235),
-        "the committed corpus renders 235 statements and the plans account for all of them"
+        (244, 244),
+        "the committed corpus renders 244 statements and the plans account for all of them"
     );
     assert_eq!(
         preflight_cases,
@@ -531,7 +546,7 @@ fn no_part_carries_the_keyset_driver_or_the_inexact_limit_cut() {
 #[test]
 fn the_corpus_this_target_reads_is_the_committed_one() {
     let gs = goldens();
-    assert_eq!(gs.len(), 72);
+    assert_eq!(gs.len(), 75);
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for g in &gs {
@@ -544,7 +559,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
             *kinds.entry(kind).or_insert(0) += 1;
         }
     }
-    assert_eq!(total, 235, "the committed corpus renders 235 statements");
+    assert_eq!(total, 244, "the committed corpus renders 244 statements");
     assert_eq!(
         kinds.get("by() cardinality probe").copied().unwrap_or(0),
         1,
@@ -616,8 +631,8 @@ fn the_first_seeded_part_names_every_generator_it_merges() {
     assert_eq!(
         multi_generator_cases,
         11 - SAME_SOURCE_GENERATOR_FAN_OUT.len(),
-        "eight committed cases plan TWO generator parts — the eleven that send two generator \
-         statements, less the three same-source ones the frozen exception collapses to one part. \
+        "nine committed cases plan TWO generator parts — the eleven that send two generator \
+         statements, less the two same-source ones the frozen exception collapses to one part. \
          Without them this gate could not tell a merged seed from a single one"
     );
 }
@@ -679,8 +694,8 @@ fn only_the_first_part_has_no_cut_and_the_unseeded_parts_open_the_plan() {
         }
     }
     assert_eq!(
-        cases_with_two_unseeded, 8,
-        "eight committed cases open the plan with more than one statement; without them this \
+        cases_with_two_unseeded, 9,
+        "nine committed cases open the plan with more than one statement; without them this \
          gate could not tell the seed rule from the cut rule"
     );
 }

@@ -117,8 +117,14 @@ impl TraceWriter {
         cfg: &WriterConfig,
         tables: TraceWriterTables,
     ) -> Self {
-        let inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
-        Self::with_inserters_with_tables(inserter.clone(), inserter, cfg, tables)
+        // Issue #560: only the span table's inserts carry the deduplication
+        // pins; the attribute index keeps the default settings.
+        let spans_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::with_settings(
+            client.clone(),
+            span_insert_settings(),
+        ));
+        let attrs_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
+        Self::with_inserters_with_tables(spans_inserter, attrs_inserter, cfg, tables)
     }
 
     /// Test/mock constructor: any [`BlockInserter`] pair — e.g. a

@@ -433,7 +433,7 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// deliberately appended LAST so an operator-managed schema lacking the
 /// table cannot block the eight pre-existing statements (rotation
 /// warns-and-continues).
-const TTL_STMTS: [&str; 14] = [
+const TTL_STMTS: [&str; 18] = [
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(unix_milli, 1000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
@@ -469,6 +469,17 @@ const TTL_STMTS: [&str; 14] = [
     "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(bucket_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    // The two derived trace tables (issue #560), appended LAST — the #137 /
+    // #173 / #187 precedent. `trace_recent`'s TTL reads `ts_max`, the
+    // newest span in the (bucket, trace) row, not `date`: a `date` TTL
+    // would expire a whole partition at midnight of `date + N` and
+    // under-retain a span written at 23:59 by almost a day.
+    "ALTER TABLE {{db}}.trace_recent{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(ts_max, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_recent{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.trace_error_spans{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_error_spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
 ];
 
 /// Applies the current `{{retention_days}}`-derived TTL ([`TTL_STMTS`]) to

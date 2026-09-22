@@ -368,6 +368,10 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         // `spans_table`/`attrs_table` (the dist-suffix rule, not the catalog
         // carve-out) — the query-time edge join stays shard-local.
         edges_table: format!("trace_edges{dist}"),
+        // Issue #560: the two derived trace tables co-shard with
+        // `trace_spans` on `cityHash64(trace_id)` — the same rule.
+        recent_table: format!("trace_recent{dist}"),
+        errors_table: format!("trace_error_spans{dist}"),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
         event_set_max_values: config.reader.traceql_event_set_max_values,

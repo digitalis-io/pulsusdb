@@ -46,6 +46,12 @@ pub struct SearchParams {
 #[derive(Debug, Clone, Copy)]
 pub struct SearchCtx<'a> {
     pub filter: SpanFilterCtx<'a>,
+    /// `trace_recent{_dist}` — the time-range generator's source (issue
+    /// #560).
+    pub recent_table: &'a str,
+    /// `trace_error_spans{_dist}`, read by the `{ status = error }`
+    /// generator only (issue #560).
+    pub errors_table: &'a str,
     /// `reader.traceql_max_candidates` — the per-generator top-K depth
     /// (`gen_cap`) *and* the merged-stream consumption ceiling.
     pub max_candidates: u64,
@@ -3048,6 +3054,8 @@ fn render_generators(
             window,
             ctx.filter.spans_table,
             ctx.filter.attrs_table,
+            ctx.recent_table,
+            ctx.errors_table,
             ctx.max_candidates,
             None,
         );
@@ -3403,6 +3411,8 @@ pub fn plan_search(
             window,
             ctx.filter.spans_table,
             ctx.filter.attrs_table,
+            ctx.recent_table,
+            ctx.errors_table,
             ctx.max_candidates,
             Some(frag),
         );
@@ -3521,6 +3531,8 @@ mod tests {
                 spans_table: "trace_spans",
                 attrs_table: "trace_attrs_idx",
             },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: 100,
             max_series: 1_000,
             distributed: false,
@@ -5156,6 +5168,8 @@ mod tests {
                 spans_table: "trace_spans_dist",
                 attrs_table: "trace_attrs_idx_dist",
             },
+            recent_table: "trace_recent_dist",
+            errors_table: "trace_error_spans_dist",
             max_candidates: 100,
             max_series: 1_000,
             distributed: true,

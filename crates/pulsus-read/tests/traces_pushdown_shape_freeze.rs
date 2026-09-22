@@ -144,6 +144,8 @@ fn row(key: &str, q: &str) -> String {
                 spans_table: "trace_spans",
                 attrs_table: "trace_attrs_idx",
             },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: 100_000,
             max_series: 1_000,
             distributed: false,

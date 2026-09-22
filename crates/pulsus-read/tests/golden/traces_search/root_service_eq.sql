@@ -2,9 +2,11 @@
 -- q: { rootServiceName = "gw" }
 
 == phase1 generator[0] ==
-SELECT trace_id, max(timestamp_ns) AS bound_ts
-FROM trace_spans
-WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
+FROM trace_recent
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND bucket >= 5666666 AND bucket <= 5666702
+  AND ts_max > 1700000000000000000 AND ts_min <= 1700010800000000000
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001

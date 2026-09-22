@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pulsus_clickhouse::{ChClient, ChError, ChRow};
+use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 use tokio::sync::{Notify, watch};
 use tracing::{error, warn};
 
@@ -46,11 +46,19 @@ where
 /// defines (both `LogSampleRow` and `LogStreamRow` share one instance).
 pub struct ChBlockInserter {
     client: Arc<ChClient>,
+    /// Settings added to every insert this inserter sends; empty for every
+    /// table but the span table (issue #560).
+    extra: QuerySettings,
 }
 
 impl ChBlockInserter {
     pub fn new(client: Arc<ChClient>) -> Self {
-        ChBlockInserter { client }
+        Self::with_settings(client, QuerySettings::new())
+    }
+
+    /// An inserter whose every insert carries `extra` (issue #560).
+    pub fn with_settings(client: Arc<ChClient>, extra: QuerySettings) -> Self {
+        ChBlockInserter { client, extra }
     }
 }
 
@@ -60,7 +68,7 @@ impl<R: ChRow> BlockInserter<R> for ChBlockInserter {
         table: &'a str,
         rows: &'a [R],
     ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
-        Box::pin(self.client.insert_block(table, rows))
+        Box::pin(self.client.insert_block_with(table, rows, &self.extra))
     }
 }
 

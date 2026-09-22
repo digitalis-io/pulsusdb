@@ -80,6 +80,7 @@
 //! | [`super::graph_sql`] | `StartClosedEndOpen` | docs/api.md §4.5 `[start, end)` |
 //! | [`super::metrics_sql`] evaluation window | `StartClosedEndOpen` | `metrics_plan`'s snapped `[start, end)` |
 //! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) |
+//! | [`super::search_sql`] `trace_recent` bucket clause ([`WindowSql::bucket_clause`], issue #560) | `StartOpenEndClosed` | the same search bound, read at bucket grain |
 //!
 //! [`super::tags_sql::DaySpan`] is deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
@@ -92,8 +93,13 @@ use super::search_sql::date_literal;
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
-/// Issue #560 tests-first stub — replaced in the implementation.
-pub const RECENT_BUCKET_NS: i64 = 0;
+/// The recency table's bucket width in nanoseconds (issue #560). THE
+/// definition — the reader owns the value, `trace_recent_mv`'s
+/// `intDiv(timestamp_ns, …)` carries the same number as TEXT, and
+/// `tests/traces_recency_table_literals.rs` binds the two. A whole number
+/// of these makes a UTC day (288 of them), so a bucket never straddles
+/// midnight and `trace_recent.date` is a function of `bucket`.
+pub const RECENT_BUCKET_NS: i64 = 300_000_000_000;
 
 /// Which nanoseconds a trace read's window contains — the ONE
 /// declaration [`WindowSql`] derives both its clauses from.
@@ -205,9 +211,34 @@ impl WindowSql {
         )
     }
 
-    /// Issue #560 tests-first stub — replaced in the implementation.
+    /// `bucket >= <lo> AND bucket <= <hi>` over `trace_recent`'s leading
+    /// sort-key column (issue #560). `lo` from `start_ns`, `hi` from
+    /// [`WindowSql::last_included_ns`], both by `div_euclid` — the floor
+    /// [`WindowSql::date_clause`] uses — and rendered SIGNED with no
+    /// clamp.
+    ///
+    /// ```text
+    ///   reader   ns.div_euclid(300_000_000_000)          floor
+    ///   writer   toUInt32(intDiv(timestamp_ns, 3e11))    truncate
+    ///   the two agree for every ns >= 0; the first disagreement is at
+    ///   ns = -1 (reader -1, writer 0), which no stored row reaches:
+    ///   ingest refuses a span before 1970-01-01
+    /// ```
+    ///
+    /// No clamp, and that is a decision: a `UInt32` column compared with
+    /// a negative literal is promoted to a signed comparison and answers
+    /// correctly (measured on 26.3: `bucket >= -7` and `bucket >= 0`
+    /// select the same stored rows). The largest bucket any `i64`
+    /// produces is 30,744,573, 0.7% of the `UInt32` ceiling, so neither
+    /// side can overflow. The clause selects a superset of the rows the
+    /// row-level `ts_max`/`ts_min` bound admits, for every window the
+    /// request parser accepts.
     pub fn bucket_clause(self) -> String {
-        String::new()
+        format!(
+            "bucket >= {} AND bucket <= {}",
+            self.start_ns.div_euclid(RECENT_BUCKET_NS),
+            self.last_included_ns().div_euclid(RECENT_BUCKET_NS)
+        )
     }
 }
 

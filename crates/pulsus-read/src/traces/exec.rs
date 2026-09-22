@@ -373,6 +373,13 @@ pub struct TraceReadConfig {
     /// clustered exactly like `spans_table`/`attrs_table` (halves co-shard
     /// on `cityHash64(trace_id)`, so the query-time join is shard-local).
     pub edges_table: String,
+    /// `trace_recent{_dist}` — the time-range generator's source (issue
+    /// #560). Same `_dist` rule as every trace table; co-shards on
+    /// `cityHash64(trace_id)`, so the recency read stays shard-local.
+    pub recent_table: String,
+    /// `trace_error_spans{_dist}` — the `{ status = error }` generator's
+    /// source (issue #560). Same rule.
+    pub errors_table: String,
     /// `reader.traceql_max_candidates` — per-generator top-K depth and
     /// the merged consumption ceiling.
     pub max_candidates: u64,
@@ -861,6 +868,8 @@ impl TraceEngine {
                 spans_table: &self.config.spans_table,
                 attrs_table: &self.config.attrs_table,
             },
+            recent_table: &self.config.recent_table,
+            errors_table: &self.config.errors_table,
             max_candidates: self.config.max_candidates,
             max_series: self.config.max_series,
             distributed: self.config.distributed,
@@ -4315,6 +4324,8 @@ mod tests {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
             edges_table: "trace_edges".to_string(),
+            recent_table: "trace_recent".to_string(),
+            errors_table: "trace_error_spans".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,
@@ -4335,6 +4346,8 @@ mod tests {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
             edges_table: "trace_edges".to_string(),
+            recent_table: "trace_recent".to_string(),
+            errors_table: "trace_error_spans".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
             event_set_max_values: 1_000_000,

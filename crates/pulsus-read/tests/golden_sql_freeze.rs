@@ -431,7 +431,38 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 75), ("traces_metrics", 2
 /// gated as an identity by `traces_metrics_explain.rs`'s
 /// `metrics_attribute_filter_projection_loss_is_recorded` and recorded in
 /// the differential ledger, not left as this sentence.
-const PINNED_SQL_CORPUS: u64 = 0xd37b_c330_eec1_a16c;
+///
+/// **Moved on issue #560: 100 -> 103 entries. Three `traces_search`
+/// goldens ADDED (`empty_selector`, `status_neq_error`, `status_eq_ok`)
+/// and ten MODIFIED, none removed.** Only the phase-1 generator section
+/// moves. The time-range superset reads the recency table instead of
+/// scanning the span table (eight goldens: `child_count`,
+/// `event_name_vs_name_neq`, `existence_absent`, `negated_attr`,
+/// `nested_set_root`, `root_service_eq`, `service_name_cross_type_eq`,
+/// `trace_duration`), and `{ status = error }` reads the error-span table
+/// (`status_only`, `structural_descendant`):
+///
+/// ```text
+/// -SELECT trace_id, max(timestamp_ns) AS bound_ts
+/// -FROM trace_spans
+/// -WHERE timestamp_ns > … AND timestamp_ns <= …
+/// +SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
+/// +FROM trace_recent
+/// +WHERE date >= toDate('…') AND date <= toDate('…')
+/// +  AND bucket >= … AND bucket <= …
+/// +  AND ts_max > … AND ts_min <= …
+///
+///  SELECT trace_id, max(timestamp_ns) AS bound_ts
+/// -FROM trace_spans
+/// -WHERE timestamp_ns > … AND timestamp_ns <= …
+/// -  AND (status_code = 2)
+/// +FROM trace_error_spans
+/// +WHERE date >= toDate('…') AND date <= toDate('…')
+/// +  AND timestamp_ns > … AND timestamp_ns <= …
+/// ```
+///
+/// No phase-2 statement moved in any of the thirteen.
+const PINNED_SQL_CORPUS: u64 = 0xfb65_48d6_14d0_6004;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -563,7 +594,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 100, "the frozen SQL corpus is 72 + 28 = 100 entries");
+    assert_eq!(total, 103, "the frozen SQL corpus is 75 + 28 = 103 entries");
 }
 
 #[test]
