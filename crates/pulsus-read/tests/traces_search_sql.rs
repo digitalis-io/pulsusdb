@@ -674,23 +674,63 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = 12345 }"#,
         distributed: false,
     },
+    Case {
+        // Issue #560: the query the search form sends before anything is
+        // typed. Its only generator is the time-range superset, which
+        // reads `trace_recent` rather than scanning the span table.
+        name: "empty_selector",
+        q: "{}",
+        distributed: false,
+    },
+    Case {
+        // Issue #560: the negation keeps its `trace_spans` generator and
+        // its predicate — only `= error` reads `trace_error_spans`.
+        name: "status_neq_error",
+        q: "{ status != error }",
+        distributed: false,
+    },
+    Case {
+        // Issue #560: another status value keeps its `trace_spans`
+        // generator too.
+        name: "status_eq_ok",
+        q: "{ status = ok }",
+        distributed: false,
+    },
 ];
 
 fn plan_for(case: &Case) -> SearchPlan {
-    let (spans, attrs) = if case.distributed {
-        ("trace_spans_dist", "trace_attrs_idx_dist")
+    plan_for_window(case, &PARAMS)
+}
+
+/// [`plan_for`] on a caller-chosen window (issue #560: the pre-epoch
+/// statement).
+fn plan_for_window(case: &Case, params: &SearchParams) -> SearchPlan {
+    let (spans, attrs, recent, errors) = if case.distributed {
+        (
+            "trace_spans_dist",
+            "trace_attrs_idx_dist",
+            "trace_recent_dist",
+            "trace_error_spans_dist",
+        )
     } else {
-        ("trace_spans", "trace_attrs_idx")
+        (
+            "trace_spans",
+            "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
+        )
     };
     let query = pulsus_traceql::parse(case.q).expect("case query parses");
     plan_search(
         &query,
-        &PARAMS,
+        params,
         &SearchCtx {
             filter: SpanFilterCtx {
                 spans_table: spans,
                 attrs_table: attrs,
             },
+            recent_table: recent,
+            errors_table: errors,
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed: case.distributed,
@@ -757,22 +797,122 @@ fn golden_dir() -> std::path::PathBuf {
 
 #[test]
 fn every_case_matches_its_committed_golden_byte_for_byte() {
+    // Collected, then asserted once (issue #560): a change that moves a
+    // SET of goldens is checked by the whole set it moved, not by the
+    // first case the loop happened to reach.
+    let mut missing: Vec<String> = Vec::new();
+    let mut drifted: Vec<String> = Vec::new();
     for case in CASES {
         let path = golden_dir().join(format!("{}.sql", case.name));
-        let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "missing golden {path:?} ({e}); run `cargo test -p pulsus-read --test \
-                 traces_search_sql -- --ignored regenerate_goldens` and commit the diff"
-            )
-        });
-        let actual = composite(case);
-        assert_eq!(
-            actual, expected,
-            "case {:?} drifted from its committed golden {path:?} — if the change is \
-             intentional, regenerate and review the diff",
-            case.name
-        );
+        match std::fs::read_to_string(&path) {
+            Err(e) => missing.push(format!("{} ({path:?}: {e})", case.name)),
+            Ok(expected) => {
+                if composite(case) != expected {
+                    drifted.push(format!("{} ({path:?})", case.name));
+                }
+            }
+        }
     }
+    assert!(
+        missing.is_empty() && drifted.is_empty(),
+        "{} case(s) missing their golden:\n{}\n{} case(s) drifted from their committed \
+         golden:\n{}\nif the change is intentional, run `cargo test -p pulsus-read --test \
+         traces_search_sql -- --ignored regenerate_goldens` and review the diff",
+        missing.len(),
+        missing.join("\n"),
+        drifted.len(),
+        drifted.join("\n")
+    );
+}
+
+/// Issue #560: the two derived-table generators, and the two status
+/// comparisons that must NOT read the error table, byte for byte. The
+/// expected text is written from the plan's printed statements, not
+/// produced by the code under test.
+#[test]
+fn the_derived_table_generators_render_the_statements_the_plan_prints() {
+    let recent = "SELECT trace_id, toInt64(max(ts_max)) AS bound_ts\n\
+                  FROM trace_recent\n\
+                  WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n  \
+                  AND bucket >= 5666666 AND bucket <= 5666702\n  \
+                  AND ts_max > 1700000000000000000 AND ts_min <= 1700010800000000000\n\
+                  GROUP BY trace_id\n\
+                  ORDER BY bound_ts DESC, trace_id ASC\n\
+                  LIMIT 100001";
+    let errors = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
+                  FROM trace_error_spans\n\
+                  WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n  \
+                  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                  GROUP BY trace_id\n\
+                  ORDER BY bound_ts DESC, trace_id ASC\n\
+                  LIMIT 100001";
+    let neq_error = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
+                     FROM trace_spans\n\
+                     WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n  \
+                     AND (status_code != 2)\n\
+                     GROUP BY trace_id\n\
+                     ORDER BY bound_ts DESC, trace_id ASC\n\
+                     LIMIT 100001";
+    let eq_ok = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
+                 FROM trace_spans\n\
+                 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n  \
+                 AND (status_code = 1)\n\
+                 GROUP BY trace_id\n\
+                 ORDER BY bound_ts DESC, trace_id ASC\n\
+                 LIMIT 100001";
+    let pre_epoch = "SELECT trace_id, toInt64(max(ts_max)) AS bound_ts\n\
+                     FROM trace_recent\n\
+                     WHERE date >= toDate('1969-12-30') AND date <= toDate('1970-01-01')\n  \
+                     AND bucket >= -289 AND bucket <= 0\n  \
+                     AND ts_max > -86400000000002 AND ts_min <= 0\n\
+                     GROUP BY trace_id\n\
+                     ORDER BY bound_ts DESC, trace_id ASC\n\
+                     LIMIT 100001";
+    let case = |name: &'static str, q: &'static str| Case {
+        name,
+        q,
+        distributed: false,
+    };
+    let pre_epoch_params = SearchParams {
+        start_ns: -86_400_000_000_002,
+        end_ns: 0,
+        ..PARAMS
+    };
+    let rows: [(Case, &SearchParams, &str); 5] = [
+        (case("empty", "{}"), &PARAMS, recent),
+        (
+            case("status_eq_error", "{ status = error }"),
+            &PARAMS,
+            errors,
+        ),
+        (
+            case("status_neq_error", "{ status != error }"),
+            &PARAMS,
+            neq_error,
+        ),
+        (case("status_eq_ok", "{ status = ok }"), &PARAMS, eq_ok),
+        (case("empty_pre_epoch", "{}"), &pre_epoch_params, pre_epoch),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for (case, params, expected) in &rows {
+        let plan = plan_for_window(case, params);
+        let got = plan.generator_sqls.first().map(String::as_str);
+        if got != Some(*expected) {
+            wrong.push(format!(
+                "{} ({}):\n--- expected\n{expected}\n--- got\n{}",
+                case.name,
+                case.q,
+                got.unwrap_or("<no generator>")
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} generator statements differ from the plan's text:\n{}",
+        wrong.len(),
+        rows.len(),
+        wrong.join("\n\n")
+    );
 }
 
 /// AC1 targeted content assertions on the worked example (the plan's
@@ -1753,6 +1893,8 @@ fn plan_of(q: &str) -> SearchPlan {
                 spans_table: "trace_spans",
                 attrs_table: "trace_attrs_idx",
             },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed: false,

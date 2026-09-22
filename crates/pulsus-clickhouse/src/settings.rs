@@ -57,6 +57,17 @@ impl QuerySettings {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Issue #560: the two block-deduplication settings pinned on every
+    /// insert into the span table, so a repeated identical span block is
+    /// recognised by the derived trace tables' own deduplication windows
+    /// whatever the server profile says. Trace spans only — never logs or
+    /// metrics, whose byte-identical blocks can be two genuine pushes.
+    pub fn deduplicate_through_views() -> Self {
+        Self::new()
+            .set("deduplicate_insert", "enable")
+            .set("deduplicate_blocks_in_dependent_materialized_views", 1)
+    }
+
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
     /// `optimize_skip_unused_shards`, `optimize_distributed_group_by_sharding_key`,
     /// `distributed_aggregation_memory_efficient`, `prefer_localhost_replica`

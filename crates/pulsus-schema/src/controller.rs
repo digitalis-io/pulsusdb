@@ -433,7 +433,7 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// deliberately appended LAST so an operator-managed schema lacking the
 /// table cannot block the eight pre-existing statements (rotation
 /// warns-and-continues).
-const TTL_STMTS: [&str; 14] = [
+const TTL_STMTS: [&str; 18] = [
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(unix_milli, 1000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
@@ -469,6 +469,17 @@ const TTL_STMTS: [&str; 14] = [
     "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(bucket_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    // The two derived trace tables (issue #560), appended LAST — the #137 /
+    // #173 / #187 precedent. `trace_recent`'s TTL reads `ts_max`, the
+    // newest span in the (bucket, trace) row, not `date`: a `date` TTL
+    // would expire a whole partition at midnight of `date + N` and
+    // under-retain a span written at 23:59 by almost a day.
+    "ALTER TABLE {{db}}.trace_recent{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(ts_max, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_recent{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.trace_error_spans{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_error_spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
 ];
 
 /// Applies the current `{{retention_days}}`-derived TTL ([`TTL_STMTS`]) to
@@ -526,13 +537,22 @@ mod tests {
             .collect();
         assert_eq!(
             trace_ttl_stmts.len(),
-            3,
-            "exactly trace_spans + trace_attrs_idx + trace_edges carry a trace MODIFY TTL"
+            5,
+            "exactly trace_spans + trace_attrs_idx + trace_edges + trace_recent + \
+             trace_error_spans carry a trace MODIFY TTL"
         );
         for stmt in &trace_ttl_stmts {
+            // Issue #560: `trace_recent`'s TTL reads its newest span in the
+            // bucket, `ts_max`; every other trace table's reads its own
+            // `timestamp_ns`.
+            let column = if stmt.contains(".trace_recent ") {
+                "ts_max"
+            } else {
+                "timestamp_ns"
+            };
             assert!(
-                stmt.contains("least(intDiv(timestamp_ns, 1000000000) + "),
-                "trace TTL must use the clamped Int64-seconds form: {stmt}"
+                stmt.contains(&format!("least(intDiv({column}, 1000000000) + ")),
+                "trace TTL must use the clamped Int64-seconds form on {column}: {stmt}"
             );
             assert!(
                 stmt.contains(", 4294967295))"),
@@ -576,7 +596,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY TTL"))
             .collect();
-        assert_eq!(ttl_stmts.len(), 7, "seven retained tables carry a TTL");
+        assert_eq!(ttl_stmts.len(), 9, "nine retained tables carry a TTL");
         for stmt in &ttl_stmts {
             assert!(
                 stmt.contains("least(intDiv("),
@@ -629,7 +649,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY SETTING ttl_only_drop_parts = 1"))
             .collect();
-        assert_eq!(setting_stmts.len(), 7, "one MODIFY SETTING per table");
+        assert_eq!(setting_stmts.len(), 9, "one MODIFY SETTING per table");
         assert_eq!(
             ttl_stmts
                 .iter()

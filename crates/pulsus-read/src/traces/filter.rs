@@ -112,6 +112,16 @@ pub enum GenClass {
 pub enum GenTable {
     Spans,
     Attrs,
+    /// `trace_recent` — one row per (five-minute bucket, trace), written by
+    /// `trace_recent_mv` from `trace_spans` (issue #560). Serves the
+    /// time-range superset: `{}`, a negated attribute leaf, a trace-level
+    /// or nested-set leaf, a bare literal.
+    Recent,
+    /// `trace_error_spans` — one row per span with `status_code = 2`,
+    /// written by `trace_error_spans_mv` (issue #560). Serves
+    /// `{ status = error }` and nothing else; `status != error` and
+    /// `status = ok` keep their `trace_spans` generator.
+    ErrorSpans,
 }
 
 /// One leaf's Phase-1 candidate generator: class + pre-escaped predicate
@@ -128,10 +138,14 @@ pub struct LeafGenerator {
 }
 
 impl LeafGenerator {
+    /// The time-range superset: every trace with a span in the window.
+    /// Read from `trace_recent` since issue #560 — the same candidate set
+    /// as a `trace_spans` scan whenever the window's ends lie in different
+    /// buckets, and a superset inside one bucket (docs/schemas.md §4.2).
     pub(crate) fn time_range() -> Self {
         LeafGenerator {
             class: GenClass::TimeRange,
-            table: GenTable::Spans,
+            table: GenTable::Recent,
             predicate: String::new(),
             prewhere: None,
         }
@@ -1733,8 +1747,23 @@ pub fn compile_leaf(
                 op,
                 code: status_code(*s),
             };
+            // Issue #560: `= error` reads `trace_error_spans`, whose view's
+            // `WHERE status_code = 2` IS the predicate, so the generator
+            // carries none. Every other status comparison keeps its
+            // `trace_spans` span scan. Phase 2 still tests the hydrated
+            // span's own `status_code` through `eval`, unchanged.
+            let generator = if op == ComparisonOp::Eq && matches!(s, StatusValue::Error) {
+                LeafGenerator {
+                    class: GenClass::SpanScan,
+                    table: GenTable::ErrorSpans,
+                    predicate: String::new(),
+                    prewhere: None,
+                }
+            } else {
+                spans_generator_for(&physical)?
+            };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical)?,
+                generator,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -2993,15 +3022,26 @@ mod tests {
         assert_eq!(compiled.generators[0].predicate, "duration_ns > 2000000000");
     }
 
+    /// Issue #560: `{ status = error }` reads `trace_error_spans`, whose
+    /// view IS the predicate, so its generator carries none; every other
+    /// status comparison keeps its `trace_spans` generator and its OTLP
+    /// wire code.
     #[test]
     fn status_and_kind_lower_to_the_otel_wire_codes() {
-        let f = first_filter("{ status = error }");
-        let compiled = compile_span_filter(&f).unwrap();
-        assert_eq!(compiled.generators[0].predicate, "status_code = 2");
-
-        let f = first_filter("{ kind = server }");
-        let compiled = compile_span_filter(&f).unwrap();
-        assert_eq!(compiled.generators[0].predicate, "kind = 2");
+        let mut wrong: Vec<String> = Vec::new();
+        for (q, expected) in [
+            ("{ status = error }", ""),
+            ("{ status != error }", "status_code != 2"),
+            ("{ status = ok }", "status_code = 1"),
+            ("{ kind = server }", "kind = 2"),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            let got = &compiled.generators[0].predicate;
+            if got != expected {
+                wrong.push(format!("{q}: expected {expected:?}, got {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]

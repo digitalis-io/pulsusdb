@@ -229,6 +229,8 @@ fn engine_config(scan_budget_rows: u64) -> TraceReadConfig {
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
         edges_table: "trace_edges".to_string(),
+        recent_table: "trace_recent".to_string(),
+        errors_table: "trace_error_spans".to_string(),
         max_candidates: 100_000,
         scan_budget_rows,
         event_set_max_values: 1_000_000,

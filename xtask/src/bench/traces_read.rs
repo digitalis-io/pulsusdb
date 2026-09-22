@@ -214,6 +214,8 @@ fn evidence_plans(base: i64, now: i64) -> anyhow::Result<(SearchPlan, SearchPlan
             spans_table: "trace_spans_dist",
             attrs_table: "trace_attrs_idx_dist",
         },
+        recent_table: "trace_recent_dist",
+        errors_table: "trace_error_spans_dist",
         max_candidates: 100_000,
         // The `reader.traceql_max_series` default (issue #185): the shared
         // `by()` cardinality cap, matching the production sites.
@@ -853,6 +855,8 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             // `_dist` like the other Traces-family tables (unused by this
             // bench's search-only path).
             edges_table: "trace_edges_dist".to_string(),
+            recent_table: "trace_recent_dist".to_string(),
+            errors_table: "trace_error_spans_dist".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,

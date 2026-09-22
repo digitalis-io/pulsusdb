@@ -1239,6 +1239,88 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the two derived trace tables (issue #560) ---
+    // `trace_recent`: one row per (five-minute bucket, trace), written by
+    // `trace_recent_mv` from every `trace_spans` insert. The empty search
+    // `{}` — and every selector whose only phase-1 generator is the
+    // time-range superset — reads it instead of scanning the span table,
+    // whose `(trace_id, timestamp_ns)` sort key prunes nothing inside a
+    // day partition on a time-only predicate. `ts_min` is the column the
+    // design record's shape lacked: without it the traces wholly after the
+    // window's end in its last bucket rank above every genuine candidate,
+    // and the empty search returns nothing at production trace rates
+    // (docs/traceql-schema-migration.md §3.6).
+    //
+    // `non_replicated_deduplication_window = 10000` is what makes a
+    // repeated identical span block leave this table's physical count
+    // unchanged on a single node: the view's insert into this table
+    // carries a block id derived from the source block, and a table with a
+    // window recognises the repeat (docs/schemas.md §4.1). The clustered
+    // (`Replicated*`) form uses `replicated_deduplication_window` instead.
+    Migration {
+        id: 60,
+        name: "trace_recent",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_recent{{on_cluster}} (\n\
+                 date      Date,\n\
+                 bucket    UInt32,\n\
+                 trace_id  FixedString(16),\n\
+                 ts_max    SimpleAggregateFunction(max, Int64)  CODEC(T64, ZSTD(1)),\n\
+                 ts_min    SimpleAggregateFunction(min, Int64)  CODEC(T64, ZSTD(1))\n\
+             ) ENGINE = AggregatingMergeTree\n\
+             PARTITION BY date\n\
+             ORDER BY (bucket, trace_id)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(ts_max)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // Its `_dist` wrapper co-shards on the family's `cityHash64(trace_id)`:
+    // a trace's recency rows sit on the shard that holds its spans.
+    Migration {
+        id: 61,
+        name: "trace_recent",
+        family: Some(Family::Traces),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // `trace_error_spans`: one row per span with `status_code = 2`,
+    // written by `trace_error_spans_mv`. `{ status = error }` reads it
+    // instead of scanning the span table. Same deduplication window.
+    Migration {
+        id: 62,
+        name: "trace_error_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_error_spans{{on_cluster}} (\n\
+                 date          Date,\n\
+                 trace_id      FixedString(16),\n\
+                 span_id       FixedString(8),\n\
+                 timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 duration_ns   Int64  CODEC(T64, ZSTD(1)),\n\
+                 service       LowCardinality(String),\n\
+                 name          LowCardinality(String),\n\
+                 kind          Int8\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             PARTITION BY date\n\
+             ORDER BY (timestamp_ns, trace_id, span_id)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 63,
+        name: "trace_error_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1312,6 +1394,32 @@ pub const MVS: &[MvDef] = &[
                FROM {{db}}.trace_spans\n\
                WHERE kind IN (3, 4)\n\
                   OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)));",
+    },
+    // Issue #560: the recency view. The bucket width `300000000000` is
+    // the reader's `RECENT_BUCKET_NS`
+    // (crates/pulsus-read/src/traces/window_sql.rs), bound to this text by
+    // crates/pulsus-read/tests/traces_recency_table_literals.rs.
+    MvDef {
+        name: "trace_recent_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_recent_mv{{on_cluster}} TO {{db}}.trace_recent AS\n\
+               SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns))  AS date,\n\
+                      toUInt32(intDiv(timestamp_ns, 300000000000))   AS bucket,\n\
+                      trace_id,\n\
+                      max(timestamp_ns)                              AS ts_max,\n\
+                      min(timestamp_ns)                              AS ts_min\n\
+               FROM {{db}}.trace_spans\n\
+               GROUP BY date, bucket, trace_id;",
+    },
+    // Issue #560: the error-span view. `status_code = 2` is the code the
+    // reader renders for `error` (`filter::status_code`), bound by the
+    // same test.
+    MvDef {
+        name: "trace_error_spans_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_error_spans_mv{{on_cluster}} TO {{db}}.trace_error_spans AS\n\
+               SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,\n\
+                      trace_id, span_id, timestamp_ns, duration_ns, service, name, kind\n\
+               FROM {{db}}.trace_spans\n\
+               WHERE status_code = 2;",
     },
 ];
 
@@ -1534,6 +1642,8 @@ mod tests {
                 "log_metrics_{{log_rollup_suffix}}_mv",
                 "trace_tag_catalog_mv",
                 "trace_edges_mv",
+                "trace_recent_mv",
+                "trace_error_spans_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );

@@ -132,10 +132,24 @@ impl ChClient {
     /// `system.query_log` carries `Settings['async_insert'] = '0'`, while
     /// the rows that do NOT are test-fixture `execute()` seeding and
     /// migration bookkeeping, which are not this path.
+    #[cfg(test)]
     fn insert_settings_of(c: &ConsistencyConfig, timeout: Duration) -> QuerySettings {
-        c.insert_settings()
-            .set("async_insert", 0)
-            .with_max_execution_time(timeout)
+        Self::insert_settings_with(c, timeout, &QuerySettings::new())
+    }
+
+    /// [`Self::insert_settings_of`] plus a caller's `extra` settings, placed
+    /// after `async_insert` and before the deadline (issue #560: the span
+    /// table's deduplication pins).
+    fn insert_settings_with(
+        c: &ConsistencyConfig,
+        timeout: Duration,
+        extra: &QuerySettings,
+    ) -> QuerySettings {
+        let mut s = c.insert_settings().set("async_insert", 0);
+        for (k, v) in extra.entries() {
+            s = s.set(k, v);
+        }
+        s.with_max_execution_time(timeout)
     }
 
     /// The complete settings the read path attaches (issue #114): the
@@ -177,12 +191,24 @@ impl ChClient {
     /// decode failure) is surfaced unchanged: nothing was committed, so it
     /// is not uncertain, merely wrong.
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
+        self.insert_block_with(table, rows, &QuerySettings::new())
+            .await
+    }
+
+    /// [`Self::insert_block`] with `extra` settings on this one insert
+    /// (issue #560).
+    pub async fn insert_block_with<R: ChRow>(
+        &self,
+        table: &str,
+        rows: &[R],
+        extra: &QuerySettings,
+    ) -> Result<(), ChError> {
         let conn = self.pool.get().await?;
         // Issue #114: the whole attached set — the server deadline plus,
         // when quorum is enabled, the quorum trio — is the single testable
         // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
         // has no typed settings helper).
-        let settings = Self::insert_settings_of(&self.consistency, self.default_timeout);
+        let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
         let fut = async {
             let mut insert = conn.client().insert::<R>(table).await?;
             for (k, v) in settings.iter() {
@@ -436,6 +462,22 @@ mod tests {
         assert_eq!(
             s.render_suffix(),
             " SETTINGS async_insert = 0, max_execution_time = 120.000"
+        );
+    }
+
+    /// Issue #560: the span inserts' two deduplication pins come after
+    /// `async_insert` and before the deadline, and nothing else moves.
+    #[test]
+    fn insert_settings_with_the_span_pins_emits_both_before_the_deadline() {
+        let s = ChClient::insert_settings_with(
+            &ConsistencyConfig::default(),
+            Duration::from_secs(120),
+            &QuerySettings::deduplicate_through_views(),
+        );
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS async_insert = 0, deduplicate_insert = enable, \
+             deduplicate_blocks_in_dependent_materialized_views = 1, max_execution_time = 120.000"
         );
     }
 

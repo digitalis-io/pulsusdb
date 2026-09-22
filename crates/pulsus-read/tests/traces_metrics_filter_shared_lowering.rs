@@ -74,6 +74,8 @@ fn plan_for_search(q: &str) -> SearchPlan {
         },
         &SearchCtx {
             filter: filter_ctx(),
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: 100_000,
             max_series: 1_000,
             distributed: false,

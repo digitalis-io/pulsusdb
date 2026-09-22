@@ -40,7 +40,7 @@
 //! [`exactly_one_committed_select_case_has_no_merge_partner`] is now the
 //! assertion that **no** committed golden renders
 //! `== phase2 select values[` or `== phase2 aggregate values[`, over all
-//! 72 files, with the count of files walked asserted so a subset walk
+//! 75 files, with the count of files walked asserted so a subset walk
 //! cannot pass.
 //!
 //! # Where this stops
@@ -84,6 +84,8 @@ fn plan_query(q: &str) -> SearchPlan {
                 spans_table: "trace_spans",
                 attrs_table: "trace_attrs_idx",
             },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
             max_candidates: MAX_CANDIDATES,
             max_series: 1_000,
             distributed: false,
@@ -205,7 +207,7 @@ fn exactly_one_committed_select_case_has_no_merge_partner() {
          satisfy the emptiness above"
     );
     assert_eq!(
-        scanned, 72,
+        scanned, 75,
         "every committed traces_search golden is walked; a subset walk cannot pass"
     );
 }

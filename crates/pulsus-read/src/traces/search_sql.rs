@@ -136,6 +136,30 @@ fn time_clause(w: TimeWindow) -> String {
     bounds(w).time_clause()
 }
 
+/// The `trace_recent` bucket prune for a window (issue #560): the same
+/// convention as [`date_clause`] and [`time_clause`], at bucket grain.
+fn bucket_clause(w: TimeWindow) -> String {
+    bounds(w).bucket_clause()
+}
+
+/// The `trace_recent` row bound (issue #560): a stored `(bucket, trace)`
+/// row can hold a span in `(start, end]` only if its newest span is after
+/// `start` and its oldest is at or before `end`.
+///
+/// There is no `ts_max <= end` bound, and there cannot be one: a trace
+/// with a span inside the window and a later span in the same bucket has
+/// `ts_max > end` and IS an answer. `ts_min <= end` is what keeps the
+/// traces wholly after `end` in the last bucket out — without it the
+/// empty search returns nothing at production trace rates
+/// (docs/traceql-schema-migration.md §4, Q0).
+fn recent_row_clause(w: TimeWindow) -> String {
+    format!(
+        "ts_max > {} AND ts_min <= {}",
+        w.start_ns,
+        bounds(w).last_included_ns()
+    )
+}
+
 /// Renders a candidate `trace_id` list as `IN (unhex('…'), …)` — hex is
 /// engine-produced from stored `[u8; 16]` ids, injection-safe by
 /// construction.
@@ -174,23 +198,50 @@ fn hex32(id: &[u8; 16]) -> String {
 /// contract), which licenses the engine's threshold termination. The
 /// `+ 1` row is the per-generator truncation probe.
 ///
+/// **The two derived tables (issue #560).** `GenTable::Recent` reads
+/// `trace_recent`, one row per (bucket, trace):
+///
+/// ```text
+/// SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
+/// FROM trace_recent
+/// WHERE <date clause>
+///   AND <bucket clause>
+///   AND ts_max > <start> AND ts_min <= <end>
+/// ```
+///
+/// There `bound_ts` is the trace's newest span in its overlapping
+/// buckets, which is `>=` the newest in-window span — still an upper
+/// bound, so threshold termination stops later, never earlier. It is cast
+/// because `max` over a `SimpleAggregateFunction(max, Int64)` column
+/// keeps the wrapper. `GenTable::ErrorSpans` reads `trace_error_spans`,
+/// one row per error span, with the date and row bounds of the span
+/// table; neither derived statement carries an `AND (<predicate>)` line —
+/// the table IS the predicate. Neither reads `FINAL`: an unmerged table
+/// can hold a false candidate, never lose a true one.
+///
 /// `having` is issue #492 part 4's: the fragment
 /// [`super::compile::aggregate_having_sql`] rendered, pre-built from
 /// closed enums and one integer, so no user text reaches it — exactly as
 /// no user text reaches `generator.predicate` unescaped. It is `None` for
 /// every statement no aggregate compiled into, which is every statement
-/// the corpus rendered before part 4.
+/// the corpus rendered before part 4, and for every statement on a
+/// derived table (the renderer refuses those sources).
+#[allow(clippy::too_many_arguments)]
 pub fn generator_sql(
     generator: &LeafGenerator,
     window: TimeWindow,
     spans_table: &str,
     attrs_table: &str,
+    recent_table: &str,
+    errors_table: &str,
     gen_cap: u64,
     having: Option<&str>,
 ) -> String {
-    let mut sql = String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n");
+    const SPAN_BOUND: &str = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n";
+    let mut sql = String::new();
     match generator.table {
         GenTable::Spans => {
+            sql.push_str(SPAN_BOUND);
             sql.push_str(&format!("FROM {spans_table}\n"));
             if let Some(prewhere) = &generator.prewhere {
                 sql.push_str(&format!("PREWHERE {prewhere}\n"));
@@ -198,7 +249,27 @@ pub fn generator_sql(
             sql.push_str(&format!("WHERE {}", time_clause(window)));
         }
         GenTable::Attrs => {
+            sql.push_str(SPAN_BOUND);
             sql.push_str(&format!("FROM {attrs_table}\n"));
+            sql.push_str(&format!(
+                "WHERE {}\n  AND {}",
+                date_clause(window),
+                time_clause(window)
+            ));
+        }
+        GenTable::Recent => {
+            sql.push_str("SELECT trace_id, toInt64(max(ts_max)) AS bound_ts\n");
+            sql.push_str(&format!("FROM {recent_table}\n"));
+            sql.push_str(&format!(
+                "WHERE {}\n  AND {}\n  AND {}",
+                date_clause(window),
+                bucket_clause(window),
+                recent_row_clause(window)
+            ));
+        }
+        GenTable::ErrorSpans => {
+            sql.push_str(SPAN_BOUND);
+            sql.push_str(&format!("FROM {errors_table}\n"));
             sql.push_str(&format!(
                 "WHERE {}\n  AND {}",
                 date_clause(window),
@@ -863,6 +934,8 @@ mod tests {
         );
     }
 
+    /// Issue #560: the time-range fallback reads `trace_recent`, with both
+    /// row bounds and no predicate line.
     #[test]
     fn generator_sql_for_a_time_range_fallback_has_no_predicate_clause() {
         let sql = generator_sql(
@@ -870,11 +943,14 @@ mod tests {
             W,
             "trace_spans",
             "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
             100,
             None,
         );
-        assert!(sql.starts_with("SELECT trace_id, max(timestamp_ns) AS bound_ts\n"));
-        assert!(sql.contains("FROM trace_spans\n"));
+        assert!(sql.starts_with("SELECT trace_id, toInt64(max(ts_max)) AS bound_ts\n"));
+        assert!(sql.contains("FROM trace_recent\n"));
+        assert!(sql.contains("ts_min <= "));
         assert!(!sql.contains("AND ("));
         assert!(sql.ends_with("LIMIT 101"));
     }
@@ -892,6 +968,8 @@ mod tests {
             W,
             "trace_spans",
             "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
             pulsus_config::TRACEQL_MAX_CANDIDATES_CEILING,
             None,
         );
@@ -1008,6 +1086,8 @@ mod tests {
             W,
             "trace_spans",
             "trace_attrs_idx",
+            "trace_recent",
+            "trace_error_spans",
             100,
             None,
         );

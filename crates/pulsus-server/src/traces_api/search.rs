@@ -81,6 +81,8 @@ async fn search_impl(
             spans_table: &read_config.spans_table,
             attrs_table: &read_config.attrs_table,
         },
+        recent_table: &read_config.recent_table,
+        errors_table: &read_config.errors_table,
         max_candidates: read_config.max_candidates,
         max_series: read_config.max_series,
         distributed: read_config.distributed,

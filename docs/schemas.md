@@ -832,6 +832,65 @@ WHERE kind IN (3, 4)
 - **Replay idempotence is read-time dedup, not ledger-exact.** Byte-identical at-least-once redelivery (the ingest contract) is fully absorbed — the read's per-side `GROUP BY` computes identical `any(...)`/`max(...)` whether zero, some, or all duplicates were physically merged. A *mutated* re-send of the same `(side, trace_id, span_id)` makes `any()` merge-order-sensitive (documented residual, unchanged in kind from the metrics path).
 - **Zipkin shared-span limitation.** The correct handling above (key a shared server half by its own id) depends on the `shared` column; a shared server half whose `zipkin.shared` marker was lost cannot be distinguished from an ordinary server half and would key by its inherited `parent_id`. No historical backfill: the edge MV sees only post-deploy inserts (a one-shot operator `INSERT ... SELECT trace_edges_mv-body FROM trace_spans` recipe reconstructs history from retained spans if needed).
 
+**The two derived trace tables (#560).** `trace_recent` holds one row per (five-minute bucket, trace) and `trace_error_spans` one row per span with `status_code = 2`, both written by views over `trace_spans`, so the empty search `{}` and `{ status = error }` stop scanning the span table (§4.2). The writer still sends one `INSERT` into `trace_spans` and one into `trace_attrs_idx`; both new tables are derived.
+
+```sql
+CREATE TABLE trace_recent (
+    date      Date,
+    bucket    UInt32,                          -- intDiv(timestamp_ns, 300000000000): 288 per UTC day
+    trace_id  FixedString(16),
+    ts_max    SimpleAggregateFunction(max, Int64)  CODEC(T64, ZSTD(1)),
+    ts_min    SimpleAggregateFunction(min, Int64)  CODEC(T64, ZSTD(1))
+) ENGINE = AggregatingMergeTree
+PARTITION BY date
+ORDER BY (bucket, trace_id)
+TTL toDateTime(fromUnixTimestamp64Nano(ts_max)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;
+
+CREATE TABLE trace_error_spans (
+    date          Date,
+    trace_id      FixedString(16),
+    span_id       FixedString(8),
+    timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),
+    duration_ns   Int64  CODEC(T64, ZSTD(1)),
+    service       LowCardinality(String),
+    name          LowCardinality(String),
+    kind          Int8
+) ENGINE = ReplacingMergeTree
+PARTITION BY date
+ORDER BY (timestamp_ns, trace_id, span_id)
+TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;
+-- Both CREATE-time TTLs are superseded at runtime by apply_ttl's saturating form:
+--   trace_recent       toDateTime(least(intDiv(ts_max, 1000000000) + retention_days*86400, 4294967295)) DELETE
+--   trace_error_spans  toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days*86400, 4294967295)) DELETE
+```
+
+```sql
+CREATE MATERIALIZED VIEW trace_recent_mv TO trace_recent AS
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns))  AS date,
+       toUInt32(intDiv(timestamp_ns, 300000000000))   AS bucket,
+       trace_id,
+       max(timestamp_ns)                              AS ts_max,
+       min(timestamp_ns)                              AS ts_min
+FROM trace_spans
+GROUP BY date, bucket, trace_id;
+
+CREATE MATERIALIZED VIEW trace_error_spans_mv TO trace_error_spans AS
+SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
+       trace_id, span_id, timestamp_ns, duration_ns, service, name, kind
+FROM trace_spans
+WHERE status_code = 2;
+```
+
+- **`ts_min` is what makes the recency read correct.** The read bounds each row by `ts_max > start AND ts_min <= end`. Without `ts_min` every trace whose spans lie wholly after `end` in the window's last bucket is a candidate, and those rank above every genuine one: the empty search returns nothing once they reach the candidate ceiling, which at the mean bucket tail is about 667 traces per second (`docs/traceql-schema-migration.md` §3.6). There is no `ts_max <= end` bound: a trace with a span in the window and a later span in the same bucket is an answer.
+- **`date` is a function of `bucket`.** A UTC day is 288 buckets exactly, so no bucket straddles midnight; `bucket` leads the sort key, so a time predicate prunes granules rather than whole day partitions. The bucket width is the reader's `RECENT_BUCKET_NS` (`crates/pulsus-read/src/traces/window_sql.rs`), bound to the view's literal by a test.
+- **`trace_recent`'s TTL reads `ts_max`, not `date`:** a `date` TTL would expire the whole partition at midnight of `date + N`, under-retaining a span written at 23:59 by almost a day.
+- **A repeated identical span block leaves both tables' physical `count()` unchanged**, immediately, with no merge and no `FINAL`. A view's insert into its target carries a block id derived from the source block (`deduplicate_blocks_in_dependent_materialized_views = 1`), and a target with its own `non_replicated_deduplication_window` recognises the repeat and drops it — the single-node `trace_spans` itself has no window and stores the block twice, as before. The span inserter pins `deduplicate_insert = enable` and `deduplicate_blocks_in_dependent_materialized_views = 1` on every insert into `trace_spans`/`trace_spans_dist` (`crates/pulsus-write/src/writer/trace.rs`, `span_insert_settings`), so this does not depend on the server profile; no other insert carries the pins. A replay whose rows arrive in another order is a different block and is written again; its rows collapse at merge, because both engines are idempotent under a duplicate row, and they change no answer. The window is 10,000 blocks per table.
+- **Neither read uses `FINAL`.** A trace whose spans for one bucket arrive in several inserts has several unmerged rows for one key; the read's `GROUP BY trace_id` finds it through the row of the block that holds its in-window span. An unmerged table can hold a false candidate, never lose a true one.
+
+**What a failing view leaves behind (#560).** Three views now fire on every `trace_spans` insert — `trace_edges_mv`, `trace_recent_mv` and `trace_error_spans_mv` — and this is the first change at which a view's failure means a missing answer, the empty search returning nothing for that block, rather than a missing index row. The insert fails: the caller receives `HTTP 500` with `Code: 395`, and is not told which tables kept the block's rows. The design record measured that outcome over 300 trials of one throwing view and three healthy sibling views over one source table (`docs/traceql-schema-migration.md` §6.3): the throwing view's own target held nothing in 300 of 300; the source rows were present in 297 of 300 and absent in 3; the three healthy siblings committed 28, 25 and 32 times out of 300, and all three together 7 times against about 0.25 if they were independent. Nothing else held on every trial. The writer passes `on_flush_poisoned: None` for `trace_spans`, so nothing replays the block, and no machinery is built for this: a client that retries after the `500` re-runs the views, and the two tables' collapse rules absorb any rows written twice; a client that gives up leaves the block's derived rows partly written, with no record of which.
+
 - **Admitted trace timestamp domain and runtime TTL (issue #131).** Ingest admits a span only if its UTC day lies in `[1970-01-01, 2106-02-06]` (days `0..=49_709`, `pulsus_model::Date::start_of_day_utc_datetime_safe`); a span outside that domain is rejected (OTLP partial success; Zipkin whole-request 400). Two wrap mechanisms motivate the gate: `PARTITION BY toDate(...)` evaluates in the 16-bit `Date` domain and wraps for days past 2149-06-06, and the delete-TTL evaluates the row timestamp in the 32-bit `DateTime` domain and wraps for instants past 2106-02-07T06:28:15Z (u32-seconds maximum, `4294967295`); day `49_710` (2106-02-07) is excluded because only part of it is u32-representable. The CREATE-time TTL shown above is superseded at runtime: `apply_ttl` re-issues `ALTER TABLE ... MODIFY TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days * 86400, 4294967295)) DELETE` on both trace tables at init and on every rotation tick, so for a stored row with epoch-seconds `s = floor(timestamp_ns / 1e9)` the operative expiry is `expiry(s) = min(s + retention_days * 86400, 4294967295)` — i.e. `min(configured_expiry, 2106-02-07T06:28:15Z)`. If `s + retention_days * 86400 <= 4294967295`, the expiry equals the configured instant, bit-identical to the pre-#131 expression; otherwise the expiry is `4294967295`, the actual retention is `4294967295 - s`, and the shortfall vs the configured value is `s + retention_days * 86400 - 4294967295`, which grows without bound as `retention_days` grows. For the enforced range `retention_days >= 1` (config validation rejects `< 1`, `crates/pulsus-config/src/validate.rs:285-287`), a row at the last admitted day (`49_709`, `s = 4_294_943_999`) has actual retention capped at `4_294_967_295 - 4_294_943_999 = 23_296 s ≈ 0.27 days (~6.5 hours)`. For every enforced `retention_days >= 1`, the saturating form strictly dominates the pre-#131 expression: pre-#131, a row with `s + retention_days * 86400 > 4294967295` wrapped to a ~1970-epoch expiry and its part became drop-eligible immediately or near-immediately after insert (`ttl_only_drop_parts = 1`); under the saturating form the same row becomes drop-eligible no earlier than 2106-02-07T06:28:15Z. The admission cutoff is deliberately not coupled to `retention_days`: retention is runtime-ALTERed after rows are stored (a changed `PULSUS_RETENTION_DAYS` re-ALTERs existing tables on the next rotation tick) and has no upper bound, so no admission-time gate can honor a retention value that did not exist when the row was admitted.
 
 ### 4.2 Read paths (generated SQL)
@@ -869,7 +928,8 @@ The generator classes, their prefixes, and their honest costs:
 | `resource.service.name =` | `trace_spans` `service_time` projection PREWHERE + time | index-served |
 | `resource.service.name =~` | its own `trace_attrs_idx` row (`key='service.name' AND scope='resource'`) | key-only scan |
 | `duration <op>` | `trace_spans` + `idx_duration` minmax within the projection | granule-pruned |
-| `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
+| `name`/`status`/`kind`, except `status = error` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
+| `status = error` (#560) | `trace_error_spans` date + time prune, no predicate — the view's `WHERE status_code = 2` is the predicate | granule-pruned on the `(timestamp_ns, …)` sort key; one row per error span |
 | `trace:id =` (issue #184) | `trace_spans` `trace_id = unhex('…')` — the `ORDER BY (trace_id, timestamp_ns)` **PK prefix** | index-served (Tier-1 EXPLAIN-gated) |
 | `statusMessage` / `span:id` / `span:parentID` (issue #184) | `trace_spans` time-window scan + predicate (`status_message`, `lower(hex(span_id/parent_id))`) | no selective index — window-bounded, budget-limited |
 | `instrumentation:name` / `instrumentation:version` (issue #192) | `trace_spans` time-window scan + predicate (`scope_name` / `scope_version`) | no selective index — window-bounded, budget-limited |
@@ -880,7 +940,36 @@ The generator classes, their prefixes, and their honest costs:
 | `link.<key>` attr (issue #192 PR-C) | `trace_attrs_idx` `(key, val, scope='link')` prefix (`=`/`=~`) or key-only `(key)` scan | index-served exactly like any attribute |
 | `link:spanID =` / `link:traceID =` (issue #192 PR-C) | `trace_attrs_idx` `(key='spanID'\|'traceID', val, scope='link:intrinsic')` prefix (`val` = lowercase hex) | index-served (AttrEq) |
 | trace-level intrinsics — `traceDuration` / `rootName` / `rootServiceName` / `span:childCount` (issue #184) | the time-range generator | no candidates of their own (a windowed root scan would MISS out-of-window roots); exact via the trace-wide co-loads below — sole-predicate scale routed to #25 |
-| `!=` / `!~` / `{}` match-all | the time-range generator (`trace_spans` over the window) | complete superset; absence is not indexable |
+| `!=` / `!~` / `{}` match-all | the time-range generator (`trace_recent` over the window, #560) | complete superset; absence is not indexable. Granule-pruned on the leading `bucket` column; the same candidates as a `trace_spans` scan whenever the window's ends lie in different buckets |
+
+**The two derived-table generators (#560).** The time-range generator and `{ status = error }` read the tables §4.1 derives from `trace_spans`, and neither statement carries an `AND (<predicate>)` line — the table is the predicate. For the window `(1700000000000000000, 1700010800000000000]` at `PULSUS_TRACEQL_MAX_CANDIDATES = 100000`:
+
+```sql
+-- the time-range generator
+SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
+FROM trace_recent
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND bucket >= 5666666 AND bucket <= 5666702
+  AND ts_max > 1700000000000000000 AND ts_min <= 1700010800000000000
+GROUP BY trace_id
+ORDER BY bound_ts DESC, trace_id ASC
+LIMIT 100001
+
+-- { status = error }
+SELECT trace_id, max(timestamp_ns) AS bound_ts
+FROM trace_error_spans
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+GROUP BY trace_id
+ORDER BY bound_ts DESC, trace_id ASC
+LIMIT 100001
+```
+
+- **The bucket clause** is `floor(start / 300 s)` to `floor(last included ns / 300 s)`, rendered signed with no clamp; a pre-epoch window renders negative literals, which a `UInt32` column compares correctly.
+- **The candidate set is the span scan's exactly** whenever the window's ends lie in different buckets — every window of 300 s or more. Inside one bucket it is a superset by one shape: a trace with a span before `start` and a span after `end` in that bucket and none between. Phase 2 hydrates it, finds no in-window span and drops it; at the candidate ceiling the response is marked partial, never wrong.
+- **`bound_ts` on `trace_recent` is the trace's newest span in its overlapping buckets**, `>=` the newest in-window span. It is still an upper bound on the public sort key, so threshold termination stops later, never earlier; the response order does not move. The cast is there because `max` over a `SimpleAggregateFunction(max, Int64)` column keeps the wrapper.
+- **Measured on a 2,000,000-span corpus** (12 spans per trace, `docs/benchmarks/issue560-two-table-reads.sh`): `{}` over three hours reads 167,277 rows against 2,000,000 and 22 marks against 248; over 300 s, 8,192 rows against 1,185,089. `{ status = error }` reads 20,000 rows against 2,000,000. The recency read reads more bytes than the span scan only below 1.58 spans per trace.
+- **No aggregate is pushed onto either table**: `aggregate_having_sql` accepts only `trace_spans` and `trace_attrs_idx` as sources.
 
 Within one `{...}` filter, an `&&` needs only its statically most selective conjunct's generator set (matches are a subset of any conjunct's); an `||` needs both sides' sets. Cross-spanset `{A} op {B}` takes the superset union of both operands' generators for **both** `&&` and `||` — exactness is Phase 2's job, never a lossy trace-id reduction. Selectivity is the fixed leaf-class priority above (byte-deterministic, never a runtime probe). Every generator (indexed and fallback alike) carries the reader scan budget (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS` as `max_rows_to_read` + throw): a query too broad to bound fails loud with `422 query_too_broad` — it is never silently slow and never quietly incomplete. Issue #398 adds the per-query memory ceiling `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES` (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill) to **every** trace read at all three settings origins — search, the independent catalog-discovery root, and the §4.2 trace-by-id point read, which carried no settings at all before — so a memory breach on any of them is a `422`, not a `500`. Phase-1 generators layer their own tighter `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` on top and keep their own reason.
 
@@ -1059,7 +1148,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in)  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
-| `trace_spans`, `trace_attrs_idx`, `trace_edges` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
+| `trace_spans`, `trace_attrs_idx`, `trace_edges`, `trace_recent`, `trace_error_spans` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
@@ -1084,6 +1173,18 @@ ENGINE = Distributed('{cluster}', pulsus, log_samples, cityHash64(fingerprint));
 CREATE TABLE metric_samples_dist AS metric_samples
 ENGINE = Distributed('{cluster}', pulsus, metric_samples, cityHash64(metric_name, fingerprint));
 ```
+
+The two derived trace tables (#560) get the same wrapper, from the Traces family's expression, and a block written through `trace_spans_dist` reaches each shard's local `trace_spans`, whose views write that shard's `trace_recent` and `trace_error_spans` — so a trace's derived rows sit on the shard that holds its spans:
+
+```sql
+CREATE TABLE trace_recent_dist AS trace_recent
+ENGINE = Distributed('{cluster}', pulsus, trace_recent, cityHash64(trace_id));
+
+CREATE TABLE trace_error_spans_dist AS trace_error_spans
+ENGINE = Distributed('{cluster}', pulsus, trace_error_spans, cityHash64(trace_id));
+```
+
+A failing view behaves the same way on each shard as on a single node: see §4.1, "What a failing view leaves behind (#560)". Clustered, the repeated-block rule is the `Replicated*` engines' own `replicated_deduplication_window`, and it applies to `trace_spans` as well as to both derived tables.
 
 Two invariants the schema controller enforces, because co-location silently breaks without them: **every table in a signal family uses the byte-identical sharding expression** (raw, tiers, series/index tables alike — a divergence would put a series' rollups on a different shard than its samples), and **all inserts either go through the `_dist` wrappers or compute the same expression client-side** — the writer never freelances shard placement. Cluster configs use `internal_replication = true` (the underlying tables are `ReplicatedMergeTree`; the Distributed layer must write each block to one replica and let replication fan it out, or rows duplicate).
 

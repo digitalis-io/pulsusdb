@@ -13,9 +13,19 @@
 #   again, setting explicit src=2 roll=6         the view fired anyway
 #
 # The protective setting (`deduplicate_blocks_in_dependent_materialized_views`)
-# is on by default and does not change the outcome. So a duplicate INSERT
-# adds to the rollup and nothing afterwards subtracts from it, which is why
-# the suppression has to happen BEFORE the insert.
+# is on by default and does not change that outcome, because the target has
+# no deduplication window of its own. So for the tables issue #494 covers,
+# whose rollup targets carry no window, a duplicate INSERT adds to the
+# rollup and nothing afterwards subtracts from it, which is why the
+# suppression has to happen BEFORE the insert.
+#
+# Block deduplication DOES work for a view's target when the target carries
+# its own window (issue #560): the view's insert into the target carries a
+# block id derived from the source block, and a target with
+# `non_replicated_deduplication_window` set recognises the repeat and drops
+# it. The last step shows it:
+#
+#   target with its own window, identical block twice   src=2 roll=2
 #
 # NOT wired into CI: it creates and drops a database, and it is evidence for
 # a decision rather than a regression check.
@@ -73,3 +83,20 @@ echo "identical block again   src=$(q "SELECT count() FROM $DB.src") roll=$(q "S
 curl -sS --fail-with-body "$CH/?deduplicate_blocks_in_dependent_materialized_views=1" \
   --data-binary "INSERT INTO $DB.src VALUES (1,10,'a'),(1,11,'b')"
 echo "again, setting explicit src=$(q "SELECT count() FROM $DB.src") roll=$(q "SELECT sum(cnt) FROM $DB.roll")"
+
+# Issue #560: the same source, view and block as above, with one
+# difference — the target carries its own deduplication window. The
+# repeated block is now dropped at the target as well as at the source.
+q "CREATE TABLE $DB.src2 (fp UInt64, ts Int64, body String)
+   ENGINE = MergeTree ORDER BY (fp, ts)
+   SETTINGS non_replicated_deduplication_window = 100"
+q "CREATE TABLE $DB.roll2 (fp UInt64, bucket Int64,
+     cnt SimpleAggregateFunction(sum, UInt64))
+   ENGINE = AggregatingMergeTree ORDER BY (fp, bucket)
+   SETTINGS non_replicated_deduplication_window = 100"
+q "CREATE MATERIALIZED VIEW $DB.roll2_mv TO $DB.roll2 AS
+   SELECT fp, intDiv(ts, 5) AS bucket, count() AS cnt
+   FROM $DB.src2 GROUP BY fp, bucket"
+q "INSERT INTO $DB.src2 VALUES (1,10,'a'),(1,11,'b')"
+q "INSERT INTO $DB.src2 VALUES (1,10,'a'),(1,11,'b')"
+echo "target with its own window, identical block twice   src=$(q "SELECT count() FROM $DB.src2") roll=$(q "SELECT sum(cnt) FROM $DB.roll2")"

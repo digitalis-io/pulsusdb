@@ -1,5 +1,5 @@
--- case: service_name_cross_type_eq
--- q: { resource.service.name = 12345 }
+-- case: empty_selector
+-- q: {}
 
 == phase1 generator[0] ==
 SELECT trace_id, toInt64(max(ts_max)) AS bound_ts

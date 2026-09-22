@@ -748,6 +748,8 @@ fn lowering_plan(start_ns: i64, end_ns: i64) -> anyhow::Result<SearchPlan> {
             spans_table: "trace_spans",
             attrs_table: "trace_attrs_idx",
         },
+        recent_table: "trace_recent",
+        errors_table: "trace_error_spans",
         max_candidates: MAX_CANDIDATES,
         max_series: MAX_SERIES,
         distributed: false,

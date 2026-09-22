@@ -4420,3 +4420,607 @@ async fn an_unscoped_key_resolves_to_the_span_scope_on_both_routes() {
 
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #560 — the empty search and the error field, answered from the
+// two derived trace tables
+// ---------------------------------------------------------------------
+
+/// Nanoseconds for "BASE seconds + off nanoseconds" — the exact-nanosecond
+/// sibling of [`ts`], for the fixture's boundary spans.
+fn ts_ns(base_s: i64, off_ns: i64) -> u64 {
+    u64::try_from(base_s * 1_000_000_000 + off_ns).expect("a post-epoch timestamp")
+}
+
+const NS: i64 = 1_000_000_000;
+
+/// A span of the issue #560 fixtures, with an explicit OTLP status code
+/// (`0` unset, `1` ok, `2` error).
+fn status_span(trace: u8, span_n: u8, start_ns: u64, code: i32) -> Span {
+    let mut s = span(tid(trace), sid(span_n), None, "op", start_ns, MS, vec![]);
+    if code != 0 {
+        s.status = Some(opentelemetry_proto::tonic::trace::v1::Status {
+            message: String::new(),
+            code,
+        });
+    }
+    s
+}
+
+/// A bucket-aligned second one hour back: the fixture's `BASE`.
+fn recency_base_s() -> i64 {
+    ((now_s() - 3_600) / 300) * 300
+}
+
+/// The twelve-trace fixture of issue #560's queries. `S = BASE - 600`,
+/// `E = BASE + 110` (seconds), so the window `(S, E]` spans buckets
+/// `k-2`, `k-1` and `k`, with `E` 110 s into bucket `k`.
+///
+/// ```text
+///   trace  spans (offsets from BASE)          why
+///   1      S + 1 ns                           the first included nanosecond
+///   2      E                                  the last included nanosecond
+///   3      -1 ns and +1 ns                    a bucket edge: two stored rows
+///   4      S - 1 s                            wholly before the window
+///   5      E + 10 s                           bucket k's tail
+///   6      S + 2 s error, S + 3 s ok          the error table
+///   7      S + 4 s                            unset is not error
+///   8      +50 s and +100 s                   the intra-bucket gap shape
+///   9      +60 s and +200 s                   in-window span, newest after E
+///   10     +70 s                              genuine inside Q2's window
+///   11     S                                  the excluded start nanosecond
+///   12     S - 1 ns                           one nanosecond before it
+/// ```
+fn twelve_trace_fixture(base_s: i64) -> Vec<Span> {
+    let s = -600 * NS;
+    let e = 110 * NS;
+    vec![
+        status_span(1, 1, ts_ns(base_s, s + 1), 0),
+        status_span(2, 1, ts_ns(base_s, e), 0),
+        status_span(3, 1, ts_ns(base_s, -1), 0),
+        status_span(3, 2, ts_ns(base_s, 1), 0),
+        status_span(4, 1, ts_ns(base_s, s - NS), 0),
+        status_span(5, 1, ts_ns(base_s, e + 10 * NS), 0),
+        status_span(6, 1, ts_ns(base_s, s + 2 * NS), 2),
+        status_span(6, 2, ts_ns(base_s, s + 3 * NS), 1),
+        status_span(7, 1, ts_ns(base_s, s + 4 * NS), 0),
+        status_span(8, 1, ts_ns(base_s, 50 * NS), 0),
+        status_span(8, 2, ts_ns(base_s, 100 * NS), 0),
+        status_span(9, 1, ts_ns(base_s, 60 * NS), 0),
+        status_span(9, 2, ts_ns(base_s, 200 * NS), 0),
+        status_span(10, 1, ts_ns(base_s, 70 * NS), 0),
+        status_span(11, 1, ts_ns(base_s, s), 0),
+        status_span(12, 1, ts_ns(base_s, s - 1), 0),
+    ]
+}
+
+/// The phase-1 generator statement a search ran, read from the same
+/// request sent with `X-Pulsus-Explain: 1`: the one stage whose SQL
+/// carries `AS bound_ts`.
+fn generator_sql_of(port: u16, q: &str, start_s: i64, end_s: i64) -> Result<String, String> {
+    let path = format!(
+        "/api/traces/v1/search?q={}&start={start_s}&end={end_s}&limit=20",
+        enc(q)
+    );
+    let raw = request_with_headers(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
+        .ok_or_else(|| format!("{q}: explain request unreachable"))?;
+    let json: serde_json::Value = serde_json::from_slice(&raw.body)
+        .map_err(|e| format!("{q}: explain body is not JSON: {e}"))?;
+    let sqls: Vec<String> = json["explain"]["stages"]
+        .as_array()
+        .map(|stages| {
+            stages
+                .iter()
+                .filter_map(|s| s["sql"].as_str())
+                .filter(|sql| sql.contains("AS bound_ts"))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    match sqls.as_slice() {
+        [one] => Ok(one.clone()),
+        other => Err(format!(
+            "{q}: expected one generator stage, found {}: {json}",
+            other.len()
+        )),
+    }
+}
+
+/// One of the issue #560 queries: its window, the expected answer, and
+/// the fragments its generator statement must (and must not) carry.
+struct RecencyCase {
+    label: &'static str,
+    q: &'static str,
+    start_s: i64,
+    end_s: i64,
+    /// The exact trace set; an order when `ordered`.
+    traces: Vec<u8>,
+    ordered: bool,
+    /// The committed `metrics` branch the response must carry, if asserted.
+    metrics: Option<&'static str>,
+    sql_has: Vec<&'static str>,
+    sql_lacks: Vec<&'static str>,
+}
+
+fn check_recency_case(port: u16, c: &RecencyCase, wrong: &mut Vec<String>) {
+    let path = format!(
+        "/api/traces/v1/search?q={}&start={}&end={}&limit=20",
+        enc(c.q),
+        c.start_s,
+        c.end_s
+    );
+    let res = get(port, &path, c.label);
+    if res.status != 200 {
+        wrong.push(format!(
+            "{}: status {}, body {:?}",
+            c.label,
+            res.status,
+            String::from_utf8_lossy(&res.body)
+        ));
+        return;
+    }
+    let json = res.json(c.label);
+    let expected: Vec<String> = c.traces.iter().map(|n| hex(&tid(*n))).collect();
+    if c.ordered {
+        let got = trace_order(&json);
+        if got != expected {
+            wrong.push(format!(
+                "{}: expected the order {expected:?}, got {got:?}",
+                c.label
+            ));
+        }
+    } else {
+        let got = trace_set(&json);
+        let want: BTreeSet<String> = expected.into_iter().collect();
+        if got != want {
+            wrong.push(format!("{}: expected {want:?}, got {got:?}", c.label));
+        }
+    }
+    if let Some(branch) = c.metrics
+        && json["metrics"] != metrics_shape(branch)
+    {
+        wrong.push(format!(
+            "{}: metrics must be the committed {branch} block, got {}",
+            c.label, json["metrics"]
+        ));
+    }
+    if c.sql_has.is_empty() && c.sql_lacks.is_empty() {
+        return;
+    }
+    match generator_sql_of(port, c.q, c.start_s, c.end_s) {
+        Err(e) => wrong.push(format!("{}: {e}", c.label)),
+        Ok(sql) => {
+            for needle in &c.sql_has {
+                if !sql.contains(needle) {
+                    wrong.push(format!(
+                        "{}: the generator lacks {needle:?}:\n{sql}",
+                        c.label
+                    ));
+                }
+            }
+            for needle in &c.sql_lacks {
+                if sql.contains(needle) {
+                    wrong.push(format!(
+                        "{}: the generator carries {needle:?}:\n{sql}",
+                        c.label
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Issue #560 criterion 12, Q1–Q7: the queries a search form sends, with
+/// the answers they must give and the generator statements they must run.
+/// The answer sets are the span scan's by design; the generator
+/// fragments are what moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_249;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_recency_answers");
+    drop_db(db).await;
+    let guard = spawn_ready(port, db, &[]);
+    let base = recency_base_s();
+    ingest(
+        port,
+        twelve_trace_fixture(base),
+        checkout_resource(),
+        "seed the twelve-trace fixture",
+    );
+    let (s, e) = (base - 600, base + 110);
+    let all = vec![1, 2, 3, 6, 7, 8, 9, 10];
+    let cases = vec![
+        RecencyCase {
+            label: "Q1 {}",
+            q: "{}",
+            start_s: s,
+            end_s: e,
+            traces: vec![2, 8, 10, 9, 3, 7, 6, 1],
+            ordered: true,
+            metrics: Some("complete"),
+            sql_has: vec!["FROM trace_recent", "ts_min <="],
+            sql_lacks: vec![],
+        },
+        RecencyCase {
+            label: "Q2 {} inside one bucket",
+            q: "{}",
+            start_s: base + 60,
+            end_s: base + 90,
+            traces: vec![10],
+            ordered: false,
+            metrics: Some("complete"),
+            sql_has: vec!["FROM trace_recent"],
+            sql_lacks: vec![],
+        },
+        RecencyCase {
+            label: "Q3 { status = error }",
+            q: "{ status = error }",
+            start_s: s,
+            end_s: e,
+            traces: vec![6],
+            ordered: false,
+            metrics: Some("complete"),
+            sql_has: vec!["FROM trace_error_spans"],
+            sql_lacks: vec!["status_code"],
+        },
+        RecencyCase {
+            label: "Q4 { status != error }",
+            q: "{ status != error }",
+            start_s: s,
+            end_s: e,
+            traces: all.clone(),
+            ordered: false,
+            metrics: None,
+            sql_has: vec!["FROM trace_spans", "AND (status_code != 2)"],
+            sql_lacks: vec![],
+        },
+        RecencyCase {
+            label: "Q5 { status = ok }",
+            q: "{ status = ok }",
+            start_s: s,
+            end_s: e,
+            traces: vec![6],
+            ordered: false,
+            metrics: None,
+            sql_has: vec!["FROM trace_spans", "AND (status_code = 1)"],
+            sql_lacks: vec![],
+        },
+        RecencyCase {
+            label: "Q6 {} before the epoch",
+            q: "{}",
+            start_s: -2_000,
+            end_s: -1_000,
+            traces: vec![],
+            ordered: false,
+            metrics: Some("complete"),
+            sql_has: vec!["bucket >= -7 AND bucket <= -4"],
+            sql_lacks: vec![],
+        },
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for c in &cases {
+        check_recency_case(port, c, &mut wrong);
+    }
+    // Q7: the rejection that must stay a rejection.
+    let res = get(
+        port,
+        "/api/traces/v1/search?q=%7B%7D&start=1700000000&end=1700000000&limit=20",
+        "Q7",
+    );
+    let body = String::from_utf8_lossy(&res.body).into_owned();
+    if res.status != 400
+        || !body.contains("invalid range: end (1700000000) must be greater than start (1700000000)")
+    {
+        wrong.push(format!(
+            "Q7: expected 400 with the range message, got {} {body:?}",
+            res.status
+        ));
+    }
+    drop(guard);
+    drop_db(db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} mismatch(es):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Issue #560 criterion 12, Q8 and Q2c, at a candidate ceiling of 2. Q8
+/// is what makes `ts_min` load-bearing: without it trace 5 (bucket k's
+/// tail, wholly after `E`) is the second candidate consumed and the answer
+/// is `{9}`. Q2c is the gap shape reaching the ceiling: marked partial,
+/// never a wrong trace.
+///
+/// ```text
+///   Q8 candidates by bound_ts   9 (BASE+200)  2 (BASE+110)  8 (BASE+100) ...
+///   Q2c candidates              9 (BASE+200)  8 (BASE+100)  10 (BASE+70) <- lookahead
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_250;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_recency_ceiling");
+    drop_db(db).await;
+    let guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_MAX_CANDIDATES", "2")]);
+    let base = recency_base_s();
+    ingest(
+        port,
+        twelve_trace_fixture(base),
+        checkout_resource(),
+        "seed the twelve-trace fixture",
+    );
+    let cases = vec![
+        RecencyCase {
+            label: "Q8 {} at a ceiling of 2",
+            q: "{}",
+            start_s: base - 600,
+            end_s: base + 110,
+            traces: vec![9, 2],
+            ordered: false,
+            metrics: Some("partial"),
+            sql_has: vec![],
+            sql_lacks: vec![],
+        },
+        RecencyCase {
+            label: "Q2c {} inside one bucket at a ceiling of 2",
+            q: "{}",
+            start_s: base + 60,
+            end_s: base + 90,
+            traces: vec![],
+            ordered: false,
+            metrics: Some("partial"),
+            sql_has: vec![],
+            sql_lacks: vec![],
+        },
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for c in &cases {
+        check_recency_case(port, c, &mut wrong);
+    }
+    drop(guard);
+    drop_db(db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} mismatch(es):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// T17's OTLP body: 20 traces `…a0`–`…b3`, 3 spans each at `base + t s +
+/// j·10 ms`; span `j = 0` of every trace with `t % 5 == 0` is an error.
+/// `base` is bucket-aligned so no trace's 20 ms straddles a recency
+/// bucket edge, which would give that trace a second row.
+fn replay_body(base_s: i64) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for t in 0..20u8 {
+        for j in 0..3u8 {
+            let start = ts_ns(base_s, i64::from(t) * NS + i64::from(j) * 10_000_000);
+            let code = if j == 0 && t % 5 == 0 { 2 } else { 0 };
+            spans.push(status_span(0xa0 + t, j + 1, start, code));
+        }
+    }
+    spans
+}
+
+fn replay_resource() -> Vec<KeyValue> {
+    vec![kv_str("service.name", "svc")]
+}
+
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+struct NameRow560 {
+    name: String,
+}
+
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+struct CountRow560 {
+    n: u64,
+}
+
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+struct SettingRow560 {
+    v: String,
+}
+
+async fn count_of(admin: &pulsus_clickhouse::ChClient, sql: &str) -> u64 {
+    use futures::StreamExt;
+    let mut stream = admin
+        .query_stream::<CountRow560>(sql, &pulsus_clickhouse::QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("count failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("a row").expect("decode").n
+}
+
+async fn admin_exec(admin: &pulsus_clickhouse::ChClient, sql: &str) {
+    admin
+        .execute(
+            sql,
+            &pulsus_clickhouse::QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("execute failed: {e}\nSQL:\n{sql}"));
+}
+
+/// Both derived tables exist in `db`, then merges on both are stopped so
+/// no merge can lower a physical count between readings.
+async fn prepare_derived_tables(admin: &pulsus_clickhouse::ChClient, db: &str) {
+    use futures::StreamExt;
+    let sql = format!("SELECT name FROM system.tables WHERE database = '{db}'");
+    let mut stream = admin
+        .query_stream::<NameRow560>(&sql, &pulsus_clickhouse::QuerySettings::new())
+        .await
+        .expect("query system.tables");
+    let mut names = BTreeSet::new();
+    while let Some(row) = stream.next().await {
+        names.insert(row.expect("decode").name);
+    }
+    drop(stream);
+    let missing: Vec<&str> = ["trace_recent", "trace_error_spans"]
+        .into_iter()
+        .filter(|t| !names.contains(*t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{db} lacks the derived trace tables: {missing:?}"
+    );
+    for table in ["trace_recent", "trace_error_spans"] {
+        admin_exec(admin, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+    }
+}
+
+/// Posts T17's body three times and returns every mismatch against 20
+/// recency rows, 4 error rows and the same 20 `{}` trace ids after each.
+async fn post_three_times(
+    port: u16,
+    admin: &pulsus_clickhouse::ChClient,
+    db: &str,
+    label: &str,
+) -> Vec<String> {
+    let base = recency_base_s();
+    let want: BTreeSet<String> = (0..20u8).map(|t| hex(&tid(0xa0 + t))).collect();
+    let mut wrong = Vec::new();
+    for post in 1..=3 {
+        ingest(port, replay_body(base), replay_resource(), label);
+        let spans = count_of(admin, &format!("SELECT count() AS n FROM {db}.trace_spans")).await;
+        let recent = count_of(
+            admin,
+            &format!("SELECT count() AS n FROM {db}.trace_recent"),
+        )
+        .await;
+        let errors = count_of(
+            admin,
+            &format!("SELECT count() AS n FROM {db}.trace_error_spans"),
+        )
+        .await;
+        eprintln!(
+            "{label} post {post}: trace_spans {spans}, trace_recent {recent}, \
+             trace_error_spans {errors}"
+        );
+        if recent != 20 {
+            wrong.push(format!(
+                "{label} post {post}: trace_recent {recent}, expected 20"
+            ));
+        }
+        if errors != 4 {
+            wrong.push(format!(
+                "{label} post {post}: trace_error_spans {errors}, expected 4"
+            ));
+        }
+        let res = search(port, "{}", base - 1, base + 30, "&limit=50", label);
+        let got = trace_set(&res.json(label));
+        if got != want {
+            wrong.push(format!(
+                "{label} post {post}: {{}} returned {got:?}, expected the 20 traces"
+            ));
+        }
+    }
+    wrong
+}
+
+/// Issue #560 criterion 9, through the product ingest route: the same
+/// OTLP body posted three times leaves the physical `count()` of both
+/// derived tables unchanged — no `FINAL`, no merge. `trace_spans` is a
+/// plain `MergeTree` on a single node and stores every post; its count is
+/// printed, not asserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_ingest_twice_leaves_the_derived_tables_count_unchanged() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_251;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_recency_replay");
+    drop_db(db).await;
+    let guard = spawn_ready(port, db, &[]);
+    let admin = pulsus_clickhouse::ChClient::new(live_db::conn_config("default"))
+        .await
+        .expect("connect the admin client");
+    prepare_derived_tables(&admin, db).await;
+    let wrong = post_three_times(port, &admin, db, "replay").await;
+    drop(guard);
+    drop_db(db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #560 criterion 22: criterion 4 holds under a server profile that
+/// disables either deduplication setting, because the span inserts pin
+/// both. The server runs as a user whose profile carries the disabling
+/// setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_that_disables_deduplication_does_not_reach_the_derived_tables() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_252;
+    let admin = pulsus_clickhouse::ChClient::new(live_db::conn_config("default"))
+        .await
+        .expect("connect the admin client");
+    let mut wrong: Vec<String> = Vec::new();
+    for (label, db, setting, name, disabled) in [
+        (
+            "dependent-view rule 0",
+            pulsus_testkit::test_db("pulsus_traces_search_it_dedup_views_off"),
+            "deduplicate_blocks_in_dependent_materialized_views = 0",
+            "deduplicate_blocks_in_dependent_materialized_views",
+            &["0", "false"][..],
+        ),
+        (
+            "deduplicate_insert disabled",
+            pulsus_testkit::test_db("pulsus_traces_search_it_dedup_insert_off"),
+            "deduplicate_insert = 'disable'",
+            "deduplicate_insert",
+            &["disable"][..],
+        ),
+    ] {
+        let db = db.as_str();
+        let user = format!("{db}_dedup_off");
+        drop_db(db).await;
+        admin_exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
+        admin_exec(
+            &admin,
+            &format!("CREATE USER {user} IDENTIFIED WITH no_password SETTINGS {setting}"),
+        )
+        .await;
+        admin_exec(&admin, &format!("GRANT ALL ON {db}.* TO {user}")).await;
+
+        let auth = format!("{user}:");
+        let guard = spawn_ready(port, db, &[("CLICKHOUSE_AUTH", auth.as_str())]);
+        prepare_derived_tables(&admin, db).await;
+
+        let mut as_user = live_db::conn_config("default");
+        as_user.user = user.clone();
+        let user_client = pulsus_clickhouse::ChClient::new(as_user)
+            .await
+            .expect("connect as the profile's user");
+        let got = {
+            use futures::StreamExt;
+            let sql = format!("SELECT toString(getSetting('{name}')) AS v");
+            let mut stream = user_client
+                .query_stream::<SettingRow560>(&sql, &pulsus_clickhouse::QuerySettings::new())
+                .await
+                .unwrap_or_else(|e| panic!("read the user's setting: {e}"));
+            stream.next().await.expect("a row").expect("decode").v
+        };
+        if !disabled.contains(&got.as_str()) {
+            wrong.push(format!(
+                "{label}: the user's {name} reads {got:?}, expected one of {disabled:?}"
+            ));
+        }
+
+        wrong.extend(post_three_times(port, &admin, db, label).await);
+        drop(guard);
+        drop_db(db).await;
+        admin_exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

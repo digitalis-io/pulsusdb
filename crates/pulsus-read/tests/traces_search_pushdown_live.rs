@@ -118,6 +118,8 @@ fn engine_config(max_candidates: u64, generator_max_memory_bytes: u64) -> TraceR
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
         edges_table: "trace_edges".to_string(),
+        recent_table: "trace_recent".to_string(),
+        errors_table: "trace_error_spans".to_string(),
         max_candidates,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,
@@ -2718,4 +2720,732 @@ async fn the_grouped_cells_return_a_superset_and_a_replay_moves_neither_side() {
     );
     exec(&clean, &format!("DROP DATABASE IF EXISTS {clean_db}")).await;
     exec(&replay, &format!("DROP DATABASE IF EXISTS {replay_db}")).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #560 — the two derived trace tables, `trace_recent` and
+// `trace_error_spans`, read by the `{}` and `{ status = error }`
+// generators
+// ---------------------------------------------------------------------
+
+const NS_PER_S: i64 = 1_000_000_000;
+
+/// A bucket-aligned second `back_s` seconds before now, in nanoseconds.
+/// 300 s is the recency table's bucket width; it is written here as a
+/// literal because the reader's constant is a stub on the tests-first
+/// commit, and a fixture must not divide by it before the existence
+/// assertion has run.
+fn bucket_aligned_base_ns(back_s: i64) -> i64 {
+    let now_s = now_ns() / NS_PER_S;
+    ((now_s - back_s) / 300) * 300 * NS_PER_S
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize)]
+struct TableNameRow {
+    name: String,
+}
+
+/// Every one of `tables` exists in `db`; the missing ones are listed.
+async fn assert_tables_exist(client: &ChClient, db: &str, tables: &[&str]) {
+    let sql = format!("SELECT name FROM system.tables WHERE database = '{db}'");
+    let mut stream = client
+        .query_stream::<TableNameRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.tables");
+    let mut names = BTreeSet::new();
+    while let Some(row) = stream.next().await {
+        names.insert(row.expect("decode table name").name);
+    }
+    drop(stream);
+    let missing: Vec<&&str> = tables.iter().filter(|t| !names.contains(**t)).collect();
+    assert!(
+        missing.is_empty(),
+        "{db} lacks the tables this test reads: {missing:?}"
+    );
+}
+
+/// One stored span of the issue #560 fixtures.
+#[derive(Debug, Clone, Copy)]
+struct RecentSpan {
+    trace: u32,
+    span: u32,
+    ts_ns: i64,
+    status: i8,
+}
+
+/// The `INSERT … VALUES` statement text for `rows`, in the given order.
+fn recent_insert(db: &str, rows: &[RecentSpan]) -> String {
+    let values: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "(unhex('{}'), unhex('{}'), unhex('0000000000000000'), 'op', 'svc', {}, 1000, \
+                 {}, 2, 1, '')",
+                hex32(&trace_id(r.trace)),
+                span_id(r.trace, r.span)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                r.ts_ns,
+                r.status
+            )
+        })
+        .collect();
+    format!(
+        "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+         timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+        values.join(", ")
+    )
+}
+
+/// T17d's block: 200 traces of 12 spans, trace `n` at `base + n s + j·10
+/// ms`; span `j = 0` of every trace with `n % 10 == 0` is an error.
+fn replay_block(base_ns: i64) -> Vec<RecentSpan> {
+    let mut rows = Vec::new();
+    for n in 0..200u32 {
+        for j in 0..12u32 {
+            rows.push(RecentSpan {
+                trace: n,
+                span: j,
+                ts_ns: base_ns + i64::from(n) * NS_PER_S + i64::from(j) * 10_000_000,
+                status: if j == 0 && n % 10 == 0 { 2 } else { 0 },
+            });
+        }
+    }
+    rows
+}
+
+/// One generator statement's `(trace_id, bound_ts)` rows, in statement
+/// order.
+type GeneratorRows = Vec<(String, i64)>;
+
+/// `(trace_id, bound_ts)` for every row one generator statement returns,
+/// in statement order.
+async fn generator_rows(client: &ChClient, sql: &str) -> GeneratorRows {
+    let mut stream = client
+        .query_stream::<IdRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("generator query failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode generator row");
+        out.push((hex32(&row.trace_id), row.bound_ts));
+    }
+    out
+}
+
+fn window(start_ns: i64, end_ns: i64) -> SearchParams {
+    SearchParams {
+        start_ns,
+        end_ns,
+        limit: 20,
+        spss: 3,
+    }
+}
+
+/// The span-scan generator statement over a window: the time-range
+/// generator as it read `trace_spans` before issue #560, written here
+/// from the plan's text rather than produced by the planner.
+fn span_scan_sql(start_ns: i64, end_ns: i64, predicate: Option<&str>) -> String {
+    let predicate = predicate
+        .map(|p| format!("\n  AND ({p})"))
+        .unwrap_or_default();
+    format!(
+        "SELECT trace_id, max(timestamp_ns) AS bound_ts\nFROM trace_spans\n\
+         WHERE timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}{predicate}\n\
+         GROUP BY trace_id\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT 100001"
+    )
+}
+
+async fn derived_counts(client: &ChClient, db: &str) -> (u64, u64, u64) {
+    (
+        scalar(
+            client,
+            &format!("SELECT count() AS v FROM {db}.trace_spans"),
+        )
+        .await,
+        scalar(
+            client,
+            &format!("SELECT count() AS v FROM {db}.trace_recent"),
+        )
+        .await,
+        scalar(
+            client,
+            &format!("SELECT count() AS v FROM {db}.trace_error_spans"),
+        )
+        .await,
+    )
+}
+
+/// Issue #560 criterion 9, at the SQL level: the same `INSERT` statement
+/// text sent twice leaves the physical `count()` of both derived tables
+/// unchanged — no `FINAL`, no merge — and moves neither generator's
+/// answer. `trace_spans` itself is a plain `MergeTree` on a single node
+/// and stores the block twice, as it did before this change; its count is
+/// printed, not asserted.
+#[tokio::test]
+async fn a_replayed_block_is_recognised_by_both_derived_tables() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_recent_replay");
+    let client = fresh_db(db).await;
+    assert_tables_exist(
+        &client,
+        db,
+        &["trace_spans", "trace_recent", "trace_error_spans"],
+    )
+    .await;
+    for table in ["trace_recent", "trace_error_spans"] {
+        exec(&client, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+    }
+    let base = bucket_aligned_base_ns(7_200);
+    let insert = recent_insert(db, &replay_block(base));
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = window(base - NS_PER_S, base + 300 * NS_PER_S);
+    let empty = plan_for(&engine, "{}", &p).generator_sqls[0].clone();
+    let errors = plan_for(&engine, "{ status = error }", &p).generator_sqls[0].clone();
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut lists: Vec<(GeneratorRows, GeneratorRows)> = Vec::new();
+    for send in 1..=2 {
+        exec(&client, &insert).await;
+        let (spans, recent, errs) = derived_counts(&client, db).await;
+        eprintln!(
+            "send {send}: trace_spans {spans}, trace_recent {recent}, trace_error_spans {errs}"
+        );
+        if recent != 200 {
+            failures.push(format!(
+                "send {send}: trace_recent holds {recent}, expected 200"
+            ));
+        }
+        if errs != 20 {
+            failures.push(format!(
+                "send {send}: trace_error_spans holds {errs}, expected 20"
+            ));
+        }
+        lists.push((
+            generator_rows(&client, &empty).await,
+            generator_rows(&client, &errors).await,
+        ));
+    }
+    if lists[0].0.len() != 200 || lists[0].1.len() != 20 {
+        failures.push(format!(
+            "the generators returned {} and {} entries after the first send, expected 200 and 20",
+            lists[0].0.len(),
+            lists[0].1.len()
+        ));
+    }
+    if lists[0] != lists[1] {
+        failures.push("a generator's (trace_id, bound_ts) list moved on the replay".to_string());
+    }
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Issue #560: a replay whose rows arrive in another order is a different
+/// block, so it is written again — and it still moves no answer and no
+/// distinct key, and a merge collapses it.
+#[tokio::test]
+async fn a_replay_in_another_order_is_written_again_and_moves_no_answer() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_recent_reorder");
+    let client = fresh_db(db).await;
+    assert_tables_exist(
+        &client,
+        db,
+        &["trace_spans", "trace_recent", "trace_error_spans"],
+    )
+    .await;
+    for table in ["trace_recent", "trace_error_spans"] {
+        exec(&client, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+    }
+    let base = bucket_aligned_base_ns(7_200);
+    let block = replay_block(base);
+    let insert = recent_insert(db, &block);
+    let reversed: Vec<RecentSpan> = block.iter().rev().copied().collect();
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = window(base - NS_PER_S, base + 300 * NS_PER_S);
+    let empty = plan_for(&engine, "{}", &p).generator_sqls[0].clone();
+    let errors = plan_for(&engine, "{ status = error }", &p).generator_sqls[0].clone();
+
+    exec(&client, &insert).await;
+    exec(&client, &insert).await;
+    let (_, recent, errs) = derived_counts(&client, db).await;
+    assert!(
+        recent > 0 && errs > 0,
+        "the fixture wrote nothing to the derived tables ({recent}, {errs})"
+    );
+    let first = (
+        generator_rows(&client, &empty).await,
+        generator_rows(&client, &errors).await,
+    );
+    exec(&client, &recent_insert(db, &reversed)).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let physical = derived_counts(&client, db).await;
+    let distinct_recent = scalar(
+        &client,
+        &format!(
+            "SELECT count() AS v FROM (SELECT DISTINCT bucket, trace_id FROM {db}.trace_recent)"
+        ),
+    )
+    .await;
+    let distinct_errors = scalar(
+        &client,
+        &format!(
+            "SELECT count() AS v FROM (SELECT DISTINCT timestamp_ns, trace_id, span_id \
+             FROM {db}.trace_error_spans)"
+        ),
+    )
+    .await;
+    eprintln!(
+        "after the reversed replay: trace_spans {}, trace_recent {} ({distinct_recent} \
+         distinct), trace_error_spans {} ({distinct_errors} distinct)",
+        physical.0, physical.1, physical.2
+    );
+    for (what, got, want) in [
+        ("trace_recent physical", physical.1, 400),
+        (
+            "trace_recent distinct (bucket, trace_id)",
+            distinct_recent,
+            200,
+        ),
+        ("trace_error_spans physical", physical.2, 40),
+        (
+            "trace_error_spans distinct (timestamp_ns, trace_id, span_id)",
+            distinct_errors,
+            20,
+        ),
+    ] {
+        if got != want {
+            failures.push(format!("{what}: expected {want}, got {got}"));
+        }
+    }
+    let after_replay = (
+        generator_rows(&client, &empty).await,
+        generator_rows(&client, &errors).await,
+    );
+    if after_replay != first {
+        failures.push("the reversed replay moved a generator's list".to_string());
+    }
+
+    for table in ["trace_recent", "trace_error_spans"] {
+        exec(&client, &format!("SYSTEM START MERGES {db}.{table}")).await;
+        exec(&client, &format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
+    }
+    let merged = derived_counts(&client, db).await;
+    if merged.1 != 200 || merged.2 != 20 {
+        failures.push(format!(
+            "after OPTIMIZE FINAL: trace_recent {}, trace_error_spans {}, expected 200 and 20",
+            merged.1, merged.2
+        ));
+    }
+    let after_merge = (
+        generator_rows(&client, &empty).await,
+        generator_rows(&client, &errors).await,
+    );
+    if after_merge != first {
+        failures.push("the merge moved a generator's list".to_string());
+    }
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Issue #560 criterion 9: a trace whose spans for one bucket arrive in
+/// two inserts has two unmerged rows for one key, and the read finds it
+/// before any merge — no `FINAL`.
+///
+/// ```text
+///   insert 1: span at BASE+10 s     row (bucket k, trace) ts_min=ts_max=BASE+10
+///   insert 2: span at BASE+20 s     row (bucket k, trace) ts_min=ts_max=BASE+20
+///
+///   window (BASE+15, BASE+30]   row 2 passes ts_max > S AND ts_min <= E -> found
+///   window (BASE+11, BASE+19]   neither row passes before a merge -> nothing;
+///                               the merged row (10, 20) passes -> a candidate
+///                               the span scan does not have (a superset)
+/// ```
+#[tokio::test]
+async fn a_trace_split_across_inserts_is_found_before_any_merge() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_recent_split");
+    let client = fresh_db(db).await;
+    assert_tables_exist(&client, db, &["trace_spans", "trace_recent"]).await;
+    exec(&client, &format!("SYSTEM STOP MERGES {db}.trace_recent")).await;
+    let base = bucket_aligned_base_ns(3_600);
+    let trace = 0x14u32;
+    for (span, off_s) in [(1u32, 10i64), (2, 20)] {
+        exec(
+            &client,
+            &recent_insert(
+                db,
+                &[RecentSpan {
+                    trace,
+                    span,
+                    ts_ns: base + off_s * NS_PER_S,
+                    status: 0,
+                }],
+            ),
+        )
+        .await;
+    }
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let found = window(base + 15 * NS_PER_S, base + 30 * NS_PER_S);
+    let gap = window(base + 11 * NS_PER_S, base + 19 * NS_PER_S);
+    let found_sql = plan_for(&engine, "{}", &found).generator_sqls[0].clone();
+    let gap_sql = plan_for(&engine, "{}", &gap).generator_sqls[0].clone();
+    let gap_scan = span_scan_sql(gap.start_ns, gap.end_ns, None);
+    let key_rows = format!(
+        "SELECT count() AS v FROM {db}.trace_recent WHERE trace_id = unhex('{}')",
+        hex32(&trace_id(trace))
+    );
+    let want_found = vec![(hex32(&trace_id(trace)), base + 20 * NS_PER_S)];
+
+    let mut failures: Vec<String> = Vec::new();
+    let rows = scalar(&client, &key_rows).await;
+    if rows != 2 {
+        failures.push(format!(
+            "before a merge: {rows} rows for the key, expected 2"
+        ));
+    }
+    let got = generator_rows(&client, &found_sql).await;
+    if got != want_found {
+        failures.push(format!(
+            "before a merge, (BASE+15 s, BASE+30 s]: expected {want_found:?}, got {got:?}"
+        ));
+    }
+    let got = generator_rows(&client, &gap_sql).await;
+    if !got.is_empty() {
+        failures.push(format!(
+            "before a merge, (BASE+11 s, BASE+19 s]: expected nothing, got {got:?}"
+        ));
+    }
+    let got = generator_rows(&client, &gap_scan).await;
+    if !got.is_empty() {
+        failures.push(format!(
+            "the span scan over (BASE+11 s, BASE+19 s]: expected nothing, got {got:?}"
+        ));
+    }
+
+    exec(&client, &format!("SYSTEM START MERGES {db}.trace_recent")).await;
+    exec(&client, &format!("OPTIMIZE TABLE {db}.trace_recent FINAL")).await;
+    let rows = scalar(&client, &key_rows).await;
+    if rows != 1 {
+        failures.push(format!(
+            "after the merge: {rows} rows for the key, expected 1"
+        ));
+    }
+    let got = generator_rows(&client, &found_sql).await;
+    if got != want_found {
+        failures.push(format!(
+            "after the merge, (BASE+15 s, BASE+30 s]: expected {want_found:?}, got {got:?}"
+        ));
+    }
+    let got: Vec<String> = generator_rows(&client, &gap_sql)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if got != vec![hex32(&trace_id(trace))] {
+        failures.push(format!(
+            "after the merge, (BASE+11 s, BASE+19 s]: expected the trace as a candidate, got \
+             {got:?}"
+        ));
+    }
+    let got = generator_rows(&client, &gap_scan).await;
+    if !got.is_empty() {
+        failures.push(format!(
+            "after the merge, the span scan over the gap: expected nothing, got {got:?}"
+        ));
+    }
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The twelve-trace layout of issue #560's queries, as offsets from a
+/// bucket-aligned `base`: `S = base - 600 s`, `E = base + 110 s`.
+///
+/// ```text
+///   trace  spans                          why
+///   1      S + 1 ns                       the first included nanosecond
+///   2      E                              the last included nanosecond
+///   3      base - 1 ns, base + 1 ns       a bucket edge: two stored rows
+///   4      S - 1 s                        wholly before the window
+///   5      E + 10 s                       bucket k's tail
+///   6      S + 2 s (error), S + 3 s       the error table
+///   7      S + 4 s                        not an error
+///   8      base + 50 s, base + 100 s      the intra-bucket gap shape
+///   9      base + 60 s, base + 200 s      newest span after E, same bucket
+///   10     base + 70 s                    a genuine trace inside the gap window
+///   11     S                              the excluded start nanosecond
+///   12     S - 1 ns                       one nanosecond before it
+/// ```
+fn twelve_traces(base: i64) -> Vec<RecentSpan> {
+    let s = base - 600 * NS_PER_S;
+    let e = base + 110 * NS_PER_S;
+    let spans: [(u32, i64, i8); 16] = [
+        (1, s + 1, 0),
+        (2, e, 0),
+        (3, base - 1, 0),
+        (3, base + 1, 0),
+        (4, s - NS_PER_S, 0),
+        (5, e + 10 * NS_PER_S, 0),
+        (6, s + 2 * NS_PER_S, 2),
+        (6, s + 3 * NS_PER_S, 0),
+        (7, s + 4 * NS_PER_S, 0),
+        (8, base + 50 * NS_PER_S, 0),
+        (8, base + 100 * NS_PER_S, 0),
+        (9, base + 60 * NS_PER_S, 0),
+        (9, base + 200 * NS_PER_S, 0),
+        (10, base + 70 * NS_PER_S, 0),
+        (11, s, 0),
+        (12, s - 1, 0),
+    ];
+    let mut out = Vec::new();
+    let mut last = 0u32;
+    let mut j = 0u32;
+    for (trace, ts_ns, status) in spans {
+        j = if trace == last { j + 1 } else { 0 };
+        last = trace;
+        out.push(RecentSpan {
+            trace,
+            span: j,
+            ts_ns,
+            status,
+        });
+    }
+    out
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize)]
+struct CountIdsRow {
+    v: u64,
+    ids: Vec<String>,
+}
+
+/// The size of a trace-id set statement, and the ids behind it.
+async fn count_ids(client: &ChClient, set_sql: &str) -> (u64, Vec<String>) {
+    let sql = format!(
+        "SELECT count() AS v, arraySort(groupArray(lower(hex(trace_id)))) AS ids FROM ({set_sql})"
+    );
+    let mut stream = client
+        .query_stream::<CountIdsRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("set query failed: {e}\nSQL:\n{sql}"));
+    let row = stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("no row for:\n{sql}"))
+        .expect("decode set row");
+    (row.v, row.ids)
+}
+
+/// Issue #560 criterion 10 (Q9 and Q11): the recency read selects exactly
+/// the span scan's candidates over a window whose ends lie in different
+/// buckets, and it is `ts_min` that makes it so; the error table selects
+/// exactly the span scan's error candidates; and no recency key spans two
+/// UTC days.
+#[tokio::test]
+async fn the_derived_tables_select_exactly_the_span_scans_candidates() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_recent_identity");
+    let client = fresh_db(db).await;
+    assert_tables_exist(
+        &client,
+        db,
+        &["trace_spans", "trace_recent", "trace_error_spans"],
+    )
+    .await;
+    let base = bucket_aligned_base_ns(3_600);
+    exec(&client, &recent_insert(db, &twelve_traces(base))).await;
+    let (_, recent, errs) = derived_counts(&client, db).await;
+    assert!(
+        recent > 0 && errs > 0,
+        "the fixture wrote nothing to the derived tables ({recent}, {errs})"
+    );
+
+    let s = base - 600 * NS_PER_S;
+    let e = base + 110 * NS_PER_S;
+    let width = pulsus_read::traces::window_sql::RECENT_BUCKET_NS;
+    let (b0, b1) = (s.div_euclid(width), e.div_euclid(width));
+    let dates =
+        pulsus_read::traces::window_sql::WindowSql::start_open_end_closed(s, e).date_clause();
+    let recent_where = format!("{dates} AND bucket >= {b0} AND bucket <= {b1} AND ts_max > {s}");
+    let t = format!(
+        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns > {s} AND timestamp_ns <= {e} \
+         GROUP BY trace_id"
+    );
+    let n = format!(
+        "SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} AND ts_min <= {e} \
+         GROUP BY trace_id"
+    );
+    let m =
+        format!("SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} GROUP BY trace_id");
+    let u = format!(
+        "SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} AND ts_max <= {e} \
+         GROUP BY trace_id"
+    );
+    let err_e = format!(
+        "SELECT trace_id FROM {db}.trace_error_spans WHERE {dates} AND timestamp_ns > {s} \
+         AND timestamp_ns <= {e} GROUP BY trace_id"
+    );
+    let err_t = format!(
+        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns > {s} AND timestamp_ns <= {e} \
+         AND status_code = 2 GROUP BY trace_id"
+    );
+    let except = |a: &str, b: &str| format!("SELECT * FROM ({a}) EXCEPT SELECT * FROM ({b})");
+    let straddle = format!(
+        "SELECT bucket, trace_id FROM {db}.trace_recent GROUP BY bucket, trace_id \
+         HAVING uniqExact(date) > 1"
+    );
+
+    let checks: [(&str, String, u64); 8] = [
+        ("Q9 lost", except(&t, &n), 0),
+        ("Q9 extra", except(&n, &t), 0),
+        ("Q9 extra_without_ts_min", except(&m, &t), 1),
+        ("Q9 lost_if_upper_bounded", except(&t, &u), 1),
+        ("Q9 genuine", t.clone(), 8),
+        ("Q11 extra", except(&err_e, &err_t), 0),
+        ("Q11 lost", except(&err_t, &err_e), 0),
+        ("keys spanning two days", straddle, 0),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (label, sql, want) in &checks {
+        let (got, ids) = if label.starts_with("keys") {
+            (
+                scalar(&client, &format!("SELECT count() AS v FROM ({sql})")).await,
+                Vec::new(),
+            )
+        } else {
+            count_ids(&client, sql).await
+        };
+        eprintln!("{label} = {got} {ids:?}");
+        if got != *want {
+            failures.push(format!("{label}: expected {want}, got {got} {ids:?}"));
+        }
+    }
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct ReadCostRow {
+    read_rows: u64,
+    selected_marks: u64,
+}
+
+/// Runs `sql` under a fresh `query_id` with the query-condition cache off,
+/// drains it, and reads its `read_rows` and `SelectedMarks` back from
+/// `system.query_log`, polling after `SYSTEM FLUSH LOGS` because the flush
+/// is not a barrier for the row appearing.
+async fn read_cost(client: &ChClient, sql: &str) -> ReadCostRow {
+    let query_id = format!("issue560-{}", uuid::Uuid::new_v4());
+    let settings = QuerySettings::new()
+        .set("query_id", &query_id)
+        .set("use_query_condition_cache", 0);
+    let mut stream = client
+        .query_stream::<IdRow>(sql, &settings)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+    while let Some(row) = stream.next().await {
+        row.expect("decode generator row");
+    }
+    drop(stream);
+    let log_sql = format!(
+        "SELECT read_rows, ProfileEvents['SelectedMarks'] AS selected_marks \
+         FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish' LIMIT 1"
+    );
+    for _ in 0..40 {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let mut log = client
+            .query_stream::<ReadCostRow>(&log_sql, &QuerySettings::new())
+            .await
+            .expect("query system.query_log");
+        if let Some(row) = log.next().await {
+            return row.expect("decode query_log row");
+        }
+        drop(log);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("no query_log row for query_id {query_id}");
+}
+
+/// Issue #560 criterion 11 (the issue's criterion 5): both derived-table
+/// reads touch strictly fewer rows and marks than the span scans they
+/// replace. 24,000 spans is three granules of `trace_spans` against one
+/// of each derived table, so both relations are strict on this corpus.
+#[tokio::test]
+async fn the_derived_table_reads_touch_fewer_rows_and_marks_than_the_span_scan() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_recent_cost");
+    let client = fresh_db(db).await;
+    assert_tables_exist(
+        &client,
+        db,
+        &["trace_spans", "trace_recent", "trace_error_spans"],
+    )
+    .await;
+    let base = bucket_aligned_base_ns(10_800);
+    // One insert, so each table holds one part: 2,000 traces × 12 spans,
+    // trace n at base + n s + j·10 ms; (12n + j) % 100 == 0 is an error.
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+             timestamp_ns, duration_ns, status_code, kind, payload_type, payload) \
+             SELECT toFixedString(unhex(leftPad(hex(intDiv(number, 12)), 32, '0')), 16), \
+                    toFixedString(unhex(leftPad(hex(number), 16, '0')), 8), \
+                    unhex('0000000000000000'), 'op', 'svc', \
+                    {base} + intDiv(number, 12) * {NS_PER_S} + (number % 12) * 10000000, \
+                    1000, if(number % 100 = 0, 2, 0), 2, 1, '' \
+             FROM numbers(24000)"
+        ),
+    )
+    .await;
+    let (_, recent, errs) = derived_counts(&client, db).await;
+    assert!(
+        recent > 0 && errs > 0,
+        "the fixture wrote nothing to the derived tables ({recent}, {errs})"
+    );
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = window(base - NS_PER_S, base + 2_001 * NS_PER_S);
+    let empty = plan_for(&engine, "{}", &p).generator_sqls[0].clone();
+    let errors = plan_for(&engine, "{ status = error }", &p).generator_sqls[0].clone();
+    let empty_scan = span_scan_sql(p.start_ns, p.end_ns, None);
+    let errors_scan = span_scan_sql(p.start_ns, p.end_ns, Some("status_code = 2"));
+
+    let mut failures: Vec<String> = Vec::new();
+    for (label, derived, scan) in [
+        ("{}", &empty, &empty_scan),
+        ("{ status = error }", &errors, &errors_scan),
+    ] {
+        let d = read_cost(&client, derived).await;
+        let s = read_cost(&client, scan).await;
+        eprintln!("{label}: derived {d:?}, span scan {s:?}");
+        if d.read_rows >= s.read_rows {
+            failures.push(format!(
+                "{label}: the derived read reads {} rows, the span scan {}",
+                d.read_rows, s.read_rows
+            ));
+        }
+        if d.selected_marks >= s.selected_marks {
+            failures.push(format!(
+                "{label}: the derived read selects {} marks, the span scan {}",
+                d.selected_marks, s.selected_marks
+            ));
+        }
+    }
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

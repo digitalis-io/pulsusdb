@@ -94,6 +94,14 @@ pub const TRACE_SPANS_CTX: SourceRef = SourceRef("trace_spans:trace_ctx");
 /// The direct-child-count co-load (issue #184), same table, same
 /// trace-wide reach.
 pub const TRACE_SPANS_CHILD_COUNT: SourceRef = SourceRef("trace_spans:child_count");
+/// `trace_recent`, one row per (five-minute bucket, trace), written by a
+/// view over the span table: the time-range generator's source (issue
+/// #560).
+pub const TRACE_RECENT: SourceRef = SourceRef("trace_recent");
+/// `trace_error_spans`, one row per span with `status_code = 2`, written
+/// by a view over the span table: the `{ status = error }` generator's
+/// source (issue #560).
+pub const TRACE_ERROR_SPANS: SourceRef = SourceRef("trace_error_spans");
 
 /// The name every slot link records on the hydration statement's
 /// projection (issue #557 for the conditions, #558 for the projected
@@ -442,7 +450,26 @@ pub fn selector_fidelity(expr: &SpansetExpr) -> Fidelity {
 /// CANDIDATE set move under a byte-identical replay, which
 /// `duplicate_index_rows_do_not_move_a_pushed_min_max_or_count` exists
 /// to prevent. Considered and not taken.
-pub fn aggregate_having_sql(stage: &PipelineStage, group_key: Option<&str>) -> Option<String> {
+///
+/// # The source is an allowlist (issue #560)
+///
+/// `source` is the generator's source, and only the two tables whose
+/// columns this fragment names are accepted. `trace_recent` has neither
+/// `span_id` nor `duration_ns`, so a fragment pushed there is `Code: 47
+/// UNKNOWN_IDENTIFIER` (measured). `trace_error_spans` has both and a push
+/// there would be sound, but nothing reaches it today (`rel.exact` is
+/// false for `{}` and `{ status = error }`), and a refusal is always
+/// correct where soundness would need re-deriving on the next widening of
+/// the exact leaf families. An allowlist and not a carve-out: a source
+/// added later defaults to refusal.
+pub fn aggregate_having_sql(
+    stage: &PipelineStage,
+    group_key: Option<&str>,
+    source: SourceRef,
+) -> Option<String> {
+    if source != TRACE_SPANS && source != TRACE_ATTRS_IDX {
+        return None;
+    }
     let PipelineStage::Aggregate {
         op,
         field,
@@ -1126,7 +1153,7 @@ impl Lower<Tql> for AggregateLower {
         let TqlLink::Pipe(stage) = s else {
             return Capability::No(BlockReason::NotYetLowered);
         };
-        if aggregate_having_sql(stage, grouped_key(rel)).is_none() {
+        if aggregate_having_sql(stage, grouped_key(rel), rel.source_ref()).is_none() {
             return Capability::No(BlockReason::NotYetLowered);
         }
         Capability::Yes
@@ -1141,7 +1168,7 @@ impl Lower<Tql> for AggregateLower {
         _cx: &LowerCx<'_, Tql>,
     ) -> Result<Relation<Tql>, PlanError> {
         if let TqlLink::Pipe(stage) = s
-            && let Some(frag) = aggregate_having_sql(stage, grouped_key(&rel))
+            && let Some(frag) = aggregate_having_sql(stage, grouped_key(&rel), rel.source_ref())
         {
             rel.having.push(frag);
         }
@@ -1499,6 +1526,8 @@ pub fn generator_source(table: GenTable) -> SourceRef {
     match table {
         GenTable::Spans => TRACE_SPANS,
         GenTable::Attrs => TRACE_ATTRS_IDX,
+        GenTable::Recent => TRACE_RECENT,
+        GenTable::ErrorSpans => TRACE_ERROR_SPANS,
     }
 }
 
@@ -2299,6 +2328,8 @@ mod tests {
                     spans_table: "trace_spans",
                     attrs_table: "trace_attrs_idx",
                 },
+                recent_table: "trace_recent",
+                errors_table: "trace_error_spans",
                 max_candidates: 100_000,
                 max_series: 1_000,
                 distributed: false,
@@ -2403,6 +2434,8 @@ mod tests {
                             spans_table: "trace_spans",
                             attrs_table: "trace_attrs_idx",
                         },
+                        recent_table: "trace_recent",
+                        errors_table: "trace_error_spans",
                         max_candidates: 100_000,
                         max_series: 1_000,
                         distributed: false,
@@ -2567,6 +2600,8 @@ mod tests {
                     spans_table: "trace_spans",
                     attrs_table: "trace_attrs_idx",
                 },
+                recent_table: "trace_recent",
+                errors_table: "trace_error_spans",
                 max_candidates: 100_000,
                 max_series: 1_000,
                 distributed: false,
@@ -2585,7 +2620,7 @@ mod tests {
                 .pipeline
                 .iter()
                 .filter(|s| matches!(s, PipelineStage::Aggregate { .. }))
-                .all(|s| aggregate_having_sql(s, None).is_some());
+                .all(|s| aggregate_having_sql(s, None, TRACE_SPANS).is_some());
             if !renders {
                 return Verdict::RefusedByRenderer;
             }
@@ -3289,7 +3324,7 @@ mod tests {
                     .iter()
                     .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
                     .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
-                let frag = aggregate_having_sql(stage, None);
+                let frag = aggregate_having_sql(stage, None, TRACE_SPANS);
                 if frag.is_some() != wants_push {
                     wrong.push(format!(
                         "{q}: expected {}, got {frag:?}",
@@ -3332,6 +3367,41 @@ mod tests {
             "{} of {} cases disagree with the boundary:\n{}",
             wrong.len(),
             rows.len() * (monotone.len() + anti_monotone.len()),
+            wrong.join("\n")
+        );
+    }
+
+    /// Issue #560: the fragment is an allowlist over the generator's
+    /// source. `trace_recent` has neither `span_id` nor `duration_ns`, so a
+    /// fragment pushed there is `Code: 47 UNKNOWN_IDENTIFIER`;
+    /// `trace_error_spans` has both, but nothing reaches it today and a
+    /// refusal is always correct.
+    #[test]
+    fn the_having_fragment_is_refused_on_every_source_but_the_two_it_names_columns_of() {
+        let q = r#"{ span.http.method = "GET" } | count() > 2"#;
+        let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let stage = query
+            .pipeline
+            .iter()
+            .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
+            .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
+        let pushes = Some("uniqExact(span_id) > 2".to_string());
+        let mut wrong: Vec<String> = Vec::new();
+        for (source, expected) in [
+            (TRACE_SPANS, pushes.clone()),
+            (TRACE_ATTRS_IDX, pushes.clone()),
+            (TRACE_RECENT, None),
+            (TRACE_ERROR_SPANS, None),
+        ] {
+            let got = aggregate_having_sql(stage, None, source);
+            if got != expected {
+                wrong.push(format!("{source:?}: expected {expected:?}, got {got:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of 4 sources wrong:\n{}",
+            wrong.len(),
             wrong.join("\n")
         );
     }

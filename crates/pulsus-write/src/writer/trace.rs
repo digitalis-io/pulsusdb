@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pulsus_clickhouse::ChClient;
+use pulsus_clickhouse::{ChClient, QuerySettings};
 use pulsus_config::WriterConfig;
 use tokio::sync::{Notify, oneshot};
 use tracing::warn;
@@ -45,6 +45,14 @@ use crate::writer::table::{self, BlockInserter, ChBlockInserter, ShutdownSignal,
 
 const SPANS_TABLE: &str = "trace_spans";
 const ATTRS_TABLE: &str = "trace_attrs_idx";
+
+/// The settings every insert into `trace_spans`/`trace_spans_dist` carries
+/// (issue #560): a repeated identical span block is dropped by the derived
+/// trace tables whatever the server profile says. A span row carries its
+/// own `span_id`, so two byte-identical span blocks are the same spans.
+pub(crate) fn span_insert_settings() -> QuerySettings {
+    QuerySettings::deduplicate_through_views()
+}
 
 /// The two target table names a [`TraceWriter`] inserts into (docs/
 /// schemas.md §4.1/§7, mirroring [`crate::writer::WriterTables`]'s issue
@@ -109,8 +117,14 @@ impl TraceWriter {
         cfg: &WriterConfig,
         tables: TraceWriterTables,
     ) -> Self {
-        let inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
-        Self::with_inserters_with_tables(inserter.clone(), inserter, cfg, tables)
+        // Issue #560: only the span table's inserts carry the deduplication
+        // pins; the attribute index keeps the default settings.
+        let spans_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::with_settings(
+            client.clone(),
+            span_insert_settings(),
+        ));
+        let attrs_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
+        Self::with_inserters_with_tables(spans_inserter, attrs_inserter, cfg, tables)
     }
 
     /// Test/mock constructor: any [`BlockInserter`] pair — e.g. a
@@ -381,5 +395,29 @@ impl TraceSink for TraceWriter {
                 .await
                 .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #560: the span inserter's settings pin both block
+    /// deduplication settings on, so criterion 4 does not depend on the
+    /// server profile.
+    #[test]
+    fn the_span_inserts_pin_block_deduplication_on() {
+        let s = span_insert_settings();
+        let mut mismatches: Vec<(&str, Option<&str>, Option<&str>)> = Vec::new();
+        for (key, want) in [
+            ("deduplicate_insert", "enable"),
+            ("deduplicate_blocks_in_dependent_materialized_views", "1"),
+        ] {
+            let got = s.get(key);
+            if got != Some(want) {
+                mismatches.push((key, Some(want), got));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches: {mismatches:?}");
     }
 }
