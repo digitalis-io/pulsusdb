@@ -2815,9 +2815,13 @@ fn replay_block(base_ns: i64) -> Vec<RecentSpan> {
     rows
 }
 
+/// One generator statement's `(trace_id, bound_ts)` rows, in statement
+/// order.
+type GeneratorRows = Vec<(String, i64)>;
+
 /// `(trace_id, bound_ts)` for every row one generator statement returns,
 /// in statement order.
-async fn generator_rows(client: &ChClient, sql: &str) -> Vec<(String, i64)> {
+async fn generator_rows(client: &ChClient, sql: &str) -> GeneratorRows {
     let mut stream = client
         .query_stream::<IdRow>(sql, &QuerySettings::new())
         .await
@@ -2904,7 +2908,7 @@ async fn a_replayed_block_is_recognised_by_both_derived_tables() {
     let errors = plan_for(&engine, "{ status = error }", &p).generator_sqls[0].clone();
 
     let mut failures: Vec<String> = Vec::new();
-    let mut lists: Vec<(Vec<(String, i64)>, Vec<(String, i64)>)> = Vec::new();
+    let mut lists: Vec<(GeneratorRows, GeneratorRows)> = Vec::new();
     for send in 1..=2 {
         exec(&client, &insert).await;
         let (spans, recent, errs) = derived_counts(&client, db).await;

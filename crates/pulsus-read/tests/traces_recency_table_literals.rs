@@ -115,8 +115,7 @@ fn the_error_view_filters_on_the_code_the_reader_renders_for_error() {
         panic!("trace_error_spans_mv in {CATALOG} carries no `WHERE status_code = <n>`:\n{def}")
     });
     assert_eq!(
-        n,
-        i64::from(m),
+        n, m,
         "trace_error_spans_mv in {CATALOG} keeps spans with status_code = {n}; the reader \
          renders status_code != {m} for `{{ status != error }}`"
     );
