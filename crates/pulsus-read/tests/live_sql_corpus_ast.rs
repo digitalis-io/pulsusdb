@@ -205,8 +205,15 @@ const CONTROL: &str = "with_binding_control.txt";
 /// `arrayFirstIndex(…) AS <alias>` — a scalar/array alias, which the
 /// parser reports as ZERO `WithElement` binding nodes. Section 2 below
 /// measures that rather than assuming it.
-const SQL_FILES: usize = 127;
-const SQL_STATEMENTS: usize = 385;
+///
+/// **Issue #560 moves `SQL_FILES` 127 -> 130 and `SQL_STATEMENTS`
+/// 385 -> 394: THREE `traces_search` goldens added (`empty_selector`,
+/// `status_neq_error`, `status_eq_ok`), each of three sections — one
+/// phase-1 generator, the hydration read and the root read — which is the
+/// whole of the `+9`.** The ten goldens that change move their generator
+/// section's text only; none gains or loses a section.
+const SQL_FILES: usize = 130;
+const SQL_STATEMENTS: usize = 394;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;
