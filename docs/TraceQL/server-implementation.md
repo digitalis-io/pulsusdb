@@ -355,6 +355,13 @@ should land near 70 B/span, and if it lands near 200 the model is wrong.
 
 ## 8. Order of work
 
+`docs/TraceQL/implementation-plan.md` breaks this into independently mergeable
+tasks, with the dependency graph, what still reads the old tables at each
+point, and the test cases each task is judged by. The seven steps below are the
+sequence it expands; where the two differ in detail, the implementation plan is
+the one a coder works from, because it is the one that says how the tree keeps
+working in between.
+
 The coder writes the test cases of `functional-requirements.md` §8 first, runs
 them red against the unchanged tree, and then:
 

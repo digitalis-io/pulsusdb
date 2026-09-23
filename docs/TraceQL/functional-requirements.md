@@ -1,13 +1,14 @@
 # TraceQL storage and query: functional requirements
 
 This document says what the trace store must do, in numbers a review can check.
-It is the first of the 7 documents under `docs/TraceQL/`:
+It is the first of the 8 documents under `docs/TraceQL/`:
 
 | document | subject |
 |---|---|
 | `docs/TraceQL/functional-requirements.md` | the requirements, the data, the queries, the benchmark, the test cases |
 | `docs/TraceQL/sql-schema.md` | the tables, the SQL each query compiles to, the measurements |
 | `docs/TraceQL/server-implementation.md` | the write path, the compiler, what is kept, replaced, deleted |
+| `docs/TraceQL/implementation-plan.md` | the work broken into 19 independently mergeable tasks, with the order, the dependencies and the test cases each one is judged by |
 | `docs/TraceQL/query-catalogue.md` | **every query in the repository's TraceQL corpus**: 138 the API serves, each with the statement the route issues, the membership statement and its literal answer, and 50 it refuses — 47 at parse or validation, 3 at plan time — each with its status and reason |
 | `docs/TraceQL/query-catalogue-accepted.md` | generated: the served queries, one row each |
 | `docs/TraceQL/query-catalogue-refused.md` | generated: the refusals, one row each |
