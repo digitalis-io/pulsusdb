@@ -1,0 +1,92 @@
+# Every counted claim the tracked TraceQL documents make that the
+# tree can answer, with the pattern that finds it and the derivation that
+# answers it. measure/claims_check.py runs them: EVERY match of a pattern is
+# compared, a pattern that finds nothing is a failure, and the totals it prints
+# are the rows it ran.
+#
+# What this file is: the judgement about which numbers are set counts. No
+# program makes that judgement, so a counted claim nobody has put here is
+# unchecked — and this file, not a sentence in a document, is what a reader
+# reads to find out what is checked.
+#
+# A pattern is applied to the document with its line breaks turned into spaces,
+# so a sentence that wrapped is still one sentence. Its one capture group is the
+# number.
+#
+# id	derivation	document	pattern
+corpus_accepted_table	corpus_parsed	functional-requirements.md	\| the parser and the validator accept \| (\d+) \|
+corpus_accepted_si	corpus_parsed	server-implementation.md	of the (\d+) queries the parser and the
+planner_refused_table	corpus_planner_refused	functional-requirements.md	\| of those, the API refuses at plan time \(`400`\) \| \*\*(\d+)\*\* \|
+planner_refused_si	corpus_planner_refused	server-implementation.md	refuses \*\*(\d+)\*\* at plan time
+planner_refused_index	corpus_planner_refused	functional-requirements.md	at parse or validation, (\d+) at plan time
+served_table	corpus_served	functional-requirements.md	\| the API serves \| \*\*(\d+)\*\* \|
+served_si	corpus_served	server-implementation.md	the API serves \*\*(\d+)\*\*
+served_index	corpus_served	functional-requirements.md	TraceQL corpus\*\*: (\d+) the API serves
+served_tc8	corpus_served	functional-requirements.md	\*\*(\d+) of 138 and \d+ of \d+\*\*
+api_agree_table	corpus_api_agree	functional-requirements.md	\| whose route statement's answer equals the independent check \| \*\*(\d+)\*\* \|
+membership_agree_table	corpus_membership_agree	functional-requirements.md	\| whose membership answer equals the independent check \| \*\*(\d+)\*\* \|
+parser_refused_table	corpus_parser_refused	functional-requirements.md	\| the parser or the validator refuses \(`400`\) \| (\d+) \|
+parser_refused_index	corpus_parser_refused	functional-requirements.md	it refuses — (\d+) at parse or validation
+parser_refused_tc9	corpus_parser_refused	functional-requirements.md	every query the API refuses: the (\d+) of `reject/`
+refused_total_index	corpus_refused_total	functional-requirements.md	literal answer, and (\d+) it refuses
+refused_total_tc9	corpus_refused_total	functional-requirements.md	envelope for all (\d+), with the message
+corpus_all_preamble	corpus_all	functional-requirements.md	all (\d+) queries of
+design_si_first	design_queries	server-implementation.md	so \*\*(\d+) rules in this table have no corpus query
+design_si_second	design_queries	server-implementation.md	those (\d+) queries are `measure/catalogue-extra\.tsv`
+design_si_third	design_queries	server-implementation.md	\*\*\d+ of the (\d+) are the row below
+design_tc8_named	design_queries	functional-requirements.md	\*\*and the (\d+) of `measure/catalogue-extra\.tsv`\*\*
+design_tc8_agree	design_queries	functional-requirements.md	\*\*138 of 138 and (\d+) of \d+\*\*
+design_tc8_agree2	design_queries	functional-requirements.md	\*\*138 of 138 and \d+ of (\d+)\*\*
+cases_total_preamble	cases_total	functional-requirements.md	\*\*(\d+) cases\*\*:
+cases_guard_kinds	cases_guard	functional-requirements.md	\*\*guard\*\* \((\d+) cases\)
+cases_guard_list	cases_guard	functional-requirements.md	The (\d+) guards are
+cases_new_kinds	cases_new	functional-requirements.md	\*\*new\*\* \((\d+) cases\)
+cases_schema	cases_schema_and_storage	functional-requirements.md	\*\*\d+ cases\*\*: (\d+) schema and storage
+cases_retention	cases_retention	functional-requirements.md	schema and storage plus (\d+) retention
+cases_window	cases_window	functional-requirements.md	\(§8\.1\), (\d+) window
+cases_statement_count	cases_statement_count_and_pushdown	functional-requirements.md	\(§8\.2\), (\d+) statement-count and pushdown
+cases_constructs	cases_compiler_constructs	functional-requirements.md	plus (\d+) compiler constructs
+cases_tag	cases_tag	functional-requirements.md	\(§8\.3\), (\d+) tag
+cases_write	cases_write_path	functional-requirements.md	\(§8\.4\), (\d+) write path
+cases_protection	cases_protection	functional-requirements.md	\(§8\.5\), (\d+) protection
+cases_corpus_scale	cases_corpus_scale	functional-requirements.md	and (\d+) corpus-scale
+layouts_measured	layout_alternatives	sql-schema.md	All ([a-z]+|\d+) alternatives are built by
+statements_total	sql_statements	functional-requirements.md	\d+ of the (\d+) statements name a route
+statements_with_route	sql_statements_with_route	functional-requirements.md	(\d+) of the \d+ statements name a route
+traceql_src_files	traceql_src_files	server-implementation.md	`crates/pulsus-traceql/src/` \((\d+) files\)
+traces_api_files	traces_api_files	server-implementation.md	`crates/pulsus-server/src/traces_api/` \((\d+) files\)
+read_traces_files	read_traces_files	server-implementation.md	`crates/pulsus-read/src/traces/` \((\d+) files\)
+traceql_tests_files	traceql_tests_files	server-implementation.md	`crates/pulsus-traceql/tests/` \((\d+) files\)
+trace_migrations	trace_migrations	server-implementation.md	(\d+) trace migrations
+catalogue_sql_per_query	catalogue_sql_per_query	sql-schema.md	and the ([a-z]+) files per served query
+tag_names_rows	tag_names_rows	functional-requirements.md	the tag-name catalog \((\d+) rows\)
+counted_shapes_rows	counted_shapes_rows	measure/README.md	`measure/counted-shapes\.tsv` says what the other \*\*(\d+)\*\*
+claims_rows	claims_rows	measure/README.md	`measure/claims\.tsv` names \*\*(\d+) claims\*\*
+trace_mvs	trace_mvs	server-implementation.md	(\d+) trace materialized views
+marker_entries	marker_entries_added	measure/README.md	which gains \*\*(\d+) marker entries\*\*
+resource_rows_si	resource_rows	server-implementation.md	On g1: (\d+) resource rows
+tag_names_rows_si	tag_names_rows	server-implementation.md	resource rows, (\d+) name rows
+tag_values_rows_si	tag_values_rows	server-implementation.md	name rows, ([\d,]+) value rows
+corpus_spans_si	corpus_spans	server-implementation.md	value rows, against ([\d,]+) spans
+bytes_per_span_si	store_bytes_per_span	server-implementation.md	\| bytes on disk per span \| 754\.44 \| ([\d.]+) \|
+resource_rows_r1	resource_rows	functional-requirements.md	Measured: (\d+) resource rows
+resource_rows_inline	resource_rows	functional-requirements.md	On g1 the (\d+) distinct resources
+resource_rows_verified	resource_rows	functional-requirements.md	Verified: 0 of (\d+) resource rows
+resource_rows_params	resource_rows	functional-requirements.md	\| services \| 24, 4 pods each \| (\d+) distinct resources \|
+tag_values_rows_fr	tag_values_rows	functional-requirements.md	tag-value catalog \(([\d,]+) rows,
+store_bytes_fr	store_total_bytes	functional-requirements.md	\| this design, five tables \| ([\d,]+) \|
+per_span_fr	store_bytes_per_span	functional-requirements.md	five tables \| [\d,]+ \| \*\*([\d.]+)\*\*
+rows_per_span_fr	store_rows_per_span	functional-requirements.md	five tables \| [\d,]+ \| \*\*[\d.]+\*\* \| ([\d.]+) \|
+per_span_r2	store_bytes_per_span	functional-requirements.md	measured \*\*([\d.]+) B/span\*\*
+overhead_r2	store_index_overhead_pct	functional-requirements.md	index overhead \*\*([\d.]+)%\*\*
+per_span_ts3	store_bytes_per_span	functional-requirements.md	\(measured ([\d.]+) and [\d.]+%\)
+overhead_ts3	store_index_overhead_pct	functional-requirements.md	\(measured [\d.]+ and ([\d.]+)%\)
+store_bytes_sql	store_total_bytes	sql-schema.md	\| \*\*total\*\* \| 2,374,663 \| \*\*([\d,]+)\*\*
+per_span_sql	store_bytes_per_span	sql-schema.md	\| \*\*total\*\* \| 2,374,663 \| \*\*[\d,]+\*\* \| \*\*([\d.]+)\*\* \|
+total_rows_sql	store_total_rows	sql-schema.md	\| \*\*total\*\* \| ([\d,]+) \|
+per_span_model	store_bytes_per_span	sql-schema.md	5\.6·`V`/spans \| \*\*([\d.]+)\*\* \|
+overhead_sql	store_index_overhead_pct	sql-schema.md	Non-span tables are \*\*([\d.]+)%\*\*
+catalogue_sql_qc	catalogue_sql_per_query	query-catalogue.md	— ([a-z]+) statements per served query
+traceql_tests_files_readme	traceql_tests_files	measure/README.md	has (\d+) files and has never had 379
+json_dynamic_paths	json_max_dynamic_paths	server-implementation.md	`max_dynamic_paths` \((\d[\d,]*) per part\)
+doc_count	doc_count	functional-requirements.md	the first of the (\d+) documents under

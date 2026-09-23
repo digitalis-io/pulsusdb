@@ -1,0 +1,1 @@
+SELECT arrayJoin(distinctJSONPaths(attrs)) AS path FROM tqd_g1.spans WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000 AND intDiv(start_ns, 300000000000) BETWEEN 5966949 AND 5966985 ORDER BY path

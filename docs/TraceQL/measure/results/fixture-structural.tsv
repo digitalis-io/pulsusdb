@@ -1,0 +1,16 @@
+form	spans
+{A} > {B}    child	…0005
+{A} !> {B}   not child	…0006
+{A} &> {B}   child union	…0004, …0005
+{A} < {B}    parent	(none)
+{A} !< {B}   not parent	…0005, …0006
+{A} &< {B}   parent union	(none)
+{A} ~ {B}    sibling	(none)
+{A} !~ {B}   not sibling	…0005, …0006
+{A} &~ {B}   sibling union	(none)
+{A} >> {B}   descendant	…0005, …0006
+{A} !>> {B}  not descendant	(none)
+{A} &>> {B}  descendant union	…0003, …0004, …0005, …0006
+{A} << {B}   ancestor	(none)
+{A} !<< {B}  not ancestor	…0005, …0006
+{A} &<< {B}  ancestor union	(none)

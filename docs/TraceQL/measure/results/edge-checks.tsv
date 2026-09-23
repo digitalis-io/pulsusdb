@@ -1,0 +1,29 @@
+check	expected	got	verdict
+st01_child_plain	ee06:03	ee06:03	PASS
+st03_child_union	ee06:02,03	ee06:02,03	PASS
+st04_parent_plain	ee06:03	ee06:03	PASS
+st06_parent_union	ee06:03,04	ee06:03,04	PASS
+st07_sibling_plain	ee06:07	ee06:07	PASS
+st09_sibling_union	ee06:06,07	ee06:06,07	PASS
+st02_child_neg	ee03:41 ee04:42 ee06:07 ee07:01	ee03:41 ee04:42 ee06:07 ee07:01	PASS
+st05_parent_neg	ee03:41 ee04:42 ee06:07 ee07:01	ee03:41 ee04:42 ee06:07 ee07:01	PASS
+st08_sibling_neg	ee03:41 ee04:42 ee05:02 ee06:03 ee07:01	ee03:41 ee04:42 ee05:02 ee06:03 ee07:01	PASS
+st10_descendant_plain	ee03:41 ee05:02 ee06:03	ee03:41 ee05:02 ee06:03	PASS
+st10_overflow	2	2	PASS
+st11_descendant_neg	ee04:42 ee06:07 ee07:01	ee04:42 ee06:07 ee07:01	PASS
+st12_descendant_union	ee03:01,41 ee05:01,02 ee06:02,03	ee03:01,41 ee05:01,02 ee06:02,03	PASS
+st13_ancestor_plain	ee05:02 ee06:03	ee05:02 ee06:03	PASS
+st13_overflow	1	1	PASS
+st14_ancestor_neg	ee03:41 ee04:42 ee06:07 ee07:01	ee03:41 ee04:42 ee06:07 ee07:01	PASS
+st15_ancestor_union	ee05:01,02 ee06:03,04	ee05:01,02 ee06:03,04	PASS
+nested_ee01_detail	01:1-8/-1 02:2-5/1 04:3-4/2 03:6-7/1 05:9-10/-1	01:1-8/-1 02:2-5/1 04:3-4/2 03:6-7/1 05:9-10/-1	PASS
+nested_ee01_totals	5 2 1 10 5 2 0	5 2 1 10 5 2 0	PASS
+nested_ee02_detail	04:1-4/-1 05:2-3/1 01:5-10/-1 02:6-9/5 03:7-8/6	04:1-4/-1 05:2-3/1 01:5-10/-1 02:6-9/5 03:7-8/6	PASS
+nested_ee02_totals	5 2 1 10 5 2 0	5 2 1 10 5 2 0	PASS
+compare_shared_resource	1/2	1/2	PASS
+compare_status_message	1/0	1/0	PASS
+compare_event_name	1/0	1/0	PASS
+compare_link_span	1/0	1/0	PASS
+compare_kind_keyword	6/2	6/2	PASS
+deep_no_match	0	0	PASS
+deep_overflow	1	1	PASS

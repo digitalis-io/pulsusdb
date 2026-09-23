@@ -1,0 +1,16 @@
+5500145d79d9a1b2a732a0ced1fe51745639ba27
+
+The revision of THIS repository that `docs/TraceQL/` describes as "today": the
+tables that ship, the migrations that manage them, the directories the design
+keeps and replaces, and the corpus loaded through the server for the
+today-versus-this-design figures.
+
+`measure/claims_check.py` reads every source-tree count at this revision with
+`git show` and `git ls-tree`, never from the working copy. A working copy is a
+place, not a fact: review round 10 counted the trace migrations in a checkout
+two commits behind the default branch, got 32 where this design says 36, and
+reported the design wrong. Reading a named revision makes the two readings the
+same number in any clone that has fetched it, and makes a clone that has not
+fetched it fail loudly instead of quietly answering something else.
+
+The check refuses to run when this revision is not in the clone.

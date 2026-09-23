@@ -1,0 +1,1 @@
+{"spans": 2000064, "traces": 70413, "bodies": 4073, "dup_bodies": 40, "dup_spans": 19669, "error_spans": 13436, "events": 70716, "links": 1963, "max_spans_per_trace": 1000, "attr_values": 10895299, "window_start_ns": 1790084801000000000, "window_end_ns": 1790095601000000000}

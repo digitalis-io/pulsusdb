@@ -1,0 +1,81 @@
+# One line per statement in measure/sql/: the literal API request that must
+# produce it, and how many statements that request may issue.
+#
+#   $S, $E   the window, in unix SECONDS (the corpus window of run_all.sh)
+#   $T20     50fb0cd99260ac2a15d0a6f208126742   (a 20-span trace)
+#   $T1000   9e0ae95131b5bedbeea2c9eb5234f1ec   (a 1,000-span trace)
+#
+# `statements` is what T-Q1 asserts by counting rows in system.query_log for the
+# request's query_id prefix. Three requests are allowed more than one, and
+# server-implementation.md 3.5 gives the reason for each.
+# `route today` says what the shipped API answers for the request, so a test can
+# tell "must keep working" from "must keep refusing".
+statement	method	path	query	statements	route today
+b01_trace_by_id_20	GET	/api/v2/traces/$T20		1	200
+b02_trace_by_id_1000	GET	/api/v2/traces/$T1000		1	200
+c01_arithmetic	GET	/api/traces/v1/search	q={ span.http.request.body.size + span.app.items.count > 4000 }&start=$S&end=$E&limit=20	1	200
+c02_field_vs_field	GET	/api/traces/v1/search	q={ span.http.request.body.size > span.app.items.count }&start=$S&end=$E&limit=20	1	200
+c03_aggregate_value	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } | avg(duration) > 100ms&start=$S&end=$E&limit=20	1	200
+c04_intrinsic_vs_attr	GET	/api/traces/v1/search	q={ duration > span.app.items.count * 1000000 }&start=$S&end=$E&limit=20	1	200
+c05_by_attribute	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" } | by(span.rpc.method)&start=$S&end=$E&limit=20	1	200
+c06_child_count	GET	/api/traces/v1/search	q={ span:childCount > 3 }&start=$S&end=$E&limit=20	1	200
+c07_nested_set	-	-	no route of its own: the numbering behind nestedSetLeft/Right/Parent, reached through c14/c15 and through { nestedSetParent < 0 }	-	-
+c08_compare	GET	/api/metrics/query_range	q={ resource.service.name = "payment" } | compare({ status = error })&start=$S&end=$E&step=3600s	1	200
+c09_exemplars	GET	/api/metrics/query_range	q={ } | rate() by(resource.service.name)&start=$S&end=$E&step=60s&exemplars=100	1	200
+c10_topk	GET	/api/metrics/query_range	q={ } | rate() by(resource.service.name) | topk(3)&start=$S&end=$E&step=60s	1	200
+c11_tag_names_catalog	GET	/api/v2/search/tags		1	200
+c12_tag_values_catalog	GET	/api/v2/search/tag/span.http.route/values		1	200
+c13_name_values	GET	/api/v2/search/tag/span:name/values	start=$S&end=$E	1	200
+c14_nested_set_numbering	-	-	the numbering of one trace, which the query path does not run: it is how the rule is checked (sql-schema.md 5.9)	-	-
+c15_nested_set_small	-	-	the same, on a 20-span trace	-	-
+c20_roots	GET	/api/traces/v1/search	q={ nestedSetParent < 0 }&start=$S&end=$E&limit=20	1	200
+c21_hydrate_candidates	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" && nestedSetLeft > 5 }&start=$S&end=$E&limit=20	2	200
+c16_truthiness	GET	/api/traces/v1/search	q={ span.app.cache.hit }&start=$S&end=$E&limit=20	1	200
+c17_presence	GET	/api/traces/v1/search	q={ span.app.tags != nil }&start=$S&end=$E&limit=20	1	200
+c18_absence	GET	/api/traces/v1/search	q={ span.app.tags = nil }&start=$S&end=$E&limit=20	1	200
+c19_mid_pipeline_filter	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" } | count() > 5 | { status = error }&start=$S&end=$E&limit=20	1	200
+g01_service_graph	GET	/api/traces/v1/service_graph	start=$S&end=$E	1	200
+m01_rate_by_service	GET	/api/metrics/query_range	q={ } | rate() by(resource.service.name)&start=$S&end=$E&step=60s	1	200
+m01b_rate_by_service_final	-	-	the m01 statement with final = 1, for the cost of deduplication; not a separate request	-	-
+m01c_rate_by_service_uniq	-	-	the m01 statement deduplicating with uniqExact, for the same comparison; not a separate request	-	-
+m02_quantiles_by_route	GET	/api/metrics/query_range	q={ } | quantile_over_time(duration, .5, .9, .99) by(span.http.route)&start=$S&end=$E&step=60s	1	400
+m03_errors_by_service	GET	/api/metrics/query_range	q={ status = error } | count_over_time() by(resource.service.name)&start=$S&end=$E&step=60s	1	200
+m04_histogram	GET	/api/metrics/query_range	q={ } | histogram_over_time(duration)&start=$S&end=$E&step=60s	1	200
+m05_instant_avg_by_name	GET	/api/metrics/query	q={ } | avg_over_time(duration) by(span:name)&start=$S&end=$E	1	400
+m06_rate_by_resource_attr	GET	/api/metrics/query_range	q={ } | rate() by(resource.k8s.pod.name)&start=$S&end=$E&step=60s	1	400
+s01_empty	GET	/api/traces/v1/search	q={}&start=$S&end=$E&limit=20	1	200
+s02_service	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" }&start=$S&end=$E&limit=20	1	200
+s03_service_error	GET	/api/traces/v1/search	q={ resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+s04_status_code_ge_500	GET	/api/traces/v1/search	q={ span.http.response.status_code >= 500 }&start=$S&end=$E&limit=20	1	200
+s05_duration_kind	GET	/api/traces/v1/search	q={ duration > 2s && kind = server }&start=$S&end=$E&limit=20	1	200
+s06_db_and_name	GET	/api/traces/v1/search	q={ span.db.system.name = "postgresql" && name = "SELECT shop" }&start=$S&end=$E&limit=20	1	200
+s07_route_regex	GET	/api/traces/v1/search	q={ span.http.route =~ "/api/auth/.*" }&start=$S&end=$E&limit=20	1	200
+s08_user_point	GET	/api/traces/v1/search	q={ span.app.user.id = "u-10013" }&start=$S&end=$E&limit=20	1	200
+s09_descendant	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+s10_child	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+s11_event_attr	GET	/api/traces/v1/search	q={ event.exception.type = "java.lang.IllegalStateException" }&start=$S&end=$E&limit=20	1	200
+s12_select	GET	/api/traces/v1/search	q={ status = error } | select(span.http.route, resource.service.name)&start=$S&end=$E&limit=20	1	200
+s13_count_gt	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" } | count() > 5&start=$S&end=$E&limit=20	1	200
+s14_trace_level	GET	/api/traces/v1/search	q={ trace:rootService = "loadgen" && trace:duration > 2s }&start=$S&end=$E&limit=20	1	200
+s15_unscoped_and_resource	GET	/api/traces/v1/search	q={ .app.cache.hit && resource.k8s.pod.name = "cart-7d9f8b-00002" }&start=$S&end=$E&limit=20	1	200
+st01_child_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st02_child_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st03_child_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st04_parent_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } < { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st05_parent_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st06_parent_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st07_sibling_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } ~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st08_sibling_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st09_sibling_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st10_descendant_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st11_descendant_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st12_descendant_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st13_ancestor_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } << { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st14_ancestor_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st15_ancestor_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+t01_tag_names_span	GET	/api/v2/search/tags	scope=span	1	200
+t02_tag_values_route	GET	/api/v2/search/tag/span.http.route/values		1	200
+t03_tag_values_filtered	GET	/api/v2/search/tag/span.http.route/values	q={ resource.service.name = "checkout" }&start=$S&end=$E	1	200
+# the multi-statement case of server-implementation.md 3.5 is a q that does not
+# narrow to ONE scope; the tag above is span-scoped, so it is one statement
+t04_tag_values_unscoped	GET	/api/v2/search/tag/.http.route/values	q={ resource.service.name = "checkout" }&start=$S&end=$E	2	200

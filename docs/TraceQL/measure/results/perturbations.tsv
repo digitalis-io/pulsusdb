@@ -1,0 +1,93 @@
+id	side	expect	api_disagree	membership_disagree	statement_errors	disposition_mismatch	parse_vector_mismatch	outcome	verdict	rule
+status_code_render	renderer	red	5	5	0	0	0	noticed	PASS	the code a status keyword stands for
+status_code_interp	interpreter	red	5	5	0	0	0	noticed	PASS	the code a status keyword stands for
+kind_code_render	renderer	red	2	2	0	0	0	noticed	PASS	the code a kind keyword stands for
+kind_code_interp	interpreter	red	2	2	0	0	0	noticed	PASS	the code a kind keyword stands for
+unscoped_order_render	renderer	red	1	1	0	0	0	noticed	PASS	the order an unscoped read tries the scopes in
+unscoped_order_interp	interpreter	red	1	1	0	0	0	noticed	PASS	the order an unscoped read tries the scopes in
+climb_bound_render	renderer	red	1	1	0	0	0	noticed	PASS	the structural climb follows at most MAX_DEPTH parent links
+climb_bound_interp	interpreter	red	2	2	0	0	0	noticed	PASS	the structural climb follows at most MAX_DEPTH parent links
+gte_render	renderer	red	2	2	0	0	0	noticed	PASS	`>=` is rendered as `>=`
+gte_interp	interpreter	red	3	3	0	0	0	noticed	PASS	`>=` evaluates as `>=`
+neq_missing_render	renderer	red	1	1	0	0	0	noticed	PASS	`!=` also matches a span lacking the key
+neq_missing_interp	interpreter	red	2	2	0	0	0	noticed	PASS	`!=` also matches a span lacking the key
+regex_anchor_render	renderer	red	3	3	0	0	0	noticed	PASS	a regex is anchored at both ends
+regex_anchor_interp	interpreter	red	3	3	0	0	0	noticed	PASS	a regex is anchored at both ends
+truthiness_render	renderer	red	1	1	0	0	0	noticed	PASS	a bare attribute is truthiness, not presence
+truthiness_span_scope_render	renderer	red	1	1	0	0	0	noticed	PASS	a bare SPAN-SCOPED attribute is truthiness
+truthiness_interp	interpreter	red	2	2	0	0	0	noticed	PASS	a bare attribute is truthiness, not presence
+service_column_render	renderer	red	3	3	0	0	0	noticed	PASS	`resource.service.name` is answered from the span column
+service_column_interp	interpreter	red	6	4	0	0	0	noticed	PASS	`resource.service.name` is answered from the span column
+child_render	renderer	red	4	4	0	0	0	noticed	PASS	`{A} > {B}`: B is a child of an A span
+child_interp	interpreter	red	5	5	0	0	0	noticed	PASS	`{A} > {B}`: B is a child of an A span
+sibling_render	renderer	red	2	2	0	0	0	noticed	PASS	a sibling is not the span itself
+sibling_interp	interpreter	red	3	3	0	0	0	noticed	PASS	a sibling is not the span itself
+union_render	renderer	red	2	2	0	0	0	noticed	PASS	a union form returns both participating sides
+union_interp	interpreter	red	2	2	0	0	0	noticed	PASS	a union form returns both participating sides
+descendant_interp	interpreter	red	1	1	0	0	0	noticed	PASS	`>>` climbs past the first parent
+limit_render	renderer	red	53	0	0	0	0	noticed	PASS	a search returns at most LIMIT traces
+limit_interp	interpreter	red	52	0	0	0	0	noticed	PASS	a search returns at most LIMIT traces
+spss_render	renderer	red	60	0	0	0	0	noticed	PASS	a spanset carries at most SPSS spans
+spss_interp	interpreter	red	60	0	0	0	0	noticed	PASS	a spanset carries at most SPSS spans
+trace_order_render	renderer	red	69	0	0	0	0	noticed	PASS	the traces come back newest first
+trace_order_interp	interpreter	red	69	0	0	0	0	noticed	PASS	the traces come back newest first
+group_missing_render	renderer	red	3	0	0	0	0	noticed	PASS	`by()` emits no spanset for a span lacking the key
+group_missing_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`by()` emits no spanset for a span lacking the key
+coalesce_render	renderer	red	1	0	0	0	0	noticed	PASS	`| coalesce()` drops the key `by()` added
+coalesce_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`| coalesce()` drops the key `by()` added
+step_label_render	renderer	red	19	19	0	0	0	noticed	PASS	a bucket is labelled by the instant that closes it
+step_label_interp	interpreter	red	19	19	0	0	0	noticed	PASS	a bucket is labelled by the instant that closes it
+histogram_render	renderer	red	1	1	0	0	0	noticed	PASS	the log2 bucket is the smallest power of two at or above the duration
+histogram_interp	interpreter	red	1	1	0	0	0	noticed	PASS	the log2 bucket is the smallest power of two at or above the duration
+topk_render	renderer	red	2	2	0	0	0	noticed	PASS	`topk` keeps the largest series, `bottomk` the smallest
+topk_interp	interpreter	red	1	1	0	0	0	noticed	PASS	`topk` keeps the largest series, `bottomk` the smallest
+exemplar_render	renderer	red	17	0	0	0	0	noticed	PASS	the exemplar is the bucket’s longest span
+exemplar_interp	interpreter	red	17	0	0	0	0	noticed	PASS	the exemplar is the bucket’s longest span
+compare_type_render	renderer	red	5	5	0	0	0	noticed	PASS	`compare()` keeps a value distinct per stored type
+compare_type_interp	interpreter	red	5	5	0	0	0	noticed	PASS	`compare()` keeps a value distinct per stored type
+root_rule_render	renderer	red	3	3	0	0	0	noticed	PASS	a root is a span whose parent is not stored
+root_rule_interp	interpreter	red	3	3	0	0	0	noticed	PASS	a root is a span whose parent is not stored
+childcount_render	renderer	red	1	1	0	0	0	noticed	PASS	`childCount` counts the spans whose parent is this span
+childcount_interp	interpreter	red	1	1	0	0	0	noticed	PASS	`childCount` counts the spans whose parent is this span
+trace_duration_render	renderer	red	2	2	0	0	0	noticed	PASS	`trace:duration` is the whole trace’s extent
+trace_duration_interp	interpreter	red	2	2	0	0	0	noticed	PASS	`trace:duration` is the whole trace’s extent
+event_existential_render	renderer	red	1	1	0	0	0	noticed	PASS	an event intrinsic asks whether ANY event satisfies it
+event_existential_interp	interpreter	red	4	4	0	0	0	noticed	PASS	an event intrinsic asks whether ANY event satisfies it
+span_id_hex_render	renderer	red	1	1	0	0	0	noticed	PASS	`span:id` reads the span’s own id column
+escape_hex_parse	parser	red	0	0	0	0	1	noticed	PASS	a `\x` escape is the character with that hexadecimal code
+escape_octal_parse	parser	red	0	0	0	0	1	noticed	PASS	a `\101` escape is the character with that octal code
+int_bounds_parse	parser	red	0	0	0	0	2	noticed	PASS	`minInt` and `maxInt` are the signed 64-bit bounds
+precedence_parse	parser	red	0	0	0	0	1	noticed	PASS	multiplication binds tighter than addition
+struct_op_parse	parser	red	0	0	0	0	1	noticed	PASS	`>>` is the descendant operator and `>` the child one
+status_names_parse	parser	red	0	0	0	0	1	noticed	PASS	`error` is a status keyword, not an attribute name
+intrinsic_set_parse	parser	red	0	0	0	7	6	noticed	PASS	`duration` is an intrinsic, not an attribute name
+duration_unit_render	renderer	red	2	2	0	0	0	noticed	PASS	a millisecond is 10^6 nanoseconds
+duration_unit_interp	interpreter	red	2	2	0	0	0	noticed	PASS	a millisecond is 10^6 nanoseconds
+group_label_render	renderer	red	6	0	0	0	0	noticed	PASS	a group label is the value’s text
+group_label_interp	interpreter	red	6	0	0	0	0	noticed	PASS	a group label is the value’s text
+group_order_render	renderer	red	2	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
+group_order_interp	interpreter	red	2	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
+compare_service_render	renderer	red	5	5	0	0	0	noticed	PASS	`resource.service.name` is counted from the span’s own column
+compare_service_interp	interpreter	red	5	5	0	0	0	noticed	PASS	`resource.service.name` is counted from the span’s own column
+compare_resource_render	renderer	red	5	5	0	0	0	noticed	PASS	the resource scope is in `compare()`’s key universe
+compare_resource_interp	interpreter	red	5	5	0	0	0	noticed	PASS	the resource scope is in `compare()`’s key universe
+compare_perspan_render	renderer	red	5	5	0	0	0	noticed	PASS	a resource is counted once per SPAN, not once per resource
+compare_keyword_render	renderer	red	5	5	0	0	0	noticed	PASS	`kind` and `status` are counted as the keywords the API returns
+compare_keyword_interp	interpreter	red	5	5	0	0	0	noticed	PASS	`kind` and `status` are counted as the keywords the API returns
+compare_topn_render	renderer	red	5	5	0	0	0	noticed	PASS	`topN` is applied per key and per side, not as one cap
+compare_topn_interp	interpreter	red	5	5	0	0	0	noticed	PASS	`topN` is applied per key and per side, not as one cap
+exemplar_off_render	renderer	red	1	0	0	0	0	noticed	PASS	`with(exemplars=false)` turns the exemplar column off
+exemplar_off_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`with(exemplars=false)` turns the exemplar column off
+matched_count_render	renderer	red	115	0	0	0	0	noticed	PASS	`matched` is how many spans of the trace the query kept
+matched_count_interp	interpreter	red	115	0	0	0	0	noticed	PASS	`matched` is how many spans of the trace the query kept
+root_columns_interp	interpreter	red	121	0	0	0	0	noticed	PASS	the trace row carries the root service and the root name, in that order
+quantile_width_render	renderer	red	1	1	0	0	0	noticed	PASS	the quantile is widened to Float64 so its text is the whole number it stands for
+presence_render	renderer	red	66	63	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
+presence_interp	interpreter	red	3	3	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
+select_projection_render	renderer	red	3	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
+select_projection_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
+spanset_and_render	renderer	red	3	3	0	0	0	noticed	PASS	`{A} && {B}` keeps only traces carrying both sides
+spanset_and_interp	interpreter	red	3	3	0	0	0	noticed	PASS	`{A} && {B}` keeps only traces carrying both sides
+group_type_render	renderer	red	2	0	0	0	0	noticed	PASS	an attribute `by()` group carries its stored type, so two values with the same label stay two groups
+group_type_interp	interpreter	red	2	0	0	0	0	noticed	PASS	an attribute `by()` group carries its stored type, so two values with the same label stay two groups
+compare_event_side_render	renderer	red	1	1	0	0	0	noticed	PASS	an event attribute row lands on the side of the SPAN that carries the event

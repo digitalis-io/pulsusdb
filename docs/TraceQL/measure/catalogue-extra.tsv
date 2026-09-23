@@ -1,0 +1,26 @@
+# Queries the catalogue runs that the TraceQL corpus does not contain.
+#
+# The corpus at crates/pulsus-traceql/tests/corpus/ is the parser's, and it was
+# written to cover the GRAMMAR. Twelve rules of server-implementation.md 3.2 are
+# ones no corpus query exercises, so the catalogue's comparison could not tell a
+# right rule from a wrong one for them, whatever its agreement count said. Each
+# row below is one such rule, with the query that reaches it and what it decides.
+# They are counted separately from the corpus's 141 and answered the same way:
+# `query-catalogue.md` counts the rows below; `server-implementation.md` §3 and
+# `functional-requirements.md`'s T-C8 state the number in prose, so both move
+# when a row is added here.
+# both statements run, both answers compared with the interpreter.
+#
+# name	traceql	what it decides
+by_span_attribute	{} | by(span.http.method)	a search grouped by an ATTRIBUTE, which 3.2 says is served; the corpus groups only by `name` and `resource.service.name`, both String columns, so no corpus query renders a group key read from the JSON
+by_missing_attribute	{} | by(span.missing)	a group key no span carries: every span is dropped by the presence rule and the search answers no traces, rather than the statement failing
+by_attribute_types	{} | by(span.a)	a group key whose value has the same TEXT at two stored types on one trace — `1` as an integer on one span and `1.0` as a double on another — so a statement that groups on the label alone merges two groups the API keeps apart (`docs/api.md` §4.2: an attribute by-key renders in the arm the sender stored it as)
+by_name_order	{} | by(name)	a trace with more than one group, whose first-appearance order differs from the group values' own order (trace six: `Az` starts before `A\n`)
+truthiness_span_scoped	{ span.success }	the SPAN-SCOPED branch of the truthiness rule; the corpus's only truthiness query is unscoped
+coalesce_after_by	{ .a = 1 } | by(resource.service.name) | coalesce()	`| coalesce()` with a group key to drop; the corpus's `| coalesce()` query has no `by()` before it
+topk_two_series	{} | rate() by(resource.service.name) | topk(1)	`topk` over more than one series; the corpus's topk query has one series on this fixture, so the two orders keep the same one
+bottomk_two_series	{} | rate() by(resource.service.name) | bottomk(1)	the same, in the other direction
+span_id_present	{ span:id = "0000000000000001" }	a `span:id` comparison with an id a fixture span HAS; the corpus's three compare a sixteen-character id with a four-character literal, so their answer is empty whichever column the rule reads
+compare_both_sides	{} | compare({ .b = 2 }, 3)	a comparison whose selection and baseline are BOTH non-empty, over a resource carried by spans on both sides, with a `topN` small enough that applying it per key and per side differs from applying it once
+compare_selection_scopes	{} | compare({ .a = 1 }, 3)	the other side of the comparison above: its selection carries the spans with events, links and instrumentation attributes, which `compare_both_sides` has only on its baseline — between them the five scopes appear on both sides, so a rule that puts one scope's rows on the wrong side cannot hide in a scope that only ever has one
+exemplars_off	{} | rate() with(exemplars=false)	`with(exemplars=false)`, the one hint that changes a read; no corpus query turns exemplars off

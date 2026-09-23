@@ -1,0 +1,2 @@
+SELECT series, t, v FROM (SELECT toString('') AS series, (intDiv(start_ns - 1, 60000000000) + 1) * 60000 AS t, count() AS v FROM tqd_cat.spans WHERE start_ns >= 1790000000000000000 AND start_ns < 1790000060000000000 AND intDiv(start_ns, 300000000000) BETWEEN 5966666 AND 5966666 AND (1) GROUP BY series, t) ORDER BY series, t FORMAT TSV
+SETTINGS final = 1, json_type_escape_dots_in_keys = 1, max_recursive_cte_evaluation_depth = 10001

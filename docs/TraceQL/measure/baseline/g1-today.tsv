@@ -1,0 +1,38 @@
+# Today's PulsusDB — the six-table trace design at 5500145d — on corpus g1.
+# An INPUT to run_all.sh, not a file it writes: the run has no server of the old
+# design to measure against. Produced on 2026-09-22, when the corpus was first
+# built, by
+#
+#   http_bench.py pulsus $PULSUS_URL $START_S $END_S 5 $CH_URL
+#
+# with the same corpus in both stores and both containers at --cpus 4 --memory 6g.
+# Columns: name status bytes ms_min ms_median ms_max statements rows_read ch_bytes_sent.
+# Regenerate by standing that build up again and re-running the line above;
+# measure/README.md says so beside the other scripts.
+s01_empty	200	10217	77	86	133	3.2	388954	1763072
+s02_service	200	12334	55	56	58	5.0	732030	1830570
+s03_service_error	200	9084	458	496	520	22.0	3921164	4247848
+s04_status_code_ge_500	200	9568	115	123	129	3.0	381979	167064
+s05_duration_kind	200	8064	58	60	111	6.0	2725508	226259
+s06_db_and_name	200	15083	118	129	178	5.5	2805094	981258
+s07_route_regex	200	8858	128	136	214	3.8	593488	809531
+s08_user_point	200	2088	24	26	34	3.7	139690	124006
+s09_descendant	200	9084	5030	5069	5306	185.8	36223690	8658969
+s10_child	200	9375	114	116	169	9.5	1579634	1079712
+s11_event_attr	200	11336	89	92	142	6.0	786242	895934
+s12_select	200	15757	102	105	111	3.5	391577	540131
+s13_count_gt	200	15731	63	65	113	6.5	875025	856434
+s14_trace_level	200	10298	74995	75369	75712	3685.5	731880713	73346958
+s15_unscoped_and_resource	200	10047	535	578	629	10.8	2079426	1622124
+t01_tag_names_span	200	577	4	4	5	3.3	745195	314216
+t02_tag_values_route	200	2696	3	4	34	4.3	753387	315648
+t03_tag_values_filtered	200	217	98	108	119	1.7	2192725	2098
+m01_rate_by_service	200	178100	170	181	226	4.7	8251924	105771
+m02_quantiles_by_route	400	136	0	0	0	0.2	336622	12694	type mismatch: by() currently supports grouping by resource.service.name only (issue #182); attribute grouping keys route to a follow-up
+m03_errors_by_service	200	142322	48	52	56	3.2	6395821	92728
+m04_histogram	200	169895	117	125	160	5.2	10435287	183462
+m05_instant_avg_by_name	400	136	0	0	0	1.2	2356355	56531	type mismatch: by() currently supports grouping by resource.service.name only (issue #182); attribute grouping keys route to a follow-up
+m06_rate_by_resource_attr	400	136	0	0	0	1.2	2356355	56531	type mismatch: by() currently supports grouping by resource.service.name only (issue #182); attribute grouping keys route to a follow-up
+b01_trace_by_id_20	200	39372	5	6	6	2.2	2363006	61261
+b02_trace_by_id_1000	200	1939250	16	17	35	3.2	2376293	155272
+g01_service_graph	200	3001	294	323	427	0.8	1390398	1501

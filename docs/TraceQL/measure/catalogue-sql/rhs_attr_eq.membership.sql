@@ -1,0 +1,2 @@
+SELECT lower(hex(span_id)) AS span FROM tqd_cat.spans AS s WHERE start_ns >= 1790000000000000000 AND start_ns < 1790000060000000000 AND intDiv(start_ns, 300000000000) BETWEEN 5966666 AND 5966666 AND ((coalesce(multiIf(dynamicType(attrs.`a`) != 'None', attrs.`a`, dynamicType(scope_attrs.`a`) != 'None', scope_attrs.`a`, NULL) = multiIf(dynamicType(attrs.`b`) != 'None', attrs.`b`, dynamicType(scope_attrs.`b`) != 'None', scope_attrs.`b`, NULL), false))) ORDER BY span FORMAT TSV
+SETTINGS final = 1, json_type_escape_dots_in_keys = 1, max_recursive_cte_evaluation_depth = 10001

@@ -1,0 +1,14 @@
+# Every count-shaped occurrence in the tracked TraceQL documents that no row of
+# claims.tsv compares, with what it is instead. measure/claims_check.py sweeps
+# the documents for two forms — a parenthesised count `(N word...)` and `N
+# files` — and fails on an occurrence that is neither compared by the registry
+# nor listed here. A row here that is no longer in the documents also fails.
+#
+# This is the short list on purpose. A number that counts something in this
+# repository belongs in claims.tsv, derived; a row here is a number that counts
+# nothing in this repository.
+#
+# document	occurrence	what it is
+sql-schema.md	(32 ms each way)	a wall-clock reading from results/g1-new-design.tsv, not a count of a set
+measure/README.md	(379 files)	the wrong number this sweep was written to catch, quoted in the paragraph that explains it; the claim itself is in server-implementation.md and is derived
+measure/README.md	(42 trace migrations)	the second wrong number, quoted in the same paragraph; the claim itself is in server-implementation.md and is derived

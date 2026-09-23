@@ -1,0 +1,24 @@
+7 documents under docs/TraceQL:
+    docs/TraceQL/functional-requirements.md
+    docs/TraceQL/measure/README.md
+    docs/TraceQL/query-catalogue-accepted.md
+    docs/TraceQL/query-catalogue-refused.md
+    docs/TraceQL/query-catalogue.md
+    docs/TraceQL/server-implementation.md
+    docs/TraceQL/sql-schema.md
+
+rule                                           occurrences
+every standalone number                               3817
+every bold span holding a number                       284
+a number then a countable noun                         174
+SWEPT: a parenthesised count, or a file count           14
+
+the rules, as written:
+    every standalone number
+        (?<![\w.])\d[\d,]*(?![\w.])
+    every bold span holding a number
+        \*\*[^*]*\d[^*]*\*\*
+    a number then a countable noun
+        (?<![\w.])(?:\d[\d,]*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+(?:\*\*)?(?:files|cases|claims|queries|rules|statements|alternatives|guards|rows|entries|tables|columns|windows|requirements|readers|spans|traces|steps|parts|scripts|documents|sections|tests|vectors|keys|shards|replicas|partitions|merges|mutations)\b
+    SWEPT: a parenthesised count, or a file count
+        \((?:\d[\d,]*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty) [a-z][a-z -]*[a-z]\)|(?<![\w.])(?:\d[\d,]*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty) files?\b

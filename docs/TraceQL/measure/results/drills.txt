@@ -1,0 +1,37 @@
+--- the window rule at both edges
+span at 1790094846486853636
+  window [T, T+1)      -> 1   (must be 1: start is inclusive)
+  window [T-1, T)      -> 0   (must be 0: end is exclusive)
+  window [T-3600s, T)  -> 0   (must be 0)
+  window [T, T+3600s)  -> 1   (must be 1)
+  window [T, midnight) -> 1   (must be 1: the last day partition is read)
+day partitions a [T, midnight) window reads
+  rendered from end       -> 2   (2: the next day is read for nothing)
+  rendered from end - 1   -> 1   (1)
+  a trace whose spans end at that last nanosecond is still selected -> 3 rows (must be > 0)
+--- retention: dropping one day
+before: 1	2000064	69152282  (parts, rows, bytes)
+drop seconds: .068180961
+after:  0	0	0  (parts, rows, bytes)
+mutations scheduled: 0
+merges running:      0
+--- the recursive climb's bound
+trace              matched unresolved   expected
+ordinary chain     1	0          1 matched, 0 unresolved
+deeper than bound  0	1          0 matched, >0 unresolved -> the reader answers 422
+cycle              0	1          0 matched, >0 unresolved -> the reader answers 422
+--- nested-set numbering on a known tree
+span	left	right	parent	expected
+root	1	8	-1	1 8 -1
+A	2	5	1	2 5 1
+C	3	4	2	3 4 2
+B	6	7	1	6 7 1
+--- shared-span service edges
+client	server	type	calls
+svc-a	svc-b	rpc	1
+svc-a	svc-c	rpc	1
+--- replication bytes
+rows on each replica: 2000064 / 2000064
+part bytes on each:   69848943 / 69848943
+replica 2 fetched:    4	69931640  (parts, bytes)
+bytes per span fetched by replica 2: 34.965
