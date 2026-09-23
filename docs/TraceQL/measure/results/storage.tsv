@@ -1,0 +1,32 @@
+table	rows	bytes	b_per_span
+resources	68	6412	0.003
+spans	2000064	69932464	34.965
+tag_names	48	1190	0.001
+tag_values	304070	1691983	0.846
+traces	70413	2919750	1.46
+total_bytes	bytes_per_span	index_overhead_pct	compression	total_rows	rows_per_span
+74551799	37.2747067093853	6.605422912025523	6.976800056262141	2374663	1.1872935066077885
+name	bytes	b_per_span
+attrs	21739822	10.87
+span_id	16009060	8.004
+parent_span_id	8030815	4.015
+start_ns	7348575	3.674
+duration_ns	7189438	3.595
+resource_id	2989842	1.495
+name	1874833	0.937
+events	1338847	0.669
+trace_id	1192195	0.596
+service	859629	0.43
+kind	504965	0.252
+scope_name	379099	0.19
+links	76322	0.038
+status_message	23184	0.012
+status_code	19515	0.01
+scope_attrs	12711	0.006
+scope_version	6421	0.003
+trace_state	1247	0.001
+flags	1247	0.001
+attrs_other	1247	0.001
+dropped_attrs	1247	0.001
+dropped_events	1247	0.001
+dropped_links	1247	0.001

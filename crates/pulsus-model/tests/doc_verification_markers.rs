@@ -306,6 +306,24 @@ const MARKERS: &[Marker] = &[
         subject: Subject::Internal,
         evidence: Evidence::None,
     },
+    Marker {
+        file: "docs/TraceQL/sql-schema.md",
+        key: "Verified against a tree whose answer is written out by hand",
+        // The tree, the expected numbering and the statement that produces
+        // it are all in this repository: `measure/nested_set_check.sh`
+        // carries the four rows the table prints.
+        subject: Subject::Internal,
+        evidence: Evidence::FromOurTree("docs/TraceQL/measure/nested_set_check.sh"),
+    },
+    Marker {
+        file: "docs/TraceQL/sql-schema.md",
+        key: "So the rule the reader implements is verified against an independent",
+        // Two statements over the same rows, compared against answers
+        // written out by hand in the script: `results/edge-checks.tsv` rows
+        // `nested_ee01_detail` … `nested_ee02_totals`.
+        subject: Subject::Internal,
+        evidence: Evidence::FromOurTree("docs/TraceQL/measure/edge_checks.sh"),
+    },
 ];
 
 /// `Subject::Reference` entries whose evidence is not `FromReference`.

@@ -1,0 +1,4 @@
+this design	trace=50fb0cd9	reps=21	min=30	p50=35	p90=38	max=92
+the reference	trace=50fb0cd9	reps=21	min=45	p50=53	p90=55	max=110
+this design	trace=9e0ae951	reps=21	min=39	p50=42	p90=49	max=102
+the reference	trace=9e0ae951	reps=21	min=95	p50=102	p90=111	max=153

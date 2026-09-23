@@ -1,0 +1,35 @@
+b01_trace_by_id_20__spans	warm	5	5190	1094009	1	11699	22664070	31	32	36
+b02_trace_by_id_1000__spans	warm	5	9286	2153604	1	335128	22837481	39	44	105
+m02_quantiles_by_route__spans	warm	5	2000064	57573259	8	28578	4817540	35	38	44
+m05_instant_avg_by_name__spans	warm	5	2000064	38001216	66	2346	4248151	23	29	32
+t03_tag_values_filtered__spans	warm	5	2000132	50005332	4	100	4320416	24	26	28
+b01_trace_by_id_20__l_trace_first_8192	warm	5	17478	4192029	1	11699	27026181	35	35	86
+b02_trace_by_id_1000__l_trace_first_8192	warm	5	17478	4234420	1	335128	26911521	38	40	98
+m02_quantiles_by_route__l_trace_first_8192	warm	5	2000064	57573259	8	28578	4746419	36	41	43
+m05_instant_avg_by_name__l_trace_first_8192	warm	5	2000064	38001216	66	2346	4256144	20	22	25
+t03_tag_values_filtered__l_trace_first_8192	warm	5	2000132	50005332	4	100	4317128	23	25	27
+b01_trace_by_id_20__l_trace_first_1024	warm	5	3142	580751	1	11699	18349895	29	32	33
+b02_trace_by_id_1000__l_trace_first_1024	warm	5	5190	1113265	1	335128	22820581	33	36	97
+m02_quantiles_by_route__l_trace_first_1024	warm	5	2000064	57573259	8	28578	5220371	39	42	52
+m05_instant_avg_by_name__l_trace_first_1024	warm	5	2000064	38001216	66	2346	4256120	21	22	31
+t03_tag_values_filtered__l_trace_first_1024	warm	5	2000132	50005332	4	100	4323608	23	30	43
+b01_trace_by_id_20__l_trace_first_512	warm	5	2118	323987	1	11699	18315610	26	29	32
+b02_trace_by_id_1000__l_trace_first_512	warm	5	4166	847845	1	335128	18514135	35	35	37
+m02_quantiles_by_route__l_trace_first_512	warm	5	2000064	57573259	8	28578	5207811	42	44	48
+m05_instant_avg_by_name__l_trace_first_512	warm	5	2000064	38001216	66	2346	4256144	28	30	60
+t03_tag_values_filtered__l_trace_first_512	warm	5	2000132	50005332	4	100	4361722	26	28	86
+b01_trace_by_id_20__l_service_first	warm	5	66630	16800932	1	11699	31289802	54	60	70
+b02_trace_by_id_1000__l_service_first	warm	5	132166	33433878	1	335128	31445116	83	94	148
+m02_quantiles_by_route__l_service_first	warm	5	905583	27229205	8	28578	4890964	27	30	33
+m05_instant_avg_by_name__l_service_first	warm	5	905583	16502899	66	2346	4232336	15	19	73
+t03_tag_values_filtered__l_service_first	warm	5	685575	17143927	4	100	4480960	14	15	20
+b01_trace_by_id_20__l_resource_inline	NOT_APPLICABLE	Code: 47. DB::Exception: Unknown expression or function identifier `resource_id` in scope WITH (SELECT (min(start_ns), max(end_ns)) FROM tqd_g1.traces WHERE trace_id = toFixedString(unhex('50FB0CD9926
+b02_trace_by_id_1000__l_resource_inline	NOT_APPLICABLE	Code: 47. DB::Exception: Unknown expression or function identifier `resource_id` in scope WITH (SELECT (min(start_ns), max(end_ns)) FROM tqd_g1.traces WHERE trace_id = toFixedString(unhex('9E0AE95131B
+m02_quantiles_by_route__l_resource_inline	warm	5	2000064	57573259	8	28578	4883940	34	40	44
+m05_instant_avg_by_name__l_resource_inline	warm	5	2000064	38001216	66	2346	4248295	22	27	46
+t03_tag_values_filtered__l_resource_inline	NOT_APPLICABLE	Code: 48. DB::Exception: Correlated subqueries are not supported as IN function arguments yet, but found in expression: resource_id IN (SELECT DISTINCT resource_id FROM tqd_g1.l_resource_inline WHERE 
+b01_trace_by_id_20__l_lz4	warm	5	5190	1090668	1	11699	23098896	23	25	30
+b02_trace_by_id_1000__l_lz4	warm	5	9286	2153604	1	335128	23066736	31	33	39
+m02_quantiles_by_route__l_lz4	warm	5	2000064	57573259	8	28578	17480567	31	34	94
+m05_instant_avg_by_name__l_lz4	warm	5	2000064	38001216	66	2346	4244055	19	21	22
+t03_tag_values_filtered__l_lz4	warm	5	2000132	50005332	4	100	4285560	19	21	62

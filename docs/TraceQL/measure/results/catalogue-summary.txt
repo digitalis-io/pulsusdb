@@ -1,0 +1,11 @@
+queries the parser and validator accept   141
+of those, the API refuses at plan time    3
+queries the API serves                    138
+their statements that ran                 138
+API answers that agree                    138
+membership answers that agree             138
+disposition rule vs shipped planner       0 mismatches
+empty on both sides without a reason      0
+rules not discriminated, with no reason   0
+refused before planning                   47
+documents written

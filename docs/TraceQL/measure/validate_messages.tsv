@@ -1,0 +1,4 @@
+{} | avg(name) > 1	aggregate field expressions must resolve to a number type: avg(name)
+{ name }	span filter field expressions must resolve to a boolean: { name }
+{ .a = 1 = 2 }	binary operations must operate on the same type: .a = 1 = 2
+{ nestedSetLeft =~ "x" }	binary operations must operate on the same type: nestedSetLeft =~ "x"

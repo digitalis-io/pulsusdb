@@ -1,0 +1,38 @@
+<!-- The server configuration offload.sh and offload_lifecycle.sh expect: two
+     ClickHouse replicas of one shard sharing a keeper, with three object-storage
+     disks and the policies the scripts name. Substitute the store's endpoint and
+     credentials, and the replica host names, for your own. -->
+<clickhouse>
+  <macros><shard>1</shard><replica>REPLICA_NAME</replica></macros>
+  <remote_servers>
+    <tqd><shard><internal_replication>true</internal_replication>
+      <replica><host>REPLICA_1_HOST</host><port>9000</port></replica>
+      <replica><host>REPLICA_2_HOST</host><port>9000</port></replica>
+    </shard></tqd>
+  </remote_servers>
+  <zookeeper><node><host>KEEPER_HOST</host><port>9181</port></node></zookeeper>
+  <storage_configuration>
+    <disks>
+      <!-- an ordinary S3 disk: metadata local, data in the store -->
+      <s3><type>s3</type><endpoint>STORE_URL/s3/</endpoint>
+        <access_key_id>KEY</access_key_id><secret_access_key>SECRET</secret_access_key>
+        <metadata_path>/var/lib/clickhouse/disks/s3/</metadata_path></s3>
+      <!-- the same, under its own prefix, for the zero-copy comparison -->
+      <s3zc><type>s3</type><endpoint>STORE_URL/zc/</endpoint>
+        <access_key_id>KEY</access_key_id><secret_access_key>SECRET</secret_access_key>
+        <metadata_path>/var/lib/clickhouse/disks/s3zc/</metadata_path></s3zc>
+      <!-- metadata in the store too, so another server can attach the prefix -->
+      <plainrw><type>object_storage</type><object_storage_type>s3</object_storage_type>
+        <metadata_type>plain_rewritable</metadata_type>
+        <endpoint>STORE_URL/plainrw/</endpoint>
+        <access_key_id>KEY</access_key_id><secret_access_key>SECRET</secret_access_key></plainrw>
+    </disks>
+    <policies>
+      <s3only><volumes><main><disk>s3</disk></main></volumes></s3only>
+      <s3zc><volumes><main><disk>s3zc</disk></main></volumes></s3zc>
+      <tiered><volumes><hot><disk>default</disk></hot><cold><disk>s3</disk></cold></volumes></tiered>
+      <tieredzc><volumes><hot><disk>default</disk></hot><cold><disk>s3zc</disk></cold></volumes></tieredzc>
+      <plainrw><volumes><main><disk>plainrw</disk></main></volumes></plainrw>
+    </policies>
+  </storage_configuration>
+</clickhouse>

@@ -1,0 +1,101 @@
+# Every mention of the results directory in every tracked script under
+# measure/, with what it does there. The rows are not maintained by hand:
+# measure/claims_check.py re-derives them from the tree and fails if this file
+# carries a line that is gone, or misses one that is there. The kind and the
+# note are the part a search cannot decide, and are why this file exists rather
+# than a sentence in a document claiming to have looked everywhere.
+#
+# A row is keyed on the LINE ITSELF, never on its number: a number moves
+# whenever anything above it is edited, and a column of hand-kept numbers is the
+# same defect one level down.
+#
+# Three kinds: `read` and `write` are what they say; `text` is a comment, a
+# docstring or a path compared as a string, which moves no data.
+#
+# file	kind	what it does	the line
+catalogue.py	text	the comment that says why the file list exists	# `results/catalogue-outputs.txt`. `measure/reproduce_check.py` compares exactly
+catalogue.py	read	the perturbation run, for the rules no query can tell apart	for _l in open(f'{OUT}/results/perturbations.tsv'):
+catalogue.py	write	the run’s own result JSON	open(wrote(f'{OUT}/results/catalogue.json'), 'w'), indent=1)
+catalogue.py	text	a sentence of the generated catalogue document	`results/perturbations.tsv` is its output, and `docs/TraceQL/measure/README.md`
+catalogue.py	write	the list of files this run wrote, opened two lines below	MANIFEST = f'{OUT}/results/catalogue-outputs.txt'
+catalogue.py	text	the line the run prints when it finishes	print(f'documents written, {len(WROTE)} files listed in results/catalogue-outputs.txt')
+claims_check.py	read	the storage table, for the tag-name catalog's row count	'tag_names_rows': lambda: tsv_cell(f'{HERE}/results/storage.tsv', 'tag_names', 'rows'),
+claims_check.py	text	the heading of the rule below	# every mention of the results directory, classified in a committed table. The
+claims_check.py	text	the same comment	# pattern is the directory NAME, not `results/`: `R=$HERE/results` names it too,
+claims_check.py	text	the search pattern itself, which is an occurrence like any other	if re.search(r'\bresults\b|\$R/|\{R\}/', line):
+claims_check.py	read	this table, to compare it with the tree	table = Counter((r.split('\t')[0], r.split('\t')[3]) for r in rows_of(f'{HERE}/results-inventory.tsv'))
+claims_check.py	text	the message the rule prints	problems.append(f'results-inventory.tsv does not carry this line of {key[0]}, which names the '
+claims_check.py	text	the same message	f'results directory — classify it as a read or a write: {key[1][:100]}')
+claims_check.py	text	the other message	problems.append(f'results-inventory.tsv carries a line of {key[0]} that is no longer there: {key[1][:100]}')
+claims_check.py	read	the catalogue run's own result: the corpus totals and its served set	CATALOGUE = json.load(open(f'{HERE}/results/catalogue.json'))
+claims_check.py	read	the corpus summary, for the span count the storage figures are per	'corpus_spans': lambda: json.load(open(f'{HERE}/results/corpus-summary.json'))['spans'],
+claims_check.py	read	the storage table, for the resource catalog's row count	'resource_rows': lambda: tsv_cell(f'{HERE}/results/storage.tsv', 'resources', 'rows'),
+claims_check.py	read	the storage table, for the tag-value catalog's row count	'tag_values_rows': lambda: tsv_cell(f'{HERE}/results/storage.tsv', 'tag_values', 'rows'),
+claims_check.py	text	the message the served-set comparison prints	problems.append(f'catalogue-sql/ and the served queries of results/catalogue.json are not the '
+claims_check.py	text	the heading of the storage-table rule below	# sql-schema.md section 2 restates `results/storage.tsv` as a Markdown table.
+claims_check.py	read	the storage table, to compare the document section 2 table with it	STORAGE_ROWS = {r.split('\t')[0]: r.split('\t')[1:] for r in rows_of(f'{HERE}/results/storage.tsv')}
+claims_check.py	text	the message that rule prints when the table has been rewritten	f'been rewritten and nothing is comparing it with results/storage.tsv')
+claims_check.py	text	the message for a table row the result no longer has	problems.append(f'results/storage.tsv has no row for `{_name}`')
+claims_check.py	text	the message for a cell that disagrees with the result	problems.append(f'sql-schema.md section 2 row `{_name}` says {got}, results/storage.tsv says {exp}')
+claims_check.py	text	the docstring of the totals accessor	"""one cell of the totals block of results/storage.tsv.
+claims_check.py	read	the storage table, for the totals block the per-table accessor cannot reach	lines = [l.split('\t') for l in rows_of(f'{HERE}/results/storage.tsv')]
+claims_check.py	text	the message that accessor prints	problems.append(f'results/storage.tsv has no totals column named {column}')
+claims_check.py	read	the measured default for max_dynamic_paths	'json_max_dynamic_paths': lambda: tsv_cell(f'{HERE}/results/json-paths-default.tsv',
+edge_checks.sh	text	the script’s own header	# WORKDIR. Writes results/edge-checks.tsv: one row per check, with the expected
+edge_checks.sh	write	the directory itself, created for this script’s own output	R=$HERE/results; mkdir -p "$R"
+edge_checks.sh	write	written here	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$v" >> "$R/edge-checks.tsv"
+edge_checks.sh	write	written here	printf 'check\texpected\tgot\tverdict\n' > "$R/edge-checks.tsv"
+perturb_check.py	write	the directory inside each perturbed copy, for that copy’s output	os.makedirs(f'{d}/results'); os.makedirs(f'{d}/catalogue-sql')
+perturb_check.py	read	each perturbed copy's own result, under that copy's scratch directory	counts = json.load(open(f'{d}/results/catalogue.json'))['counts']
+perturb_check.py	write	written here	with open(f'{HERE}/results/perturbations.tsv', 'w') as fh:
+reproduce_check.py	text	this checker’s docstring	* **the file list is the run's own**, `results/catalogue-outputs.txt`, which
+reproduce_check.py	text	the same docstring	`results/catalogue.json`'s `statement_ms` member, and the last cell of each
+reproduce_check.py	read	the file list the catalogue run it just made wrote	MANIFEST = f'{OUT}/results/catalogue-outputs.txt'
+reproduce_check.py	text	one of the two files that carry the timing reading, named as a suffix	if path.endswith('results/catalogue.json'):
+reproduce_check.py	text	both of them, named as suffixes	TIMED = ('results/catalogue.json', 'query-catalogue-accepted.md')
+run_all.sh	text	the script’s own header	# under results/.
+run_all.sh	write	the directory itself, created before the run writes into it	R=$HERE/results; mkdir -p "$WORK" "$R"
+run_all.sh	write	written here	echo "== corpus"; python3 "$HERE/gen_corpus.py" "$WORK/g1" "$END" 2000000 > "$R/corpus-summary.json"
+run_all.sh	read	the corpus span count, written at 23	SPANS=$(python3 -c "import json;print(json.load(open('$R/corpus-summary.json'))['spans'])")
+run_all.sh	read	the count the reference must report, written at 23	REFSPANS=$(python3 -c "import json;d=json.load(open('$R/corpus-summary.json'));print(d['spans'] + d['dup_spans'])")
+run_all.sh	write	written here	echo "== query suite"; export CH; : > "$R/g1-new-design.tsv"
+run_all.sh	write	written here	"$HERE/run_query.sh" "$f" warm 5 >> "$R/g1-new-design.tsv"
+run_all.sh	write	written here	"$HERE/run_query.sh" "$f" cold 3 >> "$R/g1-new-design.tsv"
+run_all.sh	write	written here	echo "== the alternative layouts, on the shapes that discriminate"; : > "$R/layout-comparison.tsv"
+run_all.sh	write	written here	if ! NAME="${shape}__${tbl}" "$HERE/run_query.sh" "$out" warm 5 >> "$R/layout-comparison.tsv" 2>/dev/null; then
+run_all.sh	write	written here	printf '%s\tNOT_APPLICABLE\t%s\n' "${shape}__${tbl}" "$why" >> "$R/layout-comparison.tsv"
+run_all.sh	write	written here	echo "== the newest-slice-first loop"; : > "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	"${P[@]}" s01_empty '1' '' 5 >> "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	"${P[@]}" s02_service "service = 'checkout'" service 5 >> "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	"${P[@]}" s04_status_code_ge_500 "coalesce(attrs.\`http%2Eresponse%2Estatus_code\`.:Int64 >= 500, false)" '' 5 >> "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	"${P[@]}" s08_user_point "attrs.\`app%2Euser%2Eid\`.:String = 'u-10013'" '' 5 >> "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	"${P[@]}" s12_select "status_code = 2" resource_id 5 >> "$R/g1-new-design-sliced.tsv"
+run_all.sh	write	written here	echo "== the reference, same queries"; python3 "$HERE/http_bench.py" reference "$REF" "$START" "$END" 5 > "$R/g1-reference-warm.tsv"
+run_all.sh	write	written here	echo "== trace fetch, interleaved"; : > "$R/g1-fetch-compare.tsv"
+run_all.sh	write	written here	python3 "$HERE/fetch_compare.py" "$CH" tqd_g1 "$REF" "$tid" 21 >> "$R/g1-fetch-compare.tsv"; done
+run_all.sh	write	written here	echo "== the reference's broad search, three calls"; : > "$R/g1-broad-search-check.tsv"
+run_all.sh	write	written here	for i in 1 2 3; do python3 "$HERE/broad_search_check.py" "$CH" tqd_g1 "$REF" "$START" "$END" | tr '\n' ' ' >> "$R/g1-broad-search-check.tsv"; echo >> "$R/g1-broad-search-check.tsv"; done
+run_all.sh	write	written here	echo "== correctness"; python3 "$HERE/ground_truth.py" "$WORK/g1/spans.jsonl" > "$R/g1-ground-truth.tsv"
+run_all.sh	write	written here	python3 "$HERE/agreement.py" "$REF" "$CH" tqd_g1 "$START" "$END" > "$R/g1-agreement-raw.tsv"
+run_all.sh	write	written here	python3 - "$R" <<'PY' > "$R/g1-agreement.tsv"
+run_all.sh	read	the corpus's own per-filter counts, written at 123	for l in open(f'{R}/g1-ground-truth.tsv'):
+run_all.sh	read	the two stores' counts, written at 124	for l in open(f'{R}/g1-agreement-raw.tsv'):
+run_all.sh	write	written here	python3 "$HERE/fixture/fixture_answers.py" "$CH" tqd_fx "$REF" "$((FB-1))" "$((FB+10))" > "$R/fixture-answers.tsv"
+run_all.sh	write	written here	> "$R/fixture-structural.tsv"
+run_all.sh	write	written here	"$HERE/edge_checks.sh" "$CH" tqd_edge "$WORK" | tee "$R/edge-checks-summary.txt"
+run_all.sh	write	written here	python3 "$HERE/fixture/make_catalogue_fixture.py" "$WORK/cat" "$CATB" > "$R/catalogue-fixture.json"
+run_all.sh	text	the comment on the step order	# results/perturbations.tsv and the catalogue document quotes it: the other
+run_all.sh	text	the same comment	# seven files under results/ that a later step of the same run reads;
+run_all.sh	write	written here	"${CATB}000000000" "$((CATB + 60))000000000" | tee "$R/catalogue-summary.txt"
+run_all.sh	write	the storage totals	GROUP BY table ORDER BY table FORMAT TSVWithNames" > "$R/storage.tsv"
+run_all.sh	write	the same file, the per-span figures	FORMAT TSVWithNames" >> "$R/storage.tsv"
+run_all.sh	write	the same file, the per-column bytes	FROM system.columns WHERE database='tqd_g1' AND table='spans' ORDER BY bytes DESC FORMAT TSVWithNames" >> "$R/storage.tsv"
+run_all.sh	write	the returned-against-stored bytes	done; } > "$R/r6-denominators.tsv"
+run_all.sh	write	the side-by-side table	python3 - "$R" "$HERE/baseline" <<'PY' > "$R/comparison.tsv"
+run_all.sh	read	the new design's timings, for the side-by-side table	for r in open(f'{R}/g1-new-design.tsv'):
+run_all.sh	read	the reference's timings, for the same table	ref = load(f'{R}/g1-reference-warm.tsv', ['status', 'bytes', 'min', 'med', 'max'])
+run_all.sh	text	a comment	# `measure/README.md` says how to regenerate it. Everything under results/ is
+run_all.sh	write	the drills	} > "$R/drills.txt" 2>&1
+run_all.sh	read	the drills, to print their first forty lines	tail -n +1 "$R/drills.txt" | head -40
+run_all.sh	text	the line the run prints when it finishes	echo "== done; results are in $R"
+run_all.sh	write	the max_dynamic_paths boundary measurement	"$HERE/json_paths_default.sh" "$CH" > "$R/json-paths-default.tsv"

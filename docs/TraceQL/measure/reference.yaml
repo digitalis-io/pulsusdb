@@ -1,0 +1,34 @@
+# The reference's configuration for the docs/TraceQL/ benchmark: the pinned
+# single-binary image of deploy/e2e/compose.single.yaml with local storage,
+# plus exactly three changes, each needed to load a 3-hour corpus in minutes:
+#   - ingestion_time_range_slack 24h, so a trace keeps its own timestamps
+#     rather than being clamped to ingestion time +/- 2m;
+#   - ingestion rate and burst raised, so the load is not throttled;
+#   - max_bytes_per_trace raised, so the 1,000-span traces are kept whole.
+server:
+  http_listen_port: 3200
+  grpc_server_max_recv_msg_size: 67108864
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+live_store:
+  wal:
+    ingestion_time_range_slack: 24h
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 500000000
+      burst_size_bytes: 1000000000
+      max_traces_per_user: 0
+    global:
+      max_bytes_per_trace: 100000000
