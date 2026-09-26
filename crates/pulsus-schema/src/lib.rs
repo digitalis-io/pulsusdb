@@ -16,7 +16,9 @@ mod render;
 mod rotation;
 
 pub use controller::{
-    SchemaParams, apply_ttl, check_version, guard_skip_ddl_in_init, reconcile, run_init,
+    NameCatalogue, REQUIRED_SERVER_NAMES, SchemaParams, absent_server_names, apply_ttl,
+    check_version, guard_skip_ddl_in_init, missing_server_names, mv_projection, reconcile,
+    required_names_sql, run_init,
 };
 pub use error::SchemaError;
 pub use render::{Family, RenderCtx, rollup_suffix};

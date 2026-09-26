@@ -481,6 +481,28 @@ mod tests {
         );
     }
 
+    /// The metrics landing insert carries the full setting set, in order:
+    /// the two block-deduplication pins, the block's own minted token, and
+    /// the block-size ceiling admission already refused a larger push
+    /// against — between `async_insert` and the deadline, with nothing else
+    /// moving. A path that sent only the first and last of them would leave
+    /// a resend storing the block twice.
+    #[test]
+    fn the_landing_insert_emits_the_full_setting_set_in_order() {
+        let s = ChClient::insert_settings_with(
+            &ConsistencyConfig::default(),
+            Duration::from_secs(120),
+            &QuerySettings::landing_insert("t1", 1_048_576),
+        );
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS async_insert = 0, deduplicate_insert = enable, \
+             deduplicate_blocks_in_dependent_materialized_views = 1, \
+             insert_deduplication_token = t1, max_insert_block_size = 1048576, \
+             max_execution_time = 120.000"
+        );
+    }
+
     /// Issue #376: the writer pins `async_insert = 0` rather than
     /// inheriting the server default, which flipped to `1` at ClickHouse
     /// 26.2. Measured 1.76x slower on this writer's own batches — see

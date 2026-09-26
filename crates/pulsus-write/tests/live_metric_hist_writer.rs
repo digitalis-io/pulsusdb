@@ -109,6 +109,8 @@ async fn init_db(bootstrap: &ChClient, db: &str) -> Arc<ChClient> {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     };
     run_init(bootstrap, &params).await.expect("run_init");
     Arc::new(
@@ -195,16 +197,29 @@ fn series_ref(name: &str, fp: Fingerprint, labels: LabelSet) -> SeriesRef {
 }
 
 async fn select_hist_rows(client: &ChClient, db: &str, name: &str) -> Vec<MetricHistSampleRow> {
+    // The LANDING table, aliased to the target row's own column names
+    // (issue #603): what the writer stores is the landing block, and the
+    // four derived tables are maintained from it by materialized view.
+    // Nothing here checks whether one of them received its copy.
     let sql = format!(
-        "SELECT metric_name, fingerprint, unix_milli, schema, zero_threshold, zero_count, count, \
-         sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
-         neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint \
-         FROM {db}.metric_hist_samples WHERE metric_name = '{name}' ORDER BY fingerprint"
+        "SELECT metric_name, fingerprint, unix_milli, hist_schema AS schema, \
+         hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count, \
+         hist_count AS count, hist_sum AS sum, \
+         hist_pos_span_offsets AS pos_span_offsets, \
+         hist_pos_span_lengths AS pos_span_lengths, \
+         hist_pos_bucket_deltas AS pos_bucket_deltas, \
+         hist_neg_span_offsets AS neg_span_offsets, \
+         hist_neg_span_lengths AS neg_span_lengths, \
+         hist_neg_bucket_deltas AS neg_bucket_deltas, \
+         hist_custom_values AS custom_values, \
+         hist_counter_reset_hint AS counter_reset_hint \
+         FROM {db}.metric_landing WHERE kind = 1 AND metric_name = '{name}' \
+         ORDER BY fingerprint"
     );
     let mut stream = client
         .query_stream::<MetricHistSampleRow>(&sql, &QuerySettings::new())
         .await
-        .expect("query metric_hist_samples");
+        .expect("query the landing table");
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         out.push(row.expect("decode MetricHistSampleRow"));
@@ -440,13 +455,17 @@ async fn cross_request_float_and_histogram_register_both_value_type_rows() {
     // Both co-sharded tables hold their row.
     let floats = count(
         &client,
-        &format!("SELECT count() AS n FROM {db}.metric_samples WHERE metric_name = 'svc'"),
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_landing WHERE kind = 0 AND metric_name = 'svc'"
+        ),
     )
     .await;
     assert_eq!(floats, 1, "the float row coexists");
     let hists = count(
         &client,
-        &format!("SELECT count() AS n FROM {db}.metric_hist_samples WHERE metric_name = 'svc'"),
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_landing WHERE kind = 1 AND metric_name = 'svc'"
+        ),
     )
     .await;
     assert_eq!(hists, 1, "the histogram row coexists");
@@ -460,7 +479,7 @@ async fn cross_request_float_and_histogram_register_both_value_type_rows() {
     }
     let sql = format!(
         "SELECT groupBitOr(bitShiftLeft(toUInt8(1), value_type)) AS mask \
-         FROM {db}.metric_series WHERE metric_name = 'svc'"
+         FROM {db}.metric_landing WHERE kind = 2 AND metric_name = 'svc'"
     );
     let mut stream = client
         .query_stream::<MaskRow>(&sql, &QuerySettings::new())

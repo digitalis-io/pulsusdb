@@ -23,10 +23,11 @@ pub struct TableMetrics {
     pub flush_latency_sum_ns: AtomicU64,
     pub flush_latency_count: AtomicU64,
     pub retries_total: AtomicU64,
-    /// Number of generations currently being inserted (0 or 1 per table
-    /// with today's single-flush-task-per-table design; a gauge, not a
-    /// counter, so a snapshot can read it without inferring from
-    /// flushes-in-progress).
+    /// Number of blocks currently being inserted into this table — a
+    /// gauge, not a counter, so a snapshot can read it without inferring
+    /// from flushes-in-progress. Range 0..=1 for a table with one flush
+    /// task, and 0..=`PULSUS_METRICS_LANDING_INSERTERS` for the metrics
+    /// landing table, whose insert workers run concurrently (issue #603).
     pub inflight: AtomicU64,
     /// Spool *I/O* failures (issue #134, residual R5): a poison/uncertain
     /// batch whose audit-file write itself failed — no durable record
@@ -86,7 +87,8 @@ impl TableMetrics {
 /// abandoned on a deterministic or uncertain re-insert outcome
 /// (`abandoned`), and the `pending` gauge (rows currently in the backlog,
 /// updated under the backlog lock). One instance per backlog:
-/// `log_streams`, `metric_series`, `metric_metadata`, `trace_attrs_idx`.
+/// `log_streams` and `trace_attrs_idx`. The metrics path has no backlog
+/// (issue #603).
 #[derive(Debug, Default)]
 pub struct BackfillMetrics {
     pub enqueued_total: AtomicU64,
@@ -223,22 +225,21 @@ impl WriterMetrics {
     }
 }
 
-/// [`WriterMetrics`]'s three-table counterpart for
-/// [`crate::writer::MetricWriter`] (issue #26 architect plan): the same
-/// shape, generalized from two tables (`samples`/`streams`) to three
-/// (`samples`/`series`/`metadata`), plus metrics-specific counters
-/// (`series_registrations_total`, `series_lru_hits/misses_total`,
-/// `metadata_upserts_total`) replacing `WriterMetrics`'s log-specific
-/// `stream_registrations_total`/`lru_hits/misses_total`. Reuses
-/// `TableMetrics`/`TableMetricsSnapshot` unchanged — the per-table counters
-/// mean the same thing regardless of family.
+/// [`WriterMetrics`]'s counterpart for [`crate::writer::MetricWriter`]
+/// (issue #26 architect plan): the same shape over the **one** table the
+/// metrics writer inserts into, the landing table (issue #603), plus
+/// metrics-specific counters (`series_registrations_total`,
+/// `series_lru_hits/misses_total`, `metadata_upserts_total`) replacing
+/// `WriterMetrics`'s log-specific `stream_registrations_total`/
+/// `lru_hits/misses_total`. Reuses `TableMetrics`/`TableMetricsSnapshot`
+/// unchanged — the per-table counters mean the same thing regardless of
+/// family.
 #[derive(Debug, Default)]
 pub struct MetricWriterMetrics {
-    pub samples: Arc<TableMetrics>,
-    pub series: Arc<TableMetrics>,
-    pub metadata: Arc<TableMetrics>,
-    /// `metric_hist_samples` per-table counters (M7-A4, issue #120).
-    pub hist_samples: Arc<TableMetrics>,
+    /// `metric_landing` per-table counters. One insert per push, so
+    /// `flushes_total` counts pushes stored and `rows_total` counts landed
+    /// events of every kind (issue #603).
+    pub landing: Arc<TableMetrics>,
     pub backpressure_total: AtomicU64,
     pub spool_poison_total: AtomicU64,
     pub spool_uncertain_total: AtomicU64,
@@ -248,20 +249,12 @@ pub struct MetricWriterMetrics {
     pub metadata_upserts_total: AtomicU64,
     pub collisions_total: AtomicU64,
     pub rejected_total: AtomicU64,
-    /// `metric_series` registration-backfill counters (issue #139) —
-    /// their own `Arc`s so each backfill task holds a cheap clone.
-    pub series_backfill: Arc<BackfillMetrics>,
-    /// `metric_metadata` registration-backfill counters (issue #139).
-    pub metadata_backfill: Arc<BackfillMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricWriterMetricsSnapshot {
-    pub samples: TableMetricsSnapshot,
-    pub series: TableMetricsSnapshot,
-    pub metadata: TableMetricsSnapshot,
-    /// `metric_hist_samples` per-table counters (M7-A4, issue #120).
-    pub hist_samples: TableMetricsSnapshot,
+    /// `metric_landing` per-table counters (issue #603).
+    pub landing: TableMetricsSnapshot,
     /// The live `queued_bytes` gauge — passed in by the caller
     /// ([`crate::writer::MetricWriter::metrics`]), which owns the
     /// authoritative `AtomicU64` (not duplicated here).
@@ -275,12 +268,6 @@ pub struct MetricWriterMetricsSnapshot {
     pub metadata_upserts_total: u64,
     pub collisions_total: u64,
     pub rejected_total: u64,
-    /// `metric_series` registration-backfill counters (issue #139 —
-    /// additive fields; no pre-existing consumer reads this snapshot's
-    /// full shape).
-    pub series_backfill: BackfillMetricsSnapshot,
-    /// `metric_metadata` registration-backfill counters (issue #139).
-    pub metadata_backfill: BackfillMetricsSnapshot,
     /// Issue #494's push-suppression counters, all zero while
     /// `PULSUS_INGEST_DEDUP` is off.
     pub dedup: DedupMetricsSnapshot,
@@ -304,10 +291,7 @@ impl MetricWriterMetrics {
     ) -> MetricWriterMetricsSnapshot {
         MetricWriterMetricsSnapshot {
             dedup,
-            samples: self.samples.snapshot(),
-            series: self.series.snapshot(),
-            metadata: self.metadata.snapshot(),
-            hist_samples: self.hist_samples.snapshot(),
+            landing: self.landing.snapshot(),
             queue_bytes,
             backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
             spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),
@@ -318,8 +302,6 @@ impl MetricWriterMetrics {
             metadata_upserts_total: self.metadata_upserts_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
-            series_backfill: self.series_backfill.snapshot(),
-            metadata_backfill: self.metadata_backfill.snapshot(),
         }
     }
 }
@@ -484,21 +466,12 @@ mod tests {
         assert_eq!(snap.backfill_dropped_total, 0);
     }
 
+    /// The metric half of this case went with the metrics registration
+    /// backfill (issue #603): one landing insert per push has one fate, so
+    /// there is no separate registration insert left to heal. The name says
+    /// what the case still asserts.
     #[test]
-    fn metric_and_trace_writer_snapshots_carry_their_backfill_embeds() {
-        let metrics = MetricWriterMetrics::default();
-        metrics
-            .series_backfill
-            .healed_total
-            .fetch_add(1, Ordering::Relaxed);
-        metrics
-            .metadata_backfill
-            .abandoned_total
-            .fetch_add(2, Ordering::Relaxed);
-        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
-        assert_eq!(snap.series_backfill.healed_total, 1);
-        assert_eq!(snap.metadata_backfill.abandoned_total, 2);
-
+    fn the_trace_writer_snapshot_carries_its_backfill_embed() {
         let trace_metrics = TraceWriterMetrics::default();
         trace_metrics
             .attrs_backfill

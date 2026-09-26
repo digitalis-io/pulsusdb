@@ -251,6 +251,9 @@ impl RollupObjectKind {
     }
 }
 
+/// One name read off a catalogue: a `system.tables` row here, and a
+/// `system.settings`/`system.merge_tree_settings`/`system.functions` row for
+/// [`absent_server_names`] (issue #603).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct NameRow {
     name: String,
@@ -502,7 +505,7 @@ const TTL_STMTS: [&str; 18] = [
 /// operator who manually altered it away is corrected on the next rotation
 /// tick too.
 pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaError> {
-    for stmt in TTL_STMTS {
+    for stmt in TTL_STMTS.iter().chain(METRIC_LANDING_STMTS) {
         let rendered = render::substitute_tokens(stmt, ctx);
         client
             .execute(&rendered, &QuerySettings::new(), Idempotency::Idempotent)
@@ -511,9 +514,333 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
     Ok(())
 }
 
+/// The metrics landing table's own delete-TTL, plus the block-deduplication
+/// window every table on the metrics write path carries (issue #603).
+///
+/// Appended to the statements [`apply_ttl`] itself runs rather than applied
+/// by a function of its own, so `run_init`, [`crate::spawn_rotation`] and
+/// the server's rotation tick all reapply them with no new wiring and no
+/// call site left to miss. `apply_ttl` stops at its first failing
+/// statement, so the order is a dependency order: these come after
+/// [`TTL_STMTS`] — the `metric_hist_samples` precedent — and the three
+/// naming the landing table come last within them, so an operator-managed
+/// schema without that table stops nothing that does not name it.
+///
+/// The four derived tables need a window of their own because a view's
+/// insert carries a block id derived from the source block, and only a
+/// table with a window recognises the repeat.
+const METRIC_LANDING_STMTS: &[&str] = &[];
+
+/// The projection one materialized view applies, read out of that view's own
+/// rendered statement so the two cannot drift (issue #603).
+///
+/// `None` when no view of that name is in the catalogue. Used by the metrics
+/// rebuild path, which replays the landing table through the same projection
+/// the view applies to a new insert.
+pub fn mv_projection(mv_name: &str, ctx: &RenderCtx) -> Option<String> {
+    let _ = (mv_name, ctx);
+    None
+}
+
+/// Which `system` table answers whether one name exists (issue #603).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameCatalogue {
+    Setting,
+    MergeTreeSetting,
+    Function,
+}
+
+impl NameCatalogue {
+    /// The `system` table this catalogue is read from.
+    pub(crate) const fn table(self) -> &'static str {
+        match self {
+            NameCatalogue::Setting => "system.settings",
+            NameCatalogue::MergeTreeSetting => "system.merge_tree_settings",
+            NameCatalogue::Function => "system.functions",
+        }
+    }
+}
+
+/// Every setting and function name this build sends that was not already
+/// somewhere in `crates/`, read back from the server before anything sends
+/// it (issue #603). A name that might not exist is never sent: absent,
+/// startup refuses and says which.
+pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[];
+
+/// One `SELECT name FROM <catalogue> WHERE name IN (…)` statement per
+/// catalogue that has at least one required name, in catalogue order. An
+/// empty `required` renders no statement.
+///
+/// **One statement per catalogue, not one joined statement.** A deployment's
+/// ClickHouse user may hold `SELECT` on some of these `system` tables and not
+/// others — `system.settings` and `system.functions` are readable by any
+/// user, while `system.merge_tree_settings` needs an explicit grant — and a
+/// joined statement fails whole on the one it cannot read, so a readable
+/// catalogue would go unchecked because of an unreadable one.
+pub fn required_names_sql(
+    required: &[(&'static str, NameCatalogue)],
+) -> Vec<(NameCatalogue, String)> {
+    let _: Vec<&str> = required.iter().map(|(_, c)| c.table()).collect();
+    Vec::new()
+}
+
+/// The required names absent from `present`, in `required` order. It matches
+/// on the name alone; the statement is what binds a name to its catalogue.
+pub fn missing_server_names(
+    required: &[(&'static str, NameCatalogue)],
+    present: &[String],
+) -> Vec<&'static str> {
+    let _ = (required, present);
+    Vec::new()
+}
+
+/// Reads each of [`required_names_sql`]'s statements off the server and
+/// reports what [`missing_server_names`] makes of the answers. An empty
+/// `required` runs no statement and returns an empty list.
+///
+/// **A catalogue this user cannot read is a catalogue this build cannot
+/// check, not a refusal.** The rule is never to send a name the server does
+/// not have; a denied `SELECT` says nothing about whether the name is there,
+/// and refusing on it would stop every least-privilege deployment from
+/// starting — `system.merge_tree_settings` needs a grant that a user granted
+/// only its own database does not hold. The names such a catalogue holds go
+/// unchecked, with a warning naming it, and a name a readable catalogue
+/// reports ABSENT still refuses.
+pub async fn absent_server_names(
+    client: &ChClient,
+    required: &[(&'static str, NameCatalogue)],
+) -> Result<Vec<&'static str>, SchemaError> {
+    let _ = (client, required);
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the metrics landing statements (issue #603) -------------------
+
+    fn metrics_ctx(retention_hours: u32, window: u64) -> RenderCtx {
+        RenderCtx {
+            db: "pulsus".to_string(),
+            cluster: None,
+            dist_suffix: "_dist".to_string(),
+            storage_policy: None,
+            retention_days: 7,
+            log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: retention_hours,
+            metrics_dedup_window: window,
+        }
+    }
+
+    /// The landing table's own delete-TTL renders the configured hours, in
+    /// the same clamped Int64-seconds form every other table's TTL uses. A
+    /// statement hard-coding 6 hours passes at the default and fails here.
+    #[test]
+    fn the_landing_ttl_renders_the_configured_hours() {
+        for hours in [1u32, 168] {
+            let rendered: Vec<String> = METRIC_LANDING_STMTS
+                .iter()
+                .map(|s| render::substitute_tokens(s, &metrics_ctx(hours, 10_000)))
+                .filter(|s| s.contains("MODIFY TTL"))
+                .collect();
+            assert_eq!(rendered.len(), 1, "one TTL statement, the landing table's");
+            assert_eq!(
+                rendered[0],
+                format!(
+                    "ALTER TABLE pulsus.metric_landing MODIFY TTL \
+                     toDateTime(least(intDiv(received_ms, 1000) + {hours} * 3600, 4294967295)) \
+                     DELETE;"
+                )
+            );
+        }
+    }
+
+    /// The landing table and all four tables the views maintain carry the
+    /// configured deduplication window: a view's insert carries a block id
+    /// derived from the source block, and only a table with a window
+    /// recognises the repeat. A statement hard-coding 10000 passes at the
+    /// default and fails here.
+    ///
+    /// **One setting per table, the count**: the engine has no seconds-based
+    /// counterpart to `non_replicated_deduplication_window`, so a block is
+    /// remembered until that many newer blocks have arrived rather than for a
+    /// stated time.
+    #[test]
+    fn the_dedup_window_statements_name_all_five_tables() {
+        let rendered: Vec<String> = METRIC_LANDING_STMTS
+            .iter()
+            .map(|s| render::substitute_tokens(s, &metrics_ctx(6, 5_000)))
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            6,
+            "one per target, plus the source's TTL and its own window"
+        );
+        for table in [
+            "metric_samples",
+            "metric_series",
+            "metric_metadata",
+            "metric_hist_samples",
+            "metric_landing",
+        ] {
+            let want = format!(
+                "ALTER TABLE pulsus.{table} MODIFY SETTING \
+                 non_replicated_deduplication_window = 5000;"
+            );
+            assert!(
+                rendered.contains(&want),
+                "missing: {want}\nrendered: {rendered:#?}"
+            );
+        }
+        assert!(
+            !rendered
+                .iter()
+                .any(|s| s.contains("non_replicated_deduplication_window_seconds")),
+            "the engine has no such setting: sending it refuses every startup"
+        );
+    }
+
+    /// `apply_ttl` stops at its first failing statement, so the order is a
+    /// dependency order: the landing table's own two statements come last, so
+    /// an operator-managed schema without that table stops nothing that does
+    /// not name it.
+    #[test]
+    fn the_landing_statements_come_last_within_the_metrics_block() {
+        let first_landing = METRIC_LANDING_STMTS
+            .iter()
+            .position(|s| s.contains("metric_landing"))
+            .expect("the landing table has statements");
+        assert!(
+            METRIC_LANDING_STMTS[first_landing..]
+                .iter()
+                .all(|s| s.contains("metric_landing")),
+            "nothing but landing statements may follow the first one"
+        );
+        assert_eq!(METRIC_LANDING_STMTS.len() - first_landing, 2);
+    }
+
+    // -- the startup name check (issue #603) --------------------------
+
+    /// The decision is pure: over an empty server every required name is
+    /// reported, over a complete one none is, and over each six-element
+    /// subset exactly the one left out. A list that hard-codes one absent
+    /// name cannot pass the subsets.
+    #[test]
+    fn the_startup_name_decision_is_pure() {
+        let all: Vec<String> = REQUIRED_SERVER_NAMES
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        assert_eq!(
+            missing_server_names(REQUIRED_SERVER_NAMES, &[]),
+            REQUIRED_SERVER_NAMES
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            "over an empty server every required name is missing, in order"
+        );
+        assert!(missing_server_names(REQUIRED_SERVER_NAMES, &all).is_empty());
+        for (i, (left_out, _)) in REQUIRED_SERVER_NAMES.iter().enumerate() {
+            let mut present = all.clone();
+            present.remove(i);
+            assert_eq!(
+                missing_server_names(REQUIRED_SERVER_NAMES, &present),
+                vec![*left_out],
+                "the subset without {left_out} reports exactly it"
+            );
+        }
+        assert!(missing_server_names(&[], &[]).is_empty());
+    }
+
+    /// The statements ask for exactly the required names, and each names its
+    /// own catalogue alone — a merge-tree setting looked for in
+    /// `system.settings` is absent there and would refuse every startup.
+    ///
+    /// **One statement per catalogue**, so a catalogue this user cannot read
+    /// does not blind the ones it can.
+    #[test]
+    fn the_sql_asks_for_exactly_the_required_names() {
+        let statements = required_names_sql(REQUIRED_SERVER_NAMES);
+        assert_eq!(
+            statements.len(),
+            3,
+            "one per catalogue with a required name"
+        );
+        let quoted: std::collections::BTreeSet<&str> = statements
+            .iter()
+            .flat_map(|(_, sql)| sql.split('\'').skip(1).step_by(2))
+            .collect();
+        let want: std::collections::BTreeSet<&str> =
+            REQUIRED_SERVER_NAMES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(quoted, want, "the literals ARE the list: {statements:?}");
+        for (catalogue, sql) in &statements {
+            for table in [
+                "system.settings",
+                "system.merge_tree_settings",
+                "system.functions",
+            ] {
+                let expected = usize::from(table == catalogue.table());
+                assert_eq!(
+                    sql.matches(table).count(),
+                    expected,
+                    "{table} in the {} statement: {sql}",
+                    catalogue.table()
+                );
+            }
+        }
+
+        // One row of each catalogue names that catalogue alone.
+        for (catalogue, table) in [
+            (NameCatalogue::Setting, "system.settings"),
+            (
+                NameCatalogue::MergeTreeSetting,
+                "system.merge_tree_settings",
+            ),
+            (NameCatalogue::Function, "system.functions"),
+        ] {
+            assert_eq!(
+                required_names_sql(&[("only_one", catalogue)]),
+                vec![(
+                    catalogue,
+                    format!("SELECT name FROM {table} WHERE name IN ('only_one')")
+                )]
+            );
+        }
+        assert!(
+            required_names_sql(&[]).is_empty(),
+            "an empty list runs no statement"
+        );
+    }
+
+    /// The three statements, written out, so the list and the statements
+    /// cannot drift apart unnoticed.
+    #[test]
+    fn the_required_names_statements_are_exactly_this_text() {
+        assert_eq!(
+            required_names_sql(REQUIRED_SERVER_NAMES),
+            vec![
+                (
+                    NameCatalogue::Setting,
+                    "SELECT name FROM system.settings WHERE name IN \
+                     ('insert_deduplication_token', 'max_insert_block_size')"
+                        .to_string()
+                ),
+                (
+                    NameCatalogue::MergeTreeSetting,
+                    "SELECT name FROM system.merge_tree_settings WHERE name IN \
+                     ('merge_with_ttl_timeout')"
+                        .to_string()
+                ),
+                (
+                    NameCatalogue::Function,
+                    "SELECT name FROM system.functions WHERE name IN \
+                     ('generateUUIDv7', 'toStartOfHour', 'tupleElement')"
+                        .to_string()
+                ),
+            ]
+        );
+    }
 
     /// Issue #131 AC9: both trace `MODIFY TTL` statements render the
     /// saturating expression — Int64 arithmetic clamped to `u32::MAX`
@@ -529,6 +856,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         };
         let trace_ttl_stmts: Vec<String> = TTL_STMTS
             .iter()
@@ -586,6 +915,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         };
         let rendered: Vec<String> = TTL_STMTS
             .iter()

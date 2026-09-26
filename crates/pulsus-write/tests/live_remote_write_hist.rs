@@ -88,6 +88,8 @@ async fn init_db(bootstrap: &ChClient, db: &str) -> Arc<ChClient> {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     };
     run_init(bootstrap, &params).await.expect("run_init");
     Arc::new(
@@ -146,16 +148,28 @@ fn series(name: &str, hint_label: &str, histograms: Vec<Histogram>) -> TimeSerie
 }
 
 async fn select_hist_rows(client: &ChClient, db: &str, name: &str) -> Vec<MetricHistSampleRow> {
+    // The LANDING table, aliased to the target row's own column names
+    // (issue #603): what the writer stores is the landing block, and the
+    // four derived tables are maintained from it by materialized view.
     let sql = format!(
-        "SELECT metric_name, fingerprint, unix_milli, schema, zero_threshold, zero_count, count, \
-         sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
-         neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint \
-         FROM {db}.metric_hist_samples WHERE metric_name = '{name}' ORDER BY fingerprint"
+        "SELECT metric_name, fingerprint, unix_milli, hist_schema AS schema, \
+         hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count, \
+         hist_count AS count, hist_sum AS sum, \
+         hist_pos_span_offsets AS pos_span_offsets, \
+         hist_pos_span_lengths AS pos_span_lengths, \
+         hist_pos_bucket_deltas AS pos_bucket_deltas, \
+         hist_neg_span_offsets AS neg_span_offsets, \
+         hist_neg_span_lengths AS neg_span_lengths, \
+         hist_neg_bucket_deltas AS neg_bucket_deltas, \
+         hist_custom_values AS custom_values, \
+         hist_counter_reset_hint AS counter_reset_hint \
+         FROM {db}.metric_landing WHERE kind = 1 AND metric_name = '{name}' \
+         ORDER BY fingerprint"
     );
     let mut stream = client
         .query_stream::<MetricHistSampleRow>(&sql, &QuerySettings::new())
         .await
-        .expect("query metric_hist_samples");
+        .expect("query the landing table");
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         out.push(row.expect("decode MetricHistSampleRow"));
@@ -252,15 +266,15 @@ async fn gauge_hint_native_histogram_lands_counter_reset_hint_3_end_to_end() {
     assert_eq!(gauge_row.pos_bucket_deltas, vec![1, 1, -1]);
     assert_eq!(gauge_row.sum.to_bits(), 5.0f64.to_bits());
 
-    // The histograms-only series registered metric_series rows with the
+    // The histograms-only series registered kind-2 landing rows with the
     // histogram value_type discriminator (= 1).
     #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
     struct CountRow {
         n: u64,
     }
     let sql = format!(
-        "SELECT count() AS n FROM {db}.metric_series \
-         WHERE metric_name = 'rw_gauge_probe' AND value_type = 1"
+        "SELECT count() AS n FROM {db}.metric_landing \
+         WHERE kind = 2 AND metric_name = 'rw_gauge_probe' AND value_type = 1"
     );
     let mut stream = client
         .query_stream::<CountRow>(&sql, &QuerySettings::new())

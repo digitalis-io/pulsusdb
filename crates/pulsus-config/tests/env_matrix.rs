@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 82 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8, 87 variables) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -252,6 +252,32 @@ const ROWS: &[Row] = &[
         value: "false",
         check: |c| !c.writer.discover_log_levels,
     },
+    // Issue #603: the metrics landing table's five dials.
+    Row {
+        var: "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+        value: "24",
+        check: |c| c.metrics_landing_retention_hours == 24,
+    },
+    Row {
+        var: "PULSUS_METRICS_DEDUP_WINDOW",
+        value: "5000",
+        check: |c| c.metrics_dedup_window == 5_000,
+    },
+    Row {
+        var: "PULSUS_METRICS_LANDING_RETRIES",
+        value: "5",
+        check: |c| c.writer.metrics_landing_retries == 5,
+    },
+    Row {
+        var: "PULSUS_METRICS_LANDING_INSERTERS",
+        value: "8",
+        check: |c| c.writer.metrics_landing_inserters == 8,
+    },
+    Row {
+        var: "PULSUS_METRICS_LANDING_MAX_ROWS",
+        value: "2000000",
+        check: |c| c.writer.metrics_landing_max_rows == 2_000_000,
+    },
     Row {
         var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
         value: "native",
@@ -465,8 +491,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        82,
-        "docs/configuration.md §§1-8 document exactly 82 variables"
+        87,
+        "docs/configuration.md §§1-8 document exactly 87 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
