@@ -12,7 +12,7 @@
 //! `_dist` wrappers appended (docs/schemas.md §7).
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, ChError, Idempotency, QuerySettings, Row};
 
 use crate::bookkeeping::{
     checksum_hex, find_migration, find_mv_checksum, record_migration, upsert_mv_checksum,
@@ -640,31 +640,76 @@ pub fn missing_server_names(
 /// reports what [`missing_server_names`] makes of the answers. An empty
 /// `required` runs no statement and returns an empty list.
 ///
-/// **A catalogue this user cannot read is a catalogue this build cannot
-/// check, not a refusal.** The rule is never to send a name the server does
-/// not have; a denied `SELECT` says nothing about whether the name is there,
-/// and refusing on it would stop every least-privilege deployment from
-/// starting — `system.merge_tree_settings` needs a grant that a user granted
-/// only its own database does not hold. The names such a catalogue holds go
-/// unchecked, with a warning naming it, and a name a readable catalogue
-/// reports ABSENT still refuses.
+/// **A catalogue this user has no grant to read is a catalogue this build
+/// cannot check, not a refusal** — and nothing wider than that: see
+/// [`catalogue_read_is_unchecked`]. A name a readable catalogue reports ABSENT
+/// still refuses.
 pub async fn absent_server_names(
     client: &ChClient,
     required: &[(&'static str, NameCatalogue)],
 ) -> Result<Vec<&'static str>, SchemaError> {
+    let mut reads = Vec::new();
+    for (catalogue, sql) in required_names_sql(required) {
+        reads.push((catalogue, read_names(client, &sql).await));
+    }
+    fold_catalogue_reads(required, reads)
+}
+
+/// ClickHouse's `ACCESS_DENIED` server error code, which a `SELECT` on a
+/// `system` table the deployment's user holds no grant for is answered with.
+/// The only failure a catalogue read is allowed to continue past.
+const ACCESS_DENIED: i32 = 497;
+
+/// Whether one catalogue read's failure leaves that catalogue **unchecked**
+/// rather than refusing startup.
+///
+/// Access denial alone. A denied `SELECT` says nothing about whether the name
+/// is there, and refusing on it would stop every least-privilege deployment
+/// from starting — `system.merge_tree_settings` needs a grant a user granted
+/// only its own database does not hold. Every other failure — a timeout, a
+/// transport fault, a decode failure, any other server exception — means the
+/// catalogue was not read for a reason that says nothing about grants, so
+/// continuing would let startup send a name nothing checked (issue #603 code
+/// review, finding 6).
+///
+/// Stubbed: which failures are tolerated arrives with the code.
+fn catalogue_read_is_unchecked(err: &SchemaError) -> bool {
+    let _denied = matches!(
+        err,
+        SchemaError::Clickhouse(ChError::Server {
+            code: ACCESS_DENIED,
+            ..
+        })
+    );
+    true
+}
+
+/// Turns one catalogue read per catalogue into the list of required names the
+/// server reported absent. Pure, so which failures are tolerated and which
+/// names go unchecked is testable without a server.
+///
+/// A read that succeeded contributes its names and puts its catalogue's
+/// required names into the checked set. A read denied by access control
+/// contributes neither, with a warning naming the catalogue. Any other
+/// failure is returned.
+fn fold_catalogue_reads(
+    required: &[(&'static str, NameCatalogue)],
+    reads: Vec<(NameCatalogue, Result<Vec<String>, SchemaError>)>,
+) -> Result<Vec<&'static str>, SchemaError> {
     let mut present: Vec<String> = Vec::new();
     let mut checked: Vec<(&'static str, NameCatalogue)> = Vec::new();
-    for (catalogue, sql) in required_names_sql(required) {
-        match read_names(client, &sql).await {
+    for (catalogue, read) in reads {
+        match read {
             Ok(names) => {
                 present.extend(names);
                 checked.extend(required.iter().filter(|(_, c)| *c == catalogue).copied());
             }
-            Err(err) => tracing::warn!(
+            Err(err) if catalogue_read_is_unchecked(&err) => tracing::warn!(
                 catalogue = catalogue.table(),
                 error = %err,
-                "cannot read a name catalogue; the names it holds are not checked"
+                "no grant to read a name catalogue; the names it holds are not checked"
             ),
+            Err(err) => return Err(err),
         }
     }
     Ok(missing_server_names(&checked, &present))
@@ -908,6 +953,93 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Issue #603 code review, finding 6: a catalogue read that failed for a
+    /// reason other than a missing grant must refuse startup, not leave the
+    /// names it holds silently unchecked. A timeout, a transport fault, a
+    /// decode failure or any other server exception says nothing about
+    /// grants — continuing past one lets the build send a name nothing ever
+    /// looked for, which is the whole point of the check.
+    #[test]
+    fn only_a_denied_grant_leaves_a_catalogue_unchecked() {
+        const NAMES: &[(&str, NameCatalogue)] = &[
+            ("a_setting", NameCatalogue::Setting),
+            ("a_function", NameCatalogue::Function),
+        ];
+        let denied = || {
+            SchemaError::Clickhouse(ChError::Server {
+                code: 497,
+                message: "Not enough privileges on system.merge_tree_settings".to_string(),
+            })
+        };
+
+        // Access denial on the settings catalogue: its name goes unchecked,
+        // and the readable catalogue's absent name still refuses.
+        let absent = fold_catalogue_reads(
+            NAMES,
+            vec![
+                (NameCatalogue::Setting, Err(denied())),
+                (NameCatalogue::Function, Ok(Vec::new())),
+            ],
+        )
+        .expect("a denied grant is not a refusal");
+        assert_eq!(
+            absent,
+            vec!["a_function"],
+            "the unreadable catalogue's name is unchecked; the readable \
+             catalogue's absent name still refuses"
+        );
+
+        // Every other failure is returned.
+        for (label, err) in [
+            (
+                "a timeout",
+                SchemaError::Clickhouse(ChError::Timeout("deadline".to_string())),
+            ),
+            (
+                "a transport fault",
+                SchemaError::Clickhouse(ChError::Io("reset by peer".to_string())),
+            ),
+            (
+                "a decode failure",
+                SchemaError::Clickhouse(ChError::Decode("not a NameRow".to_string())),
+            ),
+            (
+                "another server exception",
+                SchemaError::Clickhouse(ChError::Server {
+                    code: 60,
+                    message: "Table system.settings does not exist".to_string(),
+                }),
+            ),
+            (
+                "a non-ClickHouse schema error",
+                SchemaError::Version("nonsense".to_string()),
+            ),
+        ] {
+            let got = fold_catalogue_reads(
+                NAMES,
+                vec![
+                    (NameCatalogue::Setting, Err(err)),
+                    (NameCatalogue::Function, Ok(vec!["a_function".to_string()])),
+                ],
+            );
+            assert!(
+                got.is_err(),
+                "{label} must refuse rather than leave a catalogue unchecked, got {got:?}"
+            );
+        }
+
+        // Both readable: nothing absent.
+        let absent = fold_catalogue_reads(
+            NAMES,
+            vec![
+                (NameCatalogue::Setting, Ok(vec!["a_setting".to_string()])),
+                (NameCatalogue::Function, Ok(vec!["a_function".to_string()])),
+            ],
+        )
+        .expect("two good reads");
+        assert!(absent.is_empty(), "{absent:?}");
     }
 
     /// Issue #131 AC9: both trace `MODIFY TTL` statements render the

@@ -627,7 +627,33 @@ pub struct MetricLandingRow {
     pub hist_counter_reset_hint: u8,
 }
 
+/// One landing row's own inline footprint, in the shape the WRITER QUEUE
+/// holds it. Taken from `size_of` rather than written down, so it cannot drift
+/// from the fields it prices — the same rule [`ARRAY_ELEMENT_SLOT_BYTES`]
+/// follows.
+///
+/// A landing row is the union of the four target rows' columns, so it is far
+/// wider than any one of them: three `i64`s, three `f64`s, two `u64`s, a
+/// 16-byte fingerprint, four `String` headers, seven `Vec` headers and four
+/// small integers. What a target row costs prices only the text and array
+/// elements the row owns; the queue also holds all of those slots, every one
+/// of them whether or not its kind uses it.
+pub const LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<MetricLandingRow>() as u64;
+
 impl MetricLandingRow {
+    /// What the ingest queue is charged for one landing row whose kind's
+    /// target estimator priced its owned text and arrays at `target_bytes`.
+    ///
+    /// The queue reservation must count what we HOLD (issue #556's rule):
+    /// `PULSUS_INGEST_QUEUE_BYTES` names the buffered bytes, and a landing row
+    /// is held as a whole [`MetricLandingRow`] until its block is encoded, so
+    /// the row's inline slots are charged beside the buffers it owns.
+    ///
+    /// Stubbed: the charge arrives with the code.
+    pub fn est_landing_bytes(target_bytes: u64) -> u64 {
+        target_bytes
+    }
+
     /// A float sample, whose target is `metric_samples`.
     pub const KIND_FLOAT: u8 = 0;
     /// A native-histogram sample, whose target is `metric_hist_samples`.
@@ -2098,5 +2124,50 @@ mod tests {
         assert_eq!(meta.unit, "s");
         assert_eq!(meta.fingerprint, Fingerprint::from_raw(0));
         assert_eq!(meta.unix_milli, 0);
+    }
+
+    /// Issue #603 code review, finding 3: the ingest queue holds a landing
+    /// row, not the target row it becomes, so charging it the target row's
+    /// size leaves `PULSUS_INGEST_QUEUE_BYTES` bounding something it does not
+    /// hold. A kind-0 landing row's target estimate is 33 bytes for a
+    /// one-character metric name, while the row itself occupies the union of
+    /// all four kinds' columns — so the shortfall is per row and grows with
+    /// the row count.
+    ///
+    /// The floor is derived by hand from the declaration, so the `size_of`
+    /// equality below is not the only thing establishing the figure: three
+    /// `i64` (24) + three `f64` (24) + two `u64` (16) + one 16-byte
+    /// fingerprint + four `String` headers (4 × 24 = 96) + seven `Vec`
+    /// headers (7 × 24 = 168) + four one-byte integers = 348, plus alignment
+    /// padding for the 16-byte-aligned fingerprint.
+    #[test]
+    fn a_landing_row_is_charged_the_row_the_queue_holds() {
+        const HAND_DERIVED_FLOOR: u64 = 348;
+        assert_eq!(
+            LANDING_ROW_SLOT_BYTES,
+            std::mem::size_of::<MetricLandingRow>() as u64,
+            "the constant prices the declaration it names"
+        );
+        assert!(
+            LANDING_ROW_SLOT_BYTES >= HAND_DERIVED_FLOOR,
+            "a landing row's slots come to at least {HAND_DERIVED_FLOOR}, \
+             got {LANDING_ROW_SLOT_BYTES}"
+        );
+
+        // Every kind's charge is its target estimate plus the row it is held
+        // in, so no kind escapes the slot cost — a kind whose columns are
+        // mostly empty still occupies every slot.
+        for target in [0u64, 14, 28, 33, 75, 1_000_000] {
+            assert_eq!(
+                MetricLandingRow::est_landing_bytes(target),
+                target + LANDING_ROW_SLOT_BYTES,
+                "the charge for a row whose buffers cost {target}"
+            );
+        }
+        assert!(
+            MetricLandingRow::est_landing_bytes(33)
+                >= std::mem::size_of::<MetricLandingRow>() as u64,
+            "a kind-0 row's charge must cover the row it is held in"
+        );
     }
 }

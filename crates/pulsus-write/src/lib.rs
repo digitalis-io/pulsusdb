@@ -37,11 +37,12 @@ pub use protocols::zipkin::{
     decode as decode_zipkin, to_otlp as zipkin_to_otlp,
 };
 pub use writer::{
-    Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetricsSnapshot, LogPatternRow,
-    LogWriter, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, MetricWriter, MetricWriterTables, PushDedup, PushDigest, PushIdentity,
-    TargetOutcome, TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables, WaitGuard, WaitMode,
-    WriteError, WriterTables, index_bytes, log_identity, metric_identity, plan_capacities,
+    Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetricsSnapshot, LANDING_ROW_SLOT_BYTES,
+    LogPatternRow, LogWriter, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow,
+    MetricSampleRow, MetricSeriesRow, MetricWriter, MetricWriterTables, PushDedup, PushDigest,
+    PushIdentity, TargetOutcome, TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables,
+    WaitGuard, WaitMode, WriteError, WriterTables, index_bytes, log_identity, metric_identity,
+    plan_capacities,
 };
 
 #[cfg(test)]
