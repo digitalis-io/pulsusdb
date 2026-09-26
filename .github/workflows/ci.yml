@@ -1593,20 +1593,14 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test live_log_stream_backfill
 
-      # Issue #139: the metric registration-backfill live failure
-      # injection — L-M1 (first metric_series insert swallowed; the
-      # sample is visible while the registration is absent, then the
-      # backfill heals it and the LIMIT 1 BY lookup is byte-identical
-      # across a forced duplicate re-insert) and L-M2 (metric_metadata
-      # "false Poisoned": the backfill's genuine duplicate plus a stale
-      # re-insert both collapse to one FINAL row whose survivor is the
-      # max-updated_ns descriptor). Reuses this job's ClickHouse 26.3
-      # container.
-      - name: Metric registration backfill (live L-M1/L-M2 failure injection)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-write --test live_metric_registration_backfill
+      # Issue #603: the metric registration-backfill live failure
+      # injection had its own step here, and its suite is gone with the
+      # mechanism. One push is one insert of one block into
+      # `metric_landing`, so there is no separate registration insert to
+      # lose and nothing to heal: a push whose insert failed emits its
+      # registration rows again next time, because the series LRU is
+      # promoted only when that block commits. The landing block's own live
+      # coverage is the `Live metric writer suite` step below.
 
       # Issue #139: the trace_attrs_idx registration-backfill live
       # failure injection — L-T1 (attrs insert swallowed while the span

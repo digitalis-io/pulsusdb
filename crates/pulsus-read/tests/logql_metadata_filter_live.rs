@@ -78,6 +78,8 @@ fn schema_params(db: &str) -> SchemaParams {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     }
 }
 

@@ -954,7 +954,8 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
     }
     wait_for_scalar(
         &client,
-        "SELECT count() AS n FROM metric_samples WHERE metric_name = 'http_requests_total'",
+        "SELECT count() AS n FROM metric_landing \
+         WHERE kind = 0 AND metric_name = 'http_requests_total'",
         6,
         "off: six sample rows for three samples",
     )
@@ -976,33 +977,20 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
 // ---------------------------------------------------------------------
 
 /// **M3.** Four content-identical, descriptor-bearing writes sent at once
-/// store one push's samples and **one** descriptor row — one row written,
-/// not four rows collapsed.
+/// store **one push's samples** and **four descriptor rows**.
 ///
-/// **This corrects a claim, and the difference is worth stating.** Round
-/// 4 of this issue's code review reported four descriptors enqueued for
-/// one push's samples, and an earlier version of this test's comment
-/// explained the single visible row as `metric_metadata`'s
-/// `ReplacingMergeTree(updated_ns)` collapsing the four. Measured here,
-/// that explanation is wrong on this path: reading the table six times at
-/// one-second intervals, starting immediately after the four writes are
-/// acknowledged, `count()` without `FINAL` is **1** every time. Nothing
-/// is collapsed because nothing beyond one row is ever inserted.
+/// The descriptor count is four because there is no cache gate left (issue
+/// #603): suppression drops exactly the rows a repeat would duplicate —
+/// the sample, series and histogram rows — and every push lands its
+/// descriptors, because a repeat of a descriptor cannot change an answer
+/// while a dropped one can leave a wrong type standing. The answer
+/// `/api/v1/metadata` gives is unchanged: the statement groups by
+/// `metric_name` and takes one whole tuple, and `metric_metadata` is a
+/// `ReplacingMergeTree(updated_ns)` keyed on the name.
 ///
-/// The four is a figure of the WRITER-level fixture, and both figures are
-/// right about their own path.
-/// `concurrent_identical_descriptor_bearing_pushes_store_one_copy` in
-/// `crates/pulsus-write/tests/a494_push_dedup.rs` admits four pushes that
-/// are released by a barrier inside one process, so none of them has
-/// confirmed a flush when the others reach the descriptor cache gate, and
-/// the gate emits unless the descriptor equals the one last
-/// confirmed-flushed — so all four emit and its mock inserter records
-/// four. Four HTTP requests are not simultaneous in that sense. **Which
-/// of them confirms first, and how much of the gap the flush needs, is
-/// not measured here**; what is measured is the row count, and it is one.
-///
-/// So the user-visible claim is asserted on the visible thing: three
-/// sample rows and one descriptor row, both before and after `FINAL`.
+/// An earlier version of this case measured one descriptor row, under the
+/// descriptor cache that gated on the last durably-emitted tuple. That
+/// gate is gone, and this is what the path stores now.
 #[tokio::test]
 async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
     if !should_run() {
@@ -1040,8 +1028,8 @@ async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
 
     wait_for_scalar(
         &client,
-        "SELECT count() AS n FROM metric_samples \
-         WHERE metric_name = 'dedup_descriptor_race_total'",
+        "SELECT count() AS n FROM metric_landing \
+         WHERE kind = 0 AND metric_name = 'dedup_descriptor_race_total'",
         3,
         "M3: one push's three samples, not four pushes' twelve",
     )
@@ -1049,27 +1037,13 @@ async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
 
     wait_for_scalar(
         &client,
-        "SELECT count() AS n FROM metric_metadata FINAL \
-         WHERE metric_name = 'dedup_descriptor_race_total'",
-        1,
-        "M3: one descriptor row is visible",
+        "SELECT count() AS n FROM metric_landing \
+         WHERE kind = 3 AND metric_name = 'dedup_descriptor_race_total'",
+        4,
+        "M3: every push lands its descriptor — suppression drops the rows a repeat \
+         would duplicate, never the one a repeat would correct",
     )
     .await;
-    // Without `FINAL` as well. A row count that is only right after the
-    // replacing merge has run would be a timing claim; this one is right
-    // from the first read, which is what says one row was WRITTEN rather
-    // than four written and later collapsed.
-    let raw: Vec<CountRow> = collect(
-        &client,
-        "SELECT count() AS n FROM metric_metadata \
-         WHERE metric_name = 'dedup_descriptor_race_total'",
-    )
-    .await;
-    assert_eq!(
-        raw[0].n, 1,
-        "M3: one descriptor row is STORED, so the single visible row is not a merge \
-         having collapsed four"
-    );
 }
 
 // ---------------------------------------------------------------------
@@ -1099,7 +1073,8 @@ async fn a_retried_remote_write_stores_one_copy() {
 
     wait_for_scalar(
         &client,
-        "SELECT count() AS n FROM metric_samples WHERE metric_name = 'http_requests_total'",
+        "SELECT count() AS n FROM metric_landing \
+         WHERE kind = 0 AND metric_name = 'http_requests_total'",
         6,
         "M1: three samples per job, two jobs",
     )

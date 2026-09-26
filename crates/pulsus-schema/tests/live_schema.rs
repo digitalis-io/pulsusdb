@@ -56,6 +56,8 @@ fn test_ctx(db: &str) -> SchemaParams {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     }
 }
 
@@ -1021,6 +1023,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
         "log_streams",
         "log_streams_idx",
         "metric_hist_samples",
+        "metric_landing",
         "metric_samples",
         "metric_series",
     ];
@@ -1122,9 +1125,11 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 
     // And the cardinality, so a NEW mutation of an allowed kind is a
     // decision somebody makes rather than a line nobody reads. The split
-    // measured on this base is nine `MATERIALIZE TTL` and four
+    // measured on this base is ten `MATERIALIZE TTL` and four
     // `PROJECTION` commands — issue #560 added two `MATERIALIZE TTL`, one
-    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`.
+    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`,
+    // and issue #603 added one for the metrics landing table's own
+    // `MODIFY TTL`.
     let ttl = commands
         .iter()
         .filter(|c| *c == "(MATERIALIZE TTL)")
@@ -1132,10 +1137,372 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     let projection = commands.len() - ttl;
     assert_eq!(
         (commands.len(), ttl, projection),
-        (13, 9, 4),
+        (14, 10, 4),
         "the mutations a fresh database issues moved; read each one before repinning: \
          {commands:?}"
     );
 
     drop_database(&client, db).await;
+}
+
+// ---------------------------------------------------------------------
+// The metrics landing table and its four views (issue #603)
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct LandingColumnRow {
+    name: String,
+    r#type: String,
+    compression_codec: String,
+    default_expression: String,
+}
+
+/// `metric_landing`'s 26 columns, in declaration order, with the type and
+/// codec each carries **as the server reports them**. Written out so the
+/// shipped table cannot drift from the row type the writer sends.
+///
+/// The codecs are the server's normalised spellings, not the `CREATE`'s text:
+/// `Gorilla` is reported as `Gorilla(8)`, and a column with no codec clause
+/// reports the empty string. The same normalisation the four shipped TTL
+/// assertions read around a parenthesised product.
+const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
+    ("event_id", "UUID", ""),
+    ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("kind", "UInt8", "CODEC(ZSTD(1))"),
+    ("metric_name", "LowCardinality(String)", ""),
+    ("fingerprint", "UInt128", "CODEC(Delta(8), ZSTD(1))"),
+    ("unix_milli", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("value", "Float64", "CODEC(Gorilla(8), ZSTD(1))"),
+    ("labels", "String", "CODEC(ZSTD(5))"),
+    ("value_type", "UInt8", "CODEC(ZSTD(1))"),
+    ("metric_type", "LowCardinality(String)", ""),
+    ("help", "String", "CODEC(ZSTD(1))"),
+    ("unit", "String", "CODEC(ZSTD(1))"),
+    ("updated_ns", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("hist_schema", "Int8", "CODEC(ZSTD(1))"),
+    (
+        "hist_zero_threshold",
+        "Float64",
+        "CODEC(Gorilla(8), ZSTD(1))",
+    ),
+    ("hist_zero_count", "UInt64", "CODEC(T64, ZSTD(1))"),
+    ("hist_count", "UInt64", "CODEC(T64, ZSTD(1))"),
+    ("hist_sum", "Float64", "CODEC(Gorilla(8), ZSTD(1))"),
+    ("hist_pos_span_offsets", "Array(Int32)", "CODEC(ZSTD(1))"),
+    ("hist_pos_span_lengths", "Array(UInt32)", "CODEC(ZSTD(1))"),
+    ("hist_pos_bucket_deltas", "Array(Int64)", "CODEC(ZSTD(1))"),
+    ("hist_neg_span_offsets", "Array(Int32)", "CODEC(ZSTD(1))"),
+    ("hist_neg_span_lengths", "Array(UInt32)", "CODEC(ZSTD(1))"),
+    ("hist_neg_bucket_deltas", "Array(Int64)", "CODEC(ZSTD(1))"),
+    ("hist_custom_values", "Array(Float64)", "CODEC(ZSTD(1))"),
+    ("hist_counter_reset_hint", "UInt8", "CODEC(ZSTD(1))"),
+];
+
+/// A fresh `run_init` creates `metric_landing` with exactly the declared
+/// columns, in order, with the declared types and codecs, `event_id`
+/// defaulted by the server's own time-ordered UUID function, and the engine,
+/// partition, sorting key and fixed settings the design pins. The four
+/// `metric_*_mv` views exist beside it.
+#[tokio::test]
+async fn metric_landing_and_its_views_exist_after_init() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_landing");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let sql = format!(
+        "SELECT name, type, compression_codec, default_expression FROM system.columns \
+         WHERE database = '{db}' AND table = 'metric_landing' ORDER BY position"
+    );
+    let mut stream = client
+        .query_stream::<LandingColumnRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut seen: Vec<LandingColumnRow> = Vec::new();
+    while let Some(row) = stream.next().await {
+        seen.push(row.expect("decode LandingColumnRow"));
+    }
+    drop(stream);
+
+    assert_eq!(seen.len(), LANDING_COLUMNS.len(), "column count");
+    for (got, (name, ty, codec)) in seen.iter().zip(LANDING_COLUMNS) {
+        assert_eq!(got.name, name, "column order");
+        assert_eq!(got.r#type, ty, "{name}'s type");
+        assert_eq!(got.compression_codec, codec, "{name}'s codec");
+    }
+    assert_eq!(
+        seen[0].default_expression, "generateUUIDv7()",
+        "the landed event's identity is the server's, not the writer's"
+    );
+
+    let create = create_table_query(&client, db, "metric_landing").await;
+    for want in [
+        "ENGINE = MergeTree",
+        "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
+        "ORDER BY (kind, metric_name, fingerprint, unix_milli)",
+        "ttl_only_drop_parts = 1",
+        "merge_with_ttl_timeout = 3600",
+    ] {
+        assert!(create.contains(want), "expected {want:?} in {create}");
+    }
+
+    let names = table_names(&client, db).await;
+    for view in [
+        "metric_samples_mv",
+        "metric_hist_samples_mv",
+        "metric_series_mv",
+        "metric_metadata_mv",
+    ] {
+        assert!(
+            names.contains(&view.to_string()),
+            "{view} must exist after run_init: {names:?}"
+        );
+    }
+
+    drop_database(&client, db).await;
+}
+
+/// `IF NOT EXISTS` is what makes a re-run safe when a creation committed and
+/// its response was lost: an existing landing table is adopted, `run_init`
+/// returns `Ok`, and the migration is recorded. Without it the retry fails
+/// and the migration is never recorded.
+///
+/// The `CREATE` is written out here rather than read from the catalogue, so
+/// the case is a claim about the shipped statement's text and not a
+/// tautology over whatever the catalogue happens to hold.
+#[tokio::test]
+async fn an_existing_landing_table_is_adopted_by_a_rerun() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_landing_adopt");
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the database");
+
+    let create = format!(
+        "CREATE TABLE IF NOT EXISTS {db}.metric_landing (
+             event_id                 UUID DEFAULT generateUUIDv7(),
+             received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),
+             kind                     UInt8  CODEC(ZSTD(1)),
+             metric_name              LowCardinality(String),
+             fingerprint              UInt128  CODEC(Delta(8), ZSTD(1)),
+             unix_milli               Int64  CODEC(DoubleDelta, ZSTD(1)),
+             value                    Float64  CODEC(Gorilla, ZSTD(1)),
+             labels                   String  CODEC(ZSTD(5)),
+             value_type               UInt8  CODEC(ZSTD(1)),
+             metric_type              LowCardinality(String),
+             help                     String  CODEC(ZSTD(1)),
+             unit                     String  CODEC(ZSTD(1)),
+             updated_ns               Int64  CODEC(DoubleDelta, ZSTD(1)),
+             hist_schema              Int8  CODEC(ZSTD(1)),
+             hist_zero_threshold      Float64  CODEC(Gorilla, ZSTD(1)),
+             hist_zero_count          UInt64  CODEC(T64, ZSTD(1)),
+             hist_count               UInt64  CODEC(T64, ZSTD(1)),
+             hist_sum                 Float64  CODEC(Gorilla, ZSTD(1)),
+             hist_pos_span_offsets    Array(Int32)  CODEC(ZSTD(1)),
+             hist_pos_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),
+             hist_pos_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),
+             hist_neg_span_offsets    Array(Int32)  CODEC(ZSTD(1)),
+             hist_neg_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),
+             hist_neg_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),
+             hist_custom_values       Array(Float64)  CODEC(ZSTD(1)),
+             hist_counter_reset_hint  UInt8  CODEC(ZSTD(1))
+         ) ENGINE = MergeTree
+         PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
+         ORDER BY (kind, metric_name, fingerprint, unix_milli)
+         SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;"
+    );
+    client
+        .execute(&create, &QuerySettings::new(), Idempotency::Idempotent)
+        .await
+        .expect("create metric_landing directly, as a lost response would have left it");
+
+    run_init(&client, &test_ctx(db))
+        .await
+        .expect("a re-run adopts the existing table rather than failing");
+    let recorded = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = 64"),
+    )
+    .await;
+    assert_eq!(
+        recorded, 1,
+        "the migration is recorded once the re-run adopts the table"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// The landing table's delete-TTL is the configured hours, applied by
+/// `apply_ttl` rather than by the CREATE — so a statement that renders but is
+/// never run leaves the installed TTL what the CREATE gave, which is none at
+/// all. A second init at a different value replaces it.
+#[tokio::test]
+async fn run_init_installs_the_landing_ttl_at_the_configured_hours() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_landing_ttl");
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    ctx.metrics_landing_retention_hours = 1;
+    run_init(&client, &ctx).await.expect("run_init at 1 hour");
+
+    let create = create_table_query(&client, db, "metric_landing").await;
+    assert!(
+        create.contains("least(intDiv(received_ms, 1000) + (1 * 3600), 4294967295)"),
+        "the installed TTL must be the configured 1 hour: {create}"
+    );
+
+    ctx.metrics_landing_retention_hours = 168;
+    run_init(&client, &ctx).await.expect("re-init at 168 hours");
+    let create = create_table_query(&client, db, "metric_landing").await;
+    assert!(
+        create.contains("least(intDiv(received_ms, 1000) + (168 * 3600), 4294967295)"),
+        "the TTL must move with the configuration: {create}"
+    );
+    assert!(
+        !create.contains("(1 * 3600)"),
+        "the old value must be gone: {create}"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// The landing table and all four tables the views maintain carry the
+/// configured deduplication window: a view's insert carries a block id
+/// derived from the source block, and only a table with a window recognises
+/// the repeat.
+#[tokio::test]
+async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_dedup_windows");
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    ctx.metrics_dedup_window = 5_000;
+    run_init(&client, &ctx).await.expect("run_init");
+
+    for table in [
+        "metric_landing",
+        "metric_samples",
+        "metric_series",
+        "metric_metadata",
+        "metric_hist_samples",
+    ] {
+        let create = create_table_query(&client, db, table).await;
+        assert!(
+            create.contains("non_replicated_deduplication_window = 5000"),
+            "{table} must carry the configured block window: {create}"
+        );
+    }
+
+    drop_database(&client, db).await;
+}
+
+/// The startup name check reads the server's own catalogues: every required
+/// name is there, and a name that is not is reported by name.
+#[tokio::test]
+async fn required_names_are_read_from_the_server() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    let absent = pulsus_schema::absent_server_names(&client, pulsus_schema::REQUIRED_SERVER_NAMES)
+        .await
+        .expect("the catalogue query runs");
+    assert!(
+        absent.is_empty(),
+        "every name this build sends must exist on the server: {absent:?}"
+    );
+
+    let made_up = pulsus_schema::absent_server_names(
+        &client,
+        &[(
+            "pulsus_not_a_setting",
+            pulsus_schema::NameCatalogue::Setting,
+        )],
+    )
+    .await
+    .expect("the catalogue query runs");
+    assert_eq!(made_up, vec!["pulsus_not_a_setting"]);
+}
+
+/// A catalogue the deployment's user cannot read is a catalogue this build
+/// cannot check, **not** a refusal: `system.merge_tree_settings` needs a grant
+/// a user granted only its own database does not hold, and refusing on the
+/// denial would stop every least-privilege deployment from starting.
+///
+/// The readable catalogues are still checked, which is what separates
+/// "unreadable" from "unchecked": a made-up setting name in
+/// `system.settings`, which any user may read, is still reported absent for
+/// the same user.
+#[tokio::test]
+async fn a_catalogue_the_user_cannot_read_is_unchecked_not_a_refusal() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    let user = pulsus_testkit::test_ident("pulsus_schema_it_least_privilege");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_least_privilege_db");
+
+    let exec = |sql: String| {
+        let admin = &admin;
+        async move {
+            admin
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    };
+    exec(format!("DROP USER IF EXISTS {user}")).await;
+    exec(format!("CREATE DATABASE IF NOT EXISTS {db}")).await;
+    exec(format!("CREATE USER {user} IDENTIFIED WITH no_password")).await;
+    exec(format!("GRANT ALL ON {db}.* TO {user}")).await;
+
+    let mut as_user = test_config();
+    as_user.user = user.clone();
+    as_user.database = db.to_string();
+    let client = ChClient::new(as_user)
+        .await
+        .expect("connect as the least-privilege user");
+
+    // The user cannot read `system.merge_tree_settings`, so
+    // `merge_with_ttl_timeout` goes unchecked rather than reported absent.
+    let absent = pulsus_schema::absent_server_names(&client, pulsus_schema::REQUIRED_SERVER_NAMES)
+        .await
+        .expect("an unreadable catalogue is not an error");
+    assert!(
+        absent.is_empty(),
+        "a denied catalogue must not refuse startup: {absent:?}"
+    );
+
+    // And the readable ones are still checked.
+    let made_up = pulsus_schema::absent_server_names(
+        &client,
+        &[
+            (
+                "pulsus_not_a_setting",
+                pulsus_schema::NameCatalogue::Setting,
+            ),
+            (
+                "pulsus_not_a_merge_tree_setting",
+                pulsus_schema::NameCatalogue::MergeTreeSetting,
+            ),
+        ],
+    )
+    .await
+    .expect("the readable catalogue answers");
+    assert_eq!(
+        made_up,
+        vec!["pulsus_not_a_setting"],
+        "the readable catalogue still reports an absent name; the unreadable one reports \
+         nothing either way"
+    );
+
+    exec(format!("DROP USER IF EXISTS {user}")).await;
+    drop_database(&admin, db).await;
 }

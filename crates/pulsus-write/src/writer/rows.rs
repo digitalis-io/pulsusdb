@@ -377,40 +377,6 @@ impl SpoolEncode for MetricSeriesRow {
     }
 }
 
-/// `metric_series` backfill identity (issue #139): keyed `(metric_name,
-/// fingerprint, bucket unix_milli, value_type)` — the same scoping as the
-/// admission-time `SeriesKey` (`writer::registration`), including
-/// `value_type` (#120). VERSIONLESS (constant `0`): the key determines
-/// `labels` up to fingerprint identity (collisions are already accepted
-/// system-wide, `collisions_total`), so a "newer" enqueue mid-attempt
-/// carries byte-identical content and #134's version-checked-removal race
-/// fix degenerates safely to always-remove. Re-insert idempotency: the
-/// table is plain `MergeTree` but duplicate-tolerant by design — every
-/// read-side consumer dedups with `LIMIT 1 BY metric_name, fingerprint`
-/// (docs/schemas.md §2.1) and the writer already re-emits on LRU false
-/// miss; duplicates are bounded (one per poisoned generation per key) and
-/// collapse at read.
-impl BackfillRow for MetricSeriesRow {
-    type Key = (String, Fingerprint, i64, u8);
-
-    fn backfill_key(&self) -> Self::Key {
-        (
-            self.metric_name.clone(),
-            self.fingerprint,
-            self.unix_milli,
-            self.value_type,
-        )
-    }
-
-    fn backfill_version(&self) -> i64 {
-        0
-    }
-
-    fn backfill_bytes(&self) -> u64 {
-        self.est_bytes()
-    }
-}
-
 /// One `metric_hist_samples` row (docs/schemas.md §2.4, catalog id 23,
 /// M7-A4 issue #120). Field names/order match the DDL column list EXACTLY
 /// (identity triplet first, then the A3 histogram value columns). `schema`
@@ -615,24 +581,257 @@ impl SpoolEncode for MetricMetadataRow {
     }
 }
 
-/// `metric_metadata` backfill identity (issue #139): keyed `metric_name`
-/// (the `ReplacingMergeTree(updated_ns) ORDER BY metric_name` key),
-/// versioned on `updated_ns` — larger-wins replacement keeps the row that
-/// would win the merge, so a stale re-insert deterministically loses to a
-/// newer descriptor.
-impl BackfillRow for MetricMetadataRow {
-    type Key = String;
+/// One `metric_landing` row — one landed metrics event, whatever kind
+/// (issue #603). A metrics push becomes exactly one block of these, and the
+/// four derived metric tables are maintained from it by materialized view,
+/// so the writer inserts into none of them.
+///
+/// `kind` says which event the row is; a row sets that kind's columns and
+/// leaves the rest at the type's default. The fields are the landing
+/// table's 26 columns **less `event_id`**, in the table's own declaration
+/// order: the insert's column list is exactly this type's `COLUMN_NAMES`,
+/// so leaving the column out is what makes the server fill it from
+/// `DEFAULT generateUUIDv7()`. A row type carrying the column would store
+/// whatever the writer put there — the nil UUID on every row, for an
+/// explicit zero.
+///
+/// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
+/// `hist_sum`, `hist_zero_threshold` and `hist_custom_values` may be NaN
+/// markers, so equality must compare `.to_bits()`.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct MetricLandingRow {
+    pub received_ms: i64,
+    pub kind: u8,
+    pub metric_name: String,
+    pub fingerprint: Fingerprint,
+    pub unix_milli: i64,
+    pub value: f64,
+    pub labels: String,
+    pub value_type: u8,
+    pub metric_type: String,
+    pub help: String,
+    pub unit: String,
+    pub updated_ns: i64,
+    pub hist_schema: i8,
+    pub hist_zero_threshold: f64,
+    pub hist_zero_count: u64,
+    pub hist_count: u64,
+    pub hist_sum: f64,
+    pub hist_pos_span_offsets: Vec<i32>,
+    pub hist_pos_span_lengths: Vec<u32>,
+    pub hist_pos_bucket_deltas: Vec<i64>,
+    pub hist_neg_span_offsets: Vec<i32>,
+    pub hist_neg_span_lengths: Vec<u32>,
+    pub hist_neg_bucket_deltas: Vec<i64>,
+    pub hist_custom_values: Vec<f64>,
+    pub hist_counter_reset_hint: u8,
+}
 
-    fn backfill_key(&self) -> String {
-        self.metric_name.clone()
+/// One landing row's own inline footprint, in the shape the WRITER QUEUE
+/// holds it. Taken from `size_of` rather than written down, so it cannot drift
+/// from the fields it prices — the same rule [`ARRAY_ELEMENT_SLOT_BYTES`]
+/// follows.
+///
+/// A landing row is the union of the four target rows' columns, so it is far
+/// wider than any one of them: three `i64`s, three `f64`s, two `u64`s, a
+/// 16-byte fingerprint, four `String` headers, seven `Vec` headers and four
+/// small integers. What a target row costs prices only the text and array
+/// elements the row owns; the queue also holds all of those slots, every one
+/// of them whether or not its kind uses it.
+pub const LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<MetricLandingRow>() as u64;
+
+impl MetricLandingRow {
+    /// What the ingest queue is charged for one landing row whose kind's
+    /// target estimator priced its owned text and arrays at `target_bytes`.
+    ///
+    /// The queue reservation must count what we HOLD (issue #556's rule):
+    /// `PULSUS_INGEST_QUEUE_BYTES` names the buffered bytes, and a landing row
+    /// is held as a whole [`MetricLandingRow`] until its block is encoded, so
+    /// the row's inline slots are charged beside the buffers it owns.
+    pub fn est_landing_bytes(target_bytes: u64) -> u64 {
+        target_bytes + LANDING_ROW_SLOT_BYTES
     }
 
-    fn backfill_version(&self) -> i64 {
-        self.updated_ns
+    /// A float sample, whose target is `metric_samples`.
+    pub const KIND_FLOAT: u8 = 0;
+    /// A native-histogram sample, whose target is `metric_hist_samples`.
+    pub const KIND_HIST: u8 = 1;
+    /// A series registration, whose target is `metric_series`.
+    pub const KIND_SERIES: u8 = 2;
+    /// A metadata descriptor, whose target is `metric_metadata`.
+    pub const KIND_METADATA: u8 = 3;
+
+    /// A row of `kind` with every kind-specific column at its default.
+    fn of_kind(received_ms: i64, kind: u8) -> Self {
+        MetricLandingRow {
+            received_ms,
+            kind,
+            metric_name: String::new(),
+            fingerprint: Fingerprint::from_raw(0),
+            unix_milli: 0,
+            value: 0.0,
+            labels: String::new(),
+            value_type: 0,
+            metric_type: String::new(),
+            help: String::new(),
+            unit: String::new(),
+            updated_ns: 0,
+            hist_schema: 0,
+            hist_zero_threshold: 0.0,
+            hist_zero_count: 0,
+            hist_count: 0,
+            hist_sum: 0.0,
+            hist_pos_span_offsets: Vec::new(),
+            hist_pos_span_lengths: Vec::new(),
+            hist_pos_bucket_deltas: Vec::new(),
+            hist_neg_span_offsets: Vec::new(),
+            hist_neg_span_lengths: Vec::new(),
+            hist_neg_bucket_deltas: Vec::new(),
+            hist_custom_values: Vec::new(),
+            hist_counter_reset_hint: 0,
+        }
     }
 
-    fn backfill_bytes(&self) -> u64 {
-        self.est_bytes()
+    /// A kind-0 row: the columns `metric_samples_mv` reads, and no others.
+    pub fn float_sample(received_ms: i64, point: &MetricPoint) -> Self {
+        MetricLandingRow {
+            metric_name: point.metric_name.to_string(),
+            fingerprint: point.fingerprint,
+            unix_milli: point.unix_milli,
+            value: point.value,
+            ..Self::of_kind(received_ms, Self::KIND_FLOAT)
+        }
+    }
+
+    /// A kind-1 row: the columns `metric_hist_samples_mv` reads, and no
+    /// others. As in [`MetricHistSampleRow`]'s conversion, the histogram was
+    /// validated at the ingest seam, so `to_columns` cannot fail here.
+    pub fn hist_sample(received_ms: i64, point: &HistogramPoint) -> Self {
+        let cols = point
+            .histogram
+            .to_columns()
+            .expect("histogram validated at the ingest seam: to_columns cannot fail");
+        MetricLandingRow {
+            metric_name: point.metric_name.to_string(),
+            fingerprint: point.fingerprint,
+            unix_milli: point.unix_milli,
+            hist_schema: cols.schema,
+            hist_zero_threshold: cols.zero_threshold,
+            hist_zero_count: cols.zero_count,
+            hist_count: cols.count,
+            hist_sum: cols.sum,
+            hist_pos_span_offsets: cols.pos_span_offsets,
+            hist_pos_span_lengths: cols.pos_span_lengths,
+            hist_pos_bucket_deltas: cols.pos_bucket_deltas,
+            hist_neg_span_offsets: cols.neg_span_offsets,
+            hist_neg_span_lengths: cols.neg_span_lengths,
+            hist_neg_bucket_deltas: cols.neg_bucket_deltas,
+            hist_custom_values: cols.custom_values,
+            hist_counter_reset_hint: cols.counter_reset_hint,
+            ..Self::of_kind(received_ms, Self::KIND_HIST)
+        }
+    }
+
+    /// A kind-2 row: the columns `metric_series_mv` reads, and no others.
+    /// `unix_milli` is the activity-bucket floor the caller already
+    /// computed, never a sample time — the same contract
+    /// [`MetricSeriesRow::from_series_at_bucket`] carries.
+    pub fn series(
+        received_ms: i64,
+        series: &SeriesRef,
+        bucket_unix_milli: i64,
+        value_type: u8,
+    ) -> Self {
+        MetricLandingRow {
+            metric_name: series.metric_name.to_string(),
+            fingerprint: series.fingerprint,
+            unix_milli: bucket_unix_milli,
+            labels: series.labels.to_canonical_json(),
+            value_type,
+            ..Self::of_kind(received_ms, Self::KIND_SERIES)
+        }
+    }
+
+    /// A kind-3 row: the columns `metric_metadata_mv` reads, and no others.
+    pub fn metadata(received_ms: i64, meta: &MetricMetadata) -> Self {
+        MetricLandingRow {
+            metric_name: meta.metric_name.to_string(),
+            metric_type: meta.metric_type.clone(),
+            help: meta.help.clone(),
+            unit: meta.unit.clone(),
+            updated_ns: meta.updated_ns,
+            ..Self::of_kind(received_ms, Self::KIND_METADATA)
+        }
+    }
+}
+
+impl SpoolEncode for MetricLandingRow {
+    /// `kind` and `received_ms`, then exactly the keys that kind's target
+    /// row already emits — the two shipped float-bit encodings included, so
+    /// a non-finite value keeps its exact bit pattern
+    /// ([`MetricSampleRow`]'s impl carries the reason). One encoder
+    /// emitting every column of the union would put another kind's fields
+    /// in a row that does not carry them.
+    fn to_spool_value(&self) -> serde_json::Value {
+        match self.kind {
+            Self::KIND_FLOAT => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "value": finite_or_null(self.value),
+                "value_bits": self.value.to_bits().to_string(),
+            }),
+            Self::KIND_HIST => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "schema": self.hist_schema,
+                "zero_threshold": finite_or_null(self.hist_zero_threshold),
+                "zero_threshold_bits": self.hist_zero_threshold.to_bits().to_string(),
+                "zero_count": self.hist_zero_count,
+                "count": self.hist_count,
+                "sum": finite_or_null(self.hist_sum),
+                "sum_bits": self.hist_sum.to_bits().to_string(),
+                "pos_span_offsets": self.hist_pos_span_offsets,
+                "pos_span_lengths": self.hist_pos_span_lengths,
+                "pos_bucket_deltas": self.hist_pos_bucket_deltas,
+                "neg_span_offsets": self.hist_neg_span_offsets,
+                "neg_span_lengths": self.hist_neg_span_lengths,
+                "neg_bucket_deltas": self.hist_neg_bucket_deltas,
+                "custom_values": self.hist_custom_values.iter().copied().map(finite_or_null)
+                    .collect::<Vec<_>>(),
+                "custom_values_bits": self.hist_custom_values.iter()
+                    .map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+                "counter_reset_hint": self.hist_counter_reset_hint,
+            }),
+            Self::KIND_SERIES => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "labels": self.labels,
+                "value_type": self.value_type,
+            }),
+            // Every row is one of the four kinds — nothing else constructs
+            // one — so this arm is the descriptor's. Matching it as the
+            // fallback rather than panicking keeps the audit record
+            // readable on the one path that reaches this encoder at all,
+            // which is a failure path.
+            _ => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "metric_type": self.metric_type,
+                "help": self.help,
+                "unit": self.unit,
+                "updated_ns": self.updated_ns,
+            }),
+        }
     }
 }
 
@@ -960,6 +1159,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use pulsus_model::{Date, LabelSet, NativeHistogram, STALE_NAN_BITS, Span, UnixNano};
@@ -1647,6 +1847,325 @@ mod tests {
         assert_eq!(
             TraceAttrRow::est_source_bytes(&record),
             TraceAttrRow::from(&record).est_bytes()
+        );
+    }
+
+    // -- the landing row (issue #603) ---------------------------------
+
+    /// The 26 columns `metric_landing` declares, in its own declaration
+    /// order. Written out here so the row type cannot drift from the schema
+    /// silently — including the one column the writer must NOT send.
+    const LANDING_COLUMNS: [&str; 26] = [
+        "event_id",
+        "received_ms",
+        "kind",
+        "metric_name",
+        "fingerprint",
+        "unix_milli",
+        "value",
+        "labels",
+        "value_type",
+        "metric_type",
+        "help",
+        "unit",
+        "updated_ns",
+        "hist_schema",
+        "hist_zero_threshold",
+        "hist_zero_count",
+        "hist_count",
+        "hist_sum",
+        "hist_pos_span_offsets",
+        "hist_pos_span_lengths",
+        "hist_pos_bucket_deltas",
+        "hist_neg_span_offsets",
+        "hist_neg_span_lengths",
+        "hist_neg_bucket_deltas",
+        "hist_custom_values",
+        "hist_counter_reset_hint",
+    ];
+
+    /// The insert's column list is exactly the row type's `COLUMN_NAMES`, so
+    /// omitting `event_id` from the type is what makes the server fill the
+    /// column from its own `DEFAULT generateUUIDv7()`. A row type carrying
+    /// the column would store whatever the writer put there — the nil UUID on
+    /// every row, for an explicit zero — while passing every other case here.
+    #[test]
+    fn the_insert_omits_event_id_so_the_server_fills_it() {
+        let names = <MetricLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
+        assert_eq!(names.len(), 25, "the 26 columns less event_id");
+        let expected: Vec<&str> = LANDING_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| *c != "event_id")
+            .collect();
+        assert_eq!(names, expected.as_slice(), "in the table's own order");
+        assert!(
+            !names.contains(&"event_id"),
+            "the writer never sets the landed event's identity"
+        );
+    }
+
+    fn landing_float(value: f64) -> MetricLandingRow {
+        MetricLandingRow::float_sample(
+            7,
+            &MetricPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli: 1_000,
+                value,
+            },
+        )
+    }
+
+    fn landing_hist(sum: f64, zero_threshold: f64, custom_values: Vec<f64>) -> MetricLandingRow {
+        MetricLandingRow::hist_sample(
+            7,
+            &HistogramPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli: 1_000,
+                histogram: NativeHistogram {
+                    counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                    schema: 0,
+                    zero_threshold,
+                    zero_count: 0,
+                    count: 1,
+                    sum,
+                    positive_spans: vec![Span {
+                        offset: 1,
+                        length: 1,
+                    }],
+                    negative_spans: vec![],
+                    positive_buckets: vec![1],
+                    negative_buckets: vec![],
+                    custom_values,
+                },
+            },
+        )
+    }
+
+    /// A landing row serialized by plain JSON would turn every non-finite
+    /// float into `null`. Each `f64` column keeps its exact bit pattern in a
+    /// decimal-string `*_bits` field beside a readable value that is `null`
+    /// when the original was not finite — the shipped encoding, on the shipped
+    /// keys.
+    #[test]
+    fn the_landing_spool_keeps_every_float_bit() {
+        let float = landing_float(f64::from_bits(STALE_NAN_BITS)).to_spool_value();
+        assert_eq!(
+            float["value_bits"],
+            serde_json::Value::String(STALE_NAN_BITS.to_string())
+        );
+        assert!(float["value"].is_null());
+
+        let hist = landing_hist(
+            f64::from_bits(STALE_NAN_BITS),
+            f64::INFINITY,
+            vec![f64::NAN, 1.5],
+        )
+        .to_spool_value();
+        assert_eq!(
+            hist["sum_bits"],
+            serde_json::Value::String(STALE_NAN_BITS.to_string())
+        );
+        assert!(hist["sum"].is_null());
+        assert_eq!(
+            hist["zero_threshold_bits"],
+            serde_json::Value::String(f64::INFINITY.to_bits().to_string())
+        );
+        assert!(hist["zero_threshold"].is_null());
+        assert_eq!(
+            hist["custom_values_bits"],
+            serde_json::json!([f64::NAN.to_bits().to_string(), 1.5f64.to_bits().to_string()])
+        );
+        assert_eq!(hist["custom_values"], serde_json::json!([null, 1.5]));
+    }
+
+    /// One encoder emitting every column of the union, or omitting `kind`,
+    /// would put another kind's fields in a row that does not carry them.
+    /// Each kind's key set is exactly `{kind, received_ms}` plus the keys that
+    /// kind's shipped target encoder emits.
+    #[test]
+    fn the_landing_spool_carries_one_kind_and_its_own_fields() {
+        let (labels, _) = LabelSet::from_normalized([("a".to_string(), "b".to_string())]);
+        let series = SeriesRef {
+            metric_name: Arc::from("m"),
+            fingerprint: Fingerprint::from_raw(1),
+            labels,
+        };
+        let meta = MetricMetadata {
+            metric_name: Arc::from("m"),
+            metric_type: "counter".to_string(),
+            help: "h".to_string(),
+            unit: "s".to_string(),
+            updated_ns: 9,
+        };
+
+        let cases: [(MetricLandingRow, Vec<&str>); 4] = [
+            (
+                landing_float(1.5),
+                vec![
+                    "metric_name",
+                    "fingerprint",
+                    "unix_milli",
+                    "value",
+                    "value_bits",
+                ],
+            ),
+            (
+                landing_hist(1.0, 0.0, vec![]),
+                vec![
+                    "metric_name",
+                    "fingerprint",
+                    "unix_milli",
+                    "schema",
+                    "zero_threshold",
+                    "zero_threshold_bits",
+                    "zero_count",
+                    "count",
+                    "sum",
+                    "sum_bits",
+                    "pos_span_offsets",
+                    "pos_span_lengths",
+                    "pos_bucket_deltas",
+                    "neg_span_offsets",
+                    "neg_span_lengths",
+                    "neg_bucket_deltas",
+                    "custom_values",
+                    "custom_values_bits",
+                    "counter_reset_hint",
+                ],
+            ),
+            (
+                MetricLandingRow::series(7, &series, 3_600_000, 1),
+                vec![
+                    "metric_name",
+                    "fingerprint",
+                    "unix_milli",
+                    "labels",
+                    "value_type",
+                ],
+            ),
+            (
+                MetricLandingRow::metadata(7, &meta),
+                vec!["metric_name", "metric_type", "help", "unit", "updated_ns"],
+            ),
+        ];
+
+        for (row, own_keys) in cases {
+            let kind = row.kind;
+            let value = row.to_spool_value();
+            let got: BTreeSet<String> = value
+                .as_object()
+                .expect("a spool row is an object")
+                .keys()
+                .cloned()
+                .collect();
+            let mut want: BTreeSet<String> = own_keys.into_iter().map(str::to_string).collect();
+            want.insert("kind".to_string());
+            want.insert("received_ms".to_string());
+            assert_eq!(got, want, "kind {kind}'s key set");
+            assert_eq!(value["kind"].as_u64(), Some(u64::from(kind)));
+            assert_eq!(value["received_ms"].as_i64(), Some(7));
+        }
+    }
+
+    /// The four builders set their own kind's columns and leave every other
+    /// column at the type's default — so nothing of another kind's shape
+    /// travels in a row.
+    #[test]
+    fn each_landing_builder_sets_only_its_own_kind_columns() {
+        let float = landing_float(1.5);
+        assert_eq!(float.kind, MetricLandingRow::KIND_FLOAT);
+        assert_eq!(float.labels, "");
+        assert_eq!(float.metric_type, "");
+        assert_eq!(float.updated_ns, 0);
+        assert_eq!(float.hist_count, 0);
+        assert!(float.hist_pos_span_offsets.is_empty());
+
+        let hist = landing_hist(1.0, 0.25, vec![]);
+        assert_eq!(hist.kind, MetricLandingRow::KIND_HIST);
+        assert_eq!(hist.value, 0.0);
+        assert_eq!(hist.labels, "");
+        assert_eq!(hist.value_type, 0);
+
+        let (labels, _) = LabelSet::from_normalized([("a".to_string(), "b".to_string())]);
+        let series = MetricLandingRow::series(
+            7,
+            &SeriesRef {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                labels,
+            },
+            3_600_000,
+            1,
+        );
+        assert_eq!(series.kind, MetricLandingRow::KIND_SERIES);
+        assert_eq!(series.unix_milli, 3_600_000, "the bucket floor");
+        assert_eq!(series.labels, r#"{"a":"b"}"#);
+        assert_eq!(series.value_type, 1);
+        assert_eq!(series.value, 0.0);
+        assert_eq!(series.help, "");
+
+        let meta = MetricLandingRow::metadata(
+            7,
+            &MetricMetadata {
+                metric_name: Arc::from("m"),
+                metric_type: "counter".to_string(),
+                help: "h".to_string(),
+                unit: "s".to_string(),
+                updated_ns: 9,
+            },
+        );
+        assert_eq!(meta.kind, MetricLandingRow::KIND_METADATA);
+        assert_eq!(meta.help, "h");
+        assert_eq!(meta.unit, "s");
+        assert_eq!(meta.fingerprint, Fingerprint::from_raw(0));
+        assert_eq!(meta.unix_milli, 0);
+    }
+
+    /// Issue #603 code review, finding 3: the ingest queue holds a landing
+    /// row, not the target row it becomes, so charging it the target row's
+    /// size leaves `PULSUS_INGEST_QUEUE_BYTES` bounding something it does not
+    /// hold. A kind-0 landing row's target estimate is 33 bytes for a
+    /// one-character metric name, while the row itself occupies the union of
+    /// all four kinds' columns — so the shortfall is per row and grows with
+    /// the row count.
+    ///
+    /// The floor is derived by hand from the declaration, so the `size_of`
+    /// equality below is not the only thing establishing the figure: three
+    /// `i64` (24) + three `f64` (24) + two `u64` (16) + one 16-byte
+    /// fingerprint + four `String` headers (4 × 24 = 96) + seven `Vec`
+    /// headers (7 × 24 = 168) + four one-byte integers = 348, plus alignment
+    /// padding for the 16-byte-aligned fingerprint.
+    #[test]
+    fn a_landing_row_is_charged_the_row_the_queue_holds() {
+        const HAND_DERIVED_FLOOR: u64 = 348;
+        let slots = LANDING_ROW_SLOT_BYTES;
+        assert_eq!(
+            slots,
+            std::mem::size_of::<MetricLandingRow>() as u64,
+            "the constant prices the declaration it names"
+        );
+        assert!(
+            slots >= HAND_DERIVED_FLOOR,
+            "a landing row's slots come to at least {HAND_DERIVED_FLOOR}, got {slots}"
+        );
+
+        // Every kind's charge is its target estimate plus the row it is held
+        // in, so no kind escapes the slot cost — a kind whose columns are
+        // mostly empty still occupies every slot.
+        for target in [0u64, 14, 28, 33, 75, 1_000_000] {
+            assert_eq!(
+                MetricLandingRow::est_landing_bytes(target),
+                target + LANDING_ROW_SLOT_BYTES,
+                "the charge for a row whose buffers cost {target}"
+            );
+        }
+        assert!(
+            MetricLandingRow::est_landing_bytes(33)
+                >= std::mem::size_of::<MetricLandingRow>() as u64,
+            "a kind-0 row's charge must cover the row it is held in"
         );
     }
 }

@@ -385,20 +385,31 @@ pub fn discovery_fetch_by_names(
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
 /// `ReplacingMergeTree(updated_ns)` (docs/schemas.md §2.1) whose merges are
 /// asynchronous, so a plain `SELECT` can observe more than one row per
-/// `metric_name` — `argMax(_, updated_ns)` deterministically collapses to
-/// the latest-written value per column without waiting for a merge,
-/// grouped by the base family name (schemas.md §2.1's writer contract: a
-/// derived series' suffix is never stripped here — callers must already be
-/// querying by the base name). `metric` is an optional exact-name filter,
-/// `limit` an optional row cap.
+/// `metric_name` — `argMax(_, updated_ns)` deterministically collapses to the
+/// latest-written value without waiting for a merge, grouped by the base
+/// family name (schemas.md §2.1's writer contract: a derived series' suffix
+/// is never stripped here — callers must already be querying by the base
+/// name). `metric` is an optional exact-name filter, `limit` an optional row
+/// cap.
+///
+/// **One `argMax` over the whole tuple, not three independent ones** (issue
+/// #603). Three separate calls may resolve column by column where two rows
+/// for a name carry EQUAL `updated_ns`, and answer a descriptor assembled
+/// from both — the type from one row, the help from the other. One aggregate
+/// over the tuple makes one of the two rows win whole; which one is
+/// unspecified and needs no rule, since both are descriptors a client sent in
+/// that nanosecond, and the next push for that name settles it with a larger
+/// stamp. The columns are unpacked outside the grouping, so the four the
+/// caller decodes are unchanged, in order.
 pub fn metadata_query(metadata_table: &str, metric: Option<&str>, limit: Option<usize>) -> String {
-    let mut sql = format!(
-        "SELECT metric_name, argMax(metric_type, updated_ns) AS metric_type, argMax(help, updated_ns) AS help, argMax(unit, updated_ns) AS unit\nFROM {metadata_table}"
+    let mut sql = String::from(
+        "SELECT metric_name, tupleElement(d, 1) AS metric_type, tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\nFROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d",
     );
+    sql.push_str(&format!("\nFROM {metadata_table}"));
     if let Some(name) = metric {
         sql.push_str(&format!("\nWHERE metric_name = {}", ch_string(name)));
     }
-    sql.push_str("\nGROUP BY metric_name\nORDER BY metric_name");
+    sql.push_str("\nGROUP BY metric_name)\nORDER BY metric_name");
     if let Some(n) = limit {
         sql.push_str(&format!("\nLIMIT {n}"));
     }
@@ -1268,13 +1279,44 @@ mod tests {
 
     // --- metadata_query (issue #32) ---
 
+    /// Issue #603: one aggregate over the whole descriptor tuple. Three
+    /// independent `argMax` calls can resolve column by column on an
+    /// `updated_ns` tie and answer a descriptor assembled from two rows; the
+    /// substring count is what catches that, and the whole statement is
+    /// written out so the shape cannot drift silently.
     #[test]
-    fn metadata_query_with_no_filter_or_limit_selects_every_row() {
+    fn metadata_query_aggregates_the_descriptor_as_one_tuple() {
         let sql = metadata_query("metric_metadata", None, None);
-        assert!(sql.starts_with("SELECT metric_name, argMax(metric_type, updated_ns)"));
+        assert_eq!(
+            sql,
+            "SELECT metric_name, tupleElement(d, 1) AS metric_type, \
+             tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
+             FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
+             FROM metric_metadata\n\
+             GROUP BY metric_name)\n\
+             ORDER BY metric_name"
+        );
+        assert_eq!(
+            sql.matches("argMax(").count(),
+            1,
+            "one aggregate, so one row wins whole: {sql}"
+        );
         assert!(!sql.contains("WHERE"));
         assert!(!sql.contains("LIMIT"));
-        assert!(sql.ends_with("GROUP BY metric_name\nORDER BY metric_name"));
+
+        let filtered = metadata_query("metric_metadata", Some("up"), Some(10));
+        assert_eq!(
+            filtered,
+            "SELECT metric_name, tupleElement(d, 1) AS metric_type, \
+             tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
+             FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
+             FROM metric_metadata\n\
+             WHERE metric_name = 'up'\n\
+             GROUP BY metric_name)\n\
+             ORDER BY metric_name\n\
+             LIMIT 10"
+        );
+        assert_eq!(filtered.matches("argMax(").count(), 1);
     }
 
     #[test]

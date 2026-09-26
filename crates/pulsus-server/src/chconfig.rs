@@ -17,7 +17,7 @@ use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
     TraceEngine, TraceReadConfig,
 };
-use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema::{NameCatalogue, RenderCtx, SchemaError, SchemaParams};
 use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
 
 /// Maps `Config` to the connection settings any part of this binary dials
@@ -98,6 +98,41 @@ pub(crate) fn bootstrap_conn_config_from(config: &Config) -> ChConnConfig {
     }
 }
 
+/// Why the startup name check could not answer (issue #603). `Missing` is
+/// terminal — a name the server does not have is not going to appear — while
+/// the other two are the transient failures the serving path already
+/// log-and-backoffs.
+#[derive(Debug)]
+pub(crate) enum NameCheckError {
+    Connect(ChError),
+    Statement(SchemaError),
+    Missing(Vec<&'static str>),
+}
+
+/// Reads back every setting and function name this build sends that was not
+/// already in the tree, before anything sends one (issue #603).
+///
+/// It builds a bootstrap client of its own, so it does not need the target
+/// database to exist, and drops it again: the check runs before the serving
+/// pool is connected and before any DDL.
+pub(crate) async fn check_server_names(
+    config: &Config,
+    required: &[(&'static str, NameCatalogue)],
+) -> Result<(), NameCheckError> {
+    let client = ChClient::new(bootstrap_conn_config_from(config))
+        .await
+        .map_err(NameCheckError::Connect)?;
+    let absent = pulsus_schema::absent_server_names(&client, required)
+        .await
+        .map_err(NameCheckError::Statement)?;
+    drop(client);
+    if absent.is_empty() {
+        Ok(())
+    } else {
+        Err(NameCheckError::Missing(absent))
+    }
+}
+
 /// Maps `Config` to the schema controller's rendering/reconcile parameters
 /// (`pulsus_schema::run_init`/`reconcile`'s `SchemaParams`). Used by both
 /// `--mode init` and the serving reconnect loop's schema-reconcile step.
@@ -109,6 +144,8 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         storage_policy: config.storage_policy.clone(),
         retention_days: config.retention_days,
         log_rollup: config.log_rollup_resolution.0,
+        metrics_landing_retention_hours: config.metrics_landing_retention_hours,
+        metrics_dedup_window: config.metrics_dedup_window,
     }
 }
 
@@ -179,28 +216,19 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
     }
 }
 
-/// Maps `Config` to [`pulsus_write::MetricWriterTables`] (issue #26
-/// architect plan), deriving `_dist` names the *same way*
-/// [`writer_tables_from`] does for `metric_samples`/`metric_series` — a
-/// configured `cluster` writes through the `_dist` wrapper tables, an
-/// unclustered deployment writes the base tables directly. `metadata`
-/// NEVER carries a `_dist` suffix: `metric_metadata` is a global catalog
-/// table (docs/schemas.md §2.1/§7, catalog id 3, `family: None`), not
-/// sharded, so there is no `_dist` wrapper for it to reconcile in the
-/// first place.
+/// Maps `Config` to [`pulsus_write::MetricWriterTables`]: the one table the
+/// metrics writer inserts into (issue #603).
+///
+/// **The cluster plays no part.** The name carries no `_dist` suffix in any
+/// mode, because the landing table has no `Distributed` wrapper for the
+/// writer to name — `metric_metadata` was already rendered bare on this same
+/// path for its own reason (a global catalog table). The four target tables
+/// keep their wrappers, and [`metrics_config_from`] on the read path derives
+/// them exactly as before.
 pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
-    let dist = if config.cluster.is_some() {
-        config.dist_suffix.as_str()
-    } else {
-        ""
-    };
+    let _ = config;
     MetricWriterTables {
-        samples: Arc::from(format!("metric_samples{dist}")),
-        series: Arc::from(format!("metric_series{dist}")),
-        metadata: Arc::from("metric_metadata"),
-        // `metric_hist_samples` (M7-A4, issue #120) is a co-sharded
-        // Metrics-family table, `_dist`-aware exactly like `metric_samples`.
-        hist_samples: Arc::from(format!("metric_hist_samples{dist}")),
+        landing: Arc::from("metric_landing"),
     }
 }
 
@@ -272,10 +300,11 @@ pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> Result<La
 
 /// Maps `Config` to [`pulsus_read::MetricsConfig`] (issue #32 architect
 /// plan): `metric_samples`/`metric_series` are `_dist`-aware exactly as
-/// [`metric_writer_tables_from`]/[`label_cache_config_from`] derive them;
-/// `metric_metadata` is **never** `_dist`-suffixed (docs/schemas.md §2.1: a
-/// global, unsharded catalog table), mirroring
-/// [`metric_writer_tables_from`]'s own carve-out for it.
+/// [`label_cache_config_from`] derives them; `metric_metadata` is **never**
+/// `_dist`-suffixed (docs/schemas.md §2.1: a global, unsharded catalog
+/// table). This is the READ path and its derivation is unchanged — the four
+/// target tables keep their wrappers, and only the writer's own table name
+/// moved (issue #603, [`metric_writer_tables_from`]).
 pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
     let dist = if config.cluster.is_some() {
         config.dist_suffix.as_str()
@@ -596,26 +625,21 @@ mod tests {
     fn metric_writer_tables_from_uses_base_table_names_when_unclustered() {
         let config = Config::default();
         let tables = metric_writer_tables_from(&config);
-        assert_eq!(&*tables.samples, "metric_samples");
-        assert_eq!(&*tables.series, "metric_series");
-        assert_eq!(&*tables.metadata, "metric_metadata");
-        assert_eq!(&*tables.hist_samples, "metric_hist_samples");
+        assert_eq!(&*tables.landing, "metric_landing");
     }
 
+    /// Issue #603: no `_dist` name is left on the metrics write path at all.
+    /// The landing table has no `Distributed` wrapper for the writer to
+    /// name, so the cluster changes nothing here — unlike the read path,
+    /// whose four target tables keep their wrappers.
     #[test]
-    fn metric_writer_tables_from_uses_dist_table_names_when_clustered_except_metadata() {
+    fn metric_writer_tables_from_ignores_the_cluster_for_the_landing_table() {
         let config = Config {
             cluster: Some("prod".to_string()),
             ..Config::default()
         };
         let tables = metric_writer_tables_from(&config);
-        assert_eq!(&*tables.samples, "metric_samples_dist");
-        assert_eq!(&*tables.series, "metric_series_dist");
-        assert_eq!(
-            &*tables.metadata, "metric_metadata",
-            "metric_metadata is a global catalog table and must never carry a _dist suffix"
-        );
-        assert_eq!(&*tables.hist_samples, "metric_hist_samples_dist");
+        assert_eq!(&*tables.landing, "metric_landing");
     }
 
     #[test]

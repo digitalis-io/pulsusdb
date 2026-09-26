@@ -55,6 +55,8 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 | `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for all created tables |
 | `PULSUS_ROTATION_INTERVAL` | `1h` | how often the schema controller re-applies TTL/rotation |
 | `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
+| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | TTL for `metric_landing`, the one table a metrics push is inserted into (issue #603), in hours. The four tables queries read are maintained from it by materialized view and keep `PULSUS_RETENTION_DAYS`. It is the **replay window**: expiring it deletes nothing the views already wrote, but a target that ends up wrong can be rebuilt only from landed rows that are still there, so a deployment that wants a longer window raises it — on a cheap `PULSUS_STORAGE_POLICY` volume it buys more of that window at that volume's speed. Accepted range `1..=168`; both ends are rejected at config load |
+| `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the four tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **There is no companion time window**, because the engine has `non_replicated_deduplication_window` and no seconds-based counterpart for a non-replicated table: a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. Accepted range `1..=1000000`; both ends are rejected at config load |
 
 ## 4. Clustering
 
@@ -91,15 +93,18 @@ Deployment topologies:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_BATCH_BYTES` | `16MiB` | flush a table buffer at this size. Accepted range `1..=17179869184` bytes (16 GiB): values above the ceiling are rejected at config load, since they would defeat the byte-flush trigger. Scale tuning routes to #25 |
-| `PULSUS_BATCH_MS` | `200` | flush a table buffer at this age. Accepted range `1..=200000` ms: values above the ceiling are rejected at config load, since they would defeat the age-flush (staleness) trigger. Scale tuning routes to #25 |
+| `PULSUS_BATCH_BYTES` | `16MiB` | flush a table buffer at this size. **For metrics it is the per-push byte ceiling** (issue #603): a push whose estimated landing bytes exceed it is refused `413` whole, because a metrics push is one insert of one block and is never split. A landing row's estimate is the row the writer holds — the union of the four target tables' columns — plus the text and arrays that row owns, so the figure is what the push occupies in memory rather than what it eventually stores. Accepted range `1..=17179869184` bytes (16 GiB): values above the ceiling are rejected at config load, since they would defeat the byte-flush trigger. Scale tuning routes to #25 |
+| `PULSUS_BATCH_MS` | `200` | flush a table buffer at this age. **It no longer triggers a metrics flush** (issue #603): a metrics push is sealed and queued at admission, so nothing waits for an age trigger; on the metrics path it sets the cadence at which the push-suppression index ages an unsettled claim. Accepted range `1..=200000` ms: values above the ceiling are rejected at config load, since they would defeat the age-flush (staleness) trigger. Scale tuning routes to #25 |
 | `PULSUS_INSERT_MODE` | `sync` | `sync` \| `async` default when `X-Pulsus-Async` absent |
-| `PULSUS_INGEST_QUEUE_BYTES` | `256MiB` | total buffered bytes before `429` backpressure. Accepted range `1..=274877906944` bytes (256 GiB): values above the ceiling are rejected at config load, since they would defeat the memory backpressure guard. Scale tuning routes to #25 |
+| `PULSUS_INGEST_QUEUE_BYTES` | `256MiB` | total buffered bytes before `429` backpressure. A metrics push is charged the same estimate `PULSUS_BATCH_BYTES` bounds, and holds it until its block has committed or has been spooled. Accepted range `1..=274877906944` bytes (256 GiB): values above the ceiling are rejected at config load, since they would defeat the memory backpressure guard. Scale tuning routes to #25 |
 | `PULSUS_LOG_PATTERNS` | `true` | ingest-time log-pattern extraction (M7-C3): `true` extracts a deterministic template per log line and pre-aggregates it into `log_patterns`; `false` disables all extraction and every `log_patterns` append (zero write-path work) — the `GET /api/logs/v1/patterns` endpoint stays mounted and returns empty data |
 | `PULSUS_DISCOVER_LOG_LEVELS` | `true` | ingest-time log-level detection (issue #483): `true` attaches a `detected_level` structured-metadata pair to **every** log entry on every log-ingest path — the Loki push receiver (both encodings) and the OTLP logs receiver — resolved from a pre-existing `detected_level` pair, then a stream label, then the entry's other structured metadata, then the entry itself (the OTLP severity number, or the line parsed as JSON/logfmt, or a word-bounded scan of the whole line), falling through to `unknown`; `false` attaches nothing at all and stores a client-supplied `detected_level` exactly as sent. The value is what makes level colouring in a log view and the breakdown in a log-volume histogram work for a stream whose level is in the line body rather than in a label. It never enters `log_streams_idx`, so `/labels` and `/detected_labels` do not list it |
 | `PULSUS_INGEST_DEDUP` | `true` | retried-push suppression (issue #494). A client that retries a push after a network timeout would otherwise store its entries or samples twice, so `count_over_time`/`sum_over_time` return doubled values while `rate` looks right. `true` means a content-identical push that reaches **the same writer process** inside `PULSUS_INGEST_DEDUP_WINDOW` stores nothing and is answered with the original push's outcome; `false` restores the doubling |
 | `PULSUS_INGEST_DEDUP_WINDOW` | `5m` | how long one writer remembers an accepted push. A byte-identical push arriving after this has elapsed is a new push and is stored. Accepted range `1s..=1h`; both ends are rejected at config load |
 | `PULSUS_INGEST_DEDUP_MAX_BYTES` | `16MiB` | **per signal**, the bound on the whole suppression index — the reserved claim table plus every live registration of a blocked sync caller. The index reserves its collections once at construction and never grows them, so this is a hard bound: at it, a push is refused `429` with `pulsus_ingest_dedup_shed_total` (claim table) or `pulsus_ingest_dedup_wait_shed_total` (waiters) and nothing is stored. Accepted range `1MiB..=1GiB`; both ends are rejected at config load. Scale tuning routes to #25 |
+| `PULSUS_METRICS_LANDING_RETRIES` | `3` | resends of a failed metrics landing insert (issue #603). Every resend carries the same minted `insert_deduplication_token` and the identical block, so a resend of one the server already accepted stores nothing twice while `PULSUS_METRICS_DEDUP_WINDOW` still holds it. The **wall-clock** bound on the whole loop — the queue wait, every attempt and every sleep, from the push's admission — is 120 s, not this count; whichever binds first ends it. Accepted range `0..=10` |
+| `PULSUS_METRICS_LANDING_INSERTERS` | `4` | insert workers on the metrics landing queue, so how many landing inserts can be in flight at once. The queue itself is bounded by bytes, not by length: `PULSUS_INGEST_QUEUE_BYTES` is the only gate. Accepted range `1..=64` |
+| `PULSUS_METRICS_LANDING_MAX_ROWS` | `1048576` | per-push landing row ceiling, counted over samples, histogram samples, series registrations and descriptors together. A push at or above it is refused `413` naming its own size and both limits, never split — two blocks can commit a prefix, and a prefix is not all-or-nothing. `PULSUS_BATCH_BYTES` is the matching per-push byte ceiling. The same figure is pinned as each landing insert's `max_insert_block_size`, so an admitted push is strictly under the size the server would split a block at. Accepted range `1000..=10000000` |
 | `PULSUS_METRICS_EXP_HISTOGRAM_MODE` | `classic` | `classic` \| `native` \| `dual` — how OTLP exponential histograms are stored (see below) |
 | `PULSUS_OTLP_TRANSLATION_STRATEGY` | `UnderscoreEscapingWithSuffixes` | `NoUTF8EscapingWithSuffixes` \| `UnderscoreEscapingWithSuffixes` \| `UnderscoreEscapingWithoutSuffixes` \| `NoTranslation` — how OTLP metric and label names are rewritten on `POST /v1/metrics` (see below) |
 | `PULSUS_OTLP_PROMOTE_SCOPE_METADATA` | `false` | promote the instrumentation scope's name, version, schema URL and attributes onto every metric series as `otel_scope_*` labels |
@@ -214,6 +219,8 @@ retention_days: 7
 storage_policy: null
 rotation_interval: 1h
 log_rollup_resolution: 5s
+metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
+metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
 skip_unavailable_shards: false
@@ -247,6 +254,9 @@ writer:
   batch_ms: 200
   insert_mode: sync              # sync | async
   ingest_queue_bytes: 256MiB
+  metrics_landing_retries: 3     # resends of a failed metrics landing insert
+  metrics_landing_inserters: 4   # insert workers on the metrics landing queue
+  metrics_landing_max_rows: 1048576   # per-push landing row ceiling
 
 reader:
   cache_ttl: 60s

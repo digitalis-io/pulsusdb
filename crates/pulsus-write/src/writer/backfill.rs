@@ -8,17 +8,17 @@
 //! this task's own `InsertUncertain` outcome is terminal-abandon, never
 //! retried.
 //!
-//! Generic over [`BackfillRow`] (issue #139): one mechanism serves all
-//! four registration tables —
+//! Generic over [`BackfillRow`] (issue #139): one mechanism serves the two
+//! registration tables that still have a backlog —
 //! - `log_streams` (`LogStreamRow`): keyed `(fingerprint, month)`,
-//!   versioned on `updated_ns` (`ReplacingMergeTree(updated_ns)`);
-//! - `metric_series` (`MetricSeriesRow`): keyed `(metric_name,
-//!   fingerprint, bucket, value_type)`, versionless — duplicate-tolerant
-//!   by design (read-side `LIMIT 1 BY` collapse);
-//! - `metric_metadata` (`MetricMetadataRow`): keyed `metric_name`,
 //!   versioned on `updated_ns` (`ReplacingMergeTree(updated_ns)`);
 //! - `trace_attrs_idx` (`TraceAttrRow`): keyed on the full RMT ORDER BY
 //!   tuple, versionless — the key determines the whole logical row.
+//!
+//! **The metrics path has no backlog** (issue #603): one push is one insert
+//! of one block into `metric_landing`, so there is no separate registration
+//! insert to lose. A push whose insert failed emits its registration rows
+//! again next time, because the series LRU is promoted only by a commit.
 //!
 //! The append-only tables (`log_samples`, `metric_samples`,
 //! `metric_hist_samples`, `trace_spans`) are structurally excluded: their
@@ -32,11 +32,10 @@
 //! audit-only per #9, and the poison-spool file (when its write
 //! succeeded; `spool_write_failures_total` otherwise) remains the manual
 //! repair record. Cache promotion on heal is family-specific via the
-//! `on_healed` hook: `StreamLru`/`SeriesLru` membership promotion is safe
-//! (pure membership over the full logical identity); the metadata hook
-//! only ever *invalidates* its value cache (issue #139: a heal must never
-//! install a descriptor — see `writer::metric::metadata_healed_hook`);
-//! traces have no cache (`on_healed: None`).
+//! `on_healed` hook: `StreamLru` membership promotion is safe (pure
+//! membership over the full logical identity); traces have no cache
+//! (`on_healed: None`). The metrics path has no backlog at all (issue
+//! #603).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -176,10 +175,9 @@ impl<R: BackfillRow> RegistrationBacklog<R> {
 
 /// A confirmed-heal callback, invoked with exactly the entries a
 /// successful re-insert attempt removed from the backlog (issue #139):
-/// `log_streams` promotes `StreamLru`, `metric_series` promotes
-/// `SeriesLru` (both pure membership sets — safe), `metric_metadata`
-/// ONLY invalidates its value cache (never installs — see
-/// `writer::metric::metadata_healed_hook`), `trace_attrs_idx` has none.
+/// `log_streams` promotes `StreamLru` (a pure membership set — safe) and
+/// `trace_attrs_idx` has none. The metrics path has no backlog at all
+/// (issue #603).
 pub(crate) type BackfillHealedHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
 /// The `on_flush_poisoned` hook body shared by every registration table
@@ -422,7 +420,7 @@ fn remove_matching_and_update_gauge<R: BackfillRow>(
 mod tests {
     use super::*;
     use crate::writer::registration::StreamKey;
-    use crate::writer::rows::{LogStreamRow, MetricSeriesRow};
+    use crate::writer::rows::{LogStreamRow, TraceAttrRow};
     use pulsus_model::Fingerprint;
 
     fn row(fingerprint: Fingerprint, month: u16, updated_ns: i64) -> LogStreamRow {
@@ -603,13 +601,21 @@ mod tests {
         assert_eq!(metrics.pending.load(Ordering::Relaxed), 1);
     }
 
-    fn series_row(metric_name: &str, fingerprint: Fingerprint, bucket: i64) -> MetricSeriesRow {
-        MetricSeriesRow {
-            metric_name: metric_name.to_string(),
-            fingerprint,
-            unix_milli: bucket,
-            labels: "{\"job\":\"checkout\"}".to_string(),
-            value_type: 0,
+    /// One `trace_attrs_idx` row — the remaining VERSIONLESS family (issue
+    /// #603 took the metrics rows out of the backfill, and `metric_series`
+    /// was the fixture these two cases used before).
+    fn attr_row(key: &str, val: &str, timestamp_ns: i64) -> TraceAttrRow {
+        TraceAttrRow {
+            date: 19_800,
+            key: key.to_string(),
+            val: val.to_string(),
+            scope: "span".to_string(),
+            val_num: None,
+            timestamp_ns,
+            trace_id: [1u8; 16],
+            span_id: [2u8; 8],
+            duration_ns: 10,
+            val_type: "string".to_string(),
         }
     }
 
@@ -620,12 +626,12 @@ mod tests {
     #[test]
     fn versionless_family_removal_degenerates_to_always_remove() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let attempted = vec![series_row("up", Fingerprint::from_raw(1), 0)];
+        let attempted = vec![attr_row("http.method", "GET", 1_000)];
         backlog.enqueue(&attempted);
         // A re-enqueue mid-attempt for the same key is byte-identical
         // content ("accepted" but nothing to replace: version 0 == 0).
         assert_eq!(
-            backlog.enqueue(&[series_row("up", Fingerprint::from_raw(1), 0)]),
+            backlog.enqueue(&[attr_row("http.method", "GET", 1_000)]),
             (1, 0)
         );
         assert_eq!(backlog.len(), 1);
@@ -635,18 +641,16 @@ mod tests {
         assert_eq!(backlog.len(), 0);
     }
 
-    /// The versionless series key is the FULL logical identity: same
-    /// `(name, fingerprint)` at a different bucket or `value_type` is a
-    /// distinct entry, never a replacement.
+    /// The versionless attr key is the FULL logical identity: the same
+    /// `(key, val, scope)` at a different timestamp, or a different value at
+    /// the same timestamp, is a distinct entry and never a replacement.
     #[test]
-    fn versionless_series_keys_distinguish_bucket_and_value_type() {
+    fn versionless_attr_keys_distinguish_every_key_column() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
-        let mut hist = series_row("up", Fingerprint::from_raw(1), 0);
-        hist.value_type = 1;
         backlog.enqueue(&[
-            series_row("up", Fingerprint::from_raw(1), 0),
-            series_row("up", Fingerprint::from_raw(1), 3_600_000),
-            hist,
+            attr_row("http.method", "GET", 1_000),
+            attr_row("http.method", "GET", 2_000),
+            attr_row("http.method", "POST", 1_000),
         ]);
         assert_eq!(backlog.len(), 3);
     }

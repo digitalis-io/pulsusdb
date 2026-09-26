@@ -12,7 +12,7 @@
 //! `_dist` wrappers appended (docs/schemas.md §7).
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, ChError, Idempotency, QuerySettings, Row};
 
 use crate::bookkeeping::{
     checksum_hex, find_migration, find_mv_checksum, record_migration, upsert_mv_checksum,
@@ -251,6 +251,9 @@ impl RollupObjectKind {
     }
 }
 
+/// One name read off a catalogue: a `system.tables` row here, and a
+/// `system.settings`/`system.merge_tree_settings`/`system.functions` row for
+/// [`absent_server_names`] (issue #603).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct NameRow {
     name: String,
@@ -502,7 +505,7 @@ const TTL_STMTS: [&str; 18] = [
 /// operator who manually altered it away is corrected on the next rotation
 /// tick too.
 pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaError> {
-    for stmt in TTL_STMTS {
+    for stmt in TTL_STMTS.iter().chain(METRIC_LANDING_STMTS) {
         let rendered = render::substitute_tokens(stmt, ctx);
         client
             .execute(&rendered, &QuerySettings::new(), Idempotency::Idempotent)
@@ -511,9 +514,530 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
     Ok(())
 }
 
+/// The metrics landing table's own delete-TTL, plus the block-deduplication
+/// window every table on the metrics write path carries (issue #603).
+///
+/// Appended to the statements [`apply_ttl`] itself runs rather than applied
+/// by a function of its own, so `run_init`, [`crate::spawn_rotation`] and
+/// the server's rotation tick all reapply them with no new wiring and no
+/// call site left to miss. `apply_ttl` stops at its first failing
+/// statement, so the order is a dependency order: these come after
+/// [`TTL_STMTS`] — the `metric_hist_samples` precedent — and the three
+/// naming the landing table come last within them, so an operator-managed
+/// schema without that table stops nothing that does not name it.
+///
+/// The four derived tables need a window of their own because a view's
+/// insert carries a block id derived from the source block, and only a
+/// table with a window recognises the repeat.
+const METRIC_LANDING_STMTS: &[&str] = &[
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_series{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_metadata{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(received_ms, 1000) + {{metrics_landing_retention_hours}} * 3600, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+];
+
+/// The projection one materialized view applies, read out of that view's own
+/// rendered statement so the two cannot drift (issue #603).
+///
+/// `None` when no view of that name is in the catalogue. Used by the metrics
+/// rebuild path, which replays the landing table through the same projection
+/// the view applies to a new insert.
+pub fn mv_projection(mv_name: &str, ctx: &RenderCtx) -> Option<String> {
+    let mv = MVS.iter().find(|mv| mv.name == mv_name)?;
+    let rendered = render::render(mv.tmpl, &render::render_name(mv.name, ctx), ctx, false);
+    let (_, body) = rendered.split_once(" AS\n")?;
+    Some(body.trim_end().trim_end_matches(';').to_string())
+}
+
+/// Which `system` table answers whether one name exists (issue #603).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameCatalogue {
+    Setting,
+    MergeTreeSetting,
+    Function,
+}
+
+impl NameCatalogue {
+    /// The `system` table this catalogue is read from.
+    pub(crate) const fn table(self) -> &'static str {
+        match self {
+            NameCatalogue::Setting => "system.settings",
+            NameCatalogue::MergeTreeSetting => "system.merge_tree_settings",
+            NameCatalogue::Function => "system.functions",
+        }
+    }
+}
+
+/// Every setting and function name this build sends that was not already
+/// somewhere in `crates/`, read back from the server before anything sends
+/// it (issue #603). A name that might not exist is never sent: absent,
+/// startup refuses and says which.
+pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
+    ("insert_deduplication_token", NameCatalogue::Setting),
+    ("max_insert_block_size", NameCatalogue::Setting),
+    ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
+    ("generateUUIDv7", NameCatalogue::Function),
+    ("toStartOfHour", NameCatalogue::Function),
+    ("tupleElement", NameCatalogue::Function),
+];
+
+/// One `SELECT name FROM <catalogue> WHERE name IN (…)` statement per
+/// catalogue that has at least one required name, in catalogue order. An
+/// empty `required` renders no statement.
+///
+/// **One statement per catalogue, not one joined statement.** A deployment's
+/// ClickHouse user may hold `SELECT` on some of these `system` tables and not
+/// others — `system.settings` and `system.functions` are readable by any
+/// user, while `system.merge_tree_settings` needs an explicit grant — and a
+/// joined statement fails whole on the one it cannot read, so a readable
+/// catalogue would go unchecked because of an unreadable one.
+pub fn required_names_sql(
+    required: &[(&'static str, NameCatalogue)],
+) -> Vec<(NameCatalogue, String)> {
+    let mut out: Vec<(NameCatalogue, String)> = Vec::new();
+    for catalogue in [
+        NameCatalogue::Setting,
+        NameCatalogue::MergeTreeSetting,
+        NameCatalogue::Function,
+    ] {
+        let names: Vec<String> = required
+            .iter()
+            .filter(|(_, c)| *c == catalogue)
+            .map(|(name, _)| format!("'{name}'"))
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        out.push((
+            catalogue,
+            format!(
+                "SELECT name FROM {} WHERE name IN ({})",
+                catalogue.table(),
+                names.join(", ")
+            ),
+        ));
+    }
+    out
+}
+
+/// The required names absent from `present`, in `required` order. It matches
+/// on the name alone; the statement is what binds a name to its catalogue.
+pub fn missing_server_names(
+    required: &[(&'static str, NameCatalogue)],
+    present: &[String],
+) -> Vec<&'static str> {
+    required
+        .iter()
+        .filter(|(name, _)| !present.iter().any(|p| p == name))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Reads each of [`required_names_sql`]'s statements off the server and
+/// reports what [`missing_server_names`] makes of the answers. An empty
+/// `required` runs no statement and returns an empty list.
+///
+/// **A catalogue this user has no grant to read is a catalogue this build
+/// cannot check, not a refusal** — and nothing wider than that: see
+/// [`catalogue_read_is_unchecked`]. A name a readable catalogue reports ABSENT
+/// still refuses.
+pub async fn absent_server_names(
+    client: &ChClient,
+    required: &[(&'static str, NameCatalogue)],
+) -> Result<Vec<&'static str>, SchemaError> {
+    let mut reads = Vec::new();
+    for (catalogue, sql) in required_names_sql(required) {
+        reads.push((catalogue, read_names(client, &sql).await));
+    }
+    fold_catalogue_reads(required, reads)
+}
+
+/// ClickHouse's `ACCESS_DENIED` server error code, which a `SELECT` on a
+/// `system` table the deployment's user holds no grant for is answered with.
+/// The only failure a catalogue read is allowed to continue past.
+const ACCESS_DENIED: i32 = 497;
+
+/// Whether one catalogue read's failure leaves that catalogue **unchecked**
+/// rather than refusing startup.
+///
+/// Access denial alone. A denied `SELECT` says nothing about whether the name
+/// is there, and refusing on it would stop every least-privilege deployment
+/// from starting — `system.merge_tree_settings` needs a grant a user granted
+/// only its own database does not hold. Every other failure — a timeout, a
+/// transport fault, a decode failure, any other server exception — means the
+/// catalogue was not read for a reason that says nothing about grants, so
+/// continuing would let startup send a name nothing checked (issue #603 code
+/// review, finding 6).
+fn catalogue_read_is_unchecked(err: &SchemaError) -> bool {
+    matches!(
+        err,
+        SchemaError::Clickhouse(ChError::Server {
+            code: ACCESS_DENIED,
+            ..
+        })
+    )
+}
+
+/// Turns one catalogue read per catalogue into the list of required names the
+/// server reported absent. Pure, so which failures are tolerated and which
+/// names go unchecked is testable without a server.
+///
+/// A read that succeeded contributes its names and puts its catalogue's
+/// required names into the checked set. A read denied by access control
+/// contributes neither, with a warning naming the catalogue. Any other
+/// failure is returned.
+fn fold_catalogue_reads(
+    required: &[(&'static str, NameCatalogue)],
+    reads: Vec<(NameCatalogue, Result<Vec<String>, SchemaError>)>,
+) -> Result<Vec<&'static str>, SchemaError> {
+    let mut present: Vec<String> = Vec::new();
+    let mut checked: Vec<(&'static str, NameCatalogue)> = Vec::new();
+    for (catalogue, read) in reads {
+        match read {
+            Ok(names) => {
+                present.extend(names);
+                checked.extend(required.iter().filter(|(_, c)| *c == catalogue).copied());
+            }
+            Err(err) if catalogue_read_is_unchecked(&err) => tracing::warn!(
+                catalogue = catalogue.table(),
+                error = %err,
+                "no grant to read a name catalogue; the names it holds are not checked"
+            ),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(missing_server_names(&checked, &present))
+}
+
+/// Every `name` one catalogue statement returns.
+async fn read_names(client: &ChClient, sql: &str) -> Result<Vec<String>, SchemaError> {
+    let mut stream = client
+        .query_stream::<NameRow>(sql, &QuerySettings::new())
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row?.name);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the metrics landing statements (issue #603) -------------------
+
+    fn metrics_ctx(retention_hours: u32, window: u64) -> RenderCtx {
+        RenderCtx {
+            db: "pulsus".to_string(),
+            cluster: None,
+            dist_suffix: "_dist".to_string(),
+            storage_policy: None,
+            retention_days: 7,
+            log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: retention_hours,
+            metrics_dedup_window: window,
+        }
+    }
+
+    /// The landing table's own delete-TTL renders the configured hours, in
+    /// the same clamped Int64-seconds form every other table's TTL uses. A
+    /// statement hard-coding 6 hours passes at the default and fails here.
+    #[test]
+    fn the_landing_ttl_renders_the_configured_hours() {
+        for hours in [1u32, 168] {
+            let rendered: Vec<String> = METRIC_LANDING_STMTS
+                .iter()
+                .map(|s| render::substitute_tokens(s, &metrics_ctx(hours, 10_000)))
+                .filter(|s| s.contains("MODIFY TTL"))
+                .collect();
+            assert_eq!(rendered.len(), 1, "one TTL statement, the landing table's");
+            assert_eq!(
+                rendered[0],
+                format!(
+                    "ALTER TABLE pulsus.metric_landing MODIFY TTL \
+                     toDateTime(least(intDiv(received_ms, 1000) + {hours} * 3600, 4294967295)) \
+                     DELETE;"
+                )
+            );
+        }
+    }
+
+    /// The landing table and all four tables the views maintain carry the
+    /// configured deduplication window: a view's insert carries a block id
+    /// derived from the source block, and only a table with a window
+    /// recognises the repeat. A statement hard-coding 10000 passes at the
+    /// default and fails here.
+    ///
+    /// **One setting per table, the count**: the engine has no seconds-based
+    /// counterpart to `non_replicated_deduplication_window`, so a block is
+    /// remembered until that many newer blocks have arrived rather than for a
+    /// stated time.
+    #[test]
+    fn the_dedup_window_statements_name_all_five_tables() {
+        let rendered: Vec<String> = METRIC_LANDING_STMTS
+            .iter()
+            .map(|s| render::substitute_tokens(s, &metrics_ctx(6, 5_000)))
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            6,
+            "one per target, plus the source's TTL and its own window"
+        );
+        for table in [
+            "metric_samples",
+            "metric_series",
+            "metric_metadata",
+            "metric_hist_samples",
+            "metric_landing",
+        ] {
+            let want = format!(
+                "ALTER TABLE pulsus.{table} MODIFY SETTING \
+                 non_replicated_deduplication_window = 5000;"
+            );
+            assert!(
+                rendered.contains(&want),
+                "missing: {want}\nrendered: {rendered:#?}"
+            );
+        }
+        assert!(
+            !rendered
+                .iter()
+                .any(|s| s.contains("non_replicated_deduplication_window_seconds")),
+            "the engine has no such setting: sending it refuses every startup"
+        );
+    }
+
+    /// `apply_ttl` stops at its first failing statement, so the order is a
+    /// dependency order: the landing table's own two statements come last, so
+    /// an operator-managed schema without that table stops nothing that does
+    /// not name it.
+    #[test]
+    fn the_landing_statements_come_last_within_the_metrics_block() {
+        let first_landing = METRIC_LANDING_STMTS
+            .iter()
+            .position(|s| s.contains("metric_landing"))
+            .expect("the landing table has statements");
+        assert!(
+            METRIC_LANDING_STMTS[first_landing..]
+                .iter()
+                .all(|s| s.contains("metric_landing")),
+            "nothing but landing statements may follow the first one"
+        );
+        assert_eq!(METRIC_LANDING_STMTS.len() - first_landing, 2);
+    }
+
+    // -- the startup name check (issue #603) --------------------------
+
+    /// The decision is pure: over an empty server every required name is
+    /// reported, over a complete one none is, and over each six-element
+    /// subset exactly the one left out. A list that hard-codes one absent
+    /// name cannot pass the subsets.
+    #[test]
+    fn the_startup_name_decision_is_pure() {
+        let all: Vec<String> = REQUIRED_SERVER_NAMES
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        assert_eq!(
+            missing_server_names(REQUIRED_SERVER_NAMES, &[]),
+            REQUIRED_SERVER_NAMES
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            "over an empty server every required name is missing, in order"
+        );
+        assert!(missing_server_names(REQUIRED_SERVER_NAMES, &all).is_empty());
+        for (i, (left_out, _)) in REQUIRED_SERVER_NAMES.iter().enumerate() {
+            let mut present = all.clone();
+            present.remove(i);
+            assert_eq!(
+                missing_server_names(REQUIRED_SERVER_NAMES, &present),
+                vec![*left_out],
+                "the subset without {left_out} reports exactly it"
+            );
+        }
+        assert!(missing_server_names(&[], &[]).is_empty());
+    }
+
+    /// The statements ask for exactly the required names, and each names its
+    /// own catalogue alone — a merge-tree setting looked for in
+    /// `system.settings` is absent there and would refuse every startup.
+    ///
+    /// **One statement per catalogue**, so a catalogue this user cannot read
+    /// does not blind the ones it can.
+    #[test]
+    fn the_sql_asks_for_exactly_the_required_names() {
+        let statements = required_names_sql(REQUIRED_SERVER_NAMES);
+        assert_eq!(
+            statements.len(),
+            3,
+            "one per catalogue with a required name"
+        );
+        let quoted: std::collections::BTreeSet<&str> = statements
+            .iter()
+            .flat_map(|(_, sql)| sql.split('\'').skip(1).step_by(2))
+            .collect();
+        let want: std::collections::BTreeSet<&str> =
+            REQUIRED_SERVER_NAMES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(quoted, want, "the literals ARE the list: {statements:?}");
+        for (catalogue, sql) in &statements {
+            for table in [
+                "system.settings",
+                "system.merge_tree_settings",
+                "system.functions",
+            ] {
+                let expected = usize::from(table == catalogue.table());
+                assert_eq!(
+                    sql.matches(table).count(),
+                    expected,
+                    "{table} in the {} statement: {sql}",
+                    catalogue.table()
+                );
+            }
+        }
+
+        // One row of each catalogue names that catalogue alone.
+        for (catalogue, table) in [
+            (NameCatalogue::Setting, "system.settings"),
+            (
+                NameCatalogue::MergeTreeSetting,
+                "system.merge_tree_settings",
+            ),
+            (NameCatalogue::Function, "system.functions"),
+        ] {
+            assert_eq!(
+                required_names_sql(&[("only_one", catalogue)]),
+                vec![(
+                    catalogue,
+                    format!("SELECT name FROM {table} WHERE name IN ('only_one')")
+                )]
+            );
+        }
+        assert!(
+            required_names_sql(&[]).is_empty(),
+            "an empty list runs no statement"
+        );
+    }
+
+    /// The three statements, written out, so the list and the statements
+    /// cannot drift apart unnoticed.
+    #[test]
+    fn the_required_names_statements_are_exactly_this_text() {
+        assert_eq!(
+            required_names_sql(REQUIRED_SERVER_NAMES),
+            vec![
+                (
+                    NameCatalogue::Setting,
+                    "SELECT name FROM system.settings WHERE name IN \
+                     ('insert_deduplication_token', 'max_insert_block_size')"
+                        .to_string()
+                ),
+                (
+                    NameCatalogue::MergeTreeSetting,
+                    "SELECT name FROM system.merge_tree_settings WHERE name IN \
+                     ('merge_with_ttl_timeout')"
+                        .to_string()
+                ),
+                (
+                    NameCatalogue::Function,
+                    "SELECT name FROM system.functions WHERE name IN \
+                     ('generateUUIDv7', 'toStartOfHour', 'tupleElement')"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Issue #603 code review, finding 6: a catalogue read that failed for a
+    /// reason other than a missing grant must refuse startup, not leave the
+    /// names it holds silently unchecked. A timeout, a transport fault, a
+    /// decode failure or any other server exception says nothing about
+    /// grants — continuing past one lets the build send a name nothing ever
+    /// looked for, which is the whole point of the check.
+    #[test]
+    fn only_a_denied_grant_leaves_a_catalogue_unchecked() {
+        const NAMES: &[(&str, NameCatalogue)] = &[
+            ("a_setting", NameCatalogue::Setting),
+            ("a_function", NameCatalogue::Function),
+        ];
+        let denied = || {
+            SchemaError::Clickhouse(ChError::Server {
+                code: 497,
+                message: "Not enough privileges on system.merge_tree_settings".to_string(),
+            })
+        };
+
+        // Access denial on the settings catalogue: its name goes unchecked,
+        // and the readable catalogue's absent name still refuses.
+        let absent = fold_catalogue_reads(
+            NAMES,
+            vec![
+                (NameCatalogue::Setting, Err(denied())),
+                (NameCatalogue::Function, Ok(Vec::new())),
+            ],
+        )
+        .expect("a denied grant is not a refusal");
+        assert_eq!(
+            absent,
+            vec!["a_function"],
+            "the unreadable catalogue's name is unchecked; the readable \
+             catalogue's absent name still refuses"
+        );
+
+        // Every other failure is returned.
+        for (label, err) in [
+            (
+                "a timeout",
+                SchemaError::Clickhouse(ChError::Timeout("deadline".to_string())),
+            ),
+            (
+                "a transport fault",
+                SchemaError::Clickhouse(ChError::Io("reset by peer".to_string())),
+            ),
+            (
+                "a decode failure",
+                SchemaError::Clickhouse(ChError::Decode("not a NameRow".to_string())),
+            ),
+            (
+                "another server exception",
+                SchemaError::Clickhouse(ChError::Server {
+                    code: 60,
+                    message: "Table system.settings does not exist".to_string(),
+                }),
+            ),
+            (
+                "a non-ClickHouse schema error",
+                SchemaError::Version("nonsense".to_string()),
+            ),
+        ] {
+            let got = fold_catalogue_reads(
+                NAMES,
+                vec![
+                    (NameCatalogue::Setting, Err(err)),
+                    (NameCatalogue::Function, Ok(vec!["a_function".to_string()])),
+                ],
+            );
+            assert!(
+                got.is_err(),
+                "{label} must refuse rather than leave a catalogue unchecked, got {got:?}"
+            );
+        }
+
+        // Both readable: nothing absent.
+        let absent = fold_catalogue_reads(
+            NAMES,
+            vec![
+                (NameCatalogue::Setting, Ok(vec!["a_setting".to_string()])),
+                (NameCatalogue::Function, Ok(vec!["a_function".to_string()])),
+            ],
+        )
+        .expect("two good reads");
+        assert!(absent.is_empty(), "{absent:?}");
+    }
 
     /// Issue #131 AC9: both trace `MODIFY TTL` statements render the
     /// saturating expression — Int64 arithmetic clamped to `u32::MAX`
@@ -529,6 +1053,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         };
         let trace_ttl_stmts: Vec<String> = TTL_STMTS
             .iter()
@@ -586,6 +1112,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: std::time::Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         };
         let rendered: Vec<String> = TTL_STMTS
             .iter()

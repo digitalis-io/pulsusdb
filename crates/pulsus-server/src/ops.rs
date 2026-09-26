@@ -309,15 +309,14 @@ fn record_log_ingest_snapshot(s: &WriterMetricsSnapshot) {
     );
 }
 
-/// The metric writer's `pulsus_ingest_*` series: per-table (`metric_samples`/
-/// `metric_series`/`metric_metadata`/`metric_hist_samples`), per-signal
-/// (`signal="metrics"`), registration-cache, `metadata_upserts`, and backfill
-/// (`backlog="metric_series"`/`metric_metadata"`).
+/// The metric writer's `pulsus_ingest_*` series: per-table
+/// (`metric_landing` — the one table it inserts into, issue #603),
+/// per-signal (`signal="metrics"`), registration-cache and
+/// `metadata_upserts`. No backfill series: with one insert per push there is
+/// no separate registration insert to lose, so the metrics registration
+/// backfill is gone.
 fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
-    record_table_metrics("metric_samples", &s.samples);
-    record_table_metrics("metric_series", &s.series);
-    record_table_metrics("metric_metadata", &s.metadata);
-    record_table_metrics("metric_hist_samples", &s.hist_samples);
+    record_table_metrics("metric_landing", &s.landing);
 
     metrics::gauge!("pulsus_ingest_queue_bytes", "signal" => "metrics").set(s.queue_bytes as f64);
     metrics::counter!("pulsus_ingest_backpressure_total", "signal" => "metrics")
@@ -341,9 +340,6 @@ fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
         .absolute(s.metadata_upserts_total);
 
     record_dedup_metrics("metrics", &s.dedup);
-
-    record_backfill_metrics("metric_series", &s.series_backfill);
-    record_backfill_metrics("metric_metadata", &s.metadata_backfill);
 }
 
 /// The trace writer's `pulsus_ingest_*` series: per-table (`trace_spans`/
@@ -877,19 +873,18 @@ mod tests {
         assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
     }
 
-    /// AC-2 (metrics): the metric-writer snapshot emits its four tables, the
-    /// `signal="metrics"` series (incl. `metadata_upserts`), and both series/
-    /// metadata backfills. Exhaustive: EVERY emitted series is asserted for its
-    /// exact seeded value AND its `# TYPE`. Fully-spelled struct literal.
-    /// Distinct-nonzero seeds (per-table bases 100/110/120/130, backfill bases
-    /// 140/150, per-signal 61..=69) catch a mis-wired name/label/type.
+    /// AC-2 (metrics): the metric-writer snapshot emits the ONE table it
+    /// inserts into and the `signal="metrics"` series (incl.
+    /// `metadata_upserts`), and no backfill series at all (issue #603).
+    /// Exhaustive: EVERY emitted series is asserted for its exact seeded
+    /// value AND its `# TYPE`, and the four target tables and both backlogs
+    /// are asserted ABSENT. Fully-spelled struct literal. Distinct-nonzero
+    /// seeds (per-table base 100, per-signal 61..=69) catch a mis-wired
+    /// name/label/type.
     #[test]
     fn metric_ingest_snapshot_exports_named_series() {
         let snap = MetricWriterMetricsSnapshot {
-            samples: table_snap(100),
-            series: table_snap(110),
-            metadata: table_snap(120),
-            hist_samples: table_snap(130),
+            landing: table_snap(100),
             queue_bytes: 2000,
             backpressure_total: 61,
             spool_poison_total: 62,
@@ -900,8 +895,6 @@ mod tests {
             metadata_upserts_total: 67,
             collisions_total: 68,
             rejected_total: 69,
-            series_backfill: backfill_snap(140),
-            metadata_backfill: backfill_snap(150),
             dedup: dedup_snap(160),
         };
         let r = render_local(|| record_metric_ingest_snapshot(&snap));
@@ -909,7 +902,6 @@ mod tests {
         // # TYPE header for every emitted metric name.
         assert_table_types(&r);
         assert_signal_types(&r);
-        assert_backfill_types(&r);
         assert_type(&r, "pulsus_ingest_registrations_total", "counter");
         assert_type(&r, "pulsus_ingest_registration_cache_hits_total", "counter");
         assert_type(
@@ -920,11 +912,21 @@ mod tests {
         assert_type(&r, "pulsus_ingest_collisions_total", "counter");
         assert_type(&r, "pulsus_ingest_metadata_upserts_total", "counter");
 
-        // Per-table values (4 tables × 7 series).
-        assert_table_series(&r, "metric_samples", 100);
-        assert_table_series(&r, "metric_series", 110);
-        assert_table_series(&r, "metric_metadata", 120);
-        assert_table_series(&r, "metric_hist_samples", 130);
+        // Per-table values (one table × 7 series), and none for any of the
+        // four tables the views maintain: the writer does not insert into
+        // them, so it has nothing to report about them.
+        assert_table_series(&r, "metric_landing", 100);
+        for absent in [
+            "metric_samples",
+            "metric_series",
+            "metric_metadata",
+            "metric_hist_samples",
+        ] {
+            assert!(
+                !r.contains(&format!("table=\"{absent}\"")),
+                "the metrics writer must export no per-table series for {absent}: {r}"
+            );
+        }
 
         // Per-signal values.
         assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="metrics"}"#, 2000.0);
@@ -976,9 +978,12 @@ mod tests {
             67.0,
         );
 
-        // Backfill values (2 backlogs × 6 series).
-        assert_backfill_series(&r, "metric_series", 140);
-        assert_backfill_series(&r, "metric_metadata", 150);
+        // No registration-backfill series: the mechanism has no subject
+        // left on this path (issue #603).
+        assert!(
+            !r.contains("pulsus_ingest_backfill_"),
+            "the metrics writer must export no registration-backfill series: {r}"
+        );
 
         // Issue #494's push-suppression series, on the other signal.
         assert_dedup_types(&r);
@@ -1115,7 +1120,7 @@ mod tests {
             ..Default::default()
         };
         let metric = MetricWriterMetricsSnapshot {
-            samples: TableMetricsSnapshot {
+            landing: TableMetricsSnapshot {
                 rows_total: 71,
                 ..Default::default()
             },
@@ -1166,7 +1171,7 @@ mod tests {
         );
         assert_sample(
             &text,
-            r#"pulsus_ingest_rows_total{table="metric_samples"}"#,
+            r#"pulsus_ingest_rows_total{table="metric_landing"}"#,
             71.0,
         );
         assert_sample(

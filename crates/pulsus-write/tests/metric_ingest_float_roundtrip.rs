@@ -104,6 +104,8 @@ fn schema_params(db: &str) -> SchemaParams {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     }
 }
 
@@ -209,17 +211,21 @@ async fn otlp_json_metrics_store_the_nearest_representable_f64_bits() {
         "the OTLP/JSON metrics route must accept the body"
     );
 
+    // The LANDING table (issue #603): what the writer stores is the landing
+    // block, and `metric_samples` is maintained from it by materialized
+    // view. The bit fidelity this case exists for is a property of what the
+    // writer stored.
     let sql = format!(
         "SELECT unix_milli, reinterpretAsUInt64(value) AS bits \
-         FROM {db}.metric_samples \
-         WHERE metric_name = 'pulsus_ulp_gauge_probe' ORDER BY unix_milli"
+         FROM {db}.metric_landing \
+         WHERE kind = 0 AND metric_name = 'pulsus_ulp_gauge_probe' ORDER BY unix_milli"
     );
     let mut rows: Vec<SampleBitsRow> = Vec::new();
     {
         let mut stream = client
             .query_stream::<SampleBitsRow>(&sql, &QuerySettings::new())
             .await
-            .unwrap_or_else(|e| panic!("read back metric_samples failed: {e}\nSQL:\n{sql}"));
+            .unwrap_or_else(|e| panic!("read back metric_landing failed: {e}\nSQL:\n{sql}"));
         while let Some(row) = stream.next().await {
             rows.push(row.expect("decode SampleBitsRow"));
         }

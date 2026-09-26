@@ -37,6 +37,9 @@ struct MockInserter {
     behavior: Behavior,
     calls: AtomicUsize,
     rows: Mutex<Vec<usize>>,
+    /// Every landing row's `kind`, over every insert (issue #603). A log row
+    /// has no such column and contributes nothing.
+    kinds: Mutex<Vec<u64>>,
 }
 
 impl MockInserter {
@@ -45,6 +48,7 @@ impl MockInserter {
             behavior,
             calls: AtomicUsize::new(0),
             rows: Mutex::new(Vec::new()),
+            kinds: Mutex::new(Vec::new()),
         })
     }
 
@@ -56,6 +60,16 @@ impl MockInserter {
     fn rows_inserted(&self) -> usize {
         self.rows.lock().expect("mock mutex").iter().sum()
     }
+
+    /// How many landing rows of `kind` reached the table.
+    fn rows_of_kind(&self, kind: u64) -> usize {
+        self.kinds
+            .lock()
+            .expect("mock mutex")
+            .iter()
+            .filter(|k| **k == kind)
+            .count()
+    }
 }
 
 impl<R: ChRow> BlockInserter<R> for MockInserter {
@@ -66,6 +80,16 @@ impl<R: ChRow> BlockInserter<R> for MockInserter {
     ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.rows.lock().expect("mock mutex").push(rows.len());
+        {
+            let mut kinds = self.kinds.lock().expect("mock mutex");
+            for row in rows {
+                if let Ok(value) = serde_json::to_value(row)
+                    && let Some(kind) = value["kind"].as_u64()
+                {
+                    kinds.push(kind);
+                }
+            }
+        }
         let behavior = self.behavior;
         Box::pin(async move {
             match behavior {
@@ -124,23 +148,28 @@ fn writer_with(
     LogWriter::with_inserters(samples, streams, MockInserter::new(Behavior::Ok), &cfg)
 }
 
-fn metric_writer_with(cfg: WriterConfig, metadata: Arc<MockInserter>) -> MetricWriter {
-    metric_writer_with_samples(cfg, MockInserter::new(Behavior::Ok), metadata)
+/// One push is one insert into one table (issue #603), so the metric cases
+/// have one inserter and count rows by `kind`.
+fn metric_writer_with(cfg: WriterConfig, landing: Arc<MockInserter>) -> MetricWriter {
+    MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS)
 }
 
-fn metric_writer_with_samples(
-    cfg: WriterConfig,
-    samples: Arc<MockInserter>,
-    metadata: Arc<MockInserter>,
-) -> MetricWriter {
-    MetricWriter::with_inserters(
-        samples,
-        MockInserter::new(Behavior::Ok),
-        metadata,
-        MockInserter::new(Behavior::Ok),
-        &cfg,
-        pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS,
-    )
+/// Lets a queued landing block reach a worker and settle. An async push
+/// carries no waiter, and a block still queued when the writer shuts down is
+/// never sent, so a case that counts async inserts must wait for the queue to
+/// drain before it shuts the writer down.
+async fn drained(writer: &MetricWriter) {
+    // A sleep, not `yield_now`: on a multi-thread runtime yielding the
+    // calling task does not make another worker's task run, so a yield loop
+    // is a race rather than a wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if writer.metrics().queue_bytes == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("the landing queue never drained");
 }
 
 fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetrics {
@@ -816,8 +845,8 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
 /// that emits a descriptor is never suppressed, and this is that rule.
 #[tokio::test]
 async fn a_descriptor_that_comes_back_is_stored_again() {
-    let metadata = MockInserter::new(Behavior::Ok);
-    let writer = metric_writer_with(eager(), metadata.clone());
+    let landing = MockInserter::new(Behavior::Ok);
+    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
 
     for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
         let wait = writer
@@ -828,14 +857,23 @@ async fn a_descriptor_that_comes_back_is_stored_again() {
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
+    // The third push is suppressed, and its descriptor rides a landing block
+    // of its own with no waiter to await.
+    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(
-        metadata.rows_inserted(),
+        landing.rows_of_kind(3),
         3,
         "all three descriptors reach the table: the third is the current \
          value of the metric, and the version column is what decides the \
          winner"
+    );
+    assert_eq!(
+        landing.call_count(),
+        3,
+        "one landing insert per push, the suppressed push's descriptor-only \
+         block included"
     );
     assert_eq!(
         writer.metrics().dedup.duplicate_pushes_total,
@@ -858,13 +896,8 @@ async fn a_descriptor_that_comes_back_is_stored_again() {
 /// mechanism.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
-    let samples = MockInserter::new(Behavior::Ok);
-    let metadata = MockInserter::new(Behavior::Ok);
-    let writer = Arc::new(metric_writer_with_samples(
-        never_flushes(),
-        samples.clone(),
-        metadata.clone(),
-    ));
+    let landing = MockInserter::new(Behavior::Ok);
+    let writer = Arc::new(metric_writer_with(WriterConfig::default(), landing.clone()));
     let gate = Arc::new(tokio::sync::Barrier::new(4));
 
     let body = || {
@@ -900,40 +933,35 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
         "three of the four are suppressed"
     );
 
+    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        landing.rows_of_kind(0),
         1,
         "exactly one push's samples reached the table"
     );
     assert_eq!(
-        metadata.rows_inserted(),
+        landing.rows_of_kind(3),
         4,
-        "every one of the four enqueues its descriptor: suppression drops the sample, \
-         series and histogram rows and still offers the descriptor to the cache gate, and \
-         the gate emits a row unless the descriptor equals the one last CONFIRMED-flushed. \
-         Under this barrier none of the four has confirmed anything yet, so all four emit. \
-         **This is a figure of THIS fixture, and the live path gives one.** \
-         `a_concurrent_descriptor_race_leaves_one_visible_row` in \
-         `crates/pulsus-server/tests/push_dedup_live.rs` sends four content-identical \
-         descriptor-bearing writes over HTTP at once and measures ONE row in \
-         `metric_metadata`, with and without `FINAL`, from the first read — so nothing is \
-         collapsed there, because nothing beyond one row is written. Four HTTP requests are \
-         not released together the way a barrier releases four admissions in one process. \
-         Which of them confirms its flush first is not measured; the row counts are. Both \
-         figures are asserted, each on its own path, because round 4 of this issue's code \
-         review found the notes claiming both and the tests establishing neither."
+        "every one of the four lands its descriptor: suppression drops the sample, \
+         series and histogram rows — the ones a repeat would duplicate — and still \
+         lands the descriptors, which a repeat would CORRECT. There is no cache gate \
+         left to skip one (issue #603): a repeated descriptor is stored and collapses \
+         on `metric_name` under `ReplacingMergeTree(updated_ns)`, and the statement that \
+         reads the table takes one whole tuple, so four identical rows answer what one \
+         does."
     );
 }
 
-/// The rule costs nothing on a genuine retry: the descriptor cache emits a
-/// row only when it differs from the one last confirmed-flushed, so the
-/// retry carries none, stays claimable, and is suppressed.
+/// A genuine retry is still suppressed: suppression drops exactly the rows a
+/// repeat would duplicate — the sample, series and histogram rows — and the
+/// retry's descriptor is stored, because a repeated descriptor collapses on
+/// `metric_name` under `ReplacingMergeTree(updated_ns)` while a dropped one
+/// can leave a wrong type standing (issue #603).
 #[tokio::test]
 async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
-    let samples = MockInserter::new(Behavior::Ok);
-    let metadata = MockInserter::new(Behavior::Ok);
-    let writer = metric_writer_with_samples(eager(), samples.clone(), metadata.clone());
+    let landing = MockInserter::new(Behavior::Ok);
+    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
 
     let body = || {
         let mut batch = metadata_batch("http_requests_total", "counter", 1);
@@ -957,19 +985,73 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
+    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(
-        metadata.rows_inserted(),
-        1,
-        "the descriptor is emitted once; the retry's is already cached"
+        landing.rows_of_kind(3),
+        2,
+        "both descriptors are stored: the retry's is a repeat, and a repeat of a \
+         descriptor cannot change an answer"
     );
     assert_eq!(
-        samples.rows_inserted(),
+        landing.rows_of_kind(0),
         1,
         "and the retry's sample is suppressed, which is the point"
     );
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
+}
+
+/// A suppressed push's descriptors ride a landing block of their own: no
+/// sample, series or histogram row, no claim and no waiter, and the caller is
+/// answered with the original push's outcome.
+///
+/// Suppression is ordered before the descriptor rule, so the block a
+/// suppressed push sends carries kind-3 rows and nothing else.
+#[tokio::test]
+async fn a_suppressed_push_still_lands_its_descriptor_alone() {
+    let landing = MockInserter::new(Behavior::Ok);
+    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
+
+    let body = || {
+        let mut batch = metadata_batch("http_requests_total", "counter", 1);
+        batch.samples.push(MetricPoint {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(21),
+            unix_milli: 1_700_000_000_000,
+            value: 1.0,
+        });
+        batch.series.push(SeriesRef {
+            metric_name: "http_requests_total".into(),
+            fingerprint: Fingerprint::from_raw(21),
+            labels: labels_with_service("svc"),
+        });
+        batch
+    };
+
+    let wait = writer
+        .admit_flush(body(), PushHeaders::default())
+        .expect("queue has room");
+    wait.await.expect("the first push settles");
+    assert_eq!(landing.call_count(), 1);
+
+    let wait = writer
+        .admit_flush(body(), PushHeaders::default())
+        .expect("queue has room");
+    wait.await
+        .expect("the suppressed caller gets the original push's outcome, a success");
+    drained(&writer).await;
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "the descriptor block is its own insert"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
+    assert_eq!(landing.rows_of_kind(0), 1, "no second sample row");
+    assert_eq!(landing.rows_of_kind(2), 1, "no second registration row");
+    assert_eq!(landing.rows_of_kind(3), 2, "both descriptors land");
 }
 
 // ---------------------------------------------------------------------

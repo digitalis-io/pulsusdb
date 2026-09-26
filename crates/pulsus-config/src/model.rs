@@ -55,6 +55,24 @@ pub struct Config {
     pub storage_policy: Option<String>,
     pub rotation_interval: HumanDuration,
     pub log_rollup_resolution: HumanDuration,
+    /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
+    /// landing table's delete-TTL, in hours. It is the replay window — the
+    /// four derived metric tables can only be rebuilt from landed rows that
+    /// are still there — so a deployment that wants a longer window raises
+    /// it. Accepted range `1..=168`.
+    pub metrics_landing_retention_hours: u32,
+    /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): how many recent blocks
+    /// the landing table and each of the four derived metric tables
+    /// remember for deduplication, so a resend of a block the server
+    /// already accepted is dropped before it is stored a second time.
+    ///
+    /// **A count, and there is no companion time window**, because the
+    /// engine has no such setting for a non-replicated table: only
+    /// `non_replicated_deduplication_window` exists. A block is therefore
+    /// remembered until that many newer blocks have arrived and is never
+    /// forgotten on a timer, which is the safe direction for a resend.
+    /// Accepted range `1..=1000000`.
+    pub metrics_dedup_window: u64,
     // §4 Clustering
     pub cluster: Option<String>,
     pub dist_suffix: String,
@@ -115,6 +133,8 @@ impl Default for Config {
             storage_policy: None,
             rotation_interval: HumanDuration(Duration::from_secs(3_600)),
             log_rollup_resolution: HumanDuration(Duration::from_secs(5)),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
             cluster: None,
             dist_suffix: "_dist".to_string(),
             skip_unavailable_shards: false,
@@ -304,6 +324,21 @@ pub struct WriterConfig {
     /// never grows them, so this is a hard bound rather than a target; past
     /// it a push is refused `429` and nothing is stored.
     pub ingest_dedup_max_bytes: ByteSize,
+    /// `PULSUS_METRICS_LANDING_RETRIES` (issue #603): how many times the
+    /// writer resends a failed metrics landing insert. The wall-clock bound
+    /// on the whole loop is the landing budget, not this count — whichever
+    /// binds first ends it. Accepted range `0..=10`.
+    pub metrics_landing_retries: u32,
+    /// `PULSUS_METRICS_LANDING_INSERTERS` (issue #603): how many insert
+    /// workers take blocks off the metrics landing queue, so how many
+    /// landing inserts can be in flight at once. Accepted range `1..=64`.
+    pub metrics_landing_inserters: u32,
+    /// `PULSUS_METRICS_LANDING_MAX_ROWS` (issue #603): the per-push landing
+    /// row ceiling. A push at or above it is refused whole, never split, so
+    /// an admitted push always fits one block; the same figure is pinned as
+    /// the insert's own `max_insert_block_size`. Accepted range
+    /// `1000..=10000000`.
+    pub metrics_landing_max_rows: u64,
 }
 
 impl Default for WriterConfig {
@@ -318,6 +353,9 @@ impl Default for WriterConfig {
             ingest_dedup: true,
             ingest_dedup_window: HumanDuration(Duration::from_secs(300)),
             ingest_dedup_max_bytes: ByteSize(16 * 1024 * 1024),
+            metrics_landing_retries: 3,
+            metrics_landing_inserters: 4,
+            metrics_landing_max_rows: 1_048_576,
         }
     }
 }
