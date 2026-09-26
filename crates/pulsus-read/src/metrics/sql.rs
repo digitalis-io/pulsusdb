@@ -402,13 +402,14 @@ pub fn discovery_fetch_by_names(
 /// stamp. The columns are unpacked outside the grouping, so the four the
 /// caller decodes are unchanged, in order.
 pub fn metadata_query(metadata_table: &str, metric: Option<&str>, limit: Option<usize>) -> String {
-    let mut sql = format!(
-        "SELECT metric_name, argMax(metric_type, updated_ns) AS metric_type, argMax(help, updated_ns) AS help, argMax(unit, updated_ns) AS unit\nFROM {metadata_table}"
+    let mut sql = String::from(
+        "SELECT metric_name, tupleElement(d, 1) AS metric_type, tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\nFROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d",
     );
+    sql.push_str(&format!("\nFROM {metadata_table}"));
     if let Some(name) = metric {
         sql.push_str(&format!("\nWHERE metric_name = {}", ch_string(name)));
     }
-    sql.push_str("\nGROUP BY metric_name\nORDER BY metric_name");
+    sql.push_str("\nGROUP BY metric_name)\nORDER BY metric_name");
     if let Some(n) = limit {
         sql.push_str(&format!("\nLIMIT {n}"));
     }

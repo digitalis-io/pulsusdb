@@ -47,11 +47,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pulsus_clickhouse::{ChClient, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, QuerySettings};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Fingerprint, floor_to_activity_bucket};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricSink, ParsedMetrics, SeriesRef};
@@ -66,7 +66,7 @@ use crate::writer::rows::{
 };
 use crate::writer::spool::{SpoolKind, SpoolWriter};
 use crate::writer::table::{
-    BlockInserter, ChBlockInserter, ShutdownSignal, XorShift64, spawn_dedup_ticker,
+    self, BlockInserter, ChBlockInserter, ShutdownSignal, XorShift64, spawn_dedup_ticker,
 };
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
@@ -79,29 +79,13 @@ const VALUE_TYPE_FLOAT: u8 = 0;
 const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
 /// The message a block still queued when the budget ran out settles with.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reaches it arrives with the code"
-)]
 const MSG_BUDGET_QUEUED: &str = "the landing budget was spent before the block was sent";
 /// The message a block whose budget ran out between attempts settles with.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reaches it arrives with the code"
-)]
 const MSG_BUDGET_BETWEEN: &str = "the landing budget was spent between attempts";
 /// The message an attempt interrupted by the budget settles with.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reaches it arrives with the code"
-)]
 const MSG_BUDGET_IN_ATTEMPT: &str = "the landing budget elapsed during an attempt";
 /// The message a block abandoned mid-attempt at the shutdown deadline
 /// settles with.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reaches it arrives with the code"
-)]
 const MSG_SHUTDOWN_INFLIGHT: &str = "the writer shut down with an attempt in flight";
 /// The message a block still queued at shutdown settles with.
 const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the block was sent";
@@ -127,10 +111,6 @@ impl MetricWriterTables {
 
 /// One admitted push, sealed and queued. A worker runs it to exactly one
 /// ending and is the only place it settles.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reads every field arrives with the code"
-)]
 pub(crate) struct LandingBlock {
     /// The push's landing rows, every kind in one vector. Nothing depends on
     /// their order inside the block: the table's sorting key orders what is
@@ -162,10 +142,6 @@ pub(crate) struct LandingBlock {
 }
 
 /// What a landing worker needs to run a block to an ending.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reads every field arrives with the code"
-)]
 pub(crate) struct LandingContext {
     table: Arc<str>,
     inserter: Arc<dyn BlockInserter<MetricLandingRow>>,
@@ -182,10 +158,6 @@ pub(crate) struct LandingContext {
 /// ending whose own knowledge is "this did not send" can never walk the fate
 /// back from an earlier attempt that may have.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the insert loop that writes Uncertain arrives with the code"
-)]
 enum LandingFate {
     NeverSent(String),
     Uncertain(String),
@@ -213,10 +185,6 @@ impl LandingFate {
     }
 
     /// What an ending that may have sent calls.
-    #[allow(
-        dead_code,
-        reason = "the insert loop that calls it arrives with the code"
-    )]
     fn saw_uncertain(&mut self, msg: String) {
         *self = LandingFate::Uncertain(msg);
     }
@@ -477,6 +445,24 @@ impl MetricWriter {
         // fails nothing of it is stored, so the next push carrying the same
         // descriptors emits them again.
         if let Some(suppressed) = suppressed {
+            if !descriptors.is_empty() {
+                super::reserve_queued_bytes(
+                    &self.shared.queued_bytes,
+                    &self.shared.metrics.backpressure_total,
+                    metadata_bytes,
+                    self.shared.runtime.queue_bytes_limit,
+                )
+                .map_err(AdmitRefusal::from)?;
+                let rows: Vec<MetricLandingRow> = descriptors
+                    .iter()
+                    .map(|m| MetricLandingRow::metadata(received_ms, m))
+                    .collect();
+                self.shared
+                    .metrics
+                    .metadata_upserts_total
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                self.queue_block(rows, metadata_bytes, ClaimTicket::inert(), None, Vec::new());
+            }
             return Ok(Admitted::Suppressed(suppressed));
         }
 
@@ -585,6 +571,23 @@ impl MetricWriter {
         let total_rows =
             (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
                 as u64;
+
+        // The two per-push ceilings, counted over all four kinds. At or
+        // above the row limit the block would not be strictly under the
+        // value `max_insert_block_size` is pinned to, and the server would
+        // split it. Returning here drops the un-sealed guard, which removes
+        // the claim, so the client's retry of an unstored push is stored
+        // rather than suppressed — and no bytes have been reserved yet.
+        if total_rows >= self.shared.runtime.metrics_landing_max_rows
+            || total_bytes > self.shared.runtime.batch_bytes
+        {
+            return Err(AdmitRefusal::PushTooLarge {
+                rows: total_rows,
+                row_limit: self.shared.runtime.metrics_landing_max_rows,
+                bytes: total_bytes,
+                byte_limit: self.shared.runtime.batch_bytes,
+            });
+        }
 
         // Atomic reservation: reserve first, roll back on overflow.
         super::reserve_queued_bytes(
@@ -853,9 +856,21 @@ fn now_unix_millis() -> i64 {
 /// event's identity, which is the landing table's own `event_id` column, and
 /// it is never derived from the block's content.
 pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
-    // Stubbed: the minting arrives with the code.
-    let _ = rng;
-    String::new()
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        & 0xFFFF_FFFF_FFFF;
+    let rand_a = (rng.next_u64() & 0x0FFF) as u16;
+    let rand_b = rng.next_u64() & 0x3FFF_FFFF_FFFF_FFFF;
+    format!(
+        "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+        ((unix_ms >> 16) & 0xFFFF_FFFF) as u32,
+        (unix_ms & 0xFFFF) as u16,
+        rand_a,
+        0x8000u16 | ((rand_b >> 48) as u16 & 0x3FFF),
+        rand_b & 0xFFFF_FFFF_FFFF,
+    )
 }
 
 /// Spawns one insert worker on the landing queue. Every worker runs the same
@@ -930,21 +945,125 @@ async fn run_block(
     shutdown_rx: &mut watch::Receiver<Option<Instant>>,
     rng: &mut XorShift64,
 ) {
-    // The loop inserts nothing yet: it takes the block, settles the claim
-    // provably-not-committed and resolves the waiter, so a case fails on what
-    // it asserts rather than timing out on a block nobody settles.
-    let _ = (shutdown_rx, rng);
     let mut fate = LandingFate::NeverSent(String::new());
-    fate.saw_pre_send("the landing loop is not built yet".to_string());
-    settle_block(ctx, block, fate, TerminalCause::Normal).await;
+    let mut resends = 0u32;
+    loop {
+        let remaining = ctx
+            .runtime
+            .landing_budget
+            .saturating_sub(block.admitted_at.elapsed());
+        if remaining.is_zero() {
+            let msg = if resends == 0 {
+                MSG_BUDGET_QUEUED
+            } else {
+                MSG_BUDGET_BETWEEN
+            };
+            fate.saw_pre_send(msg.to_string());
+            settle_block(ctx, block, fate, TerminalCause::Normal).await;
+            return;
+        }
+
+        ctx.metrics.landing.inflight.fetch_add(1, Ordering::Relaxed);
+        let outcome = {
+            // The timeout encloses the two phases the client's own deadline
+            // does not: the connection checkout and the health ping it may
+            // issue.
+            let attempt = tokio::time::timeout(
+                remaining,
+                ctx.inserter
+                    .insert_with(&ctx.table, &block.rows, &block.settings),
+            );
+            tokio::pin!(attempt);
+            let already_shutting_down = *shutdown_rx.borrow_and_update();
+            match already_shutting_down {
+                Some(deadline) => table::bound_by_deadline(&mut attempt, deadline).await,
+                None => tokio::select! {
+                    outcome = &mut attempt => Ok(outcome),
+                    changed = shutdown_rx.changed() => {
+                        let _ = changed;
+                        let deadline = shutdown_rx.borrow().unwrap_or_else(Instant::now);
+                        table::bound_by_deadline(&mut attempt, deadline).await
+                    }
+                },
+            }
+        };
+        ctx.metrics.landing.inflight.fetch_sub(1, Ordering::Relaxed);
+
+        let sent = match outcome {
+            // The shutdown deadline with an attempt in flight. The attempt
+            // is abandoned, and it may have committed.
+            Err(_shutdown_elapsed) => {
+                fate.saw_uncertain(MSG_SHUTDOWN_INFLIGHT.to_string());
+                settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
+                return;
+            }
+            // The budget elapsing mid-attempt. It encloses the checkout and
+            // the health ping as well as the send and cannot tell which of
+            // the three it interrupted, so it reports the fate as unknown
+            // for a block that may never have left the process. That
+            // over-reports and never under-reports, which is the direction
+            // a claim has to err in.
+            Ok(Err(_budget_elapsed)) => {
+                fate.saw_uncertain(MSG_BUDGET_IN_ATTEMPT.to_string());
+                settle_block(ctx, block, fate, TerminalCause::Normal).await;
+                return;
+            }
+            Ok(Ok(result)) => result,
+        };
+
+        // A retryable `ChError` here is always pre-send: `insert_block_with`
+        // downgrades every retryable failure after the send to
+        // `InsertUncertain`, and the only error before it is the checkout's.
+        let resendable = match sent {
+            Ok(()) => {
+                let latency = block.admitted_at.elapsed();
+                commit_block(ctx, block, latency).await;
+                return;
+            }
+            Err(ChError::InsertUncertain(msg)) => {
+                fate.saw_uncertain(msg);
+                true
+            }
+            Err(e) if e.is_retryable() => {
+                fate.saw_pre_send(e.to_string());
+                true
+            }
+            Err(e) => {
+                fate.saw_pre_send(e.to_string());
+                false
+            }
+        };
+
+        if !resendable || resends >= ctx.runtime.metrics_landing_retries {
+            settle_block(ctx, block, fate, TerminalCause::Normal).await;
+            return;
+        }
+
+        ctx.metrics
+            .landing
+            .retries_total
+            .fetch_add(1, Ordering::Relaxed);
+        // The remainder AFTER the attempt, not the one captured before it: a
+        // failure arriving near expiry would otherwise sleep past the
+        // budget.
+        let left = ctx
+            .runtime
+            .landing_budget
+            .saturating_sub(block.admitted_at.elapsed());
+        let delay = table::backoff_delay(
+            ctx.runtime.retry_base_delay,
+            ctx.runtime.retry_max_delay,
+            resends + 1,
+            rng,
+        )
+        .min(left);
+        tokio::time::sleep(delay).await;
+        resends += 1;
+    }
 }
 
 /// The commit exit: the landing block holds the push's rows, and the four
 /// targets are written by that insert's own processing.
-#[allow(
-    dead_code,
-    reason = "the insert loop that reaches the commit exit arrives with the code"
-)]
 async fn commit_block(ctx: &Arc<LandingContext>, block: LandingBlock, latency: Duration) {
     ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
     ctx.metrics
@@ -977,10 +1096,17 @@ async fn settle_block(
 ) {
     let (kind, outcome, msg) = fate.settle();
     ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
-    // Stubbed: writing the block to its spool directory arrives with the
-    // code. The block is still settled, so a case fails on what it asserts
-    // rather than timing out.
-    let _ = &ctx.spool;
+    if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &block.rows, &msg).await {
+        ctx.metrics
+            .landing
+            .spool_write_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        error!(
+            table = %ctx.table,
+            error = %spool_err,
+            "failed to spool a landing block to disk"
+        );
+    }
     block.claim.settle(outcome);
     if let Some(waiter) = block.waiter {
         let err = match cause {

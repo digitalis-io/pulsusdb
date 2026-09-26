@@ -17,7 +17,6 @@ use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
     TraceEngine, TraceReadConfig,
 };
-#[allow(unused_imports)]
 use pulsus_schema::{NameCatalogue, RenderCtx, SchemaError, SchemaParams};
 use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
 
@@ -104,10 +103,6 @@ pub(crate) fn bootstrap_conn_config_from(config: &Config) -> ChConnConfig {
 /// the other two are the transient failures the serving path already
 /// log-and-backoffs.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "the check that constructs these arrives with the code"
-)]
 pub(crate) enum NameCheckError {
     Connect(ChError),
     Statement(SchemaError),
@@ -120,13 +115,22 @@ pub(crate) enum NameCheckError {
 /// It builds a bootstrap client of its own, so it does not need the target
 /// database to exist, and drops it again: the check runs before the serving
 /// pool is connected and before any DDL.
-#[allow(dead_code, reason = "its two call sites arrive with the code")]
 pub(crate) async fn check_server_names(
     config: &Config,
     required: &[(&'static str, NameCatalogue)],
 ) -> Result<(), NameCheckError> {
-    let _ = (config, required);
-    Ok(())
+    let client = ChClient::new(bootstrap_conn_config_from(config))
+        .await
+        .map_err(NameCheckError::Connect)?;
+    let absent = pulsus_schema::absent_server_names(&client, required)
+        .await
+        .map_err(NameCheckError::Statement)?;
+    drop(client);
+    if absent.is_empty() {
+        Ok(())
+    } else {
+        Err(NameCheckError::Missing(absent))
+    }
 }
 
 /// Maps `Config` to the schema controller's rendering/reconcile parameters
@@ -221,12 +225,10 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
 /// path for its own reason (a global catalog table). The four target tables
 /// keep their wrappers, and [`metrics_config_from`] on the read path derives
 /// them exactly as before.
-///
-/// Stubbed: the name it resolves arrives with the code.
 pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
     let _ = config;
     MetricWriterTables {
-        landing: Arc::from(""),
+        landing: Arc::from("metric_landing"),
     }
 }
 

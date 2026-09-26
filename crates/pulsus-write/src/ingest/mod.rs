@@ -109,11 +109,11 @@ pub const KEY_REUSED_MESSAGE: &str =
 /// transport that can reach it (issue #603). It names the push's own size
 /// and both limits, so a client can tell which one it crossed and by how
 /// much.
-///
-/// Stubbed: the wording arrives with the code.
 pub fn push_too_large_message(rows: u64, row_limit: u64, bytes: u64, byte_limit: u64) -> String {
-    let _ = (rows, row_limit, bytes, byte_limit);
-    String::new()
+    format!(
+        "push does not fit one block: {rows} rows (limit {row_limit}), \
+         {bytes} estimated bytes (limit {byte_limit})"
+    )
 }
 
 /// A handle a sync-mode request (`X-Pulsus-Async` absent or `0`,

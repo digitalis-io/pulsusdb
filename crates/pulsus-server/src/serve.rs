@@ -30,9 +30,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    NameCheckError, bootstrap_conn_config_from, build_label_cache, conn_config_from,
-    consistency_from, metric_writer_tables_from, schema_params_from, trace_writer_tables_from,
-    writer_tables_from,
+    NameCheckError, bootstrap_conn_config_from, build_label_cache, check_server_names,
+    conn_config_from, consistency_from, metric_writer_tables_from, schema_params_from,
+    trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -359,11 +359,12 @@ enum StartupError {
 /// The transient halves of a name check map onto the failures the reconnect
 /// loop already retries; a missing name does not (issue #603).
 impl From<NameCheckError> for StartupError {
-    /// Stubbed: which failure maps onto which startup error arrives with the
-    /// code.
     fn from(err: NameCheckError) -> Self {
-        let _ = err;
-        StartupError::MissingServerNames(Vec::new())
+        match err {
+            NameCheckError::Connect(e) => StartupError::Bootstrap(e),
+            NameCheckError::Statement(e) => StartupError::Schema(e),
+            NameCheckError::Missing(names) => StartupError::MissingServerNames(names),
+        }
     }
 }
 
@@ -705,7 +706,11 @@ async fn ensure_schema_then_connect(
     config: &Config,
     required: &'static [(&'static str, NameCatalogue)],
 ) -> Result<ChPool, StartupError> {
-    let _ = required;
+    // Issue #603: FIRST, and outside the `skip_ddl` branch — a `skip_ddl`
+    // deployment reaches no DDL but still inserts landing blocks and still
+    // reapplies the `ALTER`s on a rotation tick, where a failure would only
+    // warn and continue. No name is sent before it is known to exist.
+    check_server_names(config, required).await?;
     if !config.skip_ddl {
         reconcile_schema(config).await?;
     }

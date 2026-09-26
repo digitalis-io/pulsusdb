@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use crate::config::{ChConnConfig, ConsistencyConfig};
 use crate::error::{ChError, Idempotency};
@@ -37,6 +37,13 @@ impl<T> ChRow for T where
 /// caller request into an unbounded retry storm.
 const MAX_IDEMPOTENT_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// One `String` column, aliased `s` — the row shape
+/// [`ChClient::query_strings`] decodes.
+#[derive(crate::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StringRow {
+    s: String,
+}
 
 pub struct ChClient {
     pool: Arc<ChPool>,
@@ -275,6 +282,26 @@ impl ChClient {
             timeout: self.default_timeout,
             conn,
         })
+    }
+
+    /// Reads a statement whose result is one `String` column aliased `s`, as
+    /// a `Vec<String>`.
+    ///
+    /// A convenience over [`Self::query_stream`] for the several callers that
+    /// want a list of names and nothing else: without it each one declares
+    /// its own one-field row type, which needs the `clickhouse` derive in
+    /// scope in that crate.
+    pub async fn query_strings(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<Vec<String>, ChError> {
+        let mut stream = self.query_stream::<StringRow>(sql, settings).await?;
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await {
+            out.push(row?.s);
+        }
+        Ok(out)
     }
 
     /// DDL / maintenance statement. Settings are injected per-statement.

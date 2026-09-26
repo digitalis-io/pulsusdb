@@ -81,8 +81,9 @@ impl QuerySettings {
     /// refused a larger push against, so one push is never split into two
     /// blocks.
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
-        let _ = (token, max_rows);
-        Self::new()
+        Self::deduplicate_through_views()
+            .set("insert_deduplication_token", token)
+            .set("max_insert_block_size", max_rows)
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:

@@ -138,6 +138,14 @@ fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> 
         .replace("{{retention_days}}", retention_repr)
         .replace("{{log_rollup_suffix}}", &rollup_suffix(ctx.log_rollup))
         .replace("{{log_rollup_ns}}", &log_rollup_ns)
+        .replace(
+            "{{metrics_landing_retention_hours}}",
+            &ctx.metrics_landing_retention_hours.to_string(),
+        )
+        .replace(
+            "{{metrics_dedup_window}}",
+            &ctx.metrics_dedup_window.to_string(),
+        )
 }
 
 /// Escapes a single-quoted SQL string literal. Config-derived, not

@@ -529,7 +529,15 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
 /// The four derived tables need a window of their own because a view's
 /// insert carries a block id derived from the source block, and only a
 /// table with a window recognises the repeat.
-const METRIC_LANDING_STMTS: &[&str] = &[];
+const METRIC_LANDING_STMTS: &[&str] = &[
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_series{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_metadata{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(received_ms, 1000) + {{metrics_landing_retention_hours}} * 3600, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+];
 
 /// The projection one materialized view applies, read out of that view's own
 /// rendered statement so the two cannot drift (issue #603).
@@ -538,8 +546,10 @@ const METRIC_LANDING_STMTS: &[&str] = &[];
 /// rebuild path, which replays the landing table through the same projection
 /// the view applies to a new insert.
 pub fn mv_projection(mv_name: &str, ctx: &RenderCtx) -> Option<String> {
-    let _ = (mv_name, ctx);
-    None
+    let mv = MVS.iter().find(|mv| mv.name == mv_name)?;
+    let rendered = render::render(mv.tmpl, &render::render_name(mv.name, ctx), ctx, false);
+    let (_, body) = rendered.split_once(" AS\n")?;
+    Some(body.trim_end().trim_end_matches(';').to_string())
 }
 
 /// Which `system` table answers whether one name exists (issue #603).
@@ -565,7 +575,14 @@ impl NameCatalogue {
 /// somewhere in `crates/`, read back from the server before anything sends
 /// it (issue #603). A name that might not exist is never sent: absent,
 /// startup refuses and says which.
-pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[];
+pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
+    ("insert_deduplication_token", NameCatalogue::Setting),
+    ("max_insert_block_size", NameCatalogue::Setting),
+    ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
+    ("generateUUIDv7", NameCatalogue::Function),
+    ("toStartOfHour", NameCatalogue::Function),
+    ("tupleElement", NameCatalogue::Function),
+];
 
 /// One `SELECT name FROM <catalogue> WHERE name IN (…)` statement per
 /// catalogue that has at least one required name, in catalogue order. An
@@ -580,8 +597,30 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[];
 pub fn required_names_sql(
     required: &[(&'static str, NameCatalogue)],
 ) -> Vec<(NameCatalogue, String)> {
-    let _: Vec<&str> = required.iter().map(|(_, c)| c.table()).collect();
-    Vec::new()
+    let mut out: Vec<(NameCatalogue, String)> = Vec::new();
+    for catalogue in [
+        NameCatalogue::Setting,
+        NameCatalogue::MergeTreeSetting,
+        NameCatalogue::Function,
+    ] {
+        let names: Vec<String> = required
+            .iter()
+            .filter(|(_, c)| *c == catalogue)
+            .map(|(name, _)| format!("'{name}'"))
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        out.push((
+            catalogue,
+            format!(
+                "SELECT name FROM {} WHERE name IN ({})",
+                catalogue.table(),
+                names.join(", ")
+            ),
+        ));
+    }
+    out
 }
 
 /// The required names absent from `present`, in `required` order. It matches
@@ -590,8 +629,11 @@ pub fn missing_server_names(
     required: &[(&'static str, NameCatalogue)],
     present: &[String],
 ) -> Vec<&'static str> {
-    let _ = (required, present);
-    Vec::new()
+    required
+        .iter()
+        .filter(|(name, _)| !present.iter().any(|p| p == name))
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 /// Reads each of [`required_names_sql`]'s statements off the server and
@@ -610,8 +652,34 @@ pub async fn absent_server_names(
     client: &ChClient,
     required: &[(&'static str, NameCatalogue)],
 ) -> Result<Vec<&'static str>, SchemaError> {
-    let _ = (client, required);
-    Ok(Vec::new())
+    let mut present: Vec<String> = Vec::new();
+    let mut checked: Vec<(&'static str, NameCatalogue)> = Vec::new();
+    for (catalogue, sql) in required_names_sql(required) {
+        match read_names(client, &sql).await {
+            Ok(names) => {
+                present.extend(names);
+                checked.extend(required.iter().filter(|(_, c)| *c == catalogue).copied());
+            }
+            Err(err) => tracing::warn!(
+                catalogue = catalogue.table(),
+                error = %err,
+                "cannot read a name catalogue; the names it holds are not checked"
+            ),
+        }
+    }
+    Ok(missing_server_names(&checked, &present))
+}
+
+/// Every `name` one catalogue statement returns.
+async fn read_names(client: &ChClient, sql: &str) -> Result<Vec<String>, SchemaError> {
+    let mut stream = client
+        .query_stream::<NameRow>(sql, &QuerySettings::new())
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row?.name);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

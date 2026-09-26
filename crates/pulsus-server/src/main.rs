@@ -20,6 +20,7 @@ mod middleware;
 mod modes;
 mod ops;
 mod prom_api;
+mod rebuild;
 mod schema_init;
 mod serve;
 mod subsystems;
@@ -149,6 +150,18 @@ struct Cli {
     /// valid-values list lives in exactly one place.
     #[arg(long)]
     mode: Option<String>,
+
+    /// An operator command instead of serving. Absent, behaviour is exactly
+    /// what it was (issue #603).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Replay a window of the metrics landing table into one of the four
+    /// tables its materialized views maintain. See `src/rebuild.rs`.
+    RebuildMetrics(rebuild::RebuildMetrics),
 }
 
 #[tokio::main]
@@ -162,10 +175,12 @@ async fn main() -> ExitCode {
             // opted into auto-detection and did not hard-set the zone; the
             // resolved `local_zone` then flows through `conn_config_from`.
             azdetect::resolve_local_zone(&mut config).await;
-            if config.mode == Mode::Init {
-                schema_init::run(&config, pulsus_schema::REQUIRED_SERVER_NAMES).await
-            } else {
-                serve::run(config).await
+            match cli.command {
+                Some(Command::RebuildMetrics(args)) => rebuild::run(&config, args).await,
+                None if config.mode == Mode::Init => {
+                    schema_init::run(&config, pulsus_schema::REQUIRED_SERVER_NAMES).await
+                }
+                None => serve::run(config).await,
             }
         }
         Err(err) => {
