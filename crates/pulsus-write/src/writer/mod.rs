@@ -116,8 +116,9 @@ pub use push_dedup::{
 };
 pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
-    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricLandingRow,
-    MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow, TraceSpanRow,
+    LANDING_ROW_SLOT_BYTES, LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow,
+    MetricLandingRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow,
+    TraceSpanRow,
 };
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};

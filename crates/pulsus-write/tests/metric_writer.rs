@@ -20,7 +20,10 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
 use pulsus_config::{ByteSize, Config, WriterConfig};
 use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
-use pulsus_write::writer::{BlockInserter, MetricWriter, MetricWriterTables, WriterRuntime};
+use pulsus_write::writer::{
+    BlockInserter, LANDING_ROW_SLOT_BYTES, MetricLandingRow, MetricWriter, MetricWriterTables,
+    WriterRuntime,
+};
 use pulsus_write::{
     AdmitRefusal, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
     PushHeaders, SeriesRef, push_too_large_message,
@@ -333,22 +336,28 @@ fn one_bucket_hist(sum: f64) -> NativeHistogram {
     }
 }
 
-/// **Five landing rows and 178 estimated bytes.** The mixed push every byte
-/// figure in this file is derived from: 1 float sample and 1 one-bucket
-/// histogram sample on one unregistered series `m` whose label set is empty,
-/// both in one activity bucket, plus a `gauge` descriptor with empty help and
-/// unit. Each landing row is estimated by the target row it becomes:
+/// **Five landing rows.** The mixed push every byte figure in this file is
+/// derived from: 1 float sample and 1 one-bucket histogram sample on one
+/// unregistered series `m` whose label set is empty, both in one activity
+/// bucket, plus a `gauge` descriptor with empty help and unit.
 ///
-/// | kind | rows | bytes each |
+/// Each landing row's **owned buffers** are priced by the target row it
+/// becomes:
+///
+/// | kind | rows | buffer bytes each |
 /// |---|---|---|
 /// | 0 | 1 | 33 = 1 name + 16 fingerprint + 8 unix_milli + 8 value |
 /// | 1 | 1 | 75 = 1 + 16 + 8 + 1 schema + 8 zero_threshold + 8 zero_count + 8 count + 8 sum + 1 hint + 1×(4+4) span + 1×8 delta |
 /// | 2 | 2 | 28 = 1 + 2 labels (`{}`) + 16 + 8 + 1 value_type |
 /// | 3 | 1 | 14 = 1 name + 5 `gauge` + 0 help + 0 unit + 8 updated_ns |
 ///
-/// 33 + 75 + 28 + 28 + 14 = 178.
+/// 33 + 75 + 28 + 28 + 14 = 178 bytes of buffers. The queue also holds each
+/// row itself, which is the union of all four kinds' columns
+/// (`LANDING_ROW_SLOT_BYTES`), so the charge is those 178 plus five rows'
+/// slots — see `a_landing_row_is_charged_the_row_the_queue_holds`.
 const MIXED_PUSH_ROWS: u64 = 5;
-const MIXED_PUSH_BYTES: u64 = 178;
+const MIXED_PUSH_BUFFER_BYTES: u64 = 178;
+const MIXED_PUSH_BYTES: u64 = MIXED_PUSH_BUFFER_BYTES + MIXED_PUSH_ROWS * LANDING_ROW_SLOT_BYTES;
 
 fn mixed_push(unix_milli: i64, updated_ns: i64, with_descriptor: bool) -> ParsedMetrics {
     let mut out = ParsedMetrics {
@@ -1125,7 +1134,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     writer.shutdown(Duration::from_secs(2)).await;
 
     // The byte ceiling, at the push's own estimate and one below it. A byte
-    // total omitting any one of the four estimators lands under 177 and is
+    // total omitting any one of the four estimators lands under the limit and is
     // admitted where it must be refused.
     for (limit, refused) in [(MIXED_PUSH_BYTES, false), (MIXED_PUSH_BYTES - 1, true)] {
         let cfg = WriterConfig {
@@ -1161,6 +1170,239 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         writer.shutdown(Duration::from_secs(2)).await;
     }
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Issue #603 code review, finding 3: the figure the queue reserves and the
+/// refusal names must cover the rows the **queue** holds. A landing row is
+/// held as a whole `MetricLandingRow` from admission until its block is
+/// encoded, so a charge over the target rows' buffers alone leaves
+/// `PULSUS_INGEST_QUEUE_BYTES` bounding less than is buffered, by one row's
+/// slots per row.
+#[tokio::test]
+async fn the_queue_charge_covers_the_landing_rows_it_holds() {
+    let root = spool_root("queue-charge");
+    // One byte under the push's own charge, so the refusal reports it.
+    let cfg = WriterConfig {
+        batch_bytes: ByteSize(MIXED_PUSH_BYTES - 1),
+        ..Default::default()
+    };
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let err = writer
+        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .expect_err("one byte under its own charge");
+    let AdmitRefusal::PushTooLarge { rows, bytes, .. } = err else {
+        panic!("expected PushTooLarge, got {err:?}");
+    };
+    assert_eq!(rows, MIXED_PUSH_ROWS);
+    let held = rows * std::mem::size_of::<MetricLandingRow>() as u64;
+    assert!(
+        bytes >= held,
+        "the charge ({bytes}) must cover the {rows} landing rows the queue \
+         holds ({held} bytes of slots), not only the target rows' buffers"
+    );
+    assert_eq!(
+        bytes,
+        MIXED_PUSH_BUFFER_BYTES + held,
+        "the charge is the buffers plus the rows that hold them"
+    );
+
+    // The held figure is also what a successful push releases, so the two
+    // halves of the accounting cannot drift apart.
+    let cfg = WriterConfig::default();
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let wait = writer
+        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .expect("the default ceiling has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("settles")
+        .expect("commits");
+    assert_eq!(writer.metrics().landing.bytes_total, MIXED_PUSH_BYTES);
+    assert_eq!(writer.metrics().queue_bytes, 0);
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Issue #603 code review, finding 4: a failed block's queue reservation must
+/// stay charged until its spool copy has been **written**. `SpoolWriter::write`
+/// maps every row into a second value vector and then a serialized byte
+/// vector, so releasing first lets a new admission take the allowance while
+/// the rows and both copies are still live — the bound would then permit more
+/// than it names, by the size of whatever is being spooled.
+///
+/// The seam is tokio's blocking pool: `tokio::fs` runs on it, this runtime has
+/// exactly one blocking thread, and the case holds that thread while it reads
+/// the reservation. Deterministic, with no sleeping and no wall-clock
+/// dependency.
+#[test]
+fn a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_time()
+        .build()
+        .expect("build a runtime with one blocking thread");
+
+    runtime.block_on(async {
+        let root = spool_root("spool-reservation");
+        let cfg = WriterConfig::default();
+        let inserter = MockInserter::always(Act::Poison);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+
+        // Occupy the single blocking thread, so the settling worker's first
+        // `tokio::fs` call queues behind it rather than running.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (occupied_tx, occupied_rx) = std::sync::mpsc::channel::<()>();
+        let held = tokio::task::spawn_blocking(move || {
+            occupied_tx.send(()).expect("the case is still waiting");
+            release_rx.recv().expect("the case releases the thread");
+        });
+        occupied_rx
+            .recv()
+            .expect("the blocking thread is now occupied");
+
+        let wait = writer
+            .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+            .expect("queue has room");
+        // The worker reaches its ending and then parks on the spool write.
+        settle_until(|| inserter.call_count() == 1).await;
+        settle_until(|| false).await;
+        assert_eq!(
+            writer.metrics().queue_bytes,
+            MIXED_PUSH_BYTES,
+            "the reservation must still be charged while the spool copy is \
+             being built and written"
+        );
+        assert_eq!(
+            spool_records(&root, "poison").len(),
+            0,
+            "nothing is written yet, which is what makes the charge above the \
+             ordering claim"
+        );
+
+        release_tx.send(()).expect("the held task is still parked");
+        held.await.expect("the held task finishes");
+        let answer = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("settles")
+            .expect_err("never a success");
+        assert!(answer.to_string().contains("poison"), "{answer}");
+        assert_eq!(spool_records(&root, "poison").len(), 1);
+        assert_eq!(
+            writer.metrics().queue_bytes,
+            0,
+            "released once, after the write"
+        );
+
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    });
+}
+
+/// Issue #603 code review, finding 5: the exact push-size decision must be
+/// complete before a suppressed push can queue anything. A suppressed push
+/// takes the descriptor-only branch and enqueues its metadata rows, and today
+/// that branch is reached before either ceiling is evaluated — so a push that
+/// does not fit one block stores part of itself whenever it races a copy of
+/// itself, which is precisely what a client's retry of a `413` is.
+///
+/// The interleaving is built deterministically rather than raced. Push A is
+/// admitted while its series is resident in the registration LRU, so it is
+/// three rows; its insert is then held, which keeps its claim open. A push for
+/// a second series commits on the other worker and evicts A's key from the
+/// one-entry LRU. A's identical copy now computes a fourth row — the
+/// registration it has to emit again — and is at the row ceiling, so it must
+/// be refused whole even though the index recognises it as a repeat.
+#[tokio::test]
+async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
+    let root = spool_root("suppressed-oversized");
+    let cfg = WriterConfig {
+        metrics_landing_inserters: 2,
+        metrics_landing_max_rows: 3,
+        ..Default::default()
+    };
+    let mut runtime = runtime_at(&cfg, &root);
+    // One resident registration, so the eviction below is the only thing that
+    // changes what the identical copy computes.
+    runtime.lru_capacity = 1;
+    // Call 0 registers `m`; call 1 is push A, held; call 2 is the second
+    // series, which commits and evicts.
+    let inserter = MockInserter::new(vec![
+        Step::now(Act::Ok),
+        Step::now(Act::Hang),
+        Step::now(Act::Ok),
+    ]);
+    let writer = writer_at(runtime, inserter.clone());
+
+    // Register `m` in the LRU: 1 sample + 1 registration = 2 rows.
+    let wait = writer
+        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .expect("2 rows fit");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("settles")
+        .expect("commits");
+
+    // Push A: the same series in the same bucket, so no registration row —
+    // 1 sample + 1 descriptor = 2 rows, under the ceiling of 4. Its insert
+    // hangs, so its claim stays open.
+    let mut a = batch_for("m", 1, 1_001, true);
+    a.metadata.push(MetricMetadata {
+        metric_name: Arc::from("m"),
+        metric_type: "gauge".to_string(),
+        help: String::new(),
+        unit: String::new(),
+        updated_ns: 1,
+    });
+    writer
+        .admit(a.clone(), PushHeaders::default())
+        .expect("2 rows fit");
+    settle_until(|| inserter.call_count() == 2).await;
+
+    // A second series commits on the other worker and evicts `m`'s key.
+    let wait = writer
+        .admit_flush(batch_for("e", 2, 1_000, true), PushHeaders::default())
+        .expect("2 rows fit");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("settles")
+        .expect("commits");
+    assert_eq!(inserter.call_count(), 3, "the register, A, and the evictor");
+
+    // A's identical copy: the index recognises it as a repeat, and it now
+    // needs its registration row again — 1 sample + 1 registration + 1
+    // descriptor = 3 rows, which is AT the ceiling of 3, so it does not fit
+    // one block and must be refused whole rather than landing its descriptor.
+    let before_queue = writer.metrics().queue_bytes;
+    let result = writer.admit(a, PushHeaders::default());
+    let err = result.expect_err("the copy no longer fits one block");
+    match err {
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            byte_limit,
+            ..
+        } => {
+            assert_eq!(rows, 3, "one sample, one registration, one descriptor");
+            assert_eq!(row_limit, 3);
+            assert_eq!(byte_limit, 16 * 1024 * 1024);
+        }
+        other => panic!("expected PushTooLarge, got {other:?}"),
+    }
+    assert_eq!(
+        inserter.call_count(),
+        3,
+        "the suppressed copy queued no descriptor block of its own"
+    );
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        before_queue,
+        "a refused push leaves no bytes reserved"
+    );
+
+    writer.shutdown(Duration::from_millis(10)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1410,14 +1652,14 @@ async fn the_inserter_count_bounds_concurrent_inserts() {
 }
 
 /// The queue's byte allowance is aggregate across pushes, not per push: with
-/// room for exactly three of the 178-byte push, a fourth is refused and
+/// room for exactly three of the mixed push, a fourth is refused and
 /// nothing of it stays reserved. Releasing the held inserts returns exactly
 /// what was reserved.
 #[tokio::test]
 async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     let cfg = WriterConfig {
         metrics_landing_inserters: 1,
-        // Exactly three of the 178-byte push.
+        // Exactly three of the mixed push.
         ingest_queue_bytes: ByteSize(MIXED_PUSH_BYTES * 3),
         ..Default::default()
     };
@@ -1425,7 +1667,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     let inserter = MockInserter::always(Act::Gate);
     let writer = writer_with(&cfg, &root, inserter.clone());
 
-    // Each push is 178 bytes: the held insert never promotes the series LRU,
+    // Each push costs MIXED_PUSH_BYTES: the held insert never promotes the series LRU,
     // so all three emit their two kind-2 rows.
     for unix_milli in [1_000, 1_001, 1_002] {
         writer
@@ -1658,7 +1900,7 @@ async fn a_failed_spool_write_is_counted_and_changes_no_outcome() {
     assert_eq!(
         writer.metrics().queue_bytes,
         0,
-        "an ending that returned from the spool error without releasing would leave 178"
+        "an ending that returned from the spool error without releasing would leave the push's bytes charged"
     );
 
     writer.shutdown(Duration::from_secs(2)).await;
