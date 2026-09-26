@@ -57,7 +57,9 @@ use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
-use crate::ingest::{AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders};
+use crate::ingest::{
+    AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_too_large_message,
+};
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
 use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
@@ -924,7 +926,16 @@ fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             status_response(StatusCode::BAD_REQUEST, 3, KEY_REUSED_MESSAGE.to_string())
         }
-        AdmitRefusal::PushTooLarge { .. } => backpressure_response(),
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            8,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
     }
 }
 
@@ -938,7 +949,18 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             go_http_error_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
         }
-        AdmitRefusal::PushTooLarge { .. } => remote_write_backpressure_response(),
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => go_http_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{}\n",
+                push_too_large_message(rows, row_limit, bytes, byte_limit)
+            ),
+        ),
     }
 }
 
@@ -955,7 +977,18 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
         // constructs the variant; the arm exists because the refusal is one
         // shared enum (issue #603), and it answers the same way the metric
         // transports do.
-        AdmitRefusal::PushTooLarge { .. } => loki_backpressure_response(),
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => loki_plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{}\n",
+                push_too_large_message(rows, row_limit, bytes, byte_limit)
+            ),
+        ),
     }
 }
 
@@ -2925,7 +2958,7 @@ mod tests {
     /// queue's `429` would tell a client to retry a push that can never fit.
     #[tokio::test]
     async fn a_push_too_large_is_413_on_both_metric_transports() {
-        let want = crate::ingest::push_too_large_message(5, 5, 178, 16_777_216);
+        let want = push_too_large_message(5, 5, 178, 16_777_216);
 
         // The OTLP receiver: a `google.rpc.Status` protobuf.
         let sink = MockMetricSink::new(Outcome::PushTooLarge);

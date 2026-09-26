@@ -598,14 +598,8 @@ impl SpoolEncode for MetricMetadataRow {
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
 /// `hist_sum`, `hist_zero_threshold` and `hist_custom_values` may be NaN
 /// markers, so equality must compare `.to_bits()`.
-///
-/// **Stubbed for the tests-first commit**: the type carries `event_id`, which
-/// is exactly the shape `the_insert_omits_event_id_so_the_server_fills_it`
-/// forbids, and the four builders below set no column of their own kind. The
-/// column goes and the builders fill their kinds with the code.
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricLandingRow {
-    pub event_id: String,
     pub received_ms: i64,
     pub kind: u8,
     pub metric_name: String,
@@ -646,7 +640,6 @@ impl MetricLandingRow {
     /// A row of `kind` with every kind-specific column at its default.
     fn of_kind(received_ms: i64, kind: u8) -> Self {
         MetricLandingRow {
-            event_id: String::new(),
             received_ms,
             kind,
             metric_name: String::new(),
@@ -677,18 +670,42 @@ impl MetricLandingRow {
 
     /// A kind-0 row: the columns `metric_samples_mv` reads, and no others.
     pub fn float_sample(received_ms: i64, point: &MetricPoint) -> Self {
-        // Stubbed: which columns each kind fills arrives with the code.
-        let _ = point;
-        Self::of_kind(received_ms, Self::KIND_FLOAT)
+        MetricLandingRow {
+            metric_name: point.metric_name.to_string(),
+            fingerprint: point.fingerprint,
+            unix_milli: point.unix_milli,
+            value: point.value,
+            ..Self::of_kind(received_ms, Self::KIND_FLOAT)
+        }
     }
 
     /// A kind-1 row: the columns `metric_hist_samples_mv` reads, and no
     /// others. As in [`MetricHistSampleRow`]'s conversion, the histogram was
     /// validated at the ingest seam, so `to_columns` cannot fail here.
     pub fn hist_sample(received_ms: i64, point: &HistogramPoint) -> Self {
-        // Stubbed: which columns each kind fills arrives with the code.
-        let _ = point;
-        Self::of_kind(received_ms, Self::KIND_HIST)
+        let cols = point
+            .histogram
+            .to_columns()
+            .expect("histogram validated at the ingest seam: to_columns cannot fail");
+        MetricLandingRow {
+            metric_name: point.metric_name.to_string(),
+            fingerprint: point.fingerprint,
+            unix_milli: point.unix_milli,
+            hist_schema: cols.schema,
+            hist_zero_threshold: cols.zero_threshold,
+            hist_zero_count: cols.zero_count,
+            hist_count: cols.count,
+            hist_sum: cols.sum,
+            hist_pos_span_offsets: cols.pos_span_offsets,
+            hist_pos_span_lengths: cols.pos_span_lengths,
+            hist_pos_bucket_deltas: cols.pos_bucket_deltas,
+            hist_neg_span_offsets: cols.neg_span_offsets,
+            hist_neg_span_lengths: cols.neg_span_lengths,
+            hist_neg_bucket_deltas: cols.neg_bucket_deltas,
+            hist_custom_values: cols.custom_values,
+            hist_counter_reset_hint: cols.counter_reset_hint,
+            ..Self::of_kind(received_ms, Self::KIND_HIST)
+        }
     }
 
     /// A kind-2 row: the columns `metric_series_mv` reads, and no others.
@@ -701,16 +718,26 @@ impl MetricLandingRow {
         bucket_unix_milli: i64,
         value_type: u8,
     ) -> Self {
-        // Stubbed: which columns each kind fills arrives with the code.
-        let _ = (series, bucket_unix_milli, value_type);
-        Self::of_kind(received_ms, Self::KIND_SERIES)
+        MetricLandingRow {
+            metric_name: series.metric_name.to_string(),
+            fingerprint: series.fingerprint,
+            unix_milli: bucket_unix_milli,
+            labels: series.labels.to_canonical_json(),
+            value_type,
+            ..Self::of_kind(received_ms, Self::KIND_SERIES)
+        }
     }
 
     /// A kind-3 row: the columns `metric_metadata_mv` reads, and no others.
     pub fn metadata(received_ms: i64, meta: &MetricMetadata) -> Self {
-        // Stubbed: which columns each kind fills arrives with the code.
-        let _ = meta;
-        Self::of_kind(received_ms, Self::KIND_METADATA)
+        MetricLandingRow {
+            metric_name: meta.metric_name.to_string(),
+            metric_type: meta.metric_type.clone(),
+            help: meta.help.clone(),
+            unit: meta.unit.clone(),
+            updated_ns: meta.updated_ns,
+            ..Self::of_kind(received_ms, Self::KIND_METADATA)
+        }
     }
 }
 
@@ -721,11 +748,66 @@ impl SpoolEncode for MetricLandingRow {
     /// ([`MetricSampleRow`]'s impl carries the reason). One encoder
     /// emitting every column of the union would put another kind's fields
     /// in a row that does not carry them.
-    ///
-    /// **Stubbed for the tests-first commit**: an empty object, so the
-    /// per-kind key sets and the float-bit fields arrive with the code.
     fn to_spool_value(&self) -> serde_json::Value {
-        serde_json::json!({})
+        match self.kind {
+            Self::KIND_FLOAT => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "value": finite_or_null(self.value),
+                "value_bits": self.value.to_bits().to_string(),
+            }),
+            Self::KIND_HIST => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "schema": self.hist_schema,
+                "zero_threshold": finite_or_null(self.hist_zero_threshold),
+                "zero_threshold_bits": self.hist_zero_threshold.to_bits().to_string(),
+                "zero_count": self.hist_zero_count,
+                "count": self.hist_count,
+                "sum": finite_or_null(self.hist_sum),
+                "sum_bits": self.hist_sum.to_bits().to_string(),
+                "pos_span_offsets": self.hist_pos_span_offsets,
+                "pos_span_lengths": self.hist_pos_span_lengths,
+                "pos_bucket_deltas": self.hist_pos_bucket_deltas,
+                "neg_span_offsets": self.hist_neg_span_offsets,
+                "neg_span_lengths": self.hist_neg_span_lengths,
+                "neg_bucket_deltas": self.hist_neg_bucket_deltas,
+                "custom_values": self.hist_custom_values.iter().copied().map(finite_or_null)
+                    .collect::<Vec<_>>(),
+                "custom_values_bits": self.hist_custom_values.iter()
+                    .map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+                "counter_reset_hint": self.hist_counter_reset_hint,
+            }),
+            Self::KIND_SERIES => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "labels": self.labels,
+                "value_type": self.value_type,
+            }),
+            // Every row is one of the four kinds — nothing else constructs
+            // one — so this arm is the descriptor's. Matching it as the
+            // fallback rather than panicking keeps the audit record
+            // readable on the one path that reaches this encoder at all,
+            // which is a failure path.
+            _ => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "metric_type": self.metric_type,
+                "help": self.help,
+                "unit": self.unit,
+                "updated_ns": self.updated_ns,
+            }),
+        }
     }
 }
 

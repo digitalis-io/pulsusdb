@@ -446,6 +446,63 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(value_err("retention_days", "must be >= 1", ">= 1"));
     }
 
+    // Issue #603: the metrics landing table's dials. Both ends matter for
+    // each, so these are range checks rather than ceiling checks — see each
+    // constant for what its ends protect.
+    if !(METRICS_LANDING_RETENTION_HOURS_FLOOR..=METRICS_LANDING_RETENTION_HOURS_CEILING)
+        .contains(&cfg.metrics_landing_retention_hours)
+    {
+        return Err(range_err(
+            "metrics_landing_retention_hours",
+            u64::from(cfg.metrics_landing_retention_hours),
+            u64::from(METRICS_LANDING_RETENTION_HOURS_FLOOR),
+            u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING),
+            "hours",
+        ));
+    }
+    if !(METRICS_DEDUP_WINDOW_FLOOR..=METRICS_DEDUP_WINDOW_CEILING)
+        .contains(&cfg.metrics_dedup_window)
+    {
+        return Err(range_err(
+            "metrics_dedup_window",
+            cfg.metrics_dedup_window,
+            METRICS_DEDUP_WINDOW_FLOOR,
+            METRICS_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    if cfg.writer.metrics_landing_retries > METRICS_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.metrics_landing_retries",
+            u64::from(cfg.writer.metrics_landing_retries),
+            0,
+            u64::from(METRICS_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(METRICS_LANDING_INSERTERS_FLOOR..=METRICS_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.metrics_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.metrics_landing_inserters",
+            u64::from(cfg.writer.metrics_landing_inserters),
+            u64::from(METRICS_LANDING_INSERTERS_FLOOR),
+            u64::from(METRICS_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(METRICS_LANDING_MAX_ROWS_FLOOR..=METRICS_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.metrics_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.metrics_landing_max_rows",
+            cfg.writer.metrics_landing_max_rows,
+            METRICS_LANDING_MAX_ROWS_FLOOR,
+            METRICS_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
+    }
+
     // Rule 15: readers target `<table><dist_suffix>`; an empty suffix would
     // silently point reads at base tables.
     if cfg.dist_suffix.is_empty() {

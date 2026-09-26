@@ -498,10 +498,25 @@ async fn finish_generation<R>(
 pub(crate) fn spawn_dedup_ticker(
     dedup: Arc<PushDedup>,
     every: Duration,
-    shutdown: watch::Receiver<Option<Instant>>,
+    mut shutdown: watch::Receiver<Option<Instant>>,
 ) -> tokio::task::JoinHandle<()> {
-    let _ = (dedup, every, shutdown);
-    tokio::spawn(async {})
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => dedup.tick(),
+                changed = shutdown.changed() => {
+                    // A closed channel — the writer's `Shared`, and with it
+                    // the signal's sender, dropped without a graceful
+                    // shutdown — ends the ticker exactly as a deadline does.
+                    if changed.is_err() || shutdown.borrow().is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// A cheap, non-cryptographic xorshift64 PRNG for full-jitter retry

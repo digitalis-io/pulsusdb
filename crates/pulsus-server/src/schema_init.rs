@@ -11,7 +11,9 @@ use pulsus_clickhouse::ChClient;
 use pulsus_config::Config;
 use pulsus_schema::NameCatalogue;
 
-use crate::chconfig::{bootstrap_conn_config_from, schema_params_from};
+use crate::chconfig::{
+    NameCheckError, bootstrap_conn_config_from, check_server_names, schema_params_from,
+};
 
 /// Runs `--mode init` to completion: refuse contradictory flags, connect,
 /// version-gate, reconcile the schema, apply TTL, and map the outcome to a
@@ -44,7 +46,20 @@ pub(crate) async fn run_checked(
 ) -> Result<String, String> {
     pulsus_schema::guard_skip_ddl_in_init(config.skip_ddl).map_err(|e| e.to_string())?;
 
-    let _ = required;
+    // Issue #603: before `run_init`, so a missing name refuses BEFORE the
+    // `CREATE` — a check placed inside or after it would leave the schema
+    // created.
+    check_server_names(config, required)
+        .await
+        .map_err(|err| match err {
+            NameCheckError::Connect(e) => e.to_string(),
+            NameCheckError::Statement(e) => e.to_string(),
+            NameCheckError::Missing(names) => format!(
+                "clickhouse is missing names this build sends: {}",
+                names.join(", ")
+            ),
+        })?;
+
     let client = ChClient::new(bootstrap_conn_config_from(config))
         .await
         .map_err(|e| e.to_string())?;

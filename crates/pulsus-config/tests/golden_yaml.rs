@@ -29,6 +29,8 @@ retention_days: 7
 storage_policy: null
 rotation_interval: 1h
 log_rollup_resolution: 5s
+metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
+metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
 skip_unavailable_shards: false
@@ -48,6 +50,9 @@ writer:
   batch_ms: 200
   insert_mode: sync              # sync | async
   ingest_queue_bytes: 256MiB
+  metrics_landing_retries: 3     # resends of a failed metrics landing insert
+  metrics_landing_inserters: 4   # insert workers on the metrics landing queue
+  metrics_landing_max_rows: 1048576   # per-push landing row ceiling
 
 reader:
   cache_ttl: 60s
@@ -92,6 +97,8 @@ fn golden_yaml_from_configuration_md_section_9_parses_and_matches_defaults() {
     assert_eq!(cfg.clickhouse.server, "localhost");
     assert_eq!(cfg.clickhouse.pool_size, 8);
     assert_eq!(cfg.writer.batch_ms, 200);
+    assert_eq!(cfg.metrics_landing_retention_hours, 6);
+    assert_eq!(cfg.writer.metrics_landing_inserters, 4);
     assert_eq!(cfg.reader.cache_max_series, 50_000);
     assert_eq!(cfg.ruler.poll_interval.0, Duration::from_secs(30));
     assert_eq!(cfg.downsampling.tiers.len(), 0);

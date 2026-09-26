@@ -1321,6 +1321,70 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the metrics landing table (issue #603) ---
+    //
+    // One row per landed metrics event, whatever kind: a push is one INSERT
+    // of one block into this table, and the four derived metric tables
+    // (`metric_samples`, `metric_series`, `metric_metadata`,
+    // `metric_hist_samples`) are maintained from it by the `metric_*_mv`
+    // views below. `kind` says which event a row is; a row sets that kind's
+    // columns and the rest default.
+    //
+    // **No `Ddl::Dist` sibling.** This design adds no distributed table and
+    // the writer names the base table, so there is no `_dist` wrapper for it
+    // to name. `family` is read only by `apply_migration`'s `Ddl::Dist` arm,
+    // so it is inert on a base-only migration.
+    //
+    // `event_id` is the landed event's logical identity, filled by the
+    // server from the column default — the writer's row type deliberately
+    // omits the column. It is NOT the retry mechanism: that is the
+    // `insert_deduplication_token` the writer mints per block.
+    //
+    // `ttl_only_drop_parts` and `merge_with_ttl_timeout` are fixed and sit
+    // here; the delete-TTL and the two deduplication windows carry
+    // configuration values and are applied by `controller::apply_ttl`,
+    // because migration identity is checksummed over the rendered template
+    // and a dial inside this CREATE would read as drift.
+    Migration {
+        id: 64,
+        name: "metric_landing",
+        family: Some(Family::Metrics),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}} (\n\
+                 event_id                 UUID DEFAULT generateUUIDv7(),\n\
+                 received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 kind                     UInt8  CODEC(ZSTD(1)),\n\
+                 metric_name              LowCardinality(String),\n\
+                 fingerprint              UInt128  CODEC(Delta(8), ZSTD(1)),\n\
+                 unix_milli               Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 value                    Float64  CODEC(Gorilla, ZSTD(1)),\n\
+                 labels                   String  CODEC(ZSTD(5)),\n\
+                 value_type               UInt8  CODEC(ZSTD(1)),\n\
+                 metric_type              LowCardinality(String),\n\
+                 help                     String  CODEC(ZSTD(1)),\n\
+                 unit                     String  CODEC(ZSTD(1)),\n\
+                 updated_ns               Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 hist_schema              Int8  CODEC(ZSTD(1)),\n\
+                 hist_zero_threshold      Float64  CODEC(Gorilla, ZSTD(1)),\n\
+                 hist_zero_count          UInt64  CODEC(T64, ZSTD(1)),\n\
+                 hist_count               UInt64  CODEC(T64, ZSTD(1)),\n\
+                 hist_sum                 Float64  CODEC(Gorilla, ZSTD(1)),\n\
+                 hist_pos_span_offsets    Array(Int32)  CODEC(ZSTD(1)),\n\
+                 hist_pos_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),\n\
+                 hist_pos_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),\n\
+                 hist_neg_span_offsets    Array(Int32)  CODEC(ZSTD(1)),\n\
+                 hist_neg_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),\n\
+                 hist_neg_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),\n\
+                 hist_custom_values       Array(Float64)  CODEC(ZSTD(1)),\n\
+                 hist_counter_reset_hint  UInt8  CODEC(ZSTD(1))\n\
+             ) ENGINE = MergeTree\n\
+             PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))\n\
+             ORDER BY (kind, metric_name, fingerprint, unix_milli)\n\
+             SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1420,6 +1484,50 @@ pub const MVS: &[MvDef] = &[
                       trace_id, span_id, timestamp_ns, duration_ns, service, name, kind\n\
                FROM {{db}}.trace_spans\n\
                WHERE status_code = 2;",
+    },
+    // Issue #603: the four views that maintain the metric tables from
+    // `metric_landing`. One `kind` each, and each projection lists the
+    // target's columns **in the target's own column order**, aliased to its
+    // column names, so the view is correct whether the server matches by
+    // position or by name. `value_type` (id 25) and `counter_reset_hint`
+    // (id 27) were added by ALTER, so they come last in their targets.
+    MvDef {
+        name: "metric_samples_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.metric_samples_mv{{on_cluster}} TO {{db}}.metric_samples AS\n\
+               SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+                      unix_milli AS unix_milli, value AS value\n\
+               FROM {{db}}.metric_landing WHERE kind = 0;",
+    },
+    MvDef {
+        name: "metric_hist_samples_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.metric_hist_samples_mv{{on_cluster}} TO {{db}}.metric_hist_samples AS\n\
+               SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+                      unix_milli AS unix_milli, hist_schema AS schema,\n\
+                      hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count,\n\
+                      hist_count AS count, hist_sum AS sum,\n\
+                      hist_pos_span_offsets AS pos_span_offsets,\n\
+                      hist_pos_span_lengths AS pos_span_lengths,\n\
+                      hist_pos_bucket_deltas AS pos_bucket_deltas,\n\
+                      hist_neg_span_offsets AS neg_span_offsets,\n\
+                      hist_neg_span_lengths AS neg_span_lengths,\n\
+                      hist_neg_bucket_deltas AS neg_bucket_deltas,\n\
+                      hist_custom_values AS custom_values,\n\
+                      hist_counter_reset_hint AS counter_reset_hint\n\
+               FROM {{db}}.metric_landing WHERE kind = 1;",
+    },
+    MvDef {
+        name: "metric_series_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.metric_series_mv{{on_cluster}} TO {{db}}.metric_series AS\n\
+               SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+                      unix_milli AS unix_milli, labels AS labels, value_type AS value_type\n\
+               FROM {{db}}.metric_landing WHERE kind = 2;",
+    },
+    MvDef {
+        name: "metric_metadata_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata AS\n\
+               SELECT metric_name AS metric_name, metric_type AS metric_type, help AS help,\n\
+                      unit AS unit, updated_ns AS updated_ns\n\
+               FROM {{db}}.metric_landing WHERE kind = 3;",
     },
 ];
 
