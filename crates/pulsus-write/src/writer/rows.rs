@@ -648,10 +648,8 @@ impl MetricLandingRow {
     /// `PULSUS_INGEST_QUEUE_BYTES` names the buffered bytes, and a landing row
     /// is held as a whole [`MetricLandingRow`] until its block is encoded, so
     /// the row's inline slots are charged beside the buffers it owns.
-    ///
-    /// Stubbed: the charge arrives with the code.
     pub fn est_landing_bytes(target_bytes: u64) -> u64 {
-        target_bytes
+        target_bytes + LANDING_ROW_SLOT_BYTES
     }
 
     /// A float sample, whose target is `metric_samples`.

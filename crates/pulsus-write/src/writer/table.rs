@@ -75,6 +75,18 @@ impl ChBlockInserter {
     pub fn with_settings(client: Arc<ChClient>, extra: QuerySettings) -> Self {
         ChBlockInserter { client, extra }
     }
+
+    /// The settings one insert sends: this inserter's own, then the call's on
+    /// top, so where both name a setting the call's value wins. The metrics
+    /// landing token is minted per push and an inserter-wide value could never
+    /// stand in for it (issue #603).
+    fn merged_settings(&self, extra: &QuerySettings) -> QuerySettings {
+        let mut merged = self.extra.clone();
+        for (key, value) in extra.entries() {
+            merged = merged.set(key, value);
+        }
+        merged
+    }
 }
 
 impl<R: ChRow> BlockInserter<R> for ChBlockInserter {
@@ -84,6 +96,24 @@ impl<R: ChRow> BlockInserter<R> for ChBlockInserter {
         rows: &'a [R],
     ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
         Box::pin(self.client.insert_block_with(table, rows, &self.extra))
+    }
+
+    /// **Overridden, not inherited** (issue #603). The trait default drops
+    /// `extra` and calls [`Self::insert`], which sends this inserter's own
+    /// settings alone; inheriting it here would silently discard every
+    /// per-block setting the metrics landing path supplies — the deduplication
+    /// token and pins that make a resend safe, and the block-size ceiling that
+    /// keeps one push from becoming two blocks.
+    fn insert_with<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [R],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        Box::pin(async move {
+            let merged = self.merged_settings(extra);
+            self.client.insert_block_with(table, rows, &merged).await
+        })
     }
 }
 
@@ -127,11 +157,12 @@ pub(crate) type FlushSuccessHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
 /// A definitely-failed-flush callback (issues #134/#139): invoked ONLY
 /// from [`finish_generation`]'s `FlushOutcome::Poisoned` arm — a Poisoned
-/// outcome is provably not-committed (a non-retryable error surfaced
-/// unchanged by `insert_block`, or a pre-send retryable exhausted in the
-/// writer's retry loop; every post-send retryable is downgraded to
-/// `InsertUncertain` before it reaches this module), so re-inserting the
-/// rows replays nothing that could have committed. The registration
+/// outcome is provably not-committed (an error `insert_block` surfaced
+/// unchanged, which it does only for a failure raised before any of the block
+/// was sent, or such a retryable one exhausted in the writer's retry loop;
+/// every failure from the send onward is downgraded to `InsertUncertain`
+/// before it reaches this module, whether or not its class is retryable), so
+/// re-inserting the rows replays nothing that could have committed. The registration
 /// tables' backfill enqueues hook in here (`log_streams`,
 /// `metric_series`, `metric_metadata`, `trace_attrs_idx`); every
 /// append-only table (`log_samples`, `metric_samples`,

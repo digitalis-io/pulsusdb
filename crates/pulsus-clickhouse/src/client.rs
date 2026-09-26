@@ -45,6 +45,23 @@ struct StringRow {
     s: String,
 }
 
+/// How far one insert attempt had got when it failed — the only thing that
+/// decides whether its commit fate is knowable.
+///
+/// The boundary is the first `write`, not the server's answer: from there the
+/// request is open and the vendored client flushes on its own buffer
+/// threshold, so nothing here can tell whether bytes left the process. A
+/// failure at or after it may have committed; one before it provably did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertPhase {
+    /// The pooled connection's checkout and the target's column-metadata
+    /// read: none of the block has been sent.
+    BeforeSend,
+    /// Writing the rows, ending the insert, or the client-side deadline
+    /// cutting either.
+    MayHaveSent,
+}
+
 pub struct ChClient {
     pool: Arc<ChPool>,
     default_timeout: Duration,
@@ -189,14 +206,28 @@ impl ChClient {
     ///
     /// Bounded by both a server-side `max_execution_time` (on the `INSERT`
     /// statement) and a client-side `tokio::time::timeout` wrapping the
-    /// whole create/write/end sequence. Because a timed-out or
-    /// network-aborted insert has **unknown commit fate** (the server may
-    /// have partially applied it), any retryable-class failure here is
-    /// downgraded to the non-retryable [`ChError::InsertUncertain`] — this
-    /// is the rule that keeps a caller from ever auto-retrying an insert
-    /// whose effect is uncertain. Genuine pre-commit poison (bad SQL,
-    /// decode failure) is surfaced unchanged: nothing was committed, so it
-    /// is not uncertain, merely wrong.
+    /// whole create/write/end sequence.
+    ///
+    /// **What decides the class is the phase, not the error.** An insert's
+    /// commit fate is unknown from the moment any of the
+    /// block may have left the process: the server may have applied part of it,
+    /// and a source table whose derived tables are maintained by materialized
+    /// view can have committed its own block before a view on it throws. So
+    /// every failure from the write-or-end phase — retryable or not — is
+    /// [`ChError::InsertUncertain`], which no caller auto-retries. Only a
+    /// failure raised **before** the block was sent, which is the pooled
+    /// connection's checkout and the target's column-metadata read, is genuine
+    /// pre-commit poison and keeps its precise class: nothing was committed,
+    /// so it is not uncertain, merely wrong, and the caller may release
+    /// whatever it was holding for a retry.
+    ///
+    /// It over-reports and never under-reports: a client-side row
+    /// serialization failure on the first row is reported unknown although
+    /// nothing was sent, because the vendored client buffers and flushes on its
+    /// own threshold and nothing here can tell which side of that the failure
+    /// fell on. A caller told "unknown" for a block that was never stored
+    /// loses a retry; a caller told "not stored" for a block that was stored
+    /// double-counts it.
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         self.insert_block_with(table, rows, &QuerySettings::new())
             .await
@@ -217,38 +248,52 @@ impl ChClient {
         // has no typed settings helper).
         let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
         let fut = async {
-            let mut insert = conn.client().insert::<R>(table).await?;
+            // `insert` reads the target's column metadata and returns a
+            // builder; none of the block has been sent when it fails.
+            let mut insert = conn
+                .client()
+                .insert::<R>(table)
+                .await
+                .map_err(|e| (InsertPhase::BeforeSend, ChError::from(e)))?;
             for (k, v) in settings.iter() {
                 insert = insert.with_setting(k, v);
             }
+            // From the first `write` the request is open and the client
+            // flushes on its own buffer threshold, so anything from here on
+            // may already be on the wire.
             for row in rows {
-                insert.write(row).await?;
+                insert
+                    .write(row)
+                    .await
+                    .map_err(|e| (InsertPhase::MayHaveSent, ChError::from(e)))?;
             }
-            insert.end().await
+            insert
+                .end()
+                .await
+                .map_err(|e| (InsertPhase::MayHaveSent, ChError::from(e)))
         };
-        let result = tokio::time::timeout(self.default_timeout, fut)
-            .await
-            .map_err(|_| {
-                ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout))
-            })
-            .and_then(|inner| inner.map_err(ChError::from));
+        let result = tokio::time::timeout(self.default_timeout, fut).await;
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Transport-class failure demotes this endpoint so the next
-                // insert steers to a healthy one (no-op for logic errors —
-                // the guard lives in `report_transport_failure`).
-                conn.report_transport_failure(&e);
-                // Uncertain-fate downgrade: any retryable failure during an
-                // insert must NOT reach a caller as retryable (would
-                // duplicate the block on replay).
-                if e.is_retryable() {
-                    Err(ChError::InsertUncertain(e.to_string()))
-                } else {
-                    Err(e) // genuine pre-commit poison, surfaced precisely
-                }
-            }
+        let (phase, err) = match result {
+            // The client-side deadline cut the whole sequence: which of the
+            // phases it interrupted is not knowable, so it is unknown.
+            Err(_elapsed) => (
+                InsertPhase::MayHaveSent,
+                ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout)),
+            ),
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(pair)) => pair,
+        };
+
+        // Transport-class failure demotes this endpoint so the next insert
+        // steers to a healthy one (no-op for logic errors — the guard lives in
+        // `report_transport_failure`).
+        conn.report_transport_failure(&err);
+        match phase {
+            InsertPhase::MayHaveSent => Err(ChError::InsertUncertain(err.to_string())),
+            // Provably before the block was sent, so its class is preserved:
+            // a retryable one is still retryable, and poison is still poison.
+            InsertPhase::BeforeSend => Err(err),
         }
     }
 

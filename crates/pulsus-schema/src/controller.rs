@@ -671,17 +671,14 @@ const ACCESS_DENIED: i32 = 497;
 /// catalogue was not read for a reason that says nothing about grants, so
 /// continuing would let startup send a name nothing checked (issue #603 code
 /// review, finding 6).
-///
-/// Stubbed: which failures are tolerated arrives with the code.
 fn catalogue_read_is_unchecked(err: &SchemaError) -> bool {
-    let _denied = matches!(
+    matches!(
         err,
         SchemaError::Clickhouse(ChError::Server {
             code: ACCESS_DENIED,
             ..
         })
-    );
-    true
+    )
 }
 
 /// Turns one catalogue read per catalogue into the list of required names the
