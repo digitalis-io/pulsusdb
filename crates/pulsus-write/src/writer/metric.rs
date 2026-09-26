@@ -386,6 +386,12 @@ impl MetricWriter {
         // Every row of a push carries the same stamp, so the block lies in
         // one partition.
         let received_ms = now_unix_millis();
+        // The landing budget's anchor, taken before the claim and before any
+        // admission work, because the claim deadline it must settle inside of
+        // starts here too (issue #603 code review, finding 7). A budget
+        // measured from the enqueue instead would believe it had its full
+        // allowance after admission had already spent part of the deadline.
+        let admitted_at = tokio::time::Instant::now();
 
         // Issue #494: the claim, taken before the byte reservation so a
         // request refused by backpressure leaves no claim behind. What this
@@ -435,8 +441,67 @@ impl MetricWriter {
         let descriptors: Vec<&MetricMetadata> = last_by_name.into_values().collect();
         let metadata_bytes: u64 = descriptors
             .iter()
-            .map(|m| MetricMetadataRow::est_source_bytes(m))
+            .map(|m| MetricLandingRow::est_landing_bytes(MetricMetadataRow::est_source_bytes(m)))
             .sum();
+
+        // Reserve-before-materialize: estimate bytes and decide which
+        // series are cache misses BEFORE cloning anything into a row shape.
+        // Each landing row is charged the row the QUEUE holds — the union of
+        // the four kinds' columns — plus the buffers that kind's target
+        // estimator prices, so `PULSUS_INGEST_QUEUE_BYTES` bounds what is
+        // actually buffered.
+        let sample_bytes: u64 = batch
+            .samples
+            .iter()
+            .map(|s| MetricLandingRow::est_landing_bytes(MetricSampleRow::est_source_bytes(s)))
+            .sum();
+        let hist_sample_bytes: u64 = batch
+            .hist_samples
+            .iter()
+            .map(|h| MetricLandingRow::est_landing_bytes(MetricHistSampleRow::est_source_bytes(h)))
+            .sum();
+
+        // Which kind-2 rows the push has to register, and what they cost.
+        // This runs for a suppressed push too, because the push-size decision
+        // below is over the whole push and has to be complete before any
+        // branch can queue anything; its counters do not move for one, so
+        // issue #494's suppression path is observably unchanged.
+        let new_series = self.series_to_register(&batch, suppressed.is_none());
+        let series_bytes: u64 = new_series
+            .iter()
+            .map(|(s, _, _)| {
+                MetricLandingRow::est_landing_bytes(MetricSeriesRow::est_source_bytes(s))
+            })
+            .sum();
+
+        let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
+        let total_rows =
+            (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
+                as u64;
+
+        // The two per-push ceilings, counted over all four kinds, and decided
+        // **before** either branch below queues anything (issue #603 code
+        // review, finding 5). At or above the row limit the block would not be
+        // strictly under the value `max_insert_block_size` is pinned to, and
+        // the server would split it. Returning here drops the un-sealed guard,
+        // which removes the claim, so the client's retry of an unstored push is
+        // stored rather than suppressed — and no bytes have been reserved yet.
+        //
+        // A push the index recognises as a repeat is refused the same way, and
+        // for the same reason: it does not fit one block, so storing any part
+        // of it — its descriptors included — would leave a `413` that stored
+        // something. Its size is its own, over all four kinds, so one push
+        // gets one answer whether or not it raced a copy of itself.
+        if total_rows >= self.shared.runtime.metrics_landing_max_rows
+            || total_bytes > self.shared.runtime.batch_bytes
+        {
+            return Err(AdmitRefusal::PushTooLarge {
+                rows: total_rows,
+                row_limit: self.shared.runtime.metrics_landing_max_rows,
+                bytes: total_bytes,
+                byte_limit: self.shared.runtime.batch_bytes,
+            });
+        }
 
         // The suppressed push stops here: its samples are already stored by
         // the push it repeats, and the only thing it still owes is its
@@ -461,7 +526,14 @@ impl MetricWriter {
                     .metrics
                     .metadata_upserts_total
                     .fetch_add(rows.len() as u64, Ordering::Relaxed);
-                self.queue_block(rows, metadata_bytes, ClaimTicket::inert(), None, Vec::new());
+                self.queue_block(
+                    rows,
+                    metadata_bytes,
+                    ClaimTicket::inert(),
+                    None,
+                    Vec::new(),
+                    admitted_at,
+                );
             }
             return Ok(Admitted::Suppressed(suppressed));
         }
@@ -474,120 +546,6 @@ impl MetricWriter {
             .metrics
             .rejected_total
             .fetch_add(batch.rejected, Ordering::Relaxed);
-
-        // Reserve-before-materialize: estimate bytes and decide which
-        // series are cache misses BEFORE cloning anything into a row shape.
-        // A landing row costs what the target row it becomes costs, so the
-        // queue keeps today's units.
-        let sample_bytes: u64 = batch
-            .samples
-            .iter()
-            .map(MetricSampleRow::est_source_bytes)
-            .sum();
-        let hist_sample_bytes: u64 = batch
-            .hist_samples
-            .iter()
-            .map(MetricHistSampleRow::est_source_bytes)
-            .sum();
-
-        // An exact `(metric_name, fingerprint) -> &SeriesRef` index, built
-        // once per admission and consulted per touched bucket. One
-        // `SeriesRef` serves whichever of the float and histogram samples
-        // reference that `(metric_name, fingerprint)`.
-        let series_by_key: HashMap<(&str, Fingerprint), &SeriesRef> = batch
-            .series
-            .iter()
-            .map(|s| ((s.metric_name.as_ref(), s.fingerprint), s))
-            .collect();
-
-        // Buckets are derived per-*sample*, not per-series, so a
-        // backfilled/straddling request emits one kind-2 row per touched
-        // `(metric_name, fingerprint, bucket, value_type)`. Both float
-        // samples (`value_type = 0`) and native-histogram samples
-        // (`value_type = 1`) drive registration, so a series carrying both
-        // in one bucket registers BOTH rows.
-        let mut seen_in_request: HashSet<SeriesKey> = HashSet::new();
-        let mut new_series: Vec<(&SeriesRef, i64, u8)> = Vec::new();
-        {
-            let mut lru = self
-                .shared
-                .series_lru
-                .lock()
-                .expect("series lru mutex poisoned");
-            let float_keys = batch.samples.iter().map(|s| {
-                (
-                    &s.metric_name,
-                    s.fingerprint,
-                    s.unix_milli,
-                    VALUE_TYPE_FLOAT,
-                )
-            });
-            let hist_keys = batch.hist_samples.iter().map(|h| {
-                (
-                    &h.metric_name,
-                    h.fingerprint,
-                    h.unix_milli,
-                    VALUE_TYPE_HISTOGRAM,
-                )
-            });
-            for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
-                let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
-                let key: SeriesKey = (metric_name.clone(), fingerprint, bucket, value_type);
-                if !seen_in_request.insert(key.clone()) {
-                    continue; // already queued by an earlier sample this request
-                }
-                if lru.contains(&key) {
-                    self.shared
-                        .metrics
-                        .series_lru_hits_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                self.shared
-                    .metrics
-                    .series_lru_misses_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let Some(series_ref) = series_by_key
-                    .get(&(metric_name.as_ref(), fingerprint))
-                    .copied()
-                else {
-                    // The receiver's contract requires a `SeriesRef` for
-                    // every distinct series a request's samples touch — the
-                    // writer never panics on a caller-side contract
-                    // violation, it just cannot register a series it was
-                    // never told the labels of. The sample is still
-                    // admitted below.
-                    continue;
-                };
-                new_series.push((series_ref, bucket, value_type));
-            }
-        }
-        let series_bytes: u64 = new_series
-            .iter()
-            .map(|(s, _, _)| MetricSeriesRow::est_source_bytes(s))
-            .sum();
-
-        let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
-        let total_rows =
-            (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
-                as u64;
-
-        // The two per-push ceilings, counted over all four kinds. At or
-        // above the row limit the block would not be strictly under the
-        // value `max_insert_block_size` is pinned to, and the server would
-        // split it. Returning here drops the un-sealed guard, which removes
-        // the claim, so the client's retry of an unstored push is stored
-        // rather than suppressed — and no bytes have been reserved yet.
-        if total_rows >= self.shared.runtime.metrics_landing_max_rows
-            || total_bytes > self.shared.runtime.batch_bytes
-        {
-            return Err(AdmitRefusal::PushTooLarge {
-                rows: total_rows,
-                row_limit: self.shared.runtime.metrics_landing_max_rows,
-                bytes: total_bytes,
-                byte_limit: self.shared.runtime.batch_bytes,
-            });
-        }
 
         // Atomic reservation: reserve first, roll back on overflow.
         super::reserve_queued_bytes(
@@ -681,7 +639,7 @@ impl MetricWriter {
             None
         };
 
-        self.queue_block(rows, total_bytes, claim, waiter, promote);
+        self.queue_block(rows, total_bytes, claim, waiter, promote, admitted_at);
 
         // Arms the claim: from here a drop no longer removes it, and the
         // target set is closed.
@@ -689,6 +647,94 @@ impl MetricWriter {
             guard.seal();
         }
         Ok(Admitted::Stored(receivers))
+    }
+
+    /// The `(series, bucket, value_type)` triples a push has to register,
+    /// derived read-only from the registration LRU.
+    ///
+    /// Buckets are derived per-*sample*, not per-series, so a
+    /// backfilled/straddling request emits one kind-2 row per touched
+    /// `(metric_name, fingerprint, bucket, value_type)`. Both float samples
+    /// (`value_type = 0`) and native-histogram samples (`value_type = 1`)
+    /// drive registration, so a series carrying both in one bucket registers
+    /// BOTH rows.
+    ///
+    /// `count` is false for a suppressed push, which stores no registration
+    /// row: it is asked only so the push-size decision is over the whole push,
+    /// and the LRU hit/miss counters must not move for it.
+    fn series_to_register<'a>(
+        &self,
+        batch: &'a ParsedMetrics,
+        count: bool,
+    ) -> Vec<(&'a SeriesRef, i64, u8)> {
+        // An exact `(metric_name, fingerprint) -> &SeriesRef` index, built
+        // once per admission and consulted per touched bucket. One
+        // `SeriesRef` serves whichever of the float and histogram samples
+        // reference that `(metric_name, fingerprint)`.
+        let series_by_key: HashMap<(&str, Fingerprint), &SeriesRef> = batch
+            .series
+            .iter()
+            .map(|s| ((s.metric_name.as_ref(), s.fingerprint), s))
+            .collect();
+
+        let mut seen_in_request: HashSet<SeriesKey> = HashSet::new();
+        let mut new_series: Vec<(&'a SeriesRef, i64, u8)> = Vec::new();
+        let mut lru = self
+            .shared
+            .series_lru
+            .lock()
+            .expect("series lru mutex poisoned");
+        let float_keys = batch.samples.iter().map(|s| {
+            (
+                &s.metric_name,
+                s.fingerprint,
+                s.unix_milli,
+                VALUE_TYPE_FLOAT,
+            )
+        });
+        let hist_keys = batch.hist_samples.iter().map(|h| {
+            (
+                &h.metric_name,
+                h.fingerprint,
+                h.unix_milli,
+                VALUE_TYPE_HISTOGRAM,
+            )
+        });
+        for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
+            let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
+            let key: SeriesKey = (metric_name.clone(), fingerprint, bucket, value_type);
+            if !seen_in_request.insert(key.clone()) {
+                continue; // already queued by an earlier sample this request
+            }
+            if lru.contains(&key) {
+                if count {
+                    self.shared
+                        .metrics
+                        .series_lru_hits_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            if count {
+                self.shared
+                    .metrics
+                    .series_lru_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let Some(series_ref) = series_by_key
+                .get(&(metric_name.as_ref(), fingerprint))
+                .copied()
+            else {
+                // The receiver's contract requires a `SeriesRef` for every
+                // distinct series a request's samples touch — the writer never
+                // panics on a caller-side contract violation, it just cannot
+                // register a series it was never told the labels of. The
+                // sample is still admitted.
+                continue;
+            };
+            new_series.push((series_ref, bucket, value_type));
+        }
+        new_series
     }
 
     /// Seals one block — minting its token, so two byte-identical pushes
@@ -712,6 +758,7 @@ impl MetricWriter {
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         promote: Vec<SeriesKey>,
+        admitted_at: tokio::time::Instant,
     ) {
         let token = {
             let mut rng = self
@@ -731,7 +778,7 @@ impl MetricWriter {
             claim,
             waiter,
             promote,
-            admitted_at: tokio::time::Instant::now(),
+            admitted_at,
         };
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
@@ -1011,9 +1058,11 @@ async fn run_block(
             Ok(Ok(result)) => result,
         };
 
-        // A retryable `ChError` here is always pre-send: `insert_block_with`
-        // downgrades every retryable failure after the send to
-        // `InsertUncertain`, and the only error before it is the checkout's.
+        // Every `ChError` here other than `InsertUncertain` is pre-send:
+        // `insert_block_with` downgrades every failure from the send onward to
+        // `InsertUncertain` whatever its class, and the only errors before it
+        // are the connection checkout's and the target's column-metadata
+        // read's.
         let resendable = match sent {
             Ok(()) => {
                 let latency = block.admitted_at.elapsed();
@@ -1095,7 +1144,12 @@ async fn settle_block(
     cause: TerminalCause,
 ) {
     let (kind, outcome, msg) = fate.settle();
-    ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
+    // The reservation is released AFTER the spool write returns, on its error
+    // path too (issue #603 code review, finding 4). `SpoolWriter::write` maps
+    // every row into a second value vector and then into a serialized byte
+    // vector, so the rows and both copies are live until it returns: releasing
+    // first would let a new admission take the allowance while they are, and
+    // `PULSUS_INGEST_QUEUE_BYTES` would permit more than it names.
     if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &block.rows, &msg).await {
         ctx.metrics
             .landing
@@ -1107,6 +1161,7 @@ async fn settle_block(
             "failed to spool a landing block to disk"
         );
     }
+    ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
     block.claim.settle(outcome);
     if let Some(waiter) = block.waiter {
         let err = match cause {

@@ -648,10 +648,8 @@ impl MetricLandingRow {
     /// `PULSUS_INGEST_QUEUE_BYTES` names the buffered bytes, and a landing row
     /// is held as a whole [`MetricLandingRow`] until its block is encoded, so
     /// the row's inline slots are charged beside the buffers it owns.
-    ///
-    /// Stubbed: the charge arrives with the code.
     pub fn est_landing_bytes(target_bytes: u64) -> u64 {
-        target_bytes
+        target_bytes + LANDING_ROW_SLOT_BYTES
     }
 
     /// A float sample, whose target is `metric_samples`.
@@ -2143,15 +2141,15 @@ mod tests {
     #[test]
     fn a_landing_row_is_charged_the_row_the_queue_holds() {
         const HAND_DERIVED_FLOOR: u64 = 348;
+        let slots = LANDING_ROW_SLOT_BYTES;
         assert_eq!(
-            LANDING_ROW_SLOT_BYTES,
+            slots,
             std::mem::size_of::<MetricLandingRow>() as u64,
             "the constant prices the declaration it names"
         );
         assert!(
-            LANDING_ROW_SLOT_BYTES >= HAND_DERIVED_FLOOR,
-            "a landing row's slots come to at least {HAND_DERIVED_FLOOR}, \
-             got {LANDING_ROW_SLOT_BYTES}"
+            slots >= HAND_DERIVED_FLOOR,
+            "a landing row's slots come to at least {HAND_DERIVED_FLOOR}, got {slots}"
         );
 
         // Every kind's charge is its target estimate plus the row it is held
