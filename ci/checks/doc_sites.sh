@@ -80,7 +80,7 @@
 # issue-reference half checks nothing and still exits 0.
 #
 # **This is how every step in this workflow works, not a property of this
-# one.** `.github/workflows/ci.yml` defines 192 steps across 11 jobs, 148
+# one.** `.github/workflows/ci.yml` defines 191 steps across 11 jobs, 147
 # of which run a command, and all of them are read from the tree under
 # review. This check is conspicuous only because it reads like a security
 # control. It is not one. Its value is that it fails when documentation
