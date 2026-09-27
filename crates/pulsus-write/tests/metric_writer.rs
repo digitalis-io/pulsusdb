@@ -1226,12 +1226,13 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The escaping metric name and label set the case below pushes. Every class
-/// of JSON escaping is here: a quote and a backslash, a newline, and a run of
-/// 30 control characters with no shorthand — six bytes each once encoded,
-/// where the raw value counts one.
+/// The metric name the case below pushes. Plain: only its label values
+/// escape.
 const ESCAPING_METRIC: &str = "http_requests_total";
 
+/// A series whose label values carry every class of JSON escaping: a quote and
+/// a backslash, a newline, and a run of 30 control characters with no shorthand
+/// — six bytes each once encoded, where the raw value counts one.
 fn escaping_series(fingerprint: u128) -> SeriesRef {
     let (labels, _) = LabelSet::from_normalized([
         ("path".to_string(), "/a\"b\\c\nd".to_string()),

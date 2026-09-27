@@ -303,6 +303,27 @@ async fn a_client_deadline_after_the_insert_was_opened_is_uncertain() {
         !err.is_retryable(),
         "an uncertain block is never auto-retried: {err:?}"
     );
+    // The insert request reached the server, so the phase this case names is
+    // the phase the deadline cut. The mock records a request before it stalls,
+    // so the record is there as soon as it has read it; the bounded wait is for
+    // that record and never for the outcome asserted above.
+    let mut opened = false;
+    for _ in 0..200 {
+        if mock
+            .requests()
+            .iter()
+            .any(|r| r.body.starts_with("INSERT INTO"))
+        {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        opened,
+        "the insert request reached the mock: {:?}",
+        mock.requests()
+    );
 }
 
 /// A spool root of this case's own, so the writer writes nothing into the
