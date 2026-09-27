@@ -126,7 +126,7 @@ impl MetricWriterTables {
 /// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock>()` |
 /// | `settings`: four owned key/value pairs | their four slots, plus 192 for their text — 165 at a 36-byte token and the default row ceiling (18 + 6, 50 + 1, 26 + 36, 21 + 7), leaving room for a longer rendered ceiling |
 /// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
-/// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256, twice the 72 those come to, because the channel's own bookkeeping is private to it |
+/// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256. Those four come to 8 + 2 × 16 + 32 = 72; the rest is allowance, because the channel's own bookkeeping is private to it |
 ///
 /// **So a block may hold nothing whose size grows with the push except its
 /// rows.** A field that did would need its own per-push term and this one
@@ -173,9 +173,8 @@ fn promotion_keys(rows: &[MetricLandingRow]) -> impl Iterator<Item = SeriesKey> 
 /// One admitted push, sealed and queued. A worker runs it to exactly one
 /// ending and is the only place it settles.
 ///
-/// **No field may hold anything whose size grows with the push except
-/// `rows`** — [`LANDING_BLOCK_OVERHEAD_BYTES`] prices every other field at one
-/// figure per block.
+/// **What one of these costs the queue, and what that requires of the fields
+/// below, is [`LANDING_BLOCK_OVERHEAD_BYTES`].**
 pub(crate) struct LandingBlock {
     /// The push's landing rows, every kind in one vector. Nothing depends on
     /// their order inside the block: the table's sorting key orders what is
