@@ -582,12 +582,19 @@ impl NameCatalogue {
 /// startup refuses and says which.
 pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("insert_deduplication_token", NameCatalogue::Setting),
-    // The three limits one landing insert pins, so that one push is one
-    // block: `QuerySettings::landing_insert` names them together and says
-    // what each does.
+    // The seven settings one landing insert pins, so that one push is one
+    // deduplicated block: `QuerySettings::landing_insert` names them
+    // together, quotes what each one's own catalogue entry says, and states
+    // how the set was derived. A pin added there without a row here is
+    // caught by
+    // `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends`.
     ("max_insert_block_size", NameCatalogue::Setting),
     ("max_insert_block_size_bytes", NameCatalogue::Setting),
     ("input_format_max_block_size_bytes", NameCatalogue::Setting),
+    ("min_insert_block_size_rows", NameCatalogue::Setting),
+    ("min_insert_block_size_bytes", NameCatalogue::Setting),
+    ("input_format_connection_handling", NameCatalogue::Setting),
+    ("input_format_max_block_wait_ms", NameCatalogue::Setting),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
