@@ -201,7 +201,7 @@ docs/query-to-sql.md	catalog.rs:442	crates/pulsus-schema/src/catalog.rs	442		pro
 docs/query-to-sql.md	catalog.rs:986-992	crates/pulsus-schema/src/catalog.rs	986	992	prose	status_message	(service, timestamp_ns)
 docs/query-to-sql.md	client_agg.rs:2169	crates/pulsus-read/src/logql/client_agg.rs	2169		line	VectorAggSpec	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
 docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	minor	if (major, minor) < (26, 3) {
-docs/query-to-sql.md	controller.rs:76	crates/pulsus-schema/src/controller.rs	76		line	Some	Some(Ok(row)) => Ok(row.v),
+docs/query-to-sql.md	controller.rs:76	crates/pulsus-schema/src/controller.rs	81		line	Some	Some(Ok(row)) => Ok(row.v),
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:620	crates/pulsus-config/src/model.rs	620		line	traceql_generator_max_memory_bytes	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	syntactic	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i

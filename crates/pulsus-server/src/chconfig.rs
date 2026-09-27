@@ -115,6 +115,12 @@ pub(crate) enum NameCheckError {
 /// It builds a bootstrap client of its own, so it does not need the target
 /// database to exist, and drops it again: the check runs before the serving
 /// pool is connected and before any DDL.
+///
+/// **The version gate comes first** (issue #603 code review round 7). Every
+/// name here exists on the minimum supported server, so on an older one some
+/// are absent *because* of the version — and then the version is the refusal
+/// to report, since it is the thing an operator can act on. Reporting the
+/// names instead buries the reason under its symptom.
 pub(crate) async fn check_server_names(
     config: &Config,
     required: &[(&'static str, NameCatalogue)],
@@ -122,6 +128,10 @@ pub(crate) async fn check_server_names(
     let client = ChClient::new(bootstrap_conn_config_from(config))
         .await
         .map_err(NameCheckError::Connect)?;
+    let version = pulsus_schema::server_version(&client)
+        .await
+        .map_err(NameCheckError::Statement)?;
+    pulsus_schema::check_version(&version).map_err(NameCheckError::Statement)?;
     let absent = pulsus_schema::absent_server_names(&client, required)
         .await
         .map_err(NameCheckError::Statement)?;

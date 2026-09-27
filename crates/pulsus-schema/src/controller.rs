@@ -68,7 +68,12 @@ struct VersionRow {
 }
 
 /// Fetches the connected server's `version()` string.
-async fn fetch_version(client: &ChClient) -> Result<String, SchemaError> {
+///
+/// Public because the startup name check gates on the version before it asks
+/// which names are present: a name this build sends that arrived in a later
+/// server version is absent *because* the server is too old, and the version
+/// is the one an operator can act on (issue #603 code review round 7).
+pub async fn server_version(client: &ChClient) -> Result<String, SchemaError> {
     let mut stream = client
         .query_stream::<VersionRow>("SELECT version() AS v", &QuerySettings::new())
         .await?;
@@ -85,7 +90,7 @@ async fn fetch_version(client: &ChClient) -> Result<String, SchemaError> {
 /// MVs) → apply TTL once. Idempotent — a second run against an
 /// already-initialized database is a no-op past the version check.
 pub async fn run_init(client: &ChClient, params: &SchemaParams) -> Result<(), SchemaError> {
-    let version = fetch_version(client).await?;
+    let version = server_version(client).await?;
     check_version(&version)?;
     reconcile(client, params).await?;
     apply_ttl(client, params).await?;
