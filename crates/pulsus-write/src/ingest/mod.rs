@@ -82,6 +82,16 @@ pub enum AdmitRefusal {
     /// The same `Idempotency-Key` arrived carrying different content. A
     /// client error (`400`), never a silent suppression.
     KeyReused,
+    /// Issue #603: the push does not fit one block, so storing it would
+    /// take two inserts and two blocks can commit a prefix. It is refused
+    /// whole (`413`), naming both limits and the push's own size; nothing
+    /// is stored and no bytes stay reserved.
+    PushTooLarge {
+        rows: u64,
+        row_limit: u64,
+        bytes: u64,
+        byte_limit: u64,
+    },
 }
 
 impl From<Backpressure> for AdmitRefusal {
@@ -94,6 +104,17 @@ impl From<Backpressure> for AdmitRefusal {
 /// log/metric transport.
 pub const KEY_REUSED_MESSAGE: &str =
     "Idempotency-Key was already used by this writer for different request content";
+
+/// The message [`AdmitRefusal::PushTooLarge`] is answered with, on every
+/// transport that can reach it (issue #603). It names the push's own size
+/// and both limits, so a client can tell which one it crossed and by how
+/// much.
+///
+/// Stubbed: the wording arrives with the code.
+pub fn push_too_large_message(rows: u64, row_limit: u64, bytes: u64, byte_limit: u64) -> String {
+    let _ = (rows, row_limit, bytes, byte_limit);
+    String::new()
+}
 
 /// A handle a sync-mode request (`X-Pulsus-Async` absent or `0`,
 /// docs/api.md "Request headers") `.await`s until its admitted batch has

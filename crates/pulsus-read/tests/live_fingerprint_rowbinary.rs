@@ -299,6 +299,8 @@ async fn a_narrow_row_field_is_refused_by_the_client() {
             storage_policy: None,
             retention_days: 7,
             log_rollup: Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         },
     )
     .await
@@ -355,6 +357,8 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
             storage_policy: None,
             retention_days: 7,
             log_rollup: Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         },
     )
     .await

@@ -58,14 +58,31 @@ impl QuerySettings {
     }
 
     /// Issue #560: the two block-deduplication settings pinned on every
-    /// insert into the span table, so a repeated identical span block is
-    /// recognised by the derived trace tables' own deduplication windows
-    /// whatever the server profile says. Trace spans only — never logs or
-    /// metrics, whose byte-identical blocks can be two genuine pushes.
+    /// insert into a source table whose derived tables are maintained by
+    /// materialized view, so a repeated identical block is recognised by
+    /// those tables' own deduplication windows whatever the server profile
+    /// says.
+    ///
+    /// Two byte-identical blocks of samples or log entries can be two
+    /// genuine pushes, so a signal whose repeat is a resend of one batch
+    /// pairs these with a per-batch token rather than relying on the
+    /// content: see [`Self::landing_insert`].
     pub fn deduplicate_through_views() -> Self {
         Self::new()
             .set("deduplicate_insert", "enable")
             .set("deduplicate_blocks_in_dependent_materialized_views", 1)
+    }
+
+    /// The settings every insert of one metrics landing block carries
+    /// (issue #603): [`Self::deduplicate_through_views`], plus the token
+    /// the writer minted for that block — repeated byte-identical on every
+    /// resend, so a resend of a block the server already accepted stores
+    /// nothing twice — plus the per-block row ceiling admission has already
+    /// refused a larger push against, so one push is never split into two
+    /// blocks.
+    pub fn landing_insert(token: &str, max_rows: u64) -> Self {
+        let _ = (token, max_rows);
+        Self::new()
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:

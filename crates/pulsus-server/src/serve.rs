@@ -19,7 +19,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pulsus_clickhouse::{ChClient, ChError, ChPool, spawn_reprobe_loop};
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_read::LabelCache;
-use pulsus_schema::SchemaError;
+use pulsus_schema::{NameCatalogue, REQUIRED_SERVER_NAMES, SchemaError};
 use pulsus_write::{LogWriter, MetricWriter, TraceWriter};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -30,8 +30,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    bootstrap_conn_config_from, build_label_cache, conn_config_from, consistency_from,
-    metric_writer_tables_from, schema_params_from, trace_writer_tables_from, writer_tables_from,
+    NameCheckError, bootstrap_conn_config_from, build_label_cache, conn_config_from,
+    consistency_from, metric_writer_tables_from, schema_params_from, trace_writer_tables_from,
+    writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -130,9 +131,12 @@ pub async fn run(config: Config) -> ExitCode {
         },
         Arc::clone(&label_cache_slot),
         Arc::clone(&config),
-        rotation_tx,
-        label_cache_refresh_tx,
-        reprobe_tx,
+        BackgroundHandoff {
+            rotation: rotation_tx,
+            label_cache_refresh: label_cache_refresh_tx,
+            reprobe: reprobe_tx,
+        },
+        REQUIRED_SERVER_NAMES,
     );
 
     // The live-tail shutdown signal (issue #74): fired inside the
@@ -343,6 +347,24 @@ enum StartupError {
     Schema(SchemaError),
     #[error("clickhouse pool connect failed: {0}")]
     Pool(ChError),
+    /// Issue #603: the server does not have a setting or function this build
+    /// sends. **Terminal, not transient**: a name the server lacks is not
+    /// going to appear, so the bootstrap task returns, nothing publishes, and
+    /// `/ready` stays `503` — the same treatment the consistency-config
+    /// violation gets.
+    #[error("clickhouse is missing required names: {0:?}")]
+    MissingServerNames(Vec<&'static str>),
+}
+
+/// The transient halves of a name check map onto the failures the reconnect
+/// loop already retries; a missing name does not (issue #603).
+impl From<NameCheckError> for StartupError {
+    /// Stubbed: which failure maps onto which startup error arrives with the
+    /// code.
+    fn from(err: NameCheckError) -> Self {
+        let _ = err;
+        StartupError::MissingServerNames(Vec::new())
+    }
 }
 
 /// The per-signal writer slots the reconnect loop fills (all three
@@ -354,6 +376,16 @@ struct WriterSlots {
     log: Arc<OnceLock<Arc<LogWriter>>>,
     metric: Arc<OnceLock<Arc<MetricWriter>>>,
     trace: Arc<OnceLock<Arc<TraceWriter>>>,
+}
+
+/// The one-shot channels the reconnect loop hands its spawned background
+/// tasks back over, so `run` can abort and join them at shutdown. A bundling
+/// struct rather than three loose parameters, for [`WriterSlots`]' reason:
+/// they share one lifecycle and always travel together.
+struct BackgroundHandoff {
+    rotation: oneshot::Sender<JoinHandle<()>>,
+    label_cache_refresh: oneshot::Sender<JoinHandle<()>>,
+    reprobe: oneshot::Sender<JoinHandle<()>>,
 }
 
 /// Background task: repeatedly ensures the schema exists (unless
@@ -380,14 +412,18 @@ fn spawn_reconnect_loop(
     writer_slots: WriterSlots,
     label_cache_slot: Arc<OnceLock<Arc<LabelCache>>>,
     config: Arc<Config>,
-    rotation_tx: oneshot::Sender<JoinHandle<()>>,
-    label_cache_refresh_tx: oneshot::Sender<JoinHandle<()>>,
-    reprobe_tx: oneshot::Sender<JoinHandle<()>>,
+    handoff: BackgroundHandoff,
+    required: &'static [(&'static str, NameCatalogue)],
 ) -> JoinHandle<()> {
+    let BackgroundHandoff {
+        rotation: rotation_tx,
+        label_cache_refresh: label_cache_refresh_tx,
+        reprobe: reprobe_tx,
+    } = handoff;
     tokio::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
         loop {
-            match ensure_schema_then_connect(&config).await {
+            match ensure_schema_then_connect(&config, required).await {
                 Ok(pool) => {
                     tracing::info!("clickhouse schema ready; pool established");
                     let pool = Arc::new(pool);
@@ -510,6 +546,17 @@ fn spawn_reconnect_loop(
                         // detached until the process exits.
                         let _ = rotation_tx.send(handle);
                     }
+                    return;
+                }
+                // Issue #603: a name the server does not have is terminal,
+                // not transient. Log it naming every absent name and return:
+                // no writer or pool slot publishes and `/ready` stays `503`,
+                // exactly as a consistency-config violation is treated.
+                Err(StartupError::MissingServerNames(names)) => {
+                    tracing::error!(
+                        missing = ?names,
+                        "clickhouse is missing names this build sends; refusing to serve"
+                    );
                     return;
                 }
                 Err(err) => {
@@ -654,7 +701,11 @@ async fn rotation_tick<T, EC, EA, FC, FA>(
 /// self-healing: if the pool connect step fails after a successful
 /// reconcile, the next attempt simply reconciles again, which is a
 /// idempotent no-op (`pulsus_schema::run_init`'s contract).
-async fn ensure_schema_then_connect(config: &Config) -> Result<ChPool, StartupError> {
+async fn ensure_schema_then_connect(
+    config: &Config,
+    required: &'static [(&'static str, NameCatalogue)],
+) -> Result<ChPool, StartupError> {
+    let _ = required;
     if !config.skip_ddl {
         reconcile_schema(config).await?;
     }
@@ -770,6 +821,104 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    /// Issue #603: the two transient halves of a name check map onto the
+    /// failures the reconnect loop already retries, and only a missing name
+    /// is terminal. Pure, so nothing here depends on server behaviour.
+    #[test]
+    fn a_name_check_failure_maps_to_the_startup_error_that_matches_it() {
+        assert!(matches!(
+            StartupError::from(NameCheckError::Statement(SchemaError::Version(
+                "nonsense".to_string()
+            ))),
+            StartupError::Schema(_),
+        ));
+        assert!(matches!(
+            StartupError::from(NameCheckError::Missing(vec!["pulsus_not_a_setting"])),
+            StartupError::MissingServerNames(names) if names == vec!["pulsus_not_a_setting"],
+        ));
+    }
+
+    /// Issue #603: a name the server does not have is TERMINAL. The bootstrap
+    /// task returns rather than backing off, no writer or pool slot
+    /// publishes, and `/ready` stays `503`.
+    ///
+    /// `skip_ddl = true` and the built-in `default` database, so the pool can
+    /// connect with no schema run at all: the check is not gated by
+    /// `skip_ddl`, and that is what this shows.
+    #[tokio::test]
+    async fn a_missing_server_name_publishes_nothing() {
+        if !pulsus_testkit::live_clickhouse_enabled() {
+            eprintln!("skipping: PULSUS_TEST_CLICKHOUSE is not set");
+            return;
+        }
+        const MADE_UP: &[(&str, NameCatalogue)] =
+            &[("pulsus_not_a_setting", NameCatalogue::Setting)];
+
+        let base = Config::default();
+        let cfg = Arc::new(Config {
+            mode: Mode::Writer,
+            skip_ddl: true,
+            clickhouse: pulsus_config::ClickHouseConfig {
+                database: "default".to_string(),
+                http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(19123),
+                server: std::env::var("PULSUS_TEST_CH_HOST")
+                    .unwrap_or_else(|_| "localhost".to_string()),
+                ..base.clickhouse.clone()
+            },
+            ..base
+        });
+
+        for (required, expect_published) in [(MADE_UP, false), (REQUIRED_SERVER_NAMES, true)] {
+            let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));
+            let slots = WriterSlots {
+                log: Arc::new(OnceLock::new()),
+                metric: Arc::new(OnceLock::new()),
+                trace: Arc::new(OnceLock::new()),
+            };
+            let (rotation_tx, _rotation_rx) = oneshot::channel();
+            let (refresh_tx, _refresh_rx) = oneshot::channel();
+            let (reprobe_tx, _reprobe_rx) = oneshot::channel();
+            let handle = spawn_reconnect_loop(
+                Arc::clone(&pool_slot),
+                WriterSlots {
+                    log: Arc::clone(&slots.log),
+                    metric: Arc::clone(&slots.metric),
+                    trace: Arc::clone(&slots.trace),
+                },
+                Arc::new(OnceLock::new()),
+                Arc::clone(&cfg),
+                BackgroundHandoff {
+                    rotation: rotation_tx,
+                    label_cache_refresh: refresh_tx,
+                    reprobe: reprobe_tx,
+                },
+                required,
+            );
+            tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("the bootstrap task must finish, not back off forever")
+                .expect("it does not panic");
+
+            let published = pool_slot.read().await.is_some();
+            assert_eq!(
+                published, expect_published,
+                "the pool slot must publish only when every required name exists"
+            );
+            assert_eq!(
+                slots.metric.get().is_some(),
+                expect_published,
+                "the metric writer slot follows the pool slot"
+            );
+            if !expect_published {
+                assert!(slots.log.get().is_none());
+                assert!(slots.trace.get().is_none());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reconnect_loop_handle_is_abortable_before_it_ever_connects() {
         let mut cfg = Config::default();
@@ -787,9 +936,12 @@ mod tests {
             },
             Arc::new(OnceLock::new()),
             Arc::new(cfg),
-            rotation_tx,
-            label_cache_refresh_tx,
-            reprobe_tx,
+            BackgroundHandoff {
+                rotation: rotation_tx,
+                label_cache_refresh: label_cache_refresh_tx,
+                reprobe: reprobe_tx,
+            },
+            REQUIRED_SERVER_NAMES,
         );
         assert!(!handle.is_finished());
         handle.abort();
@@ -1167,25 +1319,47 @@ mod tests {
         cfg.clickhouse.http_port = 1; // nothing listens here
         // `ChPool` is not `Debug` (pulsus-clickhouse), so match manually
         // instead of `.expect_err`/`.unwrap_err`.
-        let err = match ensure_schema_then_connect(&cfg).await {
+        let err = match ensure_schema_then_connect(&cfg, REQUIRED_SERVER_NAMES).await {
             Err(err) => err,
             Ok(_) => panic!("nothing listens on port 1"),
         };
         assert!(matches!(err, StartupError::Bootstrap(_)));
     }
 
-    /// `PULSUS_SKIP_DDL=1` must skip the reconcile step entirely and go
-    /// straight to the serving pool connect (schema assumed pre-existing).
+    /// Issue #603: the startup name check runs **first**, and
+    /// `PULSUS_SKIP_DDL=1` does not skip it — a `skip_ddl` deployment reaches
+    /// no DDL but still inserts landing blocks and still reapplies the
+    /// `ALTER`s on a rotation tick. So with nothing listening the failure is
+    /// the bootstrap connect's under both settings, never the pool's.
+    ///
+    /// This replaces a case that asserted `StartupError::Pool(_)` under
+    /// `skip_ddl`: with the name check ahead of both branches, the pool
+    /// connect is no longer the first thing a `skip_ddl` startup reaches, and
+    /// the property that case named — that `skip_ddl` skips the reconcile —
+    /// is not observable at this seam any more. What IS observable, and is
+    /// what the change is about, is that the check is not gated by it.
     #[tokio::test]
-    async fn ensure_schema_then_connect_skips_reconcile_when_skip_ddl_is_set() {
-        let mut cfg = Config::default();
-        cfg.clickhouse.http_port = 1; // nothing listens here
-        cfg.skip_ddl = true;
-        let err = match ensure_schema_then_connect(&cfg).await {
-            Err(err) => err,
-            Ok(_) => panic!("nothing listens on port 1"),
-        };
-        assert!(matches!(err, StartupError::Pool(_)));
+    async fn the_name_check_runs_first_whether_or_not_ddl_is_skipped() {
+        for skip_ddl in [false, true] {
+            let cfg = Config {
+                skip_ddl,
+                clickhouse: pulsus_config::ClickHouseConfig {
+                    http_port: 1, // nothing listens here
+                    ..Config::default().clickhouse
+                },
+                ..Config::default()
+            };
+            // `ChPool` is not `Debug` (pulsus-clickhouse), so match manually
+            // instead of `.expect_err`/`.unwrap_err`.
+            let err = match ensure_schema_then_connect(&cfg, REQUIRED_SERVER_NAMES).await {
+                Err(err) => err,
+                Ok(_) => panic!("nothing listens on port 1"),
+            };
+            assert!(
+                matches!(err, StartupError::Bootstrap(_)),
+                "skip_ddl = {skip_ddl}: the name check's own connection fails first"
+            );
+        }
     }
 
     #[test]

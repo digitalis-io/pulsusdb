@@ -25,12 +25,14 @@
 //! `WriterRuntime::backfill_retry_interval` (5s) until confirmed, capped
 //! at `backfill_max_bytes` (32 MiB) per backlog — so a "samples/spans
 //! committed, registration lost" orphan self-heals while the process
-//! lives. One generic mechanism serves all four registration tables:
-//! `log_streams` (here, with success-only `StreamLru` promotion on a
-//! confirmed heal), `metric_series`/`metric_metadata`
-//! (`writer::metric` — `SeriesLru` promotion / invalidate-only
-//! `MetadataCache` heal respectively), and `trace_attrs_idx`
-//! (`writer::trace`, no cache). The append-only tables (`log_samples`,
+//! lives. One generic mechanism serves the two registration tables that
+//! still have one: `log_streams` (here, with success-only `StreamLru`
+//! promotion on a confirmed heal) and `trace_attrs_idx`
+//! (`writer::trace`, no cache). **The metrics path has none** (issue
+//! #603): one push is one insert of one block into `metric_landing`, so
+//! there is no separate registration insert to lose, and a push whose
+//! insert failed emits its registration rows again next time. The
+//! append-only tables (`log_samples`,
 //! `metric_samples`, `metric_hist_samples`, `trace_spans`) are
 //! structurally excluded (`on_flush_poisoned: None`). Uncertain-fate
 //! flushes are NEVER backfilled (issue #9: an `InsertUncertain` batch is
@@ -112,10 +114,10 @@ pub use push_dedup::{
     PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
     metric_identity, plan_capacities,
 };
-pub use registration::{MetadataCache, SeriesLru, StreamLru};
+pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
-    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricMetadataRow,
-    MetricSampleRow, MetricSeriesRow, TraceAttrRow, TraceSpanRow,
+    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricLandingRow,
+    MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow, TraceSpanRow,
 };
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};

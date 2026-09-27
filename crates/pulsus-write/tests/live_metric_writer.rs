@@ -1,10 +1,13 @@
-//! Live end-to-end test: [`MetricWriter`] against a real ClickHouse (issue
-//! #26), proving `metric_metadata`'s `ReplacingMergeTree(updated_ns)`
-//! collapses an A→B→A descriptor history down to a single, latest-`updated_ns`
-//! row on a `FINAL` read — the fix `metric_metadata` needed (architect plan
-//! amendment 1, finding 3) for its bounded last-value cache (finding 2) to
-//! have a deterministic "latest" to collapse to. Gated behind
-//! `PULSUS_TEST_CLICKHOUSE=1`, mirroring `pulsus-schema`'s `live_schema.rs`.
+//! Live end-to-end test: [`MetricWriter`] against a real ClickHouse — one
+//! push is one insert of one block into `metric_landing` (issue #603), and
+//! the block the server stored is what this file reads back.
+//!
+//! **Nothing here reads a target table.** `metric_samples`,
+//! `metric_series`, `metric_metadata` and `metric_hist_samples` are
+//! maintained from the landing table by materialized view; what the writer
+//! claims when it answers a push is that the landing block committed, and
+//! that is what these cases check. Gated behind `PULSUS_TEST_CLICKHOUSE=1`,
+//! mirroring `pulsus-schema`'s `live_schema.rs`.
 //!
 //! To run these:
 //!
@@ -15,7 +18,6 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
-use pulsus_write::PushHeaders;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +28,7 @@ use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::{
     MetricMetadata, MetricPoint, MetricSink, MetricWriter, MetricWriterTables, ParsedMetrics,
-    SeriesRef,
+    PushHeaders, SeriesRef,
 };
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -75,227 +77,213 @@ async fn drop_database(client: &ChClient, db: &str) {
         .expect("drop test database");
 }
 
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-struct MetricMetadataRow {
-    metric_name: String,
-    metric_type: String,
-    help: String,
-    unit: String,
-    updated_ns: i64,
-}
-
-async fn metadata_rows_final(
-    client: &ChClient,
-    db: &str,
-    metric_name: &str,
-) -> Vec<MetricMetadataRow> {
-    let sql = format!(
-        "SELECT metric_name, metric_type, help, unit, updated_ns \
-         FROM {db}.metric_metadata FINAL WHERE metric_name = '{metric_name}' ORDER BY metric_name"
-    );
-    let mut stream = client
-        .query_stream::<MetricMetadataRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("query metric_metadata");
-    let mut out = Vec::new();
-    while let Some(row) = stream.next().await {
-        out.push(row.expect("decode MetricMetadataRow"));
+fn params_for(db: &str) -> RenderCtx {
+    RenderCtx {
+        db: db.to_string(),
+        cluster: None,
+        dist_suffix: "_dist".to_string(),
+        storage_policy: None,
+        retention_days: 7,
+        log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     }
-    out
 }
 
-fn metadata(metric_name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetrics {
-    ParsedMetrics {
+/// A bootstrap client, a freshly initialised database, and a writer over it.
+///
+/// `db` is the composed name, not a bare one: every live-test object name is
+/// written as `pulsus_testkit::test_db("…")` at its own call site, so two
+/// checkouts sharing one ClickHouse cannot drop each other's data (issue
+/// #320's naming gate reads the call site, not this helper).
+async fn live_writer(db: String) -> (ChClient, String, Arc<ChClient>, MetricWriter) {
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    drop_database(&bootstrap, &db).await;
+    run_init(&bootstrap, &params_for(&db))
+        .await
+        .expect("run_init");
+
+    let client = Arc::new(
+        ChClient::new(test_config(&db))
+            .await
+            .expect("connect (target db)"),
+    );
+    let writer = MetricWriter::new_with_tables(
+        client.clone(),
+        &WriterConfig::default(),
+        DEFAULT_ACTIVITY_BUCKET_MS,
+        MetricWriterTables::metrics_default(),
+    );
+    (bootstrap, db, client, writer)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .expect("query the landing table");
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode CountRow")
+        .n
+}
+
+/// One push of every kind is one block in the landing table, with the rows
+/// the writer built and one `received_ms` shared by all of them.
+#[tokio::test]
+async fn a_push_lands_one_block_carrying_every_kind() {
+    skip_unless_live!();
+    let (bootstrap, db, client, writer) =
+        live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_block")).await;
+
+    let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
+    let metric_name: Arc<str> = Arc::from("http_requests_total");
+    let batch = ParsedMetrics {
+        samples: vec![MetricPoint {
+            metric_name: metric_name.clone(),
+            fingerprint: Fingerprint::from_raw(42),
+            unix_milli: 1_000,
+            value: 1.5,
+        }],
+        series: vec![SeriesRef {
+            metric_name: metric_name.clone(),
+            fingerprint: Fingerprint::from_raw(42),
+            labels,
+        }],
         metadata: vec![MetricMetadata {
-            metric_name: Arc::from(metric_name),
-            metric_type: metric_type.to_string(),
+            metric_name: metric_name.clone(),
+            metric_type: "counter".to_string(),
             help: "help text".to_string(),
-            unit: "".to_string(),
-            updated_ns,
+            unit: String::new(),
+            updated_ns: 1,
         }],
         ..Default::default()
-    }
-}
-
-/// A→B→A: three sync `admit_flush` calls (type=counter, gauge, counter),
-/// each with a strictly increasing `updated_ns`. `ReplacingMergeTree
-/// (updated_ns)` must collapse the three physical rows down to exactly one
-/// on a `FINAL` read, and that one row must carry the *last* admitted
-/// value (`counter`, from the third call) — not an arbitrary/undefined
-/// merge outcome (the review-cycle finding this schema fix closes).
-#[tokio::test]
-async fn metric_metadata_a_to_b_to_a_collapses_to_the_latest_value_on_final_read() {
-    skip_unless_live!();
-
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_metadata");
-    drop_database(&bootstrap, db).await;
-
-    let params = RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
     };
-    run_init(&bootstrap, &params).await.expect("run_init");
 
-    let client = Arc::new(
-        ChClient::new(test_config(db))
-            .await
-            .expect("connect (target db)"),
-    );
-    let writer = MetricWriter::new_with_tables(
-        client.clone(),
-        &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
-        MetricWriterTables::metrics_default(),
-    );
-
-    let metric_name = "http_requests_total";
-    for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
-        let wait = writer
-            .admit_flush(
-                metadata(metric_name, metric_type, updated_ns),
-                PushHeaders::default(),
-            )
-            .expect("queue has room");
-        tokio::time::timeout(Duration::from_secs(10), wait)
-            .await
-            .expect("flush settles within the test timeout")
-            .expect("metadata flush succeeds");
-    }
-
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect("the landing block commits");
     writer.shutdown(Duration::from_secs(5)).await;
 
-    let rows = metadata_rows_final(&client, db, metric_name).await;
+    for (kind, want) in [(0u8, 1u64), (1, 0), (2, 1), (3, 1)] {
+        let got = count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_landing WHERE kind = {kind}"),
+        )
+        .await;
+        assert_eq!(got, want, "kind {kind} rows in the landing block");
+    }
+    let distinct_stamps = count(
+        &client,
+        &format!("SELECT uniqExact(received_ms) AS n FROM {db}.metric_landing"),
+    )
+    .await;
     assert_eq!(
-        rows.len(),
-        1,
-        "ReplacingMergeTree(updated_ns) must collapse the 3-row A/B/A history to 1 row on FINAL"
+        distinct_stamps, 1,
+        "every row of one push carries the same stamp, so the block lies in one partition"
     );
-    assert_eq!(rows[0].metric_type, "counter");
-    assert_eq!(rows[0].updated_ns, 3, "the latest updated_ns must win");
 
-    drop_database(&bootstrap, db).await;
+    drop_database(&bootstrap, &db).await;
 }
 
-/// A metadata descriptor identical to the last one durably flushed must not
-/// be re-emitted (idempotence half of the architect plan's A→B→A fix): two
-/// admissions of the exact same tuple leave exactly one physical row.
+/// The writer never sets `event_id`, so the server fills it from the
+/// column's own `DEFAULT generateUUIDv7()`: two rows of one push carry two
+/// different, non-nil, version-7 values.
+///
+/// A row type carrying the column would store whatever the writer put
+/// there — the nil UUID on every row, for an explicit zero.
 #[tokio::test]
-async fn metric_metadata_repeated_identical_descriptor_is_idempotent() {
+async fn the_insert_omits_event_id_so_the_server_fills_it() {
     skip_unless_live!();
+    let (bootstrap, db, client, writer) =
+        live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_event_id")).await;
 
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_metadata_idempotent");
-    drop_database(&bootstrap, db).await;
-
-    let params = RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
+    let metric_name: Arc<str> = Arc::from("http_requests_total");
+    let batch = ParsedMetrics {
+        samples: vec![
+            MetricPoint {
+                metric_name: metric_name.clone(),
+                fingerprint: Fingerprint::from_raw(42),
+                unix_milli: 1_000,
+                value: 1.0,
+            },
+            MetricPoint {
+                metric_name: metric_name.clone(),
+                fingerprint: Fingerprint::from_raw(42),
+                unix_milli: 1_001,
+                value: 2.0,
+            },
+        ],
+        ..Default::default()
     };
-    run_init(&bootstrap, &params).await.expect("run_init");
-
-    let client = Arc::new(
-        ChClient::new(test_config(db))
-            .await
-            .expect("connect (target db)"),
-    );
-    let writer = MetricWriter::new_with_tables(
-        client.clone(),
-        &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
-        MetricWriterTables::metrics_default(),
-    );
-
-    let metric_name = "up";
     let wait = writer
-        .admit_flush(metadata(metric_name, "gauge", 1), PushHeaders::default())
+        .admit_flush(batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")
-        .expect("first flush succeeds");
-
-    // Second admission: identical tuple. The success-only `MetadataCache`
-    // now holds the first flush's value, so this must be suppressed at
-    // admission — never even reach a `metric_metadata` insert.
-    writer
-        .admit(metadata(metric_name, "gauge", 2), PushHeaders::default())
-        .expect("queue has room");
-
+        .expect("commits");
     writer.shutdown(Duration::from_secs(5)).await;
 
-    let rows = metadata_rows_final(&client, db, metric_name).await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "a repeated identical descriptor must not create a second physical row"
-    );
-    assert_eq!(
-        rows[0].updated_ns, 1,
-        "the suppressed duplicate never flushed"
-    );
+    let rows = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.metric_landing WHERE kind = 0"),
+    )
+    .await;
+    assert_eq!(rows, 2);
+    let distinct = count(
+        &client,
+        &format!("SELECT uniqExact(event_id) AS n FROM {db}.metric_landing WHERE kind = 0"),
+    )
+    .await;
+    assert_eq!(distinct, 2, "each landed event has its own identity");
+    let nil = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_landing \
+             WHERE event_id = toUUID('00000000-0000-0000-0000-000000000000')"
+        ),
+    )
+    .await;
+    assert_eq!(nil, 0, "no row carries the nil UUID");
+    let version_7 = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_landing \
+             WHERE substring(toString(event_id), 15, 1) = '7'"
+        ),
+    )
+    .await;
+    assert_eq!(version_7, 2, "the server's own time-ordered UUID version");
 
-    drop_database(&bootstrap, db).await;
+    drop_database(&bootstrap, &db).await;
 }
 
-/// Sanity check that the writer's own registration gate agrees with
-/// `metric_series`' schema-documented dedup key end to end: two samples in
-/// the same activity bucket for one series register exactly one
-/// `metric_series` row against a live server (the mock-based coverage in
-/// `tests/metric_writer.rs` proves the LRU logic in isolation; this proves
-/// the whole path, including RowBinary encoding of the canonical label
-/// JSON, against real ClickHouse).
+/// The writer's registration gate against a live server: two samples in the
+/// same activity bucket for one series land exactly one kind-2 row, through
+/// the whole path including the RowBinary encoding of the canonical label
+/// JSON.
 #[tokio::test]
-async fn metric_series_same_bucket_samples_register_exactly_one_row() {
+async fn same_bucket_samples_land_exactly_one_registration_row() {
     skip_unless_live!();
-
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_series");
-    drop_database(&bootstrap, db).await;
-
-    let params = RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-    };
-    run_init(&bootstrap, &params).await.expect("run_init");
-
-    let client = Arc::new(
-        ChClient::new(test_config(db))
-            .await
-            .expect("connect (target db)"),
-    );
-    let writer = MetricWriter::new_with_tables(
-        client.clone(),
-        &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
-        MetricWriterTables::metrics_default(),
-    );
+    let (bootstrap, db, client, writer) =
+        live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_series")).await;
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     let metric_name: Arc<str> = Arc::from("http_requests_total");
-    let series = SeriesRef {
-        metric_name: metric_name.clone(),
-        fingerprint: Fingerprint::from_raw(42),
-        labels,
-    };
     let batch = ParsedMetrics {
         samples: vec![
             MetricPoint {
@@ -307,11 +295,15 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
             MetricPoint {
                 metric_name: metric_name.clone(),
                 fingerprint: Fingerprint::from_raw(42),
-                unix_milli: 60_000, // same 1h bucket as unix_milli=0
+                unix_milli: 60_000, // the same 1h bucket as unix_milli = 0
                 value: 2.0,
             },
         ],
-        series: vec![series],
+        series: vec![SeriesRef {
+            metric_name: metric_name.clone(),
+            fingerprint: Fingerprint::from_raw(42),
+            labels,
+        }],
         ..Default::default()
     };
 
@@ -321,83 +313,39 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")
-        .expect("flush succeeds");
-
+        .expect("commits");
     writer.shutdown(Duration::from_secs(5)).await;
 
-    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-    struct CountRow {
-        n: u64,
-    }
-    let sql =
-        format!("SELECT count() AS n FROM {db}.metric_series WHERE metric_name = '{metric_name}'");
-    let mut stream = client
-        .query_stream::<CountRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("query metric_series");
-    let count = stream.next().await.expect("one row").expect("decode").n;
+    let registrations = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_landing \
+             WHERE kind = 2 AND metric_name = '{metric_name}'"
+        ),
+    )
+    .await;
     assert_eq!(
-        count, 1,
-        "two same-bucket samples for one series must register exactly one metric_series row"
+        registrations, 1,
+        "two same-bucket samples for one series register exactly one row"
     );
 
-    drop_database(&bootstrap, db).await;
+    drop_database(&bootstrap, &db).await;
 }
 
-/// Belt-and-suspenders guard test (issue #31 code review round 1, finding
-/// 2 — architect adjudication REJECT with a guard test required): a
-/// fingerprint's `metric_series.labels` cannot change across rows by
-/// construction — `metric_fingerprint` is `hash(canonical label set)`
-/// (docs/schemas.md §2.1) and the writer renders `labels` as deterministic
-/// canonical JSON (sorted keys, issue #4/#26 canonicalization), so a label
-/// change *is* a different fingerprint, never a new row for the same one.
-/// This is what makes issue #31's `series_labels_by_fingerprint` (a plain
-/// `DESC LIMIT 1 BY` hydration with no window bound) safe: whichever row
-/// it picks for a fingerprint carries the same `labels` any other row for
-/// that fingerprint would. Proven here against the real product write
-/// path (`MetricWriter`, not a direct `insert_block`): two samples for the
-/// same series in two *different* activity buckets (so two distinct
-/// `metric_series` rows are registered — same fingerprint, different
-/// `unix_milli`) must carry byte-identical `labels` text.
+/// A fingerprint's labels cannot change across rows by construction —
+/// `metric_fingerprint` is `hash(canonical label set)` and the writer
+/// renders `labels` as deterministic canonical JSON, so a label change *is*
+/// a different fingerprint. Proven through the product write path: two
+/// samples for one series in two different activity buckets register two
+/// rows, and the two carry byte-identical `labels` text.
 #[tokio::test]
-async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels() {
+async fn registration_rows_for_one_fingerprint_carry_byte_identical_labels() {
     skip_unless_live!();
-
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_series_label_immutability");
-    drop_database(&bootstrap, db).await;
-
-    let params = RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-    };
-    run_init(&bootstrap, &params).await.expect("run_init");
-
-    let client = Arc::new(
-        ChClient::new(test_config(db))
-            .await
-            .expect("connect (target db)"),
-    );
-    let writer = MetricWriter::new_with_tables(
-        client.clone(),
-        &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
-        MetricWriterTables::metrics_default(),
-    );
+    let (bootstrap, db, client, writer) =
+        live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_labels")).await;
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     let metric_name: Arc<str> = Arc::from("http_requests_total");
-    let series = SeriesRef {
-        metric_name: metric_name.clone(),
-        fingerprint: Fingerprint::from_raw(4242),
-        labels,
-    };
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
     let batch = ParsedMetrics {
         samples: vec![
@@ -414,7 +362,11 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
                 value: 2.0,
             },
         ],
-        series: vec![series],
+        series: vec![SeriesRef {
+            metric_name: metric_name.clone(),
+            fingerprint: Fingerprint::from_raw(4242),
+            labels,
+        }],
         ..Default::default()
     };
 
@@ -424,8 +376,7 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
         .expect("flush settles")
-        .expect("flush succeeds");
-
+        .expect("commits");
     writer.shutdown(Duration::from_secs(5)).await;
 
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -434,13 +385,14 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
         labels: String,
     }
     let sql = format!(
-        "SELECT unix_milli, labels FROM {db}.metric_series \
-         WHERE metric_name = '{metric_name}' AND fingerprint = 4242 ORDER BY unix_milli"
+        "SELECT unix_milli, labels FROM {db}.metric_landing \
+         WHERE kind = 2 AND metric_name = '{metric_name}' AND fingerprint = 4242 \
+         ORDER BY unix_milli"
     );
     let mut stream = client
         .query_stream::<LabelsRow>(&sql, &QuerySettings::new())
         .await
-        .expect("query metric_series");
+        .expect("query the landing table");
     let mut rows = Vec::new();
     while let Some(row) = stream.next().await {
         rows.push(row.expect("decode LabelsRow"));
@@ -449,13 +401,14 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
     assert_eq!(
         rows.len(),
         2,
-        "two distinct activity buckets must register two metric_series rows"
+        "two distinct activity buckets register two rows"
     );
     assert_eq!(
         rows[0].labels, rows[1].labels,
-        "the same fingerprint's labels must be byte-identical across every metric_series row \
-         (labels are immutable by construction — a change would be a different fingerprint)"
+        "the same fingerprint's labels must be byte-identical across every registration \
+         row (labels are immutable by construction — a change would be a different \
+         fingerprint)"
     );
 
-    drop_database(&bootstrap, db).await;
+    drop_database(&bootstrap, &db).await;
 }

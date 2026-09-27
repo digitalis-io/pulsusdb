@@ -39,6 +39,21 @@ where
         table: &'a str,
         rows: &'a [R],
     ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>>;
+
+    /// [`Self::insert`] with `extra` settings on this one insert (issue
+    /// #603: the metrics landing block's deduplication token and block-size
+    /// pin). The default ignores `extra` and calls [`Self::insert`], so an
+    /// implementation that has no per-insert settings — every one but the
+    /// production inserter — needs no change.
+    fn insert_with<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [R],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        let _ = extra;
+        self.insert(table, rows)
+    }
 }
 
 /// Production [`BlockInserter`]: a thin adapter over
@@ -148,9 +163,8 @@ pub(crate) struct TableContext<R> {
     /// rows after the spool attempt (regardless of the spool I/O result —
     /// the heal path must not depend on audit-file I/O) and before the
     /// generation settles `Err`. `Some` ONLY for the registration tables
-    /// (`log_streams`, `metric_series`, `metric_metadata`,
-    /// `trace_attrs_idx` — issues #134/#139); `None` on every append-only
-    /// table.
+    /// (`log_streams` and `trace_attrs_idx` — issues #134/#139); `None` on
+    /// every append-only table.
     pub on_flush_poisoned: Option<FlushPoisonedHook<R>>,
     /// Issue #494: the push-suppression index this table's flush task
     /// drives once per cycle, ageing open claims past their deadline and
@@ -474,13 +488,29 @@ async fn finish_generation<R>(
     }
 }
 
+/// Issue #494's suppression index, ticked on its own task rather than off a
+/// flush loop (issue #603): the metrics writer has no flush task left to
+/// ride, and without a ticker its claims would never age past their deadline
+/// and an unsettled claim would answer a waiting caller nothing at all.
+/// Ticks every `every` — `PULSUS_BATCH_MS` at the one call site — until the
+/// shutdown signal fires, which is also what bounds how stale the age
+/// eviction can be.
+pub(crate) fn spawn_dedup_ticker(
+    dedup: Arc<PushDedup>,
+    every: Duration,
+    shutdown: watch::Receiver<Option<Instant>>,
+) -> tokio::task::JoinHandle<()> {
+    let _ = (dedup, every, shutdown);
+    tokio::spawn(async {})
+}
+
 /// A cheap, non-cryptographic xorshift64 PRNG for full-jitter retry
 /// delays — a dedicated `rand` dependency is unwarranted for "pick a
 /// uniform random delay" (lean-deps ethos, architect plan).
-struct XorShift64(u64);
+pub(crate) struct XorShift64(u64);
 
 impl XorShift64 {
-    fn seeded() -> Self {
+    pub(crate) fn seeded() -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -490,7 +520,7 @@ impl XorShift64 {
         XorShift64(seed | 1)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -505,7 +535,12 @@ impl XorShift64 {
 /// `[0, capped]`, not just added noise around the capped value) — spreads
 /// out retries from many concurrently-failing batches instead of having
 /// them all retry in lockstep.
-fn backoff_delay(base: Duration, max: Duration, attempt: u32, rng: &mut XorShift64) -> Duration {
+pub(crate) fn backoff_delay(
+    base: Duration,
+    max: Duration,
+    attempt: u32,
+    rng: &mut XorShift64,
+) -> Duration {
     let shift = attempt.saturating_sub(1).min(20);
     let multiplier = 1u32 << shift;
     let capped = base.saturating_mul(multiplier).min(max);
@@ -700,6 +735,76 @@ mod tests {
         );
 
         std::fs::remove_file(&spool_root).ok();
+    }
+
+    /// Issue #603: the suppression index used to be ticked off a flush loop,
+    /// and the metrics writer has no flush loop left. Without a ticker an
+    /// open claim would never age past its deadline into a tombstone, and a
+    /// caller waiting on it would be told nothing at all.
+    ///
+    /// Two indexes with the same limits, each holding one open claim; only
+    /// the first gets a ticker. The second is what shows the ageing came from
+    /// the ticker and not from `admit`, which expires the *window* itself.
+    #[tokio::test(start_paused = true)]
+    async fn the_dedup_ticker_ages_an_open_claim_on_its_own() {
+        use crate::ingest::PushHeaders;
+        use crate::ingest::metrics::{MetricPoint, ParsedMetrics};
+        use crate::writer::push_dedup::{Admission, WaitMode, metric_identity};
+        use pulsus_model::Fingerprint;
+
+        let claim_deadline = Duration::from_millis(200) + Duration::from_secs(120);
+        let batch = ParsedMetrics {
+            samples: vec![MetricPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli: 1_000,
+                value: 1.0,
+            }],
+            ..Default::default()
+        };
+
+        let ticked = PushDedup::new(16 * 1024 * 1024, Duration::from_secs(300), claim_deadline);
+        let unticked = PushDedup::new(16 * 1024 * 1024, Duration::from_secs(300), claim_deadline);
+        for index in [&ticked, &unticked] {
+            let id = metric_identity(&batch, &PushHeaders::default());
+            match index.admit(id, WaitMode::None) {
+                Admission::Admit(mut guard) => {
+                    guard.note_target(true);
+                    guard.seal();
+                }
+                other => panic!("a fresh index admits: {other:?}"),
+            }
+            assert_eq!(index.snapshot().unknown_total, 0);
+        }
+
+        let (shutdown, shutdown_rx) = ShutdownSignal::new();
+        let handle = spawn_dedup_ticker(ticked.clone(), Duration::from_millis(50), shutdown_rx);
+
+        // Past the claim deadline, then let the ticker run.
+        tokio::time::advance(claim_deadline + Duration::from_secs(1)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if ticked.snapshot().unknown_total == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            ticked.snapshot().unknown_total,
+            1,
+            "the ticked index aged its open claim into a tombstone"
+        );
+        assert_eq!(
+            unticked.snapshot().unknown_total,
+            0,
+            "nothing but the ticker ages a claim: no flush task, no `admit` call"
+        );
+
+        // Dropping the signal closes the channel, which ends the ticker.
+        drop(shutdown);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the ticker returns once the signal is gone")
+            .expect("it does not panic");
     }
 
     #[test]

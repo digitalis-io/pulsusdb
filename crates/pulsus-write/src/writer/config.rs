@@ -32,13 +32,6 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 /// existing `LRU_CAPACITY` for the series LRU").
 const LRU_CAPACITY: usize = 1_000_000;
 
-/// Hand-rolled `MetadataCache` capacity (issue #26 architect plan): 1,000,000
-/// distinct `metric_name` entries, each holding one last-emitted `(type,
-/// help, unit)` descriptor — a documented constant for now, promote to a
-/// `PULSUS_*` var if a deployment needs to tune it, same precedent as
-/// [`LRU_CAPACITY`].
-const METADATA_LRU_CAPACITY: usize = 1_000_000;
-
 /// Spool root, relative to the process working directory (task-manager
 /// resolution, issue #9 — mirrors issue #8's `MAX_DECOMPRESSED_BYTES`
 /// documented-constant precedent). Holds `poison/{table}/` and
@@ -46,8 +39,8 @@ const METADATA_LRU_CAPACITY: usize = 1_000_000;
 const SPOOL_DIR: &str = "./spool";
 
 /// Cadence of every registration-backfill re-insert task (issues
-/// #134/#139: `log_streams`, `metric_series`, `metric_metadata`,
-/// `trace_attrs_idx`): every interval, any Poisoned-flush registration
+/// #134/#139: `log_streams` and `trace_attrs_idx` — the metrics path has
+/// no backlog, issue #603): every interval, any Poisoned-flush registration
 /// rows still pending in that table's in-memory backlog are re-inserted
 /// once. A documented constant per the issue-#9 constants-not-env-vars
 /// precedent ([`LRU_CAPACITY`]); promote to a `PULSUS_*` var if a
@@ -55,10 +48,10 @@ const SPOOL_DIR: &str = "./spool";
 const REGISTRATION_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Byte cap (row `est_bytes` accounting) on each in-memory registration
-/// backfill backlog (issues #134/#139). PER-BACKLOG: with four backlogs
-/// (`log_streams`, `metric_series`, `metric_metadata`,
-/// `trace_attrs_idx`), the worst-case process-wide footprint under total
-/// ClickHouse failure is 4 × 32 MiB = 128 MiB — acceptable, since the
+/// backfill backlog (issues #134/#139). PER-BACKLOG: with two backlogs
+/// (`log_streams` and `trace_attrs_idx`), the worst-case process-wide
+/// footprint under total ClickHouse failure is 2 × 32 MiB = 64 MiB —
+/// acceptable, since the
 /// sample/span paths are failing too in that state, minting few new
 /// orphans. New keys that would exceed a backlog's cap are rejected and
 /// counted via its `BackfillMetrics::dropped_total`. Same
@@ -100,16 +93,13 @@ pub struct WriterRuntime {
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
     pub lru_capacity: usize,
-    /// [`MetricWriter`](crate::writer::MetricWriter)'s `MetadataCache`
-    /// capacity — unused by [`crate::writer::LogWriter`].
-    pub metadata_lru_capacity: usize,
     pub spool_dir: PathBuf,
     /// The registration-backfill re-insert cadence (issues #134/#139),
-    /// shared by all four backfill tasks (`log_streams`, `metric_series`,
-    /// `metric_metadata`, `trace_attrs_idx`).
+    /// shared by both backfill tasks (`log_streams` and
+    /// `trace_attrs_idx`).
     pub backfill_retry_interval: Duration,
     /// The PER-BACKLOG registration-backfill byte cap (issues #134/#139)
-    /// — four backlogs ⇒ 128 MiB worst-case process-wide (see
+    /// — two backlogs ⇒ 64 MiB worst-case process-wide (see
     /// [`REGISTRATION_BACKFILL_MAX_BYTES`]).
     pub backfill_max_bytes: u64,
     /// `PULSUS_LOG_PATTERNS` (M7-C3, issue #171): the ingest-time log-pattern
@@ -130,6 +120,27 @@ pub struct WriterRuntime {
     /// How long a claim may stay open before it becomes a tombstone —
     /// derived, not a knob (see [`CLAIM_INSERT_BOUND`]).
     pub claim_deadline: Duration,
+    /// `PULSUS_METRICS_LANDING_RETRIES` (issue #603): resends of a failed
+    /// metrics landing insert. [`Self::landing_budget`] is the wall-clock
+    /// bound on the whole loop; whichever binds first ends it.
+    pub metrics_landing_retries: u32,
+    /// `PULSUS_METRICS_LANDING_INSERTERS` (issue #603): insert workers on
+    /// the metrics landing queue, so the landing inserts in flight at once.
+    pub metrics_landing_inserters: u32,
+    /// `PULSUS_METRICS_LANDING_MAX_ROWS` (issue #603): the per-push landing
+    /// row ceiling, and the `max_insert_block_size` every landing insert
+    /// pins, so an admitted push is strictly under the value the server
+    /// would split a block at.
+    pub metrics_landing_max_rows: u64,
+    /// The wall-clock bound on one metrics landing block: the queue wait,
+    /// every attempt and every sleep, measured from the push's admission
+    /// (issue #603). Derived rather than configured, from
+    /// [`CLAIM_INSERT_BOUND`] — the shipped claim deadline
+    /// (`batch_ms + CLAIM_INSERT_BOUND`) already reserves it, so the loop
+    /// settles strictly before the claim could age into a tombstone. It is a
+    /// field because the constant is private to this module and the loop
+    /// that reads it lives in another.
+    pub landing_budget: Duration,
 }
 
 impl WriterRuntime {
@@ -142,7 +153,6 @@ impl WriterRuntime {
             retry_base_delay: RETRY_BASE_DELAY,
             retry_max_delay: RETRY_MAX_DELAY,
             lru_capacity: LRU_CAPACITY,
-            metadata_lru_capacity: METADATA_LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
             backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
             backfill_max_bytes: REGISTRATION_BACKFILL_MAX_BYTES,
@@ -151,6 +161,10 @@ impl WriterRuntime {
             ingest_dedup_window: cfg.ingest_dedup_window.0,
             ingest_dedup_max_bytes: cfg.ingest_dedup_max_bytes.0,
             claim_deadline: Duration::from_millis(cfg.batch_ms) + CLAIM_INSERT_BOUND,
+            metrics_landing_retries: cfg.metrics_landing_retries,
+            metrics_landing_inserters: cfg.metrics_landing_inserters,
+            metrics_landing_max_rows: cfg.metrics_landing_max_rows,
+            landing_budget: CLAIM_INSERT_BOUND,
         }
     }
 }

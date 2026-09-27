@@ -1438,6 +1438,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         }
     }
 
@@ -1632,6 +1634,102 @@ mod tests {
         }
     }
 
+    /// Issue #603: the four view bodies render verbatim. A projection whose
+    /// column order or `kind` filter drifts passes every live case in this
+    /// change, because no case reads a target table — the views are trusted
+    /// and this is where their text is pinned.
+    #[test]
+    fn the_four_metric_view_bodies_render_verbatim() {
+        let ctx = ctx();
+        let rendered = |name: &str| {
+            let mv = MVS
+                .iter()
+                .find(|mv| mv.name == name)
+                .unwrap_or_else(|| panic!("{name} is in MVS"));
+            render::render(mv.tmpl, &render::render_name(mv.name, &ctx), &ctx, false)
+        };
+
+        assert_eq!(
+            rendered("metric_samples_mv"),
+            "CREATE MATERIALIZED VIEW pulsus.metric_samples_mv TO pulsus.metric_samples AS\n\
+             SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+             unix_milli AS unix_milli, value AS value\n\
+             FROM pulsus.metric_landing WHERE kind = 0;"
+        );
+        assert_eq!(
+            rendered("metric_hist_samples_mv"),
+            "CREATE MATERIALIZED VIEW pulsus.metric_hist_samples_mv TO \
+             pulsus.metric_hist_samples AS\n\
+             SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+             unix_milli AS unix_milli, hist_schema AS schema,\n\
+             hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count,\n\
+             hist_count AS count, hist_sum AS sum,\n\
+             hist_pos_span_offsets AS pos_span_offsets,\n\
+             hist_pos_span_lengths AS pos_span_lengths,\n\
+             hist_pos_bucket_deltas AS pos_bucket_deltas,\n\
+             hist_neg_span_offsets AS neg_span_offsets,\n\
+             hist_neg_span_lengths AS neg_span_lengths,\n\
+             hist_neg_bucket_deltas AS neg_bucket_deltas,\n\
+             hist_custom_values AS custom_values,\n\
+             hist_counter_reset_hint AS counter_reset_hint\n\
+             FROM pulsus.metric_landing WHERE kind = 1;"
+        );
+        assert_eq!(
+            rendered("metric_series_mv"),
+            "CREATE MATERIALIZED VIEW pulsus.metric_series_mv TO pulsus.metric_series AS\n\
+             SELECT metric_name AS metric_name, fingerprint AS fingerprint,\n\
+             unix_milli AS unix_milli, labels AS labels, value_type AS value_type\n\
+             FROM pulsus.metric_landing WHERE kind = 2;"
+        );
+        assert_eq!(
+            rendered("metric_metadata_mv"),
+            "CREATE MATERIALIZED VIEW pulsus.metric_metadata_mv TO pulsus.metric_metadata AS\n\
+             SELECT metric_name AS metric_name, metric_type AS metric_type, help AS help,\n\
+             unit AS unit, updated_ns AS updated_ns\n\
+             FROM pulsus.metric_landing WHERE kind = 3;"
+        );
+    }
+
+    /// The landing table's own `CREATE`: the engine, the partition, the
+    /// sorting key, the two fixed settings, and no `Ddl::Dist` sibling — this
+    /// change adds no distributed table and the writer names the base table.
+    #[test]
+    fn the_metric_landing_migration_is_a_base_only_mergetree() {
+        let m = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "metric_landing")
+            .expect("the landing migration");
+        assert_eq!(m.id, 64);
+        assert_eq!(m.scope, MigrationScope::Checksum);
+        assert_eq!(m.replication, Replication::PerShard);
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|other| other.name == "metric_landing")
+                .count(),
+            1,
+            "no `_dist` sibling: the writer names the base table"
+        );
+
+        let ddl = match &m.ddl {
+            Ddl::Static(tmpl) => render::render(tmpl, "metric_landing", &ctx(), false),
+            _ => panic!("the landing migration must be a static CREATE"),
+        };
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.metric_landing"));
+        assert!(ddl.contains("event_id                 UUID DEFAULT generateUUIDv7(),"));
+        assert!(ddl.contains("ENGINE = MergeTree"));
+        assert!(
+            ddl.contains("PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))"),
+            "one hour-wide partition per part: {ddl}"
+        );
+        assert!(ddl.contains("ORDER BY (kind, metric_name, fingerprint, unix_milli)"));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;"));
+        assert!(
+            !ddl.contains("{{"),
+            "every token must be substituted: {ddl}"
+        );
+    }
+
     #[test]
     fn mvs_are_exactly_the_expected_set() {
         let names: Vec<&str> = MVS.iter().map(|mv| mv.name).collect();
@@ -1644,6 +1742,10 @@ mod tests {
                 "trace_edges_mv",
                 "trace_recent_mv",
                 "trace_error_spans_mv",
+                "metric_samples_mv",
+                "metric_hist_samples_mv",
+                "metric_series_mv",
+                "metric_metadata_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );

@@ -105,6 +105,41 @@ fn golden_yaml_from_configuration_md_section_9_parses_and_matches_defaults() {
     support::clear_all();
 }
 
+/// Issue #603: the documented §9 block carries the five metrics landing
+/// keys, two at the root and three under `writer:`.
+///
+/// **Why a presence test at all.** The case above asserts
+/// `cfg == Config::default()`, which an OMITTED key satisfies — it simply
+/// takes its default — so nothing there would notice a line missing from the
+/// documented block. A key on the wrong carrier is caught too: the root keys
+/// must be at the root and the writer keys under `writer:`.
+#[test]
+fn the_documented_block_carries_the_metrics_landing_keys_on_their_own_carriers() {
+    let doc: serde_norway::Value =
+        serde_norway::from_str(GOLDEN_YAML).expect("§9's YAML must parse");
+    let root = doc.as_mapping().expect("§9 is a mapping");
+    for key in ["metrics_landing_retention_hours", "metrics_dedup_window"] {
+        assert!(
+            root.keys().any(|k| k.as_str() == Some(key)),
+            "docs/configuration.md §9 must document {key} at the root"
+        );
+    }
+    let writer = root
+        .get("writer")
+        .and_then(|w| w.as_mapping())
+        .expect("§9 has a writer block");
+    for key in [
+        "metrics_landing_retries",
+        "metrics_landing_inserters",
+        "metrics_landing_max_rows",
+    ] {
+        assert!(
+            writer.keys().any(|k| k.as_str() == Some(key)),
+            "docs/configuration.md §9's writer block must document {key}"
+        );
+    }
+}
+
 /// Issue #478, criterion 20: the documented §9 block carries the tag
 /// lookback key.
 ///

@@ -163,7 +163,7 @@ async fn main() -> ExitCode {
             // resolved `local_zone` then flows through `conn_config_from`.
             azdetect::resolve_local_zone(&mut config).await;
             if config.mode == Mode::Init {
-                schema_init::run(&config).await
+                schema_init::run(&config, pulsus_schema::REQUIRED_SERVER_NAMES).await
             } else {
                 serve::run(config).await
             }
