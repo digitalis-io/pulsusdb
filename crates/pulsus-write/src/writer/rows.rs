@@ -2282,4 +2282,42 @@ mod tests {
             "a kind-0 row's charge must cover the row it is held in"
         );
     }
+
+    /// Issue #603 code review round 4, finding 2: a queued row must hold no
+    /// buffer the charge does not cover, and a `String` holds its capacity
+    /// rather than its length. `to_canonical_json` grows its buffer as it
+    /// encodes and returns with spare capacity, so the kind-2 row gives that
+    /// back — the charge is the encoded bytes.
+    #[test]
+    fn a_kind_2_rows_labels_hold_no_more_than_they_encode() {
+        let (labels, _) = LabelSet::from_normalized([
+            ("job".to_string(), "checkout".to_string()),
+            ("instance".to_string(), "10.0.0.7:9100".to_string()),
+        ]);
+        let series = SeriesRef {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            fingerprint: Fingerprint::from_raw(1),
+            labels,
+        };
+
+        let row = MetricLandingRow::series(0, &series, 0, 0);
+
+        assert_eq!(
+            row.labels, r#"{"instance":"10.0.0.7:9100","job":"checkout"}"#,
+            "the encoded labels themselves are unchanged"
+        );
+        assert_eq!(
+            row.labels.capacity(),
+            row.labels.len(),
+            "the queue holds {} bytes for a row charged {} of labels",
+            row.labels.capacity(),
+            row.labels.len()
+        );
+        assert!(
+            row.labels.capacity() as u64 <= MetricSeriesRow::est_source_bytes(&series),
+            "the labels the row holds ({}) are inside the kind's own estimate ({})",
+            row.labels.capacity(),
+            MetricSeriesRow::est_source_bytes(&series)
+        );
+    }
 }
