@@ -13,7 +13,7 @@ use crate::ingest::traces::{AttrRecord, SpanRecord};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::backfill::BackfillRow;
 use crate::writer::registration::StreamKey;
-use crate::writer::spool::{SpoolEncode, SpoolSink};
+use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
 
 /// One `log_samples` row (docs/schemas.md §3.1). `structured_metadata` is a
 /// canonical sorted-key JSON String (issue #97), the LAST field so the
@@ -544,16 +544,11 @@ impl SpoolEncode for MetricHistSampleRow {
     }
 }
 
-/// A finite `f64` as a JSON number, or JSON `null` for a non-finite value
-/// (NaN/±Inf are not JSON-representable — the exact bits travel in the
-/// paired `*_bits` string field). Shared by [`MetricHistSampleRow`]'s spool
-/// audit encoding.
+/// [`FiniteOrNull`] as a [`serde_json::Value`], for the encodings that build a
+/// value tree. The rule itself is that type's `Serialize` impl and is not
+/// restated here. Shared by [`MetricHistSampleRow`]'s spool audit encoding.
 fn finite_or_null(v: f64) -> serde_json::Value {
-    if v.is_finite() {
-        serde_json::json!(v)
-    } else {
-        serde_json::Value::Null
-    }
+    serde_json::to_value(FiniteOrNull(v)).expect("FiniteOrNull emits a number or null")
 }
 
 /// One `metric_metadata` row (docs/schemas.md §2.1, issue #26 fix: gained
@@ -870,15 +865,18 @@ impl SpoolEncode for MetricLandingRow {
     }
 
     /// The same shape, written field by field and element by element into the
-    /// sink (issue #603 code review round 8, finding 2).
+    /// sink (issue #603 code review rounds 8 and 9).
     ///
     /// **Why this row overrides the default.** The default builds
-    /// [`Self::to_spool_value`] first, and a kind-1 row's `custom_values` is
-    /// as long as the push chose — up to `MAX_BUCKETS_PER_HISTOGRAM_SIDE`,
-    /// 65,536 — so that value tree and then its serialised text would both
-    /// grow with one row, beside rows the queue reservation has already been
-    /// charged for. Written this way, what is held is one chunk and one
-    /// element.
+    /// [`Self::to_spool_value`] first, and a landing row is as large as the push
+    /// chose twice over: a kind-1 row's `custom_values` runs to
+    /// `MAX_BUCKETS_PER_HISTOGRAM_SIDE`, 65,536, and a kind-2 row's `labels` or
+    /// a kind-3 row's `help` is one string of any length admission accepts. That
+    /// value tree would grow with one row, beside rows the queue reservation has
+    /// already been charged for. Written this way, the row has no value of its
+    /// own, and `SpoolSink`'s invariant bounds what the sink holds: `field`
+    /// takes only a value whose text fits one piece, `str_field` and `str_array`
+    /// escape their text in fragments, and `array` writes one element at a time.
     ///
     /// **The keys are in sorted order because that is the order the declared
     /// shape serialises in.** `serde_json::Map` is a `BTreeMap` in this
@@ -892,11 +890,11 @@ impl SpoolEncode for MetricLandingRow {
             Self::KIND_FLOAT => {
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
-                o.field("metric_name", &self.metric_name).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
-                o.field("value", &finite_or_null(self.value)).await?;
-                o.field("value_bits", &self.value.to_bits().to_string())
+                o.field("value", &FiniteOrNull(self.value)).await?;
+                o.str_field("value_bits", &self.value.to_bits().to_string())
                     .await?;
             }
             Self::KIND_HIST => {
@@ -905,10 +903,10 @@ impl SpoolEncode for MetricLandingRow {
                     .await?;
                 o.array(
                     "custom_values",
-                    self.hist_custom_values.iter().copied().map(finite_or_null),
+                    self.hist_custom_values.iter().copied().map(FiniteOrNull),
                 )
                 .await?;
-                o.array(
+                o.str_array(
                     "custom_values_bits",
                     self.hist_custom_values
                         .iter()
@@ -918,7 +916,7 @@ impl SpoolEncode for MetricLandingRow {
                 .await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
-                o.field("metric_name", &self.metric_name).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
                 o.array("neg_bucket_deltas", &self.hist_neg_bucket_deltas)
                     .await?;
                 o.array("neg_span_lengths", &self.hist_neg_span_lengths)
@@ -933,14 +931,14 @@ impl SpoolEncode for MetricLandingRow {
                     .await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("schema", &self.hist_schema).await?;
-                o.field("sum", &finite_or_null(self.hist_sum)).await?;
-                o.field("sum_bits", &self.hist_sum.to_bits().to_string())
+                o.field("sum", &FiniteOrNull(self.hist_sum)).await?;
+                o.str_field("sum_bits", &self.hist_sum.to_bits().to_string())
                     .await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("zero_count", &self.hist_zero_count).await?;
-                o.field("zero_threshold", &finite_or_null(self.hist_zero_threshold))
+                o.field("zero_threshold", &FiniteOrNull(self.hist_zero_threshold))
                     .await?;
-                o.field(
+                o.str_field(
                     "zero_threshold_bits",
                     &self.hist_zero_threshold.to_bits().to_string(),
                 )
@@ -949,8 +947,8 @@ impl SpoolEncode for MetricLandingRow {
             Self::KIND_SERIES => {
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
-                o.field("labels", &self.labels).await?;
-                o.field("metric_name", &self.metric_name).await?;
+                o.str_field("labels", &self.labels).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value_type", &self.value_type).await?;
@@ -958,12 +956,12 @@ impl SpoolEncode for MetricLandingRow {
             // The descriptor's arm, as the fallback, for the reason
             // [`Self::to_spool_value`]'s own fallback gives.
             _ => {
-                o.field("help", &self.help).await?;
+                o.str_field("help", &self.help).await?;
                 o.field("kind", &self.kind).await?;
-                o.field("metric_name", &self.metric_name).await?;
-                o.field("metric_type", &self.metric_type).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("metric_type", &self.metric_type).await?;
                 o.field("received_ms", &self.received_ms).await?;
-                o.field("unit", &self.unit).await?;
+                o.str_field("unit", &self.unit).await?;
                 o.field("updated_ns", &self.updated_ns).await?;
             }
         }

@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use pulsus_model::Fingerprint;
 use serde::Serialize;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -59,25 +60,29 @@ pub(crate) trait SpoolEncode: Sync {
     /// The same shape, written **into the sink** rather than returned
     /// (issue #603 code review round 8, finding 2).
     ///
-    /// The default materialises [`Self::to_spool_value`] first: one row's
-    /// whole value tree, and then its text in the chunk. `MetricLandingRow`
-    /// overrides it and writes its fields and arrays element by element,
-    /// because an accepted native histogram may carry 65,536 custom bucket
-    /// bounds in one row, and the queue reservation held while the file is
-    /// written covers that block's rows alone.
+    /// The default materialises [`Self::to_spool_value`] first — one row's
+    /// whole value tree — and then walks it into the sink, which holds one
+    /// chunk whatever the value's size ([`SpoolSink::put_value`]).
+    /// `MetricLandingRow` overrides it and writes its fields, arrays and text
+    /// straight into the sink, so it has no value tree of its own either: an
+    /// accepted native histogram may carry 65,536 custom bucket bounds in one
+    /// row, and the queue reservation held while the file is written covers that
+    /// block's rows alone.
     ///
-    /// **Scope, so the default is not read as a statement about size.** The
-    /// nine shipped row shapes keep it: the log rows, the trace rows and the
-    /// per-target metric rows. Their spooling is the log and trace writers'
-    /// own path, which this change does not touch and whose peak is not
-    /// measured by the case behind this method
-    /// (`crates/pulsus-write/tests/spool_stream_alloc.rs`, the metrics
-    /// landing queue's bound).
+    /// **What the default still costs, so it is not read as a statement about
+    /// size.** The nine shipped row shapes keep it: the log rows, the trace
+    /// rows and the per-target metric rows. Their value tree is a copy of the
+    /// row, held while the row is written, and nothing here removes it; what it
+    /// no longer holds is the serialized text on top of that tree. Their
+    /// spooling is the log and trace writers' own path, which this change does
+    /// not touch and whose peak is not measured by the case behind this method
+    /// (`crates/pulsus-write/tests/spool_stream_alloc.rs`, the metrics landing
+    /// queue's bound).
     fn write_spool_json(
         &self,
         out: &mut SpoolSink,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-        async move { out.put_json(&self.to_spool_value()).await }
+        async move { out.put_value(&self.to_spool_value()).await }
     }
 }
 
@@ -168,6 +173,88 @@ struct SpoolRecord<'a> {
 /// twice (`crates/pulsus-write/tests/spool_stream_alloc.rs`).
 pub const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
+/// How much of a string [`SpoolSink::put_str`] escapes at a time. Any value
+/// from 4 up works; this one makes the escaped fragment a few hundred bytes.
+const SPOOL_STR_FRAGMENT_BYTES: usize = 64;
+
+/// **The largest piece anything may hand [`SpoolSink`] in one call, and the
+/// reason the chunk never grows.**
+///
+/// A JSON string escape is at most six bytes of output per byte of input
+/// (`\u00XX`, for a control character), so one fragment escapes to at most
+/// six times its length, plus the two quotes `serde_json` writes around it and
+/// [`SpoolSink::put_str`] strips. Every scalar's JSON text is far inside the
+/// same figure: the widest is a 39-digit `u128`.
+const SPOOL_MAX_PIECE_BYTES: usize = 6 * SPOOL_STR_FRAGMENT_BYTES + 2;
+
+/// **The seal.** Nameable only inside this module, so every
+/// [`SpoolScalar`] implementation is here, beside the invariant it belongs to —
+/// a row shape in `writer::rows` cannot declare a type bounded by writing its
+/// own impl.
+mod sealed {
+    pub trait BoundedJson {}
+}
+
+/// A value whose JSON text fits in one piece of at most
+/// [`SPOOL_MAX_PIECE_BYTES`] bytes, **whatever the push contains** — a number,
+/// a flag, a fingerprint. Not a string, not a sequence, not a struct.
+///
+/// This is the type-level half of [`SpoolSink`]'s invariant: `field` and
+/// `array` take only these, so a field of a type whose text grows with the
+/// input does not compile through them and has to go through the streamed
+/// route instead. Adding a scalar type means adding an impl below, inside the
+/// seal, and `every_spool_scalar_fits_one_bounded_piece` then holds its widest
+/// value to the piece bound.
+pub(crate) trait SpoolScalar: Serialize + sealed::BoundedJson {}
+
+macro_rules! spool_scalar {
+    ($($t:ty),* $(,)?) => { $(
+        impl sealed::BoundedJson for $t {}
+        impl SpoolScalar for $t {}
+    )* };
+}
+
+// Every scalar type a row shape writes today. `i128` is the spool document's
+// own `spooled_at_ns`; `Fingerprint` is `#[serde(transparent)]` over a `u128`,
+// so its text is at most 39 digits.
+spool_scalar!(
+    bool,
+    i8,
+    i32,
+    i64,
+    i128,
+    u8,
+    u32,
+    u64,
+    Fingerprint,
+    FiniteOrNull,
+    serde_json::Number,
+);
+
+/// A reference to a bounded value is bounded — so `array` takes an iterator of
+/// references (`&Vec<i64>`) as readily as one of values.
+impl<T: sealed::BoundedJson + ?Sized> sealed::BoundedJson for &T {}
+impl<T: SpoolScalar + ?Sized> SpoolScalar for &T {}
+
+/// A finite `f64` as a JSON number, and a non-finite one as JSON `null` —
+/// NaN and ±∞ are not JSON-representable, and the exact bits travel in the
+/// paired `*_bits` string field (this module's doc comment).
+///
+/// The one definition of that rule: `writer::rows`' `finite_or_null` builds its
+/// [`serde_json::Value`] form from this impl rather than restating it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FiniteOrNull(pub(crate) f64);
+
+impl Serialize for FiniteOrNull {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_finite() {
+            s.serialize_f64(self.0)
+        } else {
+            s.serialize_none()
+        }
+    }
+}
+
 pub struct SpoolWriter {
     root: PathBuf,
     metrics: Arc<dyn SpoolCounters>,
@@ -242,10 +329,44 @@ impl SpoolWriter {
     }
 }
 
-/// A file being written in bounded pieces: what is held in memory at any
-/// instant is one chunk plus whatever the last piece serialized into it.
+/// A file being written in bounded pieces.
+///
+/// **The invariant: nothing in the encoding path holds a copy that grows with
+/// the input.** What this type holds at any instant is one chunk of at most
+/// [`SPOOL_CHUNK_BYTES`] bytes, and the chunk's allocation never grows past
+/// that for the sink's whole life. Every byte of every document reaches the
+/// file through [`Self::put_bounded`], which takes at most
+/// [`SPOOL_MAX_PIECE_BYTES`] at a time and writes the chunk out first when the
+/// piece would not fit, so the chunk is never asked to reallocate.
+///
+/// There are exactly four routes in, and each one is bounded:
+///
+/// | route | what it takes | how it stays bounded |
+/// |---|---|---|
+/// | [`Self::put_bounded`] | punctuation | the caller's literal, checked against the piece bound |
+/// | [`Self::put_scalar`] | a [`SpoolScalar`] | the type says its text fits one piece, and the seal keeps the set of such types in this module |
+/// | [`Self::put_str`] | any `&str` | escaped and written [`SPOOL_STR_FRAGMENT_BYTES`] of input at a time |
+/// | [`Self::put_value`] | any [`serde_json::Value`] | walked with an explicit stack, every leaf through one of the three above |
+///
+/// **So a field added to a row shape cannot break the bound without saying so.**
+/// A `String` field does not compile through `field`; it has to go through
+/// `str_field`, which streams. A `Vec` field has to go through `array` or
+/// `str_array`, which write one element at a time. A nested value has to go
+/// through `put_value`. And a scalar of a type with no impl here does not
+/// compile at all until someone adds one inside the seal. Two checks back the
+/// statement up: `put_bounded` refuses an over-long piece in every build, not
+/// just a debug one, and the cases in this module assert
+/// [`Self::chunk_high_water`] after writing megabyte strings and values.
+///
+/// **What is not bounded, and is not this type's to bound:** the value a caller
+/// hands in. `SpoolEncode::to_spool_value` builds a whole value tree for the
+/// row shapes that use the default encoder, and that tree is the caller's
+/// memory, charged or not by whatever queued the row. This type adds nothing
+/// to it.
 pub(crate) struct SpoolSink {
     file: fs::File,
+    /// The chunk. Allocated once at [`SPOOL_CHUNK_BYTES`] and never grown —
+    /// see the invariant above.
     buf: Vec<u8>,
     /// The most [`Self::buf`] has ever held at once — the figure the bound is
     /// about, so a case can assert it directly instead of inferring it from a
@@ -265,21 +386,33 @@ impl SpoolSink {
         }
     }
 
-    /// Appends bytes of the document that need no encoding — the punctuation
-    /// and the field names.
-    async fn put(&mut self, piece: &[u8]) -> std::io::Result<()> {
+    /// Appends one piece of at most [`SPOOL_MAX_PIECE_BYTES`] bytes — the
+    /// punctuation, one scalar's text, one fragment of a string's escaping.
+    /// Writes the chunk out first when the piece would not fit in what is left
+    /// of it, so the chunk never has to grow.
+    ///
+    /// **The over-long piece is refused rather than asserted against**, in
+    /// every build: a scalar type whose text outgrew its bound would otherwise
+    /// silently reintroduce the copy this bound exists to remove. A refusal
+    /// fails the spool write, which the caller logs (`writer::table`).
+    async fn put_bounded(&mut self, piece: &[u8]) -> std::io::Result<()> {
+        if piece.len() > SPOOL_MAX_PIECE_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "a spool document piece of {} bytes is past the {} byte \
+                     bound: see SpoolSink's invariant",
+                    piece.len(),
+                    SPOOL_MAX_PIECE_BYTES
+                ),
+            ));
+        }
+        if self.buf.len() + piece.len() > SPOOL_CHUNK_BYTES {
+            self.flush().await?;
+        }
         self.buf.extend_from_slice(piece);
         self.note_chunk();
-        self.spill().await
-    }
-
-    /// Appends one value as JSON, serialized straight into the chunk rather
-    /// than into a buffer of its own.
-    async fn put_json<T: Serialize + ?Sized>(&mut self, value: &T) -> std::io::Result<()> {
-        serde_json::to_writer(&mut self.buf, value)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-        self.note_chunk();
-        self.spill().await
+        Ok(())
     }
 
     /// Records what the chunk holds, right after the append that grew it.
@@ -290,46 +423,155 @@ impl SpoolSink {
         }
     }
 
-    /// Writes one `&str` as a JSON string.
-    ///
-    /// **Stub** (issue #603 code review round 9, finding 1): the cases that
-    /// hold this to a fixed chunk come first, so for now it is the whole-value
-    /// encoder under a name, and they are red on it. Nothing in production
-    /// calls it yet, which is what the allowance below says.
-    #[allow(dead_code)]
-    pub(crate) async fn put_str(&mut self, s: &str) -> std::io::Result<()> {
-        self.put_json(s).await
+    /// One [`SpoolScalar`]'s JSON text, formed in a fixed slot on the stack and
+    /// copied into the chunk. A type whose text does not fit the slot fails
+    /// here, which is the run-time half of the seal's promise.
+    async fn put_scalar<T: SpoolScalar + ?Sized>(&mut self, value: &T) -> std::io::Result<()> {
+        let mut slot = [0u8; SPOOL_MAX_PIECE_BYTES];
+        let mut cursor: &mut [u8] = &mut slot;
+        serde_json::to_writer(&mut cursor, value)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        let written = SPOOL_MAX_PIECE_BYTES - cursor.len();
+        self.put_bounded(&slot[..written]).await
     }
 
-    /// Writes one [`serde_json::Value`] of any shape.
+    /// Writes one `&str` as a JSON string, **one bounded fragment at a time**:
+    /// the quotes, then `serde_json`'s own escaping of at most
+    /// [`SPOOL_STR_FRAGMENT_BYTES`] input bytes per piece.
     ///
-    /// **Stub**, for [`Self::put_str`]'s reason.
-    #[allow(dead_code)]
+    /// `serde_json` escapes a string byte by byte off a lookup table and
+    /// carries no state between bytes, and a byte of a multi-byte character is
+    /// never escaped, so escaping the fragments of a string and concatenating
+    /// the results gives exactly what escaping it whole gives. The fragments
+    /// are cut on character boundaries because `&str` demands it, not because
+    /// the escaping does — `a_streamed_string_escapes_exactly_as_serde_json_does`
+    /// holds the two forms together over every character width and either side
+    /// of a fragment boundary.
+    pub(crate) async fn put_str(&mut self, s: &str) -> std::io::Result<()> {
+        self.put_bounded(b"\"").await?;
+        let mut rest = s;
+        while !rest.is_empty() {
+            // Back off to a character boundary. A character is at most four
+            // bytes and a fragment is 64, so this never reaches zero.
+            let mut cut = SPOOL_STR_FRAGMENT_BYTES.min(rest.len());
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (head, tail) = rest.split_at(cut);
+            rest = tail;
+            let mut slot = [0u8; SPOOL_MAX_PIECE_BYTES];
+            let mut cursor: &mut [u8] = &mut slot;
+            serde_json::to_writer(&mut cursor, head)
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+            let written = SPOOL_MAX_PIECE_BYTES - cursor.len();
+            // `to_writer` wrote `"<escaped>"`; the quotes are this method's.
+            self.put_bounded(&slot[1..written - 1]).await?;
+        }
+        self.put_bounded(b"\"").await
+    }
+
+    /// Writes one [`serde_json::Value`] of any shape, every leaf through a
+    /// bounded route — the encoding [`SpoolEncode::write_spool_json`]'s default
+    /// uses, and so the one every row shape but the metrics landing row's goes
+    /// through.
+    ///
+    /// Walked with an explicit stack rather than by recursion: a recursive
+    /// `async fn` boxes a future per level and would box one per array element,
+    /// where this holds one frame per level of nesting and nothing per element.
+    /// Nesting is a property of the shape the row declares, never of the push.
     pub(crate) async fn put_value(&mut self, value: &serde_json::Value) -> std::io::Result<()> {
-        self.put_json(value).await
+        use serde_json::Value;
+
+        /// One container being walked, and whether its next member is its first.
+        enum Frame<'a> {
+            Array(std::slice::Iter<'a, Value>),
+            Object(serde_json::map::Iter<'a>),
+        }
+        /// What advancing the innermost frame asks for next. Its borrows are
+        /// the walked value's, not the stack's, so the stack is free again.
+        enum Step<'a> {
+            Item(bool, &'a Value),
+            Entry(bool, &'a str, &'a Value),
+            EndArray,
+            EndObject,
+        }
+
+        let mut stack: Vec<(Frame<'_>, bool)> = Vec::new();
+        let mut next = Some(value);
+        loop {
+            if let Some(v) = next.take() {
+                match v {
+                    Value::Null => self.put_bounded(b"null").await?,
+                    Value::Bool(true) => self.put_bounded(b"true").await?,
+                    Value::Bool(false) => self.put_bounded(b"false").await?,
+                    Value::Number(n) => self.put_scalar(n).await?,
+                    Value::String(s) => self.put_str(s).await?,
+                    Value::Array(items) => {
+                        self.put_bounded(b"[").await?;
+                        stack.push((Frame::Array(items.iter()), true));
+                    }
+                    Value::Object(map) => {
+                        self.put_bounded(b"{").await?;
+                        stack.push((Frame::Object(map.iter()), true));
+                    }
+                }
+            }
+            let step = match stack.last_mut() {
+                None => return Ok(()),
+                Some((Frame::Array(items), first)) => match items.next() {
+                    Some(item) => {
+                        let was_first = *first;
+                        *first = false;
+                        Step::Item(was_first, item)
+                    }
+                    None => Step::EndArray,
+                },
+                Some((Frame::Object(entries), first)) => match entries.next() {
+                    Some((key, val)) => {
+                        let was_first = *first;
+                        *first = false;
+                        Step::Entry(was_first, key, val)
+                    }
+                    None => Step::EndObject,
+                },
+            };
+            match step {
+                Step::Item(first, item) => {
+                    if !first {
+                        self.put_bounded(b",").await?;
+                    }
+                    next = Some(item);
+                }
+                Step::Entry(first, key, val) => {
+                    if !first {
+                        self.put_bounded(b",").await?;
+                    }
+                    self.put_str(key).await?;
+                    self.put_bounded(b":").await?;
+                    next = Some(val);
+                }
+                Step::EndArray => {
+                    stack.pop();
+                    self.put_bounded(b"]").await?;
+                }
+                Step::EndObject => {
+                    stack.pop();
+                    self.put_bounded(b"}").await?;
+                }
+            }
+        }
     }
 
     /// Opens a JSON object, to be written field by field and closed with
-    /// [`SpoolObject::end`] — how a row whose arrays are as long as the push
-    /// chooses is encoded without ever holding one whole (issue #603 code
-    /// review round 8, finding 2).
+    /// [`SpoolObject::end`] — how a row whose arrays and text are as long as
+    /// the push chooses is encoded without ever holding one whole (issue #603
+    /// code review rounds 8 and 9).
     pub(crate) async fn begin_object(&mut self) -> std::io::Result<SpoolObject<'_>> {
-        self.put(b"{").await?;
+        self.put_bounded(b"{").await?;
         Ok(SpoolObject {
             sink: self,
             first: true,
         })
-    }
-
-    /// Writes the chunk out once it is full. One piece can carry the buffer
-    /// past the chunk size before this is reached, so what it holds is the
-    /// chunk plus at most one piece — never the whole document, and never a
-    /// whole array of a row that writes its elements one at a time.
-    async fn spill(&mut self) -> std::io::Result<()> {
-        if self.buf.len() < SPOOL_CHUNK_BYTES {
-            return Ok(());
-        }
-        self.flush().await
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
@@ -338,10 +580,6 @@ impl SpoolSink {
         }
         self.file.write_all(&self.buf).await?;
         self.buf.clear();
-        // A piece larger than one chunk grew this; give the memory back
-        // rather than keeping the high-water mark for the rest of the
-        // document. A no-op while the capacity is already the chunk size.
-        self.buf.shrink_to(SPOOL_CHUNK_BYTES);
         Ok(())
     }
 }
@@ -355,20 +593,23 @@ pub(crate) struct SpoolObject<'a> {
 }
 
 impl SpoolObject<'_> {
-    /// `"name":<value>`, the value serialized straight into the chunk.
-    pub(crate) async fn field<T: Serialize + ?Sized>(
+    /// `"name":<value>` for a value whose JSON text fits one bounded piece.
+    ///
+    /// **A `String`, a `Vec` or a nested value does not compile here** — that
+    /// is [`SpoolSink`]'s invariant doing its work. Use [`Self::str_field`],
+    /// [`Self::array`] or [`Self::str_array`].
+    pub(crate) async fn field<T: SpoolScalar + ?Sized>(
         &mut self,
         name: &str,
         value: &T,
     ) -> std::io::Result<()> {
         self.key(name).await?;
-        self.sink.put_json(value).await
+        self.sink.put_scalar(value).await
     }
 
-    /// `"name":"<text>"`, the string written through [`SpoolSink::put_str`].
-    ///
-    /// **Stub**, for [`SpoolSink::put_str`]'s reason.
-    #[allow(dead_code)]
+    /// `"name":"<text>"`, the text escaped and written in bounded fragments
+    /// ([`SpoolSink::put_str`]), so a string of any length holds one fragment
+    /// and not its own text.
     pub(crate) async fn str_field(&mut self, name: &str, value: &str) -> std::io::Result<()> {
         self.key(name).await?;
         self.sink.put_str(value).await
@@ -376,37 +617,56 @@ impl SpoolObject<'_> {
 
     /// `"name":[…]`, **one element at a time**, so an array of any length
     /// holds one element's text and not its own.
-    pub(crate) async fn array<T: Serialize>(
+    pub(crate) async fn array<T: SpoolScalar>(
         &mut self,
         name: &str,
         items: impl IntoIterator<Item = T>,
     ) -> std::io::Result<()> {
         self.key(name).await?;
-        self.sink.put(b"[").await?;
+        self.sink.put_bounded(b"[").await?;
         for (i, item) in items.into_iter().enumerate() {
             if i > 0 {
-                self.sink.put(b",").await?;
+                self.sink.put_bounded(b",").await?;
             }
-            self.sink.put_json(&item).await?;
+            self.sink.put_scalar(&item).await?;
         }
-        self.sink.put(b"]").await
+        self.sink.put_bounded(b"]").await
+    }
+
+    /// [`Self::array`] for strings: one element at a time and each element in
+    /// bounded fragments, so neither the array's length nor any element's
+    /// length is held.
+    pub(crate) async fn str_array<S: AsRef<str>>(
+        &mut self,
+        name: &str,
+        items: impl IntoIterator<Item = S>,
+    ) -> std::io::Result<()> {
+        self.key(name).await?;
+        self.sink.put_bounded(b"[").await?;
+        for (i, item) in items.into_iter().enumerate() {
+            if i > 0 {
+                self.sink.put_bounded(b",").await?;
+            }
+            self.sink.put_str(item.as_ref()).await?;
+        }
+        self.sink.put_bounded(b"]").await
     }
 
     /// Closes the object.
     pub(crate) async fn end(self) -> std::io::Result<()> {
-        self.sink.put(b"}").await
+        self.sink.put_bounded(b"}").await
     }
 
     /// The comma, then the quoted field name and its colon. The name goes
-    /// through `serde_json` like any other string, so it is escaped exactly as
-    /// a derived `Serialize` would escape it.
+    /// through the same string path as any other string, so it is escaped
+    /// exactly as a derived `Serialize` would escape it.
     async fn key(&mut self, name: &str) -> std::io::Result<()> {
         if !self.first {
-            self.sink.put(b",").await?;
+            self.sink.put_bounded(b",").await?;
         }
         self.first = false;
-        self.sink.put_json(name).await?;
-        self.sink.put(b":").await
+        self.sink.put_str(name).await?;
+        self.sink.put_bounded(b":").await
     }
 }
 
@@ -420,9 +680,8 @@ impl SpoolObject<'_> {
 /// the whole serialized body would put two further copies of the push beside
 /// the rows, and enough blocks failing at once would exceed
 /// `PULSUS_INGEST_QUEUE_BYTES` by a multiple of the data admitted. What this
-/// holds instead is one chunk and one piece of one row — a row that writes
-/// its fields and arrays straight into the sink never has a value or a text
-/// of its own at all ([`SpoolEncode::write_spool_json`]).
+/// holds instead is one chunk — [`SpoolSink`]'s invariant, which covers this
+/// document's own `table` and `error` text as well as the rows'.
 ///
 /// The rename is what makes the file atomic to a reader — it never observes a
 /// partially written spool file — exactly as [`write_atomic`] does for the
@@ -436,20 +695,20 @@ async fn write_record<R: SpoolEncode>(
 ) -> std::io::Result<()> {
     let tmp_path = path.with_extension("tmp");
     let mut out = SpoolSink::new(fs::File::create(&tmp_path).await?);
-    out.put(b"{\"table\":").await?;
-    out.put_json(table).await?;
-    out.put(b",\"error\":").await?;
-    out.put_json(error).await?;
-    out.put(b",\"spooled_at_ns\":").await?;
-    out.put_json(&spooled_at_ns).await?;
-    out.put(b",\"rows\":[").await?;
+    out.put_bounded(b"{\"table\":").await?;
+    out.put_str(table).await?;
+    out.put_bounded(b",\"error\":").await?;
+    out.put_str(error).await?;
+    out.put_bounded(b",\"spooled_at_ns\":").await?;
+    out.put_scalar(&spooled_at_ns).await?;
+    out.put_bounded(b",\"rows\":[").await?;
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
-            out.put(b",").await?;
+            out.put_bounded(b",").await?;
         }
         row.write_spool_json(&mut out).await?;
     }
-    out.put(b"]}").await?;
+    out.put_bounded(b"]}").await?;
     out.flush().await?;
     fs::rename(&tmp_path, path).await
 }
@@ -519,6 +778,44 @@ mod tests {
         assert_eq!(metrics.spool_poison_total.load(Ordering::Relaxed), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Every [`SpoolScalar`] type's widest value fits one bounded piece.**
+    /// The trait's promise, held against each type that carries it — the one
+    /// place a new scalar type has to be added, next to its impl.
+    #[tokio::test]
+    async fn every_spool_scalar_fits_one_bounded_piece() {
+        let widest: Vec<(&str, String)> = vec![
+            ("bool", serde_json::to_string(&false).unwrap()),
+            ("i8", serde_json::to_string(&i8::MIN).unwrap()),
+            ("i32", serde_json::to_string(&i32::MIN).unwrap()),
+            ("i64", serde_json::to_string(&i64::MIN).unwrap()),
+            ("i128", serde_json::to_string(&i128::MIN).unwrap()),
+            ("u8", serde_json::to_string(&u8::MAX).unwrap()),
+            ("u32", serde_json::to_string(&u32::MAX).unwrap()),
+            ("u64", serde_json::to_string(&u64::MAX).unwrap()),
+            (
+                "Fingerprint",
+                serde_json::to_string(&Fingerprint::from_raw(u128::MAX)).unwrap(),
+            ),
+            (
+                "FiniteOrNull",
+                serde_json::to_string(&FiniteOrNull(f64::MIN)).unwrap(),
+            ),
+            (
+                "serde_json::Number",
+                serde_json::to_string(&serde_json::json!(f64::MIN)).unwrap(),
+            ),
+        ];
+        for (name, text) in widest {
+            assert!(
+                text.len() <= SPOOL_MAX_PIECE_BYTES,
+                "{name}'s widest JSON text is {} bytes, past the \
+                 {SPOOL_MAX_PIECE_BYTES} byte piece bound: it cannot carry \
+                 SpoolScalar",
+                text.len()
+            );
+        }
     }
 
     /// **The streamed document is byte for byte what serializing the record
@@ -605,6 +902,11 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// How long a string a case gives a row's `labels`, `help` or `unit` when
+    /// it wants the encoder's string path to spill several times inside one
+    /// value rather than at a field boundary.
+    const STRING_PAST_CHUNK: usize = 5 * SPOOL_CHUNK_BYTES / 2;
 
     /// **What the sink holds does not grow with the string it is given**
     /// (issue #603 code review round 9, finding 1). A field whose text is
@@ -693,9 +995,51 @@ mod tests {
         std::fs::read_to_string(path).expect("read the document back")
     }
 
+    /// **A string written in fragments is escaped exactly as `serde_json`
+    /// escapes it whole.** Every byte value that can appear in a Rust `str`,
+    /// every character width, and lengths either side of the fragment the sink
+    /// escapes at a time — the one thing a streamed escaper can get wrong that
+    /// a whole-value encoder cannot.
+    #[tokio::test]
+    async fn a_streamed_string_escapes_exactly_as_serde_json_does() {
+        let dir = tempdir();
+        let every_char: String = (0u32..=0x2FF)
+            .filter_map(char::from_u32)
+            .chain(['\u{1F600}', '\u{10FFFF}', '\u{FFFD}'])
+            .collect();
+        let cases: Vec<String> = vec![
+            String::new(),
+            "\"".to_string(),
+            "\u{0}".repeat(4 * SPOOL_CHUNK_BYTES / 3),
+            "\\".repeat(200),
+            "é".repeat(200),
+            "\u{1F600}".repeat(200),
+            every_char.clone(),
+            every_char.repeat(40),
+            format!("{}{}", "z".repeat(63), "é"),
+            format!("{}{}", "z".repeat(64), "\u{1F600}"),
+            format!("{}{}", "z".repeat(65), "\n"),
+        ];
+        for (i, case) in cases.iter().enumerate() {
+            let path = dir.join(format!("escape-{i}.json"));
+            let mut out = SpoolSink::new(fs::File::create(&path).await.expect("create the file"));
+            out.put_str(case).await.expect("write the string");
+            assert_eq!(
+                finish(out, &path).await,
+                serde_json::to_string(case).expect("the string serializes"),
+                "case {i} ({} bytes) is not escaped the way serde_json escapes it",
+                case.len()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// One row of each landing kind, the histogram twice: an empty-array one
     /// and one carrying `MAX_BUCKETS_PER_HISTOGRAM_SIDE` custom bounds, which
-    /// is the widest single row the ingest seam admits.
+    /// is the widest single row the ingest seam admits. The kind-2 and kind-3
+    /// rows appear twice as well — once with short text and once with text
+    /// several chunks long, so the comparison covers a string the encoder has
+    /// to write in fragments (issue #603 code review round 9, finding 1).
     fn landing_rows_of_every_kind() -> Vec<(&'static str, MetricLandingRow)> {
         use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
         use pulsus_model::{CUSTOM_BUCKETS_SCHEMA, CounterResetHint, NativeHistogram, Span};
@@ -718,6 +1062,24 @@ mod tests {
             metric_type: "counter".to_string(),
             help: "requests \"served\"\n".to_string(),
             unit: "1".to_string(),
+            updated_ns: 42,
+        };
+        // The same two kinds with text several chunks long, and with a
+        // character needing an escape every few bytes so the fragments the
+        // encoder writes fall inside escapes as well as between them.
+        let long_text = "a\"b\nc\\d\u{0}e".repeat(STRING_PAST_CHUNK / 8);
+        let (long_labels, _) =
+            pulsus_model::LabelSet::from_normalized([("job".to_string(), long_text.clone())]);
+        let long_series = SeriesRef {
+            metric_name: Arc::from("http_requests_total"),
+            fingerprint: Fingerprint::from_raw(7),
+            labels: long_labels,
+        };
+        let long_meta = MetricMetadata {
+            metric_name: Arc::from("http_requests_total"),
+            metric_type: "counter".to_string(),
+            help: long_text.clone(),
+            unit: long_text,
             updated_ns: 42,
         };
         let hist = |bounds: usize| HistogramPoint {
@@ -746,7 +1108,15 @@ mod tests {
             ("hist-empty", MetricLandingRow::hist_sample(5, &hist(0))),
             ("hist-wide", MetricLandingRow::hist_sample(5, &hist(65_536))),
             ("series", MetricLandingRow::series(5, &series, 3_600_000, 1)),
+            (
+                "series-long-labels",
+                MetricLandingRow::series(5, &long_series, 3_600_000, 1),
+            ),
             ("metadata", MetricLandingRow::metadata(5, &meta)),
+            (
+                "metadata-long-text",
+                MetricLandingRow::metadata(5, &long_meta),
+            ),
         ]
     }
 

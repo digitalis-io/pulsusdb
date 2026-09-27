@@ -389,10 +389,13 @@ const BOUNDS_4X: usize = BOUNDS * 4;
 /// lengths differ by more than [`WIDTH_SLACK_BYTES`].
 ///
 /// Both fit inside `PULSUS_BATCH_BYTES` (`WriterConfig::batch_bytes`, 16 MiB
-/// by default): the kind-3 case's two strings come to nine eighths of the
-/// larger figure, and admission refuses a push above the ceiling before
-/// anything is queued.
-const STRING_BYTES: usize = 2 * 1024 * 1024;
+/// by default), which is what caps the larger figure: admission charges a
+/// kind-2 row an upper bound on its labels' escaped text, and the text here
+/// escapes to 21 bytes per 9 (`escaped_json_content_len`, which counts the
+/// six-byte form for a control character), so the larger figure is charged
+/// about 9.8 MiB. The kind-3 case's two strings are charged their lengths and
+/// come to nine eighths of it.
+const STRING_BYTES: usize = 1024 * 1024;
 const STRING_BYTES_4X: usize = STRING_BYTES * 4;
 
 /// How far apart the two widths' overheads may be, in either direction. It is
