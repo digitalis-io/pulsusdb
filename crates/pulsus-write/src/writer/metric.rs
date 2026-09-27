@@ -1290,6 +1290,248 @@ mod tests {
     /// the charge would catch.
     const WAITER_CHANNEL_BYTES: u64 = 128;
 
+    /// The activity-bucket width the cases below build a writer with. One hour
+    /// in milliseconds, the shipped default.
+    const BUCKET_MS: i64 = 3_600_000;
+
+    /// A landing inserter that reports the call and then parks until the case
+    /// releases it. That gap is where the block is admitted, charged, out of
+    /// the queue and not yet committed — the one point from which a case can
+    /// take the registration mutex knowing the commit has not reached it.
+    struct ParkingInserter {
+        /// One permit per call, added as the insert begins.
+        entered: tokio::sync::Semaphore,
+        /// The case adds the permit that lets the insert return `Ok`.
+        release: tokio::sync::Semaphore,
+    }
+
+    impl ParkingInserter {
+        fn new() -> Self {
+            ParkingInserter {
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl BlockInserter<MetricLandingRow> for ParkingInserter {
+        fn insert<'a>(
+            &'a self,
+            _table: &'a str,
+            _rows: &'a [MetricLandingRow],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release semaphore is never closed")
+                    .forget();
+                Ok(())
+            })
+        }
+    }
+
+    /// Waits for `done` in real time, naming what never happened. The worker
+    /// runs on a task of its own, so a case cannot yield to it.
+    async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// **A committed block keeps its reservation until the rows it was charged
+    /// for are gone** (issue #603 code review round 10, finding 1). The commit
+    /// exit promotes the push's new series into the registration LRU behind a
+    /// mutex that every admission and every other worker's commit also takes,
+    /// so a worker can wait there while holding a whole block. Handing the
+    /// allowance back before that point gives it to a new admission while this
+    /// block's rows — and the rows of every worker queued behind the same mutex
+    /// — are all still live, and `PULSUS_INGEST_QUEUE_BYTES` permits more than
+    /// it names.
+    ///
+    /// **The contention is genuine**: the case holds the writer's own
+    /// registration mutex while a successful insert runs to its commit.
+    /// `flushes_total` is the rendezvous — [`commit_block`] records the flush
+    /// before it asks for the mutex — so the assertion is made at a point the
+    /// worker has provably reached rather than after a sleep, and it is the
+    /// release that has to have waited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committing_block_stays_charged_until_its_rows_are_released() {
+        let inserter = Arc::new(ParkingInserter::new());
+        let mut runtime = WriterRuntime::from_config(&pulsus_config::WriterConfig::default());
+        // A committed block spools nothing. The root is this case's own
+        // anyway, so a spool write it did not expect would not land in the
+        // process working directory.
+        runtime.spool_dir =
+            std::env::temp_dir().join(format!("pulsus-landing-charge-{}", std::process::id()));
+        runtime.metrics_landing_inserters = 1;
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+
+        let batch = ParsedMetrics {
+            samples: vec![sample(7, 1_000)],
+            series: vec![series_ref(7)],
+            ..Default::default()
+        };
+        writer
+            .admit(batch, PushHeaders::default())
+            .expect("the push is admitted");
+        let charged = writer.shared.queued_bytes.load(Ordering::SeqCst);
+        assert!(charged > 0, "an admitted push holds a reservation");
+
+        // The insert has begun, so the block has left the queue and admission
+        // has finished with the registration mutex.
+        inserter
+            .entered
+            .acquire()
+            .await
+            .expect("the entered semaphore is never closed")
+            .forget();
+
+        // A blocking thread of its own holds the mutex the commit has to take,
+        // so nothing in this case holds a guard across an await.
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let lru = writer.shared.series_lru.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            let guard = lru.lock().expect("series lru mutex poisoned");
+            held_tx.send(()).expect("the case waits for the mutex");
+            release_rx.blocking_recv().ok();
+            drop(guard);
+        });
+        held_rx.await.expect("the mutex is held");
+
+        // Let the insert succeed. Once the flush is recorded the worker is
+        // inside the commit and blocked on the promotion this case is holding.
+        inserter.release.add_permits(1);
+        wait_for("the commit to record its flush", || {
+            writer.metrics().landing.flushes_total == 1
+        })
+        .await;
+
+        assert_eq!(
+            writer.shared.queued_bytes.load(Ordering::SeqCst),
+            charged,
+            "the reservation was handed back while the block's rows were still \
+             live: the worker is blocked on the registration mutex this case \
+             holds, so it has released nothing yet"
+        );
+
+        release_tx.send(()).expect("the holder waits for this");
+        holder.await.expect("the holding thread finishes");
+
+        wait_for("the reservation to be released", || {
+            writer.shared.queued_bytes.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        let registered = {
+            let mut lru = writer
+                .shared
+                .series_lru
+                .lock()
+                .expect("series lru mutex poisoned");
+            lru.contains(&(
+                Arc::from(LONG_NAME),
+                Fingerprint::from_raw(7),
+                floor_to_activity_bucket(1_000, BUCKET_MS),
+                VALUE_TYPE_FLOAT,
+            ))
+        };
+        assert!(
+            registered,
+            "the commit promoted the push's new series while the block was \
+             still charged"
+        );
+
+        writer.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// **Every release of a landing block's reservation goes through one
+    /// function**, and every take goes through `reserve_queued_bytes`
+    /// (issue #603 code review round 10, finding 1).
+    ///
+    /// The charge covers what the block holds, so it can only be given back
+    /// once the block is gone: [`LandingBlock::release`] owns that order, and
+    /// an exit path that subtracted for itself would hand the allowance to a
+    /// new admission with its own rows still live — which is what the commit
+    /// exit did before this round. No behavioural case can be written against
+    /// an exit path nobody has added yet, so this is what the next one is held
+    /// to: it either goes through that function or this census names it.
+    ///
+    /// Lexical, over this module's own source, and the needles are built at
+    /// run time so the census cannot match itself.
+    #[test]
+    fn the_landing_reservation_is_released_in_one_place() {
+        const SRC: &str = include_str!("metric.rs");
+        let gauge = "queued_bytes";
+        let subtract = format!("{gauge}.{}", "fetch_sub");
+        let add = format!("{gauge}.{}", "fetch_add");
+
+        /// The function a line declares, if it declares one: what precedes
+        /// `fn` has to be visibility and qualifiers, so prose naming a
+        /// function does not open one.
+        fn declared_fn(line: &str) -> Option<&str> {
+            let (before, after) = line.trim_start().split_once("fn ")?;
+            before
+                .split_whitespace()
+                .all(|w| {
+                    matches!(
+                        w,
+                        "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe"
+                    )
+                })
+                .then(|| after.split(['(', '<', ' ']).next().unwrap_or_default())
+        }
+
+        let lines: Vec<&str> = SRC.lines().collect();
+        let mut current = "<the module body>";
+        let mut subtracting: Vec<&str> = Vec::new();
+        let mut adding: Vec<&str> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(name) = declared_fn(line) {
+                current = name;
+            }
+            // A statement `rustfmt` may have split over a receiver and a
+            // method call, read as one string with its whitespace removed. It
+            // ends at this line, so the function named is the one the call sits
+            // in rather than one three lines above it.
+            let window: String = lines[i.saturating_sub(2)..=i]
+                .join("")
+                .split_whitespace()
+                .collect();
+            if window.contains(&subtract) && !subtracting.contains(&current) {
+                subtracting.push(current);
+            }
+            if window.contains(&add) && !adding.contains(&current) {
+                adding.push(current);
+            }
+        }
+
+        assert_eq!(
+            subtracting,
+            vec!["release"],
+            "the queue gauge is decremented outside LandingBlock::release, \
+             where the rows it is charged for are still live"
+        );
+        assert!(
+            adding.is_empty(),
+            "the queue gauge is incremented here rather than through \
+             reserve_queued_bytes, which is the only gate that refuses over \
+             the limit: {adding:?}"
+        );
+    }
+
     /// The `SeriesLru` keys a committed block registers come from the block's
     /// own kind-2 rows: such a row holds the metric name, the fingerprint, the
     /// activity-bucket floor in `unix_milli` and the value type, which is the
