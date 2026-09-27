@@ -103,7 +103,7 @@ use tracing::warn;
 
 pub use config::WriterRuntime;
 pub use error::WriteError;
-pub use metric::{MetricWriter, MetricWriterTables};
+pub use metric::{LANDING_BLOCK_OVERHEAD_BYTES, MetricWriter, MetricWriterTables};
 pub use metrics::{
     BackfillMetricsSnapshot, MetricWriterMetrics, MetricWriterMetricsSnapshot,
     TableMetricsSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot, WriterMetrics,

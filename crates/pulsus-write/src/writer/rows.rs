@@ -769,11 +769,19 @@ impl MetricLandingRow {
         bucket_unix_milli: i64,
         value_type: u8,
     ) -> Self {
+        // `to_canonical_json` grows its buffer as it encodes, so it returns
+        // with spare capacity — up to its own length again. The writer queue
+        // holds this row until its block is encoded and is charged the encoded
+        // bytes ([`estimate_canonical_json_len`]), so the spare capacity is
+        // given back rather than the charge doubled. The rule that requires it
+        // is `writer::metric`'s `LANDING_BLOCK_OVERHEAD_BYTES`.
+        let mut labels = series.labels.to_canonical_json();
+        labels.shrink_to_fit();
         MetricLandingRow {
             metric_name: series.metric_name.to_string(),
             fingerprint: series.fingerprint,
             unix_milli: bucket_unix_milli,
-            labels: series.labels.to_canonical_json(),
+            labels,
             value_type,
             ..Self::of_kind(received_ms, Self::KIND_SERIES)
         }

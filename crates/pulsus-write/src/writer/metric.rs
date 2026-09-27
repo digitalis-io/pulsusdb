@@ -38,9 +38,12 @@
 //!
 //! **Backpressure/shutdown**: `queued_bytes` is reserved atomically at
 //! admission and released exactly once, by whichever ending settles the
-//! block. Every ending but a commit spools the block — it is the push's only
-//! copy — reports the claim its fate, and answers a waiting sync caller
-//! `500`.
+//! block. What is reserved is the whole block's cost, not its rows' alone
+//! ([`LANDING_BLOCK_OVERHEAD_BYTES`]). Every ending but a commit spools the
+//! block — it is the push's only copy — reports the claim its fate, and
+//! answers a waiting sync caller `500`. No attempt starts after the announced
+//! shutdown deadline: it bounds the retry sleeps, and no attempt is built past
+//! it ([`run_block`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -109,28 +112,78 @@ impl MetricWriterTables {
     }
 }
 
-/// What the queue is charged for a push whose landing rows price
-/// `row_bytes`.
+/// What the queue holds for one block **besides its rows**, charged once per
+/// block so that `PULSUS_INGEST_QUEUE_BYTES` bounds everything a queued push
+/// retains rather than its rows alone.
+///
+/// Everything a `LandingBlock` holds, field by field, at the most any one of
+/// them holds. `rows` is priced per row by
+/// [`MetricLandingRow::est_landing_bytes`]; `bytes` and `admitted_at` are
+/// inline in the struct; every other field is a term below.
+///
+/// | what it holds | bytes |
+/// |---|---|
+/// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock>()` |
+/// | `settings`: four owned key/value pairs | their four slots, plus 192 for their text — 165 at a 36-byte token and the default row ceiling (18 + 6, 50 + 1, 26 + 36, 21 + 7), leaving room for a longer rendered ceiling |
+/// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
+/// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256, twice the 72 those come to, because the channel's own bookkeeping is private to it |
+///
+/// **So a block may hold nothing whose size grows with the push except its
+/// rows.** A field that did would need its own per-push term and this one
+/// would stop bounding it: that is what carrying one owned `SeriesKey` per new
+/// series did before `promotion_keys` derived them from the committed rows
+/// instead. `the_charge_covers_everything_a_queued_block_holds` prices a
+/// sealed block by walking it, over the push shapes where each half of this
+/// figure binds.
+pub const LANDING_BLOCK_OVERHEAD_BYTES: u64 = 2 * std::mem::size_of::<LandingBlock>() as u64
+    + 4 * std::mem::size_of::<(String, String)>() as u64
+    + 192
+    + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
+    + 256;
+
+/// What the queue is charged for a push whose landing rows price `row_bytes`.
+/// **One figure prices a push**: the per-push byte ceiling refuses against it,
+/// `reserve_queued_bytes` takes it, whichever ending settles releases it and
+/// `record_flush` reports it, so no two halves of the accounting can drift
+/// apart.
 fn landing_charge(row_bytes: u64) -> u64 {
-    row_bytes
+    row_bytes + LANDING_BLOCK_OVERHEAD_BYTES
 }
 
-/// The `SeriesLru` keys a committed block registers.
-#[allow(dead_code)]
+/// The `SeriesLru` keys a committed block registers, derived from the block's
+/// own kind-2 rows rather than carried beside them: such a row holds the
+/// metric name, the fingerprint, the activity-bucket floor in `unix_milli` and
+/// the value type, which is the whole key. Nothing is retained for a block
+/// that never commits, and what a queued block holds does not grow with the
+/// number of series a push registers — see
+/// [`LANDING_BLOCK_OVERHEAD_BYTES`].
 fn promotion_keys(rows: &[MetricLandingRow]) -> impl Iterator<Item = SeriesKey> + '_ {
-    let _ = rows;
-    std::iter::empty()
+    rows.iter()
+        .filter(|row| row.kind == MetricLandingRow::KIND_SERIES)
+        .map(|row| {
+            (
+                Arc::from(row.metric_name.as_str()),
+                row.fingerprint,
+                row.unix_milli,
+                row.value_type,
+            )
+        })
 }
 
 /// One admitted push, sealed and queued. A worker runs it to exactly one
 /// ending and is the only place it settles.
+///
+/// **No field may hold anything whose size grows with the push except
+/// `rows`** — [`LANDING_BLOCK_OVERHEAD_BYTES`] prices every other field at one
+/// figure per block.
 pub(crate) struct LandingBlock {
     /// The push's landing rows, every kind in one vector. Nothing depends on
     /// their order inside the block: the table's sorting key orders what is
-    /// stored, and every consumer matches rows by `kind`.
+    /// stored, and every consumer matches rows by `kind`. The keys a commit
+    /// promotes are read back off them ([`promotion_keys`]).
     rows: Vec<MetricLandingRow>,
-    /// Exactly what `reserve_queued_bytes` took for these rows. Released
-    /// once, by whichever ending settles.
+    /// Exactly what `reserve_queued_bytes` took for this block
+    /// ([`landing_charge`]). Released once, by whichever ending settles.
     bytes: u64,
     /// [`QuerySettings::landing_insert`], built once here and sent
     /// byte-identical on every resend.
@@ -140,10 +193,6 @@ pub(crate) struct LandingBlock {
     claim: ClaimTicket,
     /// The sync caller's waiter; `None` in async mode.
     waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
-    /// The `(metric_name, fingerprint, bucket, value_type)` keys this
-    /// block's kind-2 rows register. Inserted into `SeriesLru` only on a
-    /// commit.
-    promote: Vec<SeriesKey>,
     /// Taken with the claim. The landing budget runs from here, so a block's
     /// queue wait is spent out of its own budget.
     ///
@@ -155,14 +204,14 @@ pub(crate) struct LandingBlock {
 }
 
 impl LandingBlock {
-    /// The one place a `LandingBlock` is built.
+    /// The one place a `LandingBlock` is built, so the case that prices what
+    /// one holds prices the same value the queue does.
     fn seal(
         rows: Vec<MetricLandingRow>,
         bytes: u64,
         settings: QuerySettings,
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
-        promote: Vec<SeriesKey>,
         admitted_at: tokio::time::Instant,
     ) -> Self {
         LandingBlock {
@@ -171,7 +220,6 @@ impl LandingBlock {
             settings,
             claim,
             waiter,
-            promote,
             admitted_at,
         }
     }
@@ -238,8 +286,8 @@ impl LandingFate {
 
 struct Shared {
     /// The landing queue's sender. Bounded by **bytes, not by length**:
-    /// `reserve_queued_bytes` runs before a block is sent and is the only
-    /// gate, so what the queue holds is bounded by
+    /// [`landing_charge`] runs through `reserve_queued_bytes` before a block is
+    /// sent and is the only gate, so what the queue holds is bounded by
     /// `PULSUS_INGEST_QUEUE_BYTES`, whatever number of blocks that comes to.
     landing_tx: mpsc::UnboundedSender<LandingBlock>,
     ctx: Arc<LandingContext>,
@@ -484,8 +532,8 @@ impl MetricWriter {
         // series are cache misses BEFORE cloning anything into a row shape.
         // Each landing row is charged the row the QUEUE holds — the union of
         // the four kinds' columns — plus the buffers that kind's target
-        // estimator prices, so `PULSUS_INGEST_QUEUE_BYTES` bounds what is
-        // actually buffered.
+        // estimator prices; [`landing_charge`] adds what the block holds
+        // besides its rows.
         let sample_bytes: u64 = batch
             .samples
             .iter()
@@ -569,7 +617,6 @@ impl MetricWriter {
                     descriptor_bytes,
                     ClaimTicket::inert(),
                     None,
-                    Vec::new(),
                     admitted_at,
                 );
             }
@@ -615,17 +662,10 @@ impl MetricWriter {
                 .iter()
                 .map(|h| MetricLandingRow::hist_sample(received_ms, h)),
         );
-        let mut promote: Vec<SeriesKey> = Vec::with_capacity(new_series.len());
         for (series, bucket, value_type) in &new_series {
             rows.push(MetricLandingRow::series(
                 received_ms,
                 series,
-                *bucket,
-                *value_type,
-            ));
-            promote.push((
-                Arc::from(series.metric_name.as_ref()),
-                series.fingerprint,
                 *bucket,
                 *value_type,
             ));
@@ -677,7 +717,7 @@ impl MetricWriter {
             None
         };
 
-        self.queue_block(rows, total_bytes, claim, waiter, promote, admitted_at);
+        self.queue_block(rows, total_bytes, claim, waiter, admitted_at);
 
         // Arms the claim: from here a drop no longer removes it, and the
         // target set is closed.
@@ -795,7 +835,6 @@ impl MetricWriter {
         bytes: u64,
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
-        promote: Vec<SeriesKey>,
         admitted_at: tokio::time::Instant,
     ) {
         let token = {
@@ -812,7 +851,6 @@ impl MetricWriter {
             QuerySettings::landing_insert(&token, self.shared.runtime.metrics_landing_max_rows),
             claim,
             waiter,
-            promote,
             admitted_at,
         );
         if let Err(closed) = self.shared.landing_tx.send(block) {
@@ -1016,11 +1054,20 @@ async fn drain_queue(
 
 /// Runs one block to an ending. Returns only once that block has settled.
 ///
+/// **Two deadlines bound the loop, and each is checked before an attempt is
+/// built rather than only before the sleep above it**: a timeout polls its
+/// inner future before its own timer, so even a zero-duration bound around a
+/// fresh attempt starts an insert.
+///
 /// The budget — `WriterRuntime::landing_budget`, measured from the push's
 /// admission — bounds the whole loop: the queue wait, every attempt and
 /// every sleep. It is **recomputed after every attempt**, so a sleep can
 /// never carry the block past it, and the check at the top of the loop is
 /// what ends a block whose sleep spent what was left.
+///
+/// The announced shutdown deadline bounds the same three, so the drain
+/// terminates by the deadline it announced
+/// (`crates/pulsus-server/src/serve.rs:61`) and sends nothing after it.
 async fn run_block(
     ctx: &Arc<LandingContext>,
     block: LandingBlock,
@@ -1042,6 +1089,17 @@ async fn run_block(
             };
             fate.saw_pre_send(msg.to_string());
             settle_block(ctx, block, fate, TerminalCause::Normal).await;
+            return;
+        }
+
+        // The shutdown deadline, already passed: the block settles here rather
+        // than in an attempt bounded to nothing. It keeps whatever fate its
+        // attempts left, and the queued-shutdown message is read only when
+        // that fate is `NeverSent` — where it is exactly what happened, since
+        // every pre-send ending means nothing was sent.
+        if shutdown_deadline_passed(shutdown_rx) {
+            fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
+            settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
             return;
         }
 
@@ -1141,8 +1199,56 @@ async fn run_block(
             rng,
         )
         .min(left);
-        tokio::time::sleep(delay).await;
+        sleep_within_shutdown(shutdown_rx, delay).await;
         resends += 1;
+    }
+}
+
+/// Whether shutdown has been announced **and** the deadline it announced has
+/// passed. A closed channel is not that: it is the writer dropped without a
+/// graceful shutdown, which the attempt's own race already treats as an
+/// immediate deadline.
+fn shutdown_deadline_passed(shutdown_rx: &mut watch::Receiver<Option<Instant>>) -> bool {
+    matches!(*shutdown_rx.borrow_and_update(), Some(deadline) if deadline <= Instant::now())
+}
+
+/// Sleeps for `delay`, returning as soon as an announced shutdown deadline has
+/// passed — [`run_block`]'s own check then settles the block, so this reports
+/// nothing back.
+///
+/// A sleep that ignored the deadline would end after it and the next turn of
+/// the loop would build an attempt the drain is no longer waiting for.
+async fn sleep_within_shutdown(
+    shutdown_rx: &mut watch::Receiver<Option<Instant>>,
+    delay: Duration,
+) {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        // Bound to a value, not held as a borrow: the arm below takes the
+        // receiver again.
+        let announced = *shutdown_rx.borrow_and_update();
+        match announced {
+            // Announced: whichever of the two comes first ends the sleep.
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let _ = tokio::time::timeout(left, sleep.as_mut()).await;
+                return;
+            }
+            // Not announced yet: sleep, and come back to bound the remainder
+            // by the deadline if one is announced meanwhile. A closed channel
+            // ends the sleep, as it ends an attempt.
+            None => {
+                tokio::select! {
+                    () = &mut sleep => return,
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1155,7 +1261,7 @@ async fn commit_block(ctx: &Arc<LandingContext>, block: LandingBlock, latency: D
         .record_flush(block.rows.len() as u64, block.bytes, latency);
     {
         let mut lru = ctx.series_lru.lock().expect("series lru mutex poisoned");
-        for key in block.promote {
+        for key in promotion_keys(&block.rows) {
             lru.insert(key);
         }
     }
@@ -1401,7 +1507,6 @@ mod tests {
                 ),
                 ClaimTicket::inert(),
                 Some(tx),
-                Vec::new(),
                 tokio::time::Instant::now(),
             );
 
