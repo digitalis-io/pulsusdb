@@ -1341,7 +1341,7 @@ pub const MIGRATIONS: &[Migration] = &[
     // `insert_deduplication_token` the writer mints per block.
     //
     // `ttl_only_drop_parts` and `merge_with_ttl_timeout` are fixed and sit
-    // here; the delete-TTL and the two deduplication windows carry
+    // here; this table's delete-TTL and its one deduplication window carry
     // configuration values and are applied by `controller::apply_ttl`,
     // because migration identity is checksummed over the rendered template
     // and a dial inside this CREATE would read as drift.
