@@ -1434,6 +1434,85 @@ mod tests {
         assert_eq!(hist.value_type, 1);
     }
 
+    /// A label set whose values carry every class of JSON escaping: a quote
+    /// and a backslash (two bytes out), a newline (the two-byte shorthand), a
+    /// control character with no shorthand (`\u0001`, six bytes out), and a
+    /// multi-byte character that is not escaped at all. Keys are canonicalized
+    /// by `from_normalized`, so a value is where expansion comes from on the
+    /// production path.
+    fn escaped_labels() -> LabelSet {
+        let (labels, _) = LabelSet::from_normalized([
+            ("path".to_string(), "/a\"b\\c".to_string()),
+            ("note".to_string(), "line1\nline2\u{1}".to_string()),
+            ("city".to_string(), "café".to_string()),
+        ]);
+        labels
+    }
+
+    /// **The charge for a label set must not be less than the canonical JSON
+    /// it turns into.** The estimate prices a set before it is encoded, and
+    /// the row the queue then holds owns that encoded string: an estimate
+    /// blind to escaping undercharges by every byte an escape adds, so the
+    /// queue's byte ceiling bounds less than is buffered.
+    #[test]
+    fn the_canonical_json_estimate_is_not_less_than_the_escaped_encoding() {
+        let labels = escaped_labels();
+        let encoded = labels.to_canonical_json();
+        let estimate = estimate_canonical_json_len(&labels);
+        assert!(
+            estimate >= encoded.len(),
+            "the estimate ({estimate}) undercharges the {} bytes of \
+             {encoded} by {}",
+            encoded.len(),
+            encoded.len().saturating_sub(estimate)
+        );
+        // Unescaped labels are still priced exactly, so the bound costs
+        // nothing on the ordinary path.
+        let (plain, _) = LabelSet::from_normalized([
+            ("job".to_string(), "checkout".to_string()),
+            ("env".to_string(), "prod".to_string()),
+        ]);
+        assert_eq!(
+            estimate_canonical_json_len(&plain),
+            plain.to_canonical_json().len(),
+            "a label set needing no escaping is priced exactly"
+        );
+    }
+
+    /// The same, through the two row types that charge a label set: the
+    /// estimate taken before materializing must cover the string the
+    /// materialized row holds.
+    #[test]
+    fn est_source_bytes_covers_escaped_labels_on_the_materialized_row() {
+        let series = SeriesRef {
+            metric_name: Arc::from("http_requests_total"),
+            fingerprint: Fingerprint::from_raw(7),
+            labels: escaped_labels(),
+        };
+        let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 0);
+        assert!(
+            MetricSeriesRow::est_source_bytes(&series) >= mapped.est_bytes(),
+            "series: charged {}, holds {}",
+            MetricSeriesRow::est_source_bytes(&series),
+            mapped.est_bytes()
+        );
+
+        let row = StreamRow {
+            month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
+            fingerprint: Fingerprint::from_raw(7),
+            service: "checkout".to_string(),
+            labels: escaped_labels(),
+            updated_ns: 123,
+        };
+        let mapped = LogStreamRow::from(&row);
+        assert!(
+            LogStreamRow::est_source_bytes(&row) >= mapped.est_bytes(),
+            "stream: charged {}, holds {}",
+            LogStreamRow::est_source_bytes(&row),
+            mapped.est_bytes()
+        );
+    }
+
     #[test]
     fn metric_series_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
         let (labels, _) = LabelSet::from_normalized([

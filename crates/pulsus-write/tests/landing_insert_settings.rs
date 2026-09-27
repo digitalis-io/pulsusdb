@@ -222,6 +222,89 @@ async fn a_retryable_failure_before_the_block_was_sent_keeps_its_own_class() {
     );
 }
 
+/// **The client's own deadline firing while the metadata read is still
+/// pending is a pre-send failure, not uncertainty.** One deadline covers the
+/// whole create/write/end sequence, so the arm that handles it has to say
+/// which phase it cut: a deadline during metadata acquisition leaves the
+/// insert request never opened, and reporting it `InsertUncertain` tells the
+/// caller that a block which demonstrably never left the process may have
+/// committed — which costs it the pre-send resend it was entitled to.
+///
+/// The mock reads the `DESCRIBE` and answers nothing, so the metadata read is
+/// what the deadline interrupts; `query_timeout` is that client-side insert
+/// deadline, short here so the case does not wait out the default.
+#[tokio::test]
+async fn a_client_deadline_during_the_metadata_read_is_a_pre_send_failure() {
+    let mock = MockChInsert::start(DescribeAnswer::Stall, InsertAnswer::Ok);
+    let client = ChClient::new(mock.conn_config_with_timeout(Duration::from_millis(400)))
+        .await
+        .expect("connect to the mock");
+    let rows = vec![OneCol { v: 7 }];
+
+    let err = client
+        .insert_block_with("t", &rows, &landing_settings())
+        .await
+        .expect_err("the mock never answers the metadata read");
+
+    match &err {
+        ChError::Timeout(msg) => assert!(
+            msg.contains("insert_block exceeded"),
+            "the deadline's own error: {msg}"
+        ),
+        other => panic!(
+            "a deadline that fired before the insert request was opened must \
+             keep its own class, not be downgraded to uncertainty: {other:?}"
+        ),
+    }
+    assert!(
+        err.is_retryable(),
+        "a deadline proven to precede transmission keeps its retryable class, \
+         which is what lets the landing loop resend the block: {err:?}"
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|r| !r.body.starts_with("INSERT INTO")),
+        "no insert was ever opened: {:?}",
+        mock.requests()
+    );
+}
+
+/// **The same deadline firing once the insert request is open IS
+/// uncertainty.** The pair with the case above is what pins the phase split:
+/// one deadline, two classes, decided by how far the attempt had got. From
+/// the first `write` the vendored client may already have flushed part of the
+/// block, and a source block can be committed before a view on it answers, so
+/// the commit fate is unknown and no caller may auto-retry it.
+#[tokio::test]
+async fn a_client_deadline_after_the_insert_was_opened_is_uncertain() {
+    let mock = MockChInsert::start(DescribeAnswer::Ok, InsertAnswer::Stall);
+    let client = ChClient::new(mock.conn_config_with_timeout(Duration::from_millis(400)))
+        .await
+        .expect("connect to the mock");
+    let rows = vec![OneCol { v: 7 }];
+
+    let err = client
+        .insert_block_with("t", &rows, &landing_settings())
+        .await
+        .expect_err("the mock never answers the insert");
+
+    match &err {
+        ChError::InsertUncertain(msg) => assert!(
+            msg.contains("insert_block exceeded"),
+            "the uncertain error keeps the deadline it came from: {msg}"
+        ),
+        other => panic!(
+            "a deadline that fired with the insert request open has unknown \
+             commit fate: {other:?}"
+        ),
+    }
+    assert!(
+        !err.is_retryable(),
+        "an uncertain block is never auto-retried: {err:?}"
+    );
+}
+
 /// A spool root of this case's own, so the writer writes nothing into the
 /// process working directory.
 fn spool_root(name: &str) -> PathBuf {

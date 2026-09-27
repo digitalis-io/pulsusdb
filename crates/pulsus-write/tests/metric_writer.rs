@@ -1226,6 +1226,79 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The escaping metric name and label set the case below pushes. Every class
+/// of JSON escaping is here: a quote and a backslash, a newline, and a run of
+/// 30 control characters with no shorthand — six bytes each once encoded,
+/// where the raw value counts one.
+const ESCAPING_METRIC: &str = "http_requests_total";
+
+fn escaping_series(fingerprint: u128) -> SeriesRef {
+    let (labels, _) = LabelSet::from_normalized([
+        ("path".to_string(), "/a\"b\\c\nd".to_string()),
+        ("note".to_string(), "\u{1}".repeat(30)),
+    ]);
+    SeriesRef {
+        metric_name: Arc::from(ESCAPING_METRIC),
+        fingerprint: Fingerprint::from_raw(fingerprint),
+        labels,
+    }
+}
+
+/// Issue #603 code review round 3, finding 2: the charge must cover the
+/// **encoded** labels the queued row holds, not the raw label bytes. The
+/// kind-2 row the queue holds owns `labels` as canonical JSON, and JSON
+/// escaping expands a quote or a backslash to two bytes and a control
+/// character with no shorthand to six, so a charge taken from the raw lengths
+/// bounds less memory than is buffered.
+///
+/// The ceiling is one byte, so the push is refused and the refusal reports
+/// the charge the queue would have taken.
+#[tokio::test]
+async fn the_queue_charge_covers_the_escaped_labels_it_holds() {
+    let root = spool_root("escaped-labels");
+    let cfg = WriterConfig {
+        batch_bytes: ByteSize(1),
+        ..Default::default()
+    };
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let series = escaping_series(11);
+    let push = ParsedMetrics {
+        samples: vec![MetricPoint {
+            metric_name: Arc::from(ESCAPING_METRIC),
+            fingerprint: Fingerprint::from_raw(11),
+            unix_milli: 1_000,
+            value: 1.0,
+        }],
+        series: vec![series.clone()],
+        ..Default::default()
+    };
+
+    let err = writer
+        .admit_flush(push, PushHeaders::default())
+        .expect_err("one byte of ceiling refuses every push");
+    let AdmitRefusal::PushTooLarge { rows, bytes, .. } = err else {
+        panic!("expected PushTooLarge, got {err:?}");
+    };
+    assert_eq!(rows, 2, "one kind-0 sample row and one kind-2 series row");
+
+    // A lower bound on what the queue holds for this push: the two rows'
+    // slots, the metric name each row owns, and the canonical JSON the kind-2
+    // row owns. Only `labels` is read off the row below, and it does not
+    // depend on the bucket, so any bucket argument gives the same string.
+    let held = rows * LANDING_ROW_SLOT_BYTES
+        + 2 * ESCAPING_METRIC.len() as u64
+        + MetricLandingRow::series(0, &series, 0, 0).labels.len() as u64;
+    assert!(
+        bytes >= held,
+        "the charge ({bytes}) must cover the {held} bytes the queue holds, \
+         which includes the escaped labels the row owns"
+    );
+
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Issue #603 code review, finding 4: a failed block's queue reservation must
 /// stay charged until its spool copy has been **written**. `SpoolWriter::write`
 /// maps every row into a second value vector and then a serialized byte

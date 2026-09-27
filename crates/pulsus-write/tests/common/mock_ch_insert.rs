@@ -20,6 +20,10 @@
 //!    `500` carrying an exception code in the header the vendored patch puts
 //!    at byte 0 of the body.
 //!
+//! Either of requests 2 and 3 can instead be left unanswered (`Stall`), which
+//! holds that request pending until the mock stops, so a case with a short
+//! `query_timeout` chooses the phase the client's deadline fires in.
+//!
 //! **What it establishes and what it does not.** It establishes what our own
 //! insert path sends and how our own classifier reads the answer. It does not
 //! establish that ClickHouse answers this way — protocol behaviour is gated
@@ -51,6 +55,10 @@ pub enum InsertAnswer {
     /// reads out of `X-ClickHouse-Exception-Code`, then the exception text.
     /// This is an answer that arrives **after** the block was transmitted.
     Exception { code: i32, text: &'static str },
+    /// Read the request and never answer it, holding the connection open
+    /// until the mock stops: the insert request stays pending, so the
+    /// client's own deadline fires with the block already transmitted.
+    Stall,
 }
 
 /// What the mock answers `DESCRIBE TABLE` with.
@@ -61,6 +69,10 @@ pub enum DescribeAnswer {
     /// A `500` exception, which reaches the caller **before** any of the
     /// block is transmitted.
     Exception { code: i32, text: &'static str },
+    /// Read the request and never answer it, holding the connection open
+    /// until the mock stops: the metadata read stays pending, so the client's
+    /// own deadline fires with the insert request never opened.
+    Stall,
 }
 
 /// LEB128, which is what RowBinary uses for string lengths.
@@ -150,7 +162,9 @@ impl MockChInsert {
         let handle = thread::spawn(move || {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((sock, _)) => serve_one(sock, describe, insert, &seen_thread),
+                    Ok((sock, _)) => {
+                        serve_one(sock, describe, insert, &seen_thread, &stop_thread);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -169,13 +183,21 @@ impl MockChInsert {
     /// A connection config pointing at this mock, with one pooled connection
     /// so the request order is the client's own.
     pub fn conn_config(&self) -> ChConnConfig {
+        self.conn_config_with_timeout(Duration::from_secs(10))
+    }
+
+    /// [`Self::conn_config`] with a `query_timeout` of the case's own choosing
+    /// — which is the client-side insert deadline
+    /// (`ChClient::default_timeout`), so a case pairing a short one with a
+    /// stalling answer decides which phase the deadline fires in.
+    pub fn conn_config_with_timeout(&self, query_timeout: Duration) -> ChConnConfig {
         ChConnConfig {
             server: "127.0.0.1".to_string(),
             http_port: self.addr.port(),
             database: "default".to_string(),
             proto: ChProto::Http,
             pool_size: 1,
-            query_timeout: Duration::from_secs(10),
+            query_timeout,
             ..ChConnConfig::default()
         }
     }
@@ -212,11 +234,21 @@ fn exception_body(code: i32, text: &str) -> Vec<u8> {
     format!("Code: {code}. DB::Exception: {text}. (SOME_CODE)\n").into_bytes()
 }
 
+/// Holds the connection open, answering nothing, until the mock stops. The
+/// socket is dropped on return, so the client sees the request abandoned only
+/// after its own deadline has already fired.
+fn stall_until_stopped(stop: &Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 fn serve_one(
     mut sock: TcpStream,
     describe: DescribeAnswer,
     insert: InsertAnswer,
     seen: &Arc<Mutex<Vec<Seen>>>,
+    stop: &Arc<AtomicBool>,
 ) {
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     sock.set_nonblocking(false).ok();
@@ -302,6 +334,7 @@ fn serve_one(
                 let _ = sock.write_all(&payload);
             }
             DescribeAnswer::Exception { code, text } => write_exception(&mut sock, code, text),
+            DescribeAnswer::Stall => stall_until_stopped(stop),
         }
         let _ = sock.flush();
         return;
@@ -313,6 +346,7 @@ fn serve_one(
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
         InsertAnswer::Exception { code, text } => write_exception(&mut sock, code, text),
+        InsertAnswer::Stall => stall_until_stopped(stop),
     }
     let _ = sock.flush();
 }
