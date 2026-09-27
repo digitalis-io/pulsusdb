@@ -44,11 +44,12 @@
 //! the push's only copy — reports the claim its fate, and answers a waiting
 //! sync caller `500`.
 //!
-//! **The shutdown boundary is `writer::drain`'s**, whole: nothing starts, and
-//! nothing is abandoned, after the announced deadline. This module asks it for
-//! an attempt, waits between attempts through it, admits inside a pass it
-//! hands out, and spawns nothing it does not track. Nothing here reads the
-//! deadline or reasons about it.
+//! **The shutdown boundary is `writer::drain`'s**, whole: no attempt starts
+//! after the announced deadline, and nothing this writer spawned is abandoned
+//! at it. This module asks the boundary for an attempt, waits between attempts
+//! through it, admits inside a pass it hands out, and spawns nothing it does
+//! not track. Nothing here reads the deadline or reasons about it — including
+//! what the deadline does not bound, which is settling a block.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

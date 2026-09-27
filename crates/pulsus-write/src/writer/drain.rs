@@ -1,13 +1,19 @@
 //! The metrics landing path's shutdown boundary (issue #603).
 //!
-//! **One rule lives here: nothing starts, and nothing is abandoned, after the
-//! announced shutdown deadline.** Three review rounds found three different
-//! ways past that rule while each half of it was written where it was needed —
-//! a retry sleep the deadline did not bound, a check the poll could slip past,
-//! a settlement task nobody joined. Every part of it is this type's now, and
-//! the landing path states none of it again.
+//! **One rule lives here: no attempt starts after the announced shutdown
+//! deadline, and nothing the writer spawned is abandoned at it.** Three review
+//! rounds found three different ways past that rule while each half of it was
+//! written where it was needed — a retry sleep the deadline did not bound, a
+//! check the poll could slip past, a settlement task nobody joined. Every part
+//! of it is this type's now, and the landing path states none of it again.
 //!
-//! What makes a fourth way past it structural rather than lucky:
+//! **What the deadline does not bound is settling a block.** The spool copy is
+//! the push's only one, so the drain finishes writing it rather than dropping
+//! it at the deadline, and the drain overruns by what that write costs. That is
+//! the choice the landing path makes everywhere: a block is never lost to save
+//! time.
+//!
+//! What makes a fourth way past the rule structural rather than lucky:
 //!
 //! - **An attempt is created here and nowhere else.**
 //!   [`DrainWatch::attempt`] takes the constructor, not the future, and calls
@@ -22,6 +28,12 @@
 //!   announces the deadline. So no block reaches a closed queue, and a
 //!   settlement task — which only a pass can spawn — cannot appear after the
 //!   set of them has been joined.
+//!
+//! **The residual, stated rather than claimed away**: an attempt polled before
+//! the deadline and still in flight at it is abandoned, which is the uncertain
+//! ending. That is not work starting after the deadline, and it is the one
+//! thing no boundary can remove — a send already on the wire cannot be
+//! recalled.
 
 use std::future::Future;
 use std::sync::Mutex;
