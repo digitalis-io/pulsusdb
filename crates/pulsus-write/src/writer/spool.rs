@@ -582,6 +582,19 @@ impl SpoolSink {
         self.buf.clear();
         Ok(())
     }
+
+    /// The last chunk, and then the file's own buffer.
+    ///
+    /// The second half is not optional: `tokio::fs::File::write_all` hands the
+    /// bytes to a blocking task and returns before that task has run, so a
+    /// `rename` issued straight after it is a second blocking task with no
+    /// ordering against the first — a reader could then open the renamed file
+    /// and find it short. Flushing here waits for the write, so the rename
+    /// publishes a whole document.
+    async fn finish(&mut self) -> std::io::Result<()> {
+        self.flush().await?;
+        self.file.flush().await
+    }
 }
 
 /// One JSON object being written into a [`SpoolSink`]. Each field is written
@@ -709,7 +722,7 @@ async fn write_record<R: SpoolEncode>(
         row.write_spool_json(&mut out).await?;
     }
     out.put_bounded(b"]}").await?;
-    out.flush().await?;
+    out.finish().await?;
     fs::rename(&tmp_path, path).await
 }
 
@@ -984,13 +997,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Flushes the sink's tail **and the file's own buffer**, closes it, and
-    /// answers what is on disk. `SpoolSink::flush` hands its chunk to
-    /// `tokio::fs::File`, which is where a written-but-not-yet-flushed document
-    /// would still be.
+    /// Finishes the sink ([`SpoolSink::finish`]), closes it, and answers what is
+    /// on disk.
     async fn finish(mut out: SpoolSink, path: &Path) -> String {
-        out.flush().await.expect("flush the chunk");
-        out.file.flush().await.expect("flush the file");
+        out.finish().await.expect("flush the sink and the file");
         drop(out);
         std::fs::read_to_string(path).expect("read the document back")
     }
