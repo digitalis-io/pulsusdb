@@ -311,12 +311,17 @@ const SPOOL_CEILING_BYTES: u64 = 1024 * 1024;
 const BOUNDS: usize = 16_384;
 const BOUNDS_4X: usize = BOUNDS * 4;
 
-/// How much the wider of the two rows may hold over the narrower. It is what
-/// makes "fixed" an assertion rather than a hope: a four-fold array must cost
-/// the encoder nothing, because it writes elements one at a time into a buffer
-/// that spills as it fills. A whole-document encoder pays for every element
-/// twice, in a value tree and again in the serialised body.
-const WIDTH_SLACK_BYTES: u64 = 128 * 1024;
+/// How far apart the two widths' overheads may be, in either direction. It is
+/// what makes "fixed" an assertion rather than a hope: a four-fold array must
+/// cost the encoder nothing, because it writes elements one at a time into a
+/// buffer that spills as it fills. A whole-document encoder pays for every
+/// element twice, in a value tree and again in the serialised body, and the two
+/// widths then differ by megabytes.
+///
+/// The fixed part the encoder may add is the 64 KiB chunk and the file
+/// writer's own copy of it; this leaves room for those at either width and no
+/// room for an array of 16,384 floats.
+const WIDTH_SLACK_BYTES: u64 = 256 * 1024;
 
 /// **Both halves are in one `#[test]`.** The measurement is a process-wide
 /// high-water mark, so a second test function running on another thread would
@@ -372,12 +377,12 @@ fn spooling_a_block_holds_no_copy_of_the_push() {
         }
         let (narrow, wide) = (wide_extra[0], wide_extra[1]);
         assert!(
-            wide.saturating_sub(narrow) <= WIDTH_SLACK_BYTES,
-            "four times the array cost the spool path {} bytes more ({narrow} \
-             at {BOUNDS} bounds, {wide} at {BOUNDS_4X}): the overhead must stay \
+            wide.abs_diff(narrow) <= WIDTH_SLACK_BYTES,
+            "four times the array moved the spool path's overhead by {} bytes \
+             ({narrow} at {BOUNDS} bounds, {wide} at {BOUNDS_4X}): it must stay \
              fixed as the array grows, or the bound is one push's size and not \
              a constant",
-            wide.saturating_sub(narrow)
+            wide.abs_diff(narrow)
         );
     });
 }

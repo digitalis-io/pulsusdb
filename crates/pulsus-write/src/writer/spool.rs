@@ -53,8 +53,29 @@ use tokio::io::AsyncWriteExt;
 /// have): every row shape ever passed to `SpoolWriter::write` implements
 /// this explicitly (`writer::rows`). The default shape for a row with no
 /// non-finite-float hazard is just `serde_json::to_value(self)`.
-pub(crate) trait SpoolEncode {
+pub(crate) trait SpoolEncode: Sync {
     fn to_spool_value(&self) -> serde_json::Value;
+
+    /// The same shape, written **into the sink** rather than returned
+    /// (issue #603 code review round 8, finding 2).
+    ///
+    /// The default materialises [`Self::to_spool_value`] first, which costs a
+    /// value tree bounded by the row's own fields. A row carrying an array
+    /// whose length the *push* chooses overrides this and writes its fields
+    /// and arrays element by element, so neither the value nor the output
+    /// buffer grows with it: `MetricLandingRow` does, because an accepted
+    /// native histogram may carry 65,536 custom bucket bounds in one row.
+    ///
+    /// **The default is the nine shipped row shapes' encoding and stays
+    /// theirs.** They are the log, trace and per-target metric rows, whose
+    /// spooling is not the landing path this bound is about; overriding them
+    /// is a change to shipped behaviour with no finding behind it.
+    fn write_spool_json(
+        &self,
+        out: &mut SpoolSink,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        async move { out.put_json(&self.to_spool_value()).await }
+    }
 }
 
 /// The two counters [`SpoolWriter::write`] bumps on success — implemented
@@ -134,7 +155,7 @@ struct SpoolRecord<'a> {
     rows: Vec<serde_json::Value>,
 }
 
-/// How much of the document [`ChunkedFile`] holds before it writes what it
+/// How much of the document [`SpoolSink`] holds before it writes what it
 /// has. One `write_all` per chunk, so the file costs one blocking-pool
 /// round trip per this many bytes rather than one per row.
 const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
@@ -214,15 +235,15 @@ impl SpoolWriter {
 }
 
 /// A file being written in bounded pieces: what is held in memory at any
-/// instant is one chunk plus whatever the last value serialized into it.
-struct ChunkedFile {
+/// instant is one chunk plus whatever the last piece serialized into it.
+pub(crate) struct SpoolSink {
     file: fs::File,
     buf: Vec<u8>,
 }
 
-impl ChunkedFile {
+impl SpoolSink {
     fn new(file: fs::File) -> Self {
-        ChunkedFile {
+        SpoolSink {
             file,
             buf: Vec::with_capacity(SPOOL_CHUNK_BYTES),
         }
@@ -243,9 +264,22 @@ impl ChunkedFile {
         self.spill().await
     }
 
-    /// Writes the chunk out once it is full. One value can carry the buffer
+    /// Opens a JSON object, to be written field by field and closed with
+    /// [`SpoolObject::end`] — how a row whose arrays are as long as the push
+    /// chooses is encoded without ever holding one whole (issue #603 code
+    /// review round 8, finding 2).
+    pub(crate) async fn begin_object(&mut self) -> std::io::Result<SpoolObject<'_>> {
+        self.put(b"{").await?;
+        Ok(SpoolObject {
+            sink: self,
+            first: true,
+        })
+    }
+
+    /// Writes the chunk out once it is full. One piece can carry the buffer
     /// past the chunk size before this is reached, so what it holds is the
-    /// chunk plus at most one value — never the whole document.
+    /// chunk plus at most one piece — never the whole document, and never a
+    /// whole array of a row that writes its elements one at a time.
     async fn spill(&mut self) -> std::io::Result<()> {
         if self.buf.len() < SPOOL_CHUNK_BYTES {
             return Ok(());
@@ -259,11 +293,66 @@ impl ChunkedFile {
         }
         self.file.write_all(&self.buf).await?;
         self.buf.clear();
-        // A value larger than one chunk grew this; give the memory back
+        // A piece larger than one chunk grew this; give the memory back
         // rather than keeping the high-water mark for the rest of the
         // document. A no-op while the capacity is already the chunk size.
         self.buf.shrink_to(SPOOL_CHUNK_BYTES);
         Ok(())
+    }
+}
+
+/// One JSON object being written into a [`SpoolSink`]. Each field is written
+/// as it is named, so nothing accumulates: the comma before every field but
+/// the first is this type's whole state.
+pub(crate) struct SpoolObject<'a> {
+    sink: &'a mut SpoolSink,
+    first: bool,
+}
+
+impl SpoolObject<'_> {
+    /// `"name":<value>`, the value serialized straight into the chunk.
+    pub(crate) async fn field<T: Serialize + ?Sized>(
+        &mut self,
+        name: &str,
+        value: &T,
+    ) -> std::io::Result<()> {
+        self.key(name).await?;
+        self.sink.put_json(value).await
+    }
+
+    /// `"name":[…]`, **one element at a time**, so an array of any length
+    /// holds one element's text and not its own.
+    pub(crate) async fn array<T: Serialize>(
+        &mut self,
+        name: &str,
+        items: impl IntoIterator<Item = T>,
+    ) -> std::io::Result<()> {
+        self.key(name).await?;
+        self.sink.put(b"[").await?;
+        for (i, item) in items.into_iter().enumerate() {
+            if i > 0 {
+                self.sink.put(b",").await?;
+            }
+            self.sink.put_json(&item).await?;
+        }
+        self.sink.put(b"]").await
+    }
+
+    /// Closes the object.
+    pub(crate) async fn end(self) -> std::io::Result<()> {
+        self.sink.put(b"}").await
+    }
+
+    /// The comma, then the quoted field name and its colon. The name goes
+    /// through `serde_json` like any other string, so it is escaped exactly as
+    /// a derived `Serialize` would escape it.
+    async fn key(&mut self, name: &str) -> std::io::Result<()> {
+        if !self.first {
+            self.sink.put(b",").await?;
+        }
+        self.first = false;
+        self.sink.put_json(name).await?;
+        self.sink.put(b":").await
     }
 }
 
@@ -277,7 +366,9 @@ impl ChunkedFile {
 /// the whole serialized body would put two further copies of the push beside
 /// the rows, and enough blocks failing at once would exceed
 /// `PULSUS_INGEST_QUEUE_BYTES` by a multiple of the data admitted. What this
-/// holds instead is one chunk, one row's value and that row's text.
+/// holds instead is one chunk and one piece of one row — a row that writes
+/// its fields and arrays straight into the sink never has a value or a text
+/// of its own at all ([`SpoolEncode::write_spool_json`]).
 ///
 /// The rename is what makes the file atomic to a reader — it never observes a
 /// partially written spool file — exactly as [`write_atomic`] does for the
@@ -290,7 +381,7 @@ async fn write_record<R: SpoolEncode>(
     rows: &[R],
 ) -> std::io::Result<()> {
     let tmp_path = path.with_extension("tmp");
-    let mut out = ChunkedFile::new(fs::File::create(&tmp_path).await?);
+    let mut out = SpoolSink::new(fs::File::create(&tmp_path).await?);
     out.put(b"{\"table\":").await?;
     out.put_json(table).await?;
     out.put(b",\"error\":").await?;
@@ -302,7 +393,7 @@ async fn write_record<R: SpoolEncode>(
         if i > 0 {
             out.put(b",").await?;
         }
-        out.put_json(&row.to_spool_value()).await?;
+        row.write_spool_json(&mut out).await?;
     }
     out.put(b"]}").await?;
     out.flush().await?;
