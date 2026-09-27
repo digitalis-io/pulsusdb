@@ -1,11 +1,47 @@
 //! The metrics landing path's shutdown boundary (issue #603).
 //!
-//! **One rule lives here: no attempt starts after the announced shutdown
-//! deadline, and nothing the writer spawned is abandoned at it.** Three review
-//! rounds found three different ways past that rule while each half of it was
-//! written where it was needed — a retry sleep the deadline did not bound, a
-//! check the poll could slip past, a settlement task nobody joined. Every part
-//! of it is this type's now, and the landing path states none of it again.
+//! **One rule lives here: no attempt is authorized after the announced
+//! shutdown deadline, and nothing the writer spawned is abandoned at it.**
+//! Every part of it is this type's, and the landing path states none of it
+//! again.
+//!
+//! Four review rounds found four ways past that rule: a retry sleep the
+//! deadline did not bound, a check the poll could slip past, a settlement task
+//! nobody joined, and — with each of those fixed where it was found — a read
+//! that found nothing announced, then the publication, then the poll that
+//! starts the attempt. The second and the fourth are one shape: **a deadline
+//! read, and the work started by a later poll**, with the announcement free to
+//! land in between.
+//!
+//! So publication and authorization are ordered against each other rather
+//! than checked:
+//!
+//! - **[`Deadline`] is the one point that decides.** Publication takes its
+//!   lock to write the deadline, and [`Deadline::authorize`] takes the same
+//!   lock to read it **and calls the constructor inside that same critical
+//!   section**. Every execution therefore puts one strictly before the other:
+//!   either the publication went first and authorization reads the deadline it
+//!   published, or authorization went first and the publication waits for the
+//!   constructor to return. Nothing acts on a stale read, because no read is
+//!   separated from the act it decides.
+//! - **An attempt is only ever created by this module calling the caller's
+//!   constructor**, so authorization is the only way work begins.
+//!   [`DrainWatch::attempt`] takes that constructor rather than a future and
+//!   hands it to [`Deadline::authorize`]. The landing path issues one insert
+//!   and it is inside that constructor, at
+//!   `crates/pulsus-write/src/writer/metric.rs:1112`: `git grep -nE
+//!   'inserter$' -- crates/pulsus-write/src` returns that call's first line
+//!   and nothing else. The pattern is anchored so this comment is not one of
+//!   its own results — an unanchored one is, which is how the count read as
+//!   two.
+//! - **Every wait between attempts is [`DrainWatch::sleep`]**, which ends at
+//!   the deadline whatever its own length. A wait that ended late would still
+//!   start nothing: the next attempt is authorized afresh.
+//! - **Admission runs inside an [`AdmissionPass`]**, and
+//!   [`DrainBoundary::shutdown`] waits for every outstanding pass *before* it
+//!   announces the deadline. So no block reaches a closed queue, and a
+//!   settlement task — which only a pass can spawn — cannot appear after the
+//!   set of them has been joined.
 //!
 //! **What the deadline does not bound is settling a block.** The spool copy is
 //! the push's only one, so the drain finishes writing it rather than dropping
@@ -13,30 +49,24 @@
 //! the choice the landing path makes everywhere: a block is never lost to save
 //! time.
 //!
-//! What makes a fourth way past the rule structural rather than lucky:
+//! **Two residuals, stated rather than claimed away.** Neither is a stale
+//! read; both are the cost of not holding a lock across a send.
 //!
-//! - **An attempt is only ever created by this module calling the caller's
-//!   constructor.** [`DrainWatch::attempt`] takes that constructor rather than
-//!   a future, and calls it from inside the selection whose deadline arm is
-//!   biased to win, so with the deadline already passed that arm is ready
-//!   before the constructor runs and the attempt is never built: there is no
-//!   check to skip and no gap between a check and a poll for the deadline to
-//!   expire in. The landing path issues one insert and it is inside that
-//!   constructor: `git grep -n 'insert_with(&ctx' -- crates/pulsus-write/src`
-//!   returns exactly that one line, in `writer::metric`.
-//! - **Every wait between attempts is [`DrainWatch::sleep`]**, which ends at
-//!   the deadline whatever its own length.
-//! - **Admission runs inside an [`AdmissionPass`]**, and
-//!   [`DrainBoundary::shutdown`] waits for every outstanding pass *before* it
-//!   announces the deadline. So no block reaches a closed queue, and a
-//!   settlement task — which only a pass can spawn — cannot appear after the
-//!   set of them has been joined.
-//!
-//! **The residual, stated rather than claimed away**: an attempt polled before
-//! the deadline and still in flight at it is abandoned, which is the uncertain
-//! ending. That is not work starting after the deadline, and it is the one
-//! thing no boundary can remove — a send already on the wire cannot be
-//! recalled.
+//! 1. An attempt polled before the deadline and still in flight at it is
+//!    abandoned, which is the uncertain ending. A send already on the wire
+//!    cannot be recalled.
+//! 2. The constructor returns a future, and the request goes out on that
+//!    future's first poll — one store and one call after the lock is released,
+//!    with no await in between. A publication on another thread can land in
+//!    that gap, and then a request is issued a few instructions after the
+//!    deadline. That takes a deadline already expired when it was published,
+//!    which takes a grace of zero: with any positive grace the deadline is in
+//!    the future at publication and the request is well inside it, and the
+//!    shipped grace is ten seconds
+//!    (`crates/pulsus-server/src/serve.rs:61`). The ending is then the one
+//!    above, the uncertain one, since the deadline arm is ready at its first
+//!    poll. Closing it would mean holding [`Deadline`]'s lock across the
+//!    insert, where a shutdown would block on the network.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,11 +77,13 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-/// The announced deadline, behind its own lock. `None` until the drain begins.
+/// The announced deadline, and the one point that orders its publication
+/// against an attempt's authorization. `None` until the drain begins.
 ///
-/// A lock and not an atomic, because what the boundary needs of it is that
-/// publication and the decision to start work cannot interleave — see the
-/// cases below, which are red here.
+/// **One lock, two operations, and the decision is inside the same critical
+/// section as the act it decides** — see [`Self::authorize`] and the module
+/// docs. Nothing else may read this to decide whether work can start: a read
+/// that returns a value has already stopped being the truth.
 struct Deadline(Mutex<Option<Instant>>);
 
 impl Deadline {
@@ -59,7 +91,9 @@ impl Deadline {
         Deadline(Mutex::new(None))
     }
 
-    /// The deadline as it stands.
+    /// The deadline as it stands, for the waits that bound themselves by it.
+    /// **Not** an authorization: by the time this returns, the value may have
+    /// been replaced.
     fn read(&self) -> Option<Instant> {
         *self.0.lock().expect("deadline mutex poisoned")
     }
@@ -77,6 +111,26 @@ impl Deadline {
     fn is_locked(&self) -> bool {
         self.0.try_lock().is_err()
     }
+
+    /// Calls `make` if and only if no announced deadline has passed, and
+    /// returns what it built; `None` is the refusal, and then `make` was never
+    /// called.
+    ///
+    /// **The read and the call are one critical section.** A publication
+    /// either precedes this call — and is what the read returns — or waits for
+    /// it, in which case the work was built before the deadline existed. That
+    /// ordering is what the whole boundary rests on, so `make` must build the
+    /// work and do nothing else: it runs under this lock, it must not await,
+    /// and it must not reach back into the boundary.
+    fn authorize<F>(&self, make: impl FnOnce() -> F) -> Option<F> {
+        let deadline = self.0.lock().expect("deadline mutex poisoned");
+        if let Some(at) = *deadline
+            && Instant::now() >= at
+        {
+            return None;
+        }
+        Some(make())
+    }
 }
 
 /// The one owner of the shutdown boundary: the announced deadline, the
@@ -84,7 +138,7 @@ impl Deadline {
 /// docs.
 pub(crate) struct DrainBoundary {
     /// Wakes every task that is waiting on the announcement, and carries no
-    /// value — [`Self::deadline`] holds it. A `watch` channel so a task
+    /// value — [`Self::deadline`] holds it. A `watch` channel, so a task
     /// blocked inside an insert observes the announcement the next time it
     /// reaches a selection with no lost-wakeup window, and so a task learns
     /// the writer went away without a graceful shutdown when this sender is
@@ -297,7 +351,8 @@ pub(crate) struct DrainWatch {
     /// Wakes this view when the deadline is published. It carries no value:
     /// `deadline` is read for that.
     rx: watch::Receiver<()>,
-    /// The boundary's own [`Deadline`].
+    /// The boundary's own [`Deadline`], which is where an attempt is
+    /// authorized.
     deadline: Arc<Deadline>,
     /// Run once inside [`Self::attempt`], after the read of the deadline that
     /// found none announced and before the poll that would start the attempt.
@@ -318,7 +373,8 @@ impl DrainWatch {
         self
     }
 
-    /// The announced deadline, if the drain has begun.
+    /// The announced deadline, if the drain has begun — for bounding a wait,
+    /// never for deciding that work may start (see [`Deadline::authorize`]).
     ///
     /// The wake is marked seen **before** the deadline is read, so a
     /// publication that lands between the two is either what this read returns
@@ -348,12 +404,11 @@ impl DrainWatch {
 
     /// Runs one attempt, bounded by `budget` and by the announced deadline.
     ///
-    /// `make` builds the work, and is called by the first poll of the future
-    /// this awaits rather than here. **While a deadline is announced that poll
-    /// comes after the deadline arm has been polled and found pending**, which
-    /// is what proves the deadline had not passed, so an attempt cannot be
-    /// created once it has. Before a deadline is announced there is nothing for
-    /// it to be after, and the attempt is polled first. See the module docs.
+    /// `make` is not called here and not called by this function's own reading
+    /// of the deadline. It goes to [`Deadline::authorize`], which is the one
+    /// place an attempt can begin and which reads the deadline in the same
+    /// critical section as the call — so the selection below decides how an
+    /// attempt *ends*, and never whether it may start. See the module docs.
     pub(crate) async fn attempt<F, T>(
         &mut self,
         budget: Duration,
@@ -362,37 +417,46 @@ impl DrainWatch {
     where
         F: Future<Output = T>,
     {
-        // `make` is called by the first poll of this block and not before, so
-        // "never polled" and "never created" are one thing here.
+        // `make` reaches `authorize` on the first poll of this block and never
+        // otherwise, so "never authorized", "never created" and "never polled"
+        // are one thing here. `None` out is the refusal.
         let started = AtomicBool::new(false);
+        let deadline = self.deadline.clone();
         let work = async {
+            let work = deadline.authorize(make)?;
             started.store(true, Ordering::Relaxed);
-            make().await
+            Some(work.await)
         };
         let bounded = tokio::time::timeout(budget, work);
         tokio::pin!(bounded);
         loop {
             match self.announced() {
-                Some(deadline) => {
+                // `at`, not `deadline`: the shared `Deadline` is what
+                // authorizes an attempt, and this is one reading of the
+                // instant it holds.
+                Some(at) => {
                     // `std::time::Instant`: the deadline is the shutdown
                     // caller's own clock reading, and a deadline already passed
                     // leaves a zero-length sleep — ready at its first poll.
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = at.saturating_duration_since(Instant::now());
                     let expire = tokio::time::sleep(left);
                     tokio::pin!(expire);
                     return tokio::select! {
                         biased;
-                        // The deadline arm first, so it wins rather than
-                        // relying on poll order: with the deadline passed it is
-                        // ready before the attempt is polled at all, and
-                        // nothing is created after the deadline.
+                        // The deadline arm first, so a passed deadline ends
+                        // the attempt at once rather than after however long
+                        // one poll of the work takes. It is not what keeps the
+                        // work from being created — `authorize` is.
                         () = &mut expire => if started.load(Ordering::Relaxed) {
                             AttemptEnd::Abandoned
                         } else {
                             AttemptEnd::NotStarted
                         },
                         outcome = &mut bounded => match outcome {
-                            Ok(value) => AttemptEnd::Done(value),
+                            Ok(Some(value)) => AttemptEnd::Done(value),
+                            // Refused: the deadline had passed when the work
+                            // would have been built.
+                            Ok(None) => AttemptEnd::NotStarted,
                             Err(_elapsed) => AttemptEnd::BudgetElapsed,
                         },
                     };
@@ -402,15 +466,17 @@ impl DrainWatch {
                     if let Some(barrier) = self.barrier.take() {
                         barrier();
                     }
-                    // No deadline is announced, so nothing here needs one to
-                    // win. The attempt is polled first, which leaves a closed
-                    // signal — the writer dropped without a graceful
-                    // shutdown — abandoning an attempt in flight rather than
-                    // refusing to start one.
+                    // Nothing read here decides anything, so the attempt is
+                    // polled first: that way a closed signal — the writer
+                    // dropped without a graceful shutdown — abandons an
+                    // attempt in flight rather than refusing to start one. A
+                    // deadline published between this read and that poll is
+                    // what `authorize` sees.
                     tokio::select! {
                         biased;
                         outcome = &mut bounded => return match outcome {
-                            Ok(value) => AttemptEnd::Done(value),
+                            Ok(Some(value)) => AttemptEnd::Done(value),
+                            Ok(None) => AttemptEnd::NotStarted,
                             Err(_elapsed) => AttemptEnd::BudgetElapsed,
                         },
                         changed = self.rx.changed() => {
@@ -440,8 +506,8 @@ impl DrainWatch {
         loop {
             match self.announced() {
                 // Announced: whichever of the two comes first ends the wait.
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
                     let _ = tokio::time::timeout(left, sleep.as_mut()).await;
                     return;
                 }

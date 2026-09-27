@@ -44,12 +44,13 @@
 //! the push's only copy — reports the claim its fate, and answers a waiting
 //! sync caller `500`.
 //!
-//! **The shutdown boundary is `writer::drain`'s**, whole: no attempt starts
-//! after the announced deadline, and nothing this writer spawned is abandoned
-//! at it. This module asks the boundary for an attempt, waits between attempts
-//! through it, admits inside a pass it hands out, and spawns nothing it does
-//! not track. Nothing here reads the deadline or reasons about it — including
-//! what the deadline does not bound, which is settling a block.
+//! **The shutdown boundary is `writer::drain`'s**, whole: no attempt is
+//! authorized after the announced deadline, and nothing this writer spawned is
+//! abandoned at it. That module owns the rule, the two residuals it leaves and
+//! what the deadline does not bound, which is settling a block. This module
+//! asks the boundary for an attempt, waits between attempts through it, admits
+//! inside a pass it hands out, and spawns nothing it does not track. Nothing
+//! here reads the deadline or reasons about it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1076,7 +1077,8 @@ async fn drain_queue(
 /// and gets one of two shutdown endings instead when the deadline has passed
 /// or passes in flight, and every wait between attempts is
 /// [`DrainWatch::sleep`]. So the drain terminates by the deadline it announced
-/// (`crates/pulsus-server/src/serve.rs:61`) and sends nothing after it.
+/// (`crates/pulsus-server/src/serve.rs:61`), and starts nothing after it but
+/// what `writer::drain`'s two residuals name.
 async fn run_block(
     ctx: &Arc<LandingContext>,
     block: LandingBlock,
