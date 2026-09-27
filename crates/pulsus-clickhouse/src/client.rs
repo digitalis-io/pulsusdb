@@ -577,10 +577,10 @@ mod tests {
 
     /// The metrics landing insert carries the full setting set, in order:
     /// the two block-deduplication pins, the block's own minted token, and
-    /// the block-size ceiling admission already refused a larger push
-    /// against — between `async_insert` and the deadline, with nothing else
-    /// moving. A path that sent only the first and last of them would leave
-    /// a resend storing the block twice.
+    /// the three limits that decide how many blocks the server forms out of
+    /// the request — between `async_insert` and the deadline, with nothing
+    /// else moving. A path that sent only some of them would leave a resend
+    /// storing the block twice, or one push becoming two blocks.
     #[test]
     fn the_landing_insert_emits_the_full_setting_set_in_order() {
         let s = ChClient::insert_settings_with(
@@ -593,6 +593,7 @@ mod tests {
             " SETTINGS async_insert = 0, deduplicate_insert = enable, \
              deduplicate_blocks_in_dependent_materialized_views = 1, \
              insert_deduplication_token = t1, max_insert_block_size = 1048576, \
+             max_insert_block_size_bytes = 0, input_format_max_block_size_bytes = 0, \
              max_execution_time = 120.000"
         );
     }

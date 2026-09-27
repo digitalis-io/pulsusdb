@@ -643,6 +643,110 @@ mod tests {
         assert_eq!(end, AttemptEnd::Done(7u8));
     }
 
+    /// A stand-in for the production insert, whose first poll is the
+    /// connection checkout and whose request goes out on a **later** one
+    /// (`crates/pulsus-clickhouse/src/client.rs:249`). It parks on its first
+    /// poll without arranging any wake of its own, so the only thing that can
+    /// poll it again is the selection holding it — which is the interleaving
+    /// the case below is about.
+    struct SendsOnItsSecondPoll {
+        polls: Arc<AtomicU64>,
+        sent: Arc<AtomicBool>,
+    }
+
+    impl Future for SendsOnItsSecondPoll {
+        type Output = u8;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<u8> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return std::task::Poll::Pending;
+            }
+            self.sent.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(7)
+        }
+    }
+
+    /// **A request the attempt produces on a later poll must not leave after
+    /// the deadline** (issue #603 code review round 7, finding 2).
+    /// Authorization orders publication against the attempt's *construction*,
+    /// and the request follows on a poll that can come much later; while the
+    /// attempt is parked with no deadline read, the arm holding it is polled
+    /// first, so a task that is not scheduled for the whole grace can be
+    /// woken past the deadline and send then.
+    ///
+    /// Deterministic, and it needs no starved scheduler to arrange: the case
+    /// runs on a current-thread runtime and blocks that one thread for longer
+    /// than the grace, which is what "not scheduled for the whole grace"
+    /// means here. The publication has already woken the attempt's task by
+    /// then, so both of the selection's arms are ready when it finally runs.
+    #[test]
+    fn a_request_produced_by_a_later_poll_never_leaves_after_the_deadline() {
+        /// Long enough that the blocking sleep below cannot fall short of it,
+        /// short enough that the case is not a wait.
+        const GRACE: Duration = Duration::from_millis(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build a current-thread runtime");
+        runtime.block_on(async {
+            let boundary = Arc::new(DrainBoundary::new());
+            let polls = Arc::new(AtomicU64::new(0));
+            let sent = Arc::new(AtomicBool::new(false));
+            let attempt = {
+                let mut watch = boundary.watch();
+                let polls = polls.clone();
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    watch
+                        .attempt(Duration::from_secs(600), || SendsOnItsSecondPoll {
+                            polls,
+                            sent,
+                        })
+                        .await
+                })
+            };
+
+            // The attempt is authorized, built and parked on its checkout,
+            // with no deadline announced.
+            for _ in 0..1024 {
+                if polls.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                1,
+                "the attempt must be parked on its first poll before the drain begins"
+            );
+            assert!(!sent.load(Ordering::SeqCst), "nothing has been sent yet");
+
+            // The drain begins with a positive grace, and the thread the
+            // attempt's task runs on is held past the deadline. No await
+            // between the two, so that task cannot run in between.
+            boundary.publish(Instant::now() + GRACE);
+            std::thread::sleep(GRACE + Duration::from_millis(30));
+
+            let end: AttemptEnd<u8> = attempt.await.expect("the attempt's task completes");
+
+            assert!(
+                !sent.load(Ordering::SeqCst),
+                "the attempt was polled again after the deadline had passed and \
+                 issued its request then"
+            );
+            assert_eq!(
+                end,
+                AttemptEnd::Abandoned,
+                "an attempt already started and not finished by the deadline ends \
+                 abandoned, with nothing sent after it"
+            );
+        });
+    }
+
     /// The same, one layer out: a deadline that passes while the attempt runs
     /// abandons it, and that is a different ending — the insert may have
     /// committed.
@@ -778,6 +882,75 @@ mod tests {
         drop(pass);
         drain.await.expect("the drain completes");
         assert!(returned.load(Ordering::SeqCst));
+    }
+
+    /// **Two callers are one drain.** `shutdown` is documented idempotent, and
+    /// a second caller that empties the handle vectors the first is about to
+    /// take returns while the writer's tasks are still running — the process
+    /// then exits with a settlement half written (issue #603 code review round
+    /// 7, finding 4).
+    ///
+    /// The interleaving is deterministic rather than raced: `join!` polls the
+    /// first caller until it parks on the task it is awaiting, and only then
+    /// polls the second.
+    #[tokio::test]
+    async fn two_concurrent_drains_both_return_only_once_every_task_has_finished() {
+        let boundary = Arc::new(DrainBoundary::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        boundary.track_background([{
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                finished.store(true, Ordering::SeqCst);
+            })
+        }]);
+
+        let first = async {
+            boundary.shutdown(Duration::from_secs(60)).await;
+            assert!(
+                finished.load(Ordering::SeqCst),
+                "the first caller returned before the task it took had finished"
+            );
+        };
+        let second = async {
+            boundary.shutdown(Duration::ZERO).await;
+            assert!(
+                finished.load(Ordering::SeqCst),
+                "the second caller returned while a task the first one took was \
+                 still running: one of the two drains awaited nothing"
+            );
+        };
+        tokio::join!(first, second);
+    }
+
+    /// And the deadline the first caller announced is the one that stands. A
+    /// second publication moves an instant workers have already read and
+    /// bounded their waits by, so a worker that read a generous deadline can
+    /// find itself past an expired one it never saw announced.
+    #[tokio::test]
+    async fn a_second_drain_never_moves_the_deadline_the_first_announced() {
+        let boundary = Arc::new(DrainBoundary::new());
+        boundary.track_background([tokio::spawn(async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        })]);
+        let before = Instant::now();
+
+        tokio::join!(
+            boundary.shutdown(Duration::from_secs(60)),
+            boundary.shutdown(Duration::ZERO),
+        );
+
+        let at = boundary.deadline.read().expect("the drain announced one");
+        assert!(
+            at > before + Duration::from_secs(30),
+            "the deadline in force is {:?} after the first caller's reading, so \
+             the second caller's replaced it",
+            at.saturating_duration_since(before)
+        );
     }
 
     /// A settlement spawned inside a pass is awaited by the drain. Untracked,

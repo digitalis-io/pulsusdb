@@ -1618,6 +1618,54 @@ fn escaping_series(fingerprint: u128) -> SeriesRef {
     }
 }
 
+/// **A push whose every point was rejected is the same answer, and it still
+/// counts what it rejected.** It reaches the writer with no rows of any kind
+/// and a non-zero `rejected`, so it makes no block and is charged for none —
+/// but the parser's own tally must still land, or a caller sending nothing but
+/// bad points sees `pulsus_metric_rejected_total` stay at zero while its
+/// samples are dropped.
+///
+/// The empty-push case above sends `ParsedMetrics::default()`, where zero
+/// rejected and zero counted are the same number and nothing distinguishes
+/// counting from not counting.
+#[tokio::test]
+async fn a_push_whose_points_were_all_rejected_succeeds_and_counts_them() {
+    let root = spool_root("all-rejected");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+
+    let wait = writer
+        .admit_flush(
+            ParsedMetrics {
+                rejected: 3,
+                collisions: 2,
+                ..Default::default()
+            },
+            PushHeaders::default(),
+        )
+        .expect("a push with nothing storable in it is still admitted");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("it settles at admission, with no block to wait for")
+        .expect("a push with no storable rows is a success");
+
+    assert_eq!(inserter.call_count(), 0, "no block, so no insert");
+    assert_eq!(writer.metrics().queue_bytes, 0, "and nothing reserved");
+    let metrics = writer.metrics();
+    assert_eq!(
+        metrics.rejected_total, 3,
+        "the parser's rejected points are counted for a push that stores nothing"
+    );
+    assert_eq!(metrics.collisions_total, 2, "and so are its collisions");
+    assert_eq!(
+        metrics.landing.flushes_total, 0,
+        "nothing was flushed: there was no block"
+    );
+
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Issue #603 code review round 3, finding 2: the charge must cover the
 /// **encoded** labels the queued row holds, not the raw label bytes. The
 /// kind-2 row the queue holds owns `labels` as canonical JSON, and JSON

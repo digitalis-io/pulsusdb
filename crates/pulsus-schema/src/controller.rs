@@ -945,7 +945,8 @@ mod tests {
                 (
                     NameCatalogue::Setting,
                     "SELECT name FROM system.settings WHERE name IN \
-                     ('insert_deduplication_token', 'max_insert_block_size')"
+                     ('insert_deduplication_token', 'max_insert_block_size', \
+                     'max_insert_block_size_bytes', 'input_format_max_block_size_bytes')"
                         .to_string()
                 ),
                 (

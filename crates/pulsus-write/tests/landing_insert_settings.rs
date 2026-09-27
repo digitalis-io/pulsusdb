@@ -63,6 +63,23 @@ async fn the_production_inserter_sends_the_landing_settings_on_the_wire() {
         "the block-size pin is what stops one push becoming two blocks: {}",
         insert.target
     );
+    // The row count is one of three limits that end a block, and the other
+    // two are byte limits (issue #603 code review round 7, finding 1). Each
+    // must reach the server pinned to its "does not participate" value, or a
+    // push inside the row ceiling still becomes several blocks under a
+    // server profile that set one of them.
+    for key in [
+        "max_insert_block_size_bytes",
+        "input_format_max_block_size_bytes",
+    ] {
+        assert_eq!(
+            insert.param(key).as_deref(),
+            Some("0"),
+            "{key} must be pinned off on the wire, or the row ceiling is not \
+             the only thing that forms a block: {}",
+            insert.target
+        );
+    }
     assert_eq!(
         insert.param("deduplicate_insert").as_deref(),
         Some("enable"),

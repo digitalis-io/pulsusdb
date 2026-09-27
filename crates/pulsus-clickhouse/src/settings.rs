@@ -279,6 +279,37 @@ mod tests {
         assert_eq!(off.render_suffix(), "");
     }
 
+    /// **Every limit that can end a block is pinned, not just the row
+    /// one** (issue #603 code review round 7, finding 1). The server emits a
+    /// block while it parses the request body when *any* maximum is reached,
+    /// and two of the three are byte limits; pinning only the row count
+    /// leaves a push below the row ceiling free to become several blocks
+    /// under a server profile that set either byte limit, and several blocks
+    /// can commit a prefix.
+    ///
+    /// `0` is each byte limit's documented "does not participate in block
+    /// formation" value, so the row count is the only thing left that ends a
+    /// block — and admission has already refused every push that reaches it.
+    #[test]
+    fn the_landing_insert_pins_every_limit_that_forms_a_block() {
+        let s = QuerySettings::landing_insert("tok-1", 1_048_576);
+        assert_eq!(
+            s.get("max_insert_block_size"),
+            Some("1048576"),
+            "the row ceiling admission refuses against"
+        );
+        assert_eq!(
+            s.get("max_insert_block_size_bytes"),
+            Some("0"),
+            "the byte limit on the blocks an insert forms must not participate"
+        );
+        assert_eq!(
+            s.get("input_format_max_block_size_bytes"),
+            Some("0"),
+            "nor the byte limit on the blocks the input format forms"
+        );
+    }
+
     /// AC2 (issue #114): sequential consistency emits `= 1` only when
     /// enabled; nothing when disabled (off = pre-#114 select).
     #[test]
