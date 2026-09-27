@@ -39,22 +39,59 @@
 //! recalled.
 
 use std::future::Future;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+/// The announced deadline, behind its own lock. `None` until the drain begins.
+///
+/// A lock and not an atomic, because what the boundary needs of it is that
+/// publication and the decision to start work cannot interleave — see the
+/// cases below, which are red here.
+struct Deadline(Mutex<Option<Instant>>);
+
+impl Deadline {
+    fn new() -> Self {
+        Deadline(Mutex::new(None))
+    }
+
+    /// The deadline as it stands.
+    fn read(&self) -> Option<Instant> {
+        *self.0.lock().expect("deadline mutex poisoned")
+    }
+
+    /// Announces `at`.
+    fn publish(&self, at: Instant) {
+        *self.0.lock().expect("deadline mutex poisoned") = Some(at);
+    }
+
+    /// Whether this lock is held right now, by any thread including the
+    /// caller's. A case asks it from inside an attempt's constructor, where
+    /// the answer says whether a publication could have landed between the
+    /// read that allowed the attempt and the call that built it.
+    #[cfg(test)]
+    fn is_locked(&self) -> bool {
+        self.0.try_lock().is_err()
+    }
+}
+
 /// The one owner of the shutdown boundary: the announced deadline, the
 /// admission gate and every task the landing path spawns. See the module
 /// docs.
 pub(crate) struct DrainBoundary {
-    /// The announced deadline, `None` until the drain begins. A `watch`
-    /// channel so a task blocked inside an insert observes the announcement
-    /// the next time it reaches a selection, with no lost-wakeup window.
-    signal: watch::Sender<Option<Instant>>,
+    /// Wakes every task that is waiting on the announcement, and carries no
+    /// value — [`Self::deadline`] holds it. A `watch` channel so a task
+    /// blocked inside an insert observes the announcement the next time it
+    /// reaches a selection with no lost-wakeup window, and so a task learns
+    /// the writer went away without a graceful shutdown when this sender is
+    /// dropped with the boundary.
+    signal: watch::Sender<()>,
+    /// The announced deadline, shared with every [`DrainWatch`].
+    deadline: Arc<Deadline>,
     /// Admissions inside a pass right now.
     passes: AtomicU64,
     /// Set before the wait for `passes` to reach zero, so an admission
@@ -84,9 +121,10 @@ impl Drop for AdmissionPass<'_> {
 
 impl DrainBoundary {
     pub(crate) fn new() -> Self {
-        let (signal, _rx) = watch::channel(None);
+        let (signal, _rx) = watch::channel(());
         DrainBoundary {
             signal,
+            deadline: Arc::new(Deadline::new()),
             passes: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             background: Mutex::new(Vec::new()),
@@ -100,6 +138,9 @@ impl DrainBoundary {
     pub(crate) fn watch(&self) -> DrainWatch {
         DrainWatch {
             rx: self.signal.subscribe(),
+            deadline: self.deadline.clone(),
+            #[cfg(test)]
+            barrier: None,
         }
     }
 
@@ -162,10 +203,7 @@ impl DrainBoundary {
     /// them is joined last.
     pub(crate) async fn shutdown(&self, deadline: Duration) {
         self.close_admission().await;
-        // `send_replace`, not `send`: `send` reports every receiver being gone
-        // by leaving the value alone, and the value is what a task taking its
-        // view later reads.
-        self.signal.send_replace(Some(Instant::now() + deadline));
+        self.publish(Instant::now() + deadline);
         let background = self.take_background();
         for task in background {
             if let Err(e) = task.await {
@@ -186,6 +224,21 @@ impl DrainBoundary {
                 }
             }
         }
+    }
+
+    /// Announces the deadline `at` and nothing else. Its own step because a
+    /// case has to publish inside the window an attempt's authorization
+    /// straddles, where the drain's other steps have no part.
+    ///
+    /// The deadline first and the wake second: a task that has already read
+    /// the deadline and parked is woken by the second, and a task that has not
+    /// yet read it sees the first.
+    fn publish(&self, at: Instant) {
+        self.deadline.publish(at);
+        // `send_replace`, not `send`: `send` reports every receiver being gone
+        // by leaving the version alone, and nothing here is conditional on a
+        // task currently watching.
+        self.signal.send_replace(());
     }
 
     /// Refuses every later admission, then waits for the ones already inside.
@@ -241,13 +294,40 @@ pub(crate) enum AttemptEnd<T> {
 /// One task's view of the deadline: the only way to run an attempt or to wait
 /// between two.
 pub(crate) struct DrainWatch {
-    rx: watch::Receiver<Option<Instant>>,
+    /// Wakes this view when the deadline is published. It carries no value:
+    /// `deadline` is read for that.
+    rx: watch::Receiver<()>,
+    /// The boundary's own [`Deadline`].
+    deadline: Arc<Deadline>,
+    /// Run once inside [`Self::attempt`], after the read of the deadline that
+    /// found none announced and before the poll that would start the attempt.
+    /// A case publishes a deadline in exactly that window through this, rather
+    /// than racing a spawned task for a handful of instructions.
+    ///
+    /// Test-only: the field does not exist in a build of this crate that is
+    /// not its own test binary.
+    #[cfg(test)]
+    barrier: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl DrainWatch {
+    /// This view with `barrier` attached. See the field.
+    #[cfg(test)]
+    fn with_barrier(mut self, barrier: impl FnOnce() + Send + 'static) -> Self {
+        self.barrier = Some(Box::new(barrier));
+        self
+    }
+
     /// The announced deadline, if the drain has begun.
+    ///
+    /// The wake is marked seen **before** the deadline is read, so a
+    /// publication that lands between the two is either what this read returns
+    /// or what the next `changed()` reports. Marking it after could mark a
+    /// version this never observed, and park on a `None` that had already been
+    /// replaced.
     fn announced(&mut self) -> Option<Instant> {
-        *self.rx.borrow_and_update()
+        self.rx.mark_unchanged();
+        self.deadline.read()
     }
 
     /// Whether the drain has begun.
@@ -318,6 +398,10 @@ impl DrainWatch {
                     };
                 }
                 None => {
+                    #[cfg(test)]
+                    if let Some(barrier) = self.barrier.take() {
+                        barrier();
+                    }
                     // No deadline is announced, so nothing here needs one to
                     // win. The attempt is polled first, which leaves a closed
                     // signal — the writer dropped without a graceful
@@ -418,6 +502,79 @@ mod tests {
             !created.load(Ordering::SeqCst),
             "the constructor is never called once the deadline has passed"
         );
+    }
+
+    /// **The window between reading the deadline and starting the attempt.**
+    /// A view that read `None` is about to poll the attempt first, by the bias
+    /// the arm below it is given on purpose; the deadline is published in
+    /// between. The constructor is still never called, because the read that
+    /// decides is the one inside the authorization and not this one (issue
+    /// #603 code review round 6, finding 1).
+    ///
+    /// The publication is the barrier itself rather than a spawned task
+    /// racing for a handful of instructions: `DrainWatch::barrier` runs after
+    /// that `None` and before the poll, so the interleaving is the same every
+    /// run.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_is_never_created_by_a_read_the_deadline_overtook() {
+        let boundary = Arc::new(DrainBoundary::new());
+        let published = {
+            let boundary = boundary.clone();
+            move || boundary.publish(Instant::now())
+        };
+        let mut watch = boundary.watch().with_barrier(published);
+
+        let created = AtomicBool::new(false);
+        let end: AttemptEnd<u8> = watch
+            .attempt(Duration::from_secs(600), || {
+                created.store(true, Ordering::SeqCst);
+                async { 7u8 }
+            })
+            .await;
+
+        assert!(
+            !created.load(Ordering::SeqCst),
+            "the constructor was called after a deadline published while the \
+             attempt was between its read and its first poll"
+        );
+        assert_eq!(
+            end,
+            AttemptEnd::NotStarted,
+            "a deadline that landed in that window ends the attempt before it \
+             exists, as an expired one read up front does"
+        );
+    }
+
+    /// **The read that allows an attempt and the call that builds it are one
+    /// critical section.** The case above pins where the deciding read happens;
+    /// this one pins that publication cannot get between that read and the
+    /// constructor, which is the whole of the ordering and is not something a
+    /// cross-thread race could show deterministically — the gap is a couple of
+    /// instructions wide.
+    ///
+    /// It is asked from inside the constructor, of the lock publication takes:
+    /// held there means a publication is either already done, and was what the
+    /// read returned, or is waiting for this call to come back.
+    #[tokio::test(start_paused = true)]
+    async fn the_constructor_runs_inside_the_lock_a_publication_takes() {
+        let boundary = DrainBoundary::new();
+        let mut watch = boundary.watch();
+
+        let locked = AtomicBool::new(false);
+        let end = watch
+            .attempt(Duration::from_secs(600), || {
+                locked.store(boundary.deadline.is_locked(), Ordering::SeqCst);
+                async { 7u8 }
+            })
+            .await;
+
+        assert!(
+            locked.load(Ordering::SeqCst),
+            "the deadline's lock was free while the attempt was being built, so \
+             a publication could have landed between the read that allowed it \
+             and this call"
+        );
+        assert_eq!(end, AttemptEnd::Done(7u8));
     }
 
     /// The same, one layer out: a deadline that passes while the attempt runs
