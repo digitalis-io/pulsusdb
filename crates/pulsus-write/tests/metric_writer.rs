@@ -961,6 +961,111 @@ async fn the_budget_expiring_inside_an_attempt_reports_an_unknown_fate() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Issue #603 code review round 4, finding 1: a block in the retry sleep when
+/// the drain deadline passes settles by that deadline and starts no further
+/// attempt.
+///
+/// Two things have to hold for that, and each run here would fail on a
+/// different one. The sleep must be bounded by the announced deadline, or it
+/// runs on to its own draw and the drain waits for it. And an expired deadline
+/// must be checked **before the next attempt is built**, not only before the
+/// sleep: `bound_by_deadline` on an expired deadline still polls the attempt
+/// once, because a timeout polls its inner future before its timer, and that
+/// one poll is an insert starting after the drain deadline.
+///
+/// The backoff is a full-jitter draw in `[0, 10 s]`, so its length is not a
+/// figure this case fixes. The clock is paused and the case only yields until
+/// it announces the deadline, so the draw cannot elapse in between — except the
+/// single draw of 0 ms, which is why the attempts so far are captured rather
+/// than written down. **What is fixed for every draw: no attempt starts after
+/// the deadline, and the drain costs no clock time.**
+///
+/// The fate the attempts left is what settles: a retryable pre-send failure is
+/// provably not sent, and an uncertain attempt keeps its own message.
+#[tokio::test(start_paused = true)]
+async fn a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline() {
+    for (name, act, dir, message) in [
+        (
+            "retryable",
+            Act::Retryable,
+            "poison",
+            "the writer shut down before the block was sent",
+        ),
+        ("uncertain", Act::Uncertain, "uncertain", "mock uncertain"),
+    ] {
+        let cfg = WriterConfig {
+            metrics_landing_retries: 5,
+            metrics_landing_inserters: 1,
+            ..Default::default()
+        };
+        let root = spool_root(&format!("drain-in-sleep-{name}"));
+        let mut runtime = runtime_at(&cfg, &root);
+        runtime.retry_base_delay = Duration::from_secs(10);
+        runtime.retry_max_delay = Duration::from_secs(10);
+        // No suppression index, so the insert worker's own sleep is the only
+        // timer on this runtime: nothing else can advance the paused clock
+        // while the case measures what the drain costs.
+        runtime.ingest_dedup = false;
+        let inserter = MockInserter::always(act);
+        let writer = Arc::new(writer_at(runtime, inserter.clone()));
+
+        let wait = writer
+            .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+            .expect("queue has room");
+        settle_until(|| writer.metrics().landing.retries_total >= 1).await;
+        // The counter is bumped immediately before the sleep; the yields let
+        // the worker reach it.
+        settle_until(|| false).await;
+        assert_eq!(
+            writer.metrics().landing.retries_total,
+            1,
+            "{name}: the case needs a block held in the retry sleep"
+        );
+        let attempts = inserter.call_count();
+        assert!(attempts >= 1, "{name}: the first attempt ran");
+
+        let started = Instant::now();
+        let shutdown = {
+            let writer = writer.clone();
+            tokio::spawn(async move { writer.shutdown(Duration::ZERO).await })
+        };
+        let answer = wait.await;
+        shutdown.await.expect("shutdown completes");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            inserter.call_count(),
+            attempts,
+            "{name}: no insert attempt starts once the drain deadline has passed"
+        );
+        assert_eq!(
+            elapsed,
+            Duration::ZERO,
+            "{name}: the block settles AT the deadline, which has already passed; a \
+             sleep the deadline does not bound carries the drain to its own draw"
+        );
+        let records = spool_records(&root, dir);
+        assert_eq!(records.len(), 1, "{name}: one block, filed under {dir}/");
+        assert_eq!(
+            records[0]["error"].as_str(),
+            Some(message),
+            "{name}: the ending settles with the fate the attempts left"
+        );
+        let err = answer.expect_err("never a success").to_string();
+        assert!(
+            err.contains("shutting down"),
+            "{name}: the caller is told the writer is shutting down: {err}"
+        );
+        assert_eq!(
+            writer.metrics().queue_bytes,
+            0,
+            "{name}: the ending released the push's bytes"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
 /// The two shutdown endings are separate fates: a block abandoned mid-attempt
 /// may have committed and is filed `uncertain/`; a block that was never sent
 /// is filed `poison/`. Both callers are told the writer is shutting down.

@@ -109,6 +109,19 @@ impl MetricWriterTables {
     }
 }
 
+/// What the queue is charged for a push whose landing rows price
+/// `row_bytes`.
+fn landing_charge(row_bytes: u64) -> u64 {
+    row_bytes
+}
+
+/// The `SeriesLru` keys a committed block registers.
+#[allow(dead_code)]
+fn promotion_keys(rows: &[MetricLandingRow]) -> impl Iterator<Item = SeriesKey> + '_ {
+    let _ = rows;
+    std::iter::empty()
+}
+
 /// One admitted push, sealed and queued. A worker runs it to exactly one
 /// ending and is the only place it settles.
 pub(crate) struct LandingBlock {
@@ -139,6 +152,29 @@ pub(crate) struct LandingBlock {
     /// retry sleeps use, so a test that drives the loop on a paused clock
     /// measures one clock rather than two.
     admitted_at: tokio::time::Instant,
+}
+
+impl LandingBlock {
+    /// The one place a `LandingBlock` is built.
+    fn seal(
+        rows: Vec<MetricLandingRow>,
+        bytes: u64,
+        settings: QuerySettings,
+        claim: ClaimTicket,
+        waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
+        promote: Vec<SeriesKey>,
+        admitted_at: tokio::time::Instant,
+    ) -> Self {
+        LandingBlock {
+            rows,
+            bytes,
+            settings,
+            claim,
+            waiter,
+            promote,
+            admitted_at,
+        }
+    }
 }
 
 /// What a landing worker needs to run a block to an ending.
@@ -474,7 +510,8 @@ impl MetricWriter {
             })
             .sum();
 
-        let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
+        let total_bytes =
+            landing_charge(sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes);
         let total_rows =
             (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
                 as u64;
@@ -511,10 +548,11 @@ impl MetricWriter {
         // descriptors emits them again.
         if let Some(suppressed) = suppressed {
             if !descriptors.is_empty() {
+                let descriptor_bytes = landing_charge(metadata_bytes);
                 super::reserve_queued_bytes(
                     &self.shared.queued_bytes,
                     &self.shared.metrics.backpressure_total,
-                    metadata_bytes,
+                    descriptor_bytes,
                     self.shared.runtime.queue_bytes_limit,
                 )
                 .map_err(AdmitRefusal::from)?;
@@ -528,7 +566,7 @@ impl MetricWriter {
                     .fetch_add(rows.len() as u64, Ordering::Relaxed);
                 self.queue_block(
                     rows,
-                    metadata_bytes,
+                    descriptor_bytes,
                     ClaimTicket::inert(),
                     None,
                     Vec::new(),
@@ -768,18 +806,15 @@ impl MetricWriter {
                 .expect("token rng mutex poisoned");
             mint_landing_token(&mut rng)
         };
-        let block = LandingBlock {
+        let block = LandingBlock::seal(
             rows,
             bytes,
-            settings: QuerySettings::landing_insert(
-                &token,
-                self.shared.runtime.metrics_landing_max_rows,
-            ),
+            QuerySettings::landing_insert(&token, self.shared.runtime.metrics_landing_max_rows),
             claim,
             waiter,
             promote,
             admitted_at,
-        };
+        );
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
             let block = closed.0;
@@ -1177,7 +1212,305 @@ async fn settle_block(
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::LabelSet;
+
     use super::*;
+    use crate::ingest::metrics::{HistogramPoint, MetricPoint};
+    use crate::writer::push_dedup::PushDigest;
+
+    /// A metric name long enough that a per-series owned copy of it is visible
+    /// beside the rows' own charge.
+    const LONG_NAME: &str = "http_request_duration_seconds_bucket_by_upstream_cluster";
+
+    /// What a [`ClaimTicket`]'s first `push` allocates: a `Vec` of
+    /// [`PushDigest`], whose first allocation is four slots. The one claim a
+    /// landing block carries fills one of them.
+    const CLAIM_FIRST_ALLOCATION_BYTES: u64 = 4 * std::mem::size_of::<PushDigest>() as u64;
+
+    /// What a sync caller's `oneshot` channel allocates: a state word, two
+    /// waker slots and one `Result<(), WriteError>` come to
+    /// 8 + 2 × 16 + 32 = 72. Stated at 128 because `oneshot`'s `Inner` is
+    /// private to another crate and cannot be measured from here; a channel
+    /// larger than this is the one thing below that neither this figure nor
+    /// the charge would catch.
+    const WAITER_CHANNEL_BYTES: u64 = 128;
+
+    /// The `SeriesLru` keys a committed block registers come from the block's
+    /// own kind-2 rows: such a row holds the metric name, the fingerprint, the
+    /// activity-bucket floor in `unix_milli` and the value type, which is the
+    /// whole key. Deriving them is what keeps a block from retaining one owned
+    /// key per new series beside its rows (issue #603 code review round 4,
+    /// finding 2) — a push of 10,000 new series would otherwise hold 10,000 of
+    /// them, charged for none.
+    #[test]
+    fn the_promotion_keys_are_derived_from_the_blocks_kind_2_rows() {
+        let series = series_ref(7);
+        let rows = vec![
+            MetricLandingRow::float_sample(5, &sample(7, 1_000)),
+            MetricLandingRow::series(5, &series, 3_600_000, VALUE_TYPE_FLOAT),
+            MetricLandingRow::metadata(5, &descriptor()),
+            MetricLandingRow::series(5, &series, 7_200_000, VALUE_TYPE_HISTOGRAM),
+        ];
+
+        let keys: Vec<SeriesKey> = promotion_keys(&rows).collect();
+
+        let expected: Vec<SeriesKey> = vec![
+            (
+                Arc::from(LONG_NAME),
+                Fingerprint::from_raw(7),
+                3_600_000,
+                VALUE_TYPE_FLOAT,
+            ),
+            (
+                Arc::from(LONG_NAME),
+                Fingerprint::from_raw(7),
+                7_200_000,
+                VALUE_TYPE_HISTOGRAM,
+            ),
+        ];
+        assert_eq!(
+            keys, expected,
+            "one key per kind-2 row and none for any other kind, each carrying that \
+             row's own bucket floor and value type"
+        );
+    }
+
+    /// Issue #603 code review round 4, finding 2: what a push is charged must
+    /// cover everything the queue holds for it, not its rows alone. This
+    /// prices a sealed block by walking it — every field, and every `String`
+    /// and `Vec` reached through one, **by capacity rather than by length**,
+    /// since the capacity is what the allocator is holding.
+    ///
+    /// **Three shapes, because a block's charge and what it holds do not scale
+    /// together.** A one-row push is where the per-block half bites: every row
+    /// carries the whole block's fixed cost in one row's charge. A
+    /// series-heavy push is where a per-series retained key does: 60
+    /// registrations of a 56-byte metric name held one owned copy each, and
+    /// the charge covered none of them. The descriptor-only shape is the
+    /// suppressed push's branch, which reserves and queues on its own.
+    ///
+    /// Two of the walk's terms are stated rather than measured —
+    /// [`CLAIM_FIRST_ALLOCATION_BYTES`] and [`WAITER_CHANNEL_BYTES`], both
+    /// inside types whose fields are private to another module. Everything
+    /// else is read off the block, and no figure here comes from the constant
+    /// the charge is built with.
+    #[tokio::test]
+    async fn the_charge_covers_everything_a_queued_block_holds() {
+        struct Shape {
+            name: &'static str,
+            samples: Vec<MetricPoint>,
+            hist_samples: Vec<HistogramPoint>,
+            series: Vec<SeriesRef>,
+            descriptors: Vec<MetricMetadata>,
+        }
+
+        let shapes = vec![
+            Shape {
+                name: "one sample",
+                samples: vec![sample(1, 1_000)],
+                hist_samples: Vec::new(),
+                series: Vec::new(),
+                descriptors: Vec::new(),
+            },
+            Shape {
+                name: "one descriptor",
+                samples: Vec::new(),
+                hist_samples: Vec::new(),
+                series: Vec::new(),
+                descriptors: vec![descriptor()],
+            },
+            Shape {
+                name: "sixty new series",
+                samples: (0..60u128).map(|i| sample(i, 1_000)).collect(),
+                hist_samples: vec![hist_sample(61, 1_000)],
+                series: (0..60u128).map(series_ref).collect(),
+                descriptors: vec![descriptor()],
+            },
+        ];
+
+        for shape in shapes {
+            // The four expressions `admit_batch` prices a push with.
+            let row_bytes: u64 = shape
+                .samples
+                .iter()
+                .map(|s| MetricLandingRow::est_landing_bytes(MetricSampleRow::est_source_bytes(s)))
+                .sum::<u64>()
+                + shape
+                    .hist_samples
+                    .iter()
+                    .map(|h| {
+                        MetricLandingRow::est_landing_bytes(MetricHistSampleRow::est_source_bytes(
+                            h,
+                        ))
+                    })
+                    .sum::<u64>()
+                + shape
+                    .series
+                    .iter()
+                    .map(|s| {
+                        MetricLandingRow::est_landing_bytes(MetricSeriesRow::est_source_bytes(s))
+                    })
+                    .sum::<u64>()
+                + shape
+                    .descriptors
+                    .iter()
+                    .map(|m| {
+                        MetricLandingRow::est_landing_bytes(MetricMetadataRow::est_source_bytes(m))
+                    })
+                    .sum::<u64>();
+
+            // The rows `admit_batch` materializes for it, in its order.
+            let total_rows = shape.samples.len()
+                + shape.hist_samples.len()
+                + shape.series.len()
+                + shape.descriptors.len();
+            let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows);
+            rows.extend(
+                shape
+                    .samples
+                    .iter()
+                    .map(|s| MetricLandingRow::float_sample(5, s)),
+            );
+            rows.extend(
+                shape
+                    .hist_samples
+                    .iter()
+                    .map(|h| MetricLandingRow::hist_sample(5, h)),
+            );
+            rows.extend(
+                shape
+                    .series
+                    .iter()
+                    .map(|s| MetricLandingRow::series(5, s, 3_600_000, VALUE_TYPE_FLOAT)),
+            );
+            rows.extend(
+                shape
+                    .descriptors
+                    .iter()
+                    .map(|m| MetricLandingRow::metadata(5, m)),
+            );
+            assert_eq!(rows.len(), total_rows, "{}", shape.name);
+
+            let (tx, _rx) = oneshot::channel();
+            let block = LandingBlock::seal(
+                rows,
+                landing_charge(row_bytes),
+                QuerySettings::landing_insert(
+                    &mint_landing_token(&mut XorShift64::seeded()),
+                    1_048_576,
+                ),
+                ClaimTicket::inert(),
+                Some(tx),
+                Vec::new(),
+                tokio::time::Instant::now(),
+            );
+
+            let held = held_bytes(&block);
+            assert!(
+                block.bytes >= held,
+                "{}: the charge ({}) must cover the {held} bytes this block holds",
+                shape.name,
+                block.bytes
+            );
+        }
+    }
+
+    /// What one queued block holds, walked field by field. `bytes` and
+    /// `admitted_at` are inline in the struct the first term prices; `rows`,
+    /// `settings`, `claim` and `waiter` each own heap beyond their slots.
+    fn held_bytes(block: &LandingBlock) -> u64 {
+        // The block, and the queue slot the channel moves it into.
+        let mut held = 2 * std::mem::size_of::<LandingBlock>() as u64;
+
+        held += block.rows.capacity() as u64 * std::mem::size_of::<MetricLandingRow>() as u64;
+        for row in &block.rows {
+            held += (row.metric_name.capacity()
+                + row.labels.capacity()
+                + row.metric_type.capacity()
+                + row.help.capacity()
+                + row.unit.capacity()) as u64;
+            held += (row.hist_pos_span_offsets.capacity() * std::mem::size_of::<i32>()
+                + row.hist_pos_span_lengths.capacity() * std::mem::size_of::<u32>()
+                + row.hist_pos_bucket_deltas.capacity() * std::mem::size_of::<i64>()
+                + row.hist_neg_span_offsets.capacity() * std::mem::size_of::<i32>()
+                + row.hist_neg_span_lengths.capacity() * std::mem::size_of::<u32>()
+                + row.hist_neg_bucket_deltas.capacity() * std::mem::size_of::<i64>()
+                + row.hist_custom_values.capacity() * std::mem::size_of::<f64>())
+                as u64;
+        }
+
+        held += block.settings.entries().count() as u64
+            * std::mem::size_of::<(String, String)>() as u64
+            + block
+                .settings
+                .entries()
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum::<u64>();
+
+        // Stated, not measured: see each constant.
+        held += CLAIM_FIRST_ALLOCATION_BYTES;
+        held += WAITER_CHANNEL_BYTES;
+        held
+    }
+
+    fn label_set() -> LabelSet {
+        LabelSet::from_normalized([
+            ("job".to_string(), "checkout".to_string()),
+            ("instance".to_string(), "10.0.0.7:9100".to_string()),
+        ])
+        .0
+    }
+
+    fn series_ref(fingerprint: u128) -> SeriesRef {
+        SeriesRef {
+            metric_name: Arc::from(LONG_NAME),
+            fingerprint: Fingerprint::from_raw(fingerprint),
+            labels: label_set(),
+        }
+    }
+
+    fn sample(fingerprint: u128, unix_milli: i64) -> MetricPoint {
+        MetricPoint {
+            metric_name: Arc::from(LONG_NAME),
+            fingerprint: Fingerprint::from_raw(fingerprint),
+            unix_milli,
+            value: 1.5,
+        }
+    }
+
+    fn hist_sample(fingerprint: u128, unix_milli: i64) -> HistogramPoint {
+        HistogramPoint {
+            metric_name: Arc::from(LONG_NAME),
+            fingerprint: Fingerprint::from_raw(fingerprint),
+            unix_milli,
+            histogram: pulsus_model::NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count: 1,
+                sum: 5.0,
+                positive_spans: vec![pulsus_model::Span {
+                    offset: 1,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![1],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            },
+        }
+    }
+
+    fn descriptor() -> MetricMetadata {
+        MetricMetadata {
+            metric_name: Arc::from(LONG_NAME),
+            metric_type: "histogram".to_string(),
+            help: "the request duration".to_string(),
+            unit: "seconds".to_string(),
+            updated_ns: 7,
+        }
+    }
 
     /// The fate is a value the loop carries: an ending whose own knowledge
     /// is "this did not send" must not reverse an earlier attempt that may
