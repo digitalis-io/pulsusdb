@@ -319,17 +319,20 @@ mod tests {
         assert_eq!(off.render_suffix(), "");
     }
 
-    /// **Every limit that can end a block is pinned, not just the row
-    /// one** (issue #603 code review round 7, finding 1). The server emits a
-    /// block while it parses the request body when *any* maximum is reached,
-    /// and two of the three are byte limits; pinning only the row count
-    /// leaves a push below the row ceiling free to become several blocks
-    /// under a server profile that set either byte limit, and several blocks
-    /// can commit a prefix.
+    /// **Every setting that forms, ends or emits a block, and every setting
+    /// that decides whether the insert is deduplicated, is pinned** (issue
+    /// #603 code review rounds 7 and 8, finding 1). The set and the
+    /// catalogue quote behind each value are in [`QuerySettings::
+    /// landing_insert`]'s own table; this is that table as assertions, one
+    /// per pin and exact, because a pin that is merely present can still
+    /// carry the wrong value.
     ///
-    /// `0` is each byte limit's documented "does not participate in block
-    /// formation" value, so the row count is the only thing left that ends a
-    /// block — and admission has already refused every push that reaches it.
+    /// Two of them decide a block by counting rows (`max_insert_block_size`
+    /// and `min_insert_block_size_rows`, both at the ceiling admission has
+    /// already refused a larger push against), three by counting bytes, one
+    /// by elapsed time, and the last by whether a broken connection's
+    /// buffered rows are processed at all — which is the one that disables
+    /// deduplication, and so defeats the token rather than splitting a push.
     #[test]
     fn the_landing_insert_pins_every_limit_that_forms_a_block() {
         let s = QuerySettings::landing_insert("tok-1", 1_048_576);
@@ -348,6 +351,66 @@ mod tests {
             Some("0"),
             "nor the byte limit on the blocks the input format forms"
         );
+        assert_eq!(
+            s.get("min_insert_block_size_rows"),
+            Some("1048576"),
+            "the minimum pair emits a block when BOTH are reached, so the row \
+             half is pinned to the same ceiling as the maximum's"
+        );
+        assert_eq!(
+            s.get("min_insert_block_size_bytes"),
+            Some("0"),
+            "and the byte half must not participate"
+        );
+        assert_eq!(
+            s.get("input_format_connection_handling"),
+            Some("0"),
+            "the one that makes deduplication impossible when enabled, which \
+             defeats the token rather than splitting the push"
+        );
+        assert_eq!(
+            s.get("input_format_max_block_wait_ms"),
+            Some("0"),
+            "nor may a block be emitted because time passed"
+        );
+        assert_eq!(
+            s.get("insert_deduplication_token"),
+            Some("tok-1"),
+            "the minted token is what makes a resend safe"
+        );
+        assert_eq!(
+            s.get("deduplicate_insert"),
+            Some("enable"),
+            "it overrides insert_deduplicate and async_insert_deduplicate, so \
+             one pin closes all three"
+        );
+        assert_eq!(
+            s.get("deduplicate_blocks_in_dependent_materialized_views"),
+            Some("1"),
+            "and the views each check their own window"
+        );
+        assert_eq!(
+            s.entries().count(),
+            10,
+            "the pinned set is closed: a setting added to it without a row in \
+             landing_insert's table, and without its required-name entry, is \
+             a name sent on somebody's memory"
+        );
+    }
+
+    /// The row ceiling is a deployment's value, and **both** row limits
+    /// follow it: a deployment at the floor of its range gets the same
+    /// one-block guarantee as one at the default, because the pin that ends
+    /// a block by counting rows is the same figure admission refuses
+    /// against.
+    #[test]
+    fn both_row_limits_follow_the_deployments_own_ceiling() {
+        for max_rows in [1_000u64, 1_048_576, 10_000_000] {
+            let s = QuerySettings::landing_insert("tok-1", max_rows);
+            let want = max_rows.to_string();
+            assert_eq!(s.get("max_insert_block_size"), Some(want.as_str()));
+            assert_eq!(s.get("min_insert_block_size_rows"), Some(want.as_str()));
+        }
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when

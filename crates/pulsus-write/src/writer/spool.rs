@@ -334,7 +334,7 @@ mod tests {
 
     use super::*;
     use crate::writer::metrics::WriterMetrics;
-    use crate::writer::rows::MetricSampleRow;
+    use crate::writer::rows::{MetricLandingRow, MetricSampleRow};
 
     #[derive(Serialize)]
     struct Row {
@@ -416,6 +416,106 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Each landing row kind streams the shape that kind declares.** A row
+    /// whose arrays are written element by element into the sink (issue #603
+    /// code review round 8, finding 2) must put the same document on disk as
+    /// the declared [`SpoolEncode::to_spool_value`] shape every other case in
+    /// `writer::rows` asserts against — the audit record a replay tool reads.
+    /// Nothing else holds the two together once the encoder stops going
+    /// through a value.
+    ///
+    /// All four kinds, and the histogram twice: once with no custom bounds and
+    /// once with the widest array the ingest seam admits, so the
+    /// element-at-a-time path is what the comparison covers rather than the
+    /// empty case.
+    #[tokio::test]
+    async fn every_landing_row_kind_streams_the_shape_it_declares() {
+        let dir = tempdir();
+        for (name, row) in landing_rows_of_every_kind() {
+            let path = dir.join(format!("{name}.json"));
+            let whole = serde_json::to_vec(&SpoolRecord {
+                table: "metric_landing",
+                error: "boom",
+                spooled_at_ns: 1_700_000_000_123_456_789,
+                rows: vec![row.to_spool_value()],
+            })
+            .expect("the record serializes");
+            write_record(
+                &path,
+                "metric_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let streamed = std::fs::read(&path).expect("read the document back");
+            assert_eq!(
+                String::from_utf8(streamed).expect("the document is UTF-8"),
+                String::from_utf8(whole).expect("the record is UTF-8"),
+                "the streamed {name} row is not the shape it declares"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One row of each landing kind, the histogram twice: an empty-array one
+    /// and one carrying `MAX_BUCKETS_PER_HISTOGRAM_SIDE` custom bounds, which
+    /// is the widest single row the ingest seam admits.
+    fn landing_rows_of_every_kind() -> Vec<(&'static str, MetricLandingRow)> {
+        use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
+        use pulsus_model::{CUSTOM_BUCKETS_SCHEMA, CounterResetHint, NativeHistogram, Span};
+
+        let (labels, _) =
+            pulsus_model::LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
+        let point = MetricPoint {
+            metric_name: Arc::from("http_requests_total"),
+            fingerprint: Fingerprint::from_raw(7),
+            unix_milli: 1_000,
+            value: f64::from_bits(STALE_NAN_BITS),
+        };
+        let series = SeriesRef {
+            metric_name: Arc::from("http_requests_total"),
+            fingerprint: Fingerprint::from_raw(7),
+            labels,
+        };
+        let meta = MetricMetadata {
+            metric_name: Arc::from("http_requests_total"),
+            metric_type: "counter".to_string(),
+            help: "requests \"served\"\n".to_string(),
+            unit: "1".to_string(),
+            updated_ns: 42,
+        };
+        let hist = |bounds: usize| HistogramPoint {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            fingerprint: Fingerprint::from_raw(11),
+            unix_milli: 2_000,
+            histogram: NativeHistogram {
+                counter_reset_hint: CounterResetHint::Unknown,
+                schema: CUSTOM_BUCKETS_SCHEMA,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count: 3,
+                sum: f64::INFINITY,
+                positive_spans: vec![Span {
+                    offset: 0,
+                    length: 2,
+                }],
+                negative_spans: Vec::new(),
+                positive_buckets: vec![1, 1],
+                negative_buckets: Vec::new(),
+                custom_values: (0..bounds).map(|i| 0.5 + i as f64 / 1024.0).collect(),
+            },
+        };
+        vec![
+            ("float", MetricLandingRow::float_sample(5, &point)),
+            ("hist-empty", MetricLandingRow::hist_sample(5, &hist(0))),
+            ("hist-wide", MetricLandingRow::hist_sample(5, &hist(65_536))),
+            ("series", MetricLandingRow::series(5, &series, 3_600_000, 1)),
+            ("metadata", MetricLandingRow::metadata(5, &meta)),
+        ]
     }
 
     #[tokio::test]

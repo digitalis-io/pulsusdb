@@ -32,7 +32,7 @@ fn landing_settings() -> QuerySettings {
 /// `QuerySettings::landing_insert` to `BlockInserter::insert_with`; if the
 /// production adapter does not override that method it inherits a default
 /// that drops `extra` and calls `insert`, so the deduplication token, the two
-/// deduplication pins and the block-size ceiling are never sent — no retry
+/// deduplication pins and the seven block limits are never sent — no retry
 /// safety at all, and a push above the server's own default block size split
 /// into several blocks.
 #[tokio::test]
@@ -63,14 +63,26 @@ async fn the_production_inserter_sends_the_landing_settings_on_the_wire() {
         "the block-size pin is what stops one push becoming two blocks: {}",
         insert.target
     );
-    // The row count is one of three limits that end a block, and the other
-    // two are byte limits (issue #603 code review round 7, finding 1). Each
+    assert_eq!(
+        insert.param("min_insert_block_size_rows").as_deref(),
+        Some("1048576"),
+        "the minimum pair ends a block too, and its row half follows the same \
+         ceiling: {}",
+        insert.target
+    );
+    // Five settings end a block by a measure that is not a row count: three
+    // byte limits, one elapsed time, and the connection handling the wait
+    // time needs (issue #603 code review rounds 7 and 8, finding 1). Each
     // must reach the server pinned to its "does not participate" value, or a
     // push inside the row ceiling still becomes several blocks under a
-    // server profile that set one of them.
+    // server profile that set one of them — and the last of them disables
+    // deduplication outright, which defeats the token.
     for key in [
         "max_insert_block_size_bytes",
         "input_format_max_block_size_bytes",
+        "min_insert_block_size_bytes",
+        "input_format_max_block_wait_ms",
+        "input_format_connection_handling",
     ] {
         assert_eq!(
             insert.param(key).as_deref(),

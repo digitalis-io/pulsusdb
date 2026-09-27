@@ -17,6 +17,11 @@
 //! four times that size. It must stay under a fixed ceiling and must not grow
 //! with the push.
 //!
+//! **Two shapes of push, because one row can be as large as many** (issue #603
+//! code review round 8, finding 2): many narrow float samples, and one accepted
+//! native-histogram row carrying up to 65,536 custom bucket bounds. A per-row
+//! value tree is invisible in the first and is the whole cost in the second.
+//!
 //! Live bytes, not bytes requested: an encoder that writes the document in
 //! bounded pieces still *requests* bytes in proportion to the push, and only
 //! a high-water mark of what is held at one instant tells the two apart.
@@ -35,9 +40,14 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
+use pulsus_model::{
+    CUSTOM_BUCKETS_SCHEMA, CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet,
+    NativeHistogram, Span,
+};
 use pulsus_write::writer::{BlockInserter, MetricWriter, MetricWriterTables, WriterRuntime};
-use pulsus_write::{MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef};
+use pulsus_write::{
+    HistogramPoint, MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef,
+};
 
 // -- the allocator --------------------------------------------------------
 
@@ -164,6 +174,61 @@ fn push_of(rows: usize) -> ParsedMetrics {
     }
 }
 
+/// One accepted native-histogram sample whose single row carries `bounds`
+/// custom bucket bounds, plus its series — **two landing rows, one of them as
+/// wide as the ingest seam admits**.
+///
+/// `MAX_BUCKETS_PER_HISTOGRAM_SIDE` is 65,536
+/// (`crates/pulsus-write/src/protocols/remote_write.rs`), so a decoded
+/// histogram may carry that many `custom_values`, and `custom_values` is
+/// spooled twice — once as numbers and once as the exact bit patterns. The
+/// histogram is built the way the ingest seam accepts it (schema −53, no
+/// negative side, no zero bucket, `count` the cumulative bucket total), and
+/// the case below asserts `validate()` agrees before it is pushed: a row the
+/// seam would refuse proves nothing about what an accepted one costs.
+fn wide_hist_push(bounds: usize) -> ParsedMetrics {
+    let (labels, _) = LabelSet::from_normalized([(
+        "instance".to_string(),
+        "checkout-7.eu-west-1.internal:9100".to_string(),
+    )]);
+    ParsedMetrics {
+        hist_samples: vec![HistogramPoint {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            fingerprint: Fingerprint::from_raw(11),
+            unix_milli: 1_000,
+            histogram: wide_histogram(bounds),
+        }],
+        series: vec![SeriesRef {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            fingerprint: Fingerprint::from_raw(11),
+            labels,
+        }],
+        ..Default::default()
+    }
+}
+
+/// The histogram [`wide_hist_push`] carries: `bounds` custom bucket bounds,
+/// each a float whose decimal form is long enough that the spooled text is not
+/// a single digit.
+fn wide_histogram(bounds: usize) -> NativeHistogram {
+    NativeHistogram {
+        counter_reset_hint: CounterResetHint::Unknown,
+        schema: CUSTOM_BUCKETS_SCHEMA,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        count: 3,
+        sum: 6.25,
+        positive_spans: vec![Span {
+            offset: 0,
+            length: 2,
+        }],
+        negative_spans: Vec::new(),
+        positive_buckets: vec![1, 1],
+        negative_buckets: Vec::new(),
+        custom_values: (0..bounds).map(|i| 0.5 + i as f64 / 1024.0).collect(),
+    }
+}
+
 /// Admits one push of `rows` samples and waits for it to settle, against an
 /// inserter that either commits it or poisons it. Answers the peak live bytes
 /// over the whole push, measured from the instant before admission — the rows
@@ -171,6 +236,12 @@ fn push_of(rows: usize) -> ParsedMetrics {
 /// between the two is what the failure path holds and the success path does
 /// not.
 async fn peak_over_one_push(rows: usize, poison: bool) -> u64 {
+    peak_over_push(push_of(rows), poison).await
+}
+
+/// [`peak_over_one_push`] over any push, so the wide-row case measures the
+/// same window the many-rows case does.
+async fn peak_over_push(push: ParsedMetrics, poison: bool) -> u64 {
     let root = spool_root(if poison { "poison" } else { "commit" });
     let mut runtime = WriterRuntime::from_config(&WriterConfig {
         metrics_landing_inserters: 1,
@@ -184,8 +255,6 @@ async fn peak_over_one_push(rows: usize, poison: bool) -> u64 {
         DEFAULT_ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
-    let push = push_of(rows);
-
     let peak = peak_bytes_of(async {
         let wait = writer
             .admit_flush(push, PushHeaders::default())
@@ -237,6 +306,21 @@ const ROWS_4X: usize = ROWS * 4;
 /// ceiling robust against incidental allocation inside the window.
 const SPOOL_CEILING_BYTES: u64 = 1024 * 1024;
 
+/// The two widths of **one** row: a quarter of the ingest seam's per-side
+/// bucket cap, and the cap itself.
+const BOUNDS: usize = 16_384;
+const BOUNDS_4X: usize = BOUNDS * 4;
+
+/// How much the wider of the two rows may hold over the narrower. It is what
+/// makes "fixed" an assertion rather than a hope: a four-fold array must cost
+/// the encoder nothing, because it writes elements one at a time into a buffer
+/// that spills as it fills. A whole-document encoder pays for every element
+/// twice, in a value tree and again in the serialised body.
+const WIDTH_SLACK_BYTES: u64 = 128 * 1024;
+
+/// **Both halves are in one `#[test]`.** The measurement is a process-wide
+/// high-water mark, so a second test function running on another thread would
+/// land inside this one's window (this file's own doc comment).
 #[test]
 fn spooling_a_block_holds_no_copy_of_the_push() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -262,5 +346,38 @@ fn spooling_a_block_holds_no_copy_of_the_push() {
                  spool peak {spool})"
             );
         }
+
+        // **One wide row, not many narrow ones** (issue #603 code review round
+        // 8, finding 2). The bound above holds for a push of many small rows
+        // whatever the encoder does per row; what a per-row value tree costs is
+        // only visible when the row itself is wide, and an accepted histogram
+        // may carry 65,536 custom bucket bounds.
+        let mut wide_extra = Vec::new();
+        for (label, bounds) in [("W", BOUNDS), ("4W", BOUNDS_4X)] {
+            wide_histogram(bounds)
+                .validate()
+                .expect("the ingest seam accepts this histogram");
+            let commit = peak_over_push(wide_hist_push(bounds), false).await;
+            let spool = peak_over_push(wide_hist_push(bounds), true).await;
+            let extra = spool.saturating_sub(commit);
+            assert!(
+                extra <= SPOOL_CEILING_BYTES,
+                "spooling one row of {bounds} custom bucket bounds ({label}) \
+                 held {extra} bytes more than committing it, over the ceiling \
+                 {SPOOL_CEILING_BYTES}: the encoder holds a copy of the row's \
+                 arrays that nothing charges the queue for (commit peak \
+                 {commit}, spool peak {spool})"
+            );
+            wide_extra.push(extra);
+        }
+        let (narrow, wide) = (wide_extra[0], wide_extra[1]);
+        assert!(
+            wide.saturating_sub(narrow) <= WIDTH_SLACK_BYTES,
+            "four times the array cost the spool path {} bytes more ({narrow} \
+             at {BOUNDS} bounds, {wide} at {BOUNDS_4X}): the overhead must stay \
+             fixed as the array grows, or the bound is one push's size and not \
+             a constant",
+            wide.saturating_sub(narrow)
+        );
     });
 }

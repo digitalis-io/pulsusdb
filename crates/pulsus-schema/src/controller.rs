@@ -945,6 +945,71 @@ mod tests {
         );
     }
 
+    /// **The setting names read back at startup are exactly the setting names
+    /// the landing insert sends**, checked both ways against one written-out
+    /// set, so neither side can move without the other (issue #603 code
+    /// review round 8, finding 1: two rounds each found further settings that
+    /// end a block, and each time the list was maintained beside the pins by
+    /// hand).
+    ///
+    /// The two exemptions are the pair the **shipped** span insert already
+    /// sends (`QuerySettings::deduplicate_through_views`, issue #560). They
+    /// were in `crates/` before this work, which is the class the startup
+    /// check draws: every name this work sends that was not already there.
+    /// A server too old to carry them is refused by its version, which is a
+    /// separate check.
+    #[test]
+    fn the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends() {
+        use std::collections::BTreeSet;
+
+        /// In `crates/` before this work, so outside the probed class.
+        const ALREADY_SHIPPED: &[&str] = &[
+            "deduplicate_insert",
+            "deduplicate_blocks_in_dependent_materialized_views",
+        ];
+
+        let want: BTreeSet<&str> = BTreeSet::from([
+            "insert_deduplication_token",
+            "max_insert_block_size",
+            "max_insert_block_size_bytes",
+            "input_format_max_block_size_bytes",
+            "min_insert_block_size_rows",
+            "min_insert_block_size_bytes",
+            "input_format_connection_handling",
+            "input_format_max_block_wait_ms",
+        ]);
+
+        let read_back: BTreeSet<&str> = REQUIRED_SERVER_NAMES
+            .iter()
+            .filter(|(_, c)| *c == NameCatalogue::Setting)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            read_back, want,
+            "the settings catalogue's required names are the landing insert's \
+             pins and nothing else"
+        );
+
+        let settings = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let sent: BTreeSet<&str> = settings.entries().map(|(k, _)| k).collect();
+        let sent_new: BTreeSet<&str> = sent
+            .iter()
+            .copied()
+            .filter(|k| !ALREADY_SHIPPED.contains(k))
+            .collect();
+        assert_eq!(
+            sent_new, want,
+            "every setting one landing insert sends is either read back at \
+             startup or one of the two the shipped span insert already sends"
+        );
+        for name in ALREADY_SHIPPED {
+            assert!(
+                sent.contains(name),
+                "{name} is exempted from the check but is not sent at all"
+            );
+        }
+    }
+
     /// The three statements, written out, so the list and the statements
     /// cannot drift apart unnoticed.
     #[test]
@@ -956,7 +1021,9 @@ mod tests {
                     NameCatalogue::Setting,
                     "SELECT name FROM system.settings WHERE name IN \
                      ('insert_deduplication_token', 'max_insert_block_size', \
-                     'max_insert_block_size_bytes', 'input_format_max_block_size_bytes')"
+                     'max_insert_block_size_bytes', 'input_format_max_block_size_bytes', \
+                     'min_insert_block_size_rows', 'min_insert_block_size_bytes', \
+                     'input_format_connection_handling', 'input_format_max_block_wait_ms')"
                         .to_string()
                 ),
                 (
