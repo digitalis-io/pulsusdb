@@ -339,6 +339,14 @@ async fn query_stream_enforces_overall_deadline_on_a_stalled_query() {
 /// insert request is open, which IS uncertainty — needs a server that reads a
 /// request and never answers, so both halves are pinned together against the
 /// hermetic mock in `pulsus-write`'s `landing_insert_settings.rs`.
+///
+/// **This case asserted the opposite** while the client classified every
+/// deadline as post-send (issue #3 fix plan, finding 2: a deadline must not
+/// reach the caller as a bare retryable `Timeout` a caller would duplicate the
+/// block on). That reading held for the phase it was written about — write and
+/// end, where the block may be on the wire — and was applied to this one,
+/// which cannot reach it. The rule it stated is unchanged and now lives where
+/// it belongs: the two cases named above.
 #[tokio::test]
 async fn a_client_deadline_the_metadata_read_cannot_outrun_keeps_its_own_class() {
     skip_unless_live!();
