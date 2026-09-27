@@ -163,9 +163,7 @@ impl WriterRuntime {
             retry_max_attempts: RETRY_MAX_ATTEMPTS,
             retry_base_delay: RETRY_BASE_DELAY,
             retry_max_delay: RETRY_MAX_DELAY,
-            // A placeholder value, so the case that asserts nothing
-            // configures this seam fails on what it asserts.
-            retry_jitter_seed: Some(0),
+            retry_jitter_seed: None,
             lru_capacity: LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
             backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,

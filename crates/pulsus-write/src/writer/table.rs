@@ -18,6 +18,7 @@ use tracing::{error, warn};
 
 use crate::writer::buffer::{Generation, TableBuffer};
 use crate::writer::config::WriterRuntime;
+use crate::writer::drain::DrainWatch;
 use crate::writer::error::WriteError;
 use crate::writer::metrics::TableMetrics;
 use crate::writer::push_dedup::{ClaimTicket, PushDedup, TargetOutcome};
@@ -529,7 +530,7 @@ async fn finish_generation<R>(
 pub(crate) fn spawn_dedup_ticker(
     dedup: Arc<PushDedup>,
     every: Duration,
-    mut shutdown: watch::Receiver<Option<Instant>>,
+    mut watch: DrainWatch,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(every);
@@ -537,14 +538,9 @@ pub(crate) fn spawn_dedup_ticker(
         loop {
             tokio::select! {
                 _ = interval.tick() => dedup.tick(),
-                changed = shutdown.changed() => {
-                    // A closed channel — the writer's `Shared`, and with it
-                    // the signal's sender, dropped without a graceful
-                    // shutdown — ends the ticker exactly as a deadline does.
-                    if changed.is_err() || shutdown.borrow().is_some() {
-                        return;
-                    }
-                }
+                // A gone signal — the writer dropped without a graceful
+                // shutdown — ends the ticker exactly as a deadline does.
+                () = watch.until_announced() => return,
             }
         }
     })
@@ -561,9 +557,7 @@ impl XorShift64 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        // A xorshift generator's state must never be zero (it is a fixed
-        // point), hence the `| 1`.
-        XorShift64(seed | 1)
+        Self::from_seed(seed)
     }
 
     /// A generator whose whole sequence is `seed`'s, so a case that has to
@@ -572,10 +566,9 @@ impl XorShift64 {
     /// set. Full jitter permits a zero delay, and a case pinned to a delay
     /// it happened to draw fails on that one.
     pub(crate) fn from_seed(seed: u64) -> Self {
-        // A placeholder that ignores `seed`, so the case below fails on the
-        // draw it asserts.
-        let _ = seed;
-        XorShift64(0x9E37_79B9_7F4A_7C15)
+        // A xorshift generator's state must never be zero (it is a fixed
+        // point), hence the `| 1`.
+        XorShift64(seed | 1)
     }
 
     pub(crate) fn next_u64(&mut self) -> u64 {
@@ -835,8 +828,9 @@ mod tests {
             assert_eq!(index.snapshot().unknown_total, 0);
         }
 
-        let (shutdown, shutdown_rx) = ShutdownSignal::new();
-        let handle = spawn_dedup_ticker(ticked.clone(), Duration::from_millis(50), shutdown_rx);
+        let boundary = crate::writer::drain::DrainBoundary::new();
+        let handle =
+            spawn_dedup_ticker(ticked.clone(), Duration::from_millis(50), boundary.watch());
 
         // Past the claim deadline, then let the ticker run.
         tokio::time::advance(claim_deadline + Duration::from_secs(1)).await;
@@ -857,8 +851,8 @@ mod tests {
             "nothing but the ticker ages a claim: no flush task, no `admit` call"
         );
 
-        // Dropping the signal closes the channel, which ends the ticker.
-        drop(shutdown);
+        // Dropping the boundary closes the signal, which ends the ticker.
+        drop(boundary);
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("the ticker returns once the signal is gone")

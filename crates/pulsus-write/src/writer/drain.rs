@@ -93,6 +93,12 @@ impl DrainBoundary {
     /// that pair of stores and pair of loads only rule each other out under a
     /// single total order.
     pub(crate) fn enter(&self) -> Option<AdmissionPass<'_>> {
+        // Refused without taking a pass, so a caller still pushing after the
+        // drain began leaves nothing for [`Self::close_admission`] to wait on.
+        // This read is a fast path and not the decision: the pair below is.
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
         self.passes.fetch_add(1, Ordering::SeqCst);
         let pass = AdmissionPass { boundary: self };
         if self.closed.load(Ordering::SeqCst) {
@@ -137,18 +143,42 @@ impl DrainBoundary {
     /// queued is queued, and no settlement can be spawned after the set of
     /// them is joined last.
     pub(crate) async fn shutdown(&self, deadline: Duration) {
-        // A stub: it refuses later admissions, but neither waits for the ones
-        // already inside the boundary nor joins the settlements they spawned
-        // (issue #603 code review round 5 — the cases come first).
-        self.closed.store(true, Ordering::SeqCst);
-        // `send` only fails when every receiver is gone, which is nothing to
-        // act on: there is then no task left to tell.
-        let _ = self.signal.send(Some(Instant::now() + deadline));
+        self.close_admission().await;
+        // `send_replace`, not `send`: `send` reports every receiver being gone
+        // by leaving the value alone, and the value is what a task taking its
+        // view later reads.
+        self.signal.send_replace(Some(Instant::now() + deadline));
         let background = self.take_background();
         for task in background {
             if let Err(e) = task.await {
                 warn!(error = %e, "a metrics landing task panicked during shutdown");
             }
+        }
+        // Taken until empty rather than once: no pass is outstanding and none
+        // can be taken, so one turn is enough, and a later turn costs nothing
+        // and holds whatever order a caller gives these steps.
+        loop {
+            let settlements = self.take_settlements();
+            if settlements.is_empty() {
+                return;
+            }
+            for task in settlements {
+                if let Err(e) = task.await {
+                    warn!(error = %e, "a metrics landing settlement panicked during shutdown");
+                }
+            }
+        }
+    }
+
+    /// Refuses every later admission, then waits for the ones already inside.
+    ///
+    /// The wait is a yield loop rather than a notification: a pass is held
+    /// across admission's own body, which never awaits, so what this waits for
+    /// is bounded by one admission's synchronous work.
+    async fn close_admission(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        while self.passes.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -232,23 +262,100 @@ impl DrainWatch {
     where
         F: Future<Output = T>,
     {
-        // A placeholder, so the four attempt cases below compile and each
-        // fails on what it asserts: it neither consults the deadline nor
-        // defers `make`, and knowing nothing about the deadline it reports
-        // the two endings the boundary owns for outcomes that are not its —
-        // which is what all four of them reject.
-        match tokio::time::timeout(budget, make()).await {
-            Ok(_outcome) => AttemptEnd::Abandoned,
-            Err(_elapsed) => AttemptEnd::NotStarted,
+        // `make` is called by the first poll of this block and not before, so
+        // "never polled" and "never created" are one thing here.
+        let started = AtomicBool::new(false);
+        let work = async {
+            started.store(true, Ordering::Relaxed);
+            make().await
+        };
+        let bounded = tokio::time::timeout(budget, work);
+        tokio::pin!(bounded);
+        loop {
+            match self.announced() {
+                Some(deadline) => {
+                    // `std::time::Instant`: the deadline is the shutdown
+                    // caller's own clock reading, and a deadline already passed
+                    // leaves a zero-length sleep — ready at its first poll.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let expire = tokio::time::sleep(left);
+                    tokio::pin!(expire);
+                    return tokio::select! {
+                        biased;
+                        // The deadline arm first, so it wins rather than
+                        // relying on poll order: with the deadline passed it is
+                        // ready before the attempt is polled at all, and
+                        // nothing is created after the deadline.
+                        () = &mut expire => if started.load(Ordering::Relaxed) {
+                            AttemptEnd::Abandoned
+                        } else {
+                            AttemptEnd::NotStarted
+                        },
+                        outcome = &mut bounded => match outcome {
+                            Ok(value) => AttemptEnd::Done(value),
+                            Err(_elapsed) => AttemptEnd::BudgetElapsed,
+                        },
+                    };
+                }
+                None => {
+                    // No deadline is announced, so nothing here needs one to
+                    // win. The attempt is polled first, which leaves a closed
+                    // signal — the writer dropped without a graceful
+                    // shutdown — abandoning an attempt in flight rather than
+                    // refusing to start one.
+                    tokio::select! {
+                        biased;
+                        outcome = &mut bounded => return match outcome {
+                            Ok(value) => AttemptEnd::Done(value),
+                            Err(_elapsed) => AttemptEnd::BudgetElapsed,
+                        },
+                        changed = self.rx.changed() => {
+                            if changed.is_err() {
+                                return if started.load(Ordering::Relaxed) {
+                                    AttemptEnd::Abandoned
+                                } else {
+                                    AttemptEnd::NotStarted
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     /// Waits `delay`, returning as soon as an announced deadline has passed —
     /// the caller's own loop then settles, so this reports nothing back.
+    ///
+    /// A wait that ignored the deadline would end after it, and the next turn
+    /// of that loop would ask for an attempt the drain is no longer waiting
+    /// for.
     pub(crate) async fn sleep(&mut self, delay: Duration) {
-        // A stub: the deadline does not bound it yet (issue #603 code review
-        // round 5 — the cases come first).
-        tokio::time::sleep(delay).await;
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            match self.announced() {
+                // Announced: whichever of the two comes first ends the wait.
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let _ = tokio::time::timeout(left, sleep.as_mut()).await;
+                    return;
+                }
+                // Not announced yet: wait, and come back to bound the
+                // remainder by the deadline if one is announced meanwhile. A
+                // closed signal ends the wait, as it ends an attempt.
+                None => {
+                    tokio::select! {
+                        () = &mut sleep => return,
+                        changed = self.rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

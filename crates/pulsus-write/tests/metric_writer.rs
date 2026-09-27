@@ -1397,11 +1397,9 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
 /// `413` at the per-push ceiling and `429` at the queue allowance.
 #[tokio::test]
 async fn an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits() {
-    assert!(
-        LANDING_BLOCK_OVERHEAD_BYTES > 1,
-        "the case only bites while a block's own overhead exceeds the smallest \
-         accepted limit"
-    );
+    // The case only bites while one block's own overhead exceeds the smallest
+    // accepted limit.
+    const { assert!(LANDING_BLOCK_OVERHEAD_BYTES > 1) };
     for (name, cfg) in [
         (
             "one-byte per-push ceiling",

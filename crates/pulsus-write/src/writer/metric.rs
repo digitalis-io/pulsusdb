@@ -39,27 +39,33 @@
 //! **Backpressure/shutdown**: `queued_bytes` is reserved atomically at
 //! admission and released exactly once, by whichever ending settles the
 //! block. What is reserved is the whole block's cost, not its rows' alone
-//! ([`LANDING_BLOCK_OVERHEAD_BYTES`]). Every ending but a commit spools the
-//! block — it is the push's only copy — reports the claim its fate, and
-//! answers a waiting sync caller `500`. No attempt starts after the announced
-//! shutdown deadline: it bounds the retry sleeps, and no attempt is built past
-//! it ([`run_block`]).
+//! ([`LANDING_BLOCK_OVERHEAD_BYTES`]), and a push with no rows makes no block
+//! and is charged for none. Every ending but a commit spools the block — it is
+//! the push's only copy — reports the claim its fate, and answers a waiting
+//! sync caller `500`.
+//!
+//! **The shutdown boundary is `writer::drain`'s**, whole: nothing starts, and
+//! nothing is abandoned, after the announced deadline. This module asks it for
+//! an attempt, waits between attempts through it, admits inside a pass it
+//! hands out, and spawns nothing it does not track. Nothing here reads the
+//! deadline or reasons about it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChError, QuerySettings};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Fingerprint, floor_to_activity_bucket};
-use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{error, warn};
+use tokio::sync::{mpsc, oneshot};
+use tracing::error;
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricSink, ParsedMetrics, SeriesRef};
 use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 use crate::writer::config::WriterRuntime;
+use crate::writer::drain::{AdmissionPass, AttemptEnd, DrainBoundary, DrainWatch};
 use crate::writer::error::WriteError;
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup, TargetOutcome};
@@ -68,9 +74,7 @@ use crate::writer::rows::{
     MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
 };
 use crate::writer::spool::{SpoolKind, SpoolWriter};
-use crate::writer::table::{
-    self, BlockInserter, ChBlockInserter, ShutdownSignal, XorShift64, spawn_dedup_ticker,
-};
+use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
 /// The one table the metrics writer inserts into (issue #603).
@@ -124,7 +128,7 @@ impl MetricWriterTables {
 /// | what it holds | bytes |
 /// |---|---|
 /// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock>()` |
-/// | `settings`: four owned key/value pairs | their four slots, plus 192 for their text — 165 at a 36-byte token and the default row ceiling (18 + 6, 50 + 1, 26 + 36, 21 + 7), leaving room for a longer rendered ceiling |
+/// | `settings`: four owned key/value pairs | their vector's first allocation, which is four slots and which the four pairs fill exactly, plus 192 for their text by capacity — 165 at a 36-byte token and the default row ceiling (18 + 6, 50 + 1, 26 + 36, 21 + 7), leaving room for a longer rendered ceiling |
 /// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
 /// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256. Those four come to 8 + 2 × 16 + 32 = 72; the rest is allowance, because the channel's own bookkeeping is private to it |
 ///
@@ -305,10 +309,9 @@ struct Shared {
     /// (`pulsus_config::ReaderConfig::series_activity_bucket`, resolved by
     /// the caller — not read from `WriterConfig`).
     bucket_ms: i64,
-    shutdown: ShutdownSignal,
-    shutting_down: AtomicBool,
-    worker_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    dedup_ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The shutdown boundary: the admission gate, the announced deadline and
+    /// every task this writer spawned (`writer::drain`).
+    boundary: DrainBoundary,
 }
 
 /// Implements issue #26's `MetricSink` over one landing table. See the
@@ -394,7 +397,7 @@ impl MetricWriter {
         let metrics = Arc::new(MetricWriterMetrics::default());
         let queued_bytes = Arc::new(AtomicU64::new(0));
         let spool = Arc::new(SpoolWriter::new(runtime.spool_dir.clone(), metrics.clone()));
-        let (shutdown, shutdown_rx) = ShutdownSignal::new();
+        let boundary = DrainBoundary::new();
         let series_lru = Arc::new(Mutex::new(SeriesLru::new(runtime.lru_capacity)));
 
         // Issue #494: one index per signal. The landing insert is the one
@@ -425,15 +428,21 @@ impl MetricWriter {
         // taking a block, so up to `metrics_landing_inserters` inserts
         // overlap.
         let landing_rx = Arc::new(tokio::sync::Mutex::new(landing_rx));
-        let worker_tasks: Vec<_> = (0..runtime.metrics_landing_inserters.max(1))
-            .map(|_| spawn_landing_worker(ctx.clone(), landing_rx.clone(), shutdown_rx.clone()))
-            .collect();
-
+        // Every task goes into the boundary, which is what joins them: a task
+        // this writer spawned and nothing awaits can be cancelled by runtime
+        // teardown mid-settlement.
+        boundary.track_background(
+            (0..runtime.metrics_landing_inserters.max(1))
+                .map(|_| spawn_landing_worker(ctx.clone(), landing_rx.clone(), boundary.watch()))
+                .collect::<Vec<_>>(),
+        );
         // The suppression index used to be ticked off a flush loop, and
         // there is no flush loop left here.
-        let dedup_ticker = dedup
-            .clone()
-            .map(|d| spawn_dedup_ticker(d, runtime.batch_age, shutdown_rx.clone()));
+        boundary.track_background(
+            dedup
+                .clone()
+                .map(|d| spawn_dedup_ticker(d, runtime.batch_age, boundary.watch())),
+        );
 
         let shared = Arc::new(Shared {
             landing_tx,
@@ -445,10 +454,7 @@ impl MetricWriter {
             series_lru,
             token_rng: Mutex::new(XorShift64::seeded()),
             bucket_ms,
-            shutdown,
-            shutting_down: AtomicBool::new(false),
-            worker_tasks: Mutex::new(worker_tasks),
-            dedup_ticker: Mutex::new(dedup_ticker),
+            boundary,
         });
 
         MetricWriter { shared }
@@ -462,9 +468,14 @@ impl MetricWriter {
         mode: AdmitMode,
         push: PushHeaders,
     ) -> Result<Admitted, AdmitRefusal> {
-        if self.shared.shutting_down.load(Ordering::Acquire) {
+        // The admission gate. The pass is held for the whole of this body,
+        // which never awaits, and `shutdown` waits for every outstanding pass
+        // before it announces the deadline — so a block admitted here is in
+        // the queue before the drain can close it (issue #603 code review
+        // round 5, finding 3).
+        let Some(pass) = self.shared.boundary.enter() else {
             return Err(AdmitRefusal::Backpressure);
-        }
+        };
 
         // Every row of a push carries the same stamp, so the block lies in
         // one partition.
@@ -557,11 +568,31 @@ impl MetricWriter {
             })
             .sum();
 
-        let total_bytes =
-            landing_charge(sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes);
         let total_rows =
             (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
                 as u64;
+
+        // **A valid push with no rows of any kind is answered here**, before
+        // the charge, the two ceilings and the reservation (issue #603 code
+        // review round 5, finding 1). It makes no block and no insert, so it
+        // is charged for none: one block's fixed overhead exceeds the smallest
+        // accepted value of either byte limit, and charging an empty push for
+        // a block that is never created refused it `413` or `429`.
+        //
+        // Its claim seals with no targets, so it completes at admission.
+        if total_rows == 0 {
+            if let Some(suppressed) = suppressed {
+                return Ok(Admitted::Suppressed(suppressed));
+            }
+            self.count_parse_outcomes(&batch);
+            if let Some(guard) = guard {
+                guard.seal();
+            }
+            return Ok(Admitted::Stored(Vec::new()));
+        }
+
+        let total_bytes =
+            landing_charge(sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes);
 
         // The two per-push ceilings, counted over all four kinds, and decided
         // **before** either branch below queues anything (issue #603 code
@@ -612,6 +643,7 @@ impl MetricWriter {
                     .metadata_upserts_total
                     .fetch_add(rows.len() as u64, Ordering::Relaxed);
                 self.queue_block(
+                    &pass,
                     rows,
                     descriptor_bytes,
                     ClaimTicket::inert(),
@@ -622,14 +654,7 @@ impl MetricWriter {
             return Ok(Admitted::Suppressed(suppressed));
         }
 
-        self.shared
-            .metrics
-            .collisions_total
-            .fetch_add(batch.collisions, Ordering::Relaxed);
-        self.shared
-            .metrics
-            .rejected_total
-            .fetch_add(batch.rejected, Ordering::Relaxed);
+        self.count_parse_outcomes(&batch);
 
         // Atomic reservation: reserve first, roll back on overflow.
         super::reserve_queued_bytes(
@@ -639,13 +664,6 @@ impl MetricWriter {
             self.shared.runtime.queue_bytes_limit,
         )
         .map_err(AdmitRefusal::from)?;
-
-        if self.shared.shutting_down.load(Ordering::Acquire) {
-            self.shared
-                .queued_bytes
-                .fetch_sub(total_bytes, Ordering::AcqRel);
-            return Err(AdmitRefusal::Backpressure);
-        }
 
         // Reservation secured: only now materialize the rows.
         let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows as usize);
@@ -688,18 +706,12 @@ impl MetricWriter {
                 .fetch_add(descriptors.len() as u64, Ordering::Relaxed);
         }
 
-        // A valid push with no rows of any kind makes no block and no
-        // insert: its claim seals with no targets, completes at admission,
-        // and it is answered a success.
-        if rows.is_empty() {
-            self.shared
-                .queued_bytes
-                .fetch_sub(total_bytes, Ordering::AcqRel);
-            if let Some(guard) = guard {
-                guard.seal();
-            }
-            return Ok(Admitted::Stored(Vec::new()));
-        }
+        debug_assert_eq!(
+            rows.len() as u64,
+            total_rows,
+            "the rows materialized are the rows the push was charged and \
+             measured for"
+        );
 
         let mut claim = ClaimTicket::new(self.shared.dedup.clone(), true);
         if let Some(g) = guard.as_ref() {
@@ -716,7 +728,7 @@ impl MetricWriter {
             None
         };
 
-        self.queue_block(rows, total_bytes, claim, waiter, admitted_at);
+        self.queue_block(&pass, rows, total_bytes, claim, waiter, admitted_at);
 
         // Arms the claim: from here a drop no longer removes it, and the
         // target set is closed.
@@ -724,6 +736,20 @@ impl MetricWriter {
             guard.seal();
         }
         Ok(Admitted::Stored(receivers))
+    }
+
+    /// The parser's own per-push accounting, counted once per admitted push
+    /// that is not a suppressed repeat — including one whose rows all came to
+    /// nothing, which is exactly the push whose points were all rejected.
+    fn count_parse_outcomes(&self, batch: &ParsedMetrics) {
+        self.shared
+            .metrics
+            .collisions_total
+            .fetch_add(batch.collisions, Ordering::Relaxed);
+        self.shared
+            .metrics
+            .rejected_total
+            .fetch_add(batch.rejected, Ordering::Relaxed);
     }
 
     /// The `(series, bucket, value_type)` triples a push has to register,
@@ -817,19 +843,24 @@ impl MetricWriter {
     /// Seals one block — minting its token, so two byte-identical pushes
     /// carry different ones — and hands it to the queue.
     ///
-    /// **A block that reaches here after the queue closed is settled by this
-    /// task**, through the same ending a worker gives a block still queued
-    /// at shutdown: admission has already refused for a while by then
-    /// (`shutting_down` is stored before the signal fires), so this is the
-    /// narrow race where a push passed that check and the drain closed the
-    /// queue before the send. Settling needs the spool, which is
-    /// asynchronous, and admission is not, so the settle runs on a task of
-    /// its own; it holds an `Arc` of the context and owns the block, so it
-    /// needs nothing that could go away underneath it, and it resolves the
-    /// waiter last — a caller awaiting its answer has by then seen the bytes
-    /// released and the claim reported.
+    /// **A block that reaches here after the queue closed is settled by a task
+    /// of this admission's own**, through the same ending a worker gives a
+    /// block still queued at shutdown. Settling needs the spool, which is
+    /// asynchronous, and admission is not; the task holds an `Arc` of the
+    /// context and owns the block, so it needs nothing that could go away
+    /// underneath it, and it resolves the waiter last — a caller awaiting its
+    /// answer has by then seen the bytes released and the claim reported.
+    ///
+    /// **Nothing reaches that branch from outside**: the pass this takes is
+    /// held for the whole admission, and the drain waits for every pass before
+    /// the deadline that closes the queue is announced. It is reachable only
+    /// through [`Self::reopen_admission_for_test`], which puts admission back
+    /// past a gate the drain has already closed. The settlement is registered
+    /// with the boundary either way, so it is a task the drain awaits rather
+    /// than one runtime teardown can cancel mid-spool.
     fn queue_block(
         &self,
+        pass: &AdmissionPass<'_>,
         rows: Vec<MetricLandingRow>,
         bytes: u64,
         claim: ClaimTicket,
@@ -857,23 +888,21 @@ impl MetricWriter {
             let block = closed.0;
             let mut fate = LandingFate::NeverSent(String::new());
             fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
-            tokio::spawn(async move {
+            self.shared.boundary.spawn_settlement(pass, async move {
                 settle_block(&ctx, block, fate, TerminalCause::ShuttingDown).await;
             });
         }
     }
 
-    /// Clears the shutting-down flag after [`Self::shutdown`] has returned,
-    /// so the next admission passes that check and meets the closed queue.
+    /// Re-opens the admission gate after [`Self::shutdown`] has returned, so
+    /// the next admission takes a pass and meets the closed queue.
     ///
-    /// The race it reaches — a push past the flag check whose send finds the
-    /// queue already closed — is otherwise unreachable from outside: the
-    /// flag is stored before the signal fires, so by the time a worker has
-    /// closed the queue admission is already refusing. Nothing in the server
-    /// calls this.
+    /// That race is otherwise unreachable from outside: the drain closes the
+    /// gate and waits for every pass before it announces the deadline a worker
+    /// closes the queue on. Nothing in the server calls this.
     #[doc(hidden)]
     pub fn reopen_admission_for_test(&self) {
-        self.shared.shutting_down.store(false, Ordering::Release);
+        self.shared.boundary.reopen_for_test();
     }
 
     /// This writer's push-suppression index (issue #494), or `None` while
@@ -894,39 +923,15 @@ impl MetricWriter {
         )
     }
 
-    /// Graceful shutdown: stops admitting immediately (subsequent
-    /// `admit`/`admit_flush` calls return `Backpressure`), then awaits every
-    /// insert worker and the suppression index's ticker. Each worker closes
-    /// the queue and settles whatever is still in it, which is what makes
-    /// the drain terminate. Idempotent.
+    /// Graceful shutdown, which is the boundary's whole job
+    /// (`writer::drain`): admission closes and the admissions inside it
+    /// finish, the deadline is announced, and every task this writer spawned
+    /// is awaited — the insert workers, the suppression ticker and any
+    /// settlement an admission spawned. Each worker closes the queue and
+    /// settles whatever is still in it, which is what makes the drain
+    /// terminate. Idempotent.
     pub async fn shutdown(&self, deadline: Duration) {
-        self.shared.shutting_down.store(true, Ordering::Release);
-        self.shared.shutdown.begin(Instant::now() + deadline);
-
-        let workers: Vec<_> = std::mem::take(
-            &mut *self
-                .shared
-                .worker_tasks
-                .lock()
-                .expect("task handle mutex poisoned"),
-        );
-        let ticker = self
-            .shared
-            .dedup_ticker
-            .lock()
-            .expect("task handle mutex poisoned")
-            .take();
-
-        for task in workers {
-            if let Err(e) = task.await {
-                warn!(error = %e, table = LANDING_TABLE, "landing insert worker panicked during shutdown");
-            }
-        }
-        if let Some(task) = ticker
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "the push-suppression ticker panicked during shutdown");
-        }
+        self.shared.boundary.shutdown(deadline).await;
     }
 }
 
@@ -998,12 +1003,17 @@ pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
 pub(crate) fn spawn_landing_worker(
     ctx: Arc<LandingContext>,
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock>>>,
-    mut shutdown_rx: watch::Receiver<Option<Instant>>,
+    mut watch: DrainWatch,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut rng = XorShift64::seeded();
+        // Seeded from the clock, unless a case fixed the seed so its retry
+        // delays are the same every run (`WriterRuntime::retry_jitter_seed`).
+        let mut rng = match ctx.runtime.retry_jitter_seed {
+            Some(seed) => XorShift64::from_seed(seed),
+            None => XorShift64::seeded(),
+        };
         loop {
-            if shutdown_rx.borrow_and_update().is_some() {
+            if watch.is_announced() {
                 drain_queue(&ctx, &rx).await;
                 return;
             }
@@ -1011,12 +1021,12 @@ pub(crate) fn spawn_landing_worker(
                 let mut queue = rx.lock().await;
                 tokio::select! {
                     block = queue.recv() => Taken::Block(block),
-                    _ = shutdown_rx.changed() => Taken::ShuttingDown,
+                    () = watch.until_announced() => Taken::ShuttingDown,
                 }
             };
             match taken {
                 Taken::Block(Some(block)) => {
-                    run_block(&ctx, block, &mut shutdown_rx, &mut rng).await;
+                    run_block(&ctx, block, &mut watch, &mut rng).await;
                 }
                 // Every sender is gone, so nothing more can arrive.
                 Taken::Block(None) => return,
@@ -1053,24 +1063,23 @@ async fn drain_queue(
 
 /// Runs one block to an ending. Returns only once that block has settled.
 ///
-/// **Two deadlines bound the loop, and each is checked before an attempt is
-/// built rather than only before the sleep above it**: a timeout polls its
-/// inner future before its own timer, so even a zero-duration bound around a
-/// fresh attempt starts an insert.
+/// **Two bounds, and the loop owns one of them.** The budget —
+/// `WriterRuntime::landing_budget`, measured from the push's admission —
+/// bounds the queue wait, every attempt and every sleep. It is **recomputed
+/// after every attempt**, so a sleep can never carry the block past it, and
+/// the check at the top of the loop is what ends a block whose sleep spent
+/// what was left.
 ///
-/// The budget — `WriterRuntime::landing_budget`, measured from the push's
-/// admission — bounds the whole loop: the queue wait, every attempt and
-/// every sleep. It is **recomputed after every attempt**, so a sleep can
-/// never carry the block past it, and the check at the top of the loop is
-/// what ends a block whose sleep spent what was left.
-///
-/// The announced shutdown deadline bounds the same three, so the drain
-/// terminates by the deadline it announced
+/// The announced shutdown deadline is `writer::drain`'s, and this loop neither
+/// reads nor reasons about it: it asks [`DrainWatch::attempt`] for an attempt
+/// and gets one of two shutdown endings instead when the deadline has passed
+/// or passes in flight, and every wait between attempts is
+/// [`DrainWatch::sleep`]. So the drain terminates by the deadline it announced
 /// (`crates/pulsus-server/src/serve.rs:61`) and sends nothing after it.
 async fn run_block(
     ctx: &Arc<LandingContext>,
     block: LandingBlock,
-    shutdown_rx: &mut watch::Receiver<Option<Instant>>,
+    watch: &mut DrainWatch,
     rng: &mut XorShift64,
 ) {
     let mut fate = LandingFate::NeverSent(String::new());
@@ -1091,47 +1100,31 @@ async fn run_block(
             return;
         }
 
-        // The shutdown deadline, already passed: the block settles here rather
-        // than in an attempt bounded to nothing. It keeps whatever fate its
-        // attempts left, and the queued-shutdown message is read only when
-        // that fate is `NeverSent` — where it is exactly what happened, since
-        // every pre-send ending means nothing was sent.
-        if shutdown_deadline_passed(shutdown_rx) {
-            fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
-            settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
-            return;
-        }
-
         ctx.metrics.landing.inflight.fetch_add(1, Ordering::Relaxed);
-        let outcome = {
-            // The timeout encloses the two phases the client's own deadline
-            // does not: the connection checkout and the health ping it may
-            // issue.
-            let attempt = tokio::time::timeout(
-                remaining,
+        // The budget encloses the two phases the client's own deadline does
+        // not: the connection checkout and the health ping it may issue.
+        let end = watch
+            .attempt(remaining, || {
                 ctx.inserter
-                    .insert_with(&ctx.table, &block.rows, &block.settings),
-            );
-            tokio::pin!(attempt);
-            let already_shutting_down = *shutdown_rx.borrow_and_update();
-            match already_shutting_down {
-                Some(deadline) => table::bound_by_deadline(&mut attempt, deadline).await,
-                None => tokio::select! {
-                    outcome = &mut attempt => Ok(outcome),
-                    changed = shutdown_rx.changed() => {
-                        let _ = changed;
-                        let deadline = shutdown_rx.borrow().unwrap_or_else(Instant::now);
-                        table::bound_by_deadline(&mut attempt, deadline).await
-                    }
-                },
-            }
-        };
+                    .insert_with(&ctx.table, &block.rows, &block.settings)
+            })
+            .await;
         ctx.metrics.landing.inflight.fetch_sub(1, Ordering::Relaxed);
 
-        let sent = match outcome {
+        let sent = match end {
+            // The shutdown deadline had passed, so no attempt was created and
+            // nothing was sent. The block keeps whatever fate its earlier
+            // attempts left, and the queued-shutdown message is read only when
+            // that fate is `NeverSent` — where it is exactly what happened,
+            // since every pre-send ending means nothing was sent.
+            AttemptEnd::NotStarted => {
+                fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
+                settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
+                return;
+            }
             // The shutdown deadline with an attempt in flight. The attempt
             // is abandoned, and it may have committed.
-            Err(_shutdown_elapsed) => {
+            AttemptEnd::Abandoned => {
                 fate.saw_uncertain(MSG_SHUTDOWN_INFLIGHT.to_string());
                 settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
                 return;
@@ -1142,12 +1135,12 @@ async fn run_block(
             // for a block that may never have left the process. That
             // over-reports and never under-reports, which is the direction
             // a claim has to err in.
-            Ok(Err(_budget_elapsed)) => {
+            AttemptEnd::BudgetElapsed => {
                 fate.saw_uncertain(MSG_BUDGET_IN_ATTEMPT.to_string());
                 settle_block(ctx, block, fate, TerminalCause::Normal).await;
                 return;
             }
-            Ok(Ok(result)) => result,
+            AttemptEnd::Done(result) => result,
         };
 
         // Every `ChError` here other than `InsertUncertain` is pre-send:
@@ -1191,63 +1184,15 @@ async fn run_block(
             .runtime
             .landing_budget
             .saturating_sub(block.admitted_at.elapsed());
-        let delay = table::backoff_delay(
+        let delay = crate::writer::table::backoff_delay(
             ctx.runtime.retry_base_delay,
             ctx.runtime.retry_max_delay,
             resends + 1,
             rng,
         )
         .min(left);
-        sleep_within_shutdown(shutdown_rx, delay).await;
+        watch.sleep(delay).await;
         resends += 1;
-    }
-}
-
-/// Whether shutdown has been announced **and** the deadline it announced has
-/// passed. A closed channel is not that: it is the writer dropped without a
-/// graceful shutdown, which the attempt's own race already treats as an
-/// immediate deadline.
-fn shutdown_deadline_passed(shutdown_rx: &mut watch::Receiver<Option<Instant>>) -> bool {
-    matches!(*shutdown_rx.borrow_and_update(), Some(deadline) if deadline <= Instant::now())
-}
-
-/// Sleeps for `delay`, returning as soon as an announced shutdown deadline has
-/// passed — [`run_block`]'s own check then settles the block, so this reports
-/// nothing back.
-///
-/// A sleep that ignored the deadline would end after it and the next turn of
-/// the loop would build an attempt the drain is no longer waiting for.
-async fn sleep_within_shutdown(
-    shutdown_rx: &mut watch::Receiver<Option<Instant>>,
-    delay: Duration,
-) {
-    let sleep = tokio::time::sleep(delay);
-    tokio::pin!(sleep);
-    loop {
-        // Bound to a value, not held as a borrow: the arm below takes the
-        // receiver again.
-        let announced = *shutdown_rx.borrow_and_update();
-        match announced {
-            // Announced: whichever of the two comes first ends the sleep.
-            Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let _ = tokio::time::timeout(left, sleep.as_mut()).await;
-                return;
-            }
-            // Not announced yet: sleep, and come back to bound the remainder
-            // by the deadline if one is announced meanwhile. A closed channel
-            // ends the sleep, as it ends an attempt.
-            None => {
-                tokio::select! {
-                    () = &mut sleep => return,
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
