@@ -117,13 +117,16 @@ JSON.parse, jq arithmetic by default, ...). A replay/audit tool must parse
 original value.
 ";
 
-/// What one spool file holds. **Never built**: it is here so the document
-/// [`write_record`] streams out has a declared shape, field for field and in
-/// order, and so a reader of that function has something to compare it
-/// against. Building it would materialise every row's value at once, which is
-/// the allocation that function exists to avoid.
+/// What one spool file holds — the declared shape [`write_record`] writes by
+/// hand, field for field and in order.
+///
+/// **It exists for the case that holds the two together**
+/// (`the_streamed_document_is_what_serializing_the_record_whole_would_write`)
+/// and is compiled only for the tests: building one materialises every row's
+/// value at once, which is the allocation `write_record` exists to avoid, so
+/// production must not have it to hand.
+#[cfg(test)]
 #[derive(Serialize)]
-#[allow(dead_code)]
 struct SpoolRecord<'a> {
     table: &'a str,
     error: &'a str,
@@ -264,8 +267,8 @@ impl ChunkedFile {
     }
 }
 
-/// Writes one spool document — the [`SpoolRecord`] shape, field for field —
-/// to a `.tmp` sibling and renames it into place.
+/// Writes one spool document — the `SpoolRecord` shape, field for field — to
+/// a `.tmp` sibling and renames it into place.
 ///
 /// **It is streamed, not built** (issue #603 code review round 7, finding 3).
 /// A failed block's queue reservation covers its rows and is held until this
@@ -369,6 +372,48 @@ mod tests {
         assert!(contents.contains("\"error\":\"boom\""));
         assert!(contents.contains("\"value\":1"));
         assert_eq!(metrics.spool_poison_total.load(Ordering::Relaxed), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The streamed document is byte for byte what serializing the record
+    /// whole would have produced.** `write_record` writes the shape by hand
+    /// so that it never holds the whole of it, and the shape it writes is
+    /// [`SpoolRecord`]'s; nothing else keeps the two together, and a spool
+    /// file whose shape drifted is an audit trail no replay tool can read.
+    ///
+    /// The fixture crosses the chunk boundary several times over and the
+    /// strings carry the escaping serde owns, so the flushes fall inside
+    /// values and between them rather than only at the end.
+    #[tokio::test]
+    async fn the_streamed_document_is_what_serializing_the_record_whole_would_write() {
+        let dir = tempdir();
+        let rows: Vec<Row> = (0..30_000).map(|value| Row { value }).collect();
+        let table = "log_\"samples\"";
+        let error = "boom:\n\tone \"quoted\" \\ thing";
+        let path = dir.join("streamed.json");
+
+        write_record(&path, table, error, 1_700_000_000_123_456_789, &rows)
+            .await
+            .expect("the document is written");
+
+        let streamed = std::fs::read(&path).expect("read the document back");
+        assert!(
+            streamed.len() > 4 * SPOOL_CHUNK_BYTES,
+            "the fixture must be several chunks long, not {} bytes",
+            streamed.len()
+        );
+        let whole = serde_json::to_vec(&SpoolRecord {
+            table,
+            error,
+            spooled_at_ns: 1_700_000_000_123_456_789,
+            rows: rows.iter().map(SpoolEncode::to_spool_value).collect(),
+        })
+        .expect("the record serializes");
+        assert_eq!(
+            String::from_utf8(streamed).expect("the document is UTF-8"),
+            String::from_utf8(whole).expect("the record is UTF-8"),
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

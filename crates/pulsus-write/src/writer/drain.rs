@@ -15,7 +15,8 @@
 //! announcement free to land in between.
 //!
 //! So publication and authorization are ordered against each other rather
-//! than checked, and no poll of an attempt is reached after the deadline:
+//! than checked, and the deadline bounds the polls of an attempt as well as
+//! its creation — short of the two residuals at the end of this comment:
 //!
 //! - **[`Deadline`] is the one point that decides.** Publication takes its
 //!   lock to write the deadline, and [`Deadline::authorize`] takes the same
@@ -30,7 +31,7 @@
 //!   [`DrainWatch::attempt`] takes that constructor rather than a future and
 //!   hands it to [`Deadline::authorize`]. The landing path issues one insert
 //!   and it is inside that constructor, at
-//!   `crates/pulsus-write/src/writer/metric.rs:1112`: `git grep -nE
+//!   `crates/pulsus-write/src/writer/metric.rs:1111`: `git grep -nE
 //!   'inserter$' -- crates/pulsus-write/src` returns that call's first line
 //!   and nothing else. The pattern is anchored so this comment is not one of
 //!   its own results — an unanchored one is, which is how the count read as
@@ -378,9 +379,9 @@ pub(crate) enum AttemptEnd<T> {
 }
 
 /// How an attempt the budget bounded ended, from what the bounded future
-/// answered. One place, because two of [`DrainWatch::attempt`]'s selections
-/// have this arm and a third reading of `Ok(None)` would be a third chance to
-/// call a refusal something else.
+/// answered. One place, because all three of [`DrainWatch::attempt`]'s
+/// selections have this arm and a second reading of `Ok(None)` would be
+/// another chance to call a refusal something else.
 fn end_of<T>(outcome: Result<Option<T>, tokio::time::error::Elapsed>) -> AttemptEnd<T> {
     match outcome {
         Ok(Some(value)) => AttemptEnd::Done(value),

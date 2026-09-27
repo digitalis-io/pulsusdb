@@ -111,7 +111,7 @@ impl QuerySettings {
     ///
     /// **Nothing else divides one request into blocks.** The vendored client
     /// flushes its buffer to the socket every `MIN_CHUNK_SIZE` bytes
-    /// (`vendor/clickhouse/src/insert.rs:17`), but those are transfer chunks
+    /// (`vendor/clickhouse/src/insert.rs:18`), but those are transfer chunks
     /// of one `INSERT … FORMAT RowBinary…` request rather than blocks, and
     /// the condition that client states for an atomic insert is the row one
     /// alone (`vendor/clickhouse/README.md:157`). Parallel parsing, which
