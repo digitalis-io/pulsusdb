@@ -15,12 +15,15 @@
 //!
 //! What makes a fourth way past the rule structural rather than lucky:
 //!
-//! - **An attempt is created here and nowhere else.**
-//!   [`DrainWatch::attempt`] takes the constructor, not the future, and calls
-//!   it from inside the selection whose deadline arm is biased to win. A
-//!   deadline already passed is a zero-length sleep, ready at its first poll,
-//!   so the constructor is never called: there is no check to skip and no gap
-//!   between a check and a poll for the deadline to expire in.
+//! - **An attempt is only ever created by this module calling the caller's
+//!   constructor.** [`DrainWatch::attempt`] takes that constructor rather than
+//!   a future, and calls it from inside the selection whose deadline arm is
+//!   biased to win, so with the deadline already passed that arm is ready
+//!   before the constructor runs and the attempt is never built: there is no
+//!   check to skip and no gap between a check and a poll for the deadline to
+//!   expire in. The landing path issues one insert and it is inside that
+//!   constructor: `git grep -n 'insert_with(&ctx' -- crates/pulsus-write/src`
+//!   returns exactly that one line, in `writer::metric`.
 //! - **Every wait between attempts is [`DrainWatch::sleep`]**, which ends at
 //!   the deadline whatever its own length.
 //! - **Admission runs inside an [`AdmissionPass`]**, and
@@ -54,8 +57,8 @@ pub(crate) struct DrainBoundary {
     signal: watch::Sender<Option<Instant>>,
     /// Admissions inside a pass right now.
     passes: AtomicU64,
-    /// Set before the first wait for `passes` to reach zero, so no admission
-    /// that reads it can still be holding a pass afterwards.
+    /// Set before the wait for `passes` to reach zero, so an admission
+    /// arriving after that wait began is refused rather than waited for.
     closed: AtomicBool,
     /// The insert workers and the suppression ticker.
     background: Mutex<Vec<JoinHandle<()>>>,
@@ -65,7 +68,10 @@ pub(crate) struct DrainBoundary {
 
 /// Proof that an admission is inside the boundary: while one of these exists,
 /// [`DrainBoundary::shutdown`] has not announced the deadline and has not
-/// joined the settlement set.
+/// joined the settlement set — it waits for every pass before either. The one
+/// way to hold a pass outside that guarantee is
+/// `MetricWriter::reopen_admission_for_test`, which re-opens the gate after a
+/// drain has finished on purpose.
 pub(crate) struct AdmissionPass<'a> {
     boundary: &'a DrainBoundary,
 }
@@ -240,7 +246,7 @@ pub(crate) struct DrainWatch {
 
 impl DrainWatch {
     /// The announced deadline, if the drain has begun.
-    pub(crate) fn announced(&mut self) -> Option<Instant> {
+    fn announced(&mut self) -> Option<Instant> {
         *self.rx.borrow_and_update()
     }
 
@@ -262,10 +268,12 @@ impl DrainWatch {
 
     /// Runs one attempt, bounded by `budget` and by the announced deadline.
     ///
-    /// `make` builds the work. It is called from inside the selection, after
-    /// the deadline arm has been polled and found pending — which is what
-    /// proves the deadline had not passed — so an attempt cannot be created
-    /// once it has. See the module docs.
+    /// `make` builds the work, and is called by the first poll of the future
+    /// this awaits rather than here. **While a deadline is announced that poll
+    /// comes after the deadline arm has been polled and found pending**, which
+    /// is what proves the deadline had not passed, so an attempt cannot be
+    /// created once it has. Before a deadline is announced there is nothing for
+    /// it to be after, and the attempt is polled first. See the module docs.
     pub(crate) async fn attempt<F, T>(
         &mut self,
         budget: Duration,
