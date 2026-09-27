@@ -130,7 +130,7 @@ impl MetricWriterTables {
 /// | what it holds | bytes |
 /// |---|---|
 /// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock>()` |
-/// | `settings`: four owned key/value pairs | their vector's first allocation, which is four slots and which the four pairs fill exactly, plus 192 for their text by capacity — 165 at a 36-byte token and the default row ceiling (18 + 6, 50 + 1, 26 + 36, 21 + 7), leaving room for a longer rendered ceiling |
+/// | `settings`: six owned key/value pairs | their vector, eight slots — its first allocation is four and the fifth pair doubles it — plus 320 for their text **by capacity**, which is 254 at a 36-byte token and the default row ceiling (18 + 6, 50 + 10, 26 + 36, 21 + 7, 27 + 10, 33 + 10: a value rendered from an integer is allocated wider than its digits), and one byte more at the largest accepted ceiling |
 /// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
 /// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256. Those four come to 8 + 2 × 16 + 32 = 72; the rest is allowance, because the channel's own bookkeeping is private to it |
 ///
@@ -142,8 +142,8 @@ impl MetricWriterTables {
 /// sealed block by walking it, over the push shapes where each half of this
 /// figure binds.
 pub const LANDING_BLOCK_OVERHEAD_BYTES: u64 = 2 * std::mem::size_of::<LandingBlock>() as u64
-    + 4 * std::mem::size_of::<(String, String)>() as u64
-    + 192
+    + 8 * std::mem::size_of::<(String, String)>() as u64
+    + 320
     + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
     + 256;
 
@@ -1233,11 +1233,12 @@ async fn settle_block(
 ) {
     let (kind, outcome, msg) = fate.settle();
     // The reservation is released AFTER the spool write returns, on its error
-    // path too (issue #603 code review, finding 4). `SpoolWriter::write` maps
-    // every row into a second value vector and then into a serialized byte
-    // vector, so the rows and both copies are live until it returns: releasing
-    // first would let a new admission take the allowance while they are, and
-    // `PULSUS_INGEST_QUEUE_BYTES` would permit more than it names.
+    // path too (issue #603 code review, finding 4). The block's rows are what
+    // the write reads, one at a time, so they are live until it returns:
+    // releasing first would let a new admission take the allowance while they
+    // are, and `PULSUS_INGEST_QUEUE_BYTES` would permit more than it names.
+    // What the write itself holds on top of them is one chunk and one row —
+    // `writer::spool`'s `write_record` owns that bound.
     if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &block.rows, &msg).await {
         ctx.metrics
             .landing

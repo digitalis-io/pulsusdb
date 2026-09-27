@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Serialize;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 /// Bridges a row's real wire-format `Serialize` (RowBinary, ClickHouse
 /// inserts) to the distinct *audit-file* JSON encoding
@@ -116,13 +117,24 @@ JSON.parse, jq arithmetic by default, ...). A replay/audit tool must parse
 original value.
 ";
 
+/// What one spool file holds. **Never built**: it is here so the document
+/// [`write_record`] streams out has a declared shape, field for field and in
+/// order, and so a reader of that function has something to compare it
+/// against. Building it would materialise every row's value at once, which is
+/// the allocation that function exists to avoid.
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct SpoolRecord<'a> {
     table: &'a str,
     error: &'a str,
     spooled_at_ns: i128,
     rows: Vec<serde_json::Value>,
 }
+
+/// How much of the document [`ChunkedFile`] holds before it writes what it
+/// has. One `write_all` per chunk, so the file costs one blocking-pool
+/// round trip per this many bytes rather than one per row.
+const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct SpoolWriter {
     root: PathBuf,
@@ -161,18 +173,10 @@ impl SpoolWriter {
             self.ensure_uncertain_readme().await?;
         }
 
-        let record = SpoolRecord {
-            table,
-            error,
-            spooled_at_ns: now_unix_nanos(),
-            rows: rows.iter().map(SpoolEncode::to_spool_value).collect(),
-        };
-        let body = serde_json::to_vec(&record)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-
+        let spooled_at_ns = now_unix_nanos();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{}-{seq}.json", record.spooled_at_ns));
-        write_atomic(&path, &body).await?;
+        let path = dir.join(format!("{spooled_at_ns}-{seq}.json"));
+        write_record(&path, table, error, spooled_at_ns, rows).await?;
 
         match kind {
             SpoolKind::Poison => self
@@ -204,6 +208,102 @@ impl SpoolWriter {
             Err(e) => Err(e),
         }
     }
+}
+
+/// A file being written in bounded pieces: what is held in memory at any
+/// instant is one chunk plus whatever the last value serialized into it.
+struct ChunkedFile {
+    file: fs::File,
+    buf: Vec<u8>,
+}
+
+impl ChunkedFile {
+    fn new(file: fs::File) -> Self {
+        ChunkedFile {
+            file,
+            buf: Vec::with_capacity(SPOOL_CHUNK_BYTES),
+        }
+    }
+
+    /// Appends bytes of the document that need no encoding — the punctuation
+    /// and the field names.
+    async fn put(&mut self, piece: &[u8]) -> std::io::Result<()> {
+        self.buf.extend_from_slice(piece);
+        self.spill().await
+    }
+
+    /// Appends one value as JSON, serialized straight into the chunk rather
+    /// than into a buffer of its own.
+    async fn put_json<T: Serialize + ?Sized>(&mut self, value: &T) -> std::io::Result<()> {
+        serde_json::to_writer(&mut self.buf, value)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        self.spill().await
+    }
+
+    /// Writes the chunk out once it is full. One value can carry the buffer
+    /// past the chunk size before this is reached, so what it holds is the
+    /// chunk plus at most one value — never the whole document.
+    async fn spill(&mut self) -> std::io::Result<()> {
+        if self.buf.len() < SPOOL_CHUNK_BYTES {
+            return Ok(());
+        }
+        self.flush().await
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&self.buf).await?;
+        self.buf.clear();
+        // A value larger than one chunk grew this; give the memory back
+        // rather than keeping the high-water mark for the rest of the
+        // document. A no-op while the capacity is already the chunk size.
+        self.buf.shrink_to(SPOOL_CHUNK_BYTES);
+        Ok(())
+    }
+}
+
+/// Writes one spool document — the [`SpoolRecord`] shape, field for field —
+/// to a `.tmp` sibling and renames it into place.
+///
+/// **It is streamed, not built** (issue #603 code review round 7, finding 3).
+/// A failed block's queue reservation covers its rows and is held until this
+/// returns, so anything this holds on top of them is memory the ingest byte
+/// bound does not know about: an encoder that made a value per row and then
+/// the whole serialized body would put two further copies of the push beside
+/// the rows, and enough blocks failing at once would exceed
+/// `PULSUS_INGEST_QUEUE_BYTES` by a multiple of the data admitted. What this
+/// holds instead is one chunk, one row's value and that row's text.
+///
+/// The rename is what makes the file atomic to a reader — it never observes a
+/// partially written spool file — exactly as [`write_atomic`] does for the
+/// README.
+async fn write_record<R: SpoolEncode>(
+    path: &Path,
+    table: &str,
+    error: &str,
+    spooled_at_ns: i128,
+    rows: &[R],
+) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    let mut out = ChunkedFile::new(fs::File::create(&tmp_path).await?);
+    out.put(b"{\"table\":").await?;
+    out.put_json(table).await?;
+    out.put(b",\"error\":").await?;
+    out.put_json(error).await?;
+    out.put(b",\"spooled_at_ns\":").await?;
+    out.put_json(&spooled_at_ns).await?;
+    out.put(b",\"rows\":[").await?;
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.put(b",").await?;
+        }
+        out.put_json(&row.to_spool_value()).await?;
+    }
+    out.put(b"]}").await?;
+    out.flush().await?;
+    fs::rename(&tmp_path, path).await
 }
 
 /// Atomic write: full contents to a `.tmp` sibling, then `rename` — a

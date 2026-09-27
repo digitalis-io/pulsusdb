@@ -5,16 +5,17 @@
 //! Every part of it is this type's, and the landing path states none of it
 //! again.
 //!
-//! Four review rounds found four ways past that rule: a retry sleep the
+//! Five review rounds found five ways past that rule: a retry sleep the
 //! deadline did not bound, a check the poll could slip past, a settlement task
-//! nobody joined, and — with each of those fixed where it was found — a read
-//! that found nothing announced, then the publication, then the poll that
-//! starts the attempt. The second and the fourth are one shape: **a deadline
-//! read, and the work started by a later poll**, with the announcement free to
-//! land in between.
+//! nobody joined, a read that found nothing announced followed by the
+//! publication and then the poll that starts the attempt, and — with each of
+//! those fixed where it was found — the attempt **already started**, polled
+//! once more after the deadline and sending then. All but the third are one
+//! shape: **a deadline read, and the work carried by a later poll**, with the
+//! announcement free to land in between.
 //!
 //! So publication and authorization are ordered against each other rather
-//! than checked:
+//! than checked, and no poll of an attempt is reached after the deadline:
 //!
 //! - **[`Deadline`] is the one point that decides.** Publication takes its
 //!   lock to write the deadline, and [`Deadline::authorize`] takes the same
@@ -34,6 +35,14 @@
 //!   and nothing else. The pattern is anchored so this comment is not one of
 //!   its own results — an unanchored one is, which is how the count read as
 //!   two.
+//! - **Creating an attempt and carrying it on are two different acts**, and
+//!   the deadline bounds both. The request leaves on whichever poll of the
+//!   attempt gets past the connection checkout, which is rarely its first, so
+//!   [`DrainWatch::attempt`] polls it only while no deadline is announced, and
+//!   prefers the announcement to it in every selection that can park. The
+//!   deadline arm compares the clock against the announced instant on each
+//!   poll rather than trusting a timer to have fired — a `sleep` of a duration
+//!   already spent is not ready at its first poll.
 //! - **Every wait between attempts is [`DrainWatch::sleep`]**, which ends at
 //!   the deadline whatever its own length. A wait that ended late would still
 //!   start nothing: the next attempt is authorized afresh.
@@ -42,6 +51,9 @@
 //!   announces the deadline. So no block reaches a closed queue, and a
 //!   settlement task — which only a pass can spawn — cannot appear after the
 //!   set of them has been joined.
+//! - **However many callers ask for it, the drain is one operation with one
+//!   deadline**, and each of them returns only once it has finished. See
+//!   [`DrainBoundary::shutdown`].
 //!
 //! **What the deadline does not bound is settling a block.** The spool copy is
 //! the push's only one, so the drain finishes writing it rather than dropping
@@ -65,8 +77,10 @@
 //!    shipped grace is ten seconds
 //!    (`crates/pulsus-server/src/serve.rs:61`). The ending is then the one
 //!    above, the uncertain one, since the deadline arm is ready at its first
-//!    poll. Closing it would mean holding [`Deadline`]'s lock across the
-//!    insert, where a shutdown would block on the network.
+//!    poll whenever the instant has passed. Closing it would mean holding
+//!    [`Deadline`]'s lock across the insert's own polls, where a shutdown
+//!    would wait on the network and the insert workers would stop
+//!    overlapping.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -155,6 +169,12 @@ pub(crate) struct DrainBoundary {
     background: Mutex<Vec<JoinHandle<()>>>,
     /// Settlements spawned from inside a pass.
     settlements: Mutex<Vec<JoinHandle<()>>>,
+    /// Held for the whole of [`Self::shutdown`], so concurrent callers are
+    /// one drain rather than several. Without it each caller empties the
+    /// handle vectors the others were about to take, and whichever loses the
+    /// race returns having awaited nothing — with the writer's tasks still
+    /// running and a settlement half written.
+    drain: tokio::sync::Mutex<()>,
 }
 
 /// Proof that an admission is inside the boundary: while one of these exists,
@@ -183,6 +203,7 @@ impl DrainBoundary {
             closed: AtomicBool::new(false),
             background: Mutex::new(Vec::new()),
             settlements: Mutex::new(Vec::new()),
+            drain: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -255,9 +276,20 @@ impl DrainBoundary {
     /// so by the time the deadline is announced every block that will ever be
     /// queued is queued, and no settlement can be spawned after the set of
     /// them is joined last.
+    ///
+    /// **Concurrent callers are one drain, and every one of them waits for
+    /// it.** The body runs under `drain`, so a second caller joins nothing
+    /// until the first has finished joining everything; and the deadline is
+    /// **the first one announced**, because a later publication would move an
+    /// instant workers have already read and bounded their waits by. A caller
+    /// that asked for a different grace still returns only once the writer is
+    /// drained, which is what `shutdown` means.
     pub(crate) async fn shutdown(&self, deadline: Duration) {
+        let _drain = self.drain.lock().await;
         self.close_admission().await;
-        self.publish(Instant::now() + deadline);
+        if self.deadline.read().is_none() {
+            self.publish(Instant::now() + deadline);
+        }
         let background = self.take_background();
         for task in background {
             if let Err(e) = task.await {
@@ -343,6 +375,31 @@ pub(crate) enum AttemptEnd<T> {
     BudgetElapsed,
     /// It finished inside both bounds.
     Done(T),
+}
+
+/// How an attempt the budget bounded ended, from what the bounded future
+/// answered. One place, because two of [`DrainWatch::attempt`]'s selections
+/// have this arm and a third reading of `Ok(None)` would be a third chance to
+/// call a refusal something else.
+fn end_of<T>(outcome: Result<Option<T>, tokio::time::error::Elapsed>) -> AttemptEnd<T> {
+    match outcome {
+        Ok(Some(value)) => AttemptEnd::Done(value),
+        // Refused: the deadline had passed when the work would have been
+        // built.
+        Ok(None) => AttemptEnd::NotStarted,
+        Err(_elapsed) => AttemptEnd::BudgetElapsed,
+    }
+}
+
+/// How an attempt stopped short of its own outcome — at the deadline, or with
+/// the signal gone. Whether anything may have been sent is the whole of the
+/// difference, and `started` is what records it.
+fn stopped_at<T>(started: &AtomicBool) -> AttemptEnd<T> {
+    if started.load(Ordering::Relaxed) {
+        AttemptEnd::Abandoned
+    } else {
+        AttemptEnd::NotStarted
+    }
 }
 
 /// One task's view of the deadline: the only way to run an attempt or to wait
@@ -435,30 +492,48 @@ impl DrainWatch {
                 // authorizes an attempt, and this is one reading of the
                 // instant it holds.
                 Some(at) => {
+                    // **The deadline arm reads the clock; it does not trust a
+                    // timer to have fired.** `tokio::time::sleep` for a
+                    // duration already spent is *not* ready at its first poll —
+                    // it yields to the scheduler once — and a timer whose
+                    // instant passed while this task was not scheduled has not
+                    // necessarily been marked elapsed either, because the
+                    // driver runs on the same thread the task does. Either way
+                    // a selection that trusted the sleep alone would fall
+                    // through to the arm below and poll the attempt, and that
+                    // is the poll that issues the request (issue #603 code
+                    // review round 7, finding 2). So this arm compares `at`
+                    // against the clock on every poll and keeps the sleep only
+                    // for the wake.
+                    //
                     // `std::time::Instant`: the deadline is the shutdown
-                    // caller's own clock reading, and a deadline already passed
-                    // leaves a zero-length sleep — ready at its first poll.
-                    let left = at.saturating_duration_since(Instant::now());
-                    let expire = tokio::time::sleep(left);
+                    // caller's own clock reading.
+                    let mut timer = Box::pin(tokio::time::sleep(
+                        at.saturating_duration_since(Instant::now()),
+                    ));
+                    let expire = std::future::poll_fn(move |cx| {
+                        if Instant::now() >= at {
+                            return std::task::Poll::Ready(());
+                        }
+                        timer.as_mut().poll(cx)
+                    });
                     tokio::pin!(expire);
                     return tokio::select! {
                         biased;
                         // The deadline arm first, so a passed deadline ends
-                        // the attempt at once rather than after however long
-                        // one poll of the work takes. It is not what keeps the
-                        // work from being created — `authorize` is.
-                        () = &mut expire => if started.load(Ordering::Relaxed) {
-                            AttemptEnd::Abandoned
-                        } else {
-                            AttemptEnd::NotStarted
-                        },
-                        outcome = &mut bounded => match outcome {
-                            Ok(Some(value)) => AttemptEnd::Done(value),
-                            // Refused: the deadline had passed when the work
-                            // would have been built.
-                            Ok(None) => AttemptEnd::NotStarted,
-                            Err(_elapsed) => AttemptEnd::BudgetElapsed,
-                        },
+                        // the attempt without one further poll of the work. It
+                        // is not what keeps the work from being created —
+                        // `authorize` is.
+                        //
+                        // What that costs: an attempt that had finished but
+                        // was not polled before the deadline is reported
+                        // abandoned rather than by its own outcome. That is an
+                        // over-report of uncertainty, which is the direction
+                        // this path errs in everywhere, and it needs the same
+                        // precondition as the send it prevents — a task left
+                        // unscheduled across the whole grace.
+                        () = &mut expire => stopped_at(&started),
+                        outcome = &mut bounded => end_of(outcome),
                     };
                 }
                 None => {
@@ -466,28 +541,43 @@ impl DrainWatch {
                     if let Some(barrier) = self.barrier.take() {
                         barrier();
                     }
-                    // Nothing read here decides anything, so the attempt is
-                    // polled first: that way a closed signal — the writer
-                    // dropped without a graceful shutdown — abandons an
-                    // attempt in flight rather than refusing to start one. A
-                    // deadline published between this read and that poll is
-                    // what `authorize` sees.
+                    // **The attempt is polled, and then the signal is
+                    // preferred while nothing else can happen. This is the
+                    // second half of the boundary's rule**: `authorize` keeps
+                    // an attempt from being *created* after the deadline, and
+                    // this keeps one already created from *sending* after it —
+                    // a different act, one or more polls further on, because
+                    // the request goes out of whichever poll of the attempt
+                    // gets past the connection checkout
+                    // (`crates/pulsus-clickhouse/src/client.rs:249`).
+                    //
+                    // One poll of the attempt, never waited on: that is what
+                    // creates it, and it is what makes a closed signal — the
+                    // writer dropped without a graceful shutdown — abandon an
+                    // attempt in flight rather than refuse to start one. The
+                    // `ready` arm cannot be reached while the first is, so
+                    // this parks on nothing.
                     tokio::select! {
                         biased;
-                        outcome = &mut bounded => return match outcome {
-                            Ok(Some(value)) => AttemptEnd::Done(value),
-                            Ok(None) => AttemptEnd::NotStarted,
-                            Err(_elapsed) => AttemptEnd::BudgetElapsed,
-                        },
+                        outcome = &mut bounded => return end_of(outcome),
+                        () = std::future::ready(()) => {}
+                    }
+                    // Then the wait, with the signal first. A publication that
+                    // lands while this is parked is what the next poll of it
+                    // takes, whenever that comes, and the top of this loop
+                    // reads the deadline and bounds everything after it by
+                    // that. Were the attempt polled first here, a task not
+                    // scheduled for the whole grace would wake with both arms
+                    // ready and issue its request past the deadline (issue
+                    // #603 code review round 7, finding 2).
+                    tokio::select! {
+                        biased;
                         changed = self.rx.changed() => {
                             if changed.is_err() {
-                                return if started.load(Ordering::Relaxed) {
-                                    AttemptEnd::Abandoned
-                                } else {
-                                    AttemptEnd::NotStarted
-                                };
+                                return stopped_at(&started);
                             }
                         }
+                        outcome = &mut bounded => return end_of(outcome),
                     }
                 }
             }
@@ -649,19 +739,26 @@ mod tests {
     /// poll without arranging any wake of its own, so the only thing that can
     /// poll it again is the selection holding it — which is the interleaving
     /// the case below is about.
-    struct SendsOnItsSecondPoll {
+    struct SendsOnceCheckedOut {
+        /// Set by the case: the checkout has come back, so the next poll of
+        /// this is the one that issues the request.
+        checked_out: Arc<AtomicBool>,
+        /// How many times this has been polled, so the case can tell it has
+        /// been created and parked.
         polls: Arc<AtomicU64>,
+        /// Set by the poll that issues the request.
         sent: Arc<AtomicBool>,
     }
 
-    impl Future for SendsOnItsSecondPoll {
+    impl Future for SendsOnceCheckedOut {
         type Output = u8;
 
         fn poll(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<u8> {
-            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if !self.checked_out.load(Ordering::SeqCst) {
                 return std::task::Poll::Pending;
             }
             self.sent.store(true, Ordering::SeqCst);
@@ -694,15 +791,18 @@ mod tests {
             .expect("build a current-thread runtime");
         runtime.block_on(async {
             let boundary = Arc::new(DrainBoundary::new());
+            let checked_out = Arc::new(AtomicBool::new(false));
             let polls = Arc::new(AtomicU64::new(0));
             let sent = Arc::new(AtomicBool::new(false));
             let attempt = {
                 let mut watch = boundary.watch();
+                let checked_out = checked_out.clone();
                 let polls = polls.clone();
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     watch
-                        .attempt(Duration::from_secs(600), || SendsOnItsSecondPoll {
+                        .attempt(Duration::from_secs(600), || SendsOnceCheckedOut {
+                            checked_out,
                             polls,
                             sent,
                         })
@@ -718,17 +818,21 @@ mod tests {
                 }
                 tokio::task::yield_now().await;
             }
-            assert_eq!(
-                polls.load(Ordering::SeqCst),
-                1,
-                "the attempt must be parked on its first poll before the drain begins"
+            assert!(
+                polls.load(Ordering::SeqCst) > 0,
+                "the attempt must have been created and polled before the drain \
+                 begins, or the case proves nothing about a later poll"
             );
             assert!(!sent.load(Ordering::SeqCst), "nothing has been sent yet");
 
-            // The drain begins with a positive grace, and the thread the
-            // attempt's task runs on is held past the deadline. No await
-            // between the two, so that task cannot run in between.
+            // The drain begins with a positive grace, the checkout comes back
+            // while the deadline is still ahead, and the thread the attempt's
+            // task runs on is held past that deadline. No await between the
+            // three, so that task cannot run until the hold ends — which is
+            // what "not scheduled for the whole grace" is. Its wake is already
+            // queued: the publication sent it.
             boundary.publish(Instant::now() + GRACE);
+            checked_out.store(true, Ordering::SeqCst);
             std::thread::sleep(GRACE + Duration::from_millis(30));
 
             let end: AttemptEnd<u8> = attempt.await.expect("the attempt's task completes");
@@ -736,7 +840,9 @@ mod tests {
             assert!(
                 !sent.load(Ordering::SeqCst),
                 "the attempt was polled again after the deadline had passed and \
-                 issued its request then"
+                 issued its request then (polls {}, end {:?})",
+                polls.load(Ordering::SeqCst),
+                end
             );
             assert_eq!(
                 end,

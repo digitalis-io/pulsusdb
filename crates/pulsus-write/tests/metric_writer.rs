@@ -1722,11 +1722,12 @@ async fn the_queue_charge_covers_the_escaped_labels_it_holds() {
 }
 
 /// Issue #603 code review, finding 4: a failed block's queue reservation must
-/// stay charged until its spool copy has been **written**. `SpoolWriter::write`
-/// maps every row into a second value vector and then a serialized byte
-/// vector, so releasing first lets a new admission take the allowance while
-/// the rows and both copies are still live — the bound would then permit more
-/// than it names, by the size of whatever is being spooled.
+/// stay charged until its spool copy has been **written**. The rows are what
+/// that write reads, so releasing first lets a new admission take the
+/// allowance while they are still live — the bound would then permit more than
+/// it names, by the size of whatever is being spooled. What the write holds on
+/// top of the rows is bounded, and `spool_stream_alloc.rs` is where that is
+/// measured.
 ///
 /// The seam is tokio's blocking pool: `tokio::fs` runs on it, this runtime has
 /// exactly one blocking thread, and the case holds that thread while it reads

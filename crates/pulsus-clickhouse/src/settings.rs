@@ -77,13 +77,53 @@ impl QuerySettings {
     /// (issue #603): [`Self::deduplicate_through_views`], plus the token
     /// the writer minted for that block — repeated byte-identical on every
     /// resend, so a resend of a block the server already accepted stores
-    /// nothing twice — plus the per-block row ceiling admission has already
-    /// refused a larger push against, so one push is never split into two
-    /// blocks.
+    /// nothing twice — plus **every limit that decides where one block
+    /// ends**, so one push is never split into two.
+    ///
+    /// **Three limits end a block, and only one of them counts rows.** The
+    /// server forms blocks as it parses the request body and emits one as
+    /// soon as any maximum is reached. Their names, defaults and the meaning
+    /// of `0` are read from the server's own `system.settings` at
+    /// 26.3.29.7 — the same catalogue the startup check reads, which is why
+    /// all three are in `pulsus_schema::REQUIRED_SERVER_NAMES` and none is
+    /// sent on the strength of a name somebody remembered:
+    ///
+    /// | name | default | `0` there |
+    /// |---|---|---|
+    /// | `max_insert_block_size` | 1048449 | not accepted — `NonZeroUInt64`; `max_insert_block_size_rows` is an alias of this name |
+    /// | `max_insert_block_size_bytes` | 0 | "setting does not participate in block formation" |
+    /// | `input_format_max_block_size_bytes` | 0 | "no limit in bytes" |
+    ///
+    /// So both byte limits are pinned to `0` and the row count to the
+    /// ceiling admission has already refused a larger push against: the row
+    /// count is the only thing left that can end a block, and no admitted
+    /// push reaches it. Pinned rather than inherited, exactly as the
+    /// deduplication pair is: the defaults make neither byte limit
+    /// participate, but a server profile may set either, and then a push
+    /// well inside the row ceiling becomes several blocks and a prefix of it
+    /// can commit alone.
+    ///
+    /// **What pinning them off costs.** A deployment that set a byte limit
+    /// to bound the memory one insert takes does not get it on this insert.
+    /// What bounds this block instead is the per-push byte ceiling
+    /// (`PULSUS_BATCH_BYTES`), which refuses the push whole before anything
+    /// is queued.
+    ///
+    /// **Nothing else divides one request into blocks.** The vendored client
+    /// flushes its buffer to the socket every `MIN_CHUNK_SIZE` bytes
+    /// (`vendor/clickhouse/src/insert.rs:17`), but those are transfer chunks
+    /// of one `INSERT … FORMAT RowBinary…` request rather than blocks, and
+    /// the condition that client states for an atomic insert is the row one
+    /// alone (`vendor/clickhouse/README.md:157`). Parallel parsing, which
+    /// forms blocks from several chunks at once, is documented in the same
+    /// catalogue for `TabSeparated`, `TSKV`, `CSV` and `JSONEachRow` only —
+    /// not for the `RowBinary` family this client writes.
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
             .set("max_insert_block_size", max_rows)
+            .set("max_insert_block_size_bytes", 0)
+            .set("input_format_max_block_size_bytes", 0)
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
