@@ -38,7 +38,9 @@
 //!
 //! **Backpressure/shutdown**: `queued_bytes` is reserved atomically at
 //! admission and released exactly once, by whichever ending settles the
-//! block. What is reserved is the whole block's cost, not its rows' alone
+//! block, through [`LandingBlock::release`] — which owns when, and is the
+//! only place on this path that subtracts. What is reserved is the whole
+//! block's cost, not its rows' alone
 //! ([`LANDING_BLOCK_OVERHEAD_BYTES`]), and a push with no rows makes no block
 //! and is charged for none. Every ending but a commit spools the block — it is
 //! the push's only copy — reports the claim its fate, and answers a waiting
@@ -188,7 +190,8 @@ pub(crate) struct LandingBlock {
     /// promotes are read back off them ([`promotion_keys`]).
     rows: Vec<MetricLandingRow>,
     /// Exactly what `reserve_queued_bytes` took for this block
-    /// ([`landing_charge`]). Released once, by whichever ending settles.
+    /// ([`landing_charge`]). Released once, and in one place —
+    /// [`LandingBlock::release`], which owns when.
     bytes: u64,
     /// [`QuerySettings::landing_insert`], built once here and sent
     /// byte-identical on every resend.
@@ -227,6 +230,44 @@ impl LandingBlock {
             waiter,
             admitted_at,
         }
+    }
+
+    /// **The one place a landing block's reservation is released, and the order
+    /// it is released in** (issue #603 code review round 10, finding 1).
+    ///
+    /// The charge is the queue's allowance for what this block holds, so it is
+    /// given back only once the block is gone: this consumes it, drops the rows
+    /// and the settings — everything the charge prices that grows with the push
+    /// — reports the claim, which is where the ticket's own charged vector goes,
+    /// and subtracts last. An ending that subtracted for itself would hand the
+    /// allowance to a new admission with its own rows still in memory, and with
+    /// the rows of every worker waiting on the registration mutex behind it, so
+    /// `PULSUS_INGEST_QUEUE_BYTES` would permit more than it names.
+    ///
+    /// The waiter is returned rather than answered here: the caller resolves it
+    /// last, so a sync caller reading its answer has by then seen the bytes
+    /// released and the claim reported. What crosses the release is that one
+    /// `oneshot` channel — a fixed term of [`LANDING_BLOCK_OVERHEAD_BYTES`],
+    /// jointly owned with the caller, and therefore outside any ordering this
+    /// writer could choose.
+    fn release(
+        self,
+        ctx: &LandingContext,
+        outcome: TargetOutcome,
+    ) -> Option<oneshot::Sender<Result<(), WriteError>>> {
+        let LandingBlock {
+            rows,
+            bytes,
+            settings,
+            claim,
+            waiter,
+            admitted_at: _,
+        } = self;
+        drop(rows);
+        drop(settings);
+        claim.settle(outcome);
+        ctx.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        waiter
     }
 }
 
@@ -1202,8 +1243,12 @@ async fn run_block(
 
 /// The commit exit: the landing block holds the push's rows, and the four
 /// targets are written by that insert's own processing.
+///
+/// **The promotion runs while the block is still charged.** It takes a mutex
+/// admission and every other worker's commit take too, so a worker can wait
+/// there holding a whole block; [`LandingBlock::release`] owns the rule and
+/// says what waiting there would otherwise cost.
 async fn commit_block(ctx: &Arc<LandingContext>, block: LandingBlock, latency: Duration) {
-    ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
     ctx.metrics
         .landing
         .record_flush(block.rows.len() as u64, block.bytes, latency);
@@ -1213,8 +1258,7 @@ async fn commit_block(ctx: &Arc<LandingContext>, block: LandingBlock, latency: D
             lru.insert(key);
         }
     }
-    block.claim.settle(TargetOutcome::Committed);
-    if let Some(waiter) = block.waiter {
+    if let Some(waiter) = block.release(ctx, TargetOutcome::Committed) {
         let _ = waiter.send(Ok(()));
     }
 }
@@ -1233,13 +1277,13 @@ async fn settle_block(
     cause: TerminalCause,
 ) {
     let (kind, outcome, msg) = fate.settle();
-    // The reservation is released AFTER the spool write returns, on its error
-    // path too (issue #603 code review, finding 4). The block's rows are what
-    // the write reads, one at a time, so they are live until it returns:
-    // releasing first would let a new admission take the allowance while they
-    // are, and `PULSUS_INGEST_QUEUE_BYTES` would permit more than it names.
-    // What the write itself holds on top of them is one chunk and one row —
-    // `writer::spool`'s `write_record` owns that bound.
+    // The spool write runs while the block is still charged, on its error path
+    // too (issue #603 code review, finding 4). The block's rows are what the
+    // write reads, one at a time, so they are live until it returns. What the
+    // write itself holds on top of them is one chunk and one row —
+    // `writer::spool`'s `write_record` owns that bound — and the release order
+    // that makes this the right place for it is
+    // [`LandingBlock::release`]'s.
     if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &block.rows, &msg).await {
         ctx.metrics
             .landing
@@ -1251,9 +1295,7 @@ async fn settle_block(
             "failed to spool a landing block to disk"
         );
     }
-    ctx.queued_bytes.fetch_sub(block.bytes, Ordering::AcqRel);
-    block.claim.settle(outcome);
-    if let Some(waiter) = block.waiter {
+    if let Some(waiter) = block.release(ctx, outcome) {
         let err = match cause {
             TerminalCause::ShuttingDown => WriteError::ShuttingDown,
             TerminalCause::Normal => match kind {
