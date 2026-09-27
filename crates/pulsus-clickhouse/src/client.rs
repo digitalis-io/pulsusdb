@@ -259,7 +259,7 @@ impl ChClient {
         // whose wait returned it. A single wait over the whole sequence cannot
         // say that, and classifying a deadline that fired during the metadata
         // read as post-send costs a caller the pre-send retry it was entitled
-        // to (issue #603 code review round 3).
+        // to.
         let deadline = tokio::time::Instant::now() + self.default_timeout;
         let timed_out =
             || ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout));

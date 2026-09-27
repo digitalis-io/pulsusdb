@@ -324,8 +324,23 @@ async fn query_stream_enforces_overall_deadline_on_a_stalled_query() {
     );
 }
 
+/// **A client deadline the metadata read cannot outrun keeps its own class.**
+/// A 1ns deadline is exceeded by any network round trip, and the first round
+/// trip an insert makes is the target's column-metadata read — so on a real
+/// server this deadline is always cut in acquisition, with the insert request
+/// never opened. Nothing can have committed, so the error stays the retryable
+/// `Timeout` it is and the caller keeps the pre-send resend it is entitled to.
+/// Reported as `InsertUncertain` instead, a log or trace writer would file a
+/// block that never left the process as "may have been stored" and stop
+/// retrying a stall it should retry (issue #603 code review round 3).
+///
+/// This is the half a live server settles: that the metadata read is a genuine
+/// round trip a deadline can cut. The other half — the same deadline once the
+/// insert request is open, which IS uncertainty — needs a server that reads a
+/// request and never answers, so both halves are pinned together against the
+/// hermetic mock in `pulsus-write`'s `landing_insert_settings.rs`.
 #[tokio::test]
-async fn insert_block_returns_insert_uncertain_when_the_client_deadline_fires() {
+async fn a_client_deadline_the_metadata_read_cannot_outrun_keeps_its_own_class() {
     skip_unless_live!();
     let table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_insert_timeout");
 
@@ -346,12 +361,11 @@ async fn insert_block_returns_insert_uncertain_when_the_client_deadline_fires() 
         .expect("create table");
 
     // `insert_block` has no SQL surface to inject a literal `sleep()`
-    // (unlike the SELECT-based deadline test above), so this proves the
-    // same client-side `tokio::time::timeout` wrapper by making an
-    // unrealistically small deadline (1ns) certain to be exceeded by any
-    // real network round trip — including the mandatory insert-time
-    // schema-metadata fetch (validation is enabled by default on a fresh
-    // client with an empty metadata cache).
+    // (unlike the SELECT-based deadline test above), so this drives the
+    // client-side deadline by making an unrealistically small one (1ns)
+    // certain to be exceeded by the mandatory insert-time schema-metadata
+    // fetch, which is the first thing the insert does (validation is enabled
+    // by default on a fresh client with an empty metadata cache).
     let mut cfg = test_config();
     cfg.query_timeout = Duration::from_nanos(1);
     let client = ChClient::new(cfg).await.expect("connect (tiny deadline)");
@@ -366,17 +380,19 @@ async fn insert_block_returns_insert_uncertain_when_the_client_deadline_fires() 
         .await
         .expect_err("insert_block must not silently succeed within a 1ns deadline");
 
-    // Load-bearing assertion (issue #3 fix plan, finding 2): the failure
-    // must be the non-retryable `InsertUncertain`, never a bare retryable
-    // `Timeout` — a caller retrying on `is_retryable()` would otherwise
-    // duplicate the (possibly partially-committed) block.
+    // Load-bearing assertions: the class the phase earns, and the
+    // retryability the resend loop reads. `InsertUncertain` here would be a
+    // block reported "may have committed" that provably never left the
+    // process.
     assert!(
-        matches!(err, ChError::InsertUncertain(_)),
-        "expected InsertUncertain (uncertain commit fate), got {err:?}"
+        matches!(err, ChError::Timeout(_)),
+        "expected the deadline's own Timeout, not a downgrade to uncertainty, \
+         got {err:?}"
     );
     assert!(
-        !err.is_retryable(),
-        "InsertUncertain must never be retried (docs/schemas.md §2.2/§8)"
+        err.is_retryable(),
+        "a deadline proven to precede transmission keeps its retryable class: \
+         {err:?}"
     );
 }
 
