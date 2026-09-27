@@ -42,12 +42,6 @@
 //! copy — reports the claim its fate, and answers a waiting sync caller
 //! `500`.
 
-// **This commit only.** The admission below is stubbed whole, so the items
-// the stubbed part reads — imports, the two value-type constants, the
-// millisecond clock and two `Shared` fields — have no reader here. They are
-// read by the code the next commit adds, and this attribute goes with it.
-#![allow(unused_imports, dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -415,24 +409,270 @@ impl MetricWriter {
 
     /// Admits `batch` as one sealed landing block under one atomic byte
     /// reservation. `mode` selects sync- versus async-mode admission.
-    ///
-    /// **Stubbed whole.** The suppression guard, the descriptor selection,
-    /// the byte reservation, the series decisions and the landing rows all
-    /// arrive with the code, so a case that asserts any of them fails on what
-    /// it asserts rather than on a symbol that does not exist. What is here is
-    /// the shape the cases call: an empty block handed to the equally stubbed
-    /// [`Self::queue_block`], and a sync caller answered a stub failure rather
-    /// than having its waiter dropped — the shipped join at
-    /// `writer::mod::join_generations` debug-asserts on a waiter dropped
-    /// unsettled, and a case tripping that would fail on the invariant
-    /// instead of on its own assertion.
     fn admit_batch(
         &self,
         batch: ParsedMetrics,
         mode: AdmitMode,
         push: PushHeaders,
     ) -> Result<Admitted, AdmitRefusal> {
-        let _ = (&batch, &push);
+        if self.shared.shutting_down.load(Ordering::Acquire) {
+            return Err(AdmitRefusal::Backpressure);
+        }
+
+        // Every row of a push carries the same stamp, so the block lies in
+        // one partition.
+        let received_ms = now_unix_millis();
+
+        // Issue #494: the claim, taken before the byte reservation so a
+        // request refused by backpressure leaves no claim behind. What this
+        // change leaves exactly as it shipped is everything about a
+        // CLIENT's re-push: its suppression, its responses and its index.
+        //
+        // Suppression applies to the rows where duplication is harmful and
+        // not to the one where omission is: a suppressed push stores no
+        // sample, series or histogram row, and still lands its descriptors.
+        let mut suppressed: Option<Suppressed> = None;
+        let mut guard = match &self.shared.dedup {
+            Some(dedup) => {
+                let id = push_dedup::metric_identity(&batch, &push);
+                let rows = (batch.samples.len() + batch.hist_samples.len()) as u64;
+                match dedup.admit(id, mode.wait_mode()) {
+                    Admission::Admit(guard) => Some(guard),
+                    Admission::SuppressedSettled(outcome) => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Settled(outcome));
+                        None
+                    }
+                    Admission::SuppressedPending { guard, rx } => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Pending(guard, rx));
+                        None
+                    }
+                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
+                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
+                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
+                }
+            }
+            None => None,
+        };
+
+        // A push's descriptors are its parser's metadata entries — one per
+        // metric name per request already — locally deduped to the last
+        // occurrence per name, and gated, cached and promoted by nothing.
+        // Every push emits them: the table is a
+        // `ReplacingMergeTree(updated_ns)` keyed on `metric_name`, so a
+        // repeated descriptor collapses on merge, while NOT writing one can
+        // be wrong, because the version is a receiver clock the push
+        // identity deliberately excludes.
+        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
+        for meta in &batch.metadata {
+            last_by_name.insert(&meta.metric_name, meta);
+        }
+        let descriptors: Vec<&MetricMetadata> = last_by_name.into_values().collect();
+        let metadata_bytes: u64 = descriptors
+            .iter()
+            .map(|m| MetricMetadataRow::est_source_bytes(m))
+            .sum();
+
+        // The suppressed push stops here: its samples are already stored by
+        // the push it repeats, and the only thing it still owes is its
+        // descriptors. That insert carries no claim and no waiter — the
+        // caller is answered with the ORIGINAL push's outcome — and if it
+        // fails nothing of it is stored, so the next push carrying the same
+        // descriptors emits them again.
+        if let Some(suppressed) = suppressed {
+            return Ok(Admitted::Suppressed(suppressed));
+        }
+
+        self.shared
+            .metrics
+            .collisions_total
+            .fetch_add(batch.collisions, Ordering::Relaxed);
+        self.shared
+            .metrics
+            .rejected_total
+            .fetch_add(batch.rejected, Ordering::Relaxed);
+
+        // Reserve-before-materialize: estimate bytes and decide which
+        // series are cache misses BEFORE cloning anything into a row shape.
+        // A landing row costs what the target row it becomes costs, so the
+        // queue keeps today's units.
+        let sample_bytes: u64 = batch
+            .samples
+            .iter()
+            .map(MetricSampleRow::est_source_bytes)
+            .sum();
+        let hist_sample_bytes: u64 = batch
+            .hist_samples
+            .iter()
+            .map(MetricHistSampleRow::est_source_bytes)
+            .sum();
+
+        // An exact `(metric_name, fingerprint) -> &SeriesRef` index, built
+        // once per admission and consulted per touched bucket. One
+        // `SeriesRef` serves whichever of the float and histogram samples
+        // reference that `(metric_name, fingerprint)`.
+        let series_by_key: HashMap<(&str, Fingerprint), &SeriesRef> = batch
+            .series
+            .iter()
+            .map(|s| ((s.metric_name.as_ref(), s.fingerprint), s))
+            .collect();
+
+        // Buckets are derived per-*sample*, not per-series, so a
+        // backfilled/straddling request emits one kind-2 row per touched
+        // `(metric_name, fingerprint, bucket, value_type)`. Both float
+        // samples (`value_type = 0`) and native-histogram samples
+        // (`value_type = 1`) drive registration, so a series carrying both
+        // in one bucket registers BOTH rows.
+        let mut seen_in_request: HashSet<SeriesKey> = HashSet::new();
+        let mut new_series: Vec<(&SeriesRef, i64, u8)> = Vec::new();
+        {
+            let mut lru = self
+                .shared
+                .series_lru
+                .lock()
+                .expect("series lru mutex poisoned");
+            let float_keys = batch.samples.iter().map(|s| {
+                (
+                    &s.metric_name,
+                    s.fingerprint,
+                    s.unix_milli,
+                    VALUE_TYPE_FLOAT,
+                )
+            });
+            let hist_keys = batch.hist_samples.iter().map(|h| {
+                (
+                    &h.metric_name,
+                    h.fingerprint,
+                    h.unix_milli,
+                    VALUE_TYPE_HISTOGRAM,
+                )
+            });
+            for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
+                let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
+                let key: SeriesKey = (metric_name.clone(), fingerprint, bucket, value_type);
+                if !seen_in_request.insert(key.clone()) {
+                    continue; // already queued by an earlier sample this request
+                }
+                if lru.contains(&key) {
+                    self.shared
+                        .metrics
+                        .series_lru_hits_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                self.shared
+                    .metrics
+                    .series_lru_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let Some(series_ref) = series_by_key
+                    .get(&(metric_name.as_ref(), fingerprint))
+                    .copied()
+                else {
+                    // The receiver's contract requires a `SeriesRef` for
+                    // every distinct series a request's samples touch — the
+                    // writer never panics on a caller-side contract
+                    // violation, it just cannot register a series it was
+                    // never told the labels of. The sample is still
+                    // admitted below.
+                    continue;
+                };
+                new_series.push((series_ref, bucket, value_type));
+            }
+        }
+        let series_bytes: u64 = new_series
+            .iter()
+            .map(|(s, _, _)| MetricSeriesRow::est_source_bytes(s))
+            .sum();
+
+        let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
+        let total_rows =
+            (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
+                as u64;
+
+        // Atomic reservation: reserve first, roll back on overflow.
+        super::reserve_queued_bytes(
+            &self.shared.queued_bytes,
+            &self.shared.metrics.backpressure_total,
+            total_bytes,
+            self.shared.runtime.queue_bytes_limit,
+        )
+        .map_err(AdmitRefusal::from)?;
+
+        if self.shared.shutting_down.load(Ordering::Acquire) {
+            self.shared
+                .queued_bytes
+                .fetch_sub(total_bytes, Ordering::AcqRel);
+            return Err(AdmitRefusal::Backpressure);
+        }
+
+        // Reservation secured: only now materialize the rows.
+        let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows as usize);
+        rows.extend(
+            batch
+                .samples
+                .iter()
+                .map(|s| MetricLandingRow::float_sample(received_ms, s)),
+        );
+        rows.extend(
+            batch
+                .hist_samples
+                .iter()
+                .map(|h| MetricLandingRow::hist_sample(received_ms, h)),
+        );
+        let mut promote: Vec<SeriesKey> = Vec::with_capacity(new_series.len());
+        for (series, bucket, value_type) in &new_series {
+            rows.push(MetricLandingRow::series(
+                received_ms,
+                series,
+                *bucket,
+                *value_type,
+            ));
+            promote.push((
+                Arc::from(series.metric_name.as_ref()),
+                series.fingerprint,
+                *bucket,
+                *value_type,
+            ));
+        }
+        rows.extend(
+            descriptors
+                .iter()
+                .map(|m| MetricLandingRow::metadata(received_ms, m)),
+        );
+
+        if !new_series.is_empty() {
+            self.shared
+                .metrics
+                .series_registrations_total
+                .fetch_add(new_series.len() as u64, Ordering::Relaxed);
+        }
+        if !descriptors.is_empty() {
+            self.shared
+                .metrics
+                .metadata_upserts_total
+                .fetch_add(descriptors.len() as u64, Ordering::Relaxed);
+        }
+
+        // A valid push with no rows of any kind makes no block and no
+        // insert: its claim seals with no targets, completes at admission,
+        // and it is answered a success.
+        if rows.is_empty() {
+            self.shared
+                .queued_bytes
+                .fetch_sub(total_bytes, Ordering::AcqRel);
+            if let Some(guard) = guard {
+                guard.seal();
+            }
+            return Ok(Admitted::Stored(Vec::new()));
+        }
+
+        let mut claim = ClaimTicket::new(self.shared.dedup.clone(), true);
+        if let Some(g) = guard.as_ref() {
+            claim.push(g.key());
+        }
+        note_target(&mut guard, true);
+
         let mut receivers = Vec::new();
         let waiter = if mode == AdmitMode::Sync {
             let (tx, rx) = oneshot::channel();
@@ -441,13 +681,14 @@ impl MetricWriter {
         } else {
             None
         };
-        self.queue_block(
-            Vec::new(),
-            0,
-            ClaimTicket::new(self.shared.dedup.clone(), true),
-            waiter,
-            Vec::new(),
-        );
+
+        self.queue_block(rows, total_bytes, claim, waiter, promote);
+
+        // Arms the claim: from here a drop no longer removes it, and the
+        // target set is closed.
+        if let Some(guard) = guard {
+            guard.seal();
+        }
         Ok(Admitted::Stored(receivers))
     }
 
