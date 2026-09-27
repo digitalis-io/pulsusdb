@@ -80,8 +80,9 @@ impl QuerySettings {
     /// nothing twice — plus **every limit that decides where one block
     /// ends**, so one push is never split into two.
     ///
-    /// **Seven settings end a block, and only two of them count rows.** The
-    /// server forms blocks as it parses the request body, and its own entry
+    /// **Seven settings decide where a block ends or whether it is
+    /// deduplicated, and only two of them count rows.** The server forms
+    /// blocks as it parses the request body, and its own entry
     /// for `max_insert_block_size` states when one is emitted: "A block is
     /// emitted when either condition is met: Min thresholds (AND): Both
     /// min_insert_block_size_rows AND min_insert_block_size_bytes are
@@ -89,15 +90,17 @@ impl QuerySettings {
     /// max_insert_block_size_bytes is reached". Three more names carry their
     /// own emit rule. Every default and quotation below is read from the
     /// server's own `system.settings` at 26.3.29.7 — the same catalogue the
-    /// startup check reads, which is why each is in
+    /// startup check reads, which is why each of the seven is in
     /// `pulsus_schema::REQUIRED_SERVER_NAMES` and none is sent on the
-    /// strength of a name somebody remembered:
+    /// strength of a name somebody remembered. The two lists are checked
+    /// against each other, both ways, by
+    /// `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends`:
     ///
     /// | name | default | pinned to | what its own entry says |
     /// |---|---|---|---|
-    /// | `max_insert_block_size` | 1048449 | `max_rows` | the maximum pair's row half; `max_insert_block_size_rows` is an alias of this name, and `0` is not accepted (`NonZeroUInt64`) |
+    /// | `max_insert_block_size` | 1048449 | `max_rows` | the maximum pair's row half; `max_insert_block_size_rows` carries `alias_for = max_insert_block_size` in the same catalogue, and `0` is not accepted (`NonZeroUInt64`) |
     /// | `max_insert_block_size_bytes` | 0 | `0` | "0 — setting does not participate in block formation" |
-    /// | `min_insert_block_size_rows` | 1048449 | `max_rows` | the minimum pair's row half, emitting only when both halves are reached |
+    /// | `min_insert_block_size_rows` | 1048449 | `max_rows` | the minimum pair's row half — its entry states the same emit rule, quoted above: the pair emits only when both halves are reached |
     /// | `min_insert_block_size_bytes` | 268402944 | `0` | "0 — setting does not participate in block formation" |
     /// | `input_format_max_block_size_bytes` | 0 | `0` | "Limits the size of the blocks formed during data parsing in input formats in bytes … 0 means no limit in bytes" |
     /// | `input_format_max_block_wait_ms` | 0 | `0` | "Limits the maximum time in milliseconds to wait before emitting a block during parsing in row-based input formats. 0 means no limit." |
@@ -142,8 +145,9 @@ impl QuerySettings {
     /// | `async_insert_deduplicate`, `async_insert_max_data_size`, `async_insert_poll_timeout_ms`, `wait_for_async_insert` | each takes effect only for an asynchronous insert, which the pin above rules out |
     /// | `insert_deduplicate` | `deduplicate_insert`'s own entry: "The setting overrides `insert_deduplicate` and `async_insert_deduplicate` settings", and this insert pins it to `enable` |
     /// | `deduplicate_insert_select` | its entry scopes it to `INSERT SELECT`; this is `INSERT … FORMAT RowBinary…` |
-    /// | `input_format_parallel_parsing`, `max_parsing_threads` | "Supported only for TabSeparated (TSV), TSKV, CSV and JSONEachRow formats" — not the `RowBinary` family this client writes |
-    /// | `min_insert_block_size_rows_for_materialized_views`, `min_insert_block_size_bytes_for_materialized_views`, `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push |
+    /// | `input_format_parallel_parsing` | its entry: "Supported only for TabSeparated (TSV), TSKV, CSV and JSONEachRow formats" — not the `RowBinary` family this client writes |
+    /// | `max_parsing_threads` | its entry scopes it to "input formats that support parallel parsing", which is the four above |
+    /// | `min_insert_block_size_rows_for_materialized_views`, `min_insert_block_size_bytes_for_materialized_views`, `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push. The part-per-thread case the third one's entry names needs `max_insert_threads`, whose own entry scopes it to `INSERT SELECT` |
     /// | `max_partitions_per_insert_block` | it refuses a block, it does not split one; every row of a push carries one `received_ms`, so the block lies in one partition |
     ///
     /// **How the set was derived, and what it does not close.** Two queries

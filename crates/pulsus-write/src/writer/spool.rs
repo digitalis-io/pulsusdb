@@ -59,17 +59,20 @@ pub(crate) trait SpoolEncode: Sync {
     /// The same shape, written **into the sink** rather than returned
     /// (issue #603 code review round 8, finding 2).
     ///
-    /// The default materialises [`Self::to_spool_value`] first, which costs a
-    /// value tree bounded by the row's own fields. A row carrying an array
-    /// whose length the *push* chooses overrides this and writes its fields
-    /// and arrays element by element, so neither the value nor the output
-    /// buffer grows with it: `MetricLandingRow` does, because an accepted
-    /// native histogram may carry 65,536 custom bucket bounds in one row.
+    /// The default materialises [`Self::to_spool_value`] first: one row's
+    /// whole value tree, and then its text in the chunk. `MetricLandingRow`
+    /// overrides it and writes its fields and arrays element by element,
+    /// because an accepted native histogram may carry 65,536 custom bucket
+    /// bounds in one row, and the queue reservation held while the file is
+    /// written covers that block's rows alone.
     ///
-    /// **The default is the nine shipped row shapes' encoding and stays
-    /// theirs.** They are the log, trace and per-target metric rows, whose
-    /// spooling is not the landing path this bound is about; overriding them
-    /// is a change to shipped behaviour with no finding behind it.
+    /// **Scope, so the default is not read as a statement about size.** The
+    /// nine shipped row shapes keep it: the log rows, the trace rows and the
+    /// per-target metric rows. Their spooling is the log and trace writers'
+    /// own path, which this change does not touch and whose peak is not
+    /// measured by the case behind this method
+    /// (`crates/pulsus-write/tests/spool_stream_alloc.rs`, the metrics
+    /// landing queue's bound).
     fn write_spool_json(
         &self,
         out: &mut SpoolSink,

@@ -599,8 +599,9 @@ impl MetricWriter {
         // The two per-push ceilings, counted over all four kinds, and decided
         // **before** either branch below queues anything (issue #603 code
         // review, finding 5). At or above the row limit the block would not be
-        // strictly under the value `max_insert_block_size` is pinned to, and
-        // the server would split it. Returning here drops the un-sealed guard,
+        // strictly under the count both pinned row limits carry
+        // (`QuerySettings::landing_insert`), and the server would end a block
+        // at it. Returning here drops the un-sealed guard,
         // which removes the claim, so the client's retry of an unstored push is
         // stored rather than suppressed — and no bytes have been reserved yet.
         //

@@ -139,9 +139,11 @@ pub struct WriterRuntime {
     /// the metrics landing queue, so the landing inserts in flight at once.
     pub metrics_landing_inserters: u32,
     /// `PULSUS_METRICS_LANDING_MAX_ROWS` (issue #603): the per-push landing
-    /// row ceiling, and the `max_insert_block_size` every landing insert
-    /// pins, so an admitted push is strictly under the value the server
-    /// would split a block at.
+    /// row ceiling, and the value **both** row limits every landing insert
+    /// pins carry (`max_insert_block_size` and `min_insert_block_size_rows`
+    /// — `QuerySettings::landing_insert` owns the set and says why), so an
+    /// admitted push is strictly under the count the server would end a
+    /// block at.
     pub metrics_landing_max_rows: u64,
     /// The wall-clock bound on one metrics landing block: the queue wait,
     /// every attempt and every sleep, measured from the push's admission
