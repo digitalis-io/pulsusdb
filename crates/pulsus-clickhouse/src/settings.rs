@@ -152,6 +152,24 @@ impl QuerySettings {
         self.iter()
     }
 
+    /// The bytes this settings set's own allocations hold: the vector by
+    /// **capacity**, and every key and value string by capacity.
+    ///
+    /// Introspection for one caller (same posture as [`Self::get`] and
+    /// [`Self::entries`]): the metrics landing path charges its queue for
+    /// everything a sealed block retains, one settings set included, and the
+    /// case that prices a block walks it with this. A figure over the strings'
+    /// lengths would understate what the allocator holds, which is what the
+    /// charge has to cover.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.0.capacity() as u64 * std::mem::size_of::<(String, String)>() as u64
+            + self
+                .0
+                .iter()
+                .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
+                .sum::<u64>()
+    }
+
     /// Applies every `(key, value)` pair to a `clickhouse::query::Query`
     /// builder as per-request settings (sent as HTTP query parameters, not
     /// SQL text).

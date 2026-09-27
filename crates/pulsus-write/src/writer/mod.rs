@@ -81,6 +81,7 @@
 mod backfill;
 mod buffer;
 mod config;
+mod drain;
 mod error;
 mod metric;
 mod metrics;

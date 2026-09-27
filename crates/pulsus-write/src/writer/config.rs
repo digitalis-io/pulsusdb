@@ -92,6 +92,17 @@ pub struct WriterRuntime {
     pub retry_max_attempts: u32,
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
+    /// A fixed seed for the metrics landing worker's retry-jitter generator.
+    /// `None` in production — [`Self::from_config`] never sets it and no
+    /// configuration key reaches it — so what ships is the clock-seeded
+    /// full-jitter draw.
+    ///
+    /// The seam exists for the same reason [`Self::spool_dir`]'s does: a case
+    /// that has to hold a block in the retry sleep cannot pin a delay drawn at
+    /// random, and full jitter permits a zero delay — a legal draw that a case
+    /// pinned to "exactly one retry" fails on.
+    #[doc(hidden)]
+    pub retry_jitter_seed: Option<u64>,
     pub lru_capacity: usize,
     pub spool_dir: PathBuf,
     /// The registration-backfill re-insert cadence (issues #134/#139),
@@ -152,6 +163,9 @@ impl WriterRuntime {
             retry_max_attempts: RETRY_MAX_ATTEMPTS,
             retry_base_delay: RETRY_BASE_DELAY,
             retry_max_delay: RETRY_MAX_DELAY,
+            // A placeholder value, so the case that asserts nothing
+            // configures this seam fails on what it asserts.
+            retry_jitter_seed: Some(0),
             lru_capacity: LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
             backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
@@ -220,6 +234,16 @@ mod tests {
         assert_eq!(runtime.ingest_dedup_window, Duration::from_secs(300));
         assert_eq!(runtime.ingest_dedup_max_bytes, 16 * 1024 * 1024);
         assert!(runtime.ingest_dedup);
+    }
+
+    /// The jitter seed is a test seam and nothing configures it: what ships
+    /// draws its retry delays from the clock-seeded generator.
+    #[test]
+    fn from_config_leaves_the_retry_jitter_seed_unset() {
+        assert_eq!(
+            WriterRuntime::from_config(&WriterConfig::default()).retry_jitter_seed,
+            None
+        );
     }
 
     #[test]

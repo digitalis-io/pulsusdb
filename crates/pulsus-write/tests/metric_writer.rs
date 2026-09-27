@@ -76,6 +76,10 @@ impl Step {
 /// is a constant behaviour. Records every call's table, rows and settings.
 struct MockInserter {
     script: Vec<Step>,
+    /// Whether a call's table, rows and settings are kept. A case pushing
+    /// millions of rows past this mock would otherwise hold a JSON copy of
+    /// every one; it still counts its calls.
+    record: bool,
     calls: AtomicUsize,
     rows: Mutex<Vec<Vec<serde_json::Value>>>,
     settings: Mutex<Vec<Vec<(String, String)>>>,
@@ -88,8 +92,22 @@ struct MockInserter {
 
 impl MockInserter {
     fn new(script: Vec<Step>) -> Arc<Self> {
+        Self::built(script, true)
+    }
+
+    fn always(act: Act) -> Arc<Self> {
+        Self::new(vec![Step::now(act)])
+    }
+
+    /// [`Self::always`], keeping no copy of what it was handed.
+    fn always_unrecorded(act: Act) -> Arc<Self> {
+        Self::built(vec![Step::now(act)], false)
+    }
+
+    fn built(script: Vec<Step>, record: bool) -> Arc<Self> {
         Arc::new(MockInserter {
             script,
+            record,
             calls: AtomicUsize::new(0),
             rows: Mutex::new(Vec::new()),
             settings: Mutex::new(Vec::new()),
@@ -97,10 +115,6 @@ impl MockInserter {
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             empty: QuerySettings::new(),
         })
-    }
-
-    fn always(act: Act) -> Arc<Self> {
-        Self::new(vec![Step::now(act)])
     }
 
     fn call_count(&self) -> usize {
@@ -151,21 +165,23 @@ impl<R: ChRow> BlockInserter<R> for MockInserter {
         extra: &'a QuerySettings,
     ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        self.tables
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(table.to_string());
-        self.rows.lock().expect("mock mutex poisoned").push(
-            rows.iter()
-                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-                .collect(),
-        );
-        self.settings.lock().expect("mock mutex poisoned").push(
-            extra
-                .entries()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        );
+        if self.record {
+            self.tables
+                .lock()
+                .expect("mock mutex poisoned")
+                .push(table.to_string());
+            self.rows.lock().expect("mock mutex poisoned").push(
+                rows.iter()
+                    .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+                    .collect(),
+            );
+            self.settings.lock().expect("mock mutex poisoned").push(
+                extra
+                    .entries()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
         let step = *self
             .script
             .get(call)
@@ -972,31 +988,51 @@ async fn the_budget_expiring_inside_an_attempt_reports_an_unknown_fate() {
 ///
 /// Two things have to hold for that, and each run here would fail on a
 /// different one. The sleep must be bounded by the announced deadline, or it
-/// runs on to its own draw and the drain waits for it. And an expired deadline
-/// must be checked **before the next attempt is built**, not only before the
-/// sleep: `bound_by_deadline` on an expired deadline still polls the attempt
-/// once, because a timeout polls its inner future before its timer, and that
-/// one poll is an insert starting after the drain deadline.
+/// runs on to its own draw and the drain waits for it. And an attempt must not
+/// be created once the deadline has passed: a timeout polls its inner future
+/// before its own timer, so a zero-length bound around a fresh attempt starts
+/// an insert. `DrainWatch` owns both.
 ///
-/// The backoff is a full-jitter draw in `[0, 10 s]`, so its length is not a
-/// figure this case fixes. The clock is paused and the case only yields until
-/// it announces the deadline, so the draw cannot elapse in between — except the
-/// single draw of 0 ms, which is why the attempts so far are captured rather
-/// than written down. **What is fixed for every draw: no attempt starts after
-/// the deadline, and the drain costs no clock time.**
+/// **The jitter is seeded, so each run draws the same delays**
+/// (`WriterRuntime::retry_jitter_seed`, the values pinned by
+/// `a_seeded_jitter_draw_is_the_same_every_run`). Full jitter draws from
+/// `[0, 10 s]` with zero included, and a case pinned to a delay it happened to
+/// draw fails on the zero one (issue #603 code review round 5, finding 5) — so
+/// one run here is seeded to draw exactly that zero first delay, and it takes
+/// its second attempt before the deadline rather than its first.
 ///
 /// The fate the attempts left is what settles: a retryable pre-send failure is
 /// provably not sent, and an uncertain attempt keeps its own message.
 #[tokio::test(start_paused = true)]
 async fn a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline() {
-    for (name, act, dir, message) in [
+    for (name, act, dir, message, seed, retries) in [
         (
             "retryable",
             Act::Retryable,
             "poison",
             "the writer shut down before the block was sent",
+            1u64,
+            1usize,
         ),
-        ("uncertain", Act::Uncertain, "uncertain", "mock uncertain"),
+        (
+            "uncertain",
+            Act::Uncertain,
+            "uncertain",
+            "mock uncertain",
+            1,
+            1,
+        ),
+        // The permitted zero first delay: the block is not held by the first
+        // sleep at all, takes its second attempt, and is held by the second
+        // sleep. Two attempts and two retries, both before the deadline.
+        (
+            "a zero first delay",
+            Act::Retryable,
+            "poison",
+            "the writer shut down before the block was sent",
+            10_658,
+            2,
+        ),
     ] {
         let cfg = WriterConfig {
             metrics_landing_retries: 5,
@@ -1007,6 +1043,7 @@ async fn a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline() {
         let mut runtime = runtime_at(&cfg, &root);
         runtime.retry_base_delay = Duration::from_secs(10);
         runtime.retry_max_delay = Duration::from_secs(10);
+        runtime.retry_jitter_seed = Some(seed);
         // No suppression index, so the insert worker's own sleep is the only
         // timer on this runtime: nothing else can advance the paused clock
         // while the case measures what the drain costs.
@@ -1017,17 +1054,21 @@ async fn a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline() {
         let wait = writer
             .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
             .expect("queue has room");
-        settle_until(|| writer.metrics().landing.retries_total >= 1).await;
+        settle_until(|| writer.metrics().landing.retries_total as usize >= retries).await;
         // The counter is bumped immediately before the sleep; the yields let
         // the worker reach it.
         settle_until(|| false).await;
         assert_eq!(
-            writer.metrics().landing.retries_total,
-            1,
-            "{name}: the case needs a block held in the retry sleep"
+            writer.metrics().landing.retries_total as usize,
+            retries,
+            "{name}: the case needs a block held in the retry sleep after \
+             exactly {retries} of them"
         );
         let attempts = inserter.call_count();
-        assert!(attempts >= 1, "{name}: the first attempt ran");
+        assert_eq!(
+            attempts, retries,
+            "{name}: one attempt per retry so far, and no more"
+        );
 
         let started = Instant::now();
         let shutdown = {
@@ -1184,7 +1225,230 @@ async fn a_block_sent_after_the_queue_closed_is_settled_by_the_admitting_task() 
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// What one push in [`the_drain_accounts_for_every_push_it_admitted`] carries:
+/// descriptors whose help text is [`RACE_HELP_BYTES`] long.
+///
+/// **Bulk the writer must copy, and nothing else.** A push is charged, refused
+/// and materialized by this text and by no per-series work, so a pusher spends
+/// its time between admission's look at the gate and its hand-off to the queue
+/// — which is the stretch the drain has to be raced against — and the block's
+/// spool copy, if the drain files one, is a write of the same bulk.
+const RACE_DESCRIPTORS: usize = 8;
+/// One descriptor's help text. Eight of these are inside `PULSUS_BATCH_BYTES`
+/// at its default of 16 MiB.
+const RACE_HELP_BYTES: usize = 512 * 1024;
+
+/// Built once per pusher and re-stamped per push rather than built each time,
+/// so the copying a pusher does inside admission is not swamped by the copying
+/// it does to prepare one.
+fn wide_template() -> ParsedMetrics {
+    let help = "h".repeat(RACE_HELP_BYTES);
+    ParsedMetrics {
+        metadata: (0..RACE_DESCRIPTORS)
+            .map(|i| MetricMetadata {
+                metric_name: Arc::from(format!("m{i}").as_str()),
+                metric_type: "counter".to_string(),
+                help: help.clone(),
+                unit: "s".to_string(),
+                updated_ns: 1,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// [`wide_template`] with its descriptors' versions moved on, so no two pushes
+/// are the same body.
+fn restamped(template: &ParsedMetrics, push: u128) -> ParsedMetrics {
+    let mut batch = template.clone();
+    for descriptor in &mut batch.metadata {
+        descriptor.updated_ns = push as i64;
+    }
+    batch
+}
+
+/// A push the drain raced is either refused or accounted for: the instant
+/// `shutdown` returns, not one byte of any admitted push is still reserved.
+///
+/// Issue #603 code review round 5, finding 3. Admission and the drain are
+/// raced naturally here — no seam reaches inside either — across several
+/// threads, because on one thread admission cannot be interleaved with
+/// anything: its body never awaits. What makes the assertion exact rather
+/// than probable is that `queue_bytes` is reserved inside admission and
+/// released by whichever ending settles the block, so a non-zero reading the
+/// moment the drain returns means either a push was still being admitted or a
+/// block was still settling.
+///
+/// **The pushes are wide on purpose** ([`RACE_HELP_BYTES`]): a one-sample push
+/// spends well under a microsecond between admission's look at the gate and its
+/// hand-off to the queue, which is a window a drain would have to hit exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_drain_accounts_for_every_push_it_admitted() {
+    // A pusher stops at its first refusal, which is how it learns the drain
+    // has begun; the cap is only there so nothing runs forever.
+    const PUSHERS: u128 = 8;
+    const CAP: u128 = 400;
+
+    let cfg = WriterConfig {
+        // One worker per pusher, so a block's send does not wait behind
+        // another block's insert and the queue is empty when the drain begins.
+        metrics_landing_inserters: PUSHERS as u32,
+        // No suppression index: every push here is its own body, and a claim
+        // would add a settle path this case is not about.
+        ingest_dedup: false,
+        ..Default::default()
+    };
+    let root = spool_root("drain-accounting");
+    let inserter = MockInserter::always_unrecorded(Act::Ok);
+    let writer = Arc::new(writer_with(&cfg, &root, inserter.clone()));
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(AtomicUsize::new(0));
+
+    let mut pushers = Vec::new();
+    for p in 0..PUSHERS {
+        let writer = writer.clone();
+        let accepted = accepted.clone();
+        let refused = refused.clone();
+        let answered = answered.clone();
+        pushers.push(tokio::spawn(async move {
+            let template = wide_template();
+            // Staggered, so the pushers are spread over the phases of one
+            // admission rather than stepping through it in lockstep.
+            tokio::time::sleep(Duration::from_micros(120 * p as u64)).await;
+            for i in 0..CAP {
+                match writer.admit_flush(
+                    restamped(&template, p * CAP + i + 1),
+                    PushHeaders::default(),
+                ) {
+                    Ok(wait) => {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        // Every admitted push is answered — `Ok` or an error.
+                        // A settlement the drain abandoned would drop the
+                        // waiter instead, which `join_generations` turns into
+                        // a panic in a debug build.
+                        let _ = wait.await;
+                        answered.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(_refusal) => {
+                        refused.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    // The reading that matters is taken inside the drain's own task, the
+    // instant it returns.
+    let drain = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            writer.shutdown(Duration::from_secs(5)).await;
+            writer.metrics().queue_bytes
+        })
+    };
+
+    let queued_at_return = drain.await.expect("the drain completes");
+    for pusher in pushers {
+        pusher.await.expect("a pusher completes");
+    }
+
+    assert_eq!(
+        queued_at_return, 0,
+        "the drain returned with bytes still reserved: a push it admitted had \
+         not settled"
+    );
+    let accepted = accepted.load(Ordering::SeqCst);
+    let refused = refused.load(Ordering::SeqCst);
+    assert!(accepted > 0, "the case needs pushes the drain raced");
+    assert!(
+        refused > 0,
+        "and pushes arriving after it began, which are refused"
+    );
+    assert_eq!(
+        answered.load(Ordering::SeqCst),
+        accepted,
+        "every admitted push was answered rather than left waiting"
+    );
+    let metrics = writer.metrics();
+    assert_eq!(
+        metrics.landing.flushes_total + metrics.spool_poison_total + metrics.spool_uncertain_total,
+        accepted as u64,
+        "each admitted push ends exactly once: committed, or spooled by the drain"
+    );
+    assert_eq!(metrics.queue_bytes, 0);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // -- the two per-push ceilings ----------------------------------------
+
+/// A valid push with no rows of any kind makes no block, so it is charged for
+/// none: it is answered a success at every accepted value of both byte limits
+/// (issue #603 code review round 5, finding 1).
+///
+/// The smallest either accepts is one byte (`pulsus_config::validate`'s
+/// `positive_bytes`), and one block's fixed overhead is larger than that on its
+/// own — so a charge taken before the no-row decision refuses an empty push
+/// `413` at the per-push ceiling and `429` at the queue allowance.
+#[tokio::test]
+async fn an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits() {
+    assert!(
+        LANDING_BLOCK_OVERHEAD_BYTES > 1,
+        "the case only bites while a block's own overhead exceeds the smallest \
+         accepted limit"
+    );
+    for (name, cfg) in [
+        (
+            "one-byte per-push ceiling",
+            WriterConfig {
+                batch_bytes: ByteSize(1),
+                ..Default::default()
+            },
+        ),
+        (
+            "one-byte queue allowance",
+            WriterConfig {
+                ingest_queue_bytes: ByteSize(1),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let root = spool_root("empty-push-limits");
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+
+        let wait = writer
+            .admit_flush(ParsedMetrics::default(), PushHeaders::default())
+            .unwrap_or_else(|e| panic!("{name}: an empty push is admitted: {e:?}"));
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap_or_else(|_| panic!("{name}: it settles at admission"))
+            .unwrap_or_else(|e| panic!("{name}: an empty push is a success: {e}"));
+        writer
+            .admit(ParsedMetrics::default(), PushHeaders::default())
+            .unwrap_or_else(|e| panic!("{name}: and so is the async-mode one: {e:?}"));
+
+        assert_eq!(inserter.call_count(), 0, "{name}: nothing is inserted");
+        assert_eq!(writer.metrics().queue_bytes, 0, "{name}: nothing reserved");
+        assert_eq!(
+            writer.metrics().backpressure_total,
+            0,
+            "{name}: the queue allowance was never even consulted"
+        );
+        assert!(
+            spool_records(&root, "poison").is_empty(),
+            "{name}: nothing was spooled"
+        );
+
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
 
 /// A push that does not fit one block is refused **whole**, naming its own
 /// size and both limits, with nothing stored, no bytes reserved and the claim

@@ -1543,13 +1543,12 @@ mod tests {
                 as u64;
         }
 
-        held += block.settings.entries().count() as u64
-            * std::mem::size_of::<(String, String)>() as u64
-            + block
-                .settings
-                .entries()
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum::<u64>();
+        // By capacity, through the accessor: a `String` holds its capacity and
+        // a `Vec` grows by doubling, so a figure over the entries' lengths
+        // would understate the settings' retained allocation and this walk
+        // would clear a charge that does not cover it (issue #603 code review
+        // round 5, finding 4).
+        held += block.settings.allocated_bytes();
 
         // Stated, not measured: see each constant.
         held += CLAIM_FIRST_ALLOCATION_BYTES;

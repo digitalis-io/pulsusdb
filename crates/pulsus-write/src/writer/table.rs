@@ -566,6 +566,18 @@ impl XorShift64 {
         XorShift64(seed | 1)
     }
 
+    /// A generator whose whole sequence is `seed`'s, so a case that has to
+    /// hold a block in a retry sleep draws the same delay every run — the
+    /// landing worker takes one when `WriterRuntime::retry_jitter_seed` is
+    /// set. Full jitter permits a zero delay, and a case pinned to a delay
+    /// it happened to draw fails on that one.
+    pub(crate) fn from_seed(seed: u64) -> Self {
+        // A placeholder that ignores `seed`, so the case below fails on the
+        // draw it asserts.
+        let _ = seed;
+        XorShift64(0x9E37_79B9_7F4A_7C15)
+    }
+
     pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
@@ -880,6 +892,58 @@ mod tests {
         };
         assert!(cap_at(1) < cap_at(2));
         assert!(cap_at(2) < cap_at(3));
+    }
+
+    /// The two seeds the landing-drain cases run on, and the delays they fix.
+    /// Full jitter draws from `[0, capped]`, **zero included** — a case pinned
+    /// to a delay it happened to draw fails on that one (issue #603 code review
+    /// round 5, finding 5), so a case that has to hold a block in the retry
+    /// sleep seeds the generator through `WriterRuntime::retry_jitter_seed` and
+    /// the case that covers the zero draw seeds it to draw zero.
+    #[test]
+    fn a_seeded_jitter_draw_is_the_same_every_run() {
+        let ten = Duration::from_secs(10);
+
+        let mut held = XorShift64::from_seed(1);
+        assert_eq!(
+            backoff_delay(ten, ten, 1, &mut held),
+            Duration::from_millis(1_545),
+            "the seed a case uses to park a block in a retry sleep"
+        );
+
+        let mut zero_first = XorShift64::from_seed(10_658);
+        assert_eq!(
+            backoff_delay(ten, ten, 1, &mut zero_first),
+            Duration::ZERO,
+            "the seed whose first draw is the permitted zero delay"
+        );
+        assert_eq!(
+            backoff_delay(ten, ten, 2, &mut zero_first),
+            Duration::from_millis(9_136),
+            "and whose next draw parks the block"
+        );
+    }
+
+    /// A capped delay under a millisecond is zero without drawing at all, so a
+    /// zero-length base and cap is a zero delay for every generator state.
+    #[test]
+    fn a_sub_millisecond_cap_is_a_zero_delay() {
+        let mut rng = XorShift64::seeded();
+        for attempt in 1..=4 {
+            assert_eq!(
+                backoff_delay(Duration::ZERO, Duration::ZERO, attempt, &mut rng),
+                Duration::ZERO
+            );
+            assert_eq!(
+                backoff_delay(
+                    Duration::from_micros(200),
+                    Duration::from_micros(900),
+                    attempt,
+                    &mut rng
+                ),
+                Duration::ZERO
+            );
+        }
     }
 
     #[test]
