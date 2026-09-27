@@ -161,7 +161,12 @@ struct SpoolRecord<'a> {
 /// How much of the document [`SpoolSink`] holds before it writes what it
 /// has. One `write_all` per chunk, so the file costs one blocking-pool
 /// round trip per this many bytes rather than one per row.
-const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
+///
+/// Public because the case that measures what spooling one block costs is an
+/// integration test, and a field whose encoded text crosses this boundary is
+/// the thing it has to build — a literal there would be this figure said
+/// twice (`crates/pulsus-write/tests/spool_stream_alloc.rs`).
+pub const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct SpoolWriter {
     root: PathBuf,
@@ -242,6 +247,12 @@ impl SpoolWriter {
 pub(crate) struct SpoolSink {
     file: fs::File,
     buf: Vec<u8>,
+    /// The most [`Self::buf`] has ever held at once — the figure the bound is
+    /// about, so a case can assert it directly instead of inferring it from a
+    /// process-wide allocation high-water mark. Test-only: nothing in
+    /// production reads it.
+    #[cfg(test)]
+    chunk_high_water: usize,
 }
 
 impl SpoolSink {
@@ -249,6 +260,8 @@ impl SpoolSink {
         SpoolSink {
             file,
             buf: Vec::with_capacity(SPOOL_CHUNK_BYTES),
+            #[cfg(test)]
+            chunk_high_water: 0,
         }
     }
 
@@ -256,6 +269,7 @@ impl SpoolSink {
     /// and the field names.
     async fn put(&mut self, piece: &[u8]) -> std::io::Result<()> {
         self.buf.extend_from_slice(piece);
+        self.note_chunk();
         self.spill().await
     }
 
@@ -264,7 +278,35 @@ impl SpoolSink {
     async fn put_json<T: Serialize + ?Sized>(&mut self, value: &T) -> std::io::Result<()> {
         serde_json::to_writer(&mut self.buf, value)
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        self.note_chunk();
         self.spill().await
+    }
+
+    /// Records what the chunk holds, right after the append that grew it.
+    fn note_chunk(&mut self) {
+        #[cfg(test)]
+        {
+            self.chunk_high_water = self.chunk_high_water.max(self.buf.len());
+        }
+    }
+
+    /// Writes one `&str` as a JSON string.
+    ///
+    /// **Stub** (issue #603 code review round 9, finding 1): the cases that
+    /// hold this to a fixed chunk come first, so for now it is the whole-value
+    /// encoder under a name, and they are red on it. Nothing in production
+    /// calls it yet, which is what the allowance below says.
+    #[allow(dead_code)]
+    pub(crate) async fn put_str(&mut self, s: &str) -> std::io::Result<()> {
+        self.put_json(s).await
+    }
+
+    /// Writes one [`serde_json::Value`] of any shape.
+    ///
+    /// **Stub**, for [`Self::put_str`]'s reason.
+    #[allow(dead_code)]
+    pub(crate) async fn put_value(&mut self, value: &serde_json::Value) -> std::io::Result<()> {
+        self.put_json(value).await
     }
 
     /// Opens a JSON object, to be written field by field and closed with
@@ -321,6 +363,15 @@ impl SpoolObject<'_> {
     ) -> std::io::Result<()> {
         self.key(name).await?;
         self.sink.put_json(value).await
+    }
+
+    /// `"name":"<text>"`, the string written through [`SpoolSink::put_str`].
+    ///
+    /// **Stub**, for [`SpoolSink::put_str`]'s reason.
+    #[allow(dead_code)]
+    pub(crate) async fn str_field(&mut self, name: &str, value: &str) -> std::io::Result<()> {
+        self.key(name).await?;
+        self.sink.put_str(value).await
     }
 
     /// `"name":[…]`, **one element at a time**, so an array of any length
@@ -553,6 +604,93 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **What the sink holds does not grow with the string it is given**
+    /// (issue #603 code review round 9, finding 1). A field whose text is
+    /// megabytes has to leave the chunk the size it started: the reservation
+    /// the queue is holding covers the row, so a serialized copy of that
+    /// string beside it is memory `PULSUS_INGEST_QUEUE_BYTES` never knew
+    /// about.
+    ///
+    /// The document is compared with what `serde_json` writes for the same
+    /// field, so the bound is not bought by changing the bytes.
+    #[tokio::test]
+    async fn a_string_field_of_any_length_leaves_the_chunk_the_size_it_was() {
+        let dir = tempdir();
+        let path = dir.join("long-string.json");
+        let value = "x".repeat(64 * SPOOL_CHUNK_BYTES);
+        let mut out = SpoolSink::new(fs::File::create(&path).await.expect("create the file"));
+        let mut o = out.begin_object().await.expect("open the object");
+        o.str_field("labels", &value)
+            .await
+            .expect("write the field");
+        o.end().await.expect("close the object");
+        assert!(
+            out.chunk_high_water <= SPOOL_CHUNK_BYTES,
+            "a {} byte string had the sink holding {} bytes at once, past the \
+             {SPOOL_CHUNK_BYTES} byte chunk: the encoder keeps a copy of the \
+             field that grows with it",
+            value.len(),
+            out.chunk_high_water
+        );
+        let written = finish(out, &path).await;
+        let whole = serde_json::json!({ "labels": value });
+        assert_eq!(
+            written,
+            serde_json::to_string(&whole).expect("the object serializes"),
+            "the streamed field is not the bytes serde_json writes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The same, for a value of any shape** — the encoding every row shape
+    /// but the landing row's uses ([`SpoolEncode::write_spool_json`]'s
+    /// default). A nested value's strings and arrays go through the sink the
+    /// way a landing row's fields do, so what is held is a chunk and one piece
+    /// whatever the shape.
+    #[tokio::test]
+    async fn a_value_of_any_shape_leaves_the_chunk_the_size_it_was() {
+        let dir = tempdir();
+        let path = dir.join("long-value.json");
+        let value = serde_json::json!({
+            "body": "y".repeat(64 * SPOOL_CHUNK_BYTES),
+            "empty_array": [],
+            "empty_object": {},
+            "escapes": "a\"b\\c\nd\te\u{0}f",
+            "flags": [true, false, null],
+            "nested": [{"k": [1, -2, 3.5]}, {"k": []}],
+            "numbers": [0, -1, 1.5, 1e300],
+            "strings": ["p".repeat(SPOOL_CHUNK_BYTES), "q"],
+        });
+        let mut out = SpoolSink::new(fs::File::create(&path).await.expect("create the file"));
+        out.put_value(&value).await.expect("write the value");
+        assert!(
+            out.chunk_high_water <= SPOOL_CHUNK_BYTES,
+            "the value had the sink holding {} bytes at once, past the \
+             {SPOOL_CHUNK_BYTES} byte chunk: the default encoder keeps a copy \
+             of it",
+            out.chunk_high_water
+        );
+        assert_eq!(
+            finish(out, &path).await,
+            serde_json::to_string(&value).expect("the value serializes"),
+            "the streamed value is not the bytes serde_json writes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Flushes the sink's tail **and the file's own buffer**, closes it, and
+    /// answers what is on disk. `SpoolSink::flush` hands its chunk to
+    /// `tokio::fs::File`, which is where a written-but-not-yet-flushed document
+    /// would still be.
+    async fn finish(mut out: SpoolSink, path: &Path) -> String {
+        out.flush().await.expect("flush the chunk");
+        out.file.flush().await.expect("flush the file");
+        drop(out);
+        std::fs::read_to_string(path).expect("read the document back")
     }
 
     /// One row of each landing kind, the histogram twice: an empty-array one

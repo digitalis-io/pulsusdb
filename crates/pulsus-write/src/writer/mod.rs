@@ -121,6 +121,7 @@ pub use rows::{
     MetricLandingRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow,
     TraceSpanRow,
 };
+pub use spool::SPOOL_CHUNK_BYTES;
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};
 

@@ -17,10 +17,13 @@
 //! four times that size. It must stay under a fixed ceiling and must not grow
 //! with the push.
 //!
-//! **Two shapes of push, because one row can be as large as many** (issue #603
-//! code review round 8, finding 2): many narrow float samples, and one accepted
-//! native-histogram row carrying up to 65,536 custom bucket bounds. A per-row
-//! value tree is invisible in the first and is the whole cost in the second.
+//! **Three shapes of push, because one row can be as large as many** (issue
+//! #603 code review rounds 8 and 9): many narrow float samples; one accepted
+//! native-histogram row carrying up to 65,536 custom bucket bounds; and one row
+//! whose single string field is megabytes — a kind-2 `labels`, or a kind-3
+//! `help` and `unit`. A per-row value tree is invisible in the first and is the
+//! whole cost in the second; a serialized string is invisible in both and is
+//! the whole cost in the third.
 //!
 //! Live bytes, not bytes requested: an encoder that writes the document in
 //! bounded pieces still *requests* bytes in proportion to the push, and only
@@ -44,9 +47,11 @@ use pulsus_model::{
     CUSTOM_BUCKETS_SCHEMA, CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet,
     NativeHistogram, Span,
 };
-use pulsus_write::writer::{BlockInserter, MetricWriter, MetricWriterTables, WriterRuntime};
+use pulsus_write::writer::{
+    BlockInserter, MetricWriter, MetricWriterTables, SPOOL_CHUNK_BYTES, WriterRuntime,
+};
 use pulsus_write::{
-    HistogramPoint, MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef,
+    HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef,
 };
 
 // -- the allocator --------------------------------------------------------
@@ -207,6 +212,57 @@ fn wide_hist_push(bounds: usize) -> ParsedMetrics {
     }
 }
 
+/// One sample and its series, whose **one label value is `bytes` long** — a
+/// kind-2 landing row whose `labels` column is a single string many spool
+/// chunks long (issue #603 code review round 9, finding 1).
+///
+/// A row can be as large as many rows through its text as well as through its
+/// arrays, and nothing at the ingest seam bounds one label's value below the
+/// per-push byte ceiling. The value is plain ASCII with an escape every few
+/// bytes, so the encoded form is longer than the value and the escaping is
+/// part of what is measured.
+fn long_label_push(bytes: usize) -> ParsedMetrics {
+    let (labels, _) = LabelSet::from_normalized([("instance".to_string(), long_text(bytes))]);
+    ParsedMetrics {
+        samples: vec![MetricPoint {
+            metric_name: Arc::from("http_request_duration_seconds_bucket"),
+            fingerprint: Fingerprint::from_raw(7),
+            unix_milli: 1_000,
+            value: 1.5,
+        }],
+        series: vec![SeriesRef {
+            metric_name: Arc::from("http_request_duration_seconds_bucket"),
+            fingerprint: Fingerprint::from_raw(7),
+            labels,
+        }],
+        ..Default::default()
+    }
+}
+
+/// One descriptor whose `help` is `bytes` long and whose `unit` is an eighth
+/// of that — a kind-3 landing row carrying **two** strings past the chunk
+/// boundary, so a bound that happened to hold for the first string only would
+/// not hold here. A descriptor is a push of its own: it needs no sample, and
+/// every push emits its descriptors.
+fn long_metadata_push(bytes: usize) -> ParsedMetrics {
+    ParsedMetrics {
+        metadata: vec![MetricMetadata {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            metric_type: "histogram".to_string(),
+            help: long_text(bytes),
+            unit: long_text(bytes / 8),
+            updated_ns: 1_700_000_000_000_000_000,
+        }],
+        ..Default::default()
+    }
+}
+
+/// `bytes` of text with a character needing a JSON escape every few bytes, so
+/// a streamed escaper's fragments fall inside escapes as well as between them.
+fn long_text(bytes: usize) -> String {
+    "a\"b\nc\\d\u{0}e".repeat(bytes / 9)
+}
+
 /// The histogram [`wide_hist_push`] carries: `bounds` custom bucket bounds,
 /// each a float whose decimal form is long enough that the spooled text is not
 /// a single digit.
@@ -236,12 +292,20 @@ fn wide_histogram(bounds: usize) -> NativeHistogram {
 /// between the two is what the failure path holds and the success path does
 /// not.
 async fn peak_over_one_push(rows: usize, poison: bool) -> u64 {
-    peak_over_push(push_of(rows), poison).await
+    peak_over_push(push_of(rows), poison).await.peak
+}
+
+/// What one measured push answers: the peak live bytes, and how long the
+/// document it spooled is. The second is how a case states that its fields
+/// crossed the chunk boundary rather than assuming they did.
+struct Measured {
+    peak: u64,
+    spooled_bytes: u64,
 }
 
 /// [`peak_over_one_push`] over any push, so the wide-row case measures the
 /// same window the many-rows case does.
-async fn peak_over_push(push: ParsedMetrics, poison: bool) -> u64 {
+async fn peak_over_push(push: ParsedMetrics, poison: bool) -> Measured {
     let root = spool_root(if poison { "poison" } else { "commit" });
     let mut runtime = WriterRuntime::from_config(&WriterConfig {
         metrics_landing_inserters: 1,
@@ -270,26 +334,33 @@ async fn peak_over_push(push: ParsedMetrics, poison: bool) -> u64 {
     })
     .await;
 
+    let documents = spooled(&root);
     assert_eq!(
-        spooled(&root),
+        documents.len(),
         usize::from(poison),
         "the poisoned block is on disk and the committed one is not"
     );
+    let spooled_bytes = documents.iter().sum();
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
-    peak
+    Measured {
+        peak,
+        spooled_bytes,
+    }
 }
 
-fn spooled(root: &Path) -> usize {
+/// The byte length of every spooled document under `root`.
+fn spooled(root: &Path) -> Vec<u64> {
     let dir = root.join("poison").join("metric_landing");
     std::fs::read_dir(&dir)
         .map(|entries| {
             entries
                 .flatten()
                 .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
-                .count()
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .collect()
         })
-        .unwrap_or(0)
+        .unwrap_or_default()
 }
 
 /// The two push sizes. Small enough to stay quick, large enough that a
@@ -310,6 +381,19 @@ const SPOOL_CEILING_BYTES: u64 = 1024 * 1024;
 /// bucket cap, and the cap itself.
 const BOUNDS: usize = 16_384;
 const BOUNDS_4X: usize = BOUNDS * 4;
+
+/// The two lengths of **one string field**: both many
+/// [`SPOOL_CHUNK_BYTES`] chunks, and the larger four times the smaller. The
+/// smaller alone is twice [`SPOOL_CEILING_BYTES`], so an encoder holding one
+/// serialized copy of it is over the ceiling at either length and the two
+/// lengths differ by more than [`WIDTH_SLACK_BYTES`].
+///
+/// Both fit inside `PULSUS_BATCH_BYTES` (`WriterConfig::batch_bytes`, 16 MiB
+/// by default): the kind-3 case's two strings come to nine eighths of the
+/// larger figure, and admission refuses a push above the ceiling before
+/// anything is queued.
+const STRING_BYTES: usize = 2 * 1024 * 1024;
+const STRING_BYTES_4X: usize = STRING_BYTES * 4;
 
 /// How far apart the two widths' overheads may be, in either direction. It is
 /// what makes "fixed" an assertion rather than a hope: a four-fold array must
@@ -362,8 +446,8 @@ fn spooling_a_block_holds_no_copy_of_the_push() {
             wide_histogram(bounds)
                 .validate()
                 .expect("the ingest seam accepts this histogram");
-            let commit = peak_over_push(wide_hist_push(bounds), false).await;
-            let spool = peak_over_push(wide_hist_push(bounds), true).await;
+            let commit = peak_over_push(wide_hist_push(bounds), false).await.peak;
+            let spool = peak_over_push(wide_hist_push(bounds), true).await.peak;
             let extra = spool.saturating_sub(commit);
             assert!(
                 extra <= SPOOL_CEILING_BYTES,
@@ -384,5 +468,58 @@ fn spooling_a_block_holds_no_copy_of_the_push() {
              a constant",
             wide.abs_diff(narrow)
         );
+
+        // **One long string, not one long array** (issue #603 code review
+        // round 9, finding 1). A row is as large as the push chooses through
+        // its text as well: a kind-2 row's `labels` and a kind-3 row's `help`
+        // and `unit` are each one string, of any length admission accepts. An
+        // encoder that serialises a whole string before it spills holds a copy
+        // of that string on top of the row the reservation covers, which is the
+        // same defect the array case pins one shape further down.
+        for (name, push) in [
+            (
+                "kind-2 labels",
+                long_label_push as fn(usize) -> ParsedMetrics,
+            ),
+            ("kind-3 help and unit", long_metadata_push),
+        ] {
+            let mut string_extra = Vec::new();
+            for (label, bytes) in [("S", STRING_BYTES), ("4S", STRING_BYTES_4X)] {
+                let commit = peak_over_push(push(bytes), false).await.peak;
+                let spooled = peak_over_push(push(bytes), true).await;
+                let extra = spooled.peak.saturating_sub(commit);
+                // The boundary is crossed, not assumed: the document on disk
+                // is longer than the chunk several times over, and one field of
+                // it is longer than the chunk on its own.
+                assert!(
+                    bytes / 8 > SPOOL_CHUNK_BYTES
+                        && spooled.spooled_bytes > 4 * SPOOL_CHUNK_BYTES as u64,
+                    "the {name} case at {label} must cross the {SPOOL_CHUNK_BYTES} \
+                     byte chunk boundary inside one field: its shortest long \
+                     string is {} bytes and its document is {} bytes",
+                    bytes / 8,
+                    spooled.spooled_bytes
+                );
+                assert!(
+                    extra <= SPOOL_CEILING_BYTES,
+                    "spooling one row whose {name} is {bytes} bytes ({label}) \
+                     held {extra} bytes more than committing it, over the \
+                     ceiling {SPOOL_CEILING_BYTES}: the encoder holds a copy of \
+                     the row's text that nothing charges the queue for (commit \
+                     peak {commit}, spool peak {})",
+                    spooled.peak
+                );
+                string_extra.push(extra);
+            }
+            let (short, long) = (string_extra[0], string_extra[1]);
+            assert!(
+                long.abs_diff(short) <= WIDTH_SLACK_BYTES,
+                "four times the {name} text moved the spool path's overhead by \
+                 {} bytes ({short} at {STRING_BYTES} bytes, {long} at \
+                 {STRING_BYTES_4X}): it must stay fixed as the string grows, or \
+                 the bound is one push's size and not a constant",
+                long.abs_diff(short)
+            );
+        }
     });
 }
