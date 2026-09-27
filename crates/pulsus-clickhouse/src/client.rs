@@ -55,10 +55,11 @@ struct StringRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InsertPhase {
     /// The pooled connection's checkout and the target's column-metadata
-    /// read: none of the block has been sent.
+    /// read: none of the block has been sent, whether the phase ended in the
+    /// server's own exception or in the client's deadline.
     BeforeSend,
-    /// Writing the rows, ending the insert, or the client-side deadline
-    /// cutting either.
+    /// Writing the rows and ending the insert, whether the phase ended in the
+    /// server's answer or in the client's deadline.
     MayHaveSent,
 }
 
@@ -205,8 +206,9 @@ impl ChClient {
     /// `pulsus-write`'s policy, out of scope here).
     ///
     /// Bounded by both a server-side `max_execution_time` (on the `INSERT`
-    /// statement) and a client-side `tokio::time::timeout` wrapping the
-    /// whole create/write/end sequence.
+    /// statement) and one client-side deadline over the whole
+    /// create/write/end sequence, awaited phase by phase against the same
+    /// instant so that which phase it fired in is known.
     ///
     /// **What decides the class is the phase, not the error.** An insert's
     /// commit fate is unknown from the moment any of the
@@ -221,13 +223,16 @@ impl ChClient {
     /// so it is not uncertain, merely wrong, and the caller may release
     /// whatever it was holding for a retry.
     ///
-    /// It over-reports and never under-reports: a client-side row
-    /// serialization failure on the first row is reported unknown although
-    /// nothing was sent, because the vendored client buffers and flushes on its
-    /// own threshold and nothing here can tell which side of that the failure
-    /// fell on. A caller told "unknown" for a block that was never stored
-    /// loses a retry; a caller told "not stored" for a block that was stored
-    /// double-counts it.
+    /// Where the phase itself is not knowable it over-reports, and it never
+    /// under-reports: a client-side row serialization failure on the first row
+    /// is reported unknown although nothing was sent, because the vendored
+    /// client buffers and flushes on its own threshold and nothing here can
+    /// tell which side of that the failure fell on. A caller told "unknown"
+    /// for a block that was never stored loses a retry; a caller told "not
+    /// stored" for a block that was stored double-counts it. So an
+    /// over-report is not free, and nothing is over-reported whose phase is
+    /// knowable — the client's own deadline is classified by the phase it
+    /// fired in, not by the worse of the two.
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         self.insert_block_with(table, rows, &QuerySettings::new())
             .await
@@ -247,42 +252,59 @@ impl ChClient {
         // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
         // has no typed settings helper).
         let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
-        let fut = async {
-            // `insert` reads the target's column metadata and returns a
-            // builder; none of the block has been sent when it fails.
-            let mut insert = conn
-                .client()
-                .insert::<R>(table)
-                .await
-                .map_err(|e| (InsertPhase::BeforeSend, ChError::from(e)))?;
+        // ONE client-side deadline over the whole create/write/end sequence,
+        // awaited in its two phases against the same instant: `timeout_at`
+        // shares the deadline, so the two waits cannot add up to more than
+        // `default_timeout`, and the phase the deadline fires in is the phase
+        // whose wait returned it. A single wait over the whole sequence cannot
+        // say that, and classifying a deadline that fired during the metadata
+        // read as post-send costs a caller the pre-send retry it was entitled
+        // to (issue #603 code review round 3).
+        let deadline = tokio::time::Instant::now() + self.default_timeout;
+        let timed_out =
+            || ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout));
+
+        // Phase one, acquisition: `insert` reads the target's column metadata
+        // and returns a builder. None of the block has been sent while this
+        // runs, so every ending here — the server's own exception and the
+        // deadline alike — is `BeforeSend`.
+        let acquire = async {
+            let mut insert = conn.client().insert::<R>(table).await?;
             for (k, v) in settings.iter() {
                 insert = insert.with_setting(k, v);
             }
-            // From the first `write` the request is open and the client
-            // flushes on its own buffer threshold, so anything from here on
-            // may already be on the wire.
-            for row in rows {
-                insert
-                    .write(row)
-                    .await
-                    .map_err(|e| (InsertPhase::MayHaveSent, ChError::from(e)))?;
-            }
-            insert
-                .end()
-                .await
-                .map_err(|e| (InsertPhase::MayHaveSent, ChError::from(e)))
+            Ok::<_, clickhouse::error::Error>(insert)
         };
-        let result = tokio::time::timeout(self.default_timeout, fut).await;
+        let acquired = match tokio::time::timeout_at(deadline, acquire).await {
+            Ok(Ok(insert)) => Ok(insert),
+            Ok(Err(e)) => Err((InsertPhase::BeforeSend, ChError::from(e))),
+            Err(_elapsed) => Err((InsertPhase::BeforeSend, timed_out())),
+        };
+
+        // Phase two, write and end: from the first `write` the request is open
+        // and the client flushes on its own buffer threshold, so anything from
+        // here on may already be on the wire — every ending is `MayHaveSent`,
+        // the deadline included.
+        let result = match acquired {
+            Err(pair) => Err(pair),
+            Ok(mut insert) => {
+                let send = async {
+                    for row in rows {
+                        insert.write(row).await?;
+                    }
+                    insert.end().await
+                };
+                match tokio::time::timeout_at(deadline, send).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err((InsertPhase::MayHaveSent, ChError::from(e))),
+                    Err(_elapsed) => Err((InsertPhase::MayHaveSent, timed_out())),
+                }
+            }
+        };
 
         let (phase, err) = match result {
-            // The client-side deadline cut the whole sequence: which of the
-            // phases it interrupted is not knowable, so it is unknown.
-            Err(_elapsed) => (
-                InsertPhase::MayHaveSent,
-                ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout)),
-            ),
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(pair)) => pair,
+            Ok(()) => return Ok(()),
+            Err(pair) => pair,
         };
 
         // Transport-class failure demotes this endpoint so the next insert

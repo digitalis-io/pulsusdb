@@ -115,12 +115,12 @@ impl LogStreamRow {
 
     /// Estimates a `StreamRow`'s footprint *before* it is materialized
     /// into a `LogStreamRow` (reserve-before-materialize, architect plan
-    /// amendment 3, finding 2): approximates the eventual canonical-JSON
-    /// length ([`estimate_canonical_json_len`]) from the label set's raw
-    /// key/value bytes plus per-entry JSON punctuation, *without*
-    /// building the string — the real canonicalization (the cost this
-    /// hardening keeps off the rejected/over-limit path) only happens
-    /// once the reservation has succeeded, in `From<&StreamRow>` above.
+    /// amendment 3, finding 2): bounds the eventual canonical-JSON length
+    /// ([`estimate_canonical_json_len`]) from the label set's key/value bytes,
+    /// their JSON escaping and the per-entry punctuation, *without* building
+    /// the string — the real canonicalization (the cost this hardening keeps
+    /// off the rejected/over-limit path) only happens once the reservation has
+    /// succeeded, in `From<&StreamRow>` above.
     pub fn est_source_bytes(row: &StreamRow) -> u64 {
         Self::estimate(&row.service, estimate_canonical_json_len(&row.labels))
     }
@@ -160,22 +160,49 @@ impl BackfillRow for LogStreamRow {
     }
 }
 
-/// Approximates [`LabelSet::to_canonical_json`]'s output length without
-/// building the string: `{"k":"v","k2":"v2"}` — two enclosing braces, a
-/// comma between entries, and per entry two quoted strings plus a colon
-/// (`"k":"v"` = `k.len() + v.len() + 5`). Ignores JSON escaping, so this
-/// is a lower-bound estimate, not an exact length — consistent with
-/// [`LogSampleRow::est_bytes`]'s "conservative, not RowBinary-exact"
-/// intent.
+/// Bounds [`LabelSet::to_canonical_json`]'s output length without building
+/// the string: `{"k":"v","k2":"v2"}` — two enclosing braces, a comma between
+/// entries, and per entry two quoted strings plus a colon (5 bytes of
+/// punctuation), with each string's content priced by
+/// [`escaped_json_content_len`].
+///
+/// **An upper bound, never a lower one**, and exact for any label set that
+/// needs no escaping, which is the ordinary one. The charge has to cover the
+/// string the row then owns: a row is held from admission until its block is
+/// encoded, so an estimate below the encoding's length would leave
+/// `PULSUS_INGEST_QUEUE_BYTES` bounding less memory than is buffered (issue
+/// #603 code review round 3).
 fn estimate_canonical_json_len(labels: &LabelSet) -> usize {
     let mut len = 2; // the enclosing `{`/`}`
     for (i, (k, v)) in labels.iter().enumerate() {
         if i > 0 {
             len += 1; // the separating `,`
         }
-        len += k.len() + v.len() + 5; // `"`,`"`,`:`,`"`,`"` around key/value
+        // `"`,`"`,`:`,`"`,`"` around key/value, plus each one's escaped content
+        len += escaped_json_content_len(k) + escaped_json_content_len(v) + 5;
     }
     len
+}
+
+/// An upper bound on the bytes `s` occupies inside a JSON string literal,
+/// counted per byte: a quote or a backslash needs a two-byte escape, a control
+/// character needs at most the six-byte `\u00XX` form (five of them have a
+/// two-byte shorthand, which this deliberately does not subtract), and every
+/// other byte — every byte of a multi-byte character included — is written as
+/// it stands.
+///
+/// It bounds rather than reproduces the encoder's table, so a serializer that
+/// escapes *more* of the ASCII range than it does today cannot make this
+/// undercharge. `the_canonical_json_estimate_is_not_less_than_the_escaped_encoding`
+/// pins the bound against the encoder actually in use.
+fn escaped_json_content_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 /// One `log_patterns` row (docs/schemas.md §3.1, M7-C3 issue #171). Field
