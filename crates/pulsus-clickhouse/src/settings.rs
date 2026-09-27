@@ -146,21 +146,141 @@ impl QuerySettings {
     /// | `insert_deduplicate` | `deduplicate_insert`'s own entry: "The setting overrides `insert_deduplicate` and `async_insert_deduplicate` settings", and this insert pins it to `enable` |
     /// | `deduplicate_insert_select` | its entry scopes it to `INSERT SELECT`; this is `INSERT … FORMAT RowBinary…` |
     /// | `input_format_parallel_parsing` | its entry: "Supported only for TabSeparated (TSV), TSKV, CSV and JSONEachRow formats" — not the `RowBinary` family this client writes |
-    /// | `max_parsing_threads` | its entry scopes it to "input formats that support parallel parsing", which is the four above |
+    /// | `max_parsing_threads`, `min_chunk_bytes_for_parallel_parsing` | both belong to parallel parsing, which `input_format_parallel_parsing`'s entry supports for the four formats above and not for this one: the first is its thread count, the second what one thread takes |
     /// | `min_insert_block_size_rows_for_materialized_views`, `min_insert_block_size_bytes_for_materialized_views`, `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push. The part-per-thread case the third one's entry names needs `max_insert_threads`, whose own entry scopes it to `INSERT SELECT` |
     /// | `max_partitions_per_insert_block` | it refuses a block, it does not split one; every row of a push carries one `received_ms`, so the block lies in one partition |
     ///
-    /// **How the set was derived, and what it does not close.** Two queries
-    /// over the 1,550 rows of `system.settings` at 26.3.29.7: names or
-    /// descriptions matching `block` or `dedup` (96 rows), and, of the rest,
-    /// those matching `squash`, `flush`, `emit`, `buffer`, `batch`, `queue`,
-    /// `parsing`, `parsed`, `split` or `duplicat` (a further 96). Every name
-    /// in either answer whose own description concerns this statement is in
-    /// one of the two tables above. What that cannot close is a setting that
-    /// ends a block without using any of those words in its description;
-    /// against that the only closure is the catalogue's own emit rule,
-    /// quoted at the top, which enumerates the conditions for format
-    /// parsing.
+    /// **How the set was derived.** Two searches over the 1,550 rows of
+    /// `system.settings` at 26.3.29.7, both here literally so their counts can
+    /// be re-run — swap `count()` for `name` to list what each returns:
+    ///
+    /// ```sql
+    /// -- A, 96 rows: the class by its own words.
+    /// WITH lower(concat(name, ' ', description)) AS x
+    /// SELECT count() FROM system.settings
+    /// WHERE position(x, 'block') > 0 OR position(x, 'dedup') > 0
+    ///
+    /// -- B, 104 rows: of the rest, the neighbouring words.
+    /// WITH lower(concat(name, ' ', description)) AS x
+    /// SELECT count() FROM system.settings
+    /// WHERE NOT (position(x, 'block') > 0 OR position(x, 'dedup') > 0)
+    ///   AND arrayExists(w -> position(x, w) > 0,
+    ///       ['squash', 'flush', 'emit', 'buffer', 'batch', 'queue',
+    ///        'parsing', 'parsed', 'split', 'duplicat'])
+    /// ```
+    ///
+    /// Every name in A whose own description concerns this statement is in one
+    /// of the two tables above. **Every name in B is accounted for here**, in
+    /// nine groups that do not overlap and add to 104, so nothing rests on a
+    /// figure a reader cannot re-derive:
+    ///
+    /// 1. **Already in the second table above (7).** `async_insert`,
+    ///    `async_insert_max_data_size`, `async_insert_poll_timeout_ms`,
+    ///    `input_format_parallel_parsing`,
+    ///    `materialized_views_squash_parallel_inserts`, `max_parsing_threads`,
+    ///    `min_chunk_bytes_for_parallel_parsing`.
+    ///
+    /// 2. **An input format's own rule, or a type- or schema-inference rule
+    ///    (27).** Each decides how the request's bytes become values, never when
+    ///    a block ends; most of them name a format this insert does not use.
+    ///    `cast_string_to_date_time_mode`, `date_time_input_format`,
+    ///    `enable_parsing_to_custom_serialization`, `format_schema`,
+    ///    `input_format_json_defaults_for_missing_elements_in_named_tuple`,
+    ///    `input_format_json_ignore_unnecessary_fields`,
+    ///    `input_format_json_read_arrays_as_strings`,
+    ///    `input_format_json_read_bools_as_numbers`,
+    ///    `input_format_json_read_bools_as_strings`,
+    ///    `input_format_json_read_numbers_as_strings`,
+    ///    `input_format_json_read_objects_as_strings`,
+    ///    `input_format_orc_row_batch_size`,
+    ///    `input_format_parquet_enable_json_parsing`,
+    ///    `input_format_parquet_enable_row_group_prefetch`,
+    ///    `input_format_try_infer_dates`, `input_format_try_infer_datetimes`,
+    ///    `input_format_values_accurate_types_of_literals`,
+    ///    `input_format_values_deduce_templates_of_expressions`,
+    ///    `input_format_values_interpret_expressions`,
+    ///    `json_type_escape_dots_in_keys`,
+    ///    `max_dynamic_subcolumns_in_json_type_parsing`, `precise_float_parsing`,
+    ///    `schema_inference_make_columns_nullable`, `session_timezone`,
+    ///    `type_json_allow_duplicated_key_with_literal_and_nested_object`,
+    ///    `type_json_skip_duplicated_paths`,
+    ///    `type_json_use_partial_match_to_skip_paths_by_regexp`.
+    ///
+    /// 3. **The SQL parser's own limits, or a function's own behaviour (8).**
+    ///    `formatdatetime_parsedatetime_m_is_month_name`, `max_ast_depth`,
+    ///    `max_ast_elements`, `max_parser_backtracks`, `max_query_size`,
+    ///    `parsedatetime_e_requires_space_padding`,
+    ///    `parsedatetime_parse_without_leading_zeros`,
+    ///    `splitby_max_substrings_includes_remaining_string`.
+    ///
+    /// 4. **The read path, or a `SELECT` rewrite (17).**
+    ///    `apply_prewhere_after_final`,
+    ///    `cluster_table_function_buckets_batch_size`,
+    ///    `correlated_subqueries_use_in_memory_buffer`, `enable_vertical_final`,
+    ///    `external_storage_max_read_bytes`, `external_storage_max_read_rows`,
+    ///    `merge_tree_compact_parts_min_granules_to_multibuffer_read`,
+    ///    `merge_tree_read_split_ranges_into_intersecting_and_non_intersecting_injection_probability`,
+    ///    `optimize_duplicate_order_by_and_distinct`,
+    ///    `parallel_replicas_custom_key`,
+    ///    `parallel_replicas_custom_key_range_lower`,
+    ///    `parallel_replicas_custom_key_range_upper`, `query_plan_split_filter`,
+    ///    `read_in_order_use_buffering`,
+    ///    `split_intersecting_parts_ranges_into_layers_final`,
+    ///    `split_parts_ranges_into_intersecting_and_non_intersecting_final`,
+    ///    `union_default_mode`.
+    ///
+    /// 5. **A buffer or a limit on a file or network channel (18)** — a cache,
+    ///    object storage, an archive, a temporary file, the HTTP transport. None
+    ///    of them forms a block. `archive_adaptive_buffer_max_size_bytes`,
+    ///    `azure_list_object_keys_size`,
+    ///    `distributed_cache_prefer_bigger_buffer_size`,
+    ///    `filesystem_cache_allow_background_download`,
+    ///    `filesystem_cache_prefer_bigger_buffer_size`,
+    ///    `filesystem_cache_segments_batch_size`, `http_headers_read_timeout`,
+    ///    `http_max_multipart_form_data_size`, `http_response_buffer_size`,
+    ///    `http_wait_end_of_query`, `max_download_buffer_size`,
+    ///    `max_read_buffer_size`, `max_read_buffer_size_local_fs`,
+    ///    `max_read_buffer_size_remote_fs`, `prefetch_buffer_size`,
+    ///    `s3_list_object_keys_size`, `temporary_files_buffer_size`,
+    ///    `write_through_distributed_cache_buffer_size`.
+    ///
+    /// 6. **An output format (3):** the response, nothing on the way in.
+    ///    `output_format_parquet_batch_size`,
+    ///    `output_format_parquet_bloom_filter_flush_threshold_bytes`,
+    ///    `output_format_sql_insert_max_batch_size`.
+    ///
+    /// 7. **Another table engine's, another storage engine's, or a background
+    ///    subsystem of the server's (18).**
+    ///    `allow_experimental_object_storage_queue_hive_partitioning`,
+    ///    `allow_experimental_s3queue`,
+    ///    `background_buffer_flush_schedule_pool_size`,
+    ///    `backup_restore_batch_size_for_keeper_multi`,
+    ///    `backup_restore_batch_size_for_keeper_multiread`,
+    ///    `database_replicated_initial_query_timeout_sec`,
+    ///    `distributed_background_insert_batch`,
+    ///    `distributed_background_insert_split_batch_on_failure`,
+    ///    `distributed_directory_monitor_batch_inserts`,
+    ///    `distributed_directory_monitor_split_batch_on_failure`,
+    ///    `mysql_max_rows_to_insert`, `s3queue_allow_experimental_sharded_mode`,
+    ///    `s3queue_default_zookeeper_path`,
+    ///    `s3queue_enable_logging_to_s3queue_log`,
+    ///    `s3queue_keeper_fault_injection_probability`,
+    ///    `s3queue_migrate_old_metadata_to_buckets`,
+    ///    `stream_like_engine_allow_direct_select`,
+    ///    `stream_like_engine_insert_queue`.
+    ///
+    /// 8. **After the block rather than where it ends (1):** it delays the flush
+    ///    of the part the block became.
+    ///    `max_insert_delayed_streams_for_parallel_write`.
+    ///
+    /// 9. **Diagnostics, the client, or query admission (5).**
+    ///    `apply_settings_from_server`, `jemalloc_enable_profiler`,
+    ///    `log_comment`, `queue_max_wait_ms`, `trace_profile_events_list`.
+    ///
+    /// **What none of this closes** is a setting that ends a block without
+    /// using any of those words in its description; against that the only
+    /// closure is the catalogue's own emit rule, quoted at the top, which
+    /// enumerates the conditions for format parsing.
     ///
     /// **Nothing else divides one request into blocks.** The vendored client
     /// flushes its buffer to the socket every `MIN_CHUNK_SIZE` bytes
