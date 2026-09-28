@@ -664,10 +664,16 @@ impl MetricWriter {
 
         // The suppressed push stops here: its samples are already stored by
         // the push it repeats, and the only thing it still owes is its
-        // descriptors. That insert carries no claim and no waiter — the
-        // caller is answered with the ORIGINAL push's outcome — and if it
-        // fails nothing of it is stored, so the next push carrying the same
-        // descriptors emits them again.
+        // descriptors. That block takes a reservation of its own below, and a
+        // queue with no room for it answers this push backpressure instead of
+        // the ORIGINAL push's outcome, with no descriptor row built or queued.
+        // With the reservation granted the insert carries no claim and no
+        // waiter, the caller is answered with the ORIGINAL push's outcome, and
+        // the block runs `run_block` like any other: a failure before the send
+        // stored nothing, one from the send onward leaves whether the
+        // descriptors landed unknown. Nothing gates or caches a descriptor at
+        // any of those endings, so the next push carrying the same ones emits
+        // them again.
         if let Some(suppressed) = suppressed {
             if !descriptors.is_empty() {
                 let descriptor_bytes = landing_charge(metadata_bytes);
