@@ -300,15 +300,15 @@ Two independent layers, answering different questions.
 
 **The client's re-push** is issue #494's suppression index (`writer::push_dedup`): a
 push whose identity the index already holds is suppressed before the insert, and the
-caller is answered with the original push's outcome. Everything about a client's re-push
-— its suppression, its responses and its index — is as it shipped before this work. One
-detail is this path's: a suppressed push stores no sample, series or histogram row and
-**still sends its descriptors once their own reservation is granted**, as its own landing
-insert of kind-3 rows carrying no claim and no waiter, which runs §4's loop like any other
-block — so a failure after it was sent leaves whether they landed unknown. That block takes
-a byte reservation of its own (§6), and a queue with no room for it refuses the push `429`
-instead: no descriptor row is built, queued or sent, and the caller gets that refusal
-rather than the original push's outcome (§9 D16).
+caller is answered with the original push's outcome, with the one exception below.
+Everything about a client's re-push — its suppression, its responses and its index — is as
+it shipped before this work. One detail is this path's: a suppressed push stores no sample,
+series or histogram row and **still sends its descriptors once their own reservation is
+granted**, as its own landing insert of kind-3 rows carrying no claim and no waiter, which
+runs §4's loop like any other block — so a failure after it was sent leaves whether they
+landed unknown. That block takes a byte reservation of its own (§6), and a queue with no
+room for it refuses the push `429` instead: no descriptor row is built, queued or sent, and
+the caller gets that refusal rather than the original push's outcome (§9 D16).
 
 **The writer's own resend** — the same block sent again after an attempt whose fate is
 unknown — is the deduplication token:
@@ -637,10 +637,11 @@ label, the landing table's, with the backfill series gone
 
 ## 11. What holds each guarantee up
 
-Every entry is a test function name, findable with `git grep -n 'fn <name>'`. A file in
-brackets holds every name in the run directly before it, back to whichever comes first of
-the previous file, the previous semicolon, and the start of the cell. A name outside such
-a run is in `crates/pulsus-write/tests/metric_writer.rs`. An entry marked live runs only
+Every entry is a test function name, findable with `git grep -n 'fn <name>'`. A file name
+holds every name in the run directly before it — whether that file stands in brackets or
+in the sentence, and both spellings occur below — back to whichever comes first of the
+previous file, the previous semicolon, and the start of the cell. A name outside such a
+run is in `crates/pulsus-write/tests/metric_writer.rs`. An entry marked live runs only
 against a server.
 
 | guarantee | what holds it up |
