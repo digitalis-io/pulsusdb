@@ -58,14 +58,246 @@ impl QuerySettings {
     }
 
     /// Issue #560: the two block-deduplication settings pinned on every
-    /// insert into the span table, so a repeated identical span block is
-    /// recognised by the derived trace tables' own deduplication windows
-    /// whatever the server profile says. Trace spans only — never logs or
-    /// metrics, whose byte-identical blocks can be two genuine pushes.
+    /// insert into a source table whose derived tables are maintained by
+    /// materialized view, so a repeated identical block is recognised by
+    /// those tables' own deduplication windows whatever the server profile
+    /// says.
+    ///
+    /// Two byte-identical blocks of samples or log entries can be two
+    /// genuine pushes, so a signal whose repeat is a resend of one batch
+    /// pairs these with a per-batch token rather than relying on the
+    /// content: see [`Self::landing_insert`].
     pub fn deduplicate_through_views() -> Self {
         Self::new()
             .set("deduplicate_insert", "enable")
             .set("deduplicate_blocks_in_dependent_materialized_views", 1)
+    }
+
+    /// The settings every insert of one metrics landing block carries
+    /// (issue #603): [`Self::deduplicate_through_views`], plus the token
+    /// the writer minted for that block — repeated byte-identical on every
+    /// resend, so a resend of a block the server already accepted stores
+    /// nothing twice — plus **every limit that decides where one block
+    /// ends**, so one push is never split into two.
+    ///
+    /// **Seven settings decide where a block ends or whether it is
+    /// deduplicated, and only two of them count rows.** The server forms
+    /// blocks as it parses the request body, and its own entry
+    /// for `max_insert_block_size` states when one is emitted: "A block is
+    /// emitted when either condition is met: Min thresholds (AND): Both
+    /// min_insert_block_size_rows AND min_insert_block_size_bytes are
+    /// reached — Max thresholds (OR): Either max_insert_block_size OR
+    /// max_insert_block_size_bytes is reached". Three more names carry their
+    /// own emit rule. Every default and quotation below is read from the
+    /// server's own `system.settings` at 26.3.29.7 — the same catalogue the
+    /// startup check reads, which is why each of the seven is in
+    /// `pulsus_schema::REQUIRED_SERVER_NAMES` and none is sent on the
+    /// strength of a name somebody remembered. The two lists are checked
+    /// against each other, both ways, by
+    /// `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends`:
+    ///
+    /// | name | default | pinned to | what its own entry says |
+    /// |---|---|---|---|
+    /// | `max_insert_block_size` | 1048449 | `max_rows` | the maximum pair's row half; `max_insert_block_size_rows` carries `alias_for = max_insert_block_size` in the same catalogue, and `0` is not accepted (`NonZeroUInt64`) |
+    /// | `max_insert_block_size_bytes` | 0 | `0` | "0 — setting does not participate in block formation" |
+    /// | `min_insert_block_size_rows` | 1048449 | `max_rows` | the minimum pair's row half — its entry states the same emit rule, quoted above: the pair emits only when both halves are reached |
+    /// | `min_insert_block_size_bytes` | 268402944 | `0` | "0 — setting does not participate in block formation" |
+    /// | `input_format_max_block_size_bytes` | 0 | `0` | "Limits the size of the blocks formed during data parsing in input formats in bytes … 0 means no limit in bytes" |
+    /// | `input_format_max_block_wait_ms` | 0 | `0` | "Limits the maximum time in milliseconds to wait before emitting a block during parsing in row-based input formats. 0 means no limit." |
+    /// | `input_format_connection_handling` | 0 | `0` | "if the connection closes unexpectedly, any remaining data in the buffer will be parsed and processed instead of being treated as an error … Enabling this option disables parallel parsing and **makes deduplication impossible**" |
+    ///
+    /// So every byte limit and the wait are pinned to the value their own
+    /// entry calls "no limit" or "does not participate", the connection
+    /// handling to the value that leaves deduplication possible, and both
+    /// row counts to the ceiling admission has already refused a larger push
+    /// against. A row count is then the only thing left that can end a
+    /// block, and no admitted push reaches it — under either reading of the
+    /// minimum pair's AND, since a pair whose byte half does not participate
+    /// either never fires or fires at the same row ceiling.
+    ///
+    /// **The last of the seven is not a splitting problem.** A setting that
+    /// makes deduplication impossible defeats the token, which is the whole
+    /// of the retry safety: a resend of a block the server already committed
+    /// would store it twice. It is pinned for that reason and not because it
+    /// divides a push.
+    ///
+    /// Pinned rather than inherited, exactly as the deduplication pair is:
+    /// the defaults of four of them already sit where this pins them, but a
+    /// server profile may set any, and then a push well inside the row
+    /// ceiling becomes several blocks and a prefix of it can commit alone.
+    ///
+    /// **What pinning them off costs.** A deployment that set a byte limit
+    /// to bound the memory one insert takes does not get it on this insert.
+    /// What bounds this block instead is the per-push byte ceiling
+    /// (`PULSUS_BATCH_BYTES`), which refuses the push whole before anything
+    /// is queued. A deployment that enabled connection handling to salvage a
+    /// broken upload's buffered rows does not get that on this insert
+    /// either; a broken upload is instead a failed attempt the writer
+    /// resends under the same token.
+    ///
+    /// **In the class, and closed somewhere else.** Each of these decides
+    /// block formation or deduplication for some insert, and none needs a pin
+    /// here:
+    ///
+    /// | name | why not pinned here |
+    /// |---|---|
+    /// | `async_insert` | every insert this client makes already pins it to `0` (issue #376, [`crate::ChClient::insert_settings_of`]); its default flipped to `1` at 26.2, and an asynchronous insert buffers one query's rows for a flush that combines queries |
+    /// | `async_insert_deduplicate`, `async_insert_max_data_size`, `async_insert_poll_timeout_ms`, `wait_for_async_insert` | each takes effect only for an asynchronous insert, which the pin above rules out |
+    /// | `insert_deduplicate` | `deduplicate_insert`'s own entry: "The setting overrides `insert_deduplicate` and `async_insert_deduplicate` settings", and this insert pins it to `enable` |
+    /// | `deduplicate_insert_select` | its entry scopes it to `INSERT SELECT`; this is `INSERT … FORMAT RowBinary…` |
+    /// | `input_format_parallel_parsing` | its entry: "Supported only for TabSeparated (TSV), TSKV, CSV and JSONEachRow formats" — not the `RowBinary` family this client writes |
+    /// | `max_parsing_threads`, `min_chunk_bytes_for_parallel_parsing` | both belong to parallel parsing, which `input_format_parallel_parsing`'s entry supports for the four formats above and not for this one: the first is its thread count, the second what one thread takes |
+    /// | `min_insert_block_size_rows_for_materialized_views`, `min_insert_block_size_bytes_for_materialized_views`, `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push. The part-per-thread case the third one's entry names needs `max_insert_threads`, whose own entry scopes it to `INSERT SELECT` |
+    /// | `max_partitions_per_insert_block` | it refuses a block, it does not split one; every row of a push carries one `received_ms`, so the block lies in one partition |
+    ///
+    /// **How the set was derived.** Two searches over the 1,550 rows of
+    /// `system.settings` at 26.3.29.7, both here literally so their counts can
+    /// be re-run — swap `count()` for `name` to list what each returns:
+    ///
+    /// ```sql
+    /// -- A, 96 rows: the class by its own words.
+    /// WITH lower(concat(name, ' ', description)) AS x
+    /// SELECT count() FROM system.settings
+    /// WHERE position(x, 'block') > 0 OR position(x, 'dedup') > 0
+    ///
+    /// -- B, 104 rows: of the rest, the neighbouring words.
+    /// WITH lower(concat(name, ' ', description)) AS x
+    /// SELECT count() FROM system.settings
+    /// WHERE NOT (position(x, 'block') > 0 OR position(x, 'dedup') > 0)
+    ///   AND arrayExists(w -> position(x, w) > 0,
+    ///       ['squash', 'flush', 'emit', 'buffer', 'batch', 'queue',
+    ///        'parsing', 'parsed', 'split', 'duplicat'])
+    /// ```
+    ///
+    /// Every name in A whose own description concerns this statement is in one
+    /// of the two tables above. **Every name in B is accounted for here**, in
+    /// nine groups that do not overlap and add to 104, so nothing rests on a
+    /// figure a reader cannot re-derive:
+    ///
+    /// 1. **Already in the second table above (7).** `async_insert`,
+    ///    `async_insert_max_data_size`, `async_insert_poll_timeout_ms`,
+    ///    `input_format_parallel_parsing`,
+    ///    `materialized_views_squash_parallel_inserts`, `max_parsing_threads`,
+    ///    `min_chunk_bytes_for_parallel_parsing`.
+    ///
+    /// 2. **An input format's own rule, or a type- or schema-inference rule
+    ///    (27).** Each decides how the request's bytes become values, never when
+    ///    a block ends; most of them name a format this insert does not use.
+    ///    `cast_string_to_date_time_mode`, `date_time_input_format`,
+    ///    `enable_parsing_to_custom_serialization`, `format_schema`,
+    ///    `input_format_json_defaults_for_missing_elements_in_named_tuple`,
+    ///    `input_format_json_ignore_unnecessary_fields`,
+    ///    `input_format_json_read_arrays_as_strings`,
+    ///    `input_format_json_read_bools_as_numbers`,
+    ///    `input_format_json_read_bools_as_strings`,
+    ///    `input_format_json_read_numbers_as_strings`,
+    ///    `input_format_json_read_objects_as_strings`,
+    ///    `input_format_orc_row_batch_size`,
+    ///    `input_format_parquet_enable_json_parsing`,
+    ///    `input_format_parquet_enable_row_group_prefetch`,
+    ///    `input_format_try_infer_dates`, `input_format_try_infer_datetimes`,
+    ///    `input_format_values_accurate_types_of_literals`,
+    ///    `input_format_values_deduce_templates_of_expressions`,
+    ///    `input_format_values_interpret_expressions`,
+    ///    `json_type_escape_dots_in_keys`,
+    ///    `max_dynamic_subcolumns_in_json_type_parsing`, `precise_float_parsing`,
+    ///    `schema_inference_make_columns_nullable`, `session_timezone`,
+    ///    `type_json_allow_duplicated_key_with_literal_and_nested_object`,
+    ///    `type_json_skip_duplicated_paths`,
+    ///    `type_json_use_partial_match_to_skip_paths_by_regexp`.
+    ///
+    /// 3. **The SQL parser's own limits, or a function's own behaviour (8).**
+    ///    `formatdatetime_parsedatetime_m_is_month_name`, `max_ast_depth`,
+    ///    `max_ast_elements`, `max_parser_backtracks`, `max_query_size`,
+    ///    `parsedatetime_e_requires_space_padding`,
+    ///    `parsedatetime_parse_without_leading_zeros`,
+    ///    `splitby_max_substrings_includes_remaining_string`.
+    ///
+    /// 4. **The read path, or a `SELECT` rewrite (17).**
+    ///    `apply_prewhere_after_final`,
+    ///    `cluster_table_function_buckets_batch_size`,
+    ///    `correlated_subqueries_use_in_memory_buffer`, `enable_vertical_final`,
+    ///    `external_storage_max_read_bytes`, `external_storage_max_read_rows`,
+    ///    `merge_tree_compact_parts_min_granules_to_multibuffer_read`,
+    ///    `merge_tree_read_split_ranges_into_intersecting_and_non_intersecting_injection_probability`,
+    ///    `optimize_duplicate_order_by_and_distinct`,
+    ///    `parallel_replicas_custom_key`,
+    ///    `parallel_replicas_custom_key_range_lower`,
+    ///    `parallel_replicas_custom_key_range_upper`, `query_plan_split_filter`,
+    ///    `read_in_order_use_buffering`,
+    ///    `split_intersecting_parts_ranges_into_layers_final`,
+    ///    `split_parts_ranges_into_intersecting_and_non_intersecting_final`,
+    ///    `union_default_mode`.
+    ///
+    /// 5. **A buffer or a limit on a file or network channel (18)** — a cache,
+    ///    object storage, an archive, a temporary file, the HTTP transport. None
+    ///    of them forms a block. `archive_adaptive_buffer_max_size_bytes`,
+    ///    `azure_list_object_keys_size`,
+    ///    `distributed_cache_prefer_bigger_buffer_size`,
+    ///    `filesystem_cache_allow_background_download`,
+    ///    `filesystem_cache_prefer_bigger_buffer_size`,
+    ///    `filesystem_cache_segments_batch_size`, `http_headers_read_timeout`,
+    ///    `http_max_multipart_form_data_size`, `http_response_buffer_size`,
+    ///    `http_wait_end_of_query`, `max_download_buffer_size`,
+    ///    `max_read_buffer_size`, `max_read_buffer_size_local_fs`,
+    ///    `max_read_buffer_size_remote_fs`, `prefetch_buffer_size`,
+    ///    `s3_list_object_keys_size`, `temporary_files_buffer_size`,
+    ///    `write_through_distributed_cache_buffer_size`.
+    ///
+    /// 6. **An output format (3):** the response, nothing on the way in.
+    ///    `output_format_parquet_batch_size`,
+    ///    `output_format_parquet_bloom_filter_flush_threshold_bytes`,
+    ///    `output_format_sql_insert_max_batch_size`.
+    ///
+    /// 7. **Another table engine's, another storage engine's, or a background
+    ///    subsystem of the server's (18).**
+    ///    `allow_experimental_object_storage_queue_hive_partitioning`,
+    ///    `allow_experimental_s3queue`,
+    ///    `background_buffer_flush_schedule_pool_size`,
+    ///    `backup_restore_batch_size_for_keeper_multi`,
+    ///    `backup_restore_batch_size_for_keeper_multiread`,
+    ///    `database_replicated_initial_query_timeout_sec`,
+    ///    `distributed_background_insert_batch`,
+    ///    `distributed_background_insert_split_batch_on_failure`,
+    ///    `distributed_directory_monitor_batch_inserts`,
+    ///    `distributed_directory_monitor_split_batch_on_failure`,
+    ///    `mysql_max_rows_to_insert`, `s3queue_allow_experimental_sharded_mode`,
+    ///    `s3queue_default_zookeeper_path`,
+    ///    `s3queue_enable_logging_to_s3queue_log`,
+    ///    `s3queue_keeper_fault_injection_probability`,
+    ///    `s3queue_migrate_old_metadata_to_buckets`,
+    ///    `stream_like_engine_allow_direct_select`,
+    ///    `stream_like_engine_insert_queue`.
+    ///
+    /// 8. **After the block rather than where it ends (1):** it delays the flush
+    ///    of the part the block became.
+    ///    `max_insert_delayed_streams_for_parallel_write`.
+    ///
+    /// 9. **Diagnostics, the client, or query admission (5).**
+    ///    `apply_settings_from_server`, `jemalloc_enable_profiler`,
+    ///    `log_comment`, `queue_max_wait_ms`, `trace_profile_events_list`.
+    ///
+    /// **What none of this closes** is a setting that ends a block without
+    /// using any of those words in its description; against that the only
+    /// closure is the catalogue's own emit rule, quoted at the top, which
+    /// enumerates the conditions for format parsing.
+    ///
+    /// **Nothing else divides one request into blocks.** The vendored client
+    /// flushes its buffer to the socket every `MIN_CHUNK_SIZE` bytes
+    /// (`vendor/clickhouse/src/insert.rs:18`), but those are transfer chunks
+    /// of one `INSERT … FORMAT RowBinary…` request rather than blocks, and
+    /// the condition that client states for an atomic insert is the row one
+    /// alone (`vendor/clickhouse/README.md:157`).
+    pub fn landing_insert(token: &str, max_rows: u64) -> Self {
+        Self::deduplicate_through_views()
+            .set("insert_deduplication_token", token)
+            .set("max_insert_block_size", max_rows)
+            .set("max_insert_block_size_bytes", 0)
+            .set("input_format_max_block_size_bytes", 0)
+            .set("min_insert_block_size_rows", max_rows)
+            .set("min_insert_block_size_bytes", 0)
+            .set("input_format_connection_handling", 0)
+            .set("input_format_max_block_wait_ms", 0)
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
@@ -132,6 +364,24 @@ impl QuerySettings {
     /// `pub(crate)` internals.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.iter()
+    }
+
+    /// The bytes this settings set's own allocations hold: the vector by
+    /// **capacity**, and every key and value string by capacity.
+    ///
+    /// Introspection for one caller (same posture as [`Self::get`] and
+    /// [`Self::entries`]): the metrics landing path charges its queue for
+    /// everything a sealed block retains, one settings set included, and the
+    /// case that prices a block walks it with this. A figure over the strings'
+    /// lengths would understate what the allocator holds, which is what the
+    /// charge has to cover.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.0.capacity() as u64 * std::mem::size_of::<(String, String)>() as u64
+            + self
+                .0
+                .iter()
+                .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
+                .sum::<u64>()
     }
 
     /// Applies every `(key, value)` pair to a `clickhouse::query::Query`
@@ -241,6 +491,100 @@ mod tests {
         );
         let off = QuerySettings::new().with_insert_quorum(0, true, Duration::from_secs(5));
         assert_eq!(off.render_suffix(), "");
+    }
+
+    /// **Every setting that forms, ends or emits a block, and every setting
+    /// that decides whether the insert is deduplicated, is pinned** (issue
+    /// #603 code review rounds 7 and 8, finding 1). The set and the
+    /// catalogue quote behind each value are in [`QuerySettings::
+    /// landing_insert`]'s own table; this is that table as assertions, one
+    /// per pin and exact, because a pin that is merely present can still
+    /// carry the wrong value.
+    ///
+    /// Two of them decide a block by counting rows (`max_insert_block_size`
+    /// and `min_insert_block_size_rows`, both at the ceiling admission has
+    /// already refused a larger push against), three by counting bytes, one
+    /// by elapsed time, and the last by whether a broken connection's
+    /// buffered rows are processed at all — which is the one that disables
+    /// deduplication, and so defeats the token rather than splitting a push.
+    #[test]
+    fn the_landing_insert_pins_every_limit_that_forms_a_block() {
+        let s = QuerySettings::landing_insert("tok-1", 1_048_576);
+        assert_eq!(
+            s.get("max_insert_block_size"),
+            Some("1048576"),
+            "the row ceiling admission refuses against"
+        );
+        assert_eq!(
+            s.get("max_insert_block_size_bytes"),
+            Some("0"),
+            "the byte limit on the blocks an insert forms must not participate"
+        );
+        assert_eq!(
+            s.get("input_format_max_block_size_bytes"),
+            Some("0"),
+            "nor the byte limit on the blocks the input format forms"
+        );
+        assert_eq!(
+            s.get("min_insert_block_size_rows"),
+            Some("1048576"),
+            "the minimum pair emits a block when BOTH are reached, so the row \
+             half is pinned to the same ceiling as the maximum's"
+        );
+        assert_eq!(
+            s.get("min_insert_block_size_bytes"),
+            Some("0"),
+            "and the byte half must not participate"
+        );
+        assert_eq!(
+            s.get("input_format_connection_handling"),
+            Some("0"),
+            "the one that makes deduplication impossible when enabled, which \
+             defeats the token rather than splitting the push"
+        );
+        assert_eq!(
+            s.get("input_format_max_block_wait_ms"),
+            Some("0"),
+            "nor may a block be emitted because time passed"
+        );
+        assert_eq!(
+            s.get("insert_deduplication_token"),
+            Some("tok-1"),
+            "the minted token is what makes a resend safe"
+        );
+        assert_eq!(
+            s.get("deduplicate_insert"),
+            Some("enable"),
+            "it overrides insert_deduplicate and async_insert_deduplicate, so \
+             one pin closes all three"
+        );
+        assert_eq!(
+            s.get("deduplicate_blocks_in_dependent_materialized_views"),
+            Some("1"),
+            "and the views each check their own window"
+        );
+        assert_eq!(
+            s.entries().count(),
+            10,
+            "the pinned set is closed: a setting added to it without a row in \
+             landing_insert's table, and without its required-name entry, is \
+             a name sent on somebody's memory"
+        );
+    }
+
+    /// The row ceiling is a deployment's value, and **both** row limits
+    /// follow it: a deployment at the floor of its range gets the same
+    /// one-block guarantee as one at the default, because the pin that ends
+    /// a block by counting rows is the same figure admission refuses
+    /// against.
+    #[test]
+    fn both_row_limits_follow_the_deployments_own_ceiling() {
+        for max_rows in [1_000u64, 1_048_576, 10_000_000] {
+            let s = QuerySettings::landing_insert("tok-1", max_rows);
+            let want = max_rows.to_string();
+            assert_eq!(s.get("max_insert_block_size"), Some(want.as_str()));
+            assert_eq!(s.get("min_insert_block_size_rows"), Some(want.as_str()));
+        }
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when

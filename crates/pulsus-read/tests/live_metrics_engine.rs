@@ -101,6 +101,8 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
         storage_policy: None,
         retention_days: 7,
         log_rollup: Duration::from_secs(5),
+        metrics_landing_retention_hours: 6,
+        metrics_dedup_window: 10_000,
     };
     run_init(bootstrap, &params).await.expect("run_init");
 }
@@ -2867,6 +2869,81 @@ async fn metadata_collapses_to_the_latest_write() {
         .await
         .expect("metadata (limited)");
     assert_eq!(limited.len(), 1);
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #603: two rows for one name with the SAME `updated_ns` and no field
+/// in common. One aggregate over the whole descriptor tuple means one of the
+/// two wins **whole**; three independent `argMax` calls may resolve column by
+/// column and answer `("gauge", "help b", …)` — a descriptor no client ever
+/// sent.
+///
+/// The statement's own text is what reddens on the defect
+/// (`metadata_query_aggregates_the_descriptor_as_one_tuple`): one block of two
+/// rows may resolve the same row three times, so this case alone can pass on
+/// it. It is here because the property is about what a client is served.
+#[tokio::test]
+async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_metadata_tie");
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    seed_metadata(
+        &client,
+        &[
+            SeedMetadataRow {
+                metric_name: "up".to_string(),
+                metric_type: "gauge".to_string(),
+                help: "help a".to_string(),
+                unit: "unit_a".to_string(),
+                updated_ns: 3_000,
+            },
+            SeedMetadataRow {
+                metric_name: "up".to_string(),
+                metric_type: "counter".to_string(),
+                help: "help b".to_string(),
+                unit: "unit_b".to_string(),
+                updated_ns: 3_000,
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    let rows = engine
+        .metadata(Some("up"), None)
+        .await
+        .expect("metadata (tied)");
+    assert_eq!(rows.len(), 1, "one descriptor per name");
+    let got = (
+        rows[0].metric_type.as_str(),
+        rows[0].help.as_str(),
+        rows[0].unit.as_str(),
+    );
+    assert!(
+        got == ("gauge", "help a", "unit_a") || got == ("counter", "help b", "unit_b"),
+        "one of the two rows must win WHOLE, not a tuple assembled from both: {got:?}"
+    );
 
     drop_database(&bootstrap, db).await;
 }

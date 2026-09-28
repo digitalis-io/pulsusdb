@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use crate::config::{ChConnConfig, ConsistencyConfig};
 use crate::error::{ChError, Idempotency};
@@ -37,6 +37,31 @@ impl<T> ChRow for T where
 /// caller request into an unbounded retry storm.
 const MAX_IDEMPOTENT_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// One `String` column, aliased `s` — the row shape
+/// [`ChClient::query_strings`] decodes.
+#[derive(crate::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StringRow {
+    s: String,
+}
+
+/// How far one insert attempt had got when it failed — the only thing that
+/// decides whether its commit fate is knowable.
+///
+/// The boundary is the first `write`, not the server's answer: from there the
+/// request is open and the vendored client flushes on its own buffer
+/// threshold, so nothing here can tell whether bytes left the process. A
+/// failure at or after it may have committed; one before it provably did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertPhase {
+    /// The pooled connection's checkout and the target's column-metadata
+    /// read: none of the block has been sent, whether the phase ended in the
+    /// server's own exception or in the client's deadline.
+    BeforeSend,
+    /// Writing the rows and ending the insert, whether the phase ended in the
+    /// server's answer or in the client's deadline.
+    MayHaveSent,
+}
 
 pub struct ChClient {
     pool: Arc<ChPool>,
@@ -181,15 +206,33 @@ impl ChClient {
     /// `pulsus-write`'s policy, out of scope here).
     ///
     /// Bounded by both a server-side `max_execution_time` (on the `INSERT`
-    /// statement) and a client-side `tokio::time::timeout` wrapping the
-    /// whole create/write/end sequence. Because a timed-out or
-    /// network-aborted insert has **unknown commit fate** (the server may
-    /// have partially applied it), any retryable-class failure here is
-    /// downgraded to the non-retryable [`ChError::InsertUncertain`] — this
-    /// is the rule that keeps a caller from ever auto-retrying an insert
-    /// whose effect is uncertain. Genuine pre-commit poison (bad SQL,
-    /// decode failure) is surfaced unchanged: nothing was committed, so it
-    /// is not uncertain, merely wrong.
+    /// statement) and one client-side deadline over the whole
+    /// create/write/end sequence, awaited phase by phase against the same
+    /// instant so that which phase it fired in is known.
+    ///
+    /// **What decides the class is the phase, not the error.** An insert's
+    /// commit fate is unknown from the moment any of the
+    /// block may have left the process: the server may have applied part of it,
+    /// and a source table whose derived tables are maintained by materialized
+    /// view can have committed its own block before a view on it throws. So
+    /// every failure from the write-or-end phase — retryable or not — is
+    /// [`ChError::InsertUncertain`], which no caller auto-retries. Only a
+    /// failure raised **before** the block was sent, which is the pooled
+    /// connection's checkout and the target's column-metadata read, is genuine
+    /// pre-commit poison and keeps its precise class: nothing was committed,
+    /// so it is not uncertain, merely wrong, and the caller may release
+    /// whatever it was holding for a retry.
+    ///
+    /// Where the phase itself is not knowable it over-reports, and it never
+    /// under-reports: a client-side row serialization failure on the first row
+    /// is reported unknown although nothing was sent, because the vendored
+    /// client buffers and flushes on its own threshold and nothing here can
+    /// tell which side of that the failure fell on. A caller told "unknown"
+    /// for a block that was never stored loses a retry; a caller told "not
+    /// stored" for a block that was stored double-counts it. So an
+    /// over-report is not free, and nothing is over-reported whose phase is
+    /// knowable — the client's own deadline is classified by the phase it
+    /// fired in, not by the worse of the two.
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         self.insert_block_with(table, rows, &QuerySettings::new())
             .await
@@ -209,39 +252,70 @@ impl ChClient {
         // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
         // has no typed settings helper).
         let settings = Self::insert_settings_with(&self.consistency, self.default_timeout, extra);
-        let fut = async {
+        // ONE client-side deadline over the whole create/write/end sequence,
+        // awaited in its two phases against the same instant: `timeout_at`
+        // shares the deadline, so the two waits cannot add up to more than
+        // `default_timeout`, and the phase the deadline fires in is the phase
+        // whose wait returned it. A single wait over the whole sequence cannot
+        // say that, and classifying a deadline that fired during the metadata
+        // read as post-send costs a caller the pre-send retry it was entitled
+        // to.
+        let deadline = tokio::time::Instant::now() + self.default_timeout;
+        let timed_out =
+            || ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout));
+
+        // Phase one, acquisition: `insert` reads the target's column metadata
+        // and returns a builder. None of the block has been sent while this
+        // runs, so every ending here — the server's own exception and the
+        // deadline alike — is `BeforeSend`.
+        let acquire = async {
             let mut insert = conn.client().insert::<R>(table).await?;
             for (k, v) in settings.iter() {
                 insert = insert.with_setting(k, v);
             }
-            for row in rows {
-                insert.write(row).await?;
-            }
-            insert.end().await
+            Ok::<_, clickhouse::error::Error>(insert)
         };
-        let result = tokio::time::timeout(self.default_timeout, fut)
-            .await
-            .map_err(|_| {
-                ChError::Timeout(format!("insert_block exceeded {:?}", self.default_timeout))
-            })
-            .and_then(|inner| inner.map_err(ChError::from));
+        let acquired = match tokio::time::timeout_at(deadline, acquire).await {
+            Ok(Ok(insert)) => Ok(insert),
+            Ok(Err(e)) => Err((InsertPhase::BeforeSend, ChError::from(e))),
+            Err(_elapsed) => Err((InsertPhase::BeforeSend, timed_out())),
+        };
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Transport-class failure demotes this endpoint so the next
-                // insert steers to a healthy one (no-op for logic errors —
-                // the guard lives in `report_transport_failure`).
-                conn.report_transport_failure(&e);
-                // Uncertain-fate downgrade: any retryable failure during an
-                // insert must NOT reach a caller as retryable (would
-                // duplicate the block on replay).
-                if e.is_retryable() {
-                    Err(ChError::InsertUncertain(e.to_string()))
-                } else {
-                    Err(e) // genuine pre-commit poison, surfaced precisely
+        // Phase two, write and end: from the first `write` the request is open
+        // and the client flushes on its own buffer threshold, so anything from
+        // here on may already be on the wire — every ending is `MayHaveSent`,
+        // the deadline included.
+        let result = match acquired {
+            Err(pair) => Err(pair),
+            Ok(mut insert) => {
+                let send = async {
+                    for row in rows {
+                        insert.write(row).await?;
+                    }
+                    insert.end().await
+                };
+                match tokio::time::timeout_at(deadline, send).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err((InsertPhase::MayHaveSent, ChError::from(e))),
+                    Err(_elapsed) => Err((InsertPhase::MayHaveSent, timed_out())),
                 }
             }
+        };
+
+        let (phase, err) = match result {
+            Ok(()) => return Ok(()),
+            Err(pair) => pair,
+        };
+
+        // Transport-class failure demotes this endpoint so the next insert
+        // steers to a healthy one (no-op for logic errors — the guard lives in
+        // `report_transport_failure`).
+        conn.report_transport_failure(&err);
+        match phase {
+            InsertPhase::MayHaveSent => Err(ChError::InsertUncertain(err.to_string())),
+            // Provably before the block was sent, so its class is preserved:
+            // a retryable one is still retryable, and poison is still poison.
+            InsertPhase::BeforeSend => Err(err),
         }
     }
 
@@ -275,6 +349,26 @@ impl ChClient {
             timeout: self.default_timeout,
             conn,
         })
+    }
+
+    /// Reads a statement whose result is one `String` column aliased `s`, as
+    /// a `Vec<String>`.
+    ///
+    /// A convenience over [`Self::query_stream`] for the several callers that
+    /// want a list of names and nothing else: without it each one declares
+    /// its own one-field row type, which needs the `clickhouse` derive in
+    /// scope in that crate.
+    pub async fn query_strings(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<Vec<String>, ChError> {
+        let mut stream = self.query_stream::<StringRow>(sql, settings).await?;
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await {
+            out.push(row?.s);
+        }
+        Ok(out)
     }
 
     /// DDL / maintenance statement. Settings are injected per-statement.
@@ -478,6 +572,32 @@ mod tests {
             s.render_suffix(),
             " SETTINGS async_insert = 0, deduplicate_insert = enable, \
              deduplicate_blocks_in_dependent_materialized_views = 1, max_execution_time = 120.000"
+        );
+    }
+
+    /// The metrics landing insert carries the full setting set, in order:
+    /// the two block-deduplication pins, the block's own minted token, and
+    /// the seven settings that decide how many blocks the server forms out
+    /// of the request and whether it deduplicates them — between
+    /// `async_insert` and the deadline, with nothing else moving. A path that
+    /// sent only some of them would leave a resend storing the block twice,
+    /// or one push becoming two blocks.
+    #[test]
+    fn the_landing_insert_emits_the_full_setting_set_in_order() {
+        let s = ChClient::insert_settings_with(
+            &ConsistencyConfig::default(),
+            Duration::from_secs(120),
+            &QuerySettings::landing_insert("t1", 1_048_576),
+        );
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS async_insert = 0, deduplicate_insert = enable, \
+             deduplicate_blocks_in_dependent_materialized_views = 1, \
+             insert_deduplication_token = t1, max_insert_block_size = 1048576, \
+             max_insert_block_size_bytes = 0, input_format_max_block_size_bytes = 0, \
+             min_insert_block_size_rows = 1048576, min_insert_block_size_bytes = 0, \
+             input_format_connection_handling = 0, input_format_max_block_wait_ms = 0, \
+             max_execution_time = 120.000"
         );
     }
 

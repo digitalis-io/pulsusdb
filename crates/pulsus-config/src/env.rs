@@ -44,6 +44,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_STORAGE_POLICY",
     "PULSUS_ROTATION_INTERVAL",
     "PULSUS_LOG_ROLLUP_RESOLUTION",
+    "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+    "PULSUS_METRICS_DEDUP_WINDOW",
     "PULSUS_CLUSTER",
     "PULSUS_DIST_SUFFIX",
     "PULSUS_SKIP_UNAVAILABLE_SHARDS",
@@ -58,6 +60,9 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_INGEST_DEDUP",
     "PULSUS_INGEST_DEDUP_WINDOW",
     "PULSUS_INGEST_DEDUP_MAX_BYTES",
+    "PULSUS_METRICS_LANDING_RETRIES",
+    "PULSUS_METRICS_LANDING_INSERTERS",
+    "PULSUS_METRICS_LANDING_MAX_ROWS",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
     "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
@@ -274,6 +279,13 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_LOG_ROLLUP_RESOLUTION") {
         cfg.log_rollup_resolution = parse_dur("PULSUS_LOG_ROLLUP_RESOLUTION", &v)?;
     }
+    if let Some(v) = read("PULSUS_METRICS_LANDING_RETENTION_HOURS") {
+        cfg.metrics_landing_retention_hours =
+            parse_int("PULSUS_METRICS_LANDING_RETENTION_HOURS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_METRICS_DEDUP_WINDOW") {
+        cfg.metrics_dedup_window = parse_int("PULSUS_METRICS_DEDUP_WINDOW", &v)?;
+    }
     if let Some(v) = read("PULSUS_CLUSTER") {
         cfg.cluster = Some(v);
     }
@@ -315,6 +327,15 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_INGEST_DEDUP_MAX_BYTES") {
         cfg.writer.ingest_dedup_max_bytes = parse_size("PULSUS_INGEST_DEDUP_MAX_BYTES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_METRICS_LANDING_RETRIES") {
+        cfg.writer.metrics_landing_retries = parse_int("PULSUS_METRICS_LANDING_RETRIES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_METRICS_LANDING_INSERTERS") {
+        cfg.writer.metrics_landing_inserters = parse_int("PULSUS_METRICS_LANDING_INSERTERS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_METRICS_LANDING_MAX_ROWS") {
+        cfg.writer.metrics_landing_max_rows = parse_int("PULSUS_METRICS_LANDING_MAX_ROWS", &v)?;
     }
     if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
         cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;
@@ -459,8 +480,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            82,
-            "docs/configuration.md §§1-8 document exactly 82 variables"
+            87,
+            "docs/configuration.md §§1-8 document exactly 87 variables"
         );
     }
 

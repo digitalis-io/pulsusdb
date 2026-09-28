@@ -140,6 +140,51 @@ pub const INGEST_DEDUP_MAX_BYTES_FLOOR: u64 = 1024 * 1024;
 /// See [`INGEST_DEDUP_MAX_BYTES_FLOOR`].
 pub const INGEST_DEDUP_MAX_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 
+/// `metrics_landing_retention_hours` — issue #603's replay window: how long
+/// the metrics landing table keeps a landed row. The floor is one hour,
+/// because a shorter window leaves nothing to rebuild a derived table from;
+/// the ceiling is one week, past which the landing table is the deployment's
+/// primary storage rather than its replay window.
+pub const METRICS_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
+/// See [`METRICS_LANDING_RETENTION_HOURS_FLOOR`].
+pub const METRICS_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
+
+/// `metrics_dedup_window` — how many recent blocks each table on the metrics
+/// write path remembers. The floor is one block, the least that recognises
+/// an immediately repeated resend; the ceiling is a million, the largest the
+/// engine's own setting accepts as a useful window.
+///
+/// **There is no companion time window.** The engine has
+/// `non_replicated_deduplication_window` and no seconds-based counterpart
+/// for a non-replicated table, so a block is remembered until that many
+/// newer blocks have arrived and is never forgotten on a timer — the safe
+/// direction for a resend (issue #603).
+pub const METRICS_DEDUP_WINDOW_FLOOR: u64 = 1;
+/// See [`METRICS_DEDUP_WINDOW_FLOOR`].
+pub const METRICS_DEDUP_WINDOW_CEILING: u64 = 1_000_000;
+
+/// `writer.metrics_landing_retries` — resends of a failed landing insert.
+/// Zero is meaningful (never resend), and the ceiling is ten: the landing
+/// budget bounds the loop in wall-clock time anyway, so a larger count only
+/// spends the same budget in smaller pieces.
+pub const METRICS_LANDING_RETRIES_CEILING: u32 = 10;
+
+/// `writer.metrics_landing_inserters` — insert workers on the landing queue.
+/// The floor is one, or nothing takes a block off the queue at all; the
+/// ceiling is 64, past which the workers contend for the connection pool
+/// rather than adding throughput.
+pub const METRICS_LANDING_INSERTERS_FLOOR: u32 = 1;
+/// See [`METRICS_LANDING_INSERTERS_FLOOR`].
+pub const METRICS_LANDING_INSERTERS_CEILING: u32 = 64;
+
+/// `writer.metrics_landing_max_rows` — the per-push landing row ceiling, and
+/// the `max_insert_block_size` every landing insert pins. The floor is a
+/// thousand rows, below which an ordinary scrape is refused; the ceiling is
+/// ten million, past which one block is a memory event rather than a batch.
+pub const METRICS_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
+/// See [`METRICS_LANDING_MAX_ROWS_FLOOR`].
+pub const METRICS_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
+
 /// `reader.cache_max_series` — the matched-set / IN-list cardinality
 /// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
 /// 1000x the default of 50_000; kept below
@@ -399,6 +444,63 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 13: retention_days.
     if cfg.retention_days < 1 {
         return Err(value_err("retention_days", "must be >= 1", ">= 1"));
+    }
+
+    // Issue #603: the metrics landing table's dials. Both ends matter for
+    // each, so these are range checks rather than ceiling checks — see each
+    // constant for what its ends protect.
+    if !(METRICS_LANDING_RETENTION_HOURS_FLOOR..=METRICS_LANDING_RETENTION_HOURS_CEILING)
+        .contains(&cfg.metrics_landing_retention_hours)
+    {
+        return Err(range_err(
+            "metrics_landing_retention_hours",
+            u64::from(cfg.metrics_landing_retention_hours),
+            u64::from(METRICS_LANDING_RETENTION_HOURS_FLOOR),
+            u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING),
+            "hours",
+        ));
+    }
+    if !(METRICS_DEDUP_WINDOW_FLOOR..=METRICS_DEDUP_WINDOW_CEILING)
+        .contains(&cfg.metrics_dedup_window)
+    {
+        return Err(range_err(
+            "metrics_dedup_window",
+            cfg.metrics_dedup_window,
+            METRICS_DEDUP_WINDOW_FLOOR,
+            METRICS_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    if cfg.writer.metrics_landing_retries > METRICS_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.metrics_landing_retries",
+            u64::from(cfg.writer.metrics_landing_retries),
+            0,
+            u64::from(METRICS_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(METRICS_LANDING_INSERTERS_FLOOR..=METRICS_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.metrics_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.metrics_landing_inserters",
+            u64::from(cfg.writer.metrics_landing_inserters),
+            u64::from(METRICS_LANDING_INSERTERS_FLOOR),
+            u64::from(METRICS_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(METRICS_LANDING_MAX_ROWS_FLOOR..=METRICS_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.metrics_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.metrics_landing_max_rows",
+            cfg.writer.metrics_landing_max_rows,
+            METRICS_LANDING_MAX_ROWS_FLOOR,
+            METRICS_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
     }
 
     // Rule 15: readers target `<table><dist_suffix>`; an empty suffix would
@@ -1231,6 +1333,90 @@ mod tests {
             u64::MAX,
             BATCH_MS_CEILING,
         );
+    }
+
+    /// Issue #603: each of the five metrics landing dials resolves to its
+    /// documented default, is accepted at both ends of its range, and is
+    /// rejected one step outside each end naming its own field. A knob with
+    /// no range check accepts the out-of-range value and fails here.
+    #[test]
+    fn the_metrics_landing_dials_reject_both_sides_and_accept_both_ends() {
+        let d = Config::default();
+        assert_eq!(d.metrics_landing_retention_hours, 6);
+        assert_eq!(d.metrics_dedup_window, 10_000);
+        assert_eq!(d.writer.metrics_landing_retries, 3);
+        assert_eq!(d.writer.metrics_landing_inserters, 4);
+        assert_eq!(d.writer.metrics_landing_max_rows, 1_048_576);
+        assert!(validate(&d).is_ok());
+
+        // (field, setter, bad values, good values)
+        type Set = fn(&mut Config, u64);
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
+            (
+                "metrics_landing_retention_hours",
+                |c, v| c.metrics_landing_retention_hours = v as u32,
+                vec![0, u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING) + 1],
+                vec![
+                    u64::from(METRICS_LANDING_RETENTION_HOURS_FLOOR),
+                    u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING),
+                ],
+            ),
+            (
+                "metrics_dedup_window",
+                |c, v| c.metrics_dedup_window = v,
+                vec![
+                    METRICS_DEDUP_WINDOW_FLOOR - 1,
+                    METRICS_DEDUP_WINDOW_CEILING + 1,
+                ],
+                vec![METRICS_DEDUP_WINDOW_FLOOR, METRICS_DEDUP_WINDOW_CEILING],
+            ),
+            (
+                "writer.metrics_landing_retries",
+                |c, v| c.writer.metrics_landing_retries = v as u32,
+                vec![u64::from(METRICS_LANDING_RETRIES_CEILING) + 1],
+                // Zero is meaningful here: never resend.
+                vec![0, u64::from(METRICS_LANDING_RETRIES_CEILING)],
+            ),
+            (
+                "writer.metrics_landing_inserters",
+                |c, v| c.writer.metrics_landing_inserters = v as u32,
+                vec![0, u64::from(METRICS_LANDING_INSERTERS_CEILING) + 1],
+                vec![
+                    u64::from(METRICS_LANDING_INSERTERS_FLOOR),
+                    u64::from(METRICS_LANDING_INSERTERS_CEILING),
+                ],
+            ),
+            (
+                "writer.metrics_landing_max_rows",
+                |c, v| c.writer.metrics_landing_max_rows = v,
+                vec![
+                    METRICS_LANDING_MAX_ROWS_FLOOR - 1,
+                    METRICS_LANDING_MAX_ROWS_CEILING + 1,
+                ],
+                vec![
+                    METRICS_LANDING_MAX_ROWS_FLOOR,
+                    METRICS_LANDING_MAX_ROWS_CEILING,
+                ],
+            ),
+        ];
+
+        for (name, set, bad, good) in cases {
+            for value in bad {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                match validate(&cfg) {
+                    Err(ConfigError::Value { field, .. }) => {
+                        assert_eq!(field, name, "{name} at {value}");
+                    }
+                    other => panic!("{name} at {value}: expected a Value error, got {other:?}"),
+                }
+            }
+            for value in good {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                assert!(validate(&cfg).is_ok(), "{name} at {value} must be accepted");
+            }
+        }
     }
 
     /// Issue #494: the suppression window is a two-sided range, so both

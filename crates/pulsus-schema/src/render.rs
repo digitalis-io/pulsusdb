@@ -33,6 +33,12 @@ pub struct RenderCtx {
     /// 5s). Sets both the `log_metrics_<res>` table-name suffix and the
     /// bucket-floor expression in its materialized view.
     pub log_rollup: Duration,
+    /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
+    /// landing table's delete-TTL, in hours.
+    pub metrics_landing_retention_hours: u32,
+    /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): the block-deduplication
+    /// window the landing table and the four derived metric tables carry.
+    pub metrics_dedup_window: u64,
 }
 
 /// Table families that must shard byte-identically (docs/schemas.md §7):
@@ -132,6 +138,14 @@ fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> 
         .replace("{{retention_days}}", retention_repr)
         .replace("{{log_rollup_suffix}}", &rollup_suffix(ctx.log_rollup))
         .replace("{{log_rollup_ns}}", &log_rollup_ns)
+        .replace(
+            "{{metrics_landing_retention_hours}}",
+            &ctx.metrics_landing_retention_hours.to_string(),
+        )
+        .replace(
+            "{{metrics_dedup_window}}",
+            &ctx.metrics_dedup_window.to_string(),
+        )
 }
 
 /// Escapes a single-quoted SQL string literal. Config-derived, not
@@ -296,6 +310,8 @@ mod tests {
             storage_policy: None,
             retention_days: 7,
             log_rollup: Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
         }
     }
 

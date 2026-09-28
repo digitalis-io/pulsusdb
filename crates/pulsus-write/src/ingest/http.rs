@@ -57,7 +57,9 @@ use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
-use crate::ingest::{AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders};
+use crate::ingest::{
+    AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_too_large_message,
+};
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
 use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
@@ -924,6 +926,16 @@ fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             status_response(StatusCode::BAD_REQUEST, 3, KEY_REUSED_MESSAGE.to_string())
         }
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            8,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
     }
 }
 
@@ -937,6 +949,18 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             go_http_error_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
         }
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => go_http_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{}\n",
+                push_too_large_message(rows, row_limit, bytes, byte_limit)
+            ),
+        ),
     }
 }
 
@@ -949,6 +973,22 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             loki_plain_text_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
         }
+        // No metrics push reaches the log receiver, so nothing here
+        // constructs the variant; the arm exists because the refusal is one
+        // shared enum (issue #603), and it answers the same way the metric
+        // transports do.
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => loki_plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{}\n",
+                push_too_large_message(rows, row_limit, bytes, byte_limit)
+            ),
+        ),
     }
 }
 
@@ -1268,6 +1308,9 @@ mod tests {
         /// Issue #494: the sink refused because the request's
         /// `Idempotency-Key` had already carried different content.
         KeyReused,
+        /// Issue #603: the push does not fit one block, so it is refused
+        /// whole rather than split.
+        PushTooLarge,
     }
 
     impl Outcome {
@@ -1276,9 +1319,19 @@ mod tests {
                 Outcome::Admit | Outcome::FlushFails => None,
                 Outcome::Backpressure => Some(AdmitRefusal::Backpressure),
                 Outcome::KeyReused => Some(AdmitRefusal::KeyReused),
+                Outcome::PushTooLarge => Some(PUSH_TOO_LARGE),
             }
         }
     }
+
+    /// The refusal both metric transports are driven with below: test 3's
+    /// five-row, 178-byte push at a five-row ceiling.
+    const PUSH_TOO_LARGE: AdmitRefusal = AdmitRefusal::PushTooLarge {
+        rows: 5,
+        row_limit: 5,
+        bytes: 178,
+        byte_limit: 16_777_216,
+    };
 
     impl MockSink {
         fn new(outcome: Outcome) -> Arc<MockSink> {
@@ -1314,6 +1367,7 @@ mod tests {
                 })),
                 Outcome::Backpressure => Err(AdmitRefusal::Backpressure),
                 Outcome::KeyReused => Err(AdmitRefusal::KeyReused),
+                Outcome::PushTooLarge => Err(PUSH_TOO_LARGE),
             }
         }
     }
@@ -1926,6 +1980,7 @@ mod tests {
                 })),
                 Outcome::Backpressure => Err(AdmitRefusal::Backpressure),
                 Outcome::KeyReused => Err(AdmitRefusal::KeyReused),
+                Outcome::PushTooLarge => Err(PUSH_TOO_LARGE),
             }
         }
     }
@@ -2397,7 +2452,10 @@ mod tests {
                 // Traces are out of scope for issue #494: the trace sink
                 // has no suppression index and no `KeyReused` refusal, so
                 // that outcome is unreachable here.
-                Outcome::Admit | Outcome::FlushFails | Outcome::KeyReused => Ok(()),
+                Outcome::Admit
+                | Outcome::FlushFails
+                | Outcome::KeyReused
+                | Outcome::PushTooLarge => Ok(()),
                 Outcome::Backpressure => Err(Backpressure),
             }
         }
@@ -2405,7 +2463,9 @@ mod tests {
         fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
             self.admitted.lock().unwrap().push(batch);
             match self.outcome {
-                Outcome::Admit | Outcome::KeyReused => Ok(FlushWait::new(async { Ok(()) })),
+                Outcome::Admit | Outcome::KeyReused | Outcome::PushTooLarge => {
+                    Ok(FlushWait::new(async { Ok(()) }))
+                }
                 Outcome::FlushFails => Ok(FlushWait::new(async {
                     Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
                 })),
@@ -2890,6 +2950,35 @@ mod tests {
         let body = plain_text_body(res).await;
         assert!(body.contains("Idempotency-Key"), "{body:?}");
         assert!(body.ends_with('\n'), "the endpoint's terminator: {body:?}");
+    }
+
+    /// Issue #603: a push that does not fit one block is `413` on **both**
+    /// metric transports, each in its own body shape, carrying the message
+    /// rendered from the push's own four numbers. A refusal mapped to the
+    /// queue's `429` would tell a client to retry a push that can never fit.
+    #[tokio::test]
+    async fn a_push_too_large_is_413_on_both_metric_transports() {
+        let want = push_too_large_message(5, 5, 178, 16_777_216);
+
+        // The OTLP receiver: a `google.rpc.Status` protobuf.
+        let sink = MockMetricSink::new(Outcome::PushTooLarge);
+        let res = post_metrics_body(metrics_router(sink), valid_metrics_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 8);
+        assert_eq!(status.message, want);
+
+        // The remote-write receiver: one plain-text error writer, with the
+        // endpoint's own terminator and its nosniff header.
+        let sink = MockMetricSink::new(Outcome::PushTooLarge);
+        let res = call_remote_write(&sink, valid_remote_write_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let body = plain_text_body(res).await;
+        assert_eq!(body, format!("{want}\n"));
     }
 
     #[tokio::test]
