@@ -303,9 +303,12 @@ push whose identity the index already holds is suppressed before the insert, and
 caller is answered with the original push's outcome. Everything about a client's re-push
 — its suppression, its responses and its index — is as it shipped before this work. One
 detail is this path's: a suppressed push stores no sample, series or histogram row and
-**still sends its descriptors**, as its own landing insert of kind-3 rows carrying no
-claim and no waiter, which runs §4's loop like any other block — so a failure after it
-was sent leaves whether they landed unknown (§9 D16).
+**still sends its descriptors once their own reservation is granted**, as its own landing
+insert of kind-3 rows carrying no claim and no waiter, which runs §4's loop like any other
+block — so a failure after it was sent leaves whether they landed unknown. That block takes
+a byte reservation of its own (§6), and a queue with no room for it refuses the push `429`
+instead: no descriptor row is built, queued or sent, and the caller gets that refusal
+rather than the original push's outcome (§9 D16).
 
 **The writer's own resend** — the same block sent again after an attempt whose fate is
 unknown — is the deduplication token:
@@ -564,7 +567,7 @@ any of them is covered.
 | **D13** | the other shipped log, trace and per-target row shapes | they keep the collect-then-write encoder, which builds one value tree per row. Nothing is claimed about their peak, and it was not measured |
 | **D14** | a new scalar type declared bounded wrongly | the piece refusal turns it into an error and the widest-value case into a failing test, rather than silent growth — but the compiler cannot catch it |
 | **D15** | `pulsusdb rebuild-metrics` | deliberately without tests: there is no environment in this tree that would exercise it faithfully. It refuses a replay into the three append-only targets unless the caller also asks for their partitions to be dropped first, because a replay without that stores every row twice |
-| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged is the caller's answer — the original push's outcome. Nothing gates, caches or promotes a descriptor, so the next push carrying those descriptors emits them again |
+| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged, once that block's own byte reservation is granted, is the caller's answer — the original push's outcome; a queue with no room for that reservation refuses the repeat `429` and nothing of its descriptors is built, queued or sent (§3). Nothing gates, caches or promotes a descriptor, so the next push carrying those descriptors emits them again |
 | **D17** | a steady push rate above the rate §3 derives from `PULSUS_METRICS_DEDUP_WINDOW` | a token can be evicted before its resend arrives and the block is stored twice. Sizing the window is a deployment matter and nothing checks it |
 | **D18** | the landing table's TTL | it floors `received_ms` to the second, so expiry can fall up to 999 ms before the exact instant and never after it; and a part's drop waits for a TTL merge, so this design states no instant at which landed rows stop occupying storage |
 | **D19** | a landed event's identity | `event_id` lives only in the landing table and only while retention keeps it. No target holds it |
