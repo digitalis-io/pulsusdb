@@ -633,9 +633,11 @@ label, the landing table's, with the backfill series gone
 
 ## 11. What holds each guarantee up
 
-Every entry is a test function name, findable with `git grep -n 'fn <name>'`. Unless a
-file is named, the function is in `crates/pulsus-write/tests/metric_writer.rs`. An entry
-marked live runs only against a server.
+Every entry is a test function name, findable with `git grep -n 'fn <name>'`. A file in
+brackets holds every name in the run directly before it, back to whichever comes first of
+the previous file, the previous semicolon, and the start of the cell. A name outside such
+a run is in `crates/pulsus-write/tests/metric_writer.rs`. An entry marked live runs only
+against a server.
 
 | guarantee | what holds it up |
 |---|---|
@@ -647,16 +649,16 @@ marked live runs only against a server.
 | the pinned settings reach the wire | `the_production_inserter_sends_the_landing_settings_on_the_wire`, `the_calls_settings_win_over_the_inserters_own` (`crates/pulsus-write/tests/landing_insert_settings.rs`) |
 | a missing name refuses before any DDL | `a_missing_server_name_refuses_init_mode_before_any_ddl` (`crates/pulsus-server/src/schema_init.rs`); live: `required_names_are_read_from_the_server`, `a_catalogue_the_user_cannot_read_is_unchecked_not_a_refusal` (`crates/pulsus-schema/tests/live_schema.rs`) |
 | the landing table, its views, its TTL and the five windows exist as configured | live: `metric_landing_and_its_views_exist_after_init`, `an_existing_landing_table_is_adopted_by_a_rerun`, `run_init_installs_the_landing_ttl_at_the_configured_hours`, `dedup_settings_reach_the_landing_table_and_all_four_targets` (`crates/pulsus-schema/tests/live_schema.rs`) |
-| a push too large is refused whole, before any reservation | `a_push_at_a_ceiling_is_refused_whole`, `a_suppressed_copy_of_an_oversized_push_stores_nothing`, `the_push_too_large_message_names_the_size_and_both_limits`, `a_push_too_large_is_413_on_both_metric_transports` (`crates/pulsus-write/src/ingest/http.rs`) |
+| a push too large is refused whole, before any reservation | `a_push_at_a_ceiling_is_refused_whole`, `a_suppressed_copy_of_an_oversized_push_stores_nothing`, `the_push_too_large_message_names_the_size_and_both_limits`; `a_push_too_large_is_413_on_both_metric_transports` (`crates/pulsus-write/src/ingest/http.rs`) |
 | an empty push is a success and is charged for nothing | `an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits` |
 | a token is minted per block and repeated byte-identically on resend | `a_token_is_minted_per_sealed_block_and_repeated_on_resend` |
-| a class is preserved before the send and downgraded after it | `a_server_exception_after_the_block_was_sent_is_uncertain`, `a_retryable_failure_before_the_block_was_sent_keeps_its_own_class`, `a_client_deadline_during_the_metadata_read_is_a_pre_send_failure`, `a_client_deadline_after_the_insert_was_opened_is_uncertain` |
+| a class is preserved before the send and downgraded after it | `a_server_exception_after_the_block_was_sent_is_uncertain`, `a_retryable_failure_before_the_block_was_sent_keeps_its_own_class`, `a_client_deadline_during_the_metadata_read_is_a_pre_send_failure`, `a_client_deadline_after_the_insert_was_opened_is_uncertain` (`crates/pulsus-write/tests/landing_insert_settings.rs`) |
 | the fate never walks back from uncertain, and each ending is the one named in §4 | `the_fate_never_walks_back_from_uncertain`, `the_insert_loop_endings` |
 | the budget bounds the queue wait, every attempt and every sleep | `the_landing_budget_bounds_the_loop`, `a_retry_sleep_never_carries_a_block_past_the_budget`, `a_block_whose_budget_expired_while_queued_never_starts_an_insert`, `the_budget_expiring_inside_an_attempt_reports_an_unknown_fate` |
 | no attempt is created or carried past the shutdown deadline | `an_attempt_is_never_created_once_the_deadline_has_passed`, `an_attempt_is_never_created_by_a_read_the_deadline_overtook` (`crates/pulsus-write/src/writer/drain.rs`), `a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline` |
 | shutdown accounts for every push it admitted, and files the two fates differently | `the_drain_accounts_for_every_push_it_admitted`, `shutdown_files_an_inflight_block_and_a_queued_block_differently`, `a_block_sent_after_the_queue_closed_is_settled_by_the_admitting_task` |
 | the charge covers everything a queued block holds | `the_charge_covers_everything_a_queued_block_holds` (`crates/pulsus-write/src/writer/metric.rs`), `the_queue_charge_covers_the_landing_rows_it_holds`, `the_queue_charge_covers_the_escaped_labels_it_holds`, `the_queue_byte_allowance_is_aggregate_across_pushes` |
-| the charge outlives the memory it prices, and one function releases it | `a_committing_block_stays_charged_until_its_rows_are_released`, `a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written`, `the_landing_reservation_is_released_in_one_place` (`crates/pulsus-write/src/writer/metric.rs`) |
+| the charge outlives the memory it prices, and one function releases it | `a_committing_block_stays_charged_until_its_rows_are_released`, `the_landing_reservation_is_released_in_one_place` (`crates/pulsus-write/src/writer/metric.rs`), `a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written` |
 | spooling a block holds no copy that grows with the push | `spooling_a_block_holds_no_copy_of_the_push` (`crates/pulsus-write/tests/spool_stream_alloc.rs`) |
 | the streamed encoding is byte-for-byte the declared shape | `every_landing_row_kind_streams_the_shape_it_declares`, `a_streamed_string_escapes_exactly_as_serde_json_does`, `every_spool_scalar_fits_one_bounded_piece` (`crates/pulsus-write/src/writer/spool.rs`) |
 | a failed spool write changes no outcome | `a_failed_spool_write_is_counted_and_changes_no_outcome` |
