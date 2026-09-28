@@ -303,8 +303,9 @@ push whose identity the index already holds is suppressed before the insert, and
 caller is answered with the original push's outcome. Everything about a client's re-push
 — its suppression, its responses and its index — is as it shipped before this work. One
 detail is this path's: a suppressed push stores no sample, series or histogram row and
-**still lands its descriptors**, as its own landing insert of kind-3 rows carrying no
-claim and no waiter (§9 D16).
+**still sends its descriptors**, as its own landing insert of kind-3 rows carrying no
+claim and no waiter, which runs §4's loop like any other block — so a failure after it
+was sent leaves whether they landed unknown (§9 D16).
 
 **The writer's own resend** — the same block sent again after an attempt whose fate is
 unknown — is the deduplication token:
@@ -548,7 +549,7 @@ any of them is covered.
 
 | | precondition | effect |
 |---|---|---|
-| **D1** | a view throws while the server processes the insert | the insert fails, so the block is resent and then settled and spooled, and **which of the targets kept the block's rows is not recorded anywhere**. `docs/schemas.md` §4.1, "What a failing view leaves behind", reports that outcome measured over 300 trials of exactly this shape — one throwing view and three healthy siblings over one source table: the throwing view's own target held nothing every time, the source rows were present in nearly every trial, and each healthy sibling committed in some of them. Nothing makes the fan-out a transaction and no machinery is built for this |
+| **D1** | a view throws while the server processes the insert | the insert fails after the block was sent, so it is §4's uncertain ending and takes that row's course rather than one of its own: at a `PULSUS_METRICS_LANDING_RETRIES` of 0, or with the budget spent, the first failure settles and spools; with resends left it is sent again, and if the view no longer throws that attempt commits, with no audit copy written at all. **Which of the targets kept the block's rows is not recorded anywhere** at any of those endings. `docs/schemas.md` §4.1, "What a failing view leaves behind", reports that outcome measured over 300 trials of exactly this shape — one throwing view and three healthy siblings over one source table: the throwing view's own target held nothing every time, the source rows were present in nearly every trial, and each healthy sibling committed in some of them. Nothing makes the fan-out a transaction and no machinery is built for this |
 | **D2** | a clustered deployment | the landing table and the four targets render as `Replicated*` engines, where the window the server applies is `replicated_deduplication_window`. `METRIC_LANDING_STMTS` sets only the non-replicated name, so `PULSUS_METRICS_DEDUP_WINDOW` does not change the window in force there and the server's own default governs. The statements themselves apply without error — the clustered schema suite runs `run_init`, which runs them. `git grep -ln metric_landing` over the whole tree at the merged revision returns 23 files, and `crates/pulsus-schema/tests/live_cluster.rs` — the only suite that builds a clustered schema — is not among them, so no check covers the clustered window. **This one is a finding of this document's own and has not been through review** |
 | **D3** | an attempt polled before the deadline and still in flight at it | abandoned, which is the uncertain ending. A send already on the wire cannot be recalled |
 | **D4** | a deadline already expired when it was published, which needs a shutdown grace of zero | the constructor returns a future and the request goes out on its first poll, one store and one call after the lock is released; a publication landing in that gap means a request issued a few instructions after the deadline. With any positive grace the deadline is in the future at publication and the request is well inside it. Closing it would mean holding the deadline's lock across the insert's own polls, where a shutdown would wait on the network and the workers would stop overlapping |
@@ -563,7 +564,7 @@ any of them is covered.
 | **D13** | the other shipped log, trace and per-target row shapes | they keep the collect-then-write encoder, which builds one value tree per row. Nothing is claimed about their peak, and it was not measured |
 | **D14** | a new scalar type declared bounded wrongly | the piece refusal turns it into an error and the widest-value case into a failing test, rather than silent growth — but the compiler cannot catch it |
 | **D15** | `pulsusdb rebuild-metrics` | deliberately without tests: there is no environment in this tree that would exercise it faithfully. It refuses a replay into the three append-only targets unless the caller also asks for their partitions to be dropped first, because a replay without that stores every row twice |
-| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter. If it fails, nothing of it is stored, the caller still gets the original push's outcome, and the next push carrying those descriptors emits them again |
+| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged is the caller's answer — the original push's outcome. Nothing gates, caches or promotes a descriptor, so the next push carrying those descriptors emits them again |
 | **D17** | a steady push rate above the rate §3 derives from `PULSUS_METRICS_DEDUP_WINDOW` | a token can be evicted before its resend arrives and the block is stored twice. Sizing the window is a deployment matter and nothing checks it |
 | **D18** | the landing table's TTL | it floors `received_ms` to the second, so expiry can fall up to 999 ms before the exact instant and never after it; and a part's drop waits for a TTL merge, so this design states no instant at which landed rows stop occupying storage |
 | **D19** | a landed event's identity | `event_id` lives only in the landing table and only while retention keeps it. No target holds it |
@@ -583,38 +584,38 @@ tables.
 The settings constructor takes the row ceiling as an argument, so a second signal passes
 its own.
 
-| signal | target tables | how many | what the writer inserts into today |
-|---|---|---|---|
-| metrics | `metric_samples`, `metric_hist_samples`, `metric_series`, `metric_metadata` | 4 | one landing table (this document) |
-| logs | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_<res>`, `log_patterns` | 5 | `log_samples`, `log_streams`, `log_patterns` — three buffers, three flush tasks |
-| traces | `trace_spans`, `trace_attrs_idx`, `trace_tag_catalog`, `trace_edges`, `trace_recent`, `trace_error_spans` | 6 | `trace_spans`, `trace_attrs_idx` — two buffers, two flush tasks |
+**This document names no other signal's target tables, deliberately.** A signal's target
+set — and which of those targets its own writer writes rather than a view — is decided in
+that signal's own design, and a copy of the list here would state that decision twice and
+date it. Logs: `docs/schemas.md` §3. Traces: `docs/TraceQL/sql-schema.md` §1 and
+`docs/TraceQL/server-implementation.md` §2, whose accepted design replaces every trace
+table now in `crates/pulsus-schema/src/catalog.rs`, so a trace target list read off the
+catalogue today aims this work at tables that are going. The catalogue,
+`WriterTables::logs_default` and `TraceWriterTables::traces_default` answer what is in the
+tree now, which is a different question.
 
-The lists come from `MIGRATIONS` and `MVS` in `crates/pulsus-schema/src/catalog.rs` and
-from `WriterTables::logs_default` and `TraceWriterTables::traces_default`.
+**The discriminating values are the implementer's to choose, one per target the landing
+table feeds** — the targets that signal's writer writes today. Metrics used `kind`
+`UInt8`, values 0..3, declared as `MetricLandingRow::KIND_*` constants and read by the
+views as `WHERE kind = k`, 0 to 3. A second signal does the same: one value per kind, the
+discriminator first in the sorting key (§1.1), and a row type that is the union of its
+targets' columns less the server-filled identity column.
 
-**The discriminating values are the implementer's to choose, one per target that the
-writer writes.** Metrics used `kind` `UInt8`, values 0..3, declared as
-`MetricLandingRow::KIND_*` constants and read by the views as `WHERE kind = k`, 0 to 3.
-A second
-signal does the same: one value per kind, the discriminator first in the sorting key
-(§1.1), and a row type that is the union of its targets' columns less the server-filled
-identity column.
+**A second-level view is that signal's own question, and there is a shape that does not
+ask it.** Another signal may keep a target that a view maintains off another target
+rather than off the landing table — in the tree today `log_streams_idx` off `log_streams`,
+`log_metrics_<res>` off `log_samples`, and four trace tables off two others. The metrics
+path has no such case, all four of its targets being one view away from the landing table,
+and no insert in this tree sends a block through two levels of view: all ten views in
+`MVS` read a table the writer itself inserts into. So **nothing here establishes what a
+view does when its own source is written by a view**, and no sentence in this document
+should be read as establishing it. What this document does establish is the other shape:
+a kind and a view of its own per target, off the landing table. A signal that keeps a
+second-level view instead rests on behaviour this design never exercised, and whether it
+does is part of deciding that signal's target set, above.
 
-**The one question this design does not answer.** Of the five logs targets, two are
-already maintained by a view off another target — `log_streams_idx` from `log_streams`,
-and `log_metrics_<res>` from `log_samples`. Of the six traces targets, four are:
-`trace_tag_catalog` from `trace_attrs_idx`, and `trace_edges`, `trace_recent` and
-`trace_error_spans` from `trace_spans`. The metrics path has no such case — all four of
-its targets are one view away from the landing table — so **nothing here establishes
-what those second-level views do when their source is itself written by a view.** An
-implementer settles it before choosing the kind list, and the two outcomes lead to
-different designs: if a second-level view fires on a view's insert, a landing table with
-one kind per writer-written table is enough and the existing views stay as they are; if
-it does not, that signal needs a kind and a view of its own per target, and the
-second-level views go.
-
-Two consequences of that choice reach the rest of this document. The row type is the
-union of the kinds' columns, so a signal with more kinds holds a wider row per landed
+Two things follow for the rest of this document, whichever way that goes. The row type is
+the union of the kinds' columns, so a signal with more kinds holds a wider row per landed
 event and §6's per-row term grows with it. And each target needs the window statement of
 §1.3, whatever level of view writes it.
 
