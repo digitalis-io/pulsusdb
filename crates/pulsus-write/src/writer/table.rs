@@ -59,7 +59,7 @@ where
 
 /// Production [`BlockInserter`]: a thin adapter over
 /// `ChClient::insert_block`, generic over every row shape this crate
-/// defines (both `LogSampleRow` and `LogStreamRow` share one instance).
+/// defines (the landing rows and every trace row share one instance).
 pub struct ChBlockInserter {
     client: Arc<ChClient>,
     /// Settings added to every insert this inserter sends; empty for every
@@ -604,8 +604,9 @@ pub(crate) fn backoff_delay(
 
 #[cfg(test)]
 mod tests {
-    use pulsus_model::Fingerprint;
     use std::path::PathBuf;
+
+    use pulsus_model::Fingerprint;
     use std::sync::Mutex;
 
     use pulsus_config::WriterConfig;
@@ -614,8 +615,8 @@ mod tests {
     use crate::writer::backfill::{RegistrationBacklog, enqueue_failed};
     use crate::writer::buffer::TableBuffer;
     use crate::writer::error::WriteError;
-    use crate::writer::metrics::WriterMetrics;
-    use crate::writer::rows::LogStreamRow;
+    use crate::writer::metrics::TraceWriterMetrics;
+    use crate::writer::rows::TraceAttrRow;
 
     /// A stub inserter: `finish_generation` (the unit under test below)
     /// never inserts, but `TableContext` requires one.
@@ -631,13 +632,22 @@ mod tests {
         }
     }
 
-    fn stream_row() -> LogStreamRow {
-        LogStreamRow {
-            month: 19662,
-            fingerprint: Fingerprint::from_raw(42),
-            service: "svc".to_string(),
-            labels: "{\"service_name\":\"svc\"}".to_string(),
-            updated_ns: 1,
+    /// One `trace_attrs_idx` row — the registration shape this module still
+    /// serves. It used to be a `log_streams` row; the logs write path left
+    /// this module with issue #603's landing block, and only the
+    /// `trace_attrs_idx` backlog is left.
+    fn attr_row() -> TraceAttrRow {
+        TraceAttrRow {
+            date: 19662,
+            key: "http.method".to_string(),
+            val: "GET".to_string(),
+            scope: "span".to_string(),
+            val_num: None,
+            timestamp_ns: 1,
+            trace_id: [1u8; 16],
+            span_id: [2u8; 8],
+            duration_ns: 5,
+            val_type: "string".to_string(),
         }
     }
 
@@ -653,18 +663,18 @@ mod tests {
         path
     }
 
-    fn streams_ctx_with(
-        metrics: &Arc<WriterMetrics>,
+    fn attrs_ctx_with(
+        metrics: &Arc<TraceWriterMetrics>,
         spool_root: PathBuf,
-        on_flush_poisoned: Option<FlushPoisonedHook<LogStreamRow>>,
-    ) -> TableContext<LogStreamRow> {
+        on_flush_poisoned: Option<FlushPoisonedHook<TraceAttrRow>>,
+    ) -> TableContext<TraceAttrRow> {
         TableContext {
-            table: Arc::from("log_streams"),
+            table: Arc::from("trace_attrs_idx"),
             buffer: Arc::new(TableBuffer::new()),
             notify: Arc::new(Notify::new()),
             inserter: Arc::new(OkInserter),
             runtime: Arc::new(WriterRuntime::from_config(&WriterConfig::default())),
-            table_metrics: metrics.streams.clone(),
+            table_metrics: metrics.attrs.clone(),
             spool: Arc::new(SpoolWriter::new(spool_root, metrics.clone())),
             queued_bytes: Arc::new(AtomicU64::new(0)),
             on_flush_success: None,
@@ -680,18 +690,18 @@ mod tests {
     #[tokio::test]
     async fn poisoned_spool_write_failure_bumps_the_counter_and_still_fires_the_hook() {
         let spool_root = plain_file_spool_root();
-        let metrics = Arc::new(WriterMetrics::default());
+        let metrics = Arc::new(TraceWriterMetrics::default());
 
         let hook_rows = Arc::new(AtomicU64::new(0));
         let hook_rows_for_hook = hook_rows.clone();
-        let hook: FlushPoisonedHook<LogStreamRow> = Arc::new(move |rows: &[LogStreamRow]| {
+        let hook: FlushPoisonedHook<TraceAttrRow> = Arc::new(move |rows: &[TraceAttrRow]| {
             hook_rows_for_hook.fetch_add(rows.len() as u64, Ordering::SeqCst);
         });
-        let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
+        let ctx = attrs_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
         let (_, _, rx) = ctx
             .buffer
-            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
+            .append_and_wait(vec![attr_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 
@@ -705,7 +715,7 @@ mod tests {
 
         assert_eq!(
             metrics
-                .streams
+                .attrs
                 .spool_write_failures_total
                 .load(Ordering::SeqCst),
             1,
@@ -733,20 +743,20 @@ mod tests {
     #[tokio::test]
     async fn compound_spool_write_failure_and_byte_cap_drop_is_acknowledged_lost() {
         let spool_root = plain_file_spool_root();
-        let metrics = Arc::new(WriterMetrics::default());
+        let metrics = Arc::new(TraceWriterMetrics::default());
 
         // Cap of 1 byte: any real row is a byte-cap drop.
         let backlog = Arc::new(Mutex::new(RegistrationBacklog::new(1)));
         let backlog_for_hook = backlog.clone();
-        let backfill_metrics_for_hook = metrics.backfill.clone();
-        let hook: FlushPoisonedHook<LogStreamRow> = Arc::new(move |rows: &[LogStreamRow]| {
+        let backfill_metrics_for_hook = metrics.attrs_backfill.clone();
+        let hook: FlushPoisonedHook<TraceAttrRow> = Arc::new(move |rows: &[TraceAttrRow]| {
             enqueue_failed(&backlog_for_hook, &backfill_metrics_for_hook, rows);
         });
-        let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
+        let ctx = attrs_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
         let (_, _, rx) = ctx
             .buffer
-            .append_and_wait(vec![stream_row()], 10, u64::MAX, None);
+            .append_and_wait(vec![attr_row()], 10, u64::MAX, None);
         ctx.queued_bytes.store(10, Ordering::SeqCst);
         let generation = ctx.buffer.swap_out().expect("non-empty generation");
 
@@ -760,13 +770,19 @@ mod tests {
 
         assert_eq!(
             metrics
-                .streams
+                .attrs
                 .spool_write_failures_total
                 .load(Ordering::SeqCst),
             1
         );
-        assert_eq!(metrics.backfill.dropped_total.load(Ordering::SeqCst), 1);
-        assert_eq!(metrics.backfill.enqueued_total.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            metrics.attrs_backfill.dropped_total.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            metrics.attrs_backfill.enqueued_total.load(Ordering::SeqCst),
+            0
+        );
         assert_eq!(
             backlog
                 .lock()
@@ -775,8 +791,11 @@ mod tests {
             0,
             "the dropped row must not linger in the backlog"
         );
-        assert_eq!(metrics.backfill.pending.load(Ordering::SeqCst), 0);
-        assert_eq!(metrics.backfill.healed_total.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.attrs_backfill.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            metrics.attrs_backfill.healed_total.load(Ordering::SeqCst),
+            0
+        );
         assert!(
             matches!(
                 rx.await.expect("generation settled"),
@@ -801,7 +820,6 @@ mod tests {
         use crate::ingest::PushHeaders;
         use crate::ingest::metrics::{MetricPoint, ParsedMetrics};
         use crate::writer::push_dedup::{Admission, WaitMode, metric_identity};
-        use pulsus_model::Fingerprint;
 
         let claim_deadline = Duration::from_millis(200) + Duration::from_secs(120);
         let batch = ParsedMetrics {

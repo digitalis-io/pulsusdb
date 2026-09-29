@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use prost::Message;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_model::Fingerprint;
 use pulsus_write::protocols::loki_push::{
     EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
@@ -856,6 +856,9 @@ async fn stored_samples_by_body(
                 .query_stream::<StoredSample>(&sql, &QuerySettings::new())
                 .await
                 .expect("query log_samples");
+            land_seeded_lines(client, db).await;
+            land_seeded_streams(client, db).await;
+            land_seeded_lines(client, db).await;
             while let Some(row) = rows.next().await {
                 let row = row.expect("decode log_samples row");
                 out.insert(row.body.clone(), row);
@@ -3890,6 +3893,7 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
         )
         .await
         .expect("seed log_streams");
+    land_seeded_streams(&client, db).await;
     client
         .insert_block(
             "log_samples",
@@ -3904,7 +3908,9 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
         )
         .await
         .expect("seed log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
+    land_seeded_lines(&client, db).await;
     let verbatim = wait_for_streams(port, r#"{service_name="s539v"}"#, base_ns, 1);
     let re_rendered = wait_for_streams(
         port,
@@ -3938,4 +3944,89 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
     );
 
     drop_db(db).await;
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

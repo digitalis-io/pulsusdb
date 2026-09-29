@@ -1,6 +1,5 @@
-//! What spooling a failed metrics landing block costs in **live** memory
-//! beyond committing the same block (issue #603 code review round 7, finding
-//! 3).
+//! What spooling a failed landing block costs in **live** memory beyond
+//! committing the same block — for both signals (issue #603).
 //!
 //! A block that cannot be committed is written to disk as one JSON document,
 //! because that copy is the push's only one. The queue reservation covers the
@@ -29,9 +28,10 @@
 //! bounded pieces still *requests* bytes in proportion to the push, and only
 //! a high-water mark of what is held at one instant tells the two apart.
 //!
-//! Everything runs in the single `#[test]` below, on a current-thread runtime,
-//! so no parallel test thread contributes to the process-wide high-water mark
-//! this measures.
+//! **The measurement is process-wide, so the windows must not overlap.** Each
+//! `#[test]` below holds [`MEASURE`] for its whole body, and each runs on a
+//! current-thread runtime, so no other test thread contributes to the
+//! high-water mark this measures.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
@@ -47,12 +47,20 @@ use pulsus_model::{
     CUSTOM_BUCKETS_SCHEMA, CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet,
     NativeHistogram, Span,
 };
+use pulsus_model::{Date, UnixNano};
 use pulsus_write::writer::{
-    BlockInserter, MetricWriter, MetricWriterTables, SPOOL_CHUNK_BYTES, WriterRuntime,
+    BlockInserter, LogWriter, MetricWriter, MetricWriterTables, SPOOL_CHUNK_BYTES, WriterRuntime,
+    WriterTables,
 };
 use pulsus_write::{
-    HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef,
+    HistogramPoint, LogRow, LogSink, MetricMetadata, MetricPoint, MetricSink, ParsedLogs,
+    ParsedMetrics, PushHeaders, SeriesRef, StreamRow,
 };
+
+/// Held for the whole of each measuring `#[test]`, so two of them never share
+/// a window. `PEAK` is process-wide; without this the second test's
+/// allocations land inside the first's measurement.
+static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // -- the allocator --------------------------------------------------------
 
@@ -334,7 +342,7 @@ async fn peak_over_push(push: ParsedMetrics, poison: bool) -> Measured {
     })
     .await;
 
-    let documents = spooled(&root);
+    let documents = spooled_of(&root, "metric_landing");
     assert_eq!(
         documents.len(),
         usize::from(poison),
@@ -349,9 +357,9 @@ async fn peak_over_push(push: ParsedMetrics, poison: bool) -> Measured {
     }
 }
 
-/// The byte length of every spooled document under `root`.
-fn spooled(root: &Path) -> Vec<u64> {
-    let dir = root.join("poison").join("metric_landing");
+/// The byte length of every spooled document under `root` for `table`.
+fn spooled_of(root: &Path, table: &str) -> Vec<u64> {
+    let dir = root.join("poison").join(table);
     std::fs::read_dir(&dir)
         .map(|entries| {
             entries
@@ -410,11 +418,13 @@ const STRING_BYTES_4X: usize = STRING_BYTES * 4;
 /// room for an array of 16,384 floats.
 const WIDTH_SLACK_BYTES: u64 = 256 * 1024;
 
-/// **Both halves are in one `#[test]`.** The measurement is a process-wide
+/// **Every half is in one `#[test]`.** The measurement is a process-wide
 /// high-water mark, so a second test function running on another thread would
-/// land inside this one's window (this file's own doc comment).
+/// land inside this one's window (this file's own doc comment) — which is what
+/// [`MEASURE`] serialises.
 #[test]
 fn spooling_a_block_holds_no_copy_of_the_push() {
+    let _measuring = MEASURE.lock().expect("the measurement mutex is poisoned");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -524,5 +534,151 @@ fn spooling_a_block_holds_no_copy_of_the_push() {
                 long.abs_diff(short)
             );
         }
+    });
+}
+
+// -- the logs half --------------------------------------------------------
+
+/// `rows` log lines on one stream, each body `bytes` long, plus the stream's
+/// own registration — so the push is `rows + 1` landing rows before extraction
+/// and every one of them carries text. Patterns are off in [`peak_over_log_push`],
+/// so the row count is exactly that.
+fn long_body_log_push(bytes: usize) -> ParsedLogs {
+    const TS: i64 = 1_700_000_000_000_000_000;
+    let (labels, _) =
+        LabelSet::from_normalized([("service_name".to_string(), "checkout".to_string())]);
+    ParsedLogs {
+        rows: vec![LogRow {
+            service: "checkout".to_string(),
+            fingerprint: Fingerprint::from_raw(7),
+            timestamp_ns: UnixNano(TS),
+            severity: 0,
+            body: long_text(bytes),
+            structured_metadata: long_text(bytes / 8),
+        }],
+        streams: vec![StreamRow {
+            month: Date::start_of_month_utc(TS).expect("a representable month"),
+            fingerprint: Fingerprint::from_raw(7),
+            service: "checkout".to_string(),
+            labels,
+            updated_ns: TS,
+        }],
+        ..Default::default()
+    }
+}
+
+/// [`peak_over_push`]'s logs twin: the same window over a `LogWriter`.
+async fn peak_over_log_push(push: ParsedLogs, poison: bool) -> Measured {
+    let root = spool_root(if poison { "log-poison" } else { "log-commit" });
+    let mut runtime = WriterRuntime::from_config(&WriterConfig {
+        log_landing_inserters: 1,
+        log_landing_retries: 0,
+        // Extraction would add a kind-2 row whose template is derived from the
+        // body, which is not what this case is measuring.
+        log_patterns: false,
+        ..Default::default()
+    });
+    runtime.spool_dir = root.clone();
+    let writer = LogWriter::with_landing_inserter_and_runtime(
+        Arc::new(FixedInserter { poison }),
+        runtime,
+        WriterTables::logs_default(),
+    );
+    let peak = peak_bytes_of(async {
+        let wait = writer
+            .admit_flush(push, PushHeaders::default())
+            .expect("the queue has room");
+        let answer = tokio::time::timeout(Duration::from_secs(60), wait)
+            .await
+            .expect("the block settles");
+        assert_eq!(
+            answer.is_err(),
+            poison,
+            "the poisoned block fails and the other commits"
+        );
+    })
+    .await;
+
+    let documents = spooled_of(&root, "log_landing");
+    assert_eq!(
+        documents.len(),
+        usize::from(poison),
+        "the poisoned block is on disk and the committed one is not"
+    );
+    let spooled_bytes = documents.iter().sum();
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+    Measured {
+        peak,
+        spooled_bytes,
+    }
+}
+
+/// **T41.** Spooling a logs landing block holds no copy that grows with the
+/// push.
+///
+/// A logs landing row has no float and no array, but it has five strings and
+/// one of them is a log line of any length admission accepts. The default
+/// encoder builds that row's whole value tree before writing it, so the same
+/// fixture at two body densities costs peaks that differ by the text; the
+/// override writes the fields straight into the sink and its overhead stays
+/// fixed. **Keeping the default encoder reddens the second assertion.**
+///
+/// This is the sibling that detects a MISSING override, which
+/// `every_log_landing_row_kind_streams_the_shape_it_declares` structurally
+/// cannot: that case compares the streamed document with `to_spool_value`'s,
+/// and the default encoder walks `to_spool_value` itself.
+#[test]
+fn spooling_a_log_block_holds_no_copy_of_the_push() {
+    let _measuring = MEASURE.lock().expect("the measurement mutex is poisoned");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build a current-thread runtime");
+
+    runtime.block_on(async {
+        // Warm-up, so no measured window pays a one-time cost.
+        let _ = peak_over_log_push(long_body_log_push(64), true).await;
+        let _ = peak_over_log_push(long_body_log_push(64), false).await;
+
+        let mut extras = Vec::new();
+        for (label, bytes) in [("S", STRING_BYTES), ("4S", STRING_BYTES_4X)] {
+            let commit = peak_over_log_push(long_body_log_push(bytes), false)
+                .await
+                .peak;
+            let spooled = peak_over_log_push(long_body_log_push(bytes), true).await;
+            let extra = spooled.peak.saturating_sub(commit);
+            // The boundary is crossed, not assumed: the document on disk is
+            // longer than the chunk several times over, and the body alone is
+            // longer than the chunk.
+            assert!(
+                bytes / 9 > SPOOL_CHUNK_BYTES
+                    && spooled.spooled_bytes > 4 * SPOOL_CHUNK_BYTES as u64,
+                "the {label} case must cross the {SPOOL_CHUNK_BYTES} byte chunk \
+                 boundary inside one field: its body is {} bytes and its \
+                 document is {} bytes",
+                bytes / 9,
+                spooled.spooled_bytes
+            );
+            assert!(
+                extra <= SPOOL_CEILING_BYTES,
+                "spooling one log line of {bytes} bytes ({label}) held {extra} \
+                 bytes more than committing it, over the ceiling \
+                 {SPOOL_CEILING_BYTES}: the encoder holds a copy of the row's \
+                 text that nothing charges the queue for (commit peak \
+                 {commit}, spool peak {})",
+                spooled.peak
+            );
+            extras.push(extra);
+        }
+        let (short, long) = (extras[0], extras[1]);
+        assert!(
+            long.abs_diff(short) <= WIDTH_SLACK_BYTES,
+            "four times the log line moved the spool path's overhead by {} \
+             bytes ({short} at {STRING_BYTES} bytes, {long} at \
+             {STRING_BYTES_4X}): it must stay fixed as the body grows, or the \
+             bound is one push's size and not a constant",
+            long.abs_diff(short)
+        );
     });
 }

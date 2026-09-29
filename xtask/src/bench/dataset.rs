@@ -167,6 +167,103 @@ struct SeedSampleRow {
     body: String,
 }
 
+/// One `log_landing` row, in the table's own column order (issue #603).
+///
+/// **The corpus is seeded into the LANDING table, not into the targets.**
+/// `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_<res>` and
+/// `log_patterns` are all maintained by materialized view off this one table
+/// now, so a loader that inserted into a target directly would leave every
+/// derived table the query set reads — the stream index stage 1 resolves
+/// through, and the rollup the activity scan and the rate scenarios read —
+/// empty. `event_id` is omitted so the server fills it.
+///
+/// **`log_landing` has no `_dist` wrapper, in either mode** (docs/schemas.md
+/// §7), so `--dist` seeds the bare name and the rows land on whichever shard
+/// this client is bound to. The `--dist` settle polls below therefore wait on
+/// the DERIVED tables' `_dist` names: what has to become visible is the views'
+/// output as the reader sees it, which is the same thing they waited on before
+/// and is now also what carries the rows across the wrapper.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLandingRow {
+    received_ms: i64,
+    kind: u8,
+    service: String,
+    fingerprint: Fingerprint,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+    month: u16,
+    labels: String,
+    updated_ns: i64,
+    pattern: String,
+    pattern_count: u64,
+}
+
+/// The landing table every logs corpus is seeded through. Not a `--dist`
+/// variant: there is no `log_landing_dist`.
+const LANDING_TABLE: &str = "log_landing";
+
+/// Lands a chunk of sample rows as kind-0 landing rows.
+async fn insert_lines(
+    client: &ChClient,
+    received_ms: i64,
+    rows: &[SeedSampleRow],
+) -> anyhow::Result<()> {
+    let landing: Vec<SeedLandingRow> = rows
+        .iter()
+        .map(|r| SeedLandingRow::line(received_ms, r))
+        .collect();
+    client.insert_block(LANDING_TABLE, &landing).await?;
+    Ok(())
+}
+
+impl SeedLandingRow {
+    fn of_kind(kind: u8, received_ms: i64) -> Self {
+        SeedLandingRow {
+            received_ms,
+            kind,
+            service: String::new(),
+            fingerprint: Fingerprint::from_raw(0),
+            timestamp_ns: 0,
+            severity: 0,
+            body: String::new(),
+            structured_metadata: String::new(),
+            month: 0,
+            labels: String::new(),
+            updated_ns: 0,
+            pattern: String::new(),
+            pattern_count: 0,
+        }
+    }
+
+    /// A kind-1 row: what `log_streams_mv` writes to `log_streams`, and what
+    /// `log_streams_idx_mv` array-joins into `log_streams_idx`.
+    fn stream(received_ms: i64, row: &SeedStreamRow) -> Self {
+        SeedLandingRow {
+            service: row.service.clone(),
+            fingerprint: row.fingerprint,
+            month: row.month,
+            labels: row.labels.clone(),
+            updated_ns: row.updated_ns,
+            ..Self::of_kind(1, received_ms)
+        }
+    }
+
+    /// A kind-0 row: what `log_samples_mv` writes to `log_samples`, and what
+    /// `log_metrics_<res>_mv` aggregates into the rollup.
+    fn line(received_ms: i64, row: &SeedSampleRow) -> Self {
+        SeedLandingRow {
+            service: row.service.clone(),
+            fingerprint: row.fingerprint,
+            timestamp_ns: row.timestamp_ns,
+            severity: row.severity,
+            body: row.body.clone(),
+            ..Self::of_kind(0, received_ms)
+        }
+    }
+}
+
 fn now_ns() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -292,8 +389,13 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
             updated_ns: end_ns,
         })
         .collect();
-    for chunk in stream_rows.chunks(INSERT_BATCH_ROWS) {
-        client.insert_block(streams_table, chunk).await?;
+    let landing_ms = end_ns / 1_000_000;
+    let landing_stream_rows: Vec<SeedLandingRow> = stream_rows
+        .iter()
+        .map(|r| SeedLandingRow::stream(landing_ms, r))
+        .collect();
+    for chunk in landing_stream_rows.chunks(INSERT_BATCH_ROWS) {
+        client.insert_block(LANDING_TABLE, chunk).await?;
     }
 
     if spec.dist {
@@ -355,12 +457,12 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
             body: gen_body(i, &stream.service, carries_needle),
         });
         if batch.len() == INSERT_BATCH_ROWS {
-            client.insert_block(samples_table, &batch).await?;
+            insert_lines(client, landing_ms, &batch).await?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        client.insert_block(samples_table, &batch).await?;
+        insert_lines(client, landing_ms, &batch).await?;
     }
 
     if spec.dist {
@@ -628,8 +730,13 @@ pub async fn load_broad_tier(
             updated_ns: end_ns,
         })
         .collect();
-    for chunk in stream_rows.chunks(INSERT_BATCH_ROWS) {
-        client.insert_block(streams_table, chunk).await?;
+    let landing_ms = end_ns / 1_000_000;
+    let landing_stream_rows: Vec<SeedLandingRow> = stream_rows
+        .iter()
+        .map(|r| SeedLandingRow::stream(landing_ms, r))
+        .collect();
+    for chunk in landing_stream_rows.chunks(INSERT_BATCH_ROWS) {
+        client.insert_block(LANDING_TABLE, chunk).await?;
     }
 
     if spec.dist {
@@ -671,7 +778,7 @@ pub async fn load_broad_tier(
         });
     }
     for chunk in batch.chunks(INSERT_BATCH_ROWS) {
-        client.insert_block(samples_table, chunk).await?;
+        insert_lines(client, landing_ms, chunk).await?;
     }
 
     if spec.dist {

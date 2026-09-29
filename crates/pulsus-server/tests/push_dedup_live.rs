@@ -613,6 +613,28 @@ async fn a_retried_log_push_stores_one_copy_on_every_reader() {
     )
     .await;
 
+    // **T50: counting the LANDING rows is the observation point.** The target
+    // rows alone cannot distinguish a suppressed push from a second block the
+    // server drops as a repeat — both leave `log_samples` at two — and only
+    // the landing count separates them. A suppression branch that queued a
+    // block anyway would land four kind-0 rows here and still read two above,
+    // unless the landing table's own deduplication window also caught it.
+    wait_for_scalar(
+        &client,
+        "SELECT count() AS n FROM log_landing WHERE kind = 0 AND service = 'dupB'",
+        2,
+        "L1: the retried push lands ONE block's rows, not two",
+    )
+    .await;
+    wait_for_scalar(
+        &client,
+        "SELECT count() AS n FROM log_landing WHERE service = 'dupB' OR kind = 2",
+        4,
+        "L1: and that block is the whole push — two lines, one registration, \
+         one pattern aggregate",
+    )
+    .await;
+
     // The rollup the counting queries read, and the pattern counts, are
     // fed by materialized views over `log_samples`: a duplicate INSERT
     // fires the view and nothing later subtracts from the sum, which is

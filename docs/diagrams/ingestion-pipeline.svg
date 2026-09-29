@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="300" viewBox="0 0 1120 300" role="img" aria-labelledby="title desc">
   <title id="title">Writer ingestion pipeline</title>
-  <desc id="desc">Requests are decompressed, parsed, normalized, appended to columnar buffers, flushed by size or age, and inserted into ClickHouse as columnar batches.</desc>
+  <desc id="desc">Requests are decompressed, parsed and normalized. A logs or metrics push then becomes one charged block, admitted or refused whole, and inserted into its landing table as one block; traces still appends to per-table columnar buffers flushed by size or age.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -37,12 +37,12 @@
   <text class="small" x="602" y="136">labels, fingerprints, rows</text>
 
   <rect class="box2" x="770" y="82" width="150" height="86" rx="8"/>
-  <text class="label" x="796" y="112">buffer</text>
-  <text class="small" x="793" y="136">per-table columns</text>
+  <text class="label" x="796" y="112">block</text>
+  <text class="small" x="785" y="136">one push, one block</text>
 
   <rect class="box3" x="960" y="82" width="130" height="86" rx="8"/>
   <text class="label" x="992" y="112">insert</text>
-  <text class="small" x="982" y="136">columnar batch</text>
+  <text class="small" x="976" y="136">landing table</text>
 
   <path class="arrow" d="M 170 125 H 208"/>
   <path class="arrow" d="M 350 125 H 388"/>
@@ -50,8 +50,12 @@
   <path class="arrow" d="M 730 125 H 768"/>
   <path class="arrow" d="M 920 125 H 958"/>
 
-  <rect class="box3" x="760" y="206" width="170" height="54" rx="8"/>
-  <text class="label" x="792" y="228">flush trigger</text>
-  <text class="small" x="788" y="248">PULSUS_BATCH_BYTES or MS</text>
-  <path class="arrow" d="M 845 168 V 204"/>
+  <rect class="box3" x="700" y="206" width="290" height="54" rx="8"/>
+  <text class="label" x="722" y="228">charge, then admit or refuse</text>
+  <text class="small" x="718" y="248">PULSUS_BATCH_BYTES per push; queue bytes</text>
+  <path class="arrow" d="M 845 204 V 170"/>
+
+  <rect class="box3" x="390" y="206" width="270" height="54" rx="8"/>
+  <text class="label" x="412" y="228">traces only</text>
+  <text class="small" x="408" y="248">per-table buffer, flushed by size or age</text>
 </svg>

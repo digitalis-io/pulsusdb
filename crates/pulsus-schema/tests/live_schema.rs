@@ -49,16 +49,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 macro_rules! skip_unless_live {
@@ -1125,11 +1116,11 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 
     // And the cardinality, so a NEW mutation of an allowed kind is a
     // decision somebody makes rather than a line nobody reads. The split
-    // measured on this base is ten `MATERIALIZE TTL` and four
+    // measured on this base is eleven `MATERIALIZE TTL` and four
     // `PROJECTION` commands — issue #560 added two `MATERIALIZE TTL`, one
     // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`,
-    // and issue #603 added one for the metrics landing table's own
-    // `MODIFY TTL`.
+    // and issue #603 added one for each landing table's own `MODIFY TTL`,
+    // `metric_landing`'s and then `log_landing`'s.
     let ttl = commands
         .iter()
         .filter(|c| *c == "(MATERIALIZE TTL)")
@@ -1137,7 +1128,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     let projection = commands.len() - ttl;
     assert_eq!(
         (commands.len(), ttl, projection),
-        (14, 10, 4),
+        (15, 11, 4),
         "the mutations a fresh database issues moved; read each one before repinning: \
          {commands:?}"
     );
@@ -1400,6 +1391,263 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         assert!(
             create.contains("non_replicated_deduplication_window = 5000"),
             "{table} must carry the configured block window: {create}"
+        );
+    }
+
+    drop_database(&client, db).await;
+}
+
+/// The `log_landing` columns, in the table's own declaration order, with the
+/// type and codec the server reports back for each. The codec spellings are
+/// the SERVER's, read back — `Delta(8)` and `Gorilla(8)` carry their byte
+/// width where the DDL writes them bare.
+const LOG_LANDING_COLUMNS: &[(&str, &str, &str)] = &[
+    ("event_id", "UUID", ""),
+    ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("kind", "UInt8", "CODEC(ZSTD(1))"),
+    ("service", "LowCardinality(String)", ""),
+    ("fingerprint", "UInt128", "CODEC(Delta(8), ZSTD(1))"),
+    ("timestamp_ns", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("severity", "Int8", "CODEC(ZSTD(1))"),
+    ("body", "String", "CODEC(ZSTD(1))"),
+    ("structured_metadata", "String", "CODEC(ZSTD(1))"),
+    ("month", "Date", "CODEC(ZSTD(1))"),
+    ("labels", "String", "CODEC(ZSTD(5))"),
+    ("updated_ns", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("pattern", "String", "CODEC(ZSTD(1))"),
+    ("pattern_count", "UInt64", "CODEC(T64, ZSTD(1))"),
+];
+
+/// **T44.** A fresh `run_init` creates `log_landing` with exactly the declared
+/// columns, in order, with the declared types and codecs, `event_id` defaulted
+/// by the server's own time-ordered UUID function, and the engine, partition,
+/// sorting key and fixed settings the design pins. **All five `log_*_mv` views
+/// exist beside it, and each has a `mv_checksums` row.**
+///
+/// It fails on an absent migration or `MvDef`, and on a view whose `TO` target
+/// does not exist yet — which the server refuses at `CREATE`.
+#[tokio::test]
+async fn log_landing_and_its_views_exist_after_init() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_log_landing");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let sql = format!(
+        "SELECT name, type, compression_codec, default_expression FROM system.columns \
+         WHERE database = '{db}' AND table = 'log_landing' ORDER BY position"
+    );
+    let mut stream = client
+        .query_stream::<LandingColumnRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut seen: Vec<LandingColumnRow> = Vec::new();
+    while let Some(row) = stream.next().await {
+        seen.push(row.expect("decode LandingColumnRow"));
+    }
+    drop(stream);
+
+    assert_eq!(seen.len(), LOG_LANDING_COLUMNS.len(), "column count");
+    for (got, (name, ty, codec)) in seen.iter().zip(LOG_LANDING_COLUMNS.iter().copied()) {
+        assert_eq!(got.name, name, "column order");
+        assert_eq!(got.r#type, ty, "{name}'s type");
+        assert_eq!(got.compression_codec, codec, "{name}'s codec");
+    }
+    assert_eq!(
+        seen[0].default_expression, "generateUUIDv7()",
+        "the landed event's identity is the server's, not the writer's"
+    );
+
+    let create = create_table_query(&client, db, "log_landing").await;
+    for want in [
+        "ENGINE = MergeTree",
+        "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
+        "ORDER BY (kind, service, fingerprint, timestamp_ns)",
+        "ttl_only_drop_parts = 1",
+        "merge_with_ttl_timeout = 3600",
+    ] {
+        assert!(create.contains(want), "expected {want:?} in {create}");
+    }
+
+    let names = table_names(&client, db).await;
+    const LOG_VIEWS: [&str; 5] = [
+        "log_samples_mv",
+        "log_streams_mv",
+        "log_streams_idx_mv",
+        "log_metrics_5s_mv",
+        "log_patterns_mv",
+    ];
+    for view in LOG_VIEWS {
+        assert!(
+            names.contains(&view.to_string()),
+            "{view} must exist after run_init: {names:?}"
+        );
+    }
+    let checksummed = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.mv_checksums WHERE mv_name IN ({})",
+            LOG_VIEWS
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    assert_eq!(checksummed, 5, "one checksum row per logs view");
+
+    drop_database(&client, db).await;
+}
+
+/// **T45.** `IF NOT EXISTS` is what makes a re-run safe when a creation
+/// committed and its response was lost: an existing `log_landing` is adopted,
+/// `run_init` returns `Ok`, and the migration is recorded.
+///
+/// **Running `run_init` twice would construct nothing**: the first run both
+/// creates the table and records the migration, so the second is a no-op and
+/// could not fail on the defect this names. The `CREATE` is issued directly
+/// instead — the state a committed creation whose response was lost leaves —
+/// and written out here rather than read from the catalogue, so the case is a
+/// claim about the shipped statement's text and not a tautology over whatever
+/// the catalogue happens to hold.
+#[tokio::test]
+async fn an_existing_log_landing_table_is_adopted_by_a_rerun() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_log_landing_adopt");
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the database");
+
+    let create = format!(
+        "CREATE TABLE IF NOT EXISTS {db}.log_landing (
+             event_id             UUID DEFAULT generateUUIDv7(),
+             received_ms          Int64  CODEC(DoubleDelta, ZSTD(1)),
+             kind                 UInt8  CODEC(ZSTD(1)),
+             service              LowCardinality(String),
+             fingerprint          UInt128  CODEC(Delta(8), ZSTD(1)),
+             timestamp_ns         Int64  CODEC(DoubleDelta, ZSTD(1)),
+             severity             Int8  CODEC(ZSTD(1)),
+             body                 String  CODEC(ZSTD(1)),
+             structured_metadata  String  CODEC(ZSTD(1)),
+             month                Date  CODEC(ZSTD(1)),
+             labels               String  CODEC(ZSTD(5)),
+             updated_ns           Int64  CODEC(DoubleDelta, ZSTD(1)),
+             pattern              String  CODEC(ZSTD(1)),
+             pattern_count        UInt64  CODEC(T64, ZSTD(1))
+         ) ENGINE = MergeTree
+         PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
+         ORDER BY (kind, service, fingerprint, timestamp_ns)
+         SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;"
+    );
+    client
+        .execute(&create, &QuerySettings::new(), Idempotency::Idempotent)
+        .await
+        .expect("create log_landing directly, as a lost response would have left it");
+
+    run_init(&client, &test_ctx(db))
+        .await
+        .expect("a re-run adopts the existing table rather than failing");
+    let recorded = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = 65"),
+    )
+    .await;
+    assert_eq!(
+        recorded, 1,
+        "the migration is recorded once the re-run adopts the table"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// **T46.** The logs landing table's delete-TTL is the configured hours,
+/// applied by `apply_ttl` rather than by the CREATE — so a statement that
+/// renders but is never run leaves the installed TTL what the CREATE gave,
+/// which is none at all. A second init at a different value replaces it.
+///
+/// **The server parenthesises the multiplication** when it renders the
+/// expression back, so the unparenthesised form the statement is written in
+/// would reject a correctly installed TTL.
+#[tokio::test]
+async fn run_init_installs_the_log_landing_ttl_at_the_configured_hours() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_log_landing_ttl");
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    ctx.log_landing_retention_hours = 24;
+    run_init(&client, &ctx).await.expect("run_init at 24 hours");
+
+    let create = create_table_query(&client, db, "log_landing").await;
+    assert!(
+        create.contains("least(intDiv(received_ms, 1000) + (24 * 3600), 4294967295)"),
+        "the installed TTL must be the configured 24 hours: {create}"
+    );
+
+    ctx.log_landing_retention_hours = 168;
+    run_init(&client, &ctx).await.expect("re-init at 168 hours");
+    let create = create_table_query(&client, db, "log_landing").await;
+    assert!(
+        create.contains("least(intDiv(received_ms, 1000) + (168 * 3600), 4294967295)"),
+        "the TTL must move with the configuration: {create}"
+    );
+    assert!(
+        !create.contains("(24 * 3600)"),
+        "the old value must be gone: {create}"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// **T47.** The logs landing table and all five tables the views maintain
+/// carry the configured deduplication window: a view's insert carries a block
+/// id derived from the source block, and only a table with a window recognises
+/// the repeat.
+///
+/// **Single-node, so the non-replicated name is the one in force** — and no
+/// `replicated_` name may reach these tables, which do not carry one.
+/// `the_cluster_windows_are_the_replicated_pair_on_every_write_path_table`
+/// (`crates/pulsus-schema/tests/live_cluster.rs`) is the clustered half.
+#[tokio::test]
+async fn the_log_dedup_window_reaches_the_landing_table_and_all_five_targets() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_log_dedup_windows");
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    ctx.log_dedup_window = 5_000;
+    run_init(&client, &ctx).await.expect("run_init");
+
+    for table in [
+        "log_landing",
+        "log_samples",
+        "log_streams",
+        "log_streams_idx",
+        "log_metrics_5s",
+        "log_patterns",
+    ] {
+        let create = create_table_query(&client, db, table).await;
+        assert!(
+            create.contains("non_replicated_deduplication_window = 5000"),
+            "{table} must carry the configured block window: {create}"
+        );
+        // `non_replicated_deduplication_window` CONTAINS the replicated
+        // spelling, so the absence claim is about the replicated setting
+        // standing on its own — the name the clustered rendering sends.
+        assert!(
+            !create.contains(" replicated_deduplication_window")
+                && !create.contains(",replicated_deduplication_window"),
+            "{table} is a plain MergeTree here and carries no replicated \
+             window: {create}"
         );
     }
 

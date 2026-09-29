@@ -231,17 +231,19 @@ async fn seed_stream(
         )
         .await
         .expect("seed log_streams");
+    land_seeded_streams(client, db).await;
 }
 
 /// Seeds one `log_metrics_5s` row per fingerprint, at the 5s bucket
 /// CONTAINING `ts_ns` — the stream-activity evidence issue #399's window
 /// filter reads.
 ///
-/// Inserted directly rather than through `log_samples`: a stream that
-/// only exists to exercise `/detected_labels` must not acquire sample
-/// rows, which would change what `/detected_fields` samples in the same
-/// fixture. Streams that DO have `log_samples` rows get their rollup rows
-/// from the shipped `log_metrics_5s_mv` and need no call here.
+/// Inserted directly rather than through `log_samples`: a stream that only
+/// exists to exercise `/detected_labels` must not acquire sample rows, which
+/// would change what `/detected_fields` samples in the same fixture. Streams
+/// that DO have `log_samples` rows get their rollup rows from
+/// [`rebuild_log_metrics_rollup`], which skips every bucket this function
+/// already wrote.
 async fn seed_activity(client: &ChClient, db: &str, ts_ns: i64, fingerprints: &[u64]) {
     let bucket = ts_ns / 5_000_000_000 * 5_000_000_000;
     let values: Vec<String> = fingerprints
@@ -419,13 +421,6 @@ async fn detected_labels_and_fields_end_to_end() {
         r#"{"service_name":"sparse-svc"}"#,
     )
     .await;
-    // Issue #399: `/detected_labels` is now window-scoped, so a stream
-    // with no activity in `[start, end]` is correctly absent. Fps 1 and 9
-    // get their rollup rows from the MV over the `log_samples` inserts
-    // below; fps 2 and 3 exist only for the label-relevance cases and
-    // deliberately have no samples, so their activity is seeded here.
-    seed_activity(&client, db, now, &[2, 3]).await;
-
     // Samples for detected_fields, all on fp 1 (distinct timestamps —
     // deterministic last-entry-wins detection): a JSON body, a logfmt
     // body carrying structured metadata, and a body neither parser
@@ -447,7 +442,8 @@ async fn detected_labels_and_fields_end_to_end() {
         )
         .await
         .expect("seed log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
     // The sparse-filter corpus: 2,600 rows on fp 9; ONLY the OLDEST 3 are
     // JSON matching `| json | level="rare"`. With the default line_limit
     // (100) and scan factor (10) the paged walk (page size 1,000,
@@ -472,6 +468,17 @@ async fn detected_labels_and_fields_end_to_end() {
         .insert_block("log_samples", &sparse_rows)
         .await
         .expect("bulk insert sparse corpus");
+    land_seeded_lines(&client, db).await;
+
+    // Issue #399: `/detected_labels` is window-scoped, so a stream with no
+    // activity in `[start, end]` is correctly absent. Fps 1 and 9 get their
+    // rollup rows from `log_metrics_5s_mv` when `land_seeded_lines` lands
+    // their samples; fps 2 and 3 exist only for the label-relevance cases
+    // and deliberately have no samples, so their activity is seeded here.
+    // **After the last landing call**, which empties the rollup before
+    // refilling it from the landed lines (issue #603) and would otherwise
+    // take these two rows with it.
+    seed_activity(&client, db, now, &[2, 3]).await;
 
     let start = now - 3 * 24 * 3_600_000_000_000;
     let end = now + 60_000_000_000;
@@ -506,12 +513,23 @@ async fn detected_labels_and_fields_end_to_end() {
         agg_sql.contains("log_streams_idx"),
         "the aggregation reads the stream index"
     );
-    // Issue #399 AC9: the same single scan now also names the configured
-    // log rollup — the activity semi-join carrying the request's window.
+    // Issue #603: the activity scan is a STATEMENT OF ITS OWN, so the
+    // aggregation carries the request's window as a literal fingerprint list
+    // and names only the index table. What names the configured rollup is the
+    // `stream_activity` stage that ran before it.
     assert!(
-        agg_sql.contains("log_metrics_5s"),
-        "the aggregation must carry the activity semi-join over the configured \
-         rollup table: {agg_sql}"
+        !agg_sql.contains("log_metrics_5s") && !agg_sql.contains("SELECT DISTINCT fingerprint"),
+        "the aggregation must nest no activity subquery: {agg_sql}"
+    );
+    let activity = stages
+        .iter()
+        .find(|s| s["name"] == "stream_activity")
+        .expect("a stream_activity stage");
+    let activity_sql = activity["sql"].as_str().expect("sql");
+    assert!(
+        activity_sql.contains("log_metrics_5s"),
+        "the activity statement must read the configured rollup table, which \
+         is where the request's window applies: {activity_sql}"
     );
     for stage in stages {
         let sql = stage["sql"].as_str().unwrap_or_default();
@@ -928,6 +946,7 @@ async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, db).await;
         // Issue #399: this fixture seeds `log_streams` only (the index MV
         // fans it out), so without rollup rows every stream is inactive
         // in the requested window and both cases would answer with an
@@ -1046,6 +1065,8 @@ async fn seed_window_fixture(client: &ChClient, db: &str, now: i64) -> i64 {
             )
             .await
             .expect("seed log_samples");
+        land_seeded_lines(client, db).await;
+        land_seeded_streams(client, db).await;
     }
     b
 }
@@ -1258,7 +1279,8 @@ async fn detected_field_values_end_to_end() {
         .insert_block("log_samples", &rows)
         .await
         .expect("seed fixture V log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
     let start = now - 3_600_000_000_000;
     let end = now + 3_600_000_000_000;
     let url = |prefix: &str, field: &str, service: &str, extra: &str| {
@@ -1483,4 +1505,89 @@ async fn detected_fields_classify_a_line_as_json_exactly_when_json_reads_it() {
     ];
     assert_eq!(got, want);
     drop_db(db).await;
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

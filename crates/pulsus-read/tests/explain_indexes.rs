@@ -79,16 +79,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 macro_rules! skip_unless_live {
@@ -253,6 +244,33 @@ fn index_usage(raw: &str) -> Vec<String> {
 
 async fn explain(client: &ChClient, sql: &str) -> Vec<String> {
     index_usage(&explain_raw(client, sql).await)
+}
+
+/// The active-fingerprint set a discovery read resolves from its own
+/// statement (issue #603) before it renders the index scan. The engine runs
+/// exactly this statement; the cases below then analyse the index scan that
+/// carries its result as a literal list.
+async fn active_set(client: &ChClient, rollup: &str, start_ns: i64, end_ns: i64) -> Vec<FpLiteral> {
+    #[derive(Debug, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct Fp {
+        fingerprint: Fingerprint,
+    }
+    let sql =
+        sql::active_fingerprints(rollup, None, TimeWindow { start_ns, end_ns }, ROLLUP_RES_NS);
+    let mut stream = client
+        .query_stream::<Fp>(&sql, &pulsus_clickhouse::QuerySettings::new())
+        .await
+        .expect("the activity statement runs");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("a fingerprint row").fingerprint.sql_literal());
+    }
+    assert!(
+        !out.is_empty(),
+        "the fixture must have at least one active stream, or the index scan \
+         below would never be issued"
+    );
+    out
 }
 
 /// The FIRST `Parts: m/n` count in raw `EXPLAIN indexes = 1` text —
@@ -580,7 +598,7 @@ async fn seed(client: &ChClient, db: &str, ts_ns: i64) {
         )
         .await
         .expect("seed log_streams");
-
+    land_seeded_streams(client, db).await;
     client
         .execute(
             &format!(
@@ -594,6 +612,7 @@ async fn seed(client: &ChClient, db: &str, ts_ns: i64) {
         )
         .await
         .expect("seed log_samples");
+    land_seeded_lines(client, db).await;
 }
 
 /// Rows the line-filter fixture seeds. At the default
@@ -1391,14 +1410,10 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
     };
     let months = pulsus_read::logql::plan::months_overlapping(start_ns, end_ns);
     let table = format!("{db}.log_streams_idx");
-    let sql = sql::detected_labels(
-        &table,
-        &months,
-        None,
-        &format!("{db}.log_metrics_5s"),
-        TimeWindow { start_ns, end_ns },
-        ROLLUP_RES_NS,
-    );
+    // Issue #603: the activity set reaches the index scan as a literal list
+    // the engine resolved from its own statement, never as a subquery.
+    let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
+    let sql = sql::detected_labels(&table, &months, &active);
     assert!(!sql.contains("log_samples"), "never touches log_samples");
 
     let usage = explain(&client, &sql).await;
@@ -1666,7 +1681,8 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "Condition: (month in [#, #])",
     ];
 
-    let names_sql = sql::label_names(&idx, &months, None, &rollup, window, ROLLUP_RES_NS);
+    let active = active_set(&client, &rollup, window.start_ns, window.end_ns).await;
+    let names_sql = sql::label_names(&idx, &months, &active);
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
@@ -1677,21 +1693,17 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     let names_usage = explain(&client, &names_sql).await;
     assert_eq!(names_usage, v(&expected));
 
-    // Issue #482 AC 3 — the SCOPED form. `query=`'s stage-1 fingerprints
-    // go INSIDE the activity subquery, so the OUTER scan's index usage
-    // must be identical to the unscoped form's: same month MinMax and
-    // Partition blocks, same primary-key condition. A fingerprint list
-    // added as a second outer conjunct instead would change this extract.
+    // The SCOPED form. `query=`'s stage-1 fingerprints narrow the ACTIVITY
+    // statement, so the OUTER scan's index usage must be identical to the
+    // unscoped form's: same month MinMax and Partition blocks, same
+    // primary-key condition, over a list of its own.
     let scoped_names_sql = sql::label_names(
         &idx,
         &months,
-        Some(&[
+        &[
             Fingerprint::from_raw(7).sql_literal(),
             Fingerprint::from_raw(11).sql_literal(),
-        ]),
-        &rollup,
-        window,
-        ROLLUP_RES_NS,
+        ],
     );
     assert_eq!(
         explain(&client, &scoped_names_sql).await,
@@ -1699,15 +1711,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "the scoped /labels outer scan must analyse exactly as the unscoped one"
     );
 
-    let values_sql = sql::label_values(
-        &idx,
-        &months,
-        &literal("env"),
-        None,
-        &rollup,
-        window,
-        ROLLUP_RES_NS,
-    );
+    let values_sql = sql::label_values(&idx, &months, &literal("env"), &active);
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
@@ -1729,13 +1733,10 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &idx,
         &months,
         &literal("env"),
-        Some(&[
+        &[
             Fingerprint::from_raw(7).sql_literal(),
             Fingerprint::from_raw(11).sql_literal(),
-        ]),
-        &rollup,
-        window,
-        ROLLUP_RES_NS,
+        ],
     );
     assert_eq!(
         explain(&client, &scoped_values_sql).await,
@@ -1743,8 +1744,8 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "the scoped /label/{{name}}/values outer scan must analyse exactly as the unscoped one"
     );
 
-    // What embedding the semi-join must NOT cost: the outer scan's month
-    // partition pruning. `index_usage` drops `Parts:` counts, so assert
+    // What the literal list must NOT cost: the outer scan's month partition
+    // pruning. `index_usage` drops `Parts:` counts, so assert
     // it on the raw text.
     let raw = explain_raw(&client, &names_sql).await;
     let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
@@ -3176,4 +3177,89 @@ async fn a_uint128_fingerprint_point_read_prunes_the_primary_key() {
     );
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

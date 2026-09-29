@@ -324,6 +324,11 @@ enum DiscoveryQuery<'a> {
     DetectedLabels,
 }
 
+/// The explain stage name of the activity scan the three discovery endpoints
+/// now run as a statement of their own (issue #603). One name for all three,
+/// because `run_discovery` owns the dispatch for all three.
+const ACTIVITY_STAGE: &str = "stream_activity";
+
 impl DiscoveryQuery<'_> {
     /// The stage-2 explain stage name — the three literals those three
     /// paths pushed before issue #482 folded them into one helper.
@@ -709,42 +714,56 @@ impl LogQlEngine {
                 Some(fps)
             }
         };
-        let minted = fingerprints.as_deref().map(sql_literals);
-        let fps = minted.as_deref();
+        // **The activity scan is a statement of its own** (issue #603). It was
+        // a subquery nested inside the index scan below, which on a clustered
+        // deployment made a double-distributed `IN`; running it here and
+        // rendering its result as a literal list is what `/series` already
+        // did, and the predicate — so the answer — is the one the subquery
+        // expressed. Both bounds on what that costs are already in the tree:
+        // `check_stream_cap` inside the scan's own loop, and the rendered-SQL
+        // ceiling on the statement the list goes into.
         let window = self.activity_window(b);
+        let stage1_minted = fingerprints.as_deref().map(sql_literals);
+        let activity_sql = super::sql::active_fingerprints(
+            &self.config.rollup_table,
+            stage1_minted.as_deref(),
+            window,
+            self.config.rollup_res_ns,
+        );
+        if let Some(e) = explain.as_mut() {
+            e.push(ACTIVITY_STAGE, activity_sql.clone(), None);
+        }
+        let active = self.run_activity_scan(&activity_sql).await?;
+        if active.is_empty() {
+            // **A saved dispatch, not a correctness fix.** An empty literal
+            // list is valid SQL that selects nothing, and this helper turns no
+            // rows into the same empty vector the endpoints document, so the
+            // answer is right either way. What the early return buys is one
+            // avoided round trip on a window with no activity — the common
+            // case for a dashboard opening on a quiet range.
+            return Ok(Vec::new());
+        }
+        let fps = sql_literals(&active);
         let sql = match query {
-            DiscoveryQuery::LabelNames => super::sql::label_names(
-                &self.config.streams_idx,
-                &months,
-                fps,
-                &self.config.rollup_table,
-                window,
-                self.config.rollup_res_ns,
-            ),
+            DiscoveryQuery::LabelNames => {
+                super::sql::label_names(&self.config.streams_idx, &months, &fps)
+            }
             DiscoveryQuery::LabelValues { name } => super::sql::label_values(
                 &self.config.streams_idx,
                 &months,
                 &super::predicate::literal(name),
-                fps,
-                &self.config.rollup_table,
-                window,
-                self.config.rollup_res_ns,
+                &fps,
             ),
-            DiscoveryQuery::DetectedLabels => super::sql::detected_labels(
-                &self.config.streams_idx,
-                &months,
-                fps,
-                &self.config.rollup_table,
-                window,
-                self.config.rollup_res_ns,
-            ),
+            DiscoveryQuery::DetectedLabels => {
+                super::sql::detected_labels(&self.config.streams_idx, &months, &fps)
+            }
         };
         if let Some(e) = explain.as_mut() {
             e.push(query.stage_name(), sql.clone(), None);
         }
         let mut out = Vec::new();
         let mut stream = self
-            .query_stream::<R>(&sql, &self.activity_settings())
+            .query_stream::<R>(&sql, &self.budget_settings())
             .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| {
@@ -1022,12 +1041,31 @@ impl LogQlEngine {
             window,
             self.config.rollup_res_ns,
         );
+        self.run_activity_scan(&sql).await
+    }
+
+    /// Runs one already-rendered [`super::sql::active_fingerprints`] statement
+    /// and returns its sorted, deduplicated result.
+    ///
+    /// **The cap is applied INSIDE the streaming loop**, so an oversized store
+    /// is refused after `max_streams + 1` rows rather than after all of them —
+    /// and the caller must not re-check it on the result. That refusal is the
+    /// shipped `422 query_too_broad` carrying `TooBroadReason::StreamCap`, the
+    /// same one stage-1 resolution has always raised; issue #603 brought label
+    /// discovery under it by making this set the engine's own rather than a
+    /// subquery the server evaluated.
+    ///
+    /// Sorted before returning so the rendered `fingerprint IN (...)` text —
+    /// and therefore the explain trace — is deterministic. `DISTINCT
+    /// fingerprint` already makes the rows unique; the `dedup` is a cheap
+    /// restatement of that invariant, not a second pass over duplicates.
+    async fn run_activity_scan(&self, sql: &str) -> Result<Vec<Fingerprint>, ReadError> {
         let mut fingerprints: Vec<Fingerprint> = Vec::new();
         // Scoped so the pooled connection's lease drops before the caller
-        // issues stage 2 (the `ChRowStream` lease contract).
+        // issues its next statement (the `ChRowStream` lease contract).
         {
             let mut stream = self
-                .query_stream::<StreamRow>(&sql, &self.budget_settings())
+                .query_stream::<StreamRow>(sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| {
@@ -1113,54 +1151,23 @@ impl LogQlEngine {
         }
     }
 
-    /// [`LogQlEngine::budget_settings`] plus, when clustered,
-    /// `distributed_product_mode='local'` — the settings the three
-    /// label-discovery scans carrying issue #399's activity semi-join
-    /// dispatch with.
-    ///
-    /// `FROM log_streams_idx_dist … WHERE fingerprint IN (SELECT … FROM
-    /// log_metrics_5s_dist …)` is a double-distributed `IN`, rejected at
-    /// analysis time under ClickHouse's default `deny` (Code 288,
-    /// `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`) — deterministic 500s on a
-    /// clustered deployment. `local` is EXACT here, not merely permissive:
-    /// both tables are Logs-family and shard on `fingerprint`
-    /// (docs/schemas.md §7), so a stream's index rows and its rollup rows
-    /// are always on the same shard and shard-local `IN` decides
-    /// identically to global `IN` — the `metrics::exec::
-    /// fallback_fetch_settings` (issue #136) and `traces::exec::
-    /// metrics_settings` (issue #59) precedent.
-    ///
-    /// Applied ONLY to these three dispatches. Stage-1 resolution, stage-2
-    /// hydration and `/series`' own activity query keep
-    /// [`LogQlEngine::budget_settings`]: none of them nests a distributed
-    /// table, and a blanket client-wide default would let a future
-    /// non-co-sharded subquery silently return wrong shard-local results
-    /// instead of failing loud.
-    fn activity_settings(&self) -> QuerySettings {
-        activity_query_settings(
-            self.config.scan_budget_bytes,
-            self.config.read_max_memory_bytes,
-            self.config.distributed,
-        )
-    }
-
     /// Narrows a resolved fingerprint set to those with log lines in
-    /// `window` (issue #399). `/series` is the one endpoint of the four
-    /// that cannot embed [`super::sql::active_fingerprints`] as a
-    /// subquery: its month-scoped scan is [`super::sql::stage1`], shared
-    /// with every other LogQL path, where the predicate would be
-    /// redundant (those paths bound the window on their own
-    /// sample/rollup/patterns read) and a straight read-path regression.
+    /// `window` (issue #399). Its month-scoped scan is
+    /// [`super::sql::stage1`], shared with every other LogQL path, where an
+    /// activity predicate would be redundant — those paths bound the window on
+    /// their own sample/rollup/patterns read.
+    ///
+    /// **Since issue #603 every discovery endpoint dispatches the activity
+    /// scan this way**, as its own statement: this is no longer the one
+    /// exception to a nested form, and there is no nested form left.
     ///
     /// Runs AFTER `check_stream_cap` so the cap keeps its current meaning
     /// — the deduped pre-window union — and the cap test keeps failing for
     /// the reason it was written for (`series_stream_cap.rs`). PK-pruned:
     /// the caller's list is the `(fingerprint, bucket_ns)` prefix
     /// (measured, issue #399: 73,728 rows vs 29,080,654 unscoped on the
-    /// cost fixture). Dispatched with [`LogQlEngine::budget_settings`],
-    /// deliberately NOT [`LogQlEngine::activity_settings`] — there is no
-    /// nested distributed table here, so widening the shard-locality
-    /// assumption to it would be unearned.
+    /// cost fixture). Dispatched with [`LogQlEngine::budget_settings`], as
+    /// every other statement on this path now is.
     ///
     /// Returns the caller's order filtered by membership, so
     /// `series_inner`'s sort/dedup contract is untouched.
@@ -5708,24 +5715,6 @@ pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -
         .set("max_bytes_before_external_group_by", 0u64)
 }
 
-/// [`read_query_settings`] plus, when `distributed`,
-/// `distributed_product_mode='local'` — see
-/// [`LogQlEngine::activity_settings`], whose whole body this is. Split out
-/// as a free function for the same reason [`read_query_settings`] is one:
-/// the settings decision is provable without a ClickHouse connection.
-fn activity_query_settings(
-    scan_budget_bytes: u64,
-    read_max_memory_bytes: u64,
-    distributed: bool,
-) -> QuerySettings {
-    let base = read_query_settings(scan_budget_bytes, read_max_memory_bytes);
-    if distributed {
-        base.set("distributed_product_mode", "local")
-    } else {
-        base
-    }
-}
-
 /// Pure paging-termination decision (issue #133, the #96
 /// `probe_fanout_bound` extraction shape): `true` once the cumulative
 /// per-page `read_bytes` has consumed the whole
@@ -7011,46 +7000,60 @@ mod tests {
         );
     }
 
-    /// Issue #399 AC16: the three label-discovery scans carrying the
-    /// activity semi-join gate `distributed_product_mode='local'` on
-    /// clustered mode alone, and carry the byte budget through unchanged
-    /// in both states. Mirrors
-    /// `metrics::exec::fallback_fetch_settings_*` (#136) and
-    /// `traces::exec::metrics_settings_carry_the_set_limits_and_gate_the_local_product_mode`
-    /// (#59).
+    /// **T37.** The three discovery dispatches carry `budget_settings`' set
+    /// and nothing more, clustered or not — **`activity_query_settings` no
+    /// longer exists** (issue #603).
     ///
-    /// The complement is asserted here too, and it is the half that
-    /// matters: `/series`' own activity query dispatches with
-    /// `budget_settings`, NOT this — it nests no distributed table, so it
-    /// must not carry the setting.
+    /// The activity scan is a statement of its own now, so no discovery read
+    /// nests a distributed table inside an `IN (subquery)` and
+    /// `distributed_product_mode` has nothing to govern on this path. Sending
+    /// it anyway would be a pin over a shape that is not generated.
+    ///
+    /// **This is a completeness claim about a settings constructor that is
+    /// gone**, so it is stated as the absence of the name from what every
+    /// LogQL read carries: `read_query_settings` is the one constructor left,
+    /// and neither it nor the paging form names the setting.
     #[test]
-    fn activity_settings_gate_the_local_product_mode() {
-        let unclustered = activity_query_settings(4096, TEST_READ_MEM, false);
-        assert_eq!(unclustered.get("max_bytes_to_read"), Some("4096"));
-        assert_eq!(unclustered.get("read_overflow_mode"), Some("throw"));
-        assert_eq!(
-            unclustered.get("distributed_product_mode"),
-            None,
-            "the local-product rewrite is clustered-only"
-        );
+    fn the_discovery_reads_send_no_distributed_product_mode() {
+        const MEM: u64 = 4096;
+        const BUDGET: u64 = 1_000_000;
 
-        let clustered = activity_query_settings(4096, TEST_READ_MEM, true);
-        assert_eq!(clustered.get("max_bytes_to_read"), Some("4096"));
-        assert_eq!(clustered.get("read_overflow_mode"), Some("throw"));
-        assert_eq!(clustered.get("distributed_product_mode"), Some("local"));
+        let budget = read_query_settings(BUDGET, MEM);
         assert_eq!(
-            clustered.get("max_query_size"),
-            Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str()),
-            "the raised query-text cap survives the clustered branch"
-        );
-
-        // `/series` dispatches its activity query with the plain budget
-        // settings; those must never grow the setting by accident.
-        assert_eq!(
-            read_query_settings(4096, TEST_READ_MEM).get("distributed_product_mode"),
+            budget.get("distributed_product_mode"),
             None,
-            "the /series activity query must not carry distributed_product_mode"
+            "the discovery reads dispatch with these settings, and they must \
+             carry no product-mode pin: there is no nested distributed \
+             subquery left for it to govern"
         );
+        let paging = read_query_settings(BUDGET, MEM).set("wait_end_of_query", 1);
+        assert_eq!(paging.get("distributed_product_mode"), None);
+
+        // What they do carry is unchanged.
+        assert_eq!(budget.get("max_bytes_to_read"), Some("1000000"));
+        assert_eq!(budget.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(budget.get("max_memory_usage"), Some("4096"));
+
+        // And no transfer pin either: the earlier revision of this design
+        // pinned `max_rows_to_transfer` and `transfer_overflow_mode` on a
+        // `GLOBAL IN`, and measured against the server version the clustered
+        // fixture pins, that pair does not bind the statement this path
+        // generates. What bounds the set now is `check_stream_cap` and the
+        // rendered-SQL ceiling, both already in the tree.
+        for absent in [
+            "max_rows_to_transfer",
+            "max_bytes_to_transfer",
+            "transfer_overflow_mode",
+            "max_rows_in_set",
+            "set_overflow_mode",
+        ] {
+            assert_eq!(
+                budget.get(absent),
+                None,
+                "{absent} must not be sent: no discovery read builds a \
+                 server-side set any more"
+            );
+        }
     }
 
     /// Issue #398 AC L1: every LogQL read carries the per-query memory
@@ -7081,16 +7084,16 @@ mod tests {
     /// Issue #398 AC L2: EVERY settings constructor on this path carries
     /// the ceiling, and the byte budget never leaks into it.
     ///
-    /// The three engine methods (`budget_settings`, `activity_settings`,
-    /// `paging_settings`) are verbatim delegations to the two free
-    /// functions asserted here — `budget_settings` is
-    /// `read_query_settings(scan_budget, read_max_memory)`,
-    /// `activity_settings` is `activity_query_settings(…)`, and
-    /// `paging_settings` is `read_query_settings(remaining, …)` plus
-    /// `wait_end_of_query`. They take `&self` and so need a live
-    /// `ChClient`; the free functions exist precisely so the settings
-    /// decision is provable without one (the same reason
-    /// `activity_query_settings` and `scan_budget_spent` were split out).
+    /// The two engine methods (`budget_settings`, `paging_settings`) are
+    /// verbatim delegations to the one free function asserted here —
+    /// `budget_settings` is `read_query_settings(scan_budget,
+    /// read_max_memory)` and `paging_settings` is
+    /// `read_query_settings(remaining, …)` plus `wait_end_of_query`. They take
+    /// `&self` and so need a live `ChClient`; the free function exists
+    /// precisely so the settings decision is provable without one. **Every
+    /// discovery dispatch now takes `budget_settings` too** (issue #603): the
+    /// activity scan is its own statement, so there is no nested distributed
+    /// subquery for a product-mode setting to govern.
     /// The engine-level completeness claim — that no dispatch site
     /// bypasses these constructors — is proved live instead, by
     /// `every_logql_engine_query_carries_the_memory_ceiling` in
@@ -7099,27 +7102,18 @@ mod tests {
     fn every_logql_settings_constructor_carries_the_memory_ceiling() {
         const MEM: u64 = 4096;
         const BUDGET: u64 = 1_000_000;
-        // `budget_settings`' body.
+        // `budget_settings`' body, which every discovery dispatch shares.
         let budget = read_query_settings(BUDGET, MEM);
-        // `activity_settings`' body, both branches.
-        let activity_local = activity_query_settings(BUDGET, MEM, false);
-        let activity_dist = activity_query_settings(BUDGET, MEM, true);
-        for (name, s) in [
-            ("budget_settings", &budget),
-            ("activity_settings(unclustered)", &activity_local),
-            ("activity_settings(clustered)", &activity_dist),
-        ] {
-            assert_eq!(
-                s.get("max_memory_usage"),
-                Some(MEM.to_string().as_str()),
-                "{name} must carry the memory ceiling"
-            );
-            assert_eq!(
-                s.get("max_bytes_before_external_group_by"),
-                Some("0"),
-                "{name} must throw rather than spill"
-            );
-        }
+        assert_eq!(
+            budget.get("max_memory_usage"),
+            Some(MEM.to_string().as_str()),
+            "budget_settings must carry the memory ceiling"
+        );
+        assert_eq!(
+            budget.get("max_bytes_before_external_group_by"),
+            Some("0"),
+            "budget_settings must throw rather than spill"
+        );
 
         // `paging_settings(remaining)`' body: the DECREMENTED budget lands
         // in `max_bytes_to_read` only. The memory ceiling is per query and

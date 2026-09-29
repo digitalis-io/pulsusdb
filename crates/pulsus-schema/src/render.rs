@@ -39,6 +39,37 @@ pub struct RenderCtx {
     /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): the block-deduplication
     /// window the landing table and the four derived metric tables carry.
     pub metrics_dedup_window: u64,
+    /// `PULSUS_LOG_LANDING_RETENTION_HOURS` (issue #603): the logs landing
+    /// table's delete-TTL, in hours.
+    pub log_landing_retention_hours: u32,
+    /// `PULSUS_LOG_DEDUP_WINDOW` (issue #603): the block-deduplication window
+    /// the logs landing table and the five derived logs tables carry.
+    pub log_dedup_window: u64,
+}
+
+impl RenderCtx {
+    /// A context for a test: `db` as given, every other field at the value
+    /// `pulsus_config`'s own default carries.
+    ///
+    /// **Production does not use this.** `chconfig::schema_params_from` keeps
+    /// its exhaustive literal, so a field added here later still cannot be
+    /// silently defaulted where a deployment would notice. This exists because
+    /// every new field otherwise edits one literal per test file — thirty-odd
+    /// of them for the two fields above.
+    pub fn for_tests(db: &str) -> Self {
+        RenderCtx {
+            db: db.to_string(),
+            cluster: None,
+            dist_suffix: "_dist".to_string(),
+            storage_policy: None,
+            retention_days: 7,
+            log_rollup: Duration::from_secs(5),
+            metrics_landing_retention_hours: 6,
+            metrics_dedup_window: 10_000,
+            log_landing_retention_hours: 6,
+            log_dedup_window: 10_000,
+        }
+    }
 }
 
 /// Table families that must shard byte-identically (docs/schemas.md §7):
@@ -146,6 +177,34 @@ fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> 
             "{{metrics_dedup_window}}",
             &ctx.metrics_dedup_window.to_string(),
         )
+        .replace(
+            "{{log_landing_retention_hours}}",
+            &ctx.log_landing_retention_hours.to_string(),
+        )
+        .replace("{{log_dedup_window}}", &ctx.log_dedup_window.to_string())
+        .replace("{{dedup_window_setting}}", dedup_window_setting(ctx))
+        .replace(
+            "{{dedup_window_seconds}}",
+            &crate::controller::DEDUP_WINDOW_SECONDS.to_string(),
+        )
+}
+
+/// The `MergeTree` setting that carries the block-deduplication window on the
+/// engine this deployment renders (issue #603).
+///
+/// **The name is rendered from the same thing that renders the engine.**
+/// `non_replicated_deduplication_window` applies to a non-replicated
+/// `MergeTree` table only, and a clustered deployment — the production shape —
+/// renders every write-path table `Replicated*`, where the setting in force is
+/// the replicated engines' own. Sending the non-replicated name there left the
+/// deployment's configured window with nothing to change. Deriving both from
+/// `ctx.cluster` is what stops either name reaching a table that does not
+/// carry it.
+fn dedup_window_setting(ctx: &RenderCtx) -> &'static str {
+    match ctx.cluster {
+        Some(_) => "replicated_deduplication_window",
+        None => "non_replicated_deduplication_window",
+    }
 }
 
 /// Escapes a single-quoted SQL string literal. Config-derived, not
@@ -312,6 +371,8 @@ mod tests {
             log_rollup: Duration::from_secs(5),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
+            log_landing_retention_hours: 6,
+            log_dedup_window: 10_000,
         }
     }
 
@@ -323,6 +384,61 @@ mod tests {
         assert!(out.contains("{shard}"));
         assert!(out.contains("{replica}"));
         assert!(!out.contains("{{"));
+    }
+
+    /// **T27.** The deduplication-window setting name follows the engine.
+    ///
+    /// `non_replicated_deduplication_window` applies to a non-replicated
+    /// `MergeTree` table only, and a clustered deployment — the production
+    /// shape — renders every write-path table `Replicated*`. Rendering the
+    /// name from `ctx.cluster`, the same field that renders the engine, is
+    /// what stops either name reaching a table that does not carry it.
+    #[test]
+    fn the_dedup_window_setting_follows_the_engine() {
+        const TMPL: &str =
+            "ALTER TABLE {{db}}.t{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = 1;";
+
+        let single = ctx();
+        assert_eq!(
+            substitute_tokens(TMPL, &single),
+            "ALTER TABLE pulsus.t MODIFY SETTING non_replicated_deduplication_window = 1;"
+        );
+
+        let clustered = RenderCtx {
+            cluster: Some("c".to_string()),
+            ..ctx()
+        };
+        assert_eq!(
+            substitute_tokens(TMPL, &clustered),
+            "ALTER TABLE pulsus.t ON CLUSTER 'c' MODIFY SETTING \
+             replicated_deduplication_window = 1;"
+        );
+    }
+
+    /// The seconds window renders the one constant that carries it, so the
+    /// relation a case asserts and the statement text a deployment receives
+    /// cannot disagree.
+    #[test]
+    fn the_seconds_window_token_renders_the_constant() {
+        assert_eq!(
+            substitute_tokens("SETTING x = {{dedup_window_seconds}};", &ctx()),
+            format!("SETTING x = {};", crate::controller::DEDUP_WINDOW_SECONDS)
+        );
+    }
+
+    /// The two logs landing tokens render the context's own values, so a
+    /// statement hard-coding either passes at the default and fails here.
+    #[test]
+    fn the_log_landing_tokens_render_the_configured_values() {
+        let ctx = RenderCtx {
+            log_landing_retention_hours: 24,
+            log_dedup_window: 5_000,
+            ..ctx()
+        };
+        assert_eq!(
+            substitute_tokens("{{log_landing_retention_hours}}/{{log_dedup_window}}", &ctx),
+            "24/5000"
+        );
     }
 
     #[test]

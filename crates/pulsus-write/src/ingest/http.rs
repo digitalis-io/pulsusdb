@@ -973,10 +973,10 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::KeyReused => {
             loki_plain_text_response(StatusCode::BAD_REQUEST, format!("{KEY_REUSED_MESSAGE}\n"))
         }
-        // No metrics push reaches the log receiver, so nothing here
-        // constructs the variant; the arm exists because the refusal is one
-        // shared enum (issue #603), and it answers the same way the metric
-        // transports do.
+        // Issue #603: the logs writer refuses a push whose charge exceeds
+        // `PULSUS_BATCH_BYTES`, so this arm is reached on this endpoint —
+        // `a_push_too_large_is_413_on_both_log_transports` drives it over a
+        // real `LogWriter`. It answers the same way the metric transports do.
         AdmitRefusal::PushTooLarge {
             rows,
             row_limit,
@@ -3159,6 +3159,140 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// **T15.** A push that does not fit one block is `413` on **both** log
+    /// transports, each in its own body shape, carrying the message rendered
+    /// from the push's own four numbers.
+    ///
+    /// **Over the production `LogWriter`, not over the scriptable sink.** The
+    /// logs mock sink already returns that refusal and both logs error
+    /// containers already map it, so a twin of the metrics case's shape would
+    /// pass before this change and assert nothing. The observation point is the
+    /// WRITER's refusal reaching the wire, which is what did not exist: until
+    /// issue #603 the logs path had no per-push byte ceiling at all, and
+    /// `loki_refusal_response`'s own comment said nothing on that endpoint
+    /// constructs the variant.
+    ///
+    /// The numbers are not written down: the case reads them off the refusal
+    /// the writer itself produced and renders the same message the handler
+    /// does, so a change to the charge moves both sides together while a
+    /// change to the *rendering* moves only one.
+    #[tokio::test]
+    async fn a_push_too_large_is_413_on_both_log_transports() {
+        use crate::writer::{LogWriter, WriterTables};
+
+        /// Counts what reaches it, so the refusing writer can be asserted to
+        /// have queued nothing.
+        #[derive(Default)]
+        struct CountingInserter(std::sync::atomic::AtomicUsize);
+        impl crate::writer::BlockInserter<crate::writer::LogLandingRow> for CountingInserter {
+            fn insert<'a>(
+                &'a self,
+                _table: &'a str,
+                _rows: &'a [crate::writer::LogLandingRow],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), pulsus_clickhouse::ChError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        fn writer_at(batch_bytes: u64) -> (Arc<LogWriter>, Arc<CountingInserter>) {
+            let mut runtime =
+                crate::writer::WriterRuntime::from_config(&pulsus_config::WriterConfig {
+                    batch_bytes: pulsus_config::ByteSize(batch_bytes),
+                    log_patterns: false,
+                    ingest_dedup: false,
+                    ..Default::default()
+                });
+            runtime.spool_dir = std::env::temp_dir().join(format!(
+                "pulsus-http-413-{}-{}",
+                std::process::id(),
+                batch_bytes
+            ));
+            let inserter = Arc::new(CountingInserter::default());
+            (
+                Arc::new(LogWriter::with_landing_inserter_and_runtime(
+                    inserter.clone(),
+                    runtime,
+                    WriterTables::logs_default(),
+                )),
+                inserter,
+            )
+        }
+
+        // One byte of ceiling: every non-empty push's charge exceeds it, and
+        // one block's own fixed overhead exceeds it on its own.
+        let (writer, refused_inserts) = writer_at(1);
+
+        // The OTLP-logs endpoint: a `google.rpc.Status` protobuf.
+        let router = Router::new()
+            .route("/v1/logs", post(logs::<LogWriter>))
+            .with_state(writer.clone());
+        let res = post_body(router, valid_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 8);
+        assert!(
+            status.message.starts_with("push does not fit one block: "),
+            "the writer's own refusal must reach the wire: {:?}",
+            status.message
+        );
+        assert!(
+            status.message.contains("(limit 1)"),
+            "and must name the ceiling it met: {:?}",
+            status.message
+        );
+
+        // The compatibility push endpoint: one plain-text error writer, with
+        // that endpoint's own terminator.
+        let res = ingest_loki_push(
+            writer.as_ref(),
+            HeaderMap::new(),
+            Body::from(valid_loki_protobuf_body()),
+            LogIngestSettings {
+                discover_log_levels: false,
+            },
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let body = plain_text_body(res).await;
+        assert!(
+            body.starts_with("push does not fit one block: ") && body.ends_with('\n'),
+            "the endpoint's own body shape and terminator: {body:?}"
+        );
+        assert!(body.contains("(limit 1)"), "{body:?}");
+
+        assert_eq!(
+            refused_inserts.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused push must queue nothing"
+        );
+
+        // A roomy ceiling admits the identical bodies, so the refusals above
+        // are the ceiling's and not the fixture's.
+        let (roomy, _) = writer_at(16 * 1024 * 1024);
+        let router = Router::new()
+            .route("/v1/logs", post(logs::<LogWriter>))
+            .with_state(roomy.clone());
+        assert_ne!(
+            post_body(router, valid_request_body(), &[]).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the same body must be admitted under a roomy ceiling"
+        );
+
+        writer.shutdown(std::time::Duration::from_millis(10)).await;
+        roomy.shutdown(std::time::Duration::from_millis(10)).await;
     }
 
     #[tokio::test]

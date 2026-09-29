@@ -766,18 +766,9 @@ fn the_provenance_transcript_and_the_artifact_agree() {
 #[test]
 fn the_detected_labels_aggregate_is_still_an_exact_count() {
     let some_fps = [7, 9].map(|v| Fingerprint::from_raw(v).sql_literal());
-    for fingerprints in [None, Some(&some_fps[..])] {
-        let rendered = sql::detected_labels(
-            "log_streams_idx",
-            &[month_literal(2026, 8)],
-            fingerprints,
-            "log_metrics_5s",
-            sql::TimeWindow {
-                start_ns: 1_754_000_000_000_000_000,
-                end_ns: 1_754_003_600_000_000_000,
-            },
-            5_000_000_000,
-        );
+    for fingerprints in [&some_fps[..1], &some_fps[..]] {
+        let rendered =
+            sql::detected_labels("log_streams_idx", &[month_literal(2026, 8)], fingerprints);
         assert!(
             rendered.contains("uniqExact(val) AS cardinality"),
             "the exact aggregate is the contract: {rendered}"

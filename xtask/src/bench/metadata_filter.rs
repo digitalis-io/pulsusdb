@@ -83,6 +83,28 @@ struct SeedRow {
     structured_metadata: String,
 }
 
+/// One `log_landing` row, in the table's own column order (issue #603).
+/// The corpus is seeded through the landing table because `log_samples`,
+/// `log_streams` and `log_streams_idx` are all maintained by materialized
+/// view off it now, so an insert into a target directly would leave the
+/// index this scenario's stage-1 resolution reads empty.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLandingRow {
+    received_ms: i64,
+    kind: u8,
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+    month: u16,
+    labels: String,
+    updated_ns: i64,
+    pattern: String,
+    pattern_count: u64,
+}
+
 /// One route's totals, summed over every statement it issued. **A
 /// scenario-local struct**: the shared `QueryLogTotals` is byte-frozen by
 /// the committed evidence JSONs and must not grow a field.
@@ -152,6 +174,8 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         log_rollup: Duration::from_secs(5),
         metrics_landing_retention_hours: 6,
         metrics_dedup_window: 10_000,
+        log_landing_retention_hours: 6,
+        log_dedup_window: 10_000,
     };
     run_init(&admin, &schema).await?;
     let mut data_cfg = admin_cfg.clone();
@@ -164,12 +188,16 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             .as_nanos(),
     )? - (ROWS as i64) * 1_000_000;
     eprintln!("=== seeding {ROWS} rows on one stream ===");
+    let received_ms = ts / 1_000_000;
     client
         .execute(
             &format!(
-                "INSERT INTO {}.log_streams (month, fingerprint, service, labels, updated_ns) \
-                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({ts}))), {FP}, \
-                 '{SERVICE}', '{{\"service_name\":\"{SERVICE}\"}}', 0)",
+                "INSERT INTO {}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES ({received_ms}, 1, '{SERVICE}', {FP}, 0, 0, '', '', \
+                 toStartOfMonth(fromUnixTimestamp64Nano(toInt64({ts}))), \
+                 '{{\"service_name\":\"{SERVICE}\"}}', 0, '', 0)",
                 args.database
             ),
             &QuerySettings::new(),
@@ -189,7 +217,25 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             })
             .collect();
         written += batch.len() as u64;
-        client.insert_block("log_samples", &batch).await?;
+        let landing: Vec<SeedLandingRow> = batch
+            .iter()
+            .map(|r| SeedLandingRow {
+                received_ms,
+                kind: 0,
+                service: r.service.clone(),
+                fingerprint: r.fingerprint,
+                timestamp_ns: r.timestamp_ns,
+                severity: r.severity,
+                body: r.body.clone(),
+                structured_metadata: r.structured_metadata.clone(),
+                month: 0,
+                labels: String::new(),
+                updated_ns: 0,
+                pattern: String::new(),
+                pattern_count: 0,
+            })
+            .collect();
+        client.insert_block("log_landing", &landing).await?;
     }
     eprintln!("=== seeded {written} rows ===");
 

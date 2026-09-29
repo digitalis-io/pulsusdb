@@ -21,8 +21,8 @@ use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
 use pulsus_config::{ByteSize, Config, WriterConfig};
 use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{
-    BlockInserter, LANDING_BLOCK_OVERHEAD_BYTES, LANDING_ROW_SLOT_BYTES, MetricLandingRow,
-    MetricWriter, MetricWriterTables, WriterRuntime,
+    BlockInserter, LANDING_ROW_SLOT_BYTES, MetricLandingRow, MetricWriter, MetricWriterTables,
+    WriterRuntime, landing_block_overhead_bytes,
 };
 use pulsus_write::{
     AdmitRefusal, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
@@ -370,7 +370,7 @@ fn one_bucket_hist(sum: f64) -> NativeHistogram {
 /// 33 + 75 + 28 + 28 + 14 = 178 bytes of buffers. The queue also holds each
 /// row itself, which is the union of all four kinds' columns
 /// (`LANDING_ROW_SLOT_BYTES`), and the block those rows are sealed into
-/// (`LANDING_BLOCK_OVERHEAD_BYTES`), so the charge is those 178 plus five
+/// (`landing_block_overhead_bytes`), so the charge is those 178 plus five
 /// rows' slots plus one block's — see
 /// `a_landing_row_is_charged_the_row_the_queue_holds` and
 /// `the_charge_covers_everything_a_queued_block_holds`.
@@ -378,7 +378,7 @@ const MIXED_PUSH_ROWS: u64 = 5;
 const MIXED_PUSH_BUFFER_BYTES: u64 = 178;
 const MIXED_PUSH_BYTES: u64 = MIXED_PUSH_BUFFER_BYTES
     + MIXED_PUSH_ROWS * LANDING_ROW_SLOT_BYTES
-    + LANDING_BLOCK_OVERHEAD_BYTES;
+    + landing_block_overhead_bytes::<MetricLandingRow>();
 
 fn mixed_push(unix_milli: i64, updated_ns: i64, with_descriptor: bool) -> ParsedMetrics {
     let mut out = ParsedMetrics {
@@ -1399,7 +1399,7 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
 async fn an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits() {
     // The case only bites while one block's own overhead exceeds the smallest
     // accepted limit.
-    const { assert!(LANDING_BLOCK_OVERHEAD_BYTES > 1) };
+    assert!(landing_block_overhead_bytes::<MetricLandingRow>() > 1);
     for (name, cfg) in [
         (
             "one-byte per-push ceiling",
@@ -1576,7 +1576,7 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     );
     assert_eq!(
         bytes,
-        MIXED_PUSH_BUFFER_BYTES + held + LANDING_BLOCK_OVERHEAD_BYTES,
+        MIXED_PUSH_BUFFER_BYTES + held + landing_block_overhead_bytes::<MetricLandingRow>(),
         "the charge is the buffers, the rows that hold them, and the block they are \
          sealed into"
     );

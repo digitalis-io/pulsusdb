@@ -154,6 +154,18 @@ pub struct WriterRuntime {
     /// field because the constant is private to this module and the loop
     /// that reads it lives in another.
     pub landing_budget: Duration,
+    /// `PULSUS_LOG_LANDING_RETRIES` (issue #603): resends of a failed logs
+    /// landing insert. [`Self::landing_budget`] is the wall-clock bound on the
+    /// whole loop; whichever binds first ends it.
+    pub log_landing_retries: u32,
+    /// `PULSUS_LOG_LANDING_INSERTERS` (issue #603): insert workers on the logs
+    /// landing queue, so the landing inserts in flight at once.
+    pub log_landing_inserters: u32,
+    /// `PULSUS_LOG_LANDING_MAX_ROWS` (issue #603): the per-push logs landing
+    /// row ceiling, and the value **both** row limits every logs landing
+    /// insert pins carry, so an admitted push is strictly under the count the
+    /// server would end a block at.
+    pub log_landing_max_rows: u64,
 }
 
 impl WriterRuntime {
@@ -179,6 +191,9 @@ impl WriterRuntime {
             metrics_landing_inserters: cfg.metrics_landing_inserters,
             metrics_landing_max_rows: cfg.metrics_landing_max_rows,
             landing_budget: CLAIM_INSERT_BOUND,
+            log_landing_retries: cfg.log_landing_retries,
+            log_landing_inserters: cfg.log_landing_inserters,
+            log_landing_max_rows: cfg.log_landing_max_rows,
         }
     }
 }

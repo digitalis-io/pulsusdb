@@ -841,7 +841,7 @@ measurement.
 
 - LogQL's compiler, which is not built on the core, resolves the selector to fingerprints over
   `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:484`), then reads `log_streams` and
-  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:725`, `sql.rs:774`). Three statements; in
+  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:711`, `sql.rs:774`). Three statements; in
   the core's terms that is two source handoffs, but LogQL's compiler does not use `Cut`. Its seed is
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -972,7 +972,7 @@ core builds carries either today.
 compiler, separate from the core (owner decision, #507). Its page loop is
 `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:83`, set at `:1655` from
 `has_unpushed_dropping_stage`, `:1673`); when it is set the read is one statement per page through
-`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:867`) with
+`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:851`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. Whether a compiled LogQL filter
 lets the request's limit into the statement is decided in `plan.rs`; §2.7.7's `Fidelity` does not
 reach it. §7.1's `Limit` row reads that decision in the model's terms, as analysis.
@@ -2402,9 +2402,9 @@ beside the figures they govern rather than once here, and this list is the index
 | `max_block_size` | **4096** | the shipped value (`exec.rs:178`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
-| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:599`), applied by `generator_settings` (`exec.rs:3023`) |
+| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:659`), applied by `generator_settings` (`exec.rs:3023`) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3023`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:595`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2983-2989`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:655`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2983-2989`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2511,8 +2511,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2500` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2441` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:2668` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:2609` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -2933,7 +2933,7 @@ of them `String`, for the arithmetic form. Per span-group at the full window the
 1,129 / 1,116 / 1,104 / 454 / 571 bytes.
 
 Against that, `generator_settings` (`exec.rs:3023`) applies `max_memory_usage = 536870912` — the
-shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:599`) — with
+shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:659`) — with
 `max_bytes_before_external_group_by = 0`, so the statement throws rather than spilling:
 
 ```
@@ -3159,7 +3159,7 @@ Same answers on both tables — 1,666,667 and 10,000 matching rows — at 722x a
 So this is a second copy of the attribute rows, not a re-ordering of the existing one.
 
 **The budget it needs alongside.** `reader.traceql_scan_budget_rows`, raised from 50,000,000
-(`crates/pulsus-config/src/model.rs:616`) to cover the window's attribute rows; **200,000,000** was
+(`crates/pulsus-config/src/model.rs:655`) to cover the window's attribute rows; **200,000,000** was
 measured. Without it every one of the five classes returns
 `Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
 current rows: …` — the trailing figure is where the read had got when the limit tripped and varies
@@ -3201,7 +3201,7 @@ from an argument.
 **The finding first, because it is the one an amendment has to meet.** The per-query join form — the
 shape that justifies "replaces one statement per batch with one statement per query" — does not
 survive the shipped generator memory ceiling. At `max_memory_usage = 536870912`, the shipped
-`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:599`, applied by
+`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:659`, applied by
 `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:3023`), it refused on all three takes,
 `exception_code` 241, 721 marks selected, no rows out. **The refusal is asserted on `Code: 241` and
 `512.00 MiB`, and on nothing else.** Everything else in the message is a record, and the three
@@ -5532,19 +5532,19 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | quantity | at this revision |
 |---|---|
 | citation occurrences in the five artefacts | 727 |
-| of those, citing a bare basename | 554 |
+| of those, citing a bare basename | 550 |
 | of those, written as a continuation of a citation earlier in the paragraph | 77 |
 | of those continuations, on a later line than the citation they continue | 33 |
-| `(document, token)` pairs the rule resolves | 381 |
-| occurrences those resolved pairs cover | 522 |
-| `(document, token)` pairs it cannot resolve | 114 |
-| occurrences those frozen pairs cover | 205 |
+| `(document, token)` pairs the rule resolves | 383 |
+| occurrences those resolved pairs cover | 523 |
+| `(document, token)` pairs it cannot resolve | 113 |
+| occurrences those frozen pairs cover | 204 |
 | resolved rows anchored on a token the citing prose prints | 173 |
-| resolved rows anchored on a snapshot of the cited line | 208 |
+| resolved rows anchored on a snapshot of the cited line | 210 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 102 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 101 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 10 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
@@ -5559,7 +5559,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 727 citation occurrences the five artefacts make, 554 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 381 `(document, token)` pairs covering 522 occurrences, and cannot resolve 114 covering 205. Of the resolved rows, 173 are anchored on a token the citing prose prints and 208 on a snapshot of the cited line.
+Of the 727 citation occurrences the five artefacts make, 550 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 383 `(document, token)` pairs covering 523 occurrences, and cannot resolve 113 covering 204. Of the resolved rows, 173 are anchored on a token the citing prose prints and 210 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

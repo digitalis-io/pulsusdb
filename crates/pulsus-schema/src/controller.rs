@@ -510,7 +510,16 @@ const TTL_STMTS: [&str; 18] = [
 /// operator who manually altered it away is corrected on the next rotation
 /// tick too.
 pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaError> {
-    for stmt in TTL_STMTS.iter().chain(METRIC_LANDING_STMTS) {
+    for stmt in TTL_STMTS
+        .iter()
+        .chain(METRIC_LANDING_STMTS)
+        .chain(LOG_LANDING_STMTS)
+        .chain(if ctx.cluster.is_some() {
+            CLUSTER_DEDUP_SECONDS_STMTS
+        } else {
+            &[]
+        })
+    {
         let rendered = render::substitute_tokens(stmt, ctx);
         client
             .execute(&rendered, &QuerySettings::new(), Idempotency::Idempotent)
@@ -535,14 +544,81 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
 /// insert carries a block id derived from the source block, and only a
 /// table with a window recognises the repeat.
 const METRIC_LANDING_STMTS: &[&str] = &[
-    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
-    "ALTER TABLE {{db}}.metric_series{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
-    "ALTER TABLE {{db}}.metric_metadata{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
-    "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_series{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_metadata{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{metrics_dedup_window}};",
     "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(received_ms, 1000) + {{metrics_landing_retention_hours}} * 3600, 4294967295)) DELETE;",
-    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING non_replicated_deduplication_window = {{metrics_dedup_window}};",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{metrics_dedup_window}};",
 ];
+
+/// The logs landing table's own delete-TTL, plus the block-deduplication
+/// window every table on the logs write path carries (issue #603).
+///
+/// [`METRIC_LANDING_STMTS`]'s twin, chained after it in [`apply_ttl`] for the
+/// same reasons, and with the same order rule: the two naming `log_landing`
+/// come last, so a schema managed by hand without that table stops nothing
+/// that does not name it.
+///
+/// Five of the six windows are the tables the views maintain. A view's insert
+/// into its target carries a block id derived from the source block, and only
+/// a table with a window recognises the repeat.
+const LOG_LANDING_STMTS: &[&str] = &[
+    "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+    "ALTER TABLE {{db}}.log_streams{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+    "ALTER TABLE {{db}}.log_streams_idx{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+    "ALTER TABLE {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+    "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+    "ALTER TABLE {{db}}.log_landing{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(received_ms, 1000) + {{log_landing_retention_hours}} * 3600, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.log_landing{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
+];
+
+/// The seconds half of a replicated table's block-deduplication window, one
+/// statement per write-path table (issue #603).
+///
+/// **Chained only when a cluster is configured**, because the setting exists
+/// on a `Replicated*` engine alone. A clustered deployment is the production
+/// shape, so this is the case that matters: a replicated table forgets a block
+/// hash after `replicated_deduplication_window_seconds` **even if fewer than
+/// `replicated_deduplication_window` newer blocks have arrived**, so the block
+/// window alone does not bound a resend. A deployment that lowered this below
+/// the landing budget would forget a token while the writer is still entitled
+/// to resend under it.
+///
+/// `{{dedup_window_seconds}}` renders [`DEDUP_WINDOW_SECONDS`] — a constant
+/// and not a knob, because the precondition of the defect is a deployment
+/// setting the value too small.
+const CLUSTER_DEDUP_SECONDS_STMTS: &[&str] = &[
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.metric_series{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.metric_metadata{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_streams{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_streams_idx{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.log_landing{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+];
+
+/// The seconds deduplication window every clustered write-path table is
+/// pinned to (issue #603), in seconds.
+///
+/// **Why this number is enough.** The window guards one thing: the writer
+/// resending its own block. That is bounded by the landing budget —
+/// `WriterRuntime::landing_budget`, 120 s, measured from the push's admission
+/// — so a block settles strictly before it. A client's re-push is a different
+/// question, answered by the suppression index. The relation, not the number,
+/// is what a case holds, in the one crate that can see both sides
+/// (`pulsus-server`'s `chconfig`): `pulsus-schema` and `pulsus-write` do not
+/// depend on each other.
+///
+/// It is the server's own default, so pinning changes nothing where the server
+/// keeps it and raises it back where a server configuration lowered it.
+pub const DEDUP_WINDOW_SECONDS: u64 = 3600;
 
 /// The projection one materialized view applies, read out of that view's own
 /// rendered statement so the two cannot drift (issue #603).
@@ -596,6 +672,26 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("input_format_connection_handling", NameCatalogue::Setting),
     ("input_format_max_block_wait_ms", NameCatalogue::Setting),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
+    // The three block/seconds deduplication-window names `apply_ttl` sends
+    // (issue #603). Which of the first two a statement carries is rendered
+    // from the same thing that renders the engine
+    // (`render::dedup_window_setting`), and the third is sent on a clustered
+    // deployment only — but startup does not know which tables a later
+    // reconfiguration will render, so all three are read back. The
+    // non-replicated name was absent from this list although this build
+    // already sent it.
+    (
+        "non_replicated_deduplication_window",
+        NameCatalogue::MergeTreeSetting,
+    ),
+    (
+        "replicated_deduplication_window",
+        NameCatalogue::MergeTreeSetting,
+    ),
+    (
+        "replicated_deduplication_window_seconds",
+        NameCatalogue::MergeTreeSetting,
+    ),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
     ("tupleElement", NameCatalogue::Function),
@@ -757,6 +853,8 @@ mod tests {
             log_rollup: std::time::Duration::from_secs(5),
             metrics_landing_retention_hours: retention_hours,
             metrics_dedup_window: window,
+            log_landing_retention_hours: retention_hours,
+            log_dedup_window: window,
         }
     }
 
@@ -845,6 +943,174 @@ mod tests {
             "nothing but landing statements may follow the first one"
         );
         assert_eq!(METRIC_LANDING_STMTS.len() - first_landing, 2);
+    }
+
+    /// **T28.** The three landing statement lists, rendered, written out.
+    ///
+    /// **Both modes**, because the setting name a window statement carries is
+    /// rendered from the same thing that renders the engine — and the seconds
+    /// list is chained **only** when a cluster is configured, which the last
+    /// assertion holds. It fails if a target is dropped from any list, if a
+    /// setting name is hard-coded again, or if the seconds list reaches a
+    /// single-node deployment, where the setting does not exist.
+    #[test]
+    fn the_landing_statements_are_exactly_this_text() {
+        fn rendered(list: &[&str], ctx: &RenderCtx) -> Vec<String> {
+            list.iter()
+                .map(|s| render::substitute_tokens(s, ctx))
+                .collect()
+        }
+
+        let single = metrics_ctx(6, 5_000);
+        let clustered = RenderCtx {
+            cluster: Some("prod".to_string()),
+            ..metrics_ctx(6, 5_000)
+        };
+
+        for (mode, ctx, window_setting, on_cluster) in [
+            (
+                "single-node",
+                &single,
+                "non_replicated_deduplication_window",
+                "",
+            ),
+            (
+                "clustered",
+                &clustered,
+                "replicated_deduplication_window",
+                " ON CLUSTER 'prod'",
+            ),
+        ] {
+            let metrics = rendered(METRIC_LANDING_STMTS, ctx);
+            assert_eq!(
+                metrics,
+                vec![
+                    format!(
+                        "ALTER TABLE pulsus.metric_samples{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.metric_series{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.metric_metadata{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.metric_hist_samples{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.metric_landing{on_cluster} MODIFY TTL toDateTime(least(intDiv(received_ms, 1000) + 6 * 3600, 4294967295)) DELETE;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.metric_landing{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                ],
+                "{mode}: the metrics landing statements"
+            );
+
+            let logs = rendered(LOG_LANDING_STMTS, ctx);
+            assert_eq!(
+                logs,
+                vec![
+                    format!(
+                        "ALTER TABLE pulsus.log_samples{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_streams{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_streams_idx{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_metrics_5s{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_patterns{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_landing{on_cluster} MODIFY TTL toDateTime(least(intDiv(received_ms, 1000) + 6 * 3600, 4294967295)) DELETE;"
+                    ),
+                    format!(
+                        "ALTER TABLE pulsus.log_landing{on_cluster} MODIFY SETTING {window_setting} = 5000;"
+                    ),
+                ],
+                "{mode}: the logs landing statements"
+            );
+        }
+
+        // The seconds list, rendered once — it is only ever sent clustered.
+        let seconds = rendered(CLUSTER_DEDUP_SECONDS_STMTS, &clustered);
+        let want: Vec<String> = [
+            "metric_samples",
+            "metric_series",
+            "metric_metadata",
+            "metric_hist_samples",
+            "metric_landing",
+            "log_samples",
+            "log_streams",
+            "log_streams_idx",
+            "log_metrics_5s",
+            "log_patterns",
+            "log_landing",
+        ]
+        .iter()
+        .map(|t| {
+            format!(
+                "ALTER TABLE pulsus.{t} ON CLUSTER 'prod' MODIFY SETTING \
+                 replicated_deduplication_window_seconds = {DEDUP_WINDOW_SECONDS};"
+            )
+        })
+        .collect();
+        assert_eq!(
+            seconds, want,
+            "one statement per write-path table, in the same order the two \
+             lists above use"
+        );
+
+        // **Chained only when a cluster is configured.** The setting exists on
+        // a `Replicated*` engine alone, so sending it to a single-node
+        // deployment names a setting that table does not carry.
+        for (mode, ctx, expect_seconds) in [
+            ("single-node", &single, false),
+            ("clustered", &clustered, true),
+        ] {
+            let chained: Vec<&&str> = TTL_STMTS
+                .iter()
+                .chain(METRIC_LANDING_STMTS)
+                .chain(LOG_LANDING_STMTS)
+                .chain(if ctx.cluster.is_some() {
+                    CLUSTER_DEDUP_SECONDS_STMTS
+                } else {
+                    &[]
+                })
+                .collect();
+            let has_seconds = chained
+                .iter()
+                .any(|s| s.contains("replicated_deduplication_window_seconds"));
+            assert_eq!(
+                has_seconds, expect_seconds,
+                "{mode}: the seconds window is a clustered deployment's alone"
+            );
+        }
+    }
+
+    /// **T29.** `apply_ttl` stops at its first failing statement, so the order
+    /// is a dependency order: within `LOG_LANDING_STMTS` the two naming
+    /// `log_landing` come last, so a schema managed by hand without that table
+    /// stops nothing that does not name it. The twin of
+    /// `the_landing_statements_come_last_within_the_metrics_block`.
+    #[test]
+    fn the_landing_statements_come_last_within_the_logs_block() {
+        let first_landing = LOG_LANDING_STMTS
+            .iter()
+            .position(|s| s.contains("log_landing"))
+            .expect("the landing table has statements");
+        assert!(
+            LOG_LANDING_STMTS[first_landing..]
+                .iter()
+                .all(|s| s.contains("log_landing")),
+            "nothing but landing statements may follow the first one"
+        );
+        assert_eq!(LOG_LANDING_STMTS.len() - first_landing, 2);
     }
 
     // -- the startup name check (issue #603) --------------------------
@@ -965,6 +1231,13 @@ mod tests {
     /// check draws: every name this work sends that was not already there.
     /// A server too old to carry them is refused by its version, which is a
     /// separate check.
+    ///
+    /// **The logs landing path widens neither side** (issue #603): its insert
+    /// pins the same ten settings the metrics one does, and its read path
+    /// sends no query setting at all — the discovery reads dispatch with the
+    /// budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
+    /// (`crates/pulsus-read/src/logql/exec.rs`) asserts the other side of
+    /// that.
     #[test]
     fn the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends() {
         use std::collections::BTreeSet;
@@ -1017,8 +1290,15 @@ mod tests {
         }
     }
 
-    /// The three statements, written out, so the list and the statements
-    /// cannot drift apart unnoticed.
+    /// **T30.** The three statements, written out, so the list and the
+    /// statements cannot drift apart unnoticed.
+    ///
+    /// The `MergeTree` catalogue carries §4's **three** deduplication-window
+    /// names and nothing else: which of the two block names a statement
+    /// renders follows the engine, and the seconds name is sent on a clustered
+    /// deployment only, but startup cannot know which shape a later
+    /// reconfiguration renders, so all three are read back. **No query setting
+    /// is added**: the discovery reads send none.
     #[test]
     fn the_required_names_statements_are_exactly_this_text() {
         assert_eq!(
@@ -1036,7 +1316,9 @@ mod tests {
                 (
                     NameCatalogue::MergeTreeSetting,
                     "SELECT name FROM system.merge_tree_settings WHERE name IN \
-                     ('merge_with_ttl_timeout')"
+                     ('merge_with_ttl_timeout', 'non_replicated_deduplication_window', \
+                     'replicated_deduplication_window', \
+                     'replicated_deduplication_window_seconds')"
                         .to_string()
                 ),
                 (
@@ -1152,6 +1434,8 @@ mod tests {
             log_rollup: std::time::Duration::from_secs(5),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
+            log_landing_retention_hours: 6,
+            log_dedup_window: 10_000,
         };
         let trace_ttl_stmts: Vec<String> = TTL_STMTS
             .iter()
@@ -1211,6 +1495,8 @@ mod tests {
             log_rollup: std::time::Duration::from_secs(5),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
+            log_landing_retention_hours: 6,
+            log_dedup_window: 10_000,
         };
         let rendered: Vec<String> = TTL_STMTS
             .iter()

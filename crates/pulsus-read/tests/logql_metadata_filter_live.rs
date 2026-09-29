@@ -31,8 +31,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
-use pulsus_read::logql::{Direction, QueryParams, QuerySpec};
-use pulsus_read::{EngineConfig, LogQlEngine, QueryResult};
+use pulsus_read::logql::TooBroadReason;
+use pulsus_read::logql::{Direction, QueryParams, QuerySpec, TimeBounds};
+use pulsus_read::{EngineConfig, LogQlEngine, QueryResult, ReadError};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -71,16 +72,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn schema_params(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 fn engine_config(db: &str) -> EngineConfig {
@@ -122,14 +114,57 @@ fn now_ns() -> i64 {
     .expect("fits i64")
 }
 
+/// One `log_landing` row, in the table's own column order (issue #603).
+///
+/// **The fixture seeds the LANDING table, not the targets.** `log_samples`,
+/// `log_streams`, `log_streams_idx`, `log_metrics_<res>` and `log_patterns`
+/// are all maintained by materialized view off this one table now, so a
+/// fixture that inserted into a target directly would leave every derived
+/// table this suite reads — the stream index stage 1 resolves through, and the
+/// rollup the activity scan reads — empty.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedSampleRow {
+struct SeedLandingRow {
+    received_ms: i64,
+    kind: u8,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
     severity: i8,
     body: String,
     structured_metadata: String,
+    month: u16,
+    labels: String,
+    updated_ns: i64,
+    pattern: String,
+    pattern_count: u64,
+}
+
+impl SeedLandingRow {
+    fn of_kind(kind: u8) -> Self {
+        SeedLandingRow {
+            received_ms: 0,
+            kind,
+            service: String::new(),
+            fingerprint: 0,
+            timestamp_ns: 0,
+            severity: 0,
+            body: String::new(),
+            structured_metadata: String::new(),
+            month: 0,
+            labels: String::new(),
+            updated_ns: 0,
+            pattern: String::new(),
+            pattern_count: 0,
+        }
+    }
+}
+
+/// The days-since-epoch a `Date` column takes for the month containing
+/// `ts_ns` — the value `log_streams_mv` copies through.
+fn month_of(ts_ns: i64) -> u16 {
+    pulsus_model::Date::start_of_month_utc(ts_ns)
+        .expect("a representable month")
+        .days_since_epoch()
 }
 
 /// One seeded stream: its fingerprint, its `service` column and the
@@ -171,44 +206,33 @@ async fn create_schema(db: &str) -> ChClient {
 }
 
 async fn seed(client: &ChClient, db: &str, ts_ns: i64, streams: &[Stream], rows: &[Seed]) {
-    for s in streams {
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
-                     updated_ns) VALUES \
-                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({ts_ns}))), {}, '{}', '{}', \
-                     0)",
-                    s.fingerprint,
-                    s.service,
-                    s.labels.replace('\'', "\\'")
-                ),
-                &QuerySettings::new(),
-                Idempotency::Idempotent,
-            )
-            .await
-            .expect("seed log_streams");
-    }
-    let block: Vec<SeedSampleRow> = rows
+    let _ = db;
+    let mut block: Vec<SeedLandingRow> = streams
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let s = &streams[r.stream];
-            SeedSampleRow {
-                service: s.service.to_string(),
-                fingerprint: s.fingerprint,
-                // One nanosecond apart, ascending in seed order.
-                timestamp_ns: ts_ns + i as i64,
-                severity: 0,
-                body: r.body.to_string(),
-                structured_metadata: r.metadata.to_string(),
-            }
+        .map(|s| SeedLandingRow {
+            service: s.service.to_string(),
+            fingerprint: s.fingerprint,
+            month: month_of(ts_ns),
+            labels: s.labels.to_string(),
+            ..SeedLandingRow::of_kind(1)
         })
         .collect();
+    block.extend(rows.iter().enumerate().map(|(i, r)| {
+        let s = &streams[r.stream];
+        SeedLandingRow {
+            service: s.service.to_string(),
+            fingerprint: s.fingerprint,
+            // One nanosecond apart, ascending in seed order.
+            timestamp_ns: ts_ns + i as i64,
+            body: r.body.to_string(),
+            structured_metadata: r.metadata.to_string(),
+            ..SeedLandingRow::of_kind(0)
+        }
+    }));
     client
-        .insert_block("log_samples", &block)
+        .insert_block("log_landing", &block)
         .await
-        .expect("seed log_samples");
+        .expect("seed log_landing");
 }
 
 fn window(ts_ns: i64) -> QueryParams {
@@ -1378,4 +1402,196 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
          filters nothing, so it would count every line in the window"
     );
     drop_db(&db).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #603: label discovery runs the activity scan as its own statement
+// ---------------------------------------------------------------------
+
+/// The stream fixture the two discovery cases below seed: three streams, each
+/// with its own `env` value, so a label-values read over `env` has three
+/// distinct answers and the cap can be set either side of three.
+const DISCOVERY_STREAMS: [Stream; 3] = [
+    Stream {
+        fingerprint: 9_001,
+        service: "discA",
+        labels: r#"{"env":"alpha","service_name":"discA"}"#,
+    },
+    Stream {
+        fingerprint: 9_002,
+        service: "discB",
+        labels: r#"{"env":"bravo","service_name":"discB"}"#,
+    },
+    Stream {
+        fingerprint: 9_003,
+        service: "discC",
+        labels: r#"{"env":"charlie","service_name":"discC"}"#,
+    },
+];
+
+const DISCOVERY_SEEDS: [Seed; 3] = [
+    Seed {
+        stream: 0,
+        body: "alpha line",
+        metadata: "",
+    },
+    Seed {
+        stream: 1,
+        body: "bravo line",
+        metadata: "",
+    },
+    Seed {
+        stream: 2,
+        body: "charlie line",
+        metadata: "",
+    },
+];
+
+fn bounds(ts_ns: i64) -> TimeBounds {
+    TimeBounds {
+        start_ns: ts_ns - 60_000_000_000,
+        end_ns: ts_ns + 60_000_000_000,
+    }
+}
+
+/// **T52.** An activity set larger than `max_streams` is **refused rather than
+/// truncated**, with the shipped `422` reason.
+///
+/// Issue #603 made label discovery run the activity scan as a statement of its
+/// own and render its result as a literal list, which brings the set under
+/// `check_stream_cap` — the same Rust-side count stage-1 resolution has always
+/// applied. Before that the set was a subquery the server evaluated, so it
+/// never reached the cap at all and an arbitrarily large one was shipped into
+/// each shard's copy of the statement.
+///
+/// **It needs no cluster**: the cap is a count in this process. The
+/// `max_streams: 3` control is what stops a defect in the seeding passing as a
+/// breach — without it, a fixture that seeded nothing would "refuse" for the
+/// wrong reason, or rather would not refuse at all.
+#[tokio::test]
+async fn an_over_cap_activity_set_is_refused_rather_than_truncated() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_activity_cap");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
+
+    // At a cap of three the read answers with all three values.
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        EngineConfig {
+            max_streams: 3,
+            ..engine_config(&db)
+        },
+    );
+    let values = engine
+        .label_values("env", None, bounds(ts))
+        .await
+        .expect("a set at the cap is answered");
+    assert_eq!(
+        values,
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string()
+        ],
+        "the control must answer completely, or the breach below proves nothing"
+    );
+
+    // At a cap of two the same read is refused, naming the count and the cap.
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        EngineConfig {
+            max_streams: 2,
+            ..engine_config(&db)
+        },
+    );
+    match engine.label_values("env", None, bounds(ts)).await {
+        Err(ReadError::QueryTooBroad(TooBroadReason::StreamCap { count, cap })) => {
+            assert_eq!(cap, 2, "the cap the engine was built with");
+            assert_eq!(
+                count, 3,
+                "the cap is applied INSIDE the streaming loop, so the count is \
+                 the cap plus one rather than the whole store"
+            );
+        }
+        other => panic!("expected a StreamCap refusal, got {other:?}"),
+    }
+
+    admin_client()
+        .await
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the test database");
+}
+
+/// **T54.** A window with no activity dispatches no index scan.
+///
+/// **The observation is that the second statement was never issued** — the
+/// explain trace carries the activity stage and NOT the index-scan stage — and
+/// the returned value is the documented empty one.
+///
+/// Observing only the returned value cannot fail: an empty literal list is
+/// valid SQL that selects nothing, measured (`SELECT 1 AS x WHERE
+/// toUInt128(1) IN ()` completes with no row), and `run_discovery` turns no
+/// rows into the same empty vector either way. So the answer is right with or
+/// without the early return; what the return buys is one avoided round trip on
+/// a quiet range, which is the common case for a dashboard opening on one.
+///
+/// One endpoint, because `run_discovery` owns the branch for all three.
+#[tokio::test]
+async fn a_no_activity_window_dispatches_no_index_scan() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_no_activity");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+
+    // A window the seeded lines are inside: both stages run.
+    let (values, explain) = engine
+        .label_values_explained("env", None, bounds(ts))
+        .await
+        .expect("the active window is answered");
+    assert_eq!(values.len(), 3, "the control window has activity");
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    assert_eq!(
+        stages,
+        vec!["stream_activity", "label_values"],
+        "an active window issues the activity scan and then the index scan"
+    );
+
+    // A window an hour earlier, where the same streams have no rollup rows.
+    let quiet = TimeBounds {
+        start_ns: ts - 7_200_000_000_000,
+        end_ns: ts - 3_600_000_000_000,
+    };
+    let (values, explain) = engine
+        .label_values_explained("env", None, quiet)
+        .await
+        .expect("a quiet window is answered");
+    assert!(
+        values.is_empty(),
+        "the documented empty answer, not an error: {values:?}"
+    );
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    assert_eq!(
+        stages,
+        vec!["stream_activity"],
+        "a window with no activity must issue NO second statement: {stages:?}"
+    );
+
+    admin_client()
+        .await
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the test database");
 }

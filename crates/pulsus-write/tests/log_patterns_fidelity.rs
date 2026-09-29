@@ -71,16 +71,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 macro_rules! skip_unless_live {
@@ -201,13 +192,23 @@ fn loki_push_json(ts_ns: i64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Admits `batch` and **waits for its block to commit** before returning.
+///
+/// **Sync mode, not async** (issue #603): one push is one insert of one block
+/// on a queue a worker takes it off, and `shutdown` settles whatever is still
+/// queued as provably-not-committed rather than inserting it. An async admit
+/// followed immediately by a shutdown therefore races the worker, where
+/// `admit_flush` returns only once the block has reached an ending.
 async fn admit_and_drain(db: &str, batch: ParsedLogs) {
     let writer = LogWriter::new_with_tables(
         db_client(db).await,
         &WriterConfig::default(),
         WriterTables::logs_default(),
     );
-    pulsus_write::LogSink::admit(&writer, batch, PushHeaders::default()).expect("queue has room");
+    pulsus_write::LogSink::admit_flush(&writer, batch, PushHeaders::default())
+        .expect("queue has room")
+        .await
+        .expect("the landing block commits");
     writer.shutdown(Duration::from_secs(10)).await;
 }
 

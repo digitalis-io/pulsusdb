@@ -334,43 +334,43 @@ fn now_ns() -> i64 {
 const FP_A: u64 = 0x8000_0000_0000_0001;
 const FP_B: u64 = 0x8000_0000_0000_0002;
 
-/// Seeds two streams (`checkout`/prod, `checkout`/staging) with a handful
-/// of recent samples each. `log_streams_idx` is populated by the schema's
-/// own materialized view over `log_streams` (docs/schemas.md §3.1) — no
-/// direct index insert needed.
+/// Seeds two streams (`checkout`/prod, `checkout`/staging) with a handful of
+/// recent samples each, **through `log_landing`** (issue #603).
+///
+/// `log_samples`, `log_streams`, `log_streams_idx` and `log_metrics_<res>` are
+/// all maintained from that one table by materialized view now, so a fixture
+/// that inserted into a target directly would leave every derived table this
+/// suite reads empty — the stream index stage 1 resolves through, and the
+/// rollup the activity scan reads.
 async fn seed(client: &ChClient, db: &str, base_ns: i64) {
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
-                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_A}, 'checkout', \
-                 '{{\"env\":\"prod\",\"service_name\":\"checkout\"}}', 0), \
-                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_B}, 'checkout', \
-                 '{{\"env\":\"staging\",\"service_name\":\"checkout\"}}', 0)"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed log_streams");
-
-    let mut values = Vec::new();
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns})))");
+    let mut values = vec![
+        format!(
+            "(1, {month}, {FP_A}, 'checkout', \
+             '{{\"env\":\"prod\",\"service_name\":\"checkout\"}}', 0, 0, '')"
+        ),
+        format!(
+            "(1, {month}, {FP_B}, 'checkout', \
+             '{{\"env\":\"staging\",\"service_name\":\"checkout\"}}', 0, 0, '')"
+        ),
+    ];
     for (fp, body_prefix) in [(FP_A, "prod"), (FP_B, "staging")] {
         for i in 0..3i64 {
             let ts = base_ns - (3 - i) * 1_000_000_000;
             values.push(format!(
-                "('checkout', {fp}, {ts}, 0, '{body_prefix} line {i}')"
+                "(0, toDate(0), {fp}, 'checkout', '', 0, {ts}, '{body_prefix} line {i}')"
             ));
         }
     }
     let sql = format!(
-        "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) VALUES {}",
+        "INSERT INTO {db}.log_landing \
+         (kind, month, fingerprint, service, labels, updated_ns, timestamp_ns, body) VALUES {}",
         values.join(", ")
     );
     client
         .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
         .await
-        .expect("seed log_samples");
+        .expect("seed log_landing");
 }
 
 async fn setup(db: &str, port: u16) -> (ChildGuard, ChClient, i64) {
@@ -1049,6 +1049,7 @@ async fn query_range_memory_scales_with_the_limit_not_the_seeded_stream_count() 
         )
         .await
         .expect("seed many log_streams");
+    land_seeded_streams(&client, db).await;
     client
         .execute(
             &format!(
@@ -1060,7 +1061,9 @@ async fn query_range_memory_scales_with_the_limit_not_the_seeded_stream_count() 
         )
         .await
         .expect("seed many log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
+    land_seeded_lines(&client, db).await;
     let pid = guard.0.id();
     let rss_before = read_rss_kb(pid).expect("read RSS before request");
 
@@ -1426,6 +1429,7 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
         )
         .await
         .expect("seed log_streams");
+    land_seeded_streams(&client, db).await;
     let bodies = [
         r#"{"method":"GET","status":"500"}"#,
         r#"{"method":"GET","status":"500"}"#,
@@ -1455,7 +1459,9 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
         )
         .await
         .expect("seed log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
+    land_seeded_lines(&client, db).await;
     let start = base_ns - 3_600_000_000_000;
     let end = base_ns + 3_600_000_000_000;
     let res = http_get(
@@ -1558,6 +1564,7 @@ async fn query_range_surfaces_error_details_label_end_to_end() {
         )
         .await
         .expect("seed log_streams");
+    land_seeded_streams(&client, db).await;
     let ts = base_ns - 1_000_000_000;
     client
         .execute(
@@ -1571,7 +1578,9 @@ async fn query_range_surfaces_error_details_label_end_to_end() {
         )
         .await
         .expect("seed log_samples");
-
+    land_seeded_lines(&client, db).await;
+    land_seeded_streams(&client, db).await;
+    land_seeded_lines(&client, db).await;
     let start = base_ns - 3_600_000_000_000;
     let end = base_ns + 3_600_000_000_000;
     let start_s = start.to_string();
@@ -2810,6 +2819,7 @@ async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, db).await;
         client
             .execute(
                 &format!(
@@ -2821,6 +2831,9 @@ async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
             )
             .await
             .expect("seed log_samples");
+        land_seeded_lines(&client, db).await;
+        land_seeded_streams(&client, db).await;
+        land_seeded_lines(&client, db).await;
     }
 
     let start = (now - 600_000_000_000).to_string();
@@ -2953,6 +2966,7 @@ async fn seed_wide_streams(client: &ChClient, db: &str, base_ns: i64) {
         .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
         .await
         .expect("seed wide log_streams");
+    land_seeded_streams(client, db).await;
 }
 
 /// **The discriminator** (issue #398 AC L5a). A LogQL read that breaches
@@ -3732,7 +3746,7 @@ async fn seed_sort_order(client: &ChClient, db: &str, base_ns: i64) {
         )
         .await
         .expect("seed sort log_streams");
-
+    land_seeded_streams(client, db).await;
     let mut values = Vec::new();
     for (fp, svc, count) in [
         (FP_SORT_A, "a", 2),
@@ -3758,6 +3772,9 @@ async fn seed_sort_order(client: &ChClient, db: &str, base_ns: i64) {
         )
         .await
         .expect("seed sort log_samples");
+    land_seeded_lines(client, db).await;
+    land_seeded_streams(client, db).await;
+    land_seeded_lines(client, db).await;
 }
 
 /// The `svc` label of each element of an instant `vector` response, in
@@ -3917,7 +3934,7 @@ async fn seed_step_grid(client: &ChClient, db: &str, t0_ns: i64) {
         )
         .await
         .expect("seed step-grid log_streams");
-
+    land_seeded_streams(client, db).await;
     let mut values = Vec::with_capacity(1021);
     for i in -120i64..=900 {
         let ts = t0_ns + i * 1_000_000_000;
@@ -3935,6 +3952,9 @@ async fn seed_step_grid(client: &ChClient, db: &str, t0_ns: i64) {
         )
         .await
         .expect("seed step-grid log_samples");
+    land_seeded_lines(client, db).await;
+    land_seeded_streams(client, db).await;
+    land_seeded_lines(client, db).await;
 }
 
 /// The single matrix series' points as `(timestamp_ns, value_bits)`.
@@ -4160,39 +4180,40 @@ const FP_L1: u64 = 0x8000_0000_0000_0011;
 const FP_L2: u64 = 0x8000_0000_0000_0012;
 
 /// Fixture L — two streams differing on `app`/`env`, one of which also
-/// carries a `tier` label the other lacks. Three `log_samples` rows per
-/// fingerprint so the rollup materialized view records activity inside
-/// the window (`log_streams_idx` carries no time column; the window
-/// arrives as the activity semi-join, docs/api.md §2.3).
+/// carries a `tier` label the other lacks. Three log lines per fingerprint so
+/// the rollup materialized view records activity inside the window
+/// (`log_streams_idx` carries no time column; the window arrives as the
+/// active-fingerprint set, docs/api.md §2.3).
+///
+/// **Seeded through `log_landing`** (issue #603): every derived logs table is
+/// maintained from it by materialized view.
 async fn seed_fixture_l(client: &ChClient, db: &str, base_ns: i64) {
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
-                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_L1}, 'frontend', \
-                 '{{\"app\":\"frontend\",\"env\":\"prod\",\"service_name\":\"frontend\"}}', 0), \
-                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_L2}, 'backend', \
-                 '{{\"app\":\"backend\",\"env\":\"dev\",\"service_name\":\"backend\",\"tier\":\"batch\"}}', 0)"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed fixture L log_streams");
-
-    let mut values = Vec::new();
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns})))");
+    let mut values = vec![
+        format!(
+            "(1, {month}, {FP_L1}, 'frontend', \
+             '{{\"app\":\"frontend\",\"env\":\"prod\",\"service_name\":\"frontend\"}}', \
+             0, 0, '')"
+        ),
+        format!(
+            "(1, {month}, {FP_L2}, 'backend', \
+             '{{\"app\":\"backend\",\"env\":\"dev\",\"service_name\":\"backend\",\"tier\":\"batch\"}}', \
+             0, 0, '')"
+        ),
+    ];
     for (fp, service) in [(FP_L1, "frontend"), (FP_L2, "backend")] {
         for i in 0..3i64 {
             let ts = base_ns - (3 - i) * 1_000_000_000;
             values.push(format!(
-                "('{service}', {fp}, {ts}, 0, '{service} line {i}')"
+                "(0, toDate(0), {fp}, '{service}', '', 0, {ts}, '{service} line {i}')"
             ));
         }
     }
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                "INSERT INTO {db}.log_landing \
+                 (kind, month, fingerprint, service, labels, updated_ns, timestamp_ns, body) \
                  VALUES {}",
                 values.join(", ")
             ),
@@ -4200,7 +4221,7 @@ async fn seed_fixture_l(client: &ChClient, db: &str, base_ns: i64) {
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed fixture L log_samples");
+        .expect("seed fixture L log_landing");
 }
 
 /// **Issue #482 AC 4, fixture L.** `query=` on `/labels` and
@@ -4370,4 +4391,89 @@ async fn the_compat_health_check_query_answers_the_exact_expected_body() {
         res.body,
         r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[4000000000.000,"2"]}],"stats":{"series":1}}}"#
     );
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

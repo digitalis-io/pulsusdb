@@ -537,33 +537,27 @@ pub fn probe(
 ///
 /// **Issue #399:** the month partition alone is not the requested window —
 /// `log_streams_idx` carries no time column at all (`month Date, key, val,
-/// fingerprint`), so the window arrives as the
-/// [`active_fingerprints`] semi-join over the log rollup. The month
-/// predicate is kept exactly where it was: it is the partition-pruning
-/// bound, and the semi-join narrows within it.
+/// fingerprint`), so the window arrives as the active-fingerprint set the
+/// caller resolved from the log rollup. The month predicate is kept exactly
+/// where it was: it is the partition-pruning bound, and the set narrows within
+/// it.
 ///
-/// **Issue #482:** `fingerprints` = `None` is the unscoped form (no
-/// `query=` on the request); `Some` is the caller's stage-1 resolution of
-/// `query=`, pushed **into** the [`active_fingerprints`] subquery rather
-/// than added as a second outer `IN` — the same composition
-/// [`detected_labels`] uses, and for the same reason (the subquery's
-/// result is already a subset of the list, so rendering the list once
-/// inside it is equivalent and turns a whole-bucket-range scan into
-/// primary-key point ranges). `Some(&[])` never reaches here: the caller
-/// returns its empty result before building any statement
-/// (`super::exec::LogQlEngine::run_discovery`).
+/// **Issue #603: `fingerprints` is a literal list, never a subquery.** The
+/// caller runs [`active_fingerprints`] as its own statement and renders its
+/// result here, which is what `/series` already did — the predicate, and so
+/// the answer, is the one the nested form expressed. It is never empty: the
+/// caller returns its empty result before building any statement
+/// (`super::exec::LogQlEngine::run_discovery`), and its length is bounded by
+/// `EngineConfig::max_streams` before it is rendered.
 pub fn label_names(
     streams_idx_table: &str,
     months: &[MonthLiteral],
-    fingerprints: Option<&[FpLiteral]>,
-    rollup_table: &str,
-    window: TimeWindow,
-    rollup_res_ns: u64,
+    fingerprints: &[FpLiteral],
 ) -> String {
     format!(
         "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\n  AND fingerprint IN ({})\nORDER BY name",
         month_clause(months),
-        active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns)
+        fp_list(fingerprints)
     )
 }
 
@@ -572,29 +566,22 @@ pub fn label_names(
 /// `window`, ascending. `key_literal` is a pre-escaped ClickHouse string
 /// literal (see [`super::escape::ch_string`]).
 ///
-/// **Issue #399:** same shape and same reason as [`label_names`] — the
-/// month predicate prunes partitions, the [`active_fingerprints`]
-/// semi-join applies the request's own window.
-///
-/// **Issue #482:** `fingerprints` carries `query=`'s stage-1 resolution
-/// with exactly the placement and the `Some(&[])` precondition
-/// [`label_names`] documents. The key predicate keeps its place in the
-/// primary-key prefix either way — the semi-join sits on its own line
-/// beside it, not inside it.
+/// **Issue #399:** same shape and same reason as [`label_names`] — the month
+/// predicate prunes partitions, the active-fingerprint set applies the
+/// request's own window. **Issue #603:** that set is a literal list with
+/// exactly the precondition [`label_names`] documents. The key predicate keeps
+/// its place in the primary-key prefix.
 pub fn label_values(
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
-    fingerprints: Option<&[FpLiteral]>,
-    rollup_table: &str,
-    window: TimeWindow,
-    rollup_res_ns: u64,
+    fingerprints: &[FpLiteral],
 ) -> String {
     let key_literal = key_literal.as_sql();
     format!(
         "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
         month_clause(months),
-        active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns)
+        fp_list(fingerprints)
     )
 }
 
@@ -610,31 +597,23 @@ pub fn label_values(
 /// ([`super::predicate::non_id_values_expr`], whose `UUID_RE` constant moved
 /// there with it in issue #286) — the server-side half of the reference's
 /// `containsAllIDTypes` relevance filter (the keep rule — static label OR
-/// `non_id_values > 0` — applies client-side in `exec`). `fingerprints` =
-/// `None` for the unscoped form; `Some` pushes the caller's stage-1 result
-/// **into** the [`active_fingerprints`] subquery (the two `IN`s compose:
-/// the subquery's result is already a subset of the list, so rendering the
-/// list once inside it is equivalent and cheaper — measured ~395× fewer
-/// rows read, issue #399). **Never touches `log_samples`** — it reads the
-/// stream index plus the log rollup's `(fingerprint, bucket_ns)` prefix,
-/// month-partition-pruned on one side and bucket-range-pruned on the
-/// other, server-side aggregated (fan-in is one row per key, never per
-/// value).
+/// `non_id_values > 0` — applies client-side in `exec`). `fingerprints` is the
+/// active-fingerprint set as a literal list, with the precondition
+/// [`label_names`] documents. **Never touches `log_samples`** — it reads the
+/// stream index alone, month-partition-pruned, server-side aggregated (fan-in
+/// is one row per key, never per value).
 ///
 /// **Issue #399:** before this, the only time bound was `month`, so a
 /// ten-minute request was answered from the whole calendar month.
 pub fn detected_labels(
     streams_idx_table: &str,
     months: &[MonthLiteral],
-    fingerprints: Option<&[FpLiteral]>,
-    rollup_table: &str,
-    window: TimeWindow,
-    rollup_res_ns: u64,
+    fingerprints: &[FpLiteral],
 ) -> String {
     let month_clause = month_clause(months);
     let non_id_values = super::predicate::non_id_values_expr();
     let non_id_values = non_id_values.as_sql();
-    let active = active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns);
+    let active = fp_list(fingerprints);
     format!(
         "SELECT key, uniqExact(val) AS cardinality, {non_id_values} AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key"
     )
@@ -664,16 +643,21 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 /// the stream-activity semi-join source shared by [`detected_labels`],
 /// [`label_names`], [`label_values`] and `/series` (issue #399).
 ///
-/// `log_streams_idx` has no time column, so the window has to come from
-/// the one co-sharded table that records per-stream activity in time: the
-/// log rollup `log_metrics_<res>` (`ORDER BY (fingerprint, bucket_ns)`,
-/// `PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))`), already the
-/// source for `/stats` and `/volume`.
+/// `log_streams_idx` has no time column, so the window has to come from the
+/// one table that records per-stream activity in time: the log rollup
+/// `log_metrics_<res>` (`ORDER BY (fingerprint, bucket_ns)`, `PARTITION BY
+/// toDate(fromUnixTimestamp64Nano(bucket_ns))`), already the source for
+/// `/stats` and `/volume`.
+///
+/// **Issue #603: this renders a statement of its own on every path.** It is no
+/// longer embedded as a subquery anywhere — the four endpoints run it, cap its
+/// result and render that result as a literal list. `fingerprints` = `Some`
+/// still pushes the caller's stage-1 result into this scan so it reads PK
+/// point ranges; unscoped, `fingerprint` is unconstrained and only the
+/// `bucket_ns` range and the daily partitions bound it.
 ///
 /// `DISTINCT` on the PK prefix is a streaming distinct and is load-bearing:
-/// without it the `IN` set carries one row per bucket per stream.
-/// `fingerprints` = `Some` pushes the caller's stage-1 result INTO this
-/// scan so it reads PK point ranges instead of the whole bucket range.
+/// without it the result carries one row per bucket per stream.
 ///
 /// The lower bound is [`activity_lower_bucket_ns`], NOT `start_ns` — see
 /// that function for why the obvious `bucket_ns > start_ns` is wrong here.
@@ -1922,19 +1906,22 @@ mod tests {
     const RES_5S: u64 = 5_000_000_000;
     const ACTIVE_ALL: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
+    /// The active-fingerprint set the caller resolved and renders into a
+    /// discovery scan (issue #603): a literal list, never a subquery.
+    fn active_two() -> Vec<FpLiteral> {
+        vec![
+            Fingerprint::from_raw(7).sql_literal(),
+            Fingerprint::from_raw(9).sql_literal(),
+        ]
+    }
+    const ACTIVE_TWO_LIST: &str = "toUInt128('7'), toUInt128('9')";
+
     #[test]
     fn label_names_renders_a_distinct_key_scan_for_one_month() {
         assert_eq!(
-            label_names(
-                "log_streams_idx",
-                &[month_literal(2026, 7)],
-                None,
-                "log_metrics_5s",
-                DISCOVERY_WINDOW,
-                RES_5S
-            ),
+            label_names("log_streams_idx", &[month_literal(2026, 7)], &active_two()),
             format!(
-                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_ALL})\nORDER BY name"
+                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY name"
             )
         );
     }
@@ -1944,10 +1931,7 @@ mod tests {
         let sql = label_names(
             "log_streams_idx",
             &[month_literal(2026, 7), month_literal(2026, 8)],
-            None,
-            "log_metrics_5s",
-            DISCOVERY_WINDOW,
-            RES_5S,
+            &active_two(),
         );
         assert!(sql.contains("WHERE month IN ('2026-07-01', '2026-08-01')"));
     }
@@ -1959,73 +1943,54 @@ mod tests {
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
                 &literal("env"),
-                None,
-                "log_metrics_5s",
-                DISCOVERY_WINDOW,
-                RES_5S
+                &active_two()
             ),
             format!(
-                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_ALL})\nORDER BY value"
+                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY value"
             )
         );
     }
 
     #[test]
-    fn detected_labels_unscoped_renders_one_row_per_key_with_the_id_predicate() {
-        let sql = detected_labels(
-            "log_streams_idx",
-            &[month_literal(2026, 7)],
-            None,
-            "log_metrics_5s",
-            DISCOVERY_WINDOW,
-            RES_5S,
-        );
+    fn detected_labels_renders_one_row_per_key_with_the_id_predicate() {
+        let sql = detected_labels("log_streams_idx", &[month_literal(2026, 7)], &active_two());
         assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
         assert!(sql.contains("WHERE month = '2026-07-01'"));
-        assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_ALL})\n")));
+        assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\n")));
         assert!(sql.ends_with("GROUP BY key\nORDER BY key"));
     }
 
-    /// Issue #399: scoping moves the stage-1 list INSIDE the activity
-    /// subquery rather than adding a second outer `IN` — the two forms
-    /// differ by exactly that prefix, and the list is rendered once.
+    /// **Issue #603: no discovery builder nests a subquery.** The activity
+    /// scan is a statement of its own, so each of the three renders exactly
+    /// one `SELECT` and names only the index table — which is what decides
+    /// which route the server takes on a clustered deployment.
     #[test]
-    fn detected_labels_scoped_pushes_the_fingerprint_list_into_the_activity_subquery() {
-        let scoped = detected_labels(
-            "log_streams_idx",
-            &[month_literal(2026, 7)],
-            Some(&[
-                Fingerprint::from_raw(7).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ]),
-            "log_metrics_5s",
-            DISCOVERY_WINDOW,
-            RES_5S,
-        );
-        assert!(scoped.contains(
-            "AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE \
-             fingerprint IN (toUInt128('7'), toUInt128('9')) AND bucket_ns >="
-        ));
-        assert_eq!(
-            scoped
-                .matches("fingerprint IN (toUInt128('7'), toUInt128('9'))")
-                .count(),
-            1,
-            "the stage-1 list must be rendered exactly once: {scoped}"
-        );
-        let unscoped = detected_labels(
-            "log_streams_idx",
-            &[month_literal(2026, 7)],
-            None,
-            "log_metrics_5s",
-            DISCOVERY_WINDOW,
-            RES_5S,
-        );
-        assert_eq!(
-            scoped.replace("fingerprint IN (toUInt128('7'), toUInt128('9')) AND ", ""),
-            unscoped,
-            "scoped form must be the unscoped scan plus only the pushed-down list"
-        );
+    fn no_discovery_builder_nests_a_subquery() {
+        let months = [month_literal(2026, 7)];
+        for (name, sql) in [
+            (
+                "label_names",
+                label_names("log_streams_idx", &months, &active_two()),
+            ),
+            (
+                "label_values",
+                label_values("log_streams_idx", &months, &literal("env"), &active_two()),
+            ),
+            (
+                "detected_labels",
+                detected_labels("log_streams_idx", &months, &active_two()),
+            ),
+        ] {
+            assert_eq!(
+                sql.matches("SELECT").count(),
+                1,
+                "{name} must nest no second SELECT: {sql}"
+            );
+            assert!(
+                !sql.contains("log_metrics_5s"),
+                "{name} must name only the index table: {sql}"
+            );
+        }
     }
 
     /// Issue #399 AC2 — the discriminator against the plausible-but-wrong

@@ -175,45 +175,61 @@ async fn data_client(db: &str) -> ChClient {
     .expect("connect data client")
 }
 
-/// Seeds one `log_streams` row whose `month` matches `at_ns` (stage-1
-/// resolution is month-scoped, so the stream's month must overlap the
-/// tail window). Direct `log_streams` inserts fire the
-/// `log_streams_idx` MV, so stage 1 resolves without further seeding.
+/// Seeds one stream whose `month` matches `at_ns` (stage-1 resolution is
+/// month-scoped, so the stream's month must overlap the tail window).
+///
+/// **It inserts one kind-1 row into `log_landing`** (issue #603):
+/// `log_streams_mv` and `log_streams_idx_mv` both read that table now, so a
+/// direct `log_streams` insert would leave the index stage 1 resolves
+/// through empty. This suite lands rather than re-lands, unlike the
+/// truncate-and-refill helper other suites use, because tail asserts on
+/// INCREMENTAL visibility and emptying a table mid-stream is a behaviour
+/// its cases would read as a lost row.
 async fn seed_stream(client: &ChClient, db: &str, fp: u64, labels: &str, at_ns: i64) {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
-                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), {fp}, \
-                 'checkout', '{labels}', 0)"
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES (toUnixTimestamp64Milli(now64(3)), 1, 'checkout', {fp}, 0, 0, '', '', \
+                 toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), '{labels}', 0, '', 0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_streams");
+        .expect("seed the landing registration");
 }
 
+/// Seeds log lines as kind-0 `log_landing` rows, for the same reason.
 async fn seed_samples(client: &ChClient, db: &str, rows: &[(u64, i64, &str)]) {
     if rows.is_empty() {
         return;
     }
     let values = rows
         .iter()
-        .map(|(fp, ts, body)| format!("('checkout', {fp}, {ts}, 0, '{body}')"))
+        .map(|(fp, ts, body)| {
+            format!(
+                "(toUnixTimestamp64Milli(now64(3)), 0, 'checkout', {fp}, {ts}, 0, '{body}', '', \
+                 toDate(0), '', 0, '', 0)"
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
-                 body) VALUES {values}"
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES {values}"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_samples");
+        .expect("seed the landing lines");
 }
 
 // ---------------------------------------------------------------------
@@ -1502,6 +1518,7 @@ async fn stage1_month_narrowing_keeps_an_older_registered_orphan_resolvable_via_
             "SELECT query, read_rows FROM system.query_log \
              WHERE type = 'QueryFinish' AND current_database = '{db}' \
                AND query_start_time_microseconds >= fromUnixTimestamp64Micro({run_marker_us}) \
+               AND query LIKE 'SELECT%' \
                AND query LIKE '%log_streams_idx%' \
                AND query NOT LIKE '%system.query_log%' \
              ORDER BY query_start_time_microseconds ASC"

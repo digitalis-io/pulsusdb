@@ -185,6 +185,53 @@ pub const METRICS_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`METRICS_LANDING_MAX_ROWS_FLOOR`].
 pub const METRICS_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
+/// `log_landing_retention_hours` — issue #603's logs replay window: how long
+/// the logs landing table keeps a landed row. Both ends are the metrics key's,
+/// and for the same reasons — a shorter window than an hour leaves nothing to
+/// rebuild a derived table from; past a week the landing table is the
+/// deployment's primary storage rather than its replay window.
+pub const LOG_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
+/// See [`LOG_LANDING_RETENTION_HOURS_FLOOR`].
+pub const LOG_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
+
+/// `log_dedup_window` — how many recent blocks each table on the logs write
+/// path remembers. The floor is one block, the least that recognises an
+/// immediately repeated resend; the ceiling is a million, the largest the
+/// engine's own setting accepts as a useful window.
+///
+/// **A replicated table has a companion time window**, and it is pinned
+/// rather than configured: `pulsus_schema::DEDUP_WINDOW_SECONDS` says why.
+pub const LOG_DEDUP_WINDOW_FLOOR: u64 = 1;
+/// See [`LOG_DEDUP_WINDOW_FLOOR`].
+pub const LOG_DEDUP_WINDOW_CEILING: u64 = 1_000_000;
+
+/// `writer.log_landing_retries` — resends of a failed logs landing insert.
+/// Zero is meaningful (never resend), and the ceiling is ten: the landing
+/// budget bounds the loop in wall-clock time anyway, so a larger count only
+/// spends the same budget in smaller pieces.
+pub const LOG_LANDING_RETRIES_CEILING: u32 = 10;
+
+/// `writer.log_landing_inserters` — insert workers on the logs landing queue.
+/// The floor is one, or nothing takes a block off the queue at all; the
+/// ceiling is 64, past which the workers contend for the connection pool
+/// rather than adding throughput.
+pub const LOG_LANDING_INSERTERS_FLOOR: u32 = 1;
+/// See [`LOG_LANDING_INSERTERS_FLOOR`].
+pub const LOG_LANDING_INSERTERS_CEILING: u32 = 64;
+
+/// `writer.log_landing_max_rows` — the per-push logs landing row ceiling, and
+/// the `max_insert_block_size` every logs landing insert pins. The floor is a
+/// thousand rows, below which an ordinary push is refused; the ceiling is ten
+/// million, past which one block is a memory event rather than a batch.
+///
+/// **The range is the metrics key's and has to be**: the block-overhead figure
+/// the charge adds prices the insert's settings text at the largest accepted
+/// ceiling, so an identical range is what lets that figure be cited rather
+/// than recomputed.
+pub const LOG_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
+/// See [`LOG_LANDING_MAX_ROWS_FLOOR`].
+pub const LOG_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
+
 /// `reader.cache_max_series` — the matched-set / IN-list cardinality
 /// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
 /// 1000x the default of 50_000; kept below
@@ -499,6 +546,59 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             cfg.writer.metrics_landing_max_rows,
             METRICS_LANDING_MAX_ROWS_FLOOR,
             METRICS_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
+    }
+
+    // Issue #603: the logs landing table's dials, the metrics block's twin.
+    if !(LOG_LANDING_RETENTION_HOURS_FLOOR..=LOG_LANDING_RETENTION_HOURS_CEILING)
+        .contains(&cfg.log_landing_retention_hours)
+    {
+        return Err(range_err(
+            "log_landing_retention_hours",
+            u64::from(cfg.log_landing_retention_hours),
+            u64::from(LOG_LANDING_RETENTION_HOURS_FLOOR),
+            u64::from(LOG_LANDING_RETENTION_HOURS_CEILING),
+            "hours",
+        ));
+    }
+    if !(LOG_DEDUP_WINDOW_FLOOR..=LOG_DEDUP_WINDOW_CEILING).contains(&cfg.log_dedup_window) {
+        return Err(range_err(
+            "log_dedup_window",
+            cfg.log_dedup_window,
+            LOG_DEDUP_WINDOW_FLOOR,
+            LOG_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    if cfg.writer.log_landing_retries > LOG_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.log_landing_retries",
+            u64::from(cfg.writer.log_landing_retries),
+            0,
+            u64::from(LOG_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(LOG_LANDING_INSERTERS_FLOOR..=LOG_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.log_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.log_landing_inserters",
+            u64::from(cfg.writer.log_landing_inserters),
+            u64::from(LOG_LANDING_INSERTERS_FLOOR),
+            u64::from(LOG_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(LOG_LANDING_MAX_ROWS_FLOOR..=LOG_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.log_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.log_landing_max_rows",
+            cfg.writer.log_landing_max_rows,
+            LOG_LANDING_MAX_ROWS_FLOOR,
+            LOG_LANDING_MAX_ROWS_CEILING,
             "rows",
         ));
     }
@@ -1417,6 +1517,101 @@ mod tests {
                 assert!(validate(&cfg).is_ok(), "{name} at {value} must be accepted");
             }
         }
+    }
+
+    /// **T34.** Each of the five logs landing dials resolves to its
+    /// documented default, is accepted at both ends of its range, and is
+    /// rejected one step outside each end naming its own field. A knob with no
+    /// range check accepts the out-of-range value and fails here.
+    ///
+    /// Every range is the metrics key's, and the row ceiling's **has to be**:
+    /// the block-overhead figure the charge adds prices the insert's settings
+    /// text at the largest accepted ceiling, so an identical range is what
+    /// lets that figure be cited rather than recomputed.
+    #[test]
+    fn the_logs_landing_dials_reject_both_sides_and_accept_both_ends() {
+        let d = Config::default();
+        assert_eq!(d.log_landing_retention_hours, 6);
+        assert_eq!(d.log_dedup_window, 10_000);
+        assert_eq!(d.writer.log_landing_retries, 3);
+        assert_eq!(d.writer.log_landing_inserters, 4);
+        assert_eq!(d.writer.log_landing_max_rows, 1_048_576);
+        assert!(validate(&d).is_ok());
+
+        // (field, setter, bad values, good values)
+        type Set = fn(&mut Config, u64);
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
+            (
+                "log_landing_retention_hours",
+                |c, v| c.log_landing_retention_hours = v as u32,
+                vec![0, u64::from(LOG_LANDING_RETENTION_HOURS_CEILING) + 1],
+                vec![
+                    u64::from(LOG_LANDING_RETENTION_HOURS_FLOOR),
+                    u64::from(LOG_LANDING_RETENTION_HOURS_CEILING),
+                ],
+            ),
+            (
+                "log_dedup_window",
+                |c, v| c.log_dedup_window = v,
+                vec![LOG_DEDUP_WINDOW_FLOOR - 1, LOG_DEDUP_WINDOW_CEILING + 1],
+                vec![LOG_DEDUP_WINDOW_FLOOR, LOG_DEDUP_WINDOW_CEILING],
+            ),
+            (
+                "writer.log_landing_retries",
+                |c, v| c.writer.log_landing_retries = v as u32,
+                vec![u64::from(LOG_LANDING_RETRIES_CEILING) + 1],
+                // Zero is meaningful here: never resend.
+                vec![0, u64::from(LOG_LANDING_RETRIES_CEILING)],
+            ),
+            (
+                "writer.log_landing_inserters",
+                |c, v| c.writer.log_landing_inserters = v as u32,
+                vec![0, u64::from(LOG_LANDING_INSERTERS_CEILING) + 1],
+                vec![
+                    u64::from(LOG_LANDING_INSERTERS_FLOOR),
+                    u64::from(LOG_LANDING_INSERTERS_CEILING),
+                ],
+            ),
+            (
+                "writer.log_landing_max_rows",
+                |c, v| c.writer.log_landing_max_rows = v,
+                vec![
+                    LOG_LANDING_MAX_ROWS_FLOOR - 1,
+                    LOG_LANDING_MAX_ROWS_CEILING + 1,
+                ],
+                vec![LOG_LANDING_MAX_ROWS_FLOOR, LOG_LANDING_MAX_ROWS_CEILING],
+            ),
+        ];
+
+        for (name, set, bad, good) in cases {
+            for value in bad {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                match validate(&cfg) {
+                    Err(ConfigError::Value { field, .. }) => {
+                        assert_eq!(field, name, "{name} at {value}");
+                    }
+                    other => panic!("{name} at {value}: expected a Value error, got {other:?}"),
+                }
+            }
+            for value in good {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                assert!(validate(&cfg).is_ok(), "{name} at {value} must be accepted");
+            }
+        }
+    }
+
+    /// The logs row ceiling's accepted range is the metrics one's, exactly.
+    /// It is what lets one block-overhead derivation serve both signals: the
+    /// settings-text term is computed at the largest accepted ceiling.
+    #[test]
+    fn both_landing_row_ceilings_share_one_accepted_range() {
+        assert_eq!(LOG_LANDING_MAX_ROWS_FLOOR, METRICS_LANDING_MAX_ROWS_FLOOR);
+        assert_eq!(
+            LOG_LANDING_MAX_ROWS_CEILING,
+            METRICS_LANDING_MAX_ROWS_CEILING
+        );
     }
 
     /// Issue #494: the suppression window is a two-sided range, so both

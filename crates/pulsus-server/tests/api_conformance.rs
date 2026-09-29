@@ -2744,29 +2744,30 @@ async fn logql_scan_budget_query_too_broad_live_case() {
     )
     .expect("now fits in i64 nanoseconds");
 
+    // Issue #603: the fixture seeds `log_landing`, not the targets. Every
+    // logs table this request reads through — `log_streams_idx` for stage 1
+    // and `log_samples` for the samples read — is maintained by materialized
+    // view off the landing table now, so an insert into a target directly
+    // leaves the index the request resolves through empty. Kind 1 is the
+    // stream registration (`log_streams` + `log_streams_idx`), kind 0 the
+    // line (`log_samples` + the rollup).
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
-                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({now_ns}))), 1, \
-                 'checkout', '{{\"service_name\":\"checkout\"}}', 0)"
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES (intDiv({now_ns}, 1000000), 1, 'checkout', 1, 0, 0, '', '', \
+                 toStartOfMonth(fromUnixTimestamp64Nano(toInt64({now_ns}))), \
+                 '{{\"service_name\":\"checkout\"}}', 0, '', 0), \
+                 (intDiv({now_ns}, 1000000), 0, 'checkout', 1, {now_ns}, 0, 'hello', '', \
+                 toDate(0), '', 0, '', 0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_streams");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
-                 body) VALUES ('checkout', 1, {now_ns}, 0, 'hello')"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed log_samples");
+        .expect("seed log_landing");
 
     let res = get(
         port,

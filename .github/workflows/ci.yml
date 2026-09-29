@@ -1579,19 +1579,13 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test live_remote_write_hist
 
-      # Issue #134: the log_streams registration-backfill live failure
-      # injection — L1 "lost registration" (first streams insert swallowed
-      # with a deterministic error; the backfill heals it and the
-      # stage-1-shaped query resolves the fingerprint in the sample's
-      # month) and L2 "false Poisoned" (the first insert genuinely lands;
-      # the backfill's duplicate re-insert provably occurs and collapses
-      # to one row on a FINAL read — no inflation). Reuses this job's
-      # ClickHouse 26.3 container.
-      - name: Log stream registration backfill (live L1/L2 failure injection)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-write --test live_log_stream_backfill
+      # Issue #603: the `log_streams` registration-backfill live failure
+      # injection had its own step here, and its suite is gone with the
+      # mechanism. One push is one insert of one block into `log_landing`,
+      # so there is no separate registration insert to lose and nothing to
+      # heal: a push whose insert failed emits its registration rows again
+      # next time. `trace_attrs_idx`'s backfill is the one left, and keeps
+      # its own step.
 
       # Issue #603: the metric registration-backfill live failure
       # injection had its own step here, and its suite is gone with the
@@ -1815,6 +1809,17 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test live_metric_writer
+
+      # Issue #603: the logs write path's own live suite — one push is one
+      # insert of one block into `log_landing`, and five materialized views
+      # fire off that one insert. It is the only place the fan-out is shown;
+      # everything else about the path is asserted over the block the writer
+      # hands to a mock.
+      - name: Live log writer suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_log_writer
 
       # Spawns the real `pulsusdb` binary against this job's ClickHouse
       # container to drive it over HTTP end-to-end. Every live suite below
@@ -2290,6 +2295,19 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
+      # Issue #603: logs label discovery over SPLIT placement — the placement
+      # the landing table produces, now that a push's block is not routed by
+      # fingerprint. The negative control is the nested-subquery shape under
+      # `distributed_product_mode='local'`, which answers incompletely when
+      # the index rows and the activity rows are on different shards; the gate
+      # is that the production path answers completely. A clustered deployment
+      # is the production shape, so this is the primary case for that read.
+      - name: Live logs discovery over split placement (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
+        run: cargo test -p pulsus-read --test live_logs_cluster_discovery
 
       # Issue #549: the grouped instant read over the distributed sample
       # tables. The statement reads both `_dist` tables inside one

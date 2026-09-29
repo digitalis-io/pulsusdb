@@ -73,6 +73,25 @@ pub struct Config {
     /// forgotten on a timer, which is the safe direction for a resend.
     /// Accepted range `1..=1000000`.
     pub metrics_dedup_window: u64,
+    /// `PULSUS_LOG_LANDING_RETENTION_HOURS` (issue #603): the logs landing
+    /// table's delete-TTL, in hours. It is the replay window — the five
+    /// derived logs tables can only be rebuilt from landed rows that are
+    /// still there — so a deployment that wants a longer window raises it.
+    /// Accepted range `1..=168`.
+    pub log_landing_retention_hours: u32,
+    /// `PULSUS_LOG_DEDUP_WINDOW` (issue #603): how many recent blocks the
+    /// logs landing table and each of the five derived logs tables remember
+    /// for deduplication, so a resend of a block the server already accepted
+    /// is dropped before it is stored a second time.
+    ///
+    /// **A count of blocks.** Which setting carries it is rendered from the
+    /// deployment's own shape: a clustered deployment renders these tables
+    /// `Replicated*`, where the engine's own window is
+    /// `replicated_deduplication_window`. The seconds half of a replicated
+    /// window is pinned rather than configured — a deployment that lowered it
+    /// below the landing budget would forget a token while the writer is
+    /// still entitled to resend under it. Accepted range `1..=1000000`.
+    pub log_dedup_window: u64,
     // §4 Clustering
     pub cluster: Option<String>,
     pub dist_suffix: String,
@@ -135,6 +154,8 @@ impl Default for Config {
             log_rollup_resolution: HumanDuration(Duration::from_secs(5)),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
+            log_landing_retention_hours: 6,
+            log_dedup_window: 10_000,
             cluster: None,
             dist_suffix: "_dist".to_string(),
             skip_unavailable_shards: false,
@@ -339,6 +360,21 @@ pub struct WriterConfig {
     /// the insert's own `max_insert_block_size`. Accepted range
     /// `1000..=10000000`.
     pub metrics_landing_max_rows: u64,
+    /// `PULSUS_LOG_LANDING_RETRIES` (issue #603): how many times the writer
+    /// resends a failed logs landing insert. The wall-clock bound on the
+    /// whole loop is the landing budget, not this count — whichever binds
+    /// first ends it. Accepted range `0..=10`.
+    pub log_landing_retries: u32,
+    /// `PULSUS_LOG_LANDING_INSERTERS` (issue #603): how many insert workers
+    /// take blocks off the logs landing queue, so how many landing inserts
+    /// can be in flight at once. Accepted range `1..=64`.
+    pub log_landing_inserters: u32,
+    /// `PULSUS_LOG_LANDING_MAX_ROWS` (issue #603): the per-push landing row
+    /// ceiling. A push at or above it is refused whole, never split, so an
+    /// admitted push always fits one block; the same figure is pinned as the
+    /// insert's own `max_insert_block_size`. Accepted range
+    /// `1000..=10000000`.
+    pub log_landing_max_rows: u64,
 }
 
 impl Default for WriterConfig {
@@ -356,6 +392,9 @@ impl Default for WriterConfig {
             metrics_landing_retries: 3,
             metrics_landing_inserters: 4,
             metrics_landing_max_rows: 1_048_576,
+            log_landing_retries: 3,
+            log_landing_inserters: 4,
+            log_landing_max_rows: 1_048_576,
         }
     }
 }

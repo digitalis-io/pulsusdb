@@ -109,21 +109,9 @@ async fn exec(client: &ChClient, sql: &str) {
 
 async fn init_db(bootstrap: &ChClient, db: &str) {
     exec(bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
-    run_init(
-        bootstrap,
-        &RenderCtx {
-            db: db.to_string(),
-            cluster: None,
-            dist_suffix: "_dist".to_string(),
-            storage_policy: None,
-            retention_days: 7,
-            log_rollup: Duration::from_secs(5),
-            metrics_landing_retention_hours: 6,
-            metrics_dedup_window: 10_000,
-        },
-    )
-    .await
-    .expect("run_init");
+    run_init(bootstrap, &RenderCtx::for_tests(db))
+        .await
+        .expect("run_init");
 }
 
 fn hex(bytes: &[u8]) -> String {

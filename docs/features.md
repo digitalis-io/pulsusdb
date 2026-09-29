@@ -172,7 +172,7 @@ and for the one performance cliff it introduces.
 | Inbound TLS | native TLS termination on the listener | M7 |
 | Label cache | bounded active-series window, JOIN fallback | M2 |
 | Downsampling | insert-triggered in-database MVs (real-time tiers), one-shot backfill, checksum-gated MV recreation, `PULSUS_TIER_POLICY` exact/fast routing | M3 |
-| Clustered ClickHouse | Replicated engines, co-sharded Distributed tables, shard-local pushdown | M3 (metrics), M4 (logs/traces validation) |
+| Clustered ClickHouse | Replicated engines; Distributed tables over every table but the two ingest landing tables, which are written under their bare names so one push stays one block; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
 | Cross-cluster reads | distributed-suffix read targeting | M7 |
 | Recording rules (ruler) | LogQL + PromQL kinds, CRUD API, write-back | M7 |
 | Alerting rules | stored/validated from M7 API; evaluation + notification delivery | post-1.0 |

@@ -681,9 +681,10 @@ struct StageRef {
     sql: String,
     roster: StageRoster,
     /// Whether this stage's SQL nests a distributed table inside an `IN
-    /// (subquery)` — decides whether its `EXPLAIN PIPELINE` re-issue
-    /// needs `distributed_product_mode='local'` (issue #399). Only the
-    /// `discovery` stage is [`ProductMode::Nested`].
+    /// (subquery)` — decides whether its `EXPLAIN PIPELINE` re-issue needs
+    /// `distributed_product_mode='local'`. **No stage does since issue
+    /// #603**: discovery was the one that did, and it is two flat statements
+    /// now.
     product: ProductMode,
 }
 
@@ -1073,27 +1074,19 @@ const LOG_COMMENT: &str = "pulsus-bench:logs-read";
 /// unavailability rather than silently tolerate it and record evidence for
 /// a degraded read as if it were normal.
 /// Whether a bench query nests a distributed table inside an `IN
-/// (subquery)` — issue #399's activity semi-join, which the `/labels`
-/// discovery shape now carries. `Nested` needs
-/// `distributed_product_mode='local'` in `--dist` mode, exactly as
-/// production's `LogQlEngine::activity_settings` does: `FROM
-/// log_streams_idx_dist … IN (SELECT … FROM log_metrics_5s_dist …)` is
-/// rejected at analysis time under ClickHouse's default `deny` (Code 288).
-/// `Flat` is every other shape, which must NOT carry the setting.
+/// (subquery)`. **Since issue #603 no bench query does.** The `/labels`
+/// discovery shape was the one that did — issue #399's activity semi-join —
+/// and it is now two statements, the activity scan and an index scan carrying
+/// its result as a literal list, exactly as production issues them. So every
+/// shape is `Flat` and none carries `distributed_product_mode`.
 ///
-/// **The `--dist` leg this exists for is UNVERIFIED, not passed.** A
-/// multi-shard cluster is not startable in the sandbox this was written
-/// in (rootless podman, no multi-shard fixture), so the Code 288 failure
-/// it prevents was reasoned from ClickHouse's documented
-/// `distributed_product_mode` semantics and from the identical shape
-/// already fixed in production code (issue #136
-/// `metrics::exec::fallback_fetch_settings`, issue #59
-/// `traces::exec::metrics_settings`) — NOT reproduced here. The
-/// single-node path IS measured. Whoever first runs `xtask bench --dist`
-/// after issue #399 is the one who confirms this.
+/// The variant is kept rather than the enum collapsed, because the setting a
+/// `Nested` shape would need is a decision this harness should still be able
+/// to express if a bench query ever nests one again.
 #[derive(Debug, Clone, Copy)]
 enum ProductMode {
     Flat,
+    #[allow(dead_code)]
     Nested,
 }
 
@@ -1481,32 +1474,45 @@ async fn run_discovery_shape(
     cfg: RunConfig<'_>,
 ) -> anyhow::Result<QueryEvidence> {
     let months = month_literals(dataset.start_ns, dataset.end_ns);
-    // Issue #399: `/labels` is window-scoped through an activity
-    // semi-join over the log rollup, so the bench must issue the same
-    // two-table query production does — the corpus window is the
-    // discovery window here, as it always was.
-    let sql = sql::label_names(
-        &tables.streams_idx,
-        &months,
-        // The bench issues the UNSCOPED form — no `query=` — which is
-        // the shape this evidence has always measured (issue #482 added
-        // the parameter; it did not change this statement's text).
-        None,
+    let base_id = format!("bench-label_series_discovery_7d-{}", std::process::id());
+
+    // Issue #399: `/labels` is window-scoped by the streams active in the
+    // request's range, so the bench must issue what production issues — the
+    // corpus window is the discovery window here, as it always was.
+    //
+    // **Issue #603: that is now two statements, not one.** The activity scan
+    // runs first and its result is rendered into the index scan as a literal
+    // list, so neither statement nests a distributed subquery and the index
+    // scan is captured `Flat`. The bench issues the UNSCOPED form — no
+    // `query=` — which is the shape this evidence has always measured.
+    let activity_sql = sql::active_fingerprints(
         &tables.rollup,
+        None,
         TimeWindow {
             start_ns: dataset.start_ns,
             end_ns: dataset.end_ns,
         },
         5_000_000_000,
     );
-    let base_id = format!("bench-label_series_discovery_7d-{}", std::process::id());
+    let active = resolve_fingerprints(
+        client,
+        &activity_sql,
+        &format!("{base_id}-activity"),
+        cfg.dist,
+    )
+    .await?;
+    let fps: Vec<pulsus_model::FpLiteral> = active
+        .into_iter()
+        .map(|fp| pulsus_model::Fingerprint::from_raw(fp).sql_literal())
+        .collect();
+    let sql = sql::label_names(&tables.streams_idx, &months, &fps);
 
     execute_discard::<LabelNameRow>(
         client,
         &sql,
         &format!("{base_id}-warmup"),
         cfg.dist,
-        ProductMode::Nested,
+        ProductMode::Flat,
     )
     .await?;
 
@@ -1517,8 +1523,7 @@ async fn run_discovery_shape(
         let id = format!("{base_id}-r{rep}");
         let t0 = Instant::now();
         returned =
-            execute_discard::<LabelNameRow>(client, &sql, &id, cfg.dist, ProductMode::Nested)
-                .await?;
+            execute_discard::<LabelNameRow>(client, &sql, &id, cfg.dist, ProductMode::Flat).await?;
         wall_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         if first_id.is_empty() {
             first_id = id;
@@ -1538,7 +1543,7 @@ async fn run_discovery_shape(
         &sql,
         cfg.dist,
         &format!("{first_id}-explain-indexes"),
-        ProductMode::Nested,
+        ProductMode::Flat,
     )
     .await?;
     let total = total_marks(
@@ -1554,7 +1559,7 @@ async fn run_discovery_shape(
             query_id: first_id,
             sql: sql.clone(),
             roster: StageRoster::Full,
-            product: ProductMode::Nested,
+            product: ProductMode::Flat,
         };
         vec![
             capture_stage_evidence(
