@@ -83,16 +83,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 fn plan_ctx(db: &str) -> PlanCtx<'_> {
@@ -214,7 +205,7 @@ async fn seed_corpus(db: &str) -> (ChClient, i64) {
         )
         .await
         .expect("seed log_streams");
-
+    land_seeded_streams(&client, db).await;
     let mut rows = Vec::with_capacity(CORPUS_ROWS as usize);
     for i in 0..CORPUS_ROWS {
         let jitter = (splitmix64(i) % 1000) as i64;
@@ -239,6 +230,7 @@ async fn seed_corpus(db: &str) -> (ChClient, i64) {
         .insert_block("log_samples", &rows)
         .await
         .expect("bulk insert corpus");
+    land_seeded_lines(&client, db).await;
 
     (client, ts_ns)
 }
@@ -1010,7 +1002,7 @@ async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
         )
         .await
         .expect("seed log_streams");
-
+    land_seeded_streams(&client, db).await;
     let mut rows = Vec::with_capacity(DETECTED_CORPUS_ROWS as usize);
     for i in 0..DETECTED_CORPUS_ROWS {
         let timestamp_ns = ts_ns + (i as i64) * 36_000_000;
@@ -1037,6 +1029,7 @@ async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
         .insert_block("log_samples", &rows)
         .await
         .expect("bulk insert detected corpus");
+    land_seeded_lines(&client, db).await;
     (client, ts_ns)
 }
 
@@ -1310,16 +1303,47 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
     }
     const DISTINCT_KEYS: u64 = 3;
 
+    /// The active-fingerprint set a discovery read resolves from its own
+    /// statement (issue #603) before it renders the index scan.
+    async fn active_set(
+        client: &ChClient,
+        rollup: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Vec<pulsus_model::FpLiteral> {
+        #[derive(Debug, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+        struct Fp {
+            fingerprint: pulsus_model::Fingerprint,
+        }
+        let sql = sql::active_fingerprints(
+            rollup,
+            None,
+            sql::TimeWindow { start_ns, end_ns },
+            5_000_000_000,
+        );
+        let mut stream = client
+            .query_stream::<Fp>(&sql, &QuerySettings::new())
+            .await
+            .expect("the activity statement runs");
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await {
+            out.push(row.expect("a fingerprint row").fingerprint.sql_literal());
+        }
+        assert!(!out.is_empty(), "the fixture must have an active stream");
+        out
+    }
+
     let mut fan_in = Vec::new();
     for (i, (month, n)) in cases.iter().enumerate() {
         let (start_ns, end_ns) = month_window(month);
+        // Issue #603: the activity set is resolved by a statement of its own
+        // and rendered into this one as a literal list, which is what
+        // production issues.
+        let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
         let sql = sql::detected_labels(
             &format!("{db}.log_streams_idx"),
             &[month_literal(month_year(month), month_month(month))],
-            None,
-            &format!("{db}.log_metrics_5s"),
-            sql::TimeWindow { start_ns, end_ns },
-            5_000_000_000,
+            &active,
         );
         let query_id = format!("qlg-detected-labels-fanin-{i}");
         // The UUID predicate carries literal `?`s, which the clickhouse
@@ -1736,10 +1760,14 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
         .expect("matching label_values");
     assert_eq!(out, vec![SERVICE.to_string()]);
     let rows = mem_ceiling_rows(&admin, &run_db, &m2).await;
+    // Issue #603: the activity scan sits between them as a statement of its
+    // own. It used to be a subquery nested inside stage two, so this run saw
+    // two statements; the predicate is unchanged, but its result now arrives
+    // as its own dispatch and is rendered into stage two as a literal list.
     assert_eq!(
         rows.len(),
-        2,
-        "stage one, then stage two\n{}",
+        3,
+        "stage one, the activity scan, then stage two\n{}",
         rows.iter()
             .map(|r| r.q.clone())
             .collect::<Vec<_>>()
@@ -1753,9 +1781,14 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
         rows[0].q
     );
     assert!(
-        rows[1].q.starts_with("SELECT DISTINCT val AS value"),
-        "rows[1] must be stage two, got {:?}",
+        rows[1].q.starts_with("SELECT DISTINCT fingerprint"),
+        "rows[1] must be the activity scan, got {:?}",
         rows[1].q
+    );
+    assert!(
+        rows[2].q.starts_with("SELECT DISTINCT val AS value"),
+        "rows[2] must be stage two, got {:?}",
+        rows[2].q
     );
 
     admin
@@ -2656,6 +2689,7 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, &db).await;
     }
 
     let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
@@ -2684,6 +2718,7 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert the bucketed fixture");
+    land_seeded_lines(&client, &db).await;
     (admin, db, t)
 }
 
@@ -2964,6 +2999,50 @@ struct UnwrapSeedRow {
     structured_metadata: String,
 }
 
+/// One `log_landing` kind-0 row, in the table's own column order.
+///
+/// **The part-layout case seeds the landing table block by block** (issue
+/// #603), rather than through [`land_seeded_lines`]: that helper stages the
+/// whole of `log_samples`, empties it and lands it as one block, which is
+/// exactly the layout the case is built to control. One landing insert per
+/// chunk gives `log_samples` one part per chunk, through the view.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct UnwrapLandingRow {
+    received_ms: i64,
+    kind: u8,
+    service: String,
+    fingerprint: u128,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+    month: u16,
+    labels: String,
+    updated_ns: i64,
+    pattern: String,
+    pattern_count: u64,
+}
+
+fn unwrap_landing_rows(received_ms: i64, rows: &[UnwrapSeedRow]) -> Vec<UnwrapLandingRow> {
+    rows.iter()
+        .map(|r| UnwrapLandingRow {
+            received_ms,
+            kind: 0,
+            service: r.service.clone(),
+            fingerprint: r.fingerprint,
+            timestamp_ns: r.timestamp_ns,
+            severity: r.severity,
+            body: r.body.clone(),
+            structured_metadata: r.structured_metadata.clone(),
+            month: 0,
+            labels: String::new(),
+            updated_ns: 0,
+            pattern: String::new(),
+            pattern_count: 0,
+        })
+        .collect()
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SumRow {
     s: f64,
@@ -3086,6 +3165,7 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
             .insert_block("log_samples", &rows)
             .await
             .expect("insert");
+        land_seeded_lines(&client, &db).await;
 
         // Left to right, in timestamp order — the evaluator's accumulation.
         let mut ours = 0.0f64;
@@ -3404,6 +3484,7 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert");
+    land_seeded_lines(&client, &db).await;
 
     let sql = format!(
         "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
@@ -3569,8 +3650,9 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
                 lo + chunk
             };
             let rows = unwrap_rows(fp, t0 + lo as i64, &values[lo..hi]);
+            let landing = unwrap_landing_rows(now_ns() / 1_000_000, &rows);
             client
-                .insert_block("log_samples", &rows)
+                .insert_block("log_landing", &landing)
                 .await
                 .expect("insert");
         }
@@ -3863,6 +3945,7 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, &db).await;
         for (i, v) in values.iter().enumerate() {
             rows.push(BucketedSeedRow {
                 service: name.to_string(),
@@ -3878,6 +3961,7 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert the unwrapped fixture");
+    land_seeded_lines(&client, &db).await;
     // The standing rule: the input is asserted present before anything is
     // read from it.
     let seeded = admin
@@ -4076,6 +4160,7 @@ async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
         )
         .await
         .expect("seed log_streams");
+    land_seeded_streams(&client, &db).await;
     let offsets = [0.0f64, 2.0, 4.0, 8.0, 16.0];
     let rows: Vec<BucketedSeedRow> = offsets
         .iter()
@@ -4093,6 +4178,7 @@ async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert the high-offset fixture");
+    land_seeded_lines(&client, &db).await;
     let mut seeded = admin
         .query_stream::<PartCountRow>(
             &format!("SELECT count() AS n FROM {db}.log_samples"),
@@ -4268,6 +4354,7 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, &db).await;
         let rows: Vec<BucketedSeedRow> = values
             .iter()
             .enumerate()
@@ -4284,6 +4371,7 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
             .insert_block("log_samples", &rows)
             .await
             .expect("insert");
+        land_seeded_lines(&client, &db).await;
         let mut seeded = admin
             .query_stream::<PartCountRow>(
                 &format!("SELECT count() AS n FROM {db}.log_samples WHERE service = '{name}'"),
@@ -4577,6 +4665,7 @@ async fn seed_group_key_cases(
         .insert_block("log_samples", &rows)
         .await
         .expect("insert the group key cases");
+    land_seeded_lines(client, db).await;
 }
 
 /// A case's query with its selector, and the request it runs as: a range
@@ -5054,6 +5143,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, &db).await;
         client
             .execute(
                 &format!(
@@ -5065,6 +5155,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             )
             .await
             .expect("seed log_streams_idx");
+        land_seeded_streams(&client, &db).await;
         rows.push(BucketedSeedRow {
             service: service.to_string(),
             fingerprint: u128::from(fp),
@@ -5078,6 +5169,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert");
+    land_seeded_lines(&client, &db).await;
 
     let instant = QueryParams {
         spec: QuerySpec::Instant { at_ns: t },
@@ -7258,6 +7350,7 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
             .insert_block("log_samples", &rows)
             .await
             .expect("rows");
+        land_seeded_lines(&client, &db).await;
         group_meta.push(meta);
         group_bodies.push(bodies);
     }
@@ -8185,6 +8278,7 @@ async fn seed_selection_corpus() -> (ChClient, String) {
             )
             .await
             .expect("seed log_streams");
+        land_seeded_streams(&client, &db).await;
         for i in 0..count {
             rows.push(BucketedSeedRow {
                 service: service.to_string(),
@@ -8211,6 +8305,7 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         .insert_block("log_samples", &rows)
         .await
         .expect("insert the selection fixture");
+    land_seeded_lines(&client, &db).await;
     (admin, db)
 }
 
@@ -8583,4 +8678,89 @@ async fn regenerate_the_logql_selection_statements() {
         )
         .await
         .expect("drop the run database");
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

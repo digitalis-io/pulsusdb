@@ -123,16 +123,17 @@ impl BackfillMetrics {
     }
 }
 
-/// The whole writer's atomics. `samples`/`streams` are behind their own
-/// `Arc` so each table's flush task can hold a cheap clone without
-/// needing the rest of this struct.
+/// The whole logs writer's atomics. `landing` is behind its own `Arc` so
+/// every insert worker can hold a cheap clone without needing the rest of this
+/// struct.
 #[derive(Debug, Default)]
 pub struct WriterMetrics {
-    pub samples: Arc<TableMetrics>,
-    pub streams: Arc<TableMetrics>,
-    /// `log_patterns` per-table counters (M7-C3, issue #171). Its own `Arc`
-    /// so the patterns flush task holds a cheap clone.
-    pub patterns: Arc<TableMetrics>,
+    /// `log_landing` per-table counters. One insert per push, so
+    /// `flushes_total` counts pushes stored and `rows_total` counts landed
+    /// events of every kind (issue #603). The three per-target counter sets
+    /// this replaced went with the three flush tasks: the five logs tables are
+    /// maintained by materialized view and the writer names none of them.
+    pub landing: Arc<TableMetrics>,
     /// Rows whose (unseen) template was refused at
     /// `patterns::MAX_DISTINCT_PATTERNS_PER_BATCH` per request batch (M7-C3,
     /// issue #171) — pattern accounting only; the log lines themselves are
@@ -147,21 +148,12 @@ pub struct WriterMetrics {
     pub lru_misses_total: AtomicU64,
     pub collisions_total: AtomicU64,
     pub rejected_total: AtomicU64,
-    /// The `log_streams` registration-backfill counters (issue #134;
-    /// generalized to the [`BackfillMetrics`] embed by issue #139 — the
-    /// snapshot keeps the original flat `backfill_*` fields, filled from
-    /// this embed, so #134's committed assertions are unchanged). Its own
-    /// `Arc` so the backfill task holds a cheap clone.
-    pub backfill: Arc<BackfillMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriterMetricsSnapshot {
-    pub samples: TableMetricsSnapshot,
-    pub streams: TableMetricsSnapshot,
-    /// `log_patterns` per-table counters (M7-C3, issue #171 — additive; no
-    /// pre-existing consumer reads this snapshot's full shape).
-    pub patterns: TableMetricsSnapshot,
+    /// `log_landing` per-table counters (issue #603).
+    pub landing: TableMetricsSnapshot,
     /// Distinct-pattern-cap drops (M7-C3, issue #171).
     pub patterns_dropped_total: u64,
     /// The live `queued_bytes` gauge — passed in by the caller
@@ -176,12 +168,6 @@ pub struct WriterMetricsSnapshot {
     pub lru_misses_total: u64,
     pub collisions_total: u64,
     pub rejected_total: u64,
-    pub backfill_enqueued_total: u64,
-    pub backfill_dropped_total: u64,
-    pub backfill_retries_total: u64,
-    pub backfill_healed_total: u64,
-    pub backfill_abandoned_total: u64,
-    pub backfill_pending: u64,
     /// Issue #494's push-suppression counters. All zero — and the two
     /// gauges zero with them — while `PULSUS_INGEST_DEDUP` is off, because
     /// no index exists to report.
@@ -202,9 +188,7 @@ impl WriterMetrics {
     pub fn snapshot(&self, queue_bytes: u64, dedup: DedupMetricsSnapshot) -> WriterMetricsSnapshot {
         WriterMetricsSnapshot {
             dedup,
-            samples: self.samples.snapshot(),
-            streams: self.streams.snapshot(),
-            patterns: self.patterns.snapshot(),
+            landing: self.landing.snapshot(),
             patterns_dropped_total: self.patterns_dropped_total.load(Ordering::Relaxed),
             queue_bytes,
             backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
@@ -215,12 +199,6 @@ impl WriterMetrics {
             lru_misses_total: self.lru_misses_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
-            backfill_enqueued_total: self.backfill.enqueued_total.load(Ordering::Relaxed),
-            backfill_dropped_total: self.backfill.dropped_total.load(Ordering::Relaxed),
-            backfill_retries_total: self.backfill.retries_total.load(Ordering::Relaxed),
-            backfill_healed_total: self.backfill.healed_total.load(Ordering::Relaxed),
-            backfill_abandoned_total: self.backfill.abandoned_total.load(Ordering::Relaxed),
-            backfill_pending: self.backfill.pending.load(Ordering::Relaxed),
         }
     }
 }
@@ -444,32 +422,10 @@ mod tests {
         );
     }
 
-    /// Issue #139: `WriterMetricsSnapshot`'s flat `backfill_*` fields are
-    /// PRESERVED (filled from the embedded `BackfillMetrics`) so #134's
-    /// committed snapshot assertions do not churn.
-    #[test]
-    fn writer_metrics_snapshot_flat_backfill_fields_mirror_the_embed() {
-        let metrics = WriterMetrics::default();
-        metrics
-            .backfill
-            .enqueued_total
-            .fetch_add(7, Ordering::Relaxed);
-        metrics
-            .backfill
-            .healed_total
-            .fetch_add(3, Ordering::Relaxed);
-        metrics.backfill.pending.store(4, Ordering::Relaxed);
-        let snap = metrics.snapshot(0, DedupMetricsSnapshot::default());
-        assert_eq!(snap.backfill_enqueued_total, 7);
-        assert_eq!(snap.backfill_healed_total, 3);
-        assert_eq!(snap.backfill_pending, 4);
-        assert_eq!(snap.backfill_dropped_total, 0);
-    }
-
-    /// The metric half of this case went with the metrics registration
-    /// backfill (issue #603): one landing insert per push has one fate, so
-    /// there is no separate registration insert left to heal. The name says
-    /// what the case still asserts.
+    /// The log half of this case went with the logs registration backfill
+    /// (issue #603): one landing insert per push has one fate, so there is no
+    /// separate registration insert left to heal, and the metrics half went
+    /// the same way before it. `trace_attrs_idx`'s is the one backlog left.
     #[test]
     fn the_trace_writer_snapshot_carries_its_backfill_embed() {
         let trace_metrics = TraceWriterMetrics::default();

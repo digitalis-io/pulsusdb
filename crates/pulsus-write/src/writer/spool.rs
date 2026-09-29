@@ -62,22 +62,22 @@ pub(crate) trait SpoolEncode: Sync {
     ///
     /// The default materialises [`Self::to_spool_value`] first — one row's
     /// whole value tree — and then walks it into the sink, which holds one
-    /// chunk whatever the value's size ([`SpoolSink::put_value`]).
-    /// `MetricLandingRow` overrides it and writes its fields, arrays and text
-    /// straight into the sink, so it has no value tree of its own either: an
+    /// chunk whatever the value's size ([`SpoolSink::put_value`]). **Both
+    /// landing rows override it** and write their fields, arrays and text
+    /// straight into the sink, so neither has a value tree of its own: an
     /// accepted native histogram may carry 65,536 custom bucket bounds in one
-    /// row, and the queue reservation held while the file is written covers that
-    /// block's rows alone.
+    /// metrics row, and one logs row carries a log line of any length admission
+    /// accepts. The queue reservation held while the file is written covers
+    /// that block's rows alone, so a copy beside them is memory
+    /// `PULSUS_INGEST_QUEUE_BYTES` never knew about.
     ///
     /// **What the default still costs, so it is not read as a statement about
-    /// size.** The nine shipped row shapes keep it: the log rows, the trace
-    /// rows and the per-target metric rows. Their value tree is a copy of the
-    /// row, held while the row is written, and nothing here removes it; what it
-    /// no longer holds is the serialized text on top of that tree. Their
-    /// spooling is the log and trace writers' own path, which this change does
-    /// not touch and whose peak is not measured by the case behind this method
-    /// (`crates/pulsus-write/tests/spool_stream_alloc.rs`, the metrics landing
-    /// queue's bound).
+    /// size.** The per-target row shapes keep it: the trace rows and the
+    /// per-target log and metric rows. Their value tree is a copy of the row,
+    /// held while the row is written, and nothing here removes it; what it no
+    /// longer holds is the serialized text on top of that tree. Only the two
+    /// landing queues' bounds are measured, by
+    /// `crates/pulsus-write/tests/spool_stream_alloc.rs`.
     fn write_spool_json(
         &self,
         out: &mut SpoolSink,
@@ -224,6 +224,8 @@ spool_scalar!(
     i64,
     i128,
     u8,
+    // `LogLandingRow::month`, the days-since-epoch a `Date` column takes.
+    u16,
     u32,
     u64,
     Fingerprint,
@@ -805,6 +807,7 @@ mod tests {
             ("i64", serde_json::to_string(&i64::MIN).unwrap()),
             ("i128", serde_json::to_string(&i128::MIN).unwrap()),
             ("u8", serde_json::to_string(&u8::MAX).unwrap()),
+            ("u16", serde_json::to_string(&u16::MAX).unwrap()),
             ("u32", serde_json::to_string(&u32::MAX).unwrap()),
             ("u64", serde_json::to_string(&u64::MAX).unwrap()),
             (
@@ -914,6 +917,90 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **T40.** Each LOGS landing row kind streams the shape that kind
+    /// declares. A row written field by field into the sink must put the same
+    /// document on disk as the declared [`SpoolEncode::to_spool_value`] shape,
+    /// which is the audit record a reader reads; nothing else holds the two
+    /// together once the encoder stops going through a value.
+    ///
+    /// **What this cannot detect is a MISSING override**: the default
+    /// `write_spool_json` walks `to_spool_value` itself, so the comparison is
+    /// trivially true with no override at all. It fails on an override that
+    /// drops a field or misspells a key.
+    /// `spooling_a_log_block_holds_no_copy_of_the_push`
+    /// (`crates/pulsus-write/tests/spool_stream_alloc.rs`) is the sibling that
+    /// detects a missing override, and neither case covers the other.
+    #[tokio::test]
+    async fn every_log_landing_row_kind_streams_the_shape_it_declares() {
+        let dir = tempdir();
+        for (name, row) in log_landing_rows_of_every_kind() {
+            let path = dir.join(format!("{name}.json"));
+            let whole = serde_json::to_vec(&SpoolRecord {
+                table: "log_landing",
+                error: "boom",
+                spooled_at_ns: 1_700_000_000_123_456_789,
+                rows: vec![row.to_spool_value()],
+            })
+            .expect("the record serializes");
+            write_record(
+                &path,
+                "log_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let streamed = std::fs::read(&path).expect("read the document back");
+            assert_eq!(
+                String::from_utf8(streamed).expect("the document is UTF-8"),
+                String::from_utf8(whole).expect("the record is UTF-8"),
+                "the streamed {name} row is not the shape it declares"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One row of each logs kind, each carrying text long enough that the
+    /// string path spills the chunk rather than fitting one piece.
+    fn log_landing_rows_of_every_kind() -> Vec<(&'static str, crate::writer::rows::LogLandingRow)> {
+        use crate::protocols::otlp_logs::{LogRow, StreamRow};
+        use crate::writer::rows::{LogLandingRow, LogPatternRow};
+        use pulsus_model::{Date, UnixNano};
+
+        const TS: i64 = 1_700_000_000_000_000_000;
+        let (labels, _) = pulsus_model::LabelSet::from_normalized([
+            ("service_name".to_string(), "checkout".to_string()),
+            ("env".to_string(), "\"quoted\"\n".to_string()),
+        ]);
+        let line = LogRow {
+            service: "checkout".to_string(),
+            fingerprint: Fingerprint::from_raw(7),
+            timestamp_ns: UnixNano(TS),
+            severity: -3,
+            body: "x".repeat(STRING_PAST_CHUNK),
+            structured_metadata: "{\"scope_name\":\"tracer\"}".to_string(),
+        };
+        let stream = StreamRow {
+            month: Date::start_of_month_utc(TS).expect("a representable month"),
+            fingerprint: Fingerprint::from_raw(9),
+            service: "checkout".to_string(),
+            labels,
+            updated_ns: TS,
+        };
+        let pattern = LogPatternRow {
+            fingerprint: Fingerprint::from_raw(11),
+            bucket_ns: TS - 7,
+            pattern: "y".repeat(STRING_PAST_CHUNK),
+            count: 4_242,
+        };
+        vec![
+            ("kind0-line", LogLandingRow::line(5, &line)),
+            ("kind1-stream", LogLandingRow::stream(5, &stream)),
+            ("kind2-pattern", LogLandingRow::pattern(5, pattern)),
+        ]
     }
 
     /// How long a string a case gives a row's `labels`, `help` or `unit` when

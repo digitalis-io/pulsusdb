@@ -57,6 +57,7 @@ impl MockInserter {
     }
 
     /// Every row this table has been handed, summed over every insert.
+    #[allow(dead_code)]
     fn rows_inserted(&self) -> usize {
         self.rows.lock().expect("mock mutex").iter().sum()
     }
@@ -136,16 +137,18 @@ fn batch(fingerprint: u128, body: &str, timestamp_ns: i64, new_stream: bool) -> 
 
 const T: i64 = 1_700_000_000_000_000_000;
 
+/// One push is one insert into one table (issue #603), so the log cases have
+/// one inserter too.
 fn writer_with(
     cfg: WriterConfig,
-    samples: Arc<MockInserter>,
-    streams: Arc<MockInserter>,
+    landing: Arc<MockInserter>,
+    _unused: Arc<MockInserter>,
 ) -> LogWriter {
     let cfg = WriterConfig {
         log_patterns: false,
         ..cfg
     };
-    LogWriter::with_inserters(samples, streams, MockInserter::new(Behavior::Ok), &cfg)
+    LogWriter::with_landing_inserter(landing, &cfg)
 }
 
 /// One push is one insert into one table (issue #603), so the metric cases
@@ -187,18 +190,26 @@ fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetri
     }
 }
 
-/// Flush on the very next append, so a sync admit settles promptly.
+/// A sync admit settles promptly, because one push is one insert of one
+/// block and nothing waits for a flush trigger (issue #603).
+///
+/// **`batch_bytes` is no longer a flush threshold**, on either landing path:
+/// it is the per-push BYTE CEILING, and a push whose charge exceeds it is
+/// refused `413`. It used to be set to one byte here to make a generation
+/// flush on the very next append; that value now refuses every push in this
+/// suite.
 fn eager() -> WriterConfig {
-    WriterConfig {
-        batch_bytes: pulsus_config::ByteSize(1),
-        ..Default::default()
-    }
+    WriterConfig::default()
 }
 
-/// Nothing auto-flushes: the generation stays open for the whole test.
+/// Nothing ages: the suppression index's ticker never fires, so a claim this
+/// suite opens stays open for the whole test.
+///
+/// **`batch_ms` is no longer a flush cadence** either — there is no flush loop
+/// left — it is the suppression ticker's, which is exactly what this helper
+/// wants to stop.
 fn never_flushes() -> WriterConfig {
     WriterConfig {
-        batch_bytes: pulsus_config::ByteSize(u64::MAX),
         batch_ms: pulsus_config::BATCH_MS_CEILING,
         ..Default::default()
     }
@@ -224,7 +235,7 @@ async fn the_declared_limit_has_three_legs() {
     }
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         1,
         "the same body twice through one writer is one push"
     );
@@ -243,7 +254,7 @@ async fn the_declared_limit_has_three_legs() {
     a.shutdown(Duration::from_secs(2)).await;
     b.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        a_samples.rows_inserted() + b_samples.rows_inserted(),
+        a_samples.rows_of_kind(0) + b_samples.rows_of_kind(0),
         2,
         "the cross-writer case is the declared limit: both are stored"
     );
@@ -267,7 +278,7 @@ async fn the_declared_limit_has_three_legs() {
     }
     off.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        off_samples.rows_inserted(),
+        off_samples.rows_of_kind(0),
         2,
         "with the mechanism off the retry is stored, which is the defect"
     );
@@ -318,7 +329,7 @@ async fn eight_concurrent_identical_pushes_admit_exactly_one() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         1,
         "exactly one push's rows reached the table"
     );
@@ -356,50 +367,6 @@ async fn a_push_whose_every_target_failed_definitely_is_re_admitted() {
         "provably-not-committed rows are re-admitted, not suppressed"
     );
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
-}
-
-/// The pattern table is a claim target but never joins the durability
-/// acknowledgement, so a pattern-only failure reproduces the original
-/// caller's success for a suppressed caller — and the disagreement between
-/// the targets is counted.
-#[tokio::test]
-async fn a_pattern_only_failure_is_counted_but_is_not_the_suppressed_callers_answer() {
-    let samples = MockInserter::new(Behavior::Ok);
-    let streams = MockInserter::new(Behavior::Ok);
-    let patterns = MockInserter::new(Behavior::Poison);
-    let cfg = WriterConfig {
-        log_patterns: true,
-        ..eager()
-    };
-    let writer = LogWriter::with_inserters(samples, streams, patterns.clone(), &cfg);
-
-    let wait = writer
-        .admit_flush(batch(4, "mixed outcome", T, true), PushHeaders::default())
-        .expect("queue has room");
-    wait.await
-        .expect("a pattern failure never fails the original caller");
-
-    // The pattern generation settles asynchronously; wait for it.
-    for _ in 0..200 {
-        if writer.metrics().dedup.mixed_outcome_total == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        writer.metrics().dedup.mixed_outcome_total,
-        1,
-        "targets that disagreed are counted"
-    );
-    assert!(patterns.call_count() >= 1);
-
-    let wait = writer
-        .admit_flush(batch(4, "mixed outcome", T, true), PushHeaders::default())
-        .expect("queue has room");
-    wait.await
-        .expect("the suppressed caller is told the ORIGINAL's success, not the pattern failure");
-    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
-    writer.shutdown(Duration::from_secs(2)).await;
 }
 
 // ---------------------------------------------------------------------
@@ -473,7 +440,7 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
     );
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         2,
         "both bodies are stored, the refused one on its second attempt"
     );
@@ -498,7 +465,7 @@ async fn a_lone_retry_attempt_header_is_stored() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         1,
         "the lone retry marker is stored"
     );
@@ -533,7 +500,7 @@ async fn two_different_bodies_declaring_a_retry_are_two_pushes() {
     }
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         2,
         "the retry marker is never a suppression key"
     );
@@ -573,7 +540,7 @@ async fn a_declared_retry_moves_the_declared_dimension_only() {
         (0, 1)
     );
     writer.shutdown(Duration::from_secs(2)).await;
-    assert_eq!(samples.rows_inserted(), 1);
+    assert_eq!(samples.rows_of_kind(0), 1);
 }
 
 // ---------------------------------------------------------------------
@@ -614,7 +581,7 @@ async fn the_idempotency_key_namespaces_the_identity() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         2,
         "two distinct keys stored two pushes; the repeat and the refusal stored none"
     );
@@ -683,12 +650,24 @@ async fn a_forced_shutdown_reports_its_generations_claims() {
     let id = pulsus_write::log_identity(&body, &PushHeaders::default());
 
     let samples = MockInserter::new(Behavior::Hang);
-    let writer = writer_with(eager(), samples, MockInserter::new(Behavior::Ok));
+    let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
     let index = writer.dedup().expect("the index is on").clone();
 
     writer
         .admit(body, PushHeaders::default())
         .expect("queue has room");
+    // **The block must be provably IN FLIGHT before the deadline**, or the
+    // drain settles it as still-queued, which is a different ending: a block
+    // that never left is provably not committed, where an abandoned attempt's
+    // fate is unknown. Admitting and shutting down without waiting leaves
+    // which one happens to the scheduler.
+    for _ in 0..1024 {
+        if samples.call_count() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(samples.call_count(), 1, "the insert is in flight");
     assert!(
         matches!(
             index.admit(id, WaitMode::Register),
@@ -720,26 +699,49 @@ async fn a_forced_shutdown_reports_its_generations_claims() {
 
 use pulsus_write::Admission;
 
-/// `tick` has a production caller: the per-table flush task drives it once
-/// per cycle, and that is what ages a claim whose targets never settle into
-/// a tombstone. Remove the call and the claim stays open for ever.
+/// `tick` has a production caller: the suppression index's own ticker task
+/// drives it once per `PULSUS_BATCH_MS`, and that is what ages a claim whose
+/// target never settles into a tombstone. Remove the call and the claim stays
+/// open for ever.
+///
+/// **The caller moved with the flush loops** (issue #603). It used to be the
+/// per-table flush task; one push is one insert of one block now, so there is
+/// no flush loop left and the writer spawns `table::spawn_dedup_ticker`
+/// instead.
+///
+/// **The claim is opened through the index the writer owns, not by a push**,
+/// and that is the change this case records rather than works around. The
+/// landing loop bounds every block by `WriterRuntime::landing_budget`, which
+/// is derived to be SHORTER than the claim deadline exactly so that a block
+/// settles before its claim could age out — so a push can no longer produce
+/// an open claim that outlives its deadline. What the ticker still has to do
+/// is age one that somehow does, and this opens exactly that: one target
+/// noted, sealed, never settled.
 #[tokio::test(start_paused = true)]
-async fn the_flush_task_drives_the_index_tick() {
-    // `log_samples` hangs, so its own flush task parks inside the insert;
-    // `log_streams` has nothing to flush and keeps looping, which is the
-    // caller that ages this claim.
-    let cfg = WriterConfig {
-        batch_bytes: pulsus_config::ByteSize(1),
-        ..Default::default()
-    };
+async fn the_ticker_task_drives_the_index_tick() {
     let writer = writer_with(
-        cfg,
-        MockInserter::new(Behavior::Hang),
+        WriterConfig::default(),
+        MockInserter::new(Behavior::Ok),
         MockInserter::new(Behavior::Ok),
     );
-    writer
-        .admit(batch(11, "never settles", T, false), PushHeaders::default())
-        .expect("queue has room");
+    let index = writer.dedup().expect("the index is on").clone();
+
+    let id = pulsus_write::PushIdentity {
+        key: pulsus_write::PushDigest::from_raw(4_242),
+        content: pulsus_write::PushDigest::from_raw(4_242),
+        declared_retry: false,
+    };
+    let Admission::Admit(mut guard) = index.admit(id, WaitMode::None) else {
+        panic!("a fresh identity must admit");
+    };
+    guard.note_target(true);
+    guard.seal();
+
+    assert_eq!(
+        writer.metrics().dedup.unknown_total,
+        0,
+        "the claim is open, not yet aged"
+    );
 
     // Past the claim deadline: `PULSUS_BATCH_MS` plus the insert bound.
     tokio::time::sleep(Duration::from_secs(130)).await;
@@ -748,13 +750,20 @@ async fn the_flush_task_drives_the_index_tick() {
     assert_eq!(
         writer.metrics().dedup.unknown_total,
         1,
-        "a claim past its deadline becomes a tombstone"
+        "a claim past its deadline becomes a tombstone, which only the \
+         writer's own ticker task does"
     );
-    let index = writer.dedup().expect("the index is on").clone();
     drop(writer);
     // The tombstone is retained: a later identical push is still
     // suppressed, because those rows may have committed.
     assert_eq!(index.snapshot().unknown_total, 1);
+    assert!(
+        matches!(
+            index.admit(id, WaitMode::None),
+            Admission::SuppressedSettled(_)
+        ),
+        "a tombstoned claim still suppresses"
+    );
 }
 
 /// **The window is a real one, through the writer.** A body pushed twice
@@ -793,7 +802,7 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
         wait.await.expect("the flush settles");
     }
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         1,
         "inside the window the retry stores nothing"
     );
@@ -811,7 +820,7 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
         .expect("queue has room");
     wait.await.expect("the flush settles");
     assert_eq!(
-        samples.rows_inserted(),
+        samples.rows_of_kind(0),
         2,
         "past the window the same body is a new push and is stored"
     );

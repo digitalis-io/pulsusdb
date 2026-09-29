@@ -1385,11 +1385,94 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // Issue #603: the logs landing table. One push is one INSERT of one block
+    // here, and the five logs tables queries read are maintained by the five
+    // views below off this one source.
+    //
+    // Thirteen columns below `event_id`, the union of the three kinds' target
+    // columns. `kind` says which event a row is; a row sets that kind's
+    // columns and the rest default.
+    //
+    // Two decisions this shape makes that the metrics one did not:
+    // `timestamp_ns` carries the pattern bucket floor on a kind-2 row rather
+    // than a line time — it is the event's own time, floored — so there is no
+    // `bucket_ns` column; and the count column is `pattern_count`, because
+    // `log_patterns` and `log_metrics_<res>` both call their own column
+    // `count` and one landing column cannot be both, so `log_patterns_mv`
+    // aliases it back.
+    //
+    // `service` is second in the sorting key, mirroring `log_samples`' own
+    // `(service, fingerprint, timestamp_ns)`, so the landed kind-0 rows
+    // compress the way the target's do. A kind-2 row carries `service = ''`
+    // and sorts by fingerprint inside kind 2.
+    //
+    // **No `Ddl::Dist` sibling.** The writer names the base table in every
+    // mode: a push carries many fingerprints, so routing its block through a
+    // `Distributed` wrapper would split it per shard, and a `Distributed`
+    // insert returns before the shards have the rows — either alone ends "one
+    // push is one block".
+    Migration {
+        id: 65,
+        name: "log_landing",
+        family: Some(Family::Logs),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}} (\n\
+                 event_id             UUID DEFAULT generateUUIDv7(),\n\
+                 received_ms          Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 kind                 UInt8  CODEC(ZSTD(1)),\n\
+                 service              LowCardinality(String),\n\
+                 fingerprint          UInt128  CODEC(Delta(8), ZSTD(1)),\n\
+                 timestamp_ns         Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 severity             Int8  CODEC(ZSTD(1)),\n\
+                 body                 String  CODEC(ZSTD(1)),\n\
+                 structured_metadata  String  CODEC(ZSTD(1)),\n\
+                 month                Date  CODEC(ZSTD(1)),\n\
+                 labels               String  CODEC(ZSTD(5)),\n\
+                 updated_ns           Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 pattern              String  CODEC(ZSTD(1)),\n\
+                 pattern_count        UInt64  CODEC(T64, ZSTD(1))\n\
+             ) ENGINE = MergeTree\n\
+             PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))\n\
+             ORDER BY (kind, service, fingerprint, timestamp_ns)\n\
+             SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
 /// [`MIGRATIONS`] by `controller::reconcile_mvs`.
 pub const MVS: &[MvDef] = &[
+    // Issue #603: the five views that maintain the logs tables from
+    // `log_landing`. Three kinds, five views: `log_streams_idx_mv` is an
+    // `ARRAY JOIN` over the very same landed kind-1 row `log_streams_mv`
+    // takes, so it reads that kind rather than one of its own — a kind of its
+    // own would make the writer land the `labels` blob twice per stream.
+    //
+    // `log_streams_idx_mv` and `log_metrics_<res>_mv` keep their names and
+    // change their source from a target table to the landing table, so their
+    // checksums change and `reconcile_mvs` drops and re-creates them. Neither
+    // is second-level any more: `log_metrics_<res>` sums over
+    // `SimpleAggregateFunction(sum, UInt64)`, where a second-level view firing
+    // as well as a first-level one would double every count.
+    //
+    // Each projection lists the target's columns in the target's own column
+    // order under the target's own column names — a bare column is its own
+    // name, which is why `log_streams_idx_mv` keeps its unaliased form.
+    MvDef {
+        name: "log_samples_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.log_samples_mv{{on_cluster}} TO {{db}}.log_samples AS\n\
+               SELECT service AS service, fingerprint AS fingerprint,\n\
+                      timestamp_ns AS timestamp_ns, severity AS severity, body AS body,\n\
+                      structured_metadata AS structured_metadata\n\
+               FROM {{db}}.log_landing WHERE kind = 0;",
+    },
+    // `log_streams_idx_mv` is correct whether the server applies its `WHERE`
+    // before or after the `ARRAY JOIN`: a kind-0 and a kind-2 row carry
+    // `labels = ''`, `JSONExtractKeysAndValues('', 'String')` is the empty
+    // array, and an `ARRAY JOIN` over an empty array emits no row.
+    // `LogLandingRow`'s constructors are what make that true.
     MvDef {
         name: "log_streams_idx_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.log_streams_idx_mv{{on_cluster}} TO {{db}}.log_streams_idx AS\n\
@@ -1398,19 +1481,40 @@ pub const MVS: &[MvDef] = &[
                    kv.1 AS key,\n\
                    kv.2 AS val,\n\
                    fingerprint\n\
-               FROM {{db}}.log_streams\n\
-               ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv;",
+               FROM {{db}}.log_landing\n\
+               ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv\n\
+               WHERE kind = 1;",
     },
+    MvDef {
+        name: "log_streams_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.log_streams_mv{{on_cluster}} TO {{db}}.log_streams AS\n\
+               SELECT month AS month, fingerprint AS fingerprint, service AS service,\n\
+                      labels AS labels, updated_ns AS updated_ns\n\
+               FROM {{db}}.log_landing WHERE kind = 1;",
+    },
+    // Aggregates over the landing block exactly as it aggregated over a
+    // `log_samples` block before, and its target merges partial sums, so one
+    // push's rows produce one partial row per `(fingerprint, bucket_ns)`.
     MvDef {
         name: "log_metrics_{{log_rollup_suffix}}_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}} TO {{db}}.log_metrics_{{log_rollup_suffix}} AS\n\
-               SELECT\n\
-                   fingerprint,\n\
-                   intDiv(timestamp_ns, {{log_rollup_ns}}) * {{log_rollup_ns}} AS bucket_ns,\n\
-                   count() AS count,\n\
-                   sum(length(body)) AS bytes\n\
-               FROM {{db}}.log_samples\n\
+               SELECT fingerprint AS fingerprint,\n\
+                      intDiv(timestamp_ns, {{log_rollup_ns}}) * {{log_rollup_ns}} AS bucket_ns,\n\
+                      count() AS count,\n\
+                      sum(length(body)) AS bytes\n\
+               FROM {{db}}.log_landing WHERE kind = 0\n\
                GROUP BY fingerprint, bucket_ns;",
+    },
+    // The pattern rows are pre-aggregated before they land — template
+    // extraction is Rust, not SQL — so the writer lands one row per
+    // `(fingerprint, bucket, template)` and this view copies it through,
+    // aliasing `pattern_count` back to the target's `count`.
+    MvDef {
+        name: "log_patterns_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.log_patterns_mv{{on_cluster}} TO {{db}}.log_patterns AS\n\
+               SELECT fingerprint AS fingerprint, timestamp_ns AS bucket_ns,\n\
+                      pattern AS pattern, pattern_count AS count\n\
+               FROM {{db}}.log_landing WHERE kind = 2;",
     },
     // Fires per shard in cluster mode; every shard writes the same Global
     // replica set and `ReplacingMergeTree(scope, key, val, val_type)` +
@@ -1533,22 +1637,12 @@ pub const MVS: &[MvDef] = &[
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::render::{self, RenderCtx};
 
     fn ctx() -> RenderCtx {
-        RenderCtx {
-            db: "pulsus".to_string(),
-            cluster: None,
-            dist_suffix: "_dist".to_string(),
-            storage_policy: None,
-            retention_days: 7,
-            log_rollup: Duration::from_secs(5),
-            metrics_landing_retention_hours: 6,
-            metrics_dedup_window: 10_000,
-        }
+        RenderCtx::for_tests("pulsus")
     }
 
     /// Migration `id`'s `Ddl::Static` template, unrendered.
@@ -1838,14 +1932,88 @@ mod tests {
         );
     }
 
+    /// **T31.** Every logs view reads the landing table. A view still reading
+    /// a target table would be second-level — its source written by another
+    /// view — and `log_metrics_<res>` sums over
+    /// `SimpleAggregateFunction(sum, UInt64)`, where a second-level view
+    /// firing as well as a first-level one doubles every count.
+    #[test]
+    fn every_logs_view_reads_the_landing_table() {
+        let ctx = RenderCtx::for_tests("pulsus");
+        let logs: Vec<&MvDef> = MVS
+            .iter()
+            .filter(|mv| mv.name.starts_with("log_"))
+            .collect();
+        assert_eq!(logs.len(), 5, "three kinds, five views");
+        for mv in logs {
+            let rendered =
+                render::render(mv.tmpl, &render::render_name(mv.name, &ctx), &ctx, false);
+            assert!(
+                rendered.contains("FROM pulsus.log_landing"),
+                "{} must read the landing table: {rendered}",
+                mv.name
+            );
+        }
+    }
+
+    /// **T32.** No view reads a table another view writes: the set of tables
+    /// the views write and the set they read are disjoint, so nothing in the
+    /// catalogue is second-level. Pointing `log_metrics_<res>_mv` back at
+    /// `log_samples` reddens it.
+    ///
+    /// **The case for the target set.** Nothing in this tree establishes what
+    /// a view does when its own source is written by a view, and this change
+    /// deliberately does not need it.
+    #[test]
+    fn no_view_reads_a_table_another_view_writes() {
+        let ctx = RenderCtx::for_tests("pulsus");
+        let mut written: Vec<String> = Vec::new();
+        let mut read: Vec<String> = Vec::new();
+        for mv in MVS {
+            let rendered =
+                render::render(mv.tmpl, &render::render_name(mv.name, &ctx), &ctx, false);
+            let (_, after_to) = rendered
+                .split_once(" TO pulsus.")
+                .unwrap_or_else(|| panic!("{} has no TO target: {rendered}", mv.name));
+            written.push(
+                after_to
+                    .split_whitespace()
+                    .next()
+                    .expect("a target name")
+                    .to_string(),
+            );
+            let (_, after_from) = rendered
+                .split_once("FROM pulsus.")
+                .unwrap_or_else(|| panic!("{} has no FROM source: {rendered}", mv.name));
+            read.push(
+                after_from
+                    .split([' ', '\n', ';'])
+                    .next()
+                    .expect("a source name")
+                    .to_string(),
+            );
+        }
+        for source in &read {
+            assert!(
+                !written.contains(source),
+                "{source} is written by a view and read by another: no view's \
+                 source may be written by a view\n  written: {written:?}\n  \
+                 read: {read:?}"
+            );
+        }
+    }
+
     #[test]
     fn mvs_are_exactly_the_expected_set() {
         let names: Vec<&str> = MVS.iter().map(|mv| mv.name).collect();
         assert_eq!(
             names,
             [
+                "log_samples_mv",
                 "log_streams_idx_mv",
+                "log_streams_mv",
                 "log_metrics_{{log_rollup_suffix}}_mv",
+                "log_patterns_mv",
                 "trace_tag_catalog_mv",
                 "trace_edges_mv",
                 "trace_recent_mv",

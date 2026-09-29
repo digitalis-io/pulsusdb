@@ -176,12 +176,30 @@ ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING non_replicated_de
   recognises the writer's resend of a block (§3). Each of the four targets needs one of
   its own because a view's insert into its target carries a block id derived from the
   source block, and only a table with a window recognises the repeat.
-- **There is one window, not two.** The server has
-  `non_replicated_deduplication_window` and no seconds-based counterpart for a
-  non-replicated table, so a block is remembered until that many newer blocks have
-  arrived and is never forgotten on a timer. That is the safe direction for a resend.
-  Running the startup check of §2.2 is what established this: the name a design had
-  assumed does not exist, and sending it would have refused every startup.
+- **How many windows there are depends on the engine, and the setting's name does too**
+  (issue #603). A **non-replicated** table has one: `non_replicated_deduplication_window`,
+  counted in blocks, with no seconds-based counterpart — so a block is remembered until
+  that many newer blocks have arrived and is never forgotten on a timer. Running the
+  startup check of §2.2 is what established that: the seconds name a design had assumed
+  does not exist for this engine, and sending it would have refused every startup. A
+  **replicated** table has two, and both have to be right:
+  `replicated_deduplication_window` (blocks, server default 10000) and
+  `replicated_deduplication_window_seconds` (seconds, server default 3600), whose own
+  description says hash sums older than it are removed "even if they are less than
+  `replicated_deduplication_window`", timed from the most recent record rather than from
+  the wall clock. A deployment that lowered the seconds window below the landing budget
+  would have a token forgotten while the writer was still entitled to resend under it.
+  So the statements above render `{{dedup_window_setting}}` — the replicated name when
+  `PULSUS_CLUSTER` is set, the non-replicated one when it is not, from the same context
+  field that renders the engine — and a clustered deployment additionally gets
+  `controller::CLUSTER_DEDUP_SECONDS_STMTS`, one
+  `MODIFY SETTING replicated_deduplication_window_seconds = 3600` per write-path table.
+  **3600 is a constant, not a key**: the precondition of the defect is a deployment
+  setting it too small, it is the server's own default so pinning changes nothing where
+  the server keeps it, and it is thirty times the 120-second landing budget that bounds
+  the one thing the window guards — the writer resending its own block. A clustered
+  deployment is the production case, so this is the shape that matters; the
+  non-replicated window is the development variant.
 - **`apply_ttl` stops at its first failing statement, so the order is a dependency
   order.** These come after the shipped `TTL_STMTS`, and the two naming the landing
   table come last within them, so a schema managed by hand without that table stops
@@ -581,8 +599,11 @@ changes is the target list, the discriminating values, and its own landing table
 type, config keys and window statements. Nothing is shared between two signals' landing
 tables.
 
-**What is reusable as it stands**, all inside `pulsus-write`: `writer::drain`'s boundary
-(§5), `writer::spool`'s sink and seal (§7), `writer::reserve_queued_bytes` (§6),
+**What is reusable as it stands**, all inside `pulsus-write`: `writer::landing` — the
+generic module the second signal extracted, holding `LandingBlock<R>`, its single
+reservation-release point, `landing_charge::<R>` (§6) and the insert loop's two fates
+(§4), each over the signal's own row type; `writer::drain`'s boundary (§5),
+`writer::spool`'s sink and seal (§7), `writer::reserve_queued_bytes` (§6),
 `QuerySettings::landing_insert` (§2.1) and `pulsus_schema::REQUIRED_SERVER_NAMES` (§2.2).
 The settings constructor takes the row ceiling as an argument, so a second signal passes
 its own.
@@ -597,20 +618,30 @@ catalogue today aims this work at tables that are going. The catalogue,
 `WriterTables::logs_default` and `TraceWriterTables::traces_default` answer what is in the
 tree now, which is a different question.
 
-**The discriminating values are the implementer's to choose, one per target the landing
-table feeds** — the targets that signal's writer writes today. Metrics used `kind`
-`UInt8`, values 0..3, declared as `MetricLandingRow::KIND_*` constants and read by the
-views as `WHERE kind = k`, 0 to 3. A second signal does the same: one value per kind, the
-discriminator first in the sorting key (§1.1), and a row type that is the union of its
-targets' columns less the server-filled identity column.
+**The discriminating values are the implementer's to choose: one per landed event shape,
+and one view per target — several views may read one value.** Metrics used `kind`
+`UInt8`, values 0..3, one per target, declared as `MetricLandingRow::KIND_*` constants
+and read by the views as `WHERE kind = k`. **Logs is why the rule is stated that way**
+and not as one kind per target: it has three kinds and five views, because
+`log_streams_idx_mv` is an `ARRAY JOIN` over the very same kind-1 row `log_streams_mv`
+takes. A kind of its own for the index would make the writer land the same canonical
+label blob twice per stream — the one blob is the widest column either target needs —
+so the second view reads the first's kind instead. What a second signal keeps whichever
+way it goes: one value per landed row shape, the discriminator first in the sorting key
+(§1.1), a row type that is the union of its targets' columns less the server-filled
+identity column, and a projection per view that names the target's columns in the
+target's own order under the target's own names.
 
 **A second-level view is that signal's own question, and there is a shape that does not
 ask it.** Another signal may keep a target that a view maintains off another target
-rather than off the landing table — in the tree today `log_streams_idx` off `log_streams`,
-`log_metrics_<res>` off `log_samples`, and four trace tables off two others. The metrics
-path has no such case, all four of its targets being one view away from the landing table,
-and no insert in this tree sends a block through two levels of view: all ten views in
-`MVS` read a table the writer itself inserts into. So **nothing here establishes what a
+rather than off the landing table — four trace tables off two others. Neither the metrics
+path nor the logs path has such a case any more — every one of their targets is one view
+away from its landing table, and repointing `log_streams_idx_mv` and
+`log_metrics_<res>_mv` is what removed the last two — and no insert in this tree sends a
+block through two levels of view: every view in `MVS` reads a table the writer itself
+inserts into. For `log_metrics_<res>` that is load-bearing rather than tidy: its columns
+are `SimpleAggregateFunction(sum, UInt64)`, so a second-level view firing as well as a
+first-level one would double every count. So **nothing here establishes what a
 view does when its own source is written by a view**, and no sentence in this document
 should be read as establishing it. What this document does establish is the other shape:
 a kind and a view of its own per target, off the landing table. A signal that keeps a
@@ -627,9 +658,9 @@ both backlogs, both tasks, their counters and their healed hooks — because wha
 repaired no longer exists: a registration row rides the samples' own block, and the
 registration cache is promoted only when that block commits, so a push whose insert
 failed emits its registration rows again next time rather than leaving an orphan to
-heal. The same will hold per signal, for the `log_streams` backlog (issue #134) and the
-`trace_attrs_idx` one (issue #139), which `writer::backfill` and `WriterRuntime`'s two
-backfill fields still serve. And the per-table ingest counters collapse to one table
+heal. Logs then did the same to the `log_streams` backlog (issue #134), for the same reason.
+What `writer::backfill` and `WriterRuntime`'s remaining backfill field serve is the
+`trace_attrs_idx` backlog (issue #139), and the same will hold for it when traces moves. And the per-table ingest counters collapse to one table
 label, the landing table's, with the backfill series gone
 (`crates/pulsus-server/src/ops.rs`).
 

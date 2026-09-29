@@ -106,9 +106,8 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, Fingerprint, LabelSet, log_label_name};
+use pulsus_model::{Date, LabelSet, log_label_name};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
-use pulsus_write::writer::{LogSampleRow, LogStreamRow};
 use pulsus_write::{LogWriter, WriterTables};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -155,16 +154,7 @@ fn db_config(db: &str) -> ChConnConfig {
 }
 
 fn schema_params(db: &str) -> SchemaParams {
-    RenderCtx {
-        db: db.to_string(),
-        cluster: None,
-        dist_suffix: "_dist".to_string(),
-        storage_policy: None,
-        retention_days: 7,
-        log_rollup: Duration::from_secs(5),
-        metrics_landing_retention_hours: 6,
-        metrics_dedup_window: 10_000,
-    }
+    RenderCtx::for_tests(db)
 }
 
 /// Nanoseconds since the Unix epoch, right now. Fixture timestamps are
@@ -555,32 +545,78 @@ async fn run_path_b(db: &str, f: &Fixture) {
         0
     };
 
-    let sample = LogSampleRow {
+    // **Path B seeds the LANDING table** (issue #603), not the targets:
+    // `log_samples`, `log_streams` and `log_streams_idx` are all maintained
+    // from `log_landing` by materialized view now, so a direct insert into a
+    // target would leave the index this case reads back empty. The row shape
+    // is still Path B's own, written out here rather than built by
+    // `pulsus-write`, which is what keeps this path an independent oracle.
+    let line = PathBLandingRow {
+        kind: 0,
         service: service.clone(),
-        fingerprint: Fingerprint::from_raw(fingerprint),
+        fingerprint,
         timestamp_ns,
         severity,
         body: f.file.body.clone(),
         structured_metadata,
+        ..PathBLandingRow::empty()
     };
-    let stream = LogStreamRow {
+    let stream = PathBLandingRow {
+        kind: 1,
+        service,
+        fingerprint,
         month: Date::start_of_month_utc(timestamp_ns)
             .unwrap()
             .days_since_epoch(),
-        fingerprint: Fingerprint::from_raw(fingerprint),
-        service,
         labels: labels.to_canonical_json(),
         updated_ns: now_ns(),
+        ..PathBLandingRow::empty()
     };
 
     client
-        .insert_block("log_samples", &[sample])
+        .insert_block("log_landing", &[line, stream])
         .await
-        .expect("insert log_samples");
-    client
-        .insert_block("log_streams", &[stream])
-        .await
-        .expect("insert log_streams");
+        .expect("insert log_landing");
+}
+
+/// One `log_landing` row as Path B writes it: the table's own column order,
+/// spelled out here rather than taken from `pulsus_write::LogLandingRow`, so
+/// this path stays independent of the code under test.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PathBLandingRow {
+    received_ms: i64,
+    kind: u8,
+    service: String,
+    fingerprint: u128,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+    month: u16,
+    labels: String,
+    updated_ns: i64,
+    pattern: String,
+    pattern_count: u64,
+}
+
+impl PathBLandingRow {
+    fn empty() -> Self {
+        PathBLandingRow {
+            received_ms: 0,
+            kind: 0,
+            service: String::new(),
+            fingerprint: 0,
+            timestamp_ns: 0,
+            severity: 0,
+            body: String::new(),
+            structured_metadata: String::new(),
+            month: 0,
+            labels: String::new(),
+            updated_ns: 0,
+            pattern: String::new(),
+            pattern_count: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

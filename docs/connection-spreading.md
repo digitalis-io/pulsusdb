@@ -12,6 +12,15 @@ SQL, pushdown, granule pruning, projection choice, or `_dist` fan-out — a
 (docs/schemas.md §7), so spreading only changes *which node coordinates the
 identical query*, never the result.
 
+**One write is placed by the endpoint it was sent to**, and it is still correct
+from any of them: a logs or metrics push inserts into `log_landing` /
+`metric_landing`, which have no `_dist` wrapper, so the block and every row the
+views derive from it land on the shard that took the request (issue #603,
+docs/schemas.md §7). Spreading therefore spreads those rows, which is what the
+sharding key used to decide. No read's answer depends on it — the logs and
+metrics reads merge across shards — and the endpoint list requirement below is
+unchanged, every endpoint still being a cluster member.
+
 ![AZ-aware connection spreading](diagrams/connection-spreading.svg)
 
 ## Configuration

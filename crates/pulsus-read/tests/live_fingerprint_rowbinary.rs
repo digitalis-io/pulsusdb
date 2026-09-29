@@ -44,7 +44,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings};
 use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows as logql_rows;
 use pulsus_read::metrics::exec as metrics_exec;
@@ -152,7 +152,7 @@ async fn drop_database(client: &ChClient, db: &str) {
         .execute(
             &format!("DROP DATABASE IF EXISTS {db}"),
             &QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
+            Idempotency::Idempotent,
         )
         .await
         .expect("drop database");
@@ -162,7 +162,7 @@ async fn drop_database(client: &ChClient, db: &str) {
 /// table that carries a fingerprint, **through the writer's own `Row`
 /// structs** — so the serialize direction is exercised by the same six
 /// structs production inserts with.
-async fn seed(client: &ChClient) {
+async fn seed(client: &ChClient, db: &str) {
     let ts_ns = now_ns();
     let ts_ms = ts_ns / 1_000_000;
     let streams: Vec<LogStreamRow> = fingerprints()
@@ -181,7 +181,7 @@ async fn seed(client: &ChClient) {
         .insert_block("log_streams", &streams)
         .await
         .expect("insert log_streams through LogStreamRow");
-
+    land_seeded_streams(client, db).await;
     let samples: Vec<LogSampleRow> = fingerprints()
         .into_iter()
         .map(|fingerprint| LogSampleRow {
@@ -197,7 +197,7 @@ async fn seed(client: &ChClient) {
         .insert_block("log_samples", &samples)
         .await
         .expect("insert log_samples through LogSampleRow");
-
+    land_seeded_lines(client, db).await;
     let patterns: Vec<LogPatternRow> = fingerprints()
         .into_iter()
         .map(|fingerprint| LogPatternRow {
@@ -290,25 +290,13 @@ async fn a_narrow_row_field_is_refused_by_the_client() {
         .await
         .expect("connect");
     drop_database(&bootstrap, &db).await;
-    run_init(
-        &bootstrap,
-        &RenderCtx {
-            db: db.clone(),
-            cluster: None,
-            dist_suffix: "_dist".to_string(),
-            storage_policy: None,
-            retention_days: 7,
-            log_rollup: Duration::from_secs(5),
-            metrics_landing_retention_hours: 6,
-            metrics_dedup_window: 10_000,
-        },
-    )
-    .await
-    .expect("run_init");
+    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+        .await
+        .expect("run_init");
     let client = ChClient::new(test_config(&db))
         .await
         .expect("connect to db");
-    seed(&client).await;
+    seed(&client, &db).await;
 
     #[derive(Debug, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
     struct NarrowRow {
@@ -348,26 +336,14 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         .await
         .expect("connect");
     drop_database(&bootstrap, &db).await;
-    run_init(
-        &bootstrap,
-        &RenderCtx {
-            db: db.clone(),
-            cluster: None,
-            dist_suffix: "_dist".to_string(),
-            storage_policy: None,
-            retention_days: 7,
-            log_rollup: Duration::from_secs(5),
-            metrics_landing_retention_hours: 6,
-            metrics_dedup_window: 10_000,
-        },
-    )
-    .await
-    .expect("run_init");
+    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+        .await
+        .expect("run_init");
     let client = ChClient::new(test_config(&db))
         .await
         .expect("connect to db");
 
-    seed(&client).await;
+    seed(&client, &db).await;
     let fps = fp_in_list();
 
     // --- crates/pulsus-read/src/logql/rows.rs (10) --------------------
@@ -772,4 +748,89 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
     );
 
     drop_database(&bootstrap, &db).await;
+}
+
+/// Re-lands the rows a fixture seeded into `log_streams` through
+/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
+/// the views that maintain them (issue #603).
+///
+/// **Why the rows are moved rather than copied.** `log_streams_mv` and
+/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
+/// inserted into `log_streams` directly leaves the index a stage-1 or
+/// discovery read looks at empty. Landing a copy of those rows would leave
+/// two `log_streams` rows per stream, so the seeded rows are staged, the
+/// table is emptied, and the stage is landed as kind-1 rows: what the reads
+/// then see is exactly what the views produce.
+///
+/// **Idempotent**: a second call stages whatever is in `log_streams` at that
+/// point and lands it again, which is the same set.
+async fn land_seeded_streams(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_streams"
+        ),
+        format!("TRUNCATE TABLE {db}.log_streams"),
+        format!("TRUNCATE TABLE {db}.log_streams_idx"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
+                    month, labels, updated_ns, '', 0 \
+             FROM {db}.seed_stage_streams"
+        ),
+        format!("DROP TABLE {db}.seed_stage_streams"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded streams failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
+}
+
+/// Re-lands the rows a fixture seeded into `log_samples` through
+/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
+/// by the views that maintain them (issue #603) — the same move
+/// [`land_seeded_streams`] makes, for the line kind.
+///
+/// The rollup is truncated with the samples because its `count`/`bytes` are
+/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
+/// without emptying it would double every count.
+#[allow(dead_code)]
+async fn land_seeded_lines(client: &ChClient, db: &str) {
+    for sql in [
+        format!(
+            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
+             AS SELECT * FROM {db}.log_samples"
+        ),
+        format!("TRUNCATE TABLE {db}.log_samples"),
+        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
+        format!(
+            "INSERT INTO {db}.log_landing \
+             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
+                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
+             FROM {db}.seed_stage_lines"
+        ),
+        format!("DROP TABLE {db}.seed_stage_lines"),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "land seeded lines failed: {e}
+SQL:
+{sql}"
+                )
+            });
+    }
 }

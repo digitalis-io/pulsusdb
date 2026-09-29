@@ -45,6 +45,10 @@ static TEST_DB_SPAN_ARRAYS: pulsus_testkit::TestDb =
 // Issue #560: the two derived trace tables, clustered.
 static TEST_DB_DERIVED: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived");
+// Issue #603: the two deduplication windows a clustered write-path table
+// carries.
+static TEST_DB_DEDUP_WINDOWS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dedup_windows");
 static TEST_DB_DERIVED_REPLAY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived_replay");
 static TEST_DB_DEDUP_PROFILE: pulsus_testkit::TestDb =
@@ -112,6 +116,8 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         log_rollup: Duration::from_secs(5),
         metrics_landing_retention_hours: 6,
         metrics_dedup_window: 10_000,
+        log_landing_retention_hours: 6,
+        log_dedup_window: 10_000,
     }
 }
 
@@ -883,6 +889,157 @@ const DERIVED_TRACES: [&str; 2] = [
     "00000000000000000000000000000001",
     "00000000000000000000000000000003",
 ];
+
+/// **The topology this suite claims, established rather than assumed.**
+///
+/// `should_run()` is `pulsus_testkit::live_clickhouse_enabled()`, the same
+/// gate the single-node suites use, and `shard1_config`/`shard2_config`
+/// default their host and port to the compose fixture's static container IPs.
+/// Both variables pointed at ONE server is the unsafe direction, and whether a
+/// case notices depends on what it asserts: one that claims *distinct*
+/// per-shard content does, one that claims *identical* content cannot. So
+/// every case that reads the same thing off both shards opens with this: one
+/// catalogue read, no insert, and a false pass becomes a failure.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct ShardCountRow {
+    shards: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct HostRow {
+    host: String,
+}
+
+async fn require_two_shard_topology(shard1: &ChClient, shard2: &ChClient) {
+    let mut hosts = Vec::new();
+    for (i, client) in [shard1, shard2].into_iter().enumerate() {
+        let sql = format!(
+            "SELECT toUInt64(count(DISTINCT shard_num)) AS shards FROM system.clusters \
+             WHERE cluster = '{CLUSTER_NAME}'"
+        );
+        let mut stream = client
+            .query_stream::<ShardCountRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.clusters");
+        let shards = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode ShardCountRow")
+            .shards;
+        drop(stream);
+        assert_eq!(
+            shards,
+            2,
+            "shard{} reports {shards} shards in '{CLUSTER_NAME}': this suite's \
+             claims are about two, and one server answering for both would \
+             pass every identical-content assertion below",
+            i + 1
+        );
+
+        let mut stream = client
+            .query_stream::<HostRow>("SELECT hostName() AS host", &QuerySettings::new())
+            .await
+            .expect("read hostName()");
+        hosts.push(
+            stream
+                .next()
+                .await
+                .expect("one row")
+                .expect("decode HostRow")
+                .host,
+        );
+    }
+    assert_ne!(
+        hosts[0], hosts[1],
+        "both shard clients reached the same server ({}): the two shard \
+         variables are aliased",
+        hosts[0]
+    );
+}
+
+/// **T51.** After a clustered `run_init`, every write-path table carries the
+/// **replicated pair** of deduplication windows on **both** shards: the
+/// configured block window under the replicated engine's own setting name, and
+/// the pinned seconds window — and no `non_replicated_deduplication_window`
+/// anywhere, because these tables do not carry it.
+///
+/// **This is the case for the whole of the deduplication fix, and a clustered
+/// deployment is the production shape.** Before it, `apply_ttl` sent the
+/// non-replicated name here, so the deployment's configured window was ignored
+/// and the server's own default governed; and nothing at all set the seconds
+/// window, which forgets a block's hash on a timer whatever the block window
+/// says.
+///
+/// Reading the value back off both shards is the only thing that confirms it
+/// took: `apply_ttl` is what applies it, so a schema built by hand that never
+/// runs `apply_ttl` keeps whatever the server's own default is.
+#[tokio::test]
+async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_DEDUP_WINDOWS;
+    fresh_cluster_db(&shard1, db).await;
+    let mut ctx = cluster_ctx(db);
+    ctx.metrics_dedup_window = 5_000;
+    ctx.log_dedup_window = 5_000;
+    run_init(&shard1, &ctx).await.expect("run_init (clustered)");
+
+    const WRITE_PATH_TABLES: [&str; 11] = [
+        "log_landing",
+        "log_samples",
+        "log_streams",
+        "log_streams_idx",
+        "log_metrics_5s",
+        "log_patterns",
+        "metric_landing",
+        "metric_samples",
+        "metric_series",
+        "metric_metadata",
+        "metric_hist_samples",
+    ];
+
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        for table in WRITE_PATH_TABLES {
+            let create = create_table_query(shard, db, table).await;
+            assert!(
+                create.contains("replicated_deduplication_window = 5000"),
+                "shard{}: {table} must carry the configured BLOCK window under \
+                 the replicated engine's own setting name: {create}",
+                i + 1
+            );
+            assert!(
+                create.contains(&format!(
+                    "replicated_deduplication_window_seconds = {}",
+                    pulsus_schema::DEDUP_WINDOW_SECONDS
+                )),
+                "shard{}: {table} must carry the pinned SECONDS window, or a \
+                 block's hash is forgotten on a timer whatever the block \
+                 window says: {create}",
+                i + 1
+            );
+            assert!(
+                !create.contains("non_replicated_deduplication_window"),
+                "shard{}: {table} renders a Replicated* engine and does not \
+                 carry the non-replicated setting: {create}",
+                i + 1
+            );
+        }
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
 
 async fn exec_on(client: &ChClient, sql: &str) {
     client

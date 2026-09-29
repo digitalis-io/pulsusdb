@@ -241,6 +241,249 @@ impl SpoolEncode for LogPatternRow {
     }
 }
 
+/// One `log_landing` row (issue #603): the union of the three logs kinds'
+/// target columns, which is the one block shape a logs push inserts.
+///
+/// `kind` says which event the row is; a row sets that kind's columns and
+/// leaves the rest at the type's default. The fields are the landing table's
+/// fourteen columns **less `event_id`**, in the table's own declaration order:
+/// the insert's column list is exactly this type's `COLUMN_NAMES`, so leaving
+/// the column out is what makes the server fill it from
+/// `DEFAULT generateUUIDv7()`.
+///
+/// Two columns carry a different name or meaning from the target's:
+/// `timestamp_ns` is the pattern bucket floor on a kind-2 row rather than a
+/// line time, and `pattern_count` is `log_patterns`' own `count` under
+/// another name, because `log_metrics_<res>` also has a `count` and one
+/// landing column cannot be both. `log_patterns_mv` aliases both back.
+///
+/// `PartialEq` is derived, unlike `MetricLandingRow`'s: there is no `f64`
+/// field here, so no NaN marker makes a derived equality mislead.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct LogLandingRow {
+    pub received_ms: i64,
+    pub kind: u8,
+    pub service: String,
+    pub fingerprint: Fingerprint,
+    pub timestamp_ns: i64,
+    pub severity: i8,
+    pub body: String,
+    pub structured_metadata: String,
+    /// The bare `u16` days-since-epoch the `Date` column takes on the wire,
+    /// as [`LogStreamRow::month`] already is.
+    pub month: u16,
+    pub labels: String,
+    pub updated_ns: i64,
+    pub pattern: String,
+    pub pattern_count: u64,
+}
+
+/// One logs landing row's own inline footprint, in the shape the WRITER QUEUE
+/// holds it. Taken from `size_of` rather than written down, so it cannot drift
+/// from the fields it prices — [`LANDING_ROW_SLOT_BYTES`]'s rule.
+///
+/// A landing row is the union of the three target rows' columns, so it is
+/// wider than any one of them: three `i64`s, a `u64`, a 16-byte fingerprint,
+/// five `String` headers and three small integers. What a target row costs
+/// prices only the text the row owns; the queue also holds all of these slots,
+/// every one of them whether or not its kind uses it.
+pub const LOG_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<LogLandingRow>() as u64;
+
+impl LogLandingRow {
+    /// What the ingest queue is charged for one landing row whose kind's
+    /// target estimator priced its owned text at `target_bytes`.
+    ///
+    /// The queue reservation must count what we HOLD: `PULSUS_INGEST_QUEUE_BYTES`
+    /// names the buffered bytes, and a landing row is held as a whole
+    /// [`LogLandingRow`] until its block is encoded, so the row's inline slots
+    /// are charged beside the text it owns.
+    pub fn est_landing_bytes(target_bytes: u64) -> u64 {
+        target_bytes + LOG_LANDING_ROW_SLOT_BYTES
+    }
+
+    /// A log line, whose targets are `log_samples` and `log_metrics_<res>`.
+    pub const KIND_LINE: u8 = 0;
+    /// A stream registration, whose targets are `log_streams` and
+    /// `log_streams_idx`.
+    pub const KIND_STREAM: u8 = 1;
+    /// A pattern aggregate, whose target is `log_patterns`.
+    pub const KIND_PATTERN: u8 = 2;
+
+    /// A row of `kind` with every kind-specific column at its default.
+    ///
+    /// **`labels` defaulting to the empty string is load-bearing.**
+    /// `log_streams_idx_mv` is an `ARRAY JOIN` over
+    /// `JSONExtractKeysAndValues(labels, 'String')`, which is the empty array
+    /// for `''`, and an `ARRAY JOIN` over an empty array emits no row — so the
+    /// view is correct whether the server applies its `WHERE kind = 1` before
+    /// or after the join.
+    fn of_kind(received_ms: i64, kind: u8) -> Self {
+        LogLandingRow {
+            received_ms,
+            kind,
+            service: String::new(),
+            fingerprint: Fingerprint::from_raw(0),
+            timestamp_ns: 0,
+            severity: 0,
+            body: String::new(),
+            structured_metadata: String::new(),
+            month: 0,
+            labels: String::new(),
+            updated_ns: 0,
+            pattern: String::new(),
+            pattern_count: 0,
+        }
+    }
+
+    /// A kind-0 row: the columns `log_samples_mv` and `log_metrics_<res>_mv`
+    /// read, and no others.
+    pub fn line(received_ms: i64, row: &LogRow) -> Self {
+        LogLandingRow {
+            service: row.service.clone(),
+            fingerprint: row.fingerprint,
+            timestamp_ns: row.timestamp_ns.0,
+            severity: row.severity,
+            body: row.body.clone(),
+            structured_metadata: row.structured_metadata.clone(),
+            ..Self::of_kind(received_ms, Self::KIND_LINE)
+        }
+    }
+
+    /// A kind-1 row: the columns `log_streams_mv` and `log_streams_idx_mv`
+    /// read, and no others.
+    pub fn stream(received_ms: i64, row: &StreamRow) -> Self {
+        // `to_canonical_json` grows its buffer as it encodes, so it returns
+        // with spare capacity — up to its own length again. The queue holds
+        // this row until its block is encoded and is charged the encoded bytes
+        // ([`estimate_canonical_json_len`]), so the spare capacity is given
+        // back rather than the charge doubled.
+        let mut labels = row.labels.to_canonical_json();
+        labels.shrink_to_fit();
+        LogLandingRow {
+            month: row.month.days_since_epoch(),
+            fingerprint: row.fingerprint,
+            service: row.service.clone(),
+            labels,
+            updated_ns: row.updated_ns,
+            ..Self::of_kind(received_ms, Self::KIND_STREAM)
+        }
+    }
+
+    /// A kind-2 row: the columns `log_patterns_mv` reads, and no others.
+    ///
+    /// **Takes its argument by value** and moves the template out of it, so
+    /// the aggregation's output row and the landing row never hold the same
+    /// text at once. `timestamp_ns` carries the aggregate's bucket floor, which
+    /// is the event's own time floored — the contract the landing table's own
+    /// column comment states.
+    pub fn pattern(received_ms: i64, row: LogPatternRow) -> Self {
+        LogLandingRow {
+            fingerprint: row.fingerprint,
+            timestamp_ns: row.bucket_ns,
+            pattern: row.pattern,
+            pattern_count: row.count,
+            ..Self::of_kind(received_ms, Self::KIND_PATTERN)
+        }
+    }
+}
+
+impl SpoolEncode for LogLandingRow {
+    /// `kind` and `received_ms`, then exactly the keys that kind's target row
+    /// already emits. One encoder emitting every column of the union would put
+    /// another kind's fields in a row that does not carry them.
+    fn to_spool_value(&self) -> serde_json::Value {
+        match self.kind {
+            Self::KIND_LINE => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "service": self.service,
+                "fingerprint": self.fingerprint,
+                "timestamp_ns": self.timestamp_ns,
+                "severity": self.severity,
+                "body": self.body,
+                "structured_metadata": self.structured_metadata,
+            }),
+            Self::KIND_STREAM => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "month": self.month,
+                "fingerprint": self.fingerprint,
+                "service": self.service,
+                "labels": self.labels,
+                "updated_ns": self.updated_ns,
+            }),
+            // Every row is one of the three kinds — nothing else constructs
+            // one — so this arm is the pattern aggregate's. Matching it as the
+            // fallback rather than panicking keeps the audit record readable on
+            // the one path that reaches this encoder at all, which is a failure
+            // path. The keys are the TARGET's (`bucket_ns`, `count`), not this
+            // row type's.
+            _ => serde_json::json!({
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "fingerprint": self.fingerprint,
+                "bucket_ns": self.timestamp_ns,
+                "pattern": self.pattern,
+                "count": self.pattern_count,
+            }),
+        }
+    }
+
+    /// The same shape, written field by field into the sink.
+    ///
+    /// **Why this row overrides the default.** The default builds
+    /// [`Self::to_spool_value`] first — one row's whole value tree — beside
+    /// rows the queue reservation has already been charged for. This row has no
+    /// float and no array, but it has five `String`s and one of them is a log
+    /// line of any length admission accepts. Written this way the row has no
+    /// value of its own, and `SpoolSink`'s invariant bounds what the sink
+    /// holds: `field` takes only a value whose text fits one piece, and
+    /// `str_field` escapes its text in fragments.
+    ///
+    /// **The keys are in sorted order because that is the order the declared
+    /// shape serialises in.** `serde_json::Map` is a `BTreeMap` in this
+    /// workspace (no `preserve_order` feature), so a field added to a kind
+    /// above has to be added here in its sorted place;
+    /// `every_log_landing_row_kind_streams_the_shape_it_declares` compares the
+    /// two documents byte for byte and reddens if it is not.
+    async fn write_spool_json(&self, out: &mut SpoolSink) -> std::io::Result<()> {
+        let mut o = out.begin_object().await?;
+        match self.kind {
+            Self::KIND_LINE => {
+                o.str_field("body", &self.body).await?;
+                o.field("fingerprint", &self.fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("service", &self.service).await?;
+                o.field("severity", &self.severity).await?;
+                o.str_field("structured_metadata", &self.structured_metadata)
+                    .await?;
+                o.field("timestamp_ns", &self.timestamp_ns).await?;
+            }
+            Self::KIND_STREAM => {
+                o.field("fingerprint", &self.fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("labels", &self.labels).await?;
+                o.field("month", &self.month).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("service", &self.service).await?;
+                o.field("updated_ns", &self.updated_ns).await?;
+            }
+            // The pattern aggregate's arm, as the fallback, for the reason
+            // [`Self::to_spool_value`]'s own fallback gives.
+            _ => {
+                o.field("bucket_ns", &self.timestamp_ns).await?;
+                o.field("count", &self.pattern_count).await?;
+                o.field("fingerprint", &self.fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("pattern", &self.pattern).await?;
+                o.field("received_ms", &self.received_ms).await?;
+            }
+        }
+        o.end().await
+    }
+}
+
 /// One `metric_samples` row (docs/schemas.md §2.1). `value` is a raw `f64`
 /// carried verbatim from [`MetricPoint`] — never routed through plain
 /// `serde_json` (which would destroy a stale-NaN payload's exact bit
@@ -769,7 +1012,7 @@ impl MetricLandingRow {
         // holds this row until its block is encoded and is charged the encoded
         // bytes ([`estimate_canonical_json_len`]), so the spare capacity is
         // given back rather than the charge doubled. The rule that requires it
-        // is `writer::metric`'s `LANDING_BLOCK_OVERHEAD_BYTES`.
+        // is `writer::landing`'s `landing_block_overhead_bytes`.
         let mut labels = series.labels.to_canonical_json();
         labels.shrink_to_fit();
         MetricLandingRow {
@@ -2096,6 +2339,69 @@ mod tests {
         "hist_custom_values",
         "hist_counter_reset_hint",
     ];
+
+    /// The `log_landing` columns, in the table's own declaration order
+    /// (`crates/pulsus-schema/src/catalog.rs`, migration 65). Written out here
+    /// rather than read from the catalogue: this crate does not depend on
+    /// `pulsus-schema`, and the point of the case below is that the two agree.
+    const LOG_LANDING_COLUMNS: &[&str] = &[
+        "event_id",
+        "received_ms",
+        "kind",
+        "service",
+        "fingerprint",
+        "timestamp_ns",
+        "severity",
+        "body",
+        "structured_metadata",
+        "month",
+        "labels",
+        "updated_ns",
+        "pattern",
+        "pattern_count",
+    ];
+
+    /// **T4.** The insert's column list is exactly the row type's
+    /// `COLUMN_NAMES`, so omitting `event_id` from the type is what makes the
+    /// server fill the column from its own `DEFAULT generateUUIDv7()`. A row
+    /// type carrying the column would store whatever the writer put there —
+    /// the nil UUID on every row, for an explicit zero — while passing every
+    /// other case here.
+    #[test]
+    fn the_log_insert_omits_event_id_so_the_server_fills_it() {
+        let names = <LogLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
+        assert_eq!(names.len(), 13, "the 14 columns less event_id");
+        let expected: Vec<&str> = LOG_LANDING_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| *c != "event_id")
+            .collect();
+        assert_eq!(names, expected.as_slice(), "in the table's own order");
+        assert!(
+            !names.contains(&"event_id"),
+            "the writer never sets the landed event's identity"
+        );
+    }
+
+    /// **T5.** The landing row's slot cost is taken from `size_of`, never
+    /// written down, so it cannot drift from the fields it prices — and
+    /// `est_landing_bytes` adds exactly that slot to whatever the kind's own
+    /// target estimator priced. Hard-coding the number and adding a field
+    /// reddens the first assertion; dropping the slot term reddens the second.
+    #[test]
+    fn the_log_landing_row_slot_is_taken_from_size_of() {
+        assert_eq!(
+            LOG_LANDING_ROW_SLOT_BYTES,
+            std::mem::size_of::<LogLandingRow>() as u64
+        );
+        for t in [0u64, 1, 25, 4096, 1 << 20] {
+            assert_eq!(
+                LogLandingRow::est_landing_bytes(t),
+                t + LOG_LANDING_ROW_SLOT_BYTES,
+                "the queue holds the row's own slots beside the text it owns"
+            );
+        }
+    }
 
     /// The insert's column list is exactly the row type's `COLUMN_NAMES`, so
     /// omitting `event_id` from the type is what makes the server fill the

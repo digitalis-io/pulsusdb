@@ -31,6 +31,8 @@ rotation_interval: 1h
 log_rollup_resolution: 5s
 metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
+log_landing_retention_hours: 6        # the logs landing table's replay window, in hours
+log_dedup_window: 10000               # blocks each logs table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
 skip_unavailable_shards: false
@@ -53,6 +55,9 @@ writer:
   metrics_landing_retries: 3     # resends of a failed metrics landing insert
   metrics_landing_inserters: 4   # insert workers on the metrics landing queue
   metrics_landing_max_rows: 1048576   # per-push landing row ceiling
+  log_landing_retries: 3         # resends of a failed logs landing insert
+  log_landing_inserters: 4       # insert workers on the logs landing queue
+  log_landing_max_rows: 1048576       # per-push landing row ceiling
 
 reader:
   cache_ttl: 60s
@@ -139,6 +144,38 @@ fn the_documented_block_carries_the_metrics_landing_keys_on_their_own_carriers()
         "metrics_landing_retries",
         "metrics_landing_inserters",
         "metrics_landing_max_rows",
+    ] {
+        assert!(
+            writer.keys().any(|k| k.as_str() == Some(key)),
+            "docs/configuration.md §9's writer block must document {key}"
+        );
+    }
+}
+
+/// **T36.** The documented §9 block carries the five LOGS landing keys, two
+/// at the root and three under `writer:` — the twin of the metrics case
+/// above, and for the same reason: `cfg == Config::default()` is satisfied by
+/// an OMITTED key, so nothing else would notice a line missing from the
+/// documented block. A key documented on the wrong carrier fails too.
+#[test]
+fn the_documented_block_carries_the_log_landing_keys_on_their_own_carriers() {
+    let doc: serde_norway::Value =
+        serde_norway::from_str(GOLDEN_YAML).expect("§9's YAML must parse");
+    let root = doc.as_mapping().expect("§9 is a mapping");
+    for key in ["log_landing_retention_hours", "log_dedup_window"] {
+        assert!(
+            root.keys().any(|k| k.as_str() == Some(key)),
+            "docs/configuration.md §9 must document {key} at the root"
+        );
+    }
+    let writer = root
+        .get("writer")
+        .and_then(|w| w.as_mapping())
+        .expect("§9 has a writer block");
+    for key in [
+        "log_landing_retries",
+        "log_landing_inserters",
+        "log_landing_max_rows",
     ] {
         assert!(
             writer.keys().any(|k| k.as_str() == Some(key)),

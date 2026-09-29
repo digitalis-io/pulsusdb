@@ -236,30 +236,43 @@ fn aligned_now_ns() -> i64 {
 /// `at_ns - 60s + (k+1)*100ms`, so every line is inside the `[1m]` window
 /// at `at_ns`.
 async fn seed(client: &ChClient, db: &str, at_ns: i64) {
+    // Issue #603: the fixture seeds `log_landing`, not the targets.
+    // `log_streams`, `log_streams_idx` and `log_samples` are maintained by
+    // materialized view off it now, so an insert into a target directly
+    // leaves the index this suite's stage-1 resolution reads empty. Kind 1
+    // is the registration, kind 0 a line.
+    let received_ms = at_ns / 1_000_000;
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
-                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), {FP}, \
-                 'v277', '{{\"service_name\":\"v277\"}}', 0)"
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES ({received_ms}, 1, 'v277', {FP}, 0, 0, '', '', \
+                 toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), \
+                 '{{\"service_name\":\"v277\"}}', 0, '', 0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_streams");
+        .expect("seed the landing registration");
 
     let base = at_ns - 60_000_000_000;
     let values: Vec<String> = (0..GROUPS)
         .map(|k| {
             let ts = base + (k as i64 + 1) * SPACING_NS;
-            format!("('v277', {FP}, {ts}, 0, 'id={k}')")
+            format!(
+                "({received_ms}, 0, 'v277', {FP}, {ts}, 0, 'id={k}', '', toDate(0), '', 0, '', 0)"
+            )
         })
         .collect();
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
                  VALUES {}",
                 values.join(", ")
             ),
@@ -267,7 +280,7 @@ async fn seed(client: &ChClient, db: &str, at_ns: i64) {
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_samples");
+        .expect("seed the landing lines");
 }
 
 /// The common log range with `n` surviving `| logfmt` groups.

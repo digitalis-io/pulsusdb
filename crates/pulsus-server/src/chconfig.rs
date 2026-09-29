@@ -156,6 +156,8 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         log_rollup: config.log_rollup_resolution.0,
         metrics_landing_retention_hours: config.metrics_landing_retention_hours,
         metrics_dedup_window: config.metrics_dedup_window,
+        log_landing_retention_hours: config.log_landing_retention_hours,
+        log_dedup_window: config.log_dedup_window,
     }
 }
 
@@ -203,26 +205,23 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
     }
 }
 
-/// Maps `Config` to [`pulsus_write::WriterTables`] (issue #15 architect
-/// plan, Design A): the writer becomes `_dist`-aware, deriving table names
-/// the *same way* [`engine_config_from`] does — a configured `cluster`
-/// writes through the `_dist` wrapper tables, an unclustered deployment
-/// writes the base tables directly. schemas.md §7: "all inserts go
-/// through the `_dist` wrappers … the writer never freelances shard
-/// placement" — this function is that mandate's one enforcement point on
-/// the write path, mirroring `engine_config_from`'s enforcement on the
-/// read path.
+/// Maps `Config` to [`pulsus_write::WriterTables`]: the one table the logs
+/// writer inserts into (issue #603).
+///
+/// **The cluster plays no part.** The name carries no `_dist` suffix in any
+/// mode, because the landing table has no `Distributed` wrapper for the writer
+/// to name: a push carries many fingerprints, so routing its block through one
+/// would split the push per shard and end "one push is one block". The five
+/// target tables keep their wrappers, and [`engine_config_from`] on the read
+/// path derives them exactly as before.
+///
+/// So a fingerprint's rows can sit on several shards, where the Logs family's
+/// `cityHash64(fingerprint)` sharding key used to put them all on one. What
+/// that costs the read path is `docs/schemas.md` §7.
 pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
-    let dist = if config.cluster.is_some() {
-        config.dist_suffix.as_str()
-    } else {
-        ""
-    };
+    let _ = config;
     WriterTables {
-        samples: Arc::from(format!("log_samples{dist}")),
-        streams: Arc::from(format!("log_streams{dist}")),
-        // `log_patterns` (M7-C3, issue #171) co-shards on `fingerprint`.
-        patterns: Arc::from(format!("log_patterns{dist}")),
+        landing: Arc::from("log_landing"),
     }
 }
 
@@ -610,25 +609,65 @@ mod tests {
         assert_eq!(engine_cfg.patterns_table, "log_patterns_dist");
     }
 
+    /// **T42.** The logs writer names one table, `log_landing`, with no
+    /// `_dist` suffix in either mode (issue #603): the landing table has no
+    /// `Distributed` wrapper, because routing a push's block through one would
+    /// split it per shard and end "one push is one block". The five target
+    /// tables keep their wrappers for reads, which
+    /// `engine_config_from_uses_dist_table_names_when_clustered` above pins.
     #[test]
-    fn writer_tables_from_uses_base_table_names_when_unclustered() {
-        let config = Config::default();
-        let tables = writer_tables_from(&config);
-        assert_eq!(&*tables.samples, "log_samples");
-        assert_eq!(&*tables.streams, "log_streams");
-        assert_eq!(&*tables.patterns, "log_patterns");
-    }
+    fn the_logs_writer_names_only_the_landing_table() {
+        for (name, config) in [
+            ("unclustered", Config::default()),
+            (
+                "clustered",
+                Config {
+                    cluster: Some("prod".to_string()),
+                    ..Config::default()
+                },
+            ),
+        ] {
+            let tables = writer_tables_from(&config);
+            assert_eq!(&*tables.landing, "log_landing", "{name}");
+            assert!(
+                !tables.landing.contains("_dist"),
+                "{name}: the writer must never name a Distributed wrapper"
+            );
+        }
 
-    #[test]
-    fn writer_tables_from_uses_dist_table_names_when_clustered() {
-        let config = Config {
+        // A non-default suffix cannot reach it either: the cluster plays no
+        // part in this name at all.
+        let odd = Config {
             cluster: Some("prod".to_string()),
+            dist_suffix: "_shards".to_string(),
             ..Config::default()
         };
-        let tables = writer_tables_from(&config);
-        assert_eq!(&*tables.samples, "log_samples_dist");
-        assert_eq!(&*tables.streams, "log_streams_dist");
-        assert_eq!(&*tables.patterns, "log_patterns_dist");
+        assert_eq!(&*writer_tables_from(&odd).landing, "log_landing");
+    }
+
+    /// **T26.** The pinned seconds deduplication window covers the landing
+    /// budget, so a block the writer is still entitled to resend cannot have
+    /// had its token forgotten on the clock.
+    ///
+    /// **A relation, not a number**: lowering
+    /// `pulsus_schema::DEDUP_WINDOW_SECONDS` or raising the budget reddens it.
+    /// It has to live here because `pulsus-schema` and `pulsus-write` do not
+    /// depend on each other — neither `Cargo.toml` names the other — so this
+    /// crate is the only one that can see both sides.
+    #[test]
+    fn the_pinned_seconds_window_covers_the_landing_budget() {
+        let budget = pulsus_write::writer::WriterRuntime::from_config(
+            &pulsus_config::WriterConfig::default(),
+        )
+        .landing_budget;
+        assert!(
+            pulsus_schema::DEDUP_WINDOW_SECONDS >= budget.as_secs(),
+            "the seconds window ({}) must cover the landing budget ({} s): a \
+             shorter one forgets a block's token while the writer may still \
+             resend it",
+            pulsus_schema::DEDUP_WINDOW_SECONDS,
+            budget.as_secs()
+        );
     }
 
     #[test]

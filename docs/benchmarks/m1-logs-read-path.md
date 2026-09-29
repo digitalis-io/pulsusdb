@@ -293,10 +293,33 @@ rows respectively — not one shard holding everything).
 > previous key reaches all four under the current one. Wherever this page
 > says a stage participates on a *subset*, that is a superseded figure.
 >
+> **Superseded a second time, and further, by issue #603.** The writer no
+> longer inserts through the `_dist` wrappers at all: a logs push is one
+> insert into `log_landing`, which has no wrapper, and five materialized
+> views write that shard's local tables. So placement follows the endpoint
+> that took the push rather than the sharding key, and **one fingerprint's
+> rows can sit on several shards** — which makes the per-shard placement,
+> the owning-subset roster, the pruned shard and the per-shard `read_rows`
+> superseded whatever the key is, and not merely unreproducible under a
+> different one. Two parts of "what still holds" above narrow with it: a
+> fingerprint-scoped stage is no longer confined to a computable owning
+> subset, because there is none to compute, and "each stage executes
+> shard-locally" becomes "each stage's own partials complete per shard and
+> merge at the initiator". **Label discovery changed shape as well**: it is
+> two statements now — an activity scan, then an index scan carrying that
+> scan's result as a literal `fingerprint IN (…)` list — so "only
+> deduplicated results cross the network" no longer covers it, and the
+> active-fingerprint set crosses once to the initiator and once into each
+> shard's copy of the second statement. No read's ANSWER changed
+> (`docs/schemas.md` §7).
+>
 > **The re-capture has not been done.** It needs: the four-shard fixture at
-> `ci/bench-cluster/compose.yaml`, the same CI-scale corpus loaded through
-> the `_dist` wrappers, and a rerun of `xtask bench --dist`, which
-> regenerates [`data/logs-read-dist.json`](data/logs-read-dist.json) and
+> `ci/bench-cluster/compose.yaml`, the same CI-scale corpus **pushed through
+> the ingest API** rather than loaded through the `_dist` wrappers, a rerun
+> of `xtask bench --dist`, and — belonging with the same capture — each
+> shard's own `ProfileEvents['NetworkSendBytes']`/`['NetworkReceiveBytes']`
+> per discovery statement shape, which a single node cannot measure. The
+> rerun regenerates [`data/logs-read-dist.json`](data/logs-read-dist.json) and
 > the table below. The benchmark's own client-side roster model already
 > computes the current key and cross-checks it against the running server
 > (`xtask/src/bench/queries.rs`), so a rerun needs no further change. Full

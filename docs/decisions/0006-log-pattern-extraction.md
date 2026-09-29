@@ -34,20 +34,32 @@ per-line surprises. The trade-off accepted is coarser clustering (a digit-free
 variable word stays literal); because identity is the stored template string, a
 read-time secondary merge can refine it later without touching stored rows.
 
-**D2. Storage is a fourth Logs-family table, batch-pre-aggregated at ingest —
-NOT a materialized view and NOT per-line rows.** An MV is impossible
-(extraction is Rust, not SQL); per-line rows would double `log_samples` write
-volume. `LogWriter::admit_batch` aggregates each request batch into
-`(fingerprint, bucket_ns, template) -> count` before append, so row volume is
-~ distinct templates per stream per 10s bucket per batch. The
+**D2. Storage is a fourth Logs-family table, and the aggregate is formed in Rust
+at ingest — NOT per-line rows.** Extraction is Rust and not SQL, so no view can
+compute the template; per-line rows would double `log_samples` write volume.
+`LogWriter::admit_batch` aggregates each request batch into
+`(fingerprint, bucket_ns, template) -> count` before the block is sealed, so row
+volume is ~ distinct templates per stream per 10s bucket per batch. **What
+carries those rows to the table is a view** (issue #603): the aggregate lands as
+one kind-2 row per `(fingerprint, bucket, template)` in `log_landing`, inside the
+same block as the lines it was extracted from, and `log_patterns_mv` copies it
+through — aliasing the landed `pattern_count` back to the target's `count`, and
+reading the bucket floor off the landed `timestamp_ns`. The decision this revises
+is the ROUTE the rows take, not where the aggregate is computed: that is still
+Rust, still at admission, still before anything is sent. The
 [`log_patterns`](../schemas.md) table is an `AggregatingMergeTree` with `count
 SimpleAggregateFunction(sum, UInt64)`, **`ORDER BY (fingerprint, bucket_ns,
 pattern)`** (bucket_ns before pattern, so a bounded time range prunes at the PK
 level inside each fingerprint's key range — proven by a live `EXPLAIN
 indexes=1` gate), daily partitions, and the same delete-TTL as `log_samples`.
 The 10s ingest bucket is a code constant (`PATTERN_BUCKET_NS`), so the table is
-checksum-gated like every other structural table. Its `_dist` wrapper co-shards
-on `fingerprint` with the rest of the logs family.
+checksum-gated like every other structural table. Its `_dist` wrapper is what
+reads fan out over; **it is not what writes reach it** (issue #603). The writer
+inserts into `log_landing` under its bare name, so a pattern row is placed on
+whichever shard took the push rather than by `cityHash64(fingerprint)`, and one
+fingerprint's pattern rows can sit on several shards. The `/patterns` read
+tolerates that — it is a `GROUP BY` whose partial states merge at the initiator
+([schemas.md §7](../schemas.md)).
 
 **D3. Exactly-once framing.** The writer never auto-replays a block that could
 have committed: a post-send retryable failure is downgraded to `InsertUncertain`
@@ -61,17 +73,25 @@ are therefore **exact on the clean path and on a same-writer re-send, and
 best-effort-approximate under a cross-writer one** (the cited live fidelity
 test builds a new `LogWriter` per admit, so its two admits are the
 cross-writer case, and it cross-checks both tables inflating by the same
-factor). Patterns are excluded
-from the sync durability ack (a `log_patterns` flush failure never 500s an
-ingest whose log lines landed).
+factor). **The patterns-flush exclusion is gone** (issue #603): patterns ride the lines'
+own block, so there is no separate `log_patterns` insert left to fail on its own
+and nothing to exclude from the durability ack. A push either lands its block —
+lines, registration and pattern aggregates together — or lands none of it. What
+remains is the fan-out residual every target of `log_landing` shares: a view that
+throws while the server processes the insert leaves it unrecorded which targets
+kept the block's rows ([schemas.md §4.1](../schemas.md)).
 
 **D4. Memory bound — a fixed per-request ceiling.** The per-batch aggregation
 map is charged into the reserve-before-materialize gate as
 `reserve = Σ template_bound(row) + AGG_BASE_OVERHEAD (1024 B)
-+ min(distinct, MAX_DISTINCT_PATTERNS_PER_BATCH) × PATTERN_ROW_OVERHEAD (256 B)`.
-A hard cap of `MAX_DISTINCT_PATTERNS_PER_BATCH = 10_000` makes the aggregation
-buffer a **fixed ceiling (≈ 2.44 MiB/request)**, independent of any hashbrown
-modeling: at the cap, a row whose template is not already present is dropped
++ min(distinct, MAX_DISTINCT_PATTERNS_PER_BATCH) × (PATTERN_ROW_OVERHEAD (256 B)
++ LOG_LANDING_ROW_SLOT_BYTES)`. The last term is issue #603's: the queue now
+holds a landing row per capped pattern rather than a `LogPatternRow`, so both the
+expression and the fixed ceiling it derives are larger than the figure this
+record first carried — `LOG_LANDING_ROW_SLOT_BYTES` is `size_of::<LogLandingRow>()`,
+read from the type rather than written down, so the ceiling follows the row.
+A hard cap of `MAX_DISTINCT_PATTERNS_PER_BATCH = 10_000` still makes the
+aggregation buffer a **fixed ceiling**, independent of any hashbrown modeling: at the cap, a row whose template is not already present is dropped
 from pattern accounting only (the log line is untouched), counted in
 `patterns_dropped_total`, in deterministic parse order — an under-count folded
 into D3's approximate semantics. A dealloc-aware live-peak allocator gate asserts

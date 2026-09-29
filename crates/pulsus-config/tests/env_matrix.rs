@@ -278,6 +278,33 @@ const ROWS: &[Row] = &[
         value: "2000000",
         check: |c| c.writer.metrics_landing_max_rows == 2_000_000,
     },
+    // **T35.** Issue #603: the logs landing table's five dials. A key with a
+    // range check and no `env.rs` parse passes the range case and fails here.
+    Row {
+        var: "PULSUS_LOG_LANDING_RETENTION_HOURS",
+        value: "24",
+        check: |c| c.log_landing_retention_hours == 24,
+    },
+    Row {
+        var: "PULSUS_LOG_DEDUP_WINDOW",
+        value: "5000",
+        check: |c| c.log_dedup_window == 5_000,
+    },
+    Row {
+        var: "PULSUS_LOG_LANDING_RETRIES",
+        value: "5",
+        check: |c| c.writer.log_landing_retries == 5,
+    },
+    Row {
+        var: "PULSUS_LOG_LANDING_INSERTERS",
+        value: "8",
+        check: |c| c.writer.log_landing_inserters == 8,
+    },
+    Row {
+        var: "PULSUS_LOG_LANDING_MAX_ROWS",
+        value: "2000000",
+        check: |c| c.writer.log_landing_max_rows == 2_000_000,
+    },
     Row {
         var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
         value: "native",
@@ -491,8 +518,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        87,
-        "docs/configuration.md §§1-8 document exactly 87 variables"
+        92,
+        "docs/configuration.md §§1-8 document exactly 92 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

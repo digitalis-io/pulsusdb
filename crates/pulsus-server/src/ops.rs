@@ -266,13 +266,13 @@ fn record_dedup_metrics(signal: &'static str, d: &DedupMetricsSnapshot) {
     metrics::gauge!("pulsus_ingest_dedup_bytes", "signal" => signal).set(d.bytes as f64);
 }
 
-/// The log writer's `pulsus_ingest_*` series: per-table (`log_samples`/
-/// `log_streams`/`log_patterns`), per-signal (`signal="logs"`),
-/// registration-cache, and backfill (`backlog="log_streams"`).
+/// The log writer's `pulsus_ingest_*` series: per-table (`log_landing` — the
+/// one table it inserts into, issue #603), per-signal (`signal="logs"`) and
+/// registration-cache. No backfill series: with one insert per push there is
+/// no separate registration insert to lose, so the `log_streams` registration
+/// backfill is gone.
 fn record_log_ingest_snapshot(s: &WriterMetricsSnapshot) {
-    record_table_metrics("log_samples", &s.samples);
-    record_table_metrics("log_streams", &s.streams);
-    record_table_metrics("log_patterns", &s.patterns);
+    record_table_metrics("log_landing", &s.landing);
 
     metrics::gauge!("pulsus_ingest_queue_bytes", "signal" => "logs").set(s.queue_bytes as f64);
     metrics::counter!("pulsus_ingest_backpressure_total", "signal" => "logs")
@@ -295,18 +295,6 @@ fn record_log_ingest_snapshot(s: &WriterMetricsSnapshot) {
     metrics::counter!("pulsus_ingest_patterns_dropped_total", "signal" => "logs")
         .absolute(s.patterns_dropped_total);
     record_dedup_metrics("logs", &s.dedup);
-
-    record_backfill_metrics(
-        "log_streams",
-        &BackfillMetricsSnapshot {
-            enqueued_total: s.backfill_enqueued_total,
-            dropped_total: s.backfill_dropped_total,
-            retries_total: s.backfill_retries_total,
-            healed_total: s.backfill_healed_total,
-            abandoned_total: s.backfill_abandoned_total,
-            pending: s.backfill_pending,
-        },
-    );
 }
 
 /// The metric writer's `pulsus_ingest_*` series: per-table
@@ -767,20 +755,23 @@ mod tests {
         assert_type(r, "pulsus_ingest_rejected_total", "counter");
     }
 
-    /// AC-2 (logs): `record_log_ingest_snapshot` emits every per-table,
-    /// per-signal, registration-cache, and backfill `pulsus_ingest_*` series.
+    /// **T43.** `record_log_ingest_snapshot` emits ONE `table="log_landing"`
+    /// series set — the one table the logs writer inserts into (issue #603) —
+    /// plus the per-signal and registration-cache series, and **no
+    /// per-target table series and no backfill series at all**: with one
+    /// insert per push there is no separate registration insert to lose, so
+    /// the `log_streams` backlog is gone with the three flush loops.
+    ///
     /// Exhaustive: EVERY emitted series is asserted for both its exact seeded
     /// value AND its `# TYPE` header. The struct literal is fully spelled out
     /// (no `..Default::default()`) so a newly added exported field breaks this
     /// test's compile until it is seeded and asserted. Distinct-nonzero seeds
-    /// (per-table bases 10/20/30, backfill base 40, per-signal 51..=59) catch a
-    /// mis-wired name, `table`/`signal` label, or counter/gauge type.
+    /// (per-table base 10, per-signal 51..=59) catch a mis-wired name,
+    /// `table`/`signal` label, or counter/gauge type.
     #[test]
-    fn log_ingest_snapshot_exports_named_series() {
+    fn the_log_ingest_series_carry_the_landing_table_label() {
         let snap = WriterMetricsSnapshot {
-            samples: table_snap(10),
-            streams: table_snap(20),
-            patterns: table_snap(30),
+            landing: table_snap(10),
             patterns_dropped_total: 51,
             queue_bytes: 1000,
             backpressure_total: 52,
@@ -791,12 +782,6 @@ mod tests {
             lru_misses_total: 57,
             collisions_total: 58,
             rejected_total: 59,
-            backfill_enqueued_total: 41,
-            backfill_dropped_total: 42,
-            backfill_retries_total: 43,
-            backfill_healed_total: 44,
-            backfill_abandoned_total: 45,
-            backfill_pending: 46,
             dedup: dedup_snap(70),
         };
         let r = render_local(|| record_log_ingest_snapshot(&snap));
@@ -804,7 +789,6 @@ mod tests {
         // # TYPE header for every emitted metric name.
         assert_table_types(&r);
         assert_signal_types(&r);
-        assert_backfill_types(&r);
         assert_type(&r, "pulsus_ingest_registrations_total", "counter");
         assert_type(&r, "pulsus_ingest_registration_cache_hits_total", "counter");
         assert_type(
@@ -815,10 +799,15 @@ mod tests {
         assert_type(&r, "pulsus_ingest_collisions_total", "counter");
         assert_type(&r, "pulsus_ingest_patterns_dropped_total", "counter");
 
-        // Per-table values (7 series each).
-        assert_table_series(&r, "log_samples", 10);
-        assert_table_series(&r, "log_streams", 20);
-        assert_table_series(&r, "log_patterns", 30);
+        // Per-table values (7 series), for the ONE table the writer names.
+        assert_table_series(&r, "log_landing", 10);
+        for absent in ["log_samples", "log_streams", "log_patterns"] {
+            assert!(
+                !r.contains(&format!("table=\"{absent}\"")),
+                "{absent} is maintained by materialized view and the writer \
+                 never names it"
+            );
+        }
 
         // Per-signal values.
         assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="logs"}"#, 1000.0);
@@ -866,8 +855,12 @@ mod tests {
         assert_dedup_types(&r);
         assert_dedup_series(&r, "logs", 70);
 
-        // Backfill values (6 series).
-        assert_backfill_series(&r, "log_streams", 40);
+        // No backfill series: a registration row rides the lines' own block,
+        // so there is no separate registration insert left to heal.
+        assert!(
+            !r.contains("pulsus_ingest_backfill"),
+            "the log_streams registration backfill went with the flush loops"
+        );
 
         // Logs have no per-metrics metadata-upsert series.
         assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
@@ -1106,13 +1099,9 @@ mod tests {
         let handle = recorder.handle();
 
         let log = WriterMetricsSnapshot {
-            samples: TableMetricsSnapshot {
+            landing: TableMetricsSnapshot {
                 rows_total: 7,
                 bytes_total: 512,
-                ..Default::default()
-            },
-            streams: TableMetricsSnapshot {
-                rows_total: 3,
                 ..Default::default()
             },
             queue_bytes: 1024,
@@ -1155,13 +1144,8 @@ mod tests {
         // All three sinks bridged through the real handler with their seeds.
         assert_sample(
             &text,
-            r#"pulsus_ingest_rows_total{table="log_samples"}"#,
+            r#"pulsus_ingest_rows_total{table="log_landing"}"#,
             7.0,
-        );
-        assert_sample(
-            &text,
-            r#"pulsus_ingest_rows_total{table="log_streams"}"#,
-            3.0,
         );
         assert_sample(&text, r#"pulsus_ingest_queue_bytes{signal="logs"}"#, 1024.0);
         assert_sample(

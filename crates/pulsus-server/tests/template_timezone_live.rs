@@ -237,30 +237,31 @@ async fn seed(db: &str) {
     let client = ChClient::new(conn_config(db))
         .await
         .expect("connect data client");
+    // Issue #603: the fixture seeds `log_landing`, not the targets.
+    // `log_streams`, `log_streams_idx` and `log_samples` are maintained by
+    // materialized view off it now, so an insert into a target directly
+    // leaves the index this suite's stage-1 resolution reads empty. Kind 1
+    // is the registration, kind 0 the line. `received_ms` is the wall clock
+    // rather than the fixture's fixed instant, because the landing table's
+    // own TTL is on `received_ms` and is hours rather than days — the line's
+    // `timestamp_ns` stays the fixed instant this suite is about.
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
-                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({FIXED_TS_NS}))), \
-                 {FINGERPRINT}, '{SERVICE}', \
-                 '{{\"service_name\":\"{SERVICE}\"}}', 0)"
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 VALUES (toUnixTimestamp64Milli(now64(3)), 1, '{SERVICE}', {FINGERPRINT}, 0, 0, \
+                 '', '', toStartOfMonth(fromUnixTimestamp64Nano(toInt64({FIXED_TS_NS}))), \
+                 '{{\"service_name\":\"{SERVICE}\"}}', 0, '', 0), \
+                 (toUnixTimestamp64Milli(now64(3)), 0, '{SERVICE}', {FINGERPRINT}, \
+                 {FIXED_TS_NS}, 0, 'irrelevant body', '', toDate(0), '', 0, '', 0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed log_streams");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
-                 VALUES ('{SERVICE}', {FINGERPRINT}, {FIXED_TS_NS}, 0, 'irrelevant body')"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed log_samples");
+        .expect("seed log_landing");
 }
 
 /// Runs the one query whose whole output is a template-rendered local time
