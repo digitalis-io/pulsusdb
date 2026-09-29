@@ -5,7 +5,7 @@
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (key = 'a' AND val = '1')
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
@@ -15,7 +15,7 @@ LIMIT 100001
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (key = 'b' AND val = '2')
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
@@ -54,7 +54,7 @@ SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substr
        [if(pi0s != 0, attr_val[pi0s] = '1', if(pi0r != 0, attr_val[pi0r] = '1', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = '1', 0))))), if(pi1s != 0, attr_val[pi1s] = '2', if(pi1r != 0, attr_val[pi1r] = '2', if(pi1e != 0, pm1e != 0, if(pi1l != 0, pm1l != 0, if(pi1i != 0, attr_val[pi1i] = '2', 0))))), if(pi2s != 0, attr_val[pi2s] = '3', if(pi2r != 0, attr_val[pi2r] = '3', if(pi2e != 0, pm2e != 0, if(pi2l != 0, pm2l != 0, if(pi2i != 0, attr_val[pi2i] = '3', 0))))), if(pi3s != 0, attr_val[pi3s] = '4', if(pi3r != 0, attr_val[pi3r] = '4', if(pi3e != 0, pm3e != 0, if(pi3l != 0, pm3l != 0, if(pi3i != 0, attr_val[pi3i] = '4', 0)))))] AS attr_slot
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
 ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 

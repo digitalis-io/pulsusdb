@@ -103,25 +103,11 @@ pub(crate) fn date_literal(days: i64) -> String {
 }
 
 /// The search window's bound convention, declared ONCE for this whole
-/// module: `ts > start AND ts <= end` (docs/schemas.md §4.2), so
-/// `end_ns` is IN the window.
-///
-/// Both [`date_clause`] and [`time_clause`] render from the value this
-/// returns, which is what keeps the day-partition prune agreeing with
-/// the row bound. Changing the constructor here to
-/// [`WindowSql::start_closed_end_open`] — the convention
-/// [`super::graph_sql`] and [`super::metrics_sql`] use, and the obvious
-/// "fix" for three files that look inconsistent — changes the row bound
-/// too and moves every `golden/traces_search/*.sql`. That is deliberate.
-///
-/// Were the DAY bound alone to take the right-open rule, it would narrow
-/// to one day less than the row bound admits and DROP spans stored at
-/// exactly `end_ns` — measured, 499 999 rows returned where 500 001 were
-/// correct. That is the loud direction in consequence but the quiet one
-/// in appearance: no SQL a golden pins would move. See
-/// [`super::window_sql`] for both directions and their figures.
+/// module: `start <= ts < end` (requirement R9, `docs/api.md` §4.2), the
+/// one rule every request window follows. [`super::window_sql`]'s module
+/// doc owns the two conventions and says which caller takes which.
 fn bounds(w: TimeWindow) -> WindowSql {
-    WindowSql::start_open_end_closed(w.start_ns, w.end_ns)
+    WindowSql::start_closed_end_open(w.start_ns, w.end_ns)
 }
 
 /// The `trace_attrs_idx` daily-partition pruning clause for a window
@@ -130,7 +116,7 @@ fn date_clause(w: TimeWindow) -> String {
     bounds(w).date_clause()
 }
 
-/// The row-level time bound (`ts > start AND ts <= end`,
+/// The row-level time bound (`ts >= start AND ts < end`,
 /// docs/schemas.md §4.2).
 fn time_clause(w: TimeWindow) -> String {
     bounds(w).time_clause()
@@ -143,8 +129,15 @@ fn bucket_clause(w: TimeWindow) -> String {
 }
 
 /// The `trace_recent` row bound (issue #560): a stored `(bucket, trace)`
-/// row can hold a span in `(start, end]` only if its newest span is after
-/// `start` and its oldest is at or before `end`.
+/// row can hold a span in `[start, end)` only if its newest span is at or
+/// after the window's first included nanosecond and its oldest is at or
+/// before the last.
+///
+/// **Both literals come from [`bounds`]**, not from `w` — the operators
+/// are written out here, so taking `start_ns` directly would leave this
+/// one clause on the other convention while every other rendering moved,
+/// and a trace whose newest span sits exactly on `start` would be dropped
+/// from the candidate set before phase 2 ever saw it.
 ///
 /// There is no `ts_max <= end` bound, and there cannot be one: a trace
 /// with a span inside the window and a later span in the same bucket has
@@ -153,10 +146,11 @@ fn bucket_clause(w: TimeWindow) -> String {
 /// empty search returns nothing at production trace rates
 /// (docs/traceql-schema-migration.md §4, Q0).
 fn recent_row_clause(w: TimeWindow) -> String {
+    let b = bounds(w);
     format!(
-        "ts_max > {} AND ts_min <= {}",
-        w.start_ns,
-        bounds(w).last_included_ns()
+        "ts_max >= {} AND ts_min <= {}",
+        b.first_included_ns(),
+        b.last_included_ns()
     )
 }
 
@@ -206,7 +200,7 @@ fn hex32(id: &[u8; 16]) -> String {
 /// FROM trace_recent
 /// WHERE <date clause>
 ///   AND <bucket clause>
-///   AND ts_max > <start> AND ts_min <= <end>
+///   AND ts_max >= <start> AND ts_min <= <end - 1>
 /// ```
 ///
 /// There `bound_ts` is the trace's newest span in its overlapping
@@ -820,7 +814,7 @@ mod tests {
                  \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
                  \x20\x20FROM trace_spans\n\
                  \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
-                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20\x20\x20AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n\
                  \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
                  \x20\x20LIMIT 10000 BY trace_id\n\
                  )",
@@ -832,7 +826,7 @@ mod tests {
                  \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_num\n\
                  \x20\x20FROM trace_spans\n\
                  \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
-                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20\x20\x20AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n\
                  \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
                  \x20\x20LIMIT 10000 BY trace_id\n\
                  )",
@@ -844,7 +838,7 @@ mod tests {
                  \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
                  \x20\x20FROM trace_spans\n\
                  \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
-                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20\x20\x20AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n\
                  \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
                  \x20\x20LIMIT 10000 BY trace_id\n\
                  )",
@@ -856,7 +850,7 @@ mod tests {
                  \x20\x20SELECT trace_id, span_id, attr_key, attr_scope, attr_val\n\
                  \x20\x20FROM trace_spans\n\
                  \x20\x20WHERE trace_id IN (unhex('07070707070707070707070707070707'))\n\
-                 \x20\x20\x20\x20AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20\x20\x20\x20AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n\
                  \x20\x20ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
                  \x20\x20LIMIT 10000 BY trace_id\n\
                  )",
@@ -890,38 +884,33 @@ mod tests {
         );
     }
 
-    /// The search window's end is INCLUDED (`ts <= end`), so a window
-    /// ending exactly at midnight still contains one nanosecond of the
-    /// next UTC day and must keep that day's partition — the opposite of
-    /// the rule `graph_sql`/`metrics_sql` correctly apply to their
-    /// right-OPEN windows (issue #525).
+    /// The search window's end is EXCLUDED (`ts < end`, R9), so a window
+    /// ending exactly at midnight contains no nanosecond of the next UTC
+    /// day and must not read that day's partition.
     ///
     /// `date_clause_spans_the_windows_utc_days` above cannot see this:
     /// its window ends mid-day, where both conventions agree. A window
     /// ending on a day boundary is the only input that discriminates.
     ///
-    /// Giving THIS module the right-open rule narrows the day clause to
-    /// one day less than the row bound admits, so a span stored at
-    /// exactly `end_ns` sits in a partition the query never reads:
-    /// measured, 499 999 rows returned where 500 001 were correct. A
-    /// lost answer, not a slower query. The reverse mistake — an
-    /// exclusive window given this module's inclusive rule — is the one
-    /// that keeps every answer and merely reads an extra partition
-    /// ([`super::window_sql`] has both).
+    /// Giving THIS module the right-closed rule widens the day clause by
+    /// one day: every answer identical, one extra partition read — the
+    /// quiet direction. The other mistake, a right-closed window given
+    /// the right-open day rule, loses rows instead
+    /// ([`super::window_sql`] has both, with their figures).
     #[test]
-    fn date_clause_keeps_the_end_day_because_the_search_end_is_included() {
+    fn date_clause_drops_the_end_day_because_the_search_end_is_excluded() {
         let w = TimeWindow {
             start_ns: 1_699_920_000_000_000_000, // 2023-11-14 00:00:00
-            end_ns: 1_700_006_400_000_000_000,   // 2023-11-15 00:00:00 (INCLUDED)
+            end_ns: 1_700_006_400_000_000_000,   // 2023-11-15 00:00:00 (EXCLUDED)
         };
         assert_eq!(
             date_clause(w),
-            "date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
+            "date >= toDate('2023-11-14') AND date <= toDate('2023-11-14')"
         );
         // And the row bound this day bound has to agree with.
         assert_eq!(
             time_clause(w),
-            "timestamp_ns > 1699920000000000000 AND timestamp_ns <= 1700006400000000000"
+            "timestamp_ns >= 1699920000000000000 AND timestamp_ns < 1700006400000000000"
         );
     }
 

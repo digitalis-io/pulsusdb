@@ -968,7 +968,7 @@ FROM trace_spans
 WHERE status_code = 2;
 ```
 
-- **`ts_min` is what makes the recency read correct.** The read bounds each row by `ts_max > start AND ts_min <= end`. Without `ts_min` every trace whose spans lie wholly after `end` in the window's last bucket is a candidate, and those rank above every genuine one: the empty search returns nothing once they reach the candidate ceiling, which at the mean bucket tail is about 667 traces per second (`docs/traceql-schema-migration.md` §3.6). There is no `ts_max <= end` bound: a trace with a span in the window and a later span in the same bucket is an answer.
+- **`ts_min` is what makes the recency read correct.** The read bounds each row by `ts_max >= start AND ts_min <= end - 1` — the window's first included nanosecond and its last (requirement R9). Without `ts_min` every trace whose spans lie wholly after `end` in the window's last bucket is a candidate, and those rank above every genuine one: the empty search returns nothing once they reach the candidate ceiling, which at the mean bucket tail is about 667 traces per second (`docs/traceql-schema-migration.md` §3.6). There is no `ts_max <= end` bound: a trace with a span in the window and a later span in the same bucket is an answer.
 - **`date` is a function of `bucket`.** A UTC day is 288 buckets exactly, so no bucket straddles midnight; `bucket` leads the sort key, so a time predicate prunes granules rather than whole day partitions. The bucket width is the reader's `RECENT_BUCKET_NS` (`crates/pulsus-read/src/traces/window_sql.rs`), bound to the view's literal by a test.
 - **`trace_recent`'s TTL reads `ts_max`, not `date`:** a `date` TTL would expire the whole partition at midnight of `date + N`, under-retaining a span written at 23:59 by almost a day.
 - **A repeated identical span block leaves both tables' physical `count()` unchanged**, immediately, with no merge and no `FINAL`. A view's insert into its target carries a block id derived from the source block (`deduplicate_blocks_in_dependent_materialized_views = 1`), and a target with its own `non_replicated_deduplication_window` recognises the repeat and drops it — the single-node `trace_spans` itself has no window and stores the block twice, as before. The span inserter pins `deduplicate_insert = enable` and `deduplicate_blocks_in_dependent_materialized_views = 1` on every insert into `trace_spans`/`trace_spans_dist` (`crates/pulsus-write/src/writer/trace.rs`, `span_insert_settings`), so this does not depend on the server profile; no other insert carries the pins. A replay whose rows arrive in another order is a different block and is written again; its rows collapse at merge, because both engines are idempotent under a duplicate row, and they change no answer. The window is 10,000 blocks per table.
@@ -1027,7 +1027,7 @@ The generator classes, their prefixes, and their honest costs:
 | trace-level intrinsics — `traceDuration` / `rootName` / `rootServiceName` / `span:childCount` (issue #184) | the time-range generator | no candidates of their own (a windowed root scan would MISS out-of-window roots); exact via the trace-wide co-loads below — sole-predicate scale routed to #25 |
 | `!=` / `!~` / `{}` match-all | the time-range generator (`trace_recent` over the window, #560) | complete superset; absence is not indexable. Granule-pruned on the leading `bucket` column; the same candidates as a `trace_spans` scan whenever the window's ends lie in different buckets |
 
-**The two derived-table generators (#560).** The time-range generator and `{ status = error }` read the tables §4.1 derives from `trace_spans`, and neither statement carries an `AND (<predicate>)` line — the table is the predicate. For the window `(1700000000000000000, 1700010800000000000]` at `PULSUS_TRACEQL_MAX_CANDIDATES = 100000`:
+**The two derived-table generators (#560).** The time-range generator and `{ status = error }` read the tables §4.1 derives from `trace_spans`, and neither statement carries an `AND (<predicate>)` line — the table is the predicate. For the window `[1700000000000000000, 1700010800000000000)` at `PULSUS_TRACEQL_MAX_CANDIDATES = 100000`:
 
 ```sql
 -- the time-range generator
@@ -1035,7 +1035,7 @@ SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
 FROM trace_recent
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND bucket >= 5666666 AND bucket <= 5666702
-  AND ts_max > 1700000000000000000 AND ts_min <= 1700010800000000000
+  AND ts_max >= 1700000000000000000 AND ts_min <= 1700010799999999999
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
@@ -1044,7 +1044,7 @@ LIMIT 100001
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_error_spans
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001

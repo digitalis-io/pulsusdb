@@ -600,7 +600,11 @@ class Statement(Render):
         win = self.W
         if len(stage['args']) >= 3:
             s0, e0 = int(stage['args'][1]), int(stage['args'][2])
-            sel_win = f"start_ns >= {s0} AND start_ns < {e0}"
+            # Right-CLOSED, unlike every request window this file renders:
+            # compare()'s start/end are operands of the query language and
+            # the reference defines them as `(start, end]`
+            # (functional-requirements.md §4.1).
+            sel_win = f"start_ns > {s0} AND start_ns <= {e0}"
         else:
             sel_win = '1'
         kinds = "[" + ", ".join(f"'{k}'" for k in KIND_KEYWORDS) + "]"

@@ -637,7 +637,7 @@ async fn stage1_intrinsics_query_selects_the_service_time_projection() {
     let stage1 = format!(
         "SELECT trace_id, span_id, timestamp_ns, duration_ns FROM {db}.trace_spans \
          PREWHERE service = 'checkout' \
-         WHERE timestamp_ns > {base_ns} AND timestamp_ns <= {end_ns} \
+         WHERE timestamp_ns >= {base_ns} AND timestamp_ns < {end_ns} \
            AND duration_ns > 2000000000"
     );
 
@@ -803,7 +803,7 @@ async fn a_span_name_search_selects_the_name_time_projection_and_prunes() {
 
     let search = format!(
         "SELECT trace_id, max(timestamp_ns) AS bound_ts FROM {db}.trace_spans \
-         WHERE timestamp_ns > {base_ns} AND timestamp_ns <= {end_ns} \
+         WHERE timestamp_ns >= {base_ns} AND timestamp_ns < {end_ns} \
            AND (name = 'op-7') \
          GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001"
     );
@@ -1009,7 +1009,7 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
         format!(
             "SELECT trace_id, span_id FROM {db}.trace_attrs_idx \
              WHERE key = 'http.status_code' AND val = '500' AND scope = 'span' \
-               AND timestamp_ns > {from_ns} AND timestamp_ns <= {end_ns}"
+               AND timestamp_ns >= {from_ns} AND timestamp_ns < {end_ns}"
         )
     };
     let full_sql = stage2(base_ns);

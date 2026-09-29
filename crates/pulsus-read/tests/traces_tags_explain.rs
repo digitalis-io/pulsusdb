@@ -899,6 +899,10 @@ fn final_granules(raw: &str) -> (u64, u64) {
 /// alternative, and the one a later reader is most likely to try —
 /// defeats the projection, which is exactly why
 /// `tags_sql::span_name_values_sql` carries only the day clause.
+///
+/// Issue #583 left this case alone deliberately: part (c) is the guard on
+/// the deferral — the store-backed tag reads keep the day-granular window
+/// until issue #598 moves them onto the statement whose cost is measured.
 #[tokio::test]
 async fn span_name_projection_is_selected_and_prunes() {
     if !should_run() {

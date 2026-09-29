@@ -219,7 +219,9 @@ fn duration_expr(span_index: &str) -> String {
 ///
 /// `+ 1` nanosecond so the first span lands strictly inside the request
 /// window, whose lower bound the generator applies as
-/// `timestamp_ns > start_ns`; and the offset is `index * spacing` rather
+/// `timestamp_ns >= start_ns` (issue #583; it was `>` when this was
+/// written, so the nanosecond was load-bearing then and is margin now);
+/// and the offset is `index * spacing` rather
 /// than `(index + 1) * spacing` so the LAST span lands strictly inside
 /// the fifth day rather than exactly on the midnight that opens the
 /// sixth. One span in a sixth partition would make the corpus 6 parts

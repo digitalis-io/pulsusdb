@@ -108,7 +108,11 @@ without its index row (`T-W6`).
 
 ### 3.1 The window
 
-One rule, `start <= ts < end`, on every read path (owner decision, 2026-09-22).
+One rule, `start <= ts < end`, on every **request** window (owner decision,
+2026-09-22). `functional-requirements.md` §4.1 is the inventory and names the
+exemptions: an instant set the query text itself names — `compare()`'s
+`start`/`end` arguments, a range selector's `[5m]` — is defined by the query
+language and keeps the reference's definition.
 The row bound, the bucket bound and the day-partition bound are rendered from
 one value — the last nanosecond the window includes — in one place, the existing
 `window_sql` module, which exists because rendering them separately loses rows

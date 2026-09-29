@@ -84,8 +84,8 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:651	crates/p
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:183	crates/pulsus-read/src/traces/search_eval.rs	183		line	from_stored	pub fn from_stored(s: &str) -> Self {
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:2436	crates/pulsus-read/src/traces/search_eval.rs	2436		line	ProjectionValue	ProjectionValue::SelectValue { field_idx } => env
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
-docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:454	crates/pulsus-read/src/traces/search_sql.rs	454		line	hydration_sql	pub fn hydration_sql(
-docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:551-561	crates/pulsus-read/src/traces/search_sql.rs	551	561	line	membership	/// gated rather than asserted. /// /// **`SELECT DISTINCT` over one more column can return more rows.** A span /// carr
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:448	crates/pulsus-read/src/traces/search_sql.rs	448		line	hydration_sql	pub fn hydration_sql(
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:545-555	crates/pulsus-read/src/traces/search_sql.rs	545	555	line	membership	/// gated rather than asserted. /// /// **`SELECT DISTINCT` over one more column can return more rows.** A span /// carr
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:71	crates/pulsus-read/src/traces/search_sql.rs	71		line	byte_cap_expr	pub(crate) fn byte_cap_expr(col: &str) -> String {
 docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:359	crates/pulsus-schema/src/catalog.rs	359		prose	timestamp_ns	(trace_id, timestamp_ns)
 docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
@@ -170,7 +170,7 @@ docs/query-lowering.md	search_plan.rs:2143	crates/pulsus-read/src/traces/search_
 docs/query-lowering.md	search_plan.rs:3141	crates/pulsus-read/src/traces/search_plan.rs	3141		line	candidates	// Cross-spanset `{A} op {B}` candidates are the superset union of
 docs/query-lowering.md	search_plan.rs:954	crates/pulsus-read/src/traces/search_plan.rs	954		line	count	.count()
 docs/query-lowering.md	search_response.rs:504	crates/pulsus-server/src/traces_api/search_response.rs	504		line	group_json	// one-entry list and is served by `group_json` above, so the
-docs/query-lowering.md	search_sql.rs:684	crates/pulsus-read/src/traces/search_sql.rs	684		line	spans_table	pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
+docs/query-lowering.md	search_sql.rs:678	crates/pulsus-read/src/traces/search_sql.rs	678		line	spans_table	pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 docs/query-lowering.md	sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		prose	streams_table	fingerprint
 docs/query-lowering.md	traces/compile.rs:172	crates/pulsus-read/src/traces/compile.rs	172		line	hydrated	/// every leaf against every hydrated span on every search. A
 docs/query-lowering.md	traces/compile.rs:175	crates/pulsus-read/src/traces/compile.rs	175		line	predicate	/// generates on the service predicate alone — is a superset, and
@@ -343,22 +343,22 @@ docs/query-to-sql.md	search_plan.rs:2119	crates/pulsus-read/src/traces/search_pl
 docs/query-to-sql.md	search_plan.rs:2130	crates/pulsus-read/src/traces/search_plan.rs	2130		line	PipelineStage	PipelineStage::Metric(stage) => {
 docs/query-to-sql.md	search_plan.rs:2131	crates/pulsus-read/src/traces/search_plan.rs	2131		line	TypeMismatch	return Err(PlanError::TypeMismatch(format!(
 docs/query-to-sql.md	search_plan.rs:2137	crates/pulsus-read/src/traces/search_plan.rs	2137		line	MetricSecondStage	PipelineStage::MetricSecondStage(stage) => {
-docs/query-to-sql.md	search_sql.rs:110-112	crates/pulsus-read/src/traces/search_sql.rs	110	112	line	start_closed_end_open	/// returns, which is what keeps the day-partition prune agreeing with /// the row bound. Changing the constructor here
-docs/query-to-sql.md	search_sql.rs:135	crates/pulsus-read/src/traces/search_sql.rs	135		line	time_clause	fn time_clause(w: TimeWindow) -> String {
-docs/query-to-sql.md	search_sql.rs:176	crates/pulsus-read/src/traces/search_sql.rs	176		line	for	for b in id {
-docs/query-to-sql.md	search_sql.rs:230	crates/pulsus-read/src/traces/search_sql.rs	230		prose	generator_sql	generator_sql
-docs/query-to-sql.md	search_sql.rs:243	crates/pulsus-read/src/traces/search_sql.rs	243		line	GenTable	GenTable::Spans => {
-docs/query-to-sql.md	search_sql.rs:288	crates/pulsus-read/src/traces/search_sql.rs	288		prose	trace_id	ORDER BY bound_ts DESC, trace_id ASC
-docs/query-to-sql.md	search_sql.rs:289	crates/pulsus-read/src/traces/search_sql.rs	289		line	gen_cap	gen_cap + 1
-docs/query-to-sql.md	search_sql.rs:454	crates/pulsus-read/src/traces/search_sql.rs	454		prose	hydration_sql	hydration_sql
-docs/query-to-sql.md	search_sql.rs:507	crates/pulsus-read/src/traces/search_sql.rs	507		line	trace_id	LIMIT {} BY trace_id",
-docs/query-to-sql.md	search_sql.rs:562	crates/pulsus-read/src/traces/search_sql.rs	562		prose	membership_sql	membership_sql
-docs/query-to-sql.md	search_sql.rs:634	crates/pulsus-read/src/traces/search_sql.rs	634		prose	event_set_sql	event_set_sql
-docs/query-to-sql.md	search_sql.rs:638-662	crates/pulsus-read/src/traces/search_sql.rs	638	662	line	max_spans_per_trace	window: TimeWindow, max_spans_per_trace: usize, ) -> String { let key = escape::ch_string(set.key()); let scope = escape
-docs/query-to-sql.md	search_sql.rs:684	crates/pulsus-read/src/traces/search_sql.rs	684		prose	spans_table	root_sql
-docs/query-to-sql.md	search_sql.rs:708-710	crates/pulsus-read/src/traces/search_sql.rs	708	710	line	root_ordering_tuple	pub(crate) fn root_ordering_tuple() -> String { format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id
-docs/query-to-sql.md	search_sql.rs:724	crates/pulsus-read/src/traces/search_sql.rs	724		prose	trace_ctx_sql	trace_ctx_sql
-docs/query-to-sql.md	search_sql.rs:748	crates/pulsus-read/src/traces/search_sql.rs	748		prose	child_count_sql	child_count_sql
+docs/query-to-sql.md	search_sql.rs:109-111	crates/pulsus-read/src/traces/search_sql.rs	109	111	line	start_closed_end_open	fn bounds(w: TimeWindow) -> WindowSql { WindowSql::start_closed_end_open(w.start_ns, w.end_ns) }
+docs/query-to-sql.md	search_sql.rs:121	crates/pulsus-read/src/traces/search_sql.rs	121		line	time_clause	fn time_clause(w: TimeWindow) -> String {
+docs/query-to-sql.md	search_sql.rs:170	crates/pulsus-read/src/traces/search_sql.rs	170		line	for	for b in id {
+docs/query-to-sql.md	search_sql.rs:224	crates/pulsus-read/src/traces/search_sql.rs	224		prose	generator_sql	generator_sql
+docs/query-to-sql.md	search_sql.rs:237	crates/pulsus-read/src/traces/search_sql.rs	237		line	GenTable	GenTable::Spans => {
+docs/query-to-sql.md	search_sql.rs:282	crates/pulsus-read/src/traces/search_sql.rs	282		prose	trace_id	ORDER BY bound_ts DESC, trace_id ASC
+docs/query-to-sql.md	search_sql.rs:283	crates/pulsus-read/src/traces/search_sql.rs	283		line	gen_cap	gen_cap + 1
+docs/query-to-sql.md	search_sql.rs:448	crates/pulsus-read/src/traces/search_sql.rs	448		prose	hydration_sql	hydration_sql
+docs/query-to-sql.md	search_sql.rs:501	crates/pulsus-read/src/traces/search_sql.rs	501		line	trace_id	LIMIT {} BY trace_id",
+docs/query-to-sql.md	search_sql.rs:556	crates/pulsus-read/src/traces/search_sql.rs	556		prose	membership_sql	membership_sql
+docs/query-to-sql.md	search_sql.rs:628	crates/pulsus-read/src/traces/search_sql.rs	628		prose	event_set_sql	event_set_sql
+docs/query-to-sql.md	search_sql.rs:632-656	crates/pulsus-read/src/traces/search_sql.rs	632	656	line	max_spans_per_trace	window: TimeWindow, max_spans_per_trace: usize, ) -> String { let key = escape::ch_string(set.key()); let scope = escape
+docs/query-to-sql.md	search_sql.rs:678	crates/pulsus-read/src/traces/search_sql.rs	678		prose	spans_table	root_sql
+docs/query-to-sql.md	search_sql.rs:702-704	crates/pulsus-read/src/traces/search_sql.rs	702	704	line	root_ordering_tuple	pub(crate) fn root_ordering_tuple() -> String { format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id
+docs/query-to-sql.md	search_sql.rs:718	crates/pulsus-read/src/traces/search_sql.rs	718		prose	trace_ctx_sql	trace_ctx_sql
+docs/query-to-sql.md	search_sql.rs:742	crates/pulsus-read/src/traces/search_sql.rs	742		prose	child_count_sql	child_count_sql
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	RollupBytes	sum(bytes)
 docs/query-to-sql.md	sql.rs:1123-1129	crates/pulsus-read/src/logql/sql.rs	1123	1129	prose	WithStructuredMetadata	structured_metadata
 docs/query-to-sql.md	sql.rs:1216-1239	crates/pulsus-read/src/logql/sql.rs	1216	1239	prose	metric_raw_samples_sliding	metric_raw_samples_sliding
@@ -378,7 +378,7 @@ docs/query-to-sql.md	traces/exec.rs:3584	crates/pulsus-read/src/traces/exec.rs	3
 docs/query-to-sql.md	traces/exec.rs:843	crates/pulsus-read/src/traces/exec.rs	843		line	0	.0
 docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	nanosecond	/// the window and the last nanosecond it contains is `end_ns - 1`.
 docs/query-to-sql.md	traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
-docs/query-to-sql.md	traces/search_sql.rs:110-112	crates/pulsus-read/src/traces/search_sql.rs	110	112	line	start_closed_end_open	/// returns, which is what keeps the day-partition prune agreeing with /// the row bound. Changing the constructor here
-docs/query-to-sql.md	traces/search_sql.rs:176	crates/pulsus-read/src/traces/search_sql.rs	176		line	for	for b in id {
+docs/query-to-sql.md	traces/search_sql.rs:109-111	crates/pulsus-read/src/traces/search_sql.rs	109	111	line	start_closed_end_open	fn bounds(w: TimeWindow) -> WindowSql { WindowSql::start_closed_end_open(w.start_ns, w.end_ns) }
+docs/query-to-sql.md	traces/search_sql.rs:170	crates/pulsus-read/src/traces/search_sql.rs	170		line	for	for b in id {
 docs/query-to-sql.md	traces_api/error.rs:270-274	crates/pulsus-server/src/traces_api/error.rs	270	274	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
 docs/query-to-sql.md	traces_api/error.rs:385	crates/pulsus-server/src/traces_api/error.rs	385		line	PipelineInvalid	ReadError::PipelineInvalid { .. } => (StatusCode::BAD_REQUEST, e.to_string()),

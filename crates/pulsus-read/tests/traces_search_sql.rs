@@ -835,36 +835,36 @@ fn the_derived_table_generators_render_the_statements_the_plan_prints() {
                   FROM trace_recent\n\
                   WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n  \
                   AND bucket >= 5666666 AND bucket <= 5666702\n  \
-                  AND ts_max > 1700000000000000000 AND ts_min <= 1700010800000000000\n\
+                  AND ts_max >= 1700000000000000000 AND ts_min <= 1700010799999999999\n\
                   GROUP BY trace_id\n\
                   ORDER BY bound_ts DESC, trace_id ASC\n\
                   LIMIT 100001";
     let errors = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
                   FROM trace_error_spans\n\
                   WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n  \
-                  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n\
                   GROUP BY trace_id\n\
                   ORDER BY bound_ts DESC, trace_id ASC\n\
                   LIMIT 100001";
     let neq_error = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
                      FROM trace_spans\n\
-                     WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n  \
+                     WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n  \
                      AND (status_code != 2)\n\
                      GROUP BY trace_id\n\
                      ORDER BY bound_ts DESC, trace_id ASC\n\
                      LIMIT 100001";
     let eq_ok = "SELECT trace_id, max(timestamp_ns) AS bound_ts\n\
                  FROM trace_spans\n\
-                 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n  \
+                 WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000\n  \
                  AND (status_code = 1)\n\
                  GROUP BY trace_id\n\
                  ORDER BY bound_ts DESC, trace_id ASC\n\
                  LIMIT 100001";
     let pre_epoch = "SELECT trace_id, toInt64(max(ts_max)) AS bound_ts\n\
                      FROM trace_recent\n\
-                     WHERE date >= toDate('1969-12-30') AND date <= toDate('1970-01-01')\n  \
-                     AND bucket >= -289 AND bucket <= 0\n  \
-                     AND ts_max > -86400000000002 AND ts_min <= 0\n\
+                     WHERE date >= toDate('1969-12-30') AND date <= toDate('1969-12-31')\n  \
+                     AND bucket >= -289 AND bucket <= -1\n  \
+                     AND ts_max >= -86400000000002 AND ts_min <= -1\n\
                      GROUP BY trace_id\n\
                      ORDER BY bound_ts DESC, trace_id ASC\n\
                      LIMIT 100001";
@@ -927,8 +927,8 @@ fn worked_example_pins_the_documented_fragments() {
     );
     let generator = &plan.generator_sqls[0];
     assert!(generator.contains("PREWHERE service = 'checkout'"));
-    assert!(generator.contains("timestamp_ns > 1700000000000000000"));
-    assert!(generator.contains("timestamp_ns <= 1700010800000000000"));
+    assert!(generator.contains("timestamp_ns >= 1700000000000000000"));
+    assert!(generator.contains("timestamp_ns < 1700010800000000000"));
     assert!(generator.contains("ORDER BY bound_ts DESC, trace_id ASC"));
     assert!(
         generator.ends_with(&format!("LIMIT {}", MAX_CANDIDATES + 1)),

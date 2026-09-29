@@ -11,7 +11,7 @@ docs/query-lowering.md	ast.rs:939	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1655	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2077	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:627	blank_target_line
-docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:602	ambiguous_basename
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:596	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:391	ambiguous_basename
 docs/query-lowering.md	exec.rs:124	ambiguous_basename
 docs/query-lowering.md	exec.rs:148	ambiguous_basename

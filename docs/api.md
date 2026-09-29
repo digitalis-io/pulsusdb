@@ -977,7 +977,7 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 |-------|-------|
 | `q` | TraceQL query (preferred) |
 | `tags`, `minDuration`, `maxDuration` | legacy search params, compiled to TraceQL internally (below) |
-| `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms; integers with magnitude ≥ 10^12 are nanoseconds, smaller ones seconds); **both required**, `end > start` |
+| `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms; integers with magnitude ≥ 10^12 are nanoseconds, smaller ones seconds); **both required**, `end > start`. The window is `start <= ts < end` — a span at exactly `start` matches, one at exactly `end` does not (requirement R9) |
 | `limit`, `spss` | result cap (default 20) and spans-per-spanset cap (default 3); positive integers |
 
 **`q` vs legacy params:** mutually exclusive — supplying `q` together with any of `tags`/`minDuration`/`maxDuration` is a `400`, never silent precedence. Supplying neither is a valid time-range-only search (`{}`).
