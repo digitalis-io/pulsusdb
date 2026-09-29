@@ -847,7 +847,7 @@ measurement.
   (`crates/pulsus-read/src/logql/params.rs:121`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
   `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:466`,
-  `crates/pulsus-read/src/traces/search_sql.rs:602`). The seed is the winners' trace ids, bounded
+  `crates/pulsus-read/src/traces/search_sql.rs:596`). The seed is the winners' trace ids, bounded
   by the request `limit`.
 
 **This is the case §2.6's earlier form got structurally wrong.** `Emit` is `Never`, so §2.5's fold
@@ -925,7 +925,7 @@ nine read two tables and two (`nested_boolean`, `structural_sibling`) read one.
 == phase1 generator[0] ==
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_spans
-WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (duration_ns > 2000000000)
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
@@ -935,7 +935,7 @@ LIMIT 100001
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (key = 'foo' AND val = 'x' AND scope = 'span')
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
@@ -1437,7 +1437,7 @@ LIMIT 20
 ```
 
 ```sql
--- the winners' root read, unchanged (`search_sql.rs:684`): 20 literal ids,
+-- the winners' root read, unchanged (`search_sql.rs:678`): 20 literal ids,
 -- no time predicate and no row cap, because the true root may predate the
 -- search window
 SELECT trace_id, span_id, parent_id, <byte-capped service>, <byte-capped name>,
@@ -3511,7 +3511,7 @@ section publishes comes from it.
 
 **A `trace_spans` without `status_message` cannot run table 3 at all.** The shipped hydration
 statement projects that column (`hydration_sql`,
-`crates/pulsus-read/src/traces/search_sql.rs:454`, and any `== phase2 hydration ==` section in the
+`crates/pulsus-read/src/traces/search_sql.rs:448`, and any `== phase2 hydration ==` section in the
 committed goldens), so a reduced span shape fails with `UNKNOWN_IDENTIFIER` before the query starts
 rather than returning a wrong number. That is the good failure, but only if the recipe carries the
 column — which is why it carries the shipped span shape **as it was when these counters were
@@ -4204,7 +4204,7 @@ Its three prerequisites, each with what a taker must read first:
    projects `SELECT DISTINCT trace_id, span_id, v, t`, and its own documentation records that a span
    carrying one key at one text under two stored types yields **two** rows where the non-value arm
    yields one — "stated rather than guarded", because our ingest cannot produce it
-   (`crates/pulsus-read/src/traces/search_sql.rs:551-561`). A merged form is
+   (`crates/pulsus-read/src/traces/search_sql.rs:545-555`). A merged form is
    `GROUP BY trace_id, span_id`, which collapses that to one row. Whether the collapse is accepted
    is a decision the later part must take itself: the arm came from #479 and its `val_type` column
    from #510, and both issues are closed, so nothing open owns it.

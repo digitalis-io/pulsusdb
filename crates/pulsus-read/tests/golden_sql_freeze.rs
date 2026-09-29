@@ -462,7 +462,30 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 75), ("traces_metrics", 2
 /// ```
 ///
 /// No phase-2 statement moved in any of the thirteen.
-const PINNED_SQL_CORPUS: u64 = 0xfb65_48d6_14d0_6004;
+///
+/// **Moved on issue #583: 75 `traces_search` files MODIFIED, 0 added, 0
+/// removed, and no `traces_metrics` file touched.** Requirement R9 gives
+/// every request window one rule, `start <= ts < end`, so the search
+/// window's operators move and nothing else does — 164 lines across the
+/// 75 files, and no third kind of line:
+///
+/// ```text
+/// -WHERE timestamp_ns > <s> AND timestamp_ns <= <e>        155 lines
+/// +WHERE timestamp_ns >= <s> AND timestamp_ns < <e>
+///
+/// -  AND ts_max > <s> AND ts_min <= <e>                      9 lines
+/// +  AND ts_max >= <s> AND ts_min <= <e - 1>
+/// ```
+///
+/// The `ts_min` literal is the only moved NUMBER: the recency row bound
+/// is rendered from the window's last included nanosecond, which is
+/// `end_ns - 1` under the new convention. Every window in this corpus
+/// starts and ends mid-day, so no day literal and no bucket literal
+/// moves. `compare()`'s selection window is **not** a request window and
+/// keeps the reference's `(start, end]`, which is why
+/// `traces_metrics/compare_status_window.sql` is unchanged and the
+/// `traces_metrics` corpus contributes nothing to this value.
+const PINNED_SQL_CORPUS: u64 = 0x4eff_8ddc_344c_0ce4;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -1374,11 +1374,12 @@ async fn two_phase_search_explain_and_budget_gates() {
          never the full 120k-trace match set"
     );
     assert_eq!(
-        unlimited.result_rows,
-        CORPUS_SPANS - 1,
+        unlimited.result_rows, CORPUS_SPANS,
         "without the LIMIT the full common-value match set ships (every in-window \
-         trace; row 0 sits exactly on the half-open start bound) — the bounded-\
-         transfer gate above genuinely discriminates"
+         trace; row 0 sits exactly on `start`, which the window INCLUDES since \
+         issue #583 — it was excluded, and the figure was CORPUS_SPANS - 1, while \
+         the bound was start-open) — the bounded-transfer gate above genuinely \
+         discriminates"
     );
     // Execution-graph differential (deterministic — a memory_usage
     // comparison proved cold-server-flaky: the 120k-group aggregation

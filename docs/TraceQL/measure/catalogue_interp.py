@@ -431,7 +431,9 @@ class Interp:
         topn = int(stage['args'][0]) if stage['args'] else 10
         if len(stage['args']) >= 3:
             s0, e0 = int(stage['args'][1]), int(stage['args'][2])
-            in_win = lambda r: s0 <= r['start_ns'] < e0
+            # `(start, end]`, the reference's definition — see the same
+            # window in catalogue_render.py.
+            in_win = lambda r: s0 < r['start_ns'] <= e0
         else:
             in_win = lambda r: True
         counts = {}

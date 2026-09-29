@@ -58,6 +58,14 @@ code*, and never meant *our code could not produce it*. Re-deriving the marked b
 renderers is a separate pass and has not been done. That sentence applies to every such block in the
 document and is not repeated at each one.
 
+**The TraceQL search window moved after this document's statements were taken.** Issue #583 gives
+every request window one rule, `start <= ts < end`, so the shipped search renders
+`timestamp_ns >= <start> AND timestamp_ns < <end>`, and its recency candidate bound
+`ts_max >= <start> AND ts_min <= <end - 1>`. Every trace-search statement quoted in this document
+shows the operators of the day, `> <start> AND <= <end>`; that one clause is superseded wherever it
+appears and nothing else in those blocks is. This applies to every such block and is not repeated
+at each one. The three sentences that stated the convention in prose carry the new rule.
+
 **Statements marked *decided here* were run.** They are this document's own decisions, and each was
 executed against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, over the corpus of
 part 4.1 loaded into tables built from `crates/pulsus-schema/src/catalog.rs`. That establishes that
@@ -436,19 +444,19 @@ batch's hydration statement.
 
 | builder | line | what it reads | when it is used |
 |---|---|---|---|
-| `generator_sql` | `search_sql.rs:230` | `trace_attrs_idx`, `trace_spans`, `trace_recent` (the time-range superset, #560) or `trace_error_spans` (`{ status = error }`, #560) | once per selector branch, before any batch |
-| `hydration_sql` | `search_sql.rs:454` | `trace_spans` | once per batch. Reads the spans of the batch's traces |
-| `membership_sql` | `search_sql.rs:562` | `trace_attrs_idx` | **no production caller since #557.** Kept, with `MembershipRow`, as the reproduction path for the frozen #492 lowering evidence |
-| `event_set_sql` | `search_sql.rs:634` | `trace_spans` | once per batch, for a span-event or span-link intrinsic. **Moved off the attribute index by #558**: it expands the span row's own array over a retained-row subquery |
-| `trace_ctx_sql` | `search_sql.rs:724` | `trace_spans` | once per batch, only if the query names `traceDuration`, `rootName` or `rootServiceName`. **No time bound** |
-| `child_count_sql` | `search_sql.rs:748` | `trace_spans` | once per batch, only if the query names `span:childCount`. **No time bound** |
-| `root_sql` | `search_sql.rs:684` | `trace_spans` | once, at the end, over the traces that won. **No time bound** |
+| `generator_sql` | `search_sql.rs:224` | `trace_attrs_idx`, `trace_spans`, `trace_recent` (the time-range superset, #560) or `trace_error_spans` (`{ status = error }`, #560) | once per selector branch, before any batch |
+| `hydration_sql` | `search_sql.rs:448` | `trace_spans` | once per batch. Reads the spans of the batch's traces |
+| `membership_sql` | `search_sql.rs:556` | `trace_attrs_idx` | **no production caller since #557.** Kept, with `MembershipRow`, as the reproduction path for the frozen #492 lowering evidence |
+| `event_set_sql` | `search_sql.rs:628` | `trace_spans` | once per batch, for a span-event or span-link intrinsic. **Moved off the attribute index by #558**: it expands the span row's own array over a retained-row subquery |
+| `trace_ctx_sql` | `search_sql.rs:718` | `trace_spans` | once per batch, only if the query names `traceDuration`, `rootName` or `rootServiceName`. **No time bound** |
+| `child_count_sql` | `search_sql.rs:742` | `trace_spans` | once per batch, only if the query names `span:childCount`. **No time bound** |
+| `root_sql` | `search_sql.rs:678` | `trace_spans` | once, at the end, over the traces that won. **No time bound** |
 
 The first statement of a selector-only search, byte-exact from
 `crates/pulsus-read/tests/golden/traces_search/unscoped_attr.sql`:
 
 ```sql
--- emitted today, search_sql.rs:230; query { .k = "v" }
+-- emitted today, search_sql.rs:224; query { .k = "v" }
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
@@ -470,7 +478,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 
 | written as | SQL emitted today | marking and source |
 |---|---|---|
-| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:230`. An unscoped attribute adds **no** `scope` term (`filter.rs:1220`, `AttrScope::Unscoped => None`) |
+| `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:224`. An unscoped attribute adds **no** `scope` term (`filter.rs:1220`, `AttrScope::Unscoped => None`) |
 | `{ resource.service.name = "checkout" }` | `PREWHERE service = 'checkout'` over `trace_spans` | *emitted today*, golden `count_pipeline.sql`. This one attribute is a physical column, so it reads the span table directly |
 | `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, golden `val_num_range.sql`. Skips granules on the `key` prefix only: `val_num` is not part of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:383`) |
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | *emitted today*, golden `service_regex.sql`. Anchored, unlike a LogQL line filter |
@@ -491,8 +499,8 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:398`. On the **search** route they are refused with `400` (`search_plan.rs:2130`, `:2131`, `:2137`) |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:968` records it as the plan's `reduce` and `traces/exec.rs:3584` applies it to the framed series (called at `:843` for range, `:1528` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2137`) |
-| ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:288`. The final ordering across statements is done in `pulsus-server` |
-| `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:289`. The request limit is applied after the read |
+| ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:282`. The final ordering across statements is done in `pulsus-server` |
+| `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:283`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
 
 ### 1.6 TraceQL — the metrics routes, which already compile everything
@@ -585,10 +593,11 @@ GROUP BY t
 ORDER BY t ASC
 ```
 
-**The two routes bound the window in opposite directions, deliberately.** Search uses
-`timestamp_ns > start AND timestamp_ns <= end` (`search_sql.rs:135`); metrics uses
-`timestamp_ns >= start AND timestamp_ns < end` (`metrics_sql.rs:116`). A span whose timestamp equals
-`start` is counted by the metrics route and not by the search route.
+**Both routes bound the window the same way**, since issue #583 gave every request window one
+rule. Search uses `timestamp_ns >= start AND timestamp_ns < end` (`search_sql.rs:121`) and so does
+metrics (`metrics_sql.rs:116`). A span whose timestamp equals `start` is counted by both, and one at
+exactly `end` by neither. They did differ — search was `> start AND <= end` — which is the form
+every statement quoted in this document still shows.
 
 ---
 
@@ -721,7 +730,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`catalog.rs:344`) and the attribute index (`catalog.rs:371-385`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
-| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:454` and `search_plan.rs:1262`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
+| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1262`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2130`); this work does not change that |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:968` records it, `traces/exec.rs:3584` applies it. Still `400` on the search route (`search_plan.rs:2137`) |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
@@ -737,7 +746,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 **Today** — one first statement, then 563 rounds of two statements, then one final statement:
 
 ```sql
--- emitted today, search_sql.rs:176
+-- emitted today, search_sql.rs:170
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('<d0>') AND date <= toDate('<d1>')
@@ -749,7 +758,7 @@ LIMIT 100001
 ```
 
 ```sql
--- emitted today, search_sql.rs:243, once per batch of 32 candidates, 563 times, one after another
+-- emitted today, search_sql.rs:237, once per batch of 32 candidates, 563 times, one after another
 SELECT trace_id, span_id, parent_id,
        if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service,
        if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name,
@@ -766,7 +775,7 @@ LIMIT 10001 BY trace_id
 ```
 
 ```sql
--- emitted today, search_sql.rs:562, the second statement of each of those 563 rounds
+-- emitted today, search_sql.rs:556, the second statement of each of those 563 rounds
 SELECT DISTINCT trace_id, span_id
 FROM trace_attrs_idx
 WHERE date >= toDate('<d0>') AND date <= toDate('<d1>')
@@ -776,7 +785,7 @@ WHERE date >= toDate('<d0>') AND date <= toDate('<d1>')
 ```
 
 ```sql
--- emitted today, search_sql.rs:684, once at the end. No time bound.
+-- emitted today, search_sql.rs:678, once at the end. No time bound.
 SELECT trace_id, span_id, parent_id,
        if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service,
        if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name,
@@ -835,7 +844,7 @@ LIMIT 20
 ```
 
 ```sql
--- from the design; the text is today's final statement unchanged (search_sql.rs:684),
+-- from the design; the text is today's final statement unchanged (search_sql.rs:678),
 -- now reached with the 20 winning trace ids written in as literals and still no time bound
 SELECT trace_id, span_id, parent_id,
        if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service,
@@ -1959,7 +1968,7 @@ LIMIT 20
 ```
 
 Ran, returning 20 span rows each carrying its `foo` value; read 311,296 rows and 11.59 MiB. The
-`if(length(val) <= 8192, …)` wrapper is today's, unchanged (`search_sql.rs:507`).
+`if(length(val) <= 8192, …)` wrapper is today's, unchanged (`search_sql.rs:501`).
 
 **Why a join rather than one wider scan.** The form without a join widens the selector's own
 predicate to `key IN ('http.status_code', 'foo')` and picks the two apart with `anyIf`. It reads
@@ -1972,7 +1981,7 @@ ADR 0008 does not name, and ADR 0008 now forbids one until it is amended** — �
 
 **What it was said to avoid, and what was measured instead.** This paragraph used to claim the
 form above collapses the per-batch value read into a single read for the whole request. Today the
-value read is issued once per 32 candidates (`search_sql.rs:507`, `exec.rs:119`); at the candidate
+value read is issued once per 32 candidates (`search_sql.rs:501`, `exec.rs:119`); at the candidate
 ceiling that is 3,125 statements over the same `key = 'foo'` prefix, and the `trace_id IN (…32)`
 term in each of them prunes nothing, because `trace_id` is the fifth column of the ordering key
 (`catalog.rs:383`). **The collapse does not survive the shipped generator memory ceiling.**
@@ -2112,7 +2121,7 @@ Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-5
 `pulsus-read/src/logql/plan.rs:1053`. The three passes that make this decision today are `plan.rs:3763`,
 `plan.rs:1688` and `plan.rs:1722`; LogQL's compiler keeps or replaces them itself, and does not move
 them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1266`. The
-TraceQL equivalents are `traces/search_plan.rs:1117`, `traces/search_sql.rs:176` and
+TraceQL equivalents are `traces/search_plan.rs:1117`, `traces/search_sql.rs:170` and
 `traces/exec.rs:1856`.
 
 ### 3.3 The decision, per step
@@ -4349,7 +4358,7 @@ GROUP BY trace_id
 
 Note `argMin(…, (toUInt8(parent_id != <zero>), timestamp_ns, span_id))`: a span with no parent
 sorts before every span with one, and within a class the earliest wins. That tuple picks the same span
-the evaluator would pick, term for term (`search_sql.rs:708-710`).
+the evaluator would pick, term for term (`search_sql.rs:702-704`).
 
 #### TraceQL17 — counting a span's children
 
@@ -4372,7 +4381,7 @@ GROUP BY trace_id, parent_id
 **SQL after this work** — none. **Never becomes SQL**, the same reason as TraceQL16.
 
 `count(DISTINCT span_id)`, not `count()`: ingest is at-least-once, so a replayed span would
-otherwise be counted twice (`search_sql.rs:638-662`).
+otherwise be counted twice (`search_sql.rs:632-656`).
 
 #### TraceQL18 — a structural relation between two spans
 
@@ -4454,10 +4463,10 @@ WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
 
 **SQL after this work** — unchanged. This work does not touch the metrics routes.
 
-The window is `timestamp_ns >= start AND timestamp_ns < end` — the **opposite** half-open form
-from the search route's `> start AND <= end` (`metrics_sql.rs:89` against `search_sql.rs:110-112`). A
-span whose timestamp equals `start` is counted here and not by a search. It appears once, because
-after issue #559 there is no second read to keep in step with it.
+The window is `timestamp_ns >= start AND timestamp_ns < end`, the same half-open form the search
+route has used since issue #583 (`metrics_sql.rs:89` and `search_sql.rs:109-111`). A span whose
+timestamp equals `start` is counted by both routes and one at exactly `end` by neither. It appears
+once, because after issue #559 there is no second read to keep in step with it.
 
 **What the `ifNull` is for.** `attr_num` is `Array(Nullable(Float64))`, so a located element with
 no numeric reading — a span storing `span.n = "abc"` — makes the comparison `NULL`. That is falsy
@@ -5390,10 +5399,10 @@ engine will read, and what it will return:
   the same mechanism for sets — 1,000,000 rows, `traces/exec.rs:222` — and TraceQL20's series probe
   is the same idea applied before the statement runs.
 - **The window on every statement.** Every compiled search statement carries the request's own
-  half-open bound, `timestamp_ns > start AND timestamp_ns <= end` (`traces/search_sql.rs:110-112`),
-  plus a `date` bound on `trace_attrs_idx`; the metrics route uses the other half-open form,
-  `>= start AND < end` (`traces/metrics_sql.rs:89`). So no compiled read covers a longer time range
-  than the request. The one exception is the trace-root read, which has no time bound by necessity
+  half-open bound, `timestamp_ns >= start AND timestamp_ns < end`
+  (`traces/search_sql.rs:109-111`), plus a `date` bound on `trace_attrs_idx`; since issue #583 the
+  metrics route uses the same form (`traces/metrics_sql.rs:89`). So no compiled read covers a longer
+  time range than the request. The one exception is the trace-root read, which has no time bound by necessity
   (part 5) and is bounded instead by its list of literal ids.
 
 **What is NOT bounded, because it is not a size**: the final digits of an unwrapped range

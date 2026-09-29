@@ -5,7 +5,7 @@
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (key = 'k' AND val = 'v')
 GROUP BY trace_id
 ORDER BY bound_ts DESC, trace_id ASC
@@ -23,7 +23,7 @@ SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substr
        [if(pi0s != 0, attr_val[pi0s] = 'v', if(pi0r != 0, attr_val[pi0r] = 'v', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = 'v', 0)))))] AS attr_slot
 FROM trace_spans
 WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
-  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
 ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 

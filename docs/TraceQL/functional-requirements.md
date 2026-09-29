@@ -125,19 +125,25 @@ other answer. "g1" is the corpus of §5.
 | R6 | **Bytes returned**: ≤ 8 KB for a search whatever it matched; ≤ 24 bytes per point per series for a metrics range query; ≤ 4 KB for tag names or values; for a trace fetch, **≤ 2× the uncompressed stored bytes of that trace's rows**, which is the denominator `T-Q3` computes with `byteSize`. | `T-Q3`: measured 546–4,926 B per search; 10.3–19.8 B per point; 100–1,445 B for tags; fetch 11,699 B against 11,708 (1.00×) and 335,128 against 589,696 (0.57×), the denominators being `sum(byteSize(*))` over that trace's rows with `final = 1`, which is the expression `measure/run_all.sh` runs and `results/r6-denominators.tsv` records |
 | R7 | **A span crosses a zone once per further replica**, and no read path reads a column twice in one statement. | `T-W4`: `measure/replication_bytes.sh` reads replica 2's `system.part_log`; it fails if the bytes fetched per span exceed the stored part bytes per span by more than **5%** — one compressed copy and its part metadata, never a second copy. Measured **34.965 B/span** fetched against **34.923** stored, which is 1.0012× |
 | R8 | **Retention is a partition drop**: one `ALTER TABLE … DROP PARTITION` per table per day, no `ALTER … DELETE`, no row rewrite, and no merge scheduled by it. | `T-R1`: `measure/retention.sh` — measured **0.068 s** for a day of 2,000,064 spans, 0 mutations, 0 merges |
-| R9 | **One window rule**: `start <= ts < end` wherever a time window selects spans, with the day-partition bound and the bucket bound rendered from the same last-included nanosecond. Three windows change (search, the store-backed tag reads, `compare()`'s `start`/`end` arguments); the metrics evaluation window and both halves of the service graph are already half-open and must stay so; a metrics range selector's own `(aS − step, aE]` instants are not a request window and do not change. §4.1 is the whole inventory, read off the code. | `T-B1`–`T-B8`: `measure/boundary.sh`, one case per changed window and one regression case for the two that do not change |
+| R9 | **One window rule**: `start <= ts < end` wherever a **request** window selects spans, with the day-partition bound and the bucket bound rendered from the same last-included nanosecond. **One** window changes here (search); the store-backed tag reads change at **#598**; the metrics evaluation window and both halves of the service graph are already half-open and must stay so; `compare()`'s `start`/`end` arguments join the exempt list beside the metrics range selector's own `(aS − step, aE]` instants, on §4.1's line — neither is a request window. §4.1 is the whole inventory, read off the code. | `T-B1`–`T-B8`: `measure/boundary.sh`, one case per changed window and one regression case for the **three** that do not change |
 | R10 | **Faster than the reference**, warm, interleaved, on the same machine and data, for every shape except the search class §6.3 names. | `T-P1`: `measure/fetch_compare.py` and `measure/http_bench.py`; measured below |
 | R11 | **Exact answers.** A retried push is counted once; structural and trace-level queries evaluate over the whole trace; typed comparisons do not cross types. | `T-C1`–`T-C6`: the 18 corpus filters and the fixture |
 | R12 | **The protections survive the replacement**: the 256 MiB request expansion bound, the attribute nesting depth limit, the scan-row and result-byte budgets, the admitted timestamp domain, and the recursive-climb depth bound. | `T-X1`–`T-X5`: one case per protection sending the breaching input and asserting the status and body |
 
-### 4.1 Every window, and what the ruling changes
+### 4.1 Every window, and what the decision changes
 
-The owner's ruling (2026-09-22) is one rule for every time window that selects
-spans: `start <= ts < end`. This table is read off the code, one row per window,
-with the file and lines that decide it. Three of the eight are already
-half-open, so the ruling costs them nothing; saying so is the point of the
-table, because "make them all consistent" applied to the wrong three would move
-answers nobody asked to move.
+The owner's decision (2026-09-22) is one rule for every window a **request**
+uses to select spans: `start <= ts < end`. This table is read off the code, one
+row per window, with the file and lines that decide it. Three of the eight are
+already half-open, so the decision costs them nothing; saying so is the point of
+the table, because "make them all consistent" applied to the wrong three would
+move answers nobody asked to move.
+
+**A fourth row is right-closed and STAYS right-closed.** `compare()`'s
+`start`/`end` arguments are operands of the query language, not a request's
+window: what they select is what the reference defines them to select, and the
+parity mandate governs them. They take the same exemption as the per-step range
+selector, and for the same reason.
 
 | window | today, and where it is decided | under the rule | the edit |
 |---|---|---|---|
@@ -145,8 +151,8 @@ answers nobody asked to move.
 | service graph, both halves | **already `[start, end)`** — `crates/pulsus-read/src/traces/graph_sql.rs:65-67` | unchanged | none. The graph half of `T-B5` is the regression half: that assertion holds before the change and must hold after, so the case fails if the graph is "tidied" into the search convention. `T-B6` is the guard that covers the same window end to end |
 | metrics evaluation window | **already `[start, end)`** — `crates/pulsus-read/src/traces/metrics_sql.rs:86-114` | unchanged | none |
 | the per-step range selector inside a metrics query | the instants `(aS − step, aE]`, rendered as `[aS − step + 1, aE + 1)` — `crates/pulsus-read/src/traces/metrics_plan.rs:473-482` | unchanged, and **out of scope** | none. This is not the request's window: it is what a range selector means in the query language, the same right-closed instant set Prometheus and the reference define, and it is computed from the already-half-open request window. Changing it would move every metrics value by one step edge |
-| `compare()`'s `start`/`end` arguments | `ts > start AND ts <= end` — `metrics_sql.rs:1355-1365`, `docs/api.md` §4.4 | `[start, end)` | `metrics_sql.rs:1365`; `docs/api.md` §4.4; a ledger row, because the reference defines this one as right-closed (`pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2, `spanStartTime > start && <= end`) |
-| tag **values**, the store-backed reads (`q`-narrowed values, and the `name` intrinsic) | the window is **widened to every UTC day it touches** — `docs/api.md` §4.3 | `[start, end)` at nanosecond precision, with the day partition pruned from the same last-included nanosecond | `docs/api.md` §4.3's "widened to every UTC day" sentence, and the tag-value read |
+| `compare()`'s `start`/`end` arguments | `ts > start AND ts <= end` — `metrics_sql.rs:1355-1365`, `docs/api.md` §4.4 | unchanged, and **out of scope** | none. These are operands of the query language, not a request's window: the reference defines them as right-closed (`pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2, `spanStartTime > start && <= end`) and the parity mandate governs them, so there is no divergence and no ledger row. `T-B8` is the guard that keeps both ends where they are |
+| tag **values**, the store-backed reads (`q`-narrowed values, and the `name` intrinsic) | the window is **widened to every UTC day it touches** — `docs/api.md` §4.3 | `[start, end)` at nanosecond precision, with the day partition pruned from the same last-included nanosecond | `docs/api.md` §4.3's "widened to every UTC day" sentence, and the tag-value read — made at **#598**, not at #583. The row bound takes the read off the day-grain projection and onto one row per span, and #598 is where that statement's cost is measured; `T-B7` and `T-T6` move with it |
 | tag **names** | time-less: `start`/`end` are accepted and ignored — `docs/api.md` §4.3 | unchanged — a name is not a span selection, and the catalog has no timestamp column | none |
 | trace by id | no window: the per-trace extent locates the spans | unchanged | none |
 
@@ -159,8 +165,10 @@ bound from the same value.
 
 Three of the rows are behaviour a client can see, and each gets its own case
 with literal values in §8: the search boundary at both ends (`T-B1`, `T-B2`),
-a tag value that exists only before the window opens on the window's first day
-(`T-B7`), and a span at exactly `compare()`'s `end` (`T-B8`).
+and a tag value that exists only before the window opens on the window's first
+day (`T-B7`, which moves to **#598** with the read it asserts). `T-B8` — a span
+at exactly `compare()`'s `end` — is a **guard** on behaviour that is staying,
+not a change a client sees.
 
 ### R1 stated precisely
 
@@ -460,16 +468,21 @@ of two kinds**, and the kind says what that first run must show:
 
 | kind | on the unchanged tree | why it is here |
 |---|---|---|
-| **new** (59 cases) | **fails**, on an assertion | it asserts behaviour this change introduces |
-| **guard** (16 cases) | **passes**, and must still pass afterwards | it asserts behaviour that is staying exactly as it is, so that the change cannot move it by accident |
+| **new** (58 cases) | **fails**, on an assertion | it asserts behaviour this change introduces |
+| **guard** (17 cases) | **passes**, and must still pass afterwards | it asserts behaviour that is staying exactly as it is, so that the change cannot move it by accident |
 
-The 16 guards are `T-B6`, `T-A15`, `T-T1`, `T-T2`, `T-T4`, `T-T5`, `T-T7`,
-`T-T8`, `T-C3`, `T-C4`, `T-C9`, `T-X1`, `T-X2`, `T-X3`, `T-X4` and `T-X5`. Every
-other case is new. `T-B5` is **not** a guard even though part of it is: it
-compiles five reads and asserts one window form for all of them, and the graph
-and metrics windows already have that form while the search and tag-value ones
-do not, so the case fails as a whole. Its row says which two are the regression
+The 17 guards are `T-B6`, `T-B8`, `T-A15`, `T-T1`, `T-T2`, `T-T4`, `T-T5`,
+`T-T7`, `T-T8`, `T-C3`, `T-C4`, `T-C9`, `T-X1`, `T-X2`, `T-X3`, `T-X4` and
+`T-X5`. Every other case is new. `T-B5` is **not** a guard even though part of
+it is: it compiles five reads and asserts one window form for all of them, and
+the graph and metrics windows already have that form while the search one does
+not, so the case fails as a whole. Its row says which two are the regression
 half.
+
+`T-B8` is a guard rather than a new case because `compare()`'s selection window
+does not move (§4.1), and `T-B7` is owned by **#598** with the read it asserts.
+Neither changes the 75-case total or the 8-window count above: one changes kind
+and one changes owning task.
 
 **The first run settles this, not this document.** The coder pastes the run
 against the unchanged tree. A `new` case that passes, or a `guard` case that
@@ -525,8 +538,8 @@ which is why some requests below carry nanoseconds and some seconds.
 | `T-B4` | any search window | the emitted SQL text | contains `intDiv(start_ns, 300000000000) BETWEEN 5966982 AND 5966982` for the `T-B1` window — the bucket bound rendered from `start` and from `end - 1` | the compiler emits no bucket bound at all, so the sort key's leading column cannot prune |
 | `T-B5` | compile one search, one trace fetch, one tag-value read, one metrics range query and one service-graph request | every time clause in the emitted SQL | all of the form `start_ns >= <s> AND start_ns < <e>` | search and the store-backed tag read use other conventions. **This case is a regression case for the graph and the metrics window**: both are already half-open (`graph_sql.rs:65-67`, `metrics_sql.rs:86-114`), so those two assertions pass before the change and must keep passing after it |
 | `T-B6` | fixture B, plus a client span at `1790094846486853630` in service `gw` whose child server span is b1 | `GET /api/traces/v1/service_graph?start=1790094846486853630&end=1790094846486853636` | the `gw → checkout` edge is **absent**, because b1 starts at exactly `end` | **guard**: passes today — the graph window is already `[start, end)` (`crates/pulsus-read/src/traces/graph_sql.rs:65-67`, `WindowSql::start_closed_end_open`). It is here so that making the four conventions one does not quietly widen the graph |
-| `T-B7` | fixture B | `GET /api/v2/search/tag/span.http.route/values?q={span.tenant="t1"}&start=1790038800&end=1790121600` (seconds, so the window opens at `01:00:00`) | the values are exactly `["/inside"]`: `/only-before` is **not** returned | the store-backed read is widened to every UTC day the window touches, so b3's value comes back although b3 is an hour before the window opens |
-| `T-B8` | fixture B | `GET /api/metrics/query_range?q={span.tenant="t1"} \| compare({span.http.route="/inside"}, 10, 1790035230000000000, 1790038800000000000)&start=1790035200&end=1790121600&step=3600s` | b4, whose start is exactly the `end` argument, counts in the **baseline**: the series `__meta_type="baseline"` carries `span.http.route="/inside"` with 1, and the `selection` side does not | `compare()`'s selection window is right-closed, so b4 counts in the selection |
+| `T-B7` | fixture B | `GET /api/v2/search/tag/span.http.route/values?q={span.tenant="t1"}&start=1790038800&end=1790121600` (seconds, so the window opens at `01:00:00`) | the values are exactly `["/inside"]`: `/only-before` is **not** returned | the store-backed read is widened to every UTC day the window touches, so b3's value comes back although b3 is an hour before the window opens. **Made to pass at #598**, with the read it asserts |
+| `T-B8` | fixture B | two requests. **(a)** `GET /api/metrics/query_range?q={span.tenant="t1"} \| compare({span.http.route="/inside"}, 10, 1790035230000000000, 1790038800000000000)&start=1790035200&end=1790121600&step=3600s` — b4 at exactly the `end` argument; **(b)** the same with `compare({span.http.route="/inside"}, 10, 1790038800000000000, 1790121600000000000)` — b4 at exactly the `start` argument | **(a)** b4 counts in the **selection**: the series `__meta_type="selection"` carries `span.http.route="/inside"` with 1 and the `baseline` side does not. **(b)** it counts in the **baseline** and not in the selection | **guard**: passes today, both halves, and must still pass — `compare()`'s selection window is the reference's `(start, end]` and does not move (§4.1). Pinning both ends is what a half-conversion fails: `>=` on the start with `<=` left on the end keeps (a) green and breaks (b) |
 
 ### 8.3 The compiler
 
@@ -633,20 +646,23 @@ rule, the ordering contract, the tag contract of `docs/api.md` §4.3, and the
 response envelopes. The semantics that do change are these, and §4.1 is the inventory for the first:
 
 - **The window bound**, by the owner's decision of 2026-09-22: `start <= ts <
-  end` wherever a window selects spans. Three windows move — the search window
-  (`WindowSql::start_open_end_closed` at `crates/pulsus-read/src/traces/search_sql.rs:124`
-  is replaced by the half-open constructor the metrics routes already use), the
-  store-backed tag-value reads, and `compare()`'s `start`/`end` arguments at
-  `metrics_sql.rs:1365`. `docs/api.md` §4.2, §4.3 and §4.4 state those bounds
-  and are updated with them. The metrics evaluation window and both halves of
-  the service graph are already half-open and are not touched.
+  end` wherever a **request** window selects spans. The search window moves
+  first (`WindowSql::start_open_end_closed` at
+  `crates/pulsus-read/src/traces/search_sql.rs:124` is replaced by the half-open
+  constructor the metrics routes already use), and `docs/api.md` §4.2 states the
+  bound. The store-backed tag-value reads move at **#598**, where the statement
+  the row bound sends them to is measured, so `docs/api.md` §4.3's
+  "widened to every UTC day" sentence is that task's to change. The metrics
+  evaluation window and both halves of the service graph are already half-open
+  and are not touched.
   **There is no ledger row to correct for the search window**: searching all 72
   rows of `docs/benchmarks/traces-differential-ledger.md` for the bound finds
   none, so the difference was never recorded as a divergence — it is being
-  removed before it ever was. `compare()`'s window is the other way round: the
-  reference defines it as right-closed
-  (`pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2), so moving it to the
-  one rule **adds** a ledger row.
+  removed before it ever was. `compare()`'s window is **not moved at all**: it
+  is an operand of the query language, the reference defines it as right-closed
+  (`pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2), and the parity
+  mandate keeps it there — so `docs/api.md` §4.4 is unchanged and no ledger row
+  is added.
 - **`{ nestedSetParent < 0 }` over a window answers "no stored parent"**, so a
   span inside a pure cycle is not returned, while the numbering — computed over
   candidate traces — promotes one member of each cyclic component to a root. The

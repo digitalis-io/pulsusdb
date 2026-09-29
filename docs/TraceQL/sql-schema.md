@@ -214,13 +214,14 @@ WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
 ```
 
 The rule is `start <= ts < end` (owner decision, 2026-09-22), and it holds
-wherever a window selects spans: search, the store-backed tag reads, the metrics
-evaluation window, `compare()`'s own `start`/`end` arguments and both halves of
-the service graph. Three of those are already half-open in the tree and change
-nothing; `functional-requirements.md` §4.1 is the inventory, one row per window,
-read off the code, and it also says which window is **not** covered by the rule:
-the per-step range selector inside a metrics query keeps the right-closed
-instants the query language defines for it. The
+wherever a **request** window selects spans: search, the store-backed tag reads,
+the metrics evaluation window and both halves of the service graph. Three of
+those are already half-open in the tree and change nothing;
+`functional-requirements.md` §4.1 is the inventory, one row per window, read off
+the code, and it also says which windows are **not** covered by the rule: the
+per-step range selector inside a metrics query and `compare()`'s own
+`start`/`end` arguments both keep the right-closed instants the query language
+defines for them. The
 **row bound**, the **bucket bound** and the day-partition bound are rendered from one value —
 the last nanosecond the window includes, `end - 1` — because when they are
 rendered separately one can be narrower than the other and answers lose rows

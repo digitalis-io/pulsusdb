@@ -1959,6 +1959,30 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run traces_search_live -p pulsus-server --test traces_search_live
 
+      # Issue #583 (requirement R9): the window rule at the boundary, over
+      # HTTP. Spawns the `pulsusdb` binary and asserts what a client
+      # sees at each end of a request window — a span at exactly `start` is
+      # returned, one at exactly `end` is not, a window ending at the next
+      # UTC midnight reads one day's partitions — plus the guards on the
+      # two windows that do NOT move, the service graph's and `compare()`'s
+      # own arguments. Reuses this job's ClickHouse 26.3 container.
+      - name: Live traces window suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test traces_api_v2_live
+
+      # Issue #583 (requirement R9), the compile-side half: one window
+      # compiled five ways — search, trace fetch, tag-value read, metrics
+      # range query, service graph — with the operators asserted on every
+      # emitted time bound. Hermetic, and here rather than in the plain
+      # `ci` job only to sit beside its live sibling.
+      - name: TraceQL window compile gate
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_compile_v2
+
       # Issue #58 AC9 (Tier-1, scale-invariant): the tag-discovery index
       # gates on the exact tags_sql shapes — strict (scope)/(scope, key)
       # primary-key-prefix pruning for the scoped shapes (two-shape

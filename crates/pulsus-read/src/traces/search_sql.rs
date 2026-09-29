@@ -103,25 +103,11 @@ pub(crate) fn date_literal(days: i64) -> String {
 }
 
 /// The search window's bound convention, declared ONCE for this whole
-/// module: `ts > start AND ts <= end` (docs/schemas.md §4.2), so
-/// `end_ns` is IN the window.
-///
-/// Both [`date_clause`] and [`time_clause`] render from the value this
-/// returns, which is what keeps the day-partition prune agreeing with
-/// the row bound. Changing the constructor here to
-/// [`WindowSql::start_closed_end_open`] — the convention
-/// [`super::graph_sql`] and [`super::metrics_sql`] use, and the obvious
-/// "fix" for three files that look inconsistent — changes the row bound
-/// too and moves every `golden/traces_search/*.sql`. That is deliberate.
-///
-/// Were the DAY bound alone to take the right-open rule, it would narrow
-/// to one day less than the row bound admits and DROP spans stored at
-/// exactly `end_ns` — measured, 499 999 rows returned where 500 001 were
-/// correct. That is the loud direction in consequence but the quiet one
-/// in appearance: no SQL a golden pins would move. See
-/// [`super::window_sql`] for both directions and their figures.
+/// module: `start <= ts < end` (requirement R9, `docs/api.md` §4.2), the
+/// one rule every request window follows. [`super::window_sql`]'s module
+/// doc owns the two conventions and says which caller takes which.
 fn bounds(w: TimeWindow) -> WindowSql {
-    WindowSql::start_open_end_closed(w.start_ns, w.end_ns)
+    WindowSql::start_closed_end_open(w.start_ns, w.end_ns)
 }
 
 /// The `trace_attrs_idx` daily-partition pruning clause for a window
@@ -130,7 +116,7 @@ fn date_clause(w: TimeWindow) -> String {
     bounds(w).date_clause()
 }
 
-/// The row-level time bound (`ts > start AND ts <= end`,
+/// The row-level time bound (`ts >= start AND ts < end`,
 /// docs/schemas.md §4.2).
 fn time_clause(w: TimeWindow) -> String {
     bounds(w).time_clause()
@@ -143,8 +129,15 @@ fn bucket_clause(w: TimeWindow) -> String {
 }
 
 /// The `trace_recent` row bound (issue #560): a stored `(bucket, trace)`
-/// row can hold a span in `(start, end]` only if its newest span is after
-/// `start` and its oldest is at or before `end`.
+/// row can hold a span in `[start, end)` only if its newest span is at or
+/// after the window's first included nanosecond and its oldest is at or
+/// before the last.
+///
+/// **Both literals come from [`bounds`]**, not from `w` — the operators
+/// are written out here, so taking `start_ns` directly would leave this
+/// one clause on the other convention while every other rendering moved,
+/// and a trace whose newest span sits exactly on `start` would be dropped
+/// from the candidate set before phase 2 ever saw it.
 ///
 /// There is no `ts_max <= end` bound, and there cannot be one: a trace
 /// with a span inside the window and a later span in the same bucket has
@@ -153,10 +146,11 @@ fn bucket_clause(w: TimeWindow) -> String {
 /// empty search returns nothing at production trace rates
 /// (docs/traceql-schema-migration.md §4, Q0).
 fn recent_row_clause(w: TimeWindow) -> String {
+    let b = bounds(w);
     format!(
-        "ts_max > {} AND ts_min <= {}",
-        w.start_ns,
-        bounds(w).last_included_ns()
+        "ts_max >= {} AND ts_min <= {}",
+        b.first_included_ns(),
+        b.last_included_ns()
     )
 }
 
@@ -206,7 +200,7 @@ fn hex32(id: &[u8; 16]) -> String {
 /// FROM trace_recent
 /// WHERE <date clause>
 ///   AND <bucket clause>
-///   AND ts_max > <start> AND ts_min <= <end>
+///   AND ts_max >= <start> AND ts_min <= <end - 1>
 /// ```
 ///
 /// There `bound_ts` is the trace's newest span in its overlapping

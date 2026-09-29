@@ -1147,6 +1147,14 @@ today's query returns. Measured on the 2,000,000-span corpus of §4's table, win
 
     (26.3.29.7; use_query_condition_cache=0, optimize_move_to_prewhere=1, max_block_size=65409, max_threads=auto(16); 3 reps, zero spread; corpus C1)
 
+**The window convention moved after this was measured** (issue #583: the search
+window is `[start, end)` now, so the row bound reads
+`ts_max >= <start> AND ts_min <= <end - 1>`). The statements, the figures and
+the witness above are issue #560's, at the convention of the day, and are left
+as they were recorded; what they establish — that `ts_min` is the bound that
+keeps the answer's set, and that `ts_max <= <end>` loses traces — does not
+depend on which end is included.
+
 The witness is trace `009c0bde7c7bcbcdd0952fd56bbb74bc`:
 
     its spans      1700005399913600000            <- inside the window

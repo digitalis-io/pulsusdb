@@ -74,13 +74,20 @@
 //!
 //! **Who uses which:**
 //!
+//! **A request window is half-open; an instant set named inside the query
+//! text is not.** Requirement R9 gives every window that a *request*
+//! selects spans with one rule, `start <= ts < end`. What a query's own
+//! operands mean is defined by the query language and follows the
+//! reference: `compare()`'s `start`/`end` arguments are right-closed there
+//! and stay right-closed here, as does a metrics range selector's `[5m]`.
+//!
 //! | caller | convention | why |
 //! |---|---|---|
-//! | [`super::search_sql`] | `StartOpenEndClosed` | docs/schemas.md §4.2 search bound |
+//! | [`super::search_sql`] | `StartClosedEndOpen` | R9, docs/api.md §4.2 `[start, end)` |
 //! | [`super::graph_sql`] | `StartClosedEndOpen` | docs/api.md §4.5 `[start, end)` |
 //! | [`super::metrics_sql`] evaluation window | `StartClosedEndOpen` | `metrics_plan`'s snapped `[start, end)` |
-//! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) |
-//! | [`super::search_sql`] `trace_recent` bucket clause ([`WindowSql::bucket_clause`], issue #560) | `StartOpenEndClosed` | the same search bound, read at bucket grain |
+//! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) — a query operand, not a request window |
+//! | [`super::search_sql`] `trace_recent` bucket clause ([`WindowSql::bucket_clause`], issue #560) | `StartClosedEndOpen` | the same search bound, read at bucket grain |
 //!
 //! [`super::tags_sql::DaySpan`] is deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
@@ -167,6 +174,23 @@ impl WindowSql {
         match self.bounds {
             WindowBounds::StartOpenEndClosed => self.end_ns,
             WindowBounds::StartClosedEndOpen => self.end_ns - 1,
+        }
+    }
+
+    /// The first nanosecond the window contains — the mirror of
+    /// [`WindowSql::last_included_ns`], for a clause whose operators are
+    /// written out rather than rendered by [`WindowSql::time_clause`].
+    ///
+    /// [`super::search_sql`]'s `trace_recent` row bound is the one such
+    /// clause: `ts_max >= <this> AND ts_min <= <last included>`. Taking
+    /// `start_ns` there instead would leave that clause on whichever
+    /// convention it was written under while every other rendering
+    /// followed the constructor, which is the shape that drops a trace
+    /// whose newest span sits exactly on `start_ns`.
+    pub fn first_included_ns(self) -> i64 {
+        match self.bounds {
+            WindowBounds::StartOpenEndClosed => self.start_ns + 1,
+            WindowBounds::StartClosedEndOpen => self.start_ns,
         }
     }
 
