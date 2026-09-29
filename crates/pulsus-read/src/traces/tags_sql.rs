@@ -432,6 +432,12 @@ mod tests {
 
     /// The unnarrowed span-name read, byte for byte. NO `timestamp_ns`
     /// predicate: one would defeat the `span_name_day` projection.
+    ///
+    /// The absence is DEFERRED work, owned by issue #598, not an
+    /// oversight: the store-backed reads keep the day-granular window
+    /// until the statement whose cost is measured replaces this one.
+    /// Whoever adds the row bound moves this case rather than editing
+    /// the literal.
     #[test]
     fn unnarrowed_span_name_sql_is_byte_exact() {
         assert_eq!(
@@ -445,7 +451,14 @@ mod tests {
         );
     }
 
-    /// One physical term and one attribute term, byte for byte.
+    /// One physical term and one attribute term, byte for byte. NO
+    /// `timestamp_ns` predicate, for the reason above.
+    ///
+    /// The absence is DEFERRED work, owned by issue #598, not an
+    /// oversight: the store-backed reads keep the day-granular window
+    /// until the statement whose cost is measured replaces this one.
+    /// Whoever adds the row bound moves this case rather than editing
+    /// the literal.
     #[test]
     fn narrowed_span_name_sql_is_byte_exact() {
         let terms = narrow("{resource.service.name=\"cart\" && span.http.method=\"GET\"}");
@@ -466,7 +479,13 @@ mod tests {
 
     /// The narrowed attribute-values read, byte for byte: the `(val,
     /// val_type)` pair of issue #476 over the `(key, scope)` prefix, then
-    /// the span-set intersection.
+    /// the span-set intersection. NO `timestamp_ns` predicate either.
+    ///
+    /// The absence is DEFERRED work, owned by issue #598, not an
+    /// oversight: the store-backed reads keep the day-granular window
+    /// until the statement whose cost is measured replaces this one.
+    /// Whoever adds the row bound moves this case rather than editing
+    /// the literal.
     #[test]
     fn narrowed_attr_values_sql_is_byte_exact() {
         let terms = narrow("{resource.service.name=\"cart\"}");

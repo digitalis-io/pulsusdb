@@ -4453,13 +4453,13 @@ fn recency_base_s() -> i64 {
 }
 
 /// The twelve-trace fixture of issue #560's queries. `S = BASE - 600`,
-/// `E = BASE + 110` (seconds), so the window `(S, E]` spans buckets
+/// `E = BASE + 110` (seconds), so the window `[S, E)` spans buckets
 /// `k-2`, `k-1` and `k`, with `E` 110 s into bucket `k`.
 ///
 /// ```text
 ///   trace  spans (offsets from BASE)          why
-///   1      S + 1 ns                           the first included nanosecond
-///   2      E                                  the last included nanosecond
+///   1      S + 1 ns                           one nanosecond into the window
+///   2      E                                  the first EXCLUDED nanosecond
 ///   3      -1 ns and +1 ns                    a bucket edge: two stored rows
 ///   4      S - 1 s                            wholly before the window
 ///   5      E + 10 s                           bucket k's tail
@@ -4468,7 +4468,7 @@ fn recency_base_s() -> i64 {
 ///   8      +50 s and +100 s                   the intra-bucket gap shape
 ///   9      +60 s and +200 s                   in-window span, newest after E
 ///   10     +70 s                              genuine inside Q2's window
-///   11     S                                  the excluded start nanosecond
+///   11     S                                  the first included nanosecond
 ///   12     S - 1 ns                           one nanosecond before it
 /// ```
 fn twelve_trace_fixture(base_s: i64) -> Vec<Span> {
@@ -4632,14 +4632,14 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         "seed the twelve-trace fixture",
     );
     let (s, e) = (base - 600, base + 110);
-    let all = vec![1, 2, 3, 6, 7, 8, 9, 10];
+    let all = vec![1, 3, 6, 7, 8, 9, 10, 11];
     let cases = vec![
         RecencyCase {
             label: "Q1 {}",
             q: "{}",
             start_s: s,
             end_s: e,
-            traces: vec![2, 8, 10, 9, 3, 7, 6, 1],
+            traces: vec![8, 10, 9, 3, 7, 6, 1, 11],
             ordered: true,
             metrics: Some("complete"),
             sql_has: vec!["FROM trace_recent", "ts_min <="],
@@ -4650,7 +4650,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
             q: "{}",
             start_s: base + 60,
             end_s: base + 90,
-            traces: vec![10],
+            traces: vec![9, 10],
             ordered: false,
             metrics: Some("complete"),
             sql_has: vec!["FROM trace_recent"],
@@ -4737,7 +4737,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
 /// never a wrong trace.
 ///
 /// ```text
-///   Q8 candidates by bound_ts   9 (BASE+200)  2 (BASE+110)  8 (BASE+100) ...
+///   Q8 candidates by bound_ts   9 (BASE+200)  8 (BASE+100)  10 (BASE+70) ...
 ///   Q2c candidates              9 (BASE+200)  8 (BASE+100)  10 (BASE+70) <- lookahead
 /// ```
 #[tokio::test(flavor = "multi_thread")]
@@ -4763,7 +4763,7 @@ async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
             q: "{}",
             start_s: base - 600,
             end_s: base + 110,
-            traces: vec![9, 2],
+            traces: vec![9, 8],
             ordered: false,
             metrics: Some("partial"),
             sql_has: vec![],
@@ -4774,7 +4774,7 @@ async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
             q: "{}",
             start_s: base + 60,
             end_s: base + 90,
-            traces: vec![],
+            traces: vec![9],
             ordered: false,
             metrics: Some("partial"),
             sql_has: vec![],

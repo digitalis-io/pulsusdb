@@ -752,11 +752,13 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
 
     let batch = corpus_batch();
 
-    // The window opens at `base - 1` because the search bound is
-    // START-OPEN (`timestamp_ns > start`) and the seed writes its first
-    // span at exactly `base`. At `base` that span is excluded and the
-    // batch decodes 31 rows, which would make the 32/16 counts below
-    // wrong for a reason that has nothing to do with this change.
+    // The window opens at `base - 1`, one nanosecond before the seed's
+    // first span. It was written that way while the search bound was
+    // start-open: at `base` that span was excluded and the batch decoded
+    // 31 rows, which made the 32/16 counts below wrong for a reason that
+    // has nothing to do with this change. The bound is `[start, end)`
+    // now (issue #583), so `base` would serve equally; the window is left
+    // where it is because no span sits at `base - 1`, so no count moves.
     let (w_start, w_end) = (base - 1, now);
     let a = plan_for(engine, r#"{ resource.env = "prod" }"#, w_start, w_end);
     let b = plan_for(
@@ -3995,7 +3997,7 @@ async fn the_pushdown_keeps_the_generators_index_selection(
     // MUST move part selection.
     let narrowed = statements[0]
         .1
-        .replace("timestamp_ns > ", &format!("timestamp_ns > {now} + "));
+        .replace("timestamp_ns >= ", &format!("timestamp_ns >= {now} + "));
     assert_ne!(
         &narrowed, statements[0].1,
         "the positive control must differ"

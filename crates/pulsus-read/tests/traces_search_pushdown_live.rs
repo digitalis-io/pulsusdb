@@ -2836,16 +2836,19 @@ fn window(start_ns: i64, end_ns: i64) -> SearchParams {
     }
 }
 
-/// The span-scan generator statement over a window: the time-range
-/// generator as it read `trace_spans` before issue #560, written here
-/// from the plan's text rather than produced by the planner.
+/// The span-scan generator statement over a window: the shape the
+/// time-range generator had before issue #560, at today's window
+/// convention (`[start, end)`, issue #583), written here from the plan's
+/// text rather than produced by the planner. The sibling rendering in
+/// `the_derived_tables_select_exactly_the_span_scans_candidates` carries
+/// the same operators.
 fn span_scan_sql(start_ns: i64, end_ns: i64, predicate: Option<&str>) -> String {
     let predicate = predicate
         .map(|p| format!("\n  AND ({p})"))
         .unwrap_or_default();
     format!(
         "SELECT trace_id, max(timestamp_ns) AS bound_ts\nFROM trace_spans\n\
-         WHERE timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}{predicate}\n\
+         WHERE timestamp_ns >= {start_ns} AND timestamp_ns < {end_ns}{predicate}\n\
          GROUP BY trace_id\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT 100001"
     )
 }
@@ -3057,8 +3060,8 @@ async fn a_replay_in_another_order_is_written_again_and_moves_no_answer() {
 ///   insert 1: span at BASE+10 s     row (bucket k, trace) ts_min=ts_max=BASE+10
 ///   insert 2: span at BASE+20 s     row (bucket k, trace) ts_min=ts_max=BASE+20
 ///
-///   window (BASE+15, BASE+30]   row 2 passes ts_max > S AND ts_min <= E -> found
-///   window (BASE+11, BASE+19]   neither row passes before a merge -> nothing;
+///   window [BASE+15, BASE+30)   row 2 passes ts_max >= S AND ts_min <= E-1 -> found
+///   window [BASE+11, BASE+19)   neither row passes before a merge -> nothing;
 ///                               the merged row (10, 20) passes -> a candidate
 ///                               the span scan does not have (a superset)
 /// ```
@@ -3111,19 +3114,19 @@ async fn a_trace_split_across_inserts_is_found_before_any_merge() {
     let got = generator_rows(&client, &found_sql).await;
     if got != want_found {
         failures.push(format!(
-            "before a merge, (BASE+15 s, BASE+30 s]: expected {want_found:?}, got {got:?}"
+            "before a merge, [BASE+15 s, BASE+30 s): expected {want_found:?}, got {got:?}"
         ));
     }
     let got = generator_rows(&client, &gap_sql).await;
     if !got.is_empty() {
         failures.push(format!(
-            "before a merge, (BASE+11 s, BASE+19 s]: expected nothing, got {got:?}"
+            "before a merge, [BASE+11 s, BASE+19 s): expected nothing, got {got:?}"
         ));
     }
     let got = generator_rows(&client, &gap_scan).await;
     if !got.is_empty() {
         failures.push(format!(
-            "the span scan over (BASE+11 s, BASE+19 s]: expected nothing, got {got:?}"
+            "the span scan over [BASE+11 s, BASE+19 s): expected nothing, got {got:?}"
         ));
     }
 
@@ -3138,7 +3141,7 @@ async fn a_trace_split_across_inserts_is_found_before_any_merge() {
     let got = generator_rows(&client, &found_sql).await;
     if got != want_found {
         failures.push(format!(
-            "after the merge, (BASE+15 s, BASE+30 s]: expected {want_found:?}, got {got:?}"
+            "after the merge, [BASE+15 s, BASE+30 s): expected {want_found:?}, got {got:?}"
         ));
     }
     let got: Vec<String> = generator_rows(&client, &gap_sql)
@@ -3148,7 +3151,7 @@ async fn a_trace_split_across_inserts_is_found_before_any_merge() {
         .collect();
     if got != vec![hex32(&trace_id(trace))] {
         failures.push(format!(
-            "after the merge, (BASE+11 s, BASE+19 s]: expected the trace as a candidate, got \
+            "after the merge, [BASE+11 s, BASE+19 s): expected the trace as a candidate, got \
              {got:?}"
         ));
     }
@@ -3167,8 +3170,8 @@ async fn a_trace_split_across_inserts_is_found_before_any_merge() {
 ///
 /// ```text
 ///   trace  spans                          why
-///   1      S + 1 ns                       the first included nanosecond
-///   2      E                              the last included nanosecond
+///   1      S + 1 ns                       one nanosecond into the window
+///   2      E                              the first EXCLUDED nanosecond
 ///   3      base - 1 ns, base + 1 ns       a bucket edge: two stored rows
 ///   4      S - 1 s                        wholly before the window
 ///   5      E + 10 s                       bucket k's tail
@@ -3177,7 +3180,7 @@ async fn a_trace_split_across_inserts_is_found_before_any_merge() {
 ///   8      base + 50 s, base + 100 s      the intra-bucket gap shape
 ///   9      base + 60 s, base + 200 s      newest span after E, same bucket
 ///   10     base + 70 s                    a genuine trace inside the gap window
-///   11     S                              the excluded start nanosecond
+///   11     S                              the first included nanosecond
 ///   12     S - 1 ns                       one nanosecond before it
 /// ```
 fn twelve_traces(base: i64) -> Vec<RecentSpan> {
@@ -3269,15 +3272,16 @@ async fn the_derived_tables_select_exactly_the_span_scans_candidates() {
     let width = pulsus_read::traces::window_sql::RECENT_BUCKET_NS;
     let (b0, b1) = (s.div_euclid(width), e.div_euclid(width));
     let dates =
-        pulsus_read::traces::window_sql::WindowSql::start_open_end_closed(s, e).date_clause();
-    let recent_where = format!("{dates} AND bucket >= {b0} AND bucket <= {b1} AND ts_max > {s}");
+        pulsus_read::traces::window_sql::WindowSql::start_closed_end_open(s, e).date_clause();
+    let recent_where = format!("{dates} AND bucket >= {b0} AND bucket <= {b1} AND ts_max >= {s}");
     let t = format!(
-        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns > {s} AND timestamp_ns <= {e} \
+        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns >= {s} AND timestamp_ns < {e} \
          GROUP BY trace_id"
     );
     let n = format!(
-        "SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} AND ts_min <= {e} \
-         GROUP BY trace_id"
+        "SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} AND ts_min <= {} \
+         GROUP BY trace_id",
+        e - 1
     );
     let m =
         format!("SELECT trace_id FROM {db}.trace_recent WHERE {recent_where} GROUP BY trace_id");
@@ -3286,11 +3290,11 @@ async fn the_derived_tables_select_exactly_the_span_scans_candidates() {
          GROUP BY trace_id"
     );
     let err_e = format!(
-        "SELECT trace_id FROM {db}.trace_error_spans WHERE {dates} AND timestamp_ns > {s} \
-         AND timestamp_ns <= {e} GROUP BY trace_id"
+        "SELECT trace_id FROM {db}.trace_error_spans WHERE {dates} AND timestamp_ns >= {s} \
+         AND timestamp_ns < {e} GROUP BY trace_id"
     );
     let err_t = format!(
-        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns > {s} AND timestamp_ns <= {e} \
+        "SELECT trace_id FROM {db}.trace_spans WHERE timestamp_ns >= {s} AND timestamp_ns < {e} \
          AND status_code = 2 GROUP BY trace_id"
     );
     let except = |a: &str, b: &str| format!("SELECT * FROM ({a}) EXCEPT SELECT * FROM ({b})");
@@ -3302,7 +3306,11 @@ async fn the_derived_tables_select_exactly_the_span_scans_candidates() {
     let checks: [(&str, String, u64); 8] = [
         ("Q9 lost", except(&t, &n), 0),
         ("Q9 extra", except(&n, &t), 0),
-        ("Q9 extra_without_ts_min", except(&m, &t), 1),
+        // Two extras without `ts_min`: trace 2, at exactly `e`, which the
+        // span scan drops by `< e` while `ts_max >= s` still admits it,
+        // and trace 5, wholly after `e`. Trace 11, at exactly `s`, is in
+        // both sets and is not an extra.
+        ("Q9 extra_without_ts_min", except(&m, &t), 2),
         ("Q9 lost_if_upper_bounded", except(&t, &u), 1),
         ("Q9 genuine", t.clone(), 8),
         ("Q11 extra", except(&err_e, &err_t), 0),
