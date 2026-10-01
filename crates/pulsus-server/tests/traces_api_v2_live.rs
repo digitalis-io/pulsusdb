@@ -18,7 +18,7 @@
 //! ## The fixture is derived from the clock, not written as literals
 //!
 //! `trace_spans` carries a delete TTL at `retention_days` (default 7,
-//! `crates/pulsus-config/src/model.rs:151`) with `ttl_only_drop_parts =
+//! `crates/pulsus-config/src/model.rs:165`) with `ttl_only_drop_parts =
 //! 1`. Fixed calendar timestamps fall outside that window as soon as this
 //! file is a week old: the rows are dropped, every case returns empty,
 //! and the two cases whose expected answer is "nothing" would pass over an

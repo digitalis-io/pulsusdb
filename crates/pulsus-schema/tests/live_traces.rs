@@ -2172,9 +2172,18 @@ async fn migrations_39_41_add_val_type_idempotently_and_extend_only_the_sorting_
         cols.push(row.expect("decode column row"));
     }
     drop(stream);
+    // `tag_values` and its own view carry a column of the same name for a
+    // different reason (issues #584 to #586): the trace landing path's tag
+    // catalog declares `val_type` in its own `CREATE`, not by an additive
+    // `ALTER`. They are listed so the set stays closed; the two defaults
+    // below are looked up by table name rather than by position, because a
+    // table added to this list would otherwise silently move which row
+    // each one reads.
     assert_eq!(
         cols.iter().map(|c| c.table.as_str()).collect::<Vec<_>>(),
         vec![
+            "tag_values",
+            "tag_values_mv",
             "trace_attrs_idx",
             "trace_tag_catalog",
             "trace_tag_catalog_mv"
@@ -2187,12 +2196,21 @@ async fn migrations_39_41_add_val_type_idempotently_and_extend_only_the_sorting_
         cols.iter().all(|c| c.r#type == "LowCardinality(String)"),
         "every copy is LowCardinality(String): {cols:?}"
     );
+    let default_of = |table: &str| -> &str {
+        cols.iter()
+            .find(|c| c.table == table)
+            .unwrap_or_else(|| panic!("no val_type column on {table}: {cols:?}"))
+            .default_expression
+            .as_str()
+    };
     assert_eq!(
-        cols[0].default_expression, "''",
+        default_of("trace_attrs_idx"),
+        "''",
         "the attribute index's copy carries the ordinary '' default"
     );
     assert_eq!(
-        cols[1].default_expression, "",
+        default_of("trace_tag_catalog"),
+        "",
         "the catalog's copy carries NO default expression — a defaulted column cannot enter a \
          sorting key in the same ALTER"
     );

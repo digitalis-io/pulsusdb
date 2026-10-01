@@ -651,6 +651,60 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
 
+    // Issues #584 to #586: the traces landing table's dials, the two shipped
+    // signals' blocks' twin.
+    if !(TRACE_LANDING_RETENTION_HOURS_FLOOR..=TRACE_LANDING_RETENTION_HOURS_CEILING)
+        .contains(&cfg.trace_landing_retention_hours)
+    {
+        return Err(range_err(
+            "trace_landing_retention_hours",
+            u64::from(cfg.trace_landing_retention_hours),
+            u64::from(TRACE_LANDING_RETENTION_HOURS_FLOOR),
+            u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING),
+            "hours",
+        ));
+    }
+    if !(TRACE_DEDUP_WINDOW_FLOOR..=TRACE_DEDUP_WINDOW_CEILING).contains(&cfg.trace_dedup_window) {
+        return Err(range_err(
+            "trace_dedup_window",
+            cfg.trace_dedup_window,
+            TRACE_DEDUP_WINDOW_FLOOR,
+            TRACE_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    if cfg.writer.trace_landing_retries > TRACE_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.trace_landing_retries",
+            u64::from(cfg.writer.trace_landing_retries),
+            0,
+            u64::from(TRACE_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(TRACE_LANDING_INSERTERS_FLOOR..=TRACE_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.trace_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.trace_landing_inserters",
+            u64::from(cfg.writer.trace_landing_inserters),
+            u64::from(TRACE_LANDING_INSERTERS_FLOOR),
+            u64::from(TRACE_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(TRACE_LANDING_MAX_ROWS_FLOOR..=TRACE_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.trace_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.trace_landing_max_rows",
+            cfg.writer.trace_landing_max_rows,
+            TRACE_LANDING_MAX_ROWS_FLOOR,
+            TRACE_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
+    }
+
     // Rule 15: readers target `<table><dist_suffix>`; an empty suffix would
     // silently point reads at base tables.
     if cfg.dist_suffix.is_empty() {

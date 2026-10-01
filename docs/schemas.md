@@ -1135,6 +1135,215 @@ LIMIT {SERVICE_GRAPH_MAX_EDGES + 1}
 
 ---
 
+### 4.3 The landing table and the five tables the TraceQL reads query
+
+Issues #584 to #586. **One push is one `INSERT` of one block into
+`trace_landing`**, and the five tables below are each one materialized view
+away from it; the writer names none of them. The shape, the sealed block, the
+insert loop and its two fates, the budget and the byte accounting are
+`docs/ingest-one-source-table.md`'s and are not restated here.
+
+The six tables are **additional**: the reads that have not moved still answer
+from `trace_spans` and `trace_attrs_idx` (§4.1, §4.2), so a trace push
+performs three inserts — that path's two and this one. **No equivalence
+between the two stores is claimed, required or tested.**
+
+```sql
+CREATE TABLE trace_landing (
+    event_id        UUID DEFAULT generateUUIDv7(),
+    received_ms     Int64  CODEC(DoubleDelta, ZSTD(1)),
+    row_kind        UInt8  CODEC(ZSTD(1)),
+    trace_id        FixedString(16)  CODEC(ZSTD(1)),
+    span_id         FixedString(8)  CODEC(ZSTD(1)),
+    parent_span_id  FixedString(8)  CODEC(ZSTD(1)),
+    start_ns        Int64  CODEC(Delta, ZSTD(1)),
+    duration_ns     Int64  CODEC(T64, ZSTD(1)),
+    resource_id     UInt128  CODEC(ZSTD(1)),
+    name            LowCardinality(String)  CODEC(ZSTD(1)),
+    kind            UInt8  CODEC(ZSTD(1)),
+    status_code     UInt8  CODEC(ZSTD(1)),
+    status_message  String  CODEC(ZSTD(1)),
+    trace_state     String  CODEC(ZSTD(1)),
+    flags           UInt32  CODEC(ZSTD(1)),
+    scope_name      LowCardinality(String)  CODEC(ZSTD(1)),
+    scope_version   LowCardinality(String)  CODEC(ZSTD(1)),
+    scope_attrs     JSON  CODEC(ZSTD(1)),
+    events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),
+    dropped_events  UInt32  CODEC(ZSTD(1)),
+    links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),
+    dropped_links   UInt32  CODEC(ZSTD(1)),
+    service         LowCardinality(String)  CODEC(ZSTD(1)),
+    attrs           JSON  CODEC(ZSTD(1)),
+    attrs_other     String  CODEC(ZSTD(1)),
+    dropped_attrs   UInt32  CODEC(ZSTD(1)),
+    day             Date  CODEC(ZSTD(1)),
+    schema_url      String  CODEC(ZSTD(1)),
+    tag_scope       LowCardinality(String)  CODEC(ZSTD(1)),
+    tag_key         String  CODEC(ZSTD(1)),
+    tag_value       String  CODEC(ZSTD(1)),
+    tag_type        LowCardinality(String)  CODEC(ZSTD(1))
+) ENGINE = MergeTree
+PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
+ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
+SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0;
+
+CREATE TABLE spans (
+    trace_id        FixedString(16)          CODEC(ZSTD(1)),
+    span_id         FixedString(8)           CODEC(ZSTD(1)),
+    parent_span_id  FixedString(8)           CODEC(ZSTD(1)),
+    start_ns        Int64                    CODEC(Delta, ZSTD(1)),
+    duration_ns     Int64                    CODEC(T64, ZSTD(1)),
+    service         LowCardinality(String)   CODEC(ZSTD(1)),
+    resource_id     UInt128                  CODEC(ZSTD(1)),
+    name            LowCardinality(String)   CODEC(ZSTD(1)),
+    kind            UInt8                    CODEC(ZSTD(1)),
+    status_code     UInt8                    CODEC(ZSTD(1)),
+    status_message  String                   CODEC(ZSTD(1)),
+    trace_state     String                   CODEC(ZSTD(1)),
+    flags           UInt32                   CODEC(ZSTD(1)),
+    scope_name      LowCardinality(String)   CODEC(ZSTD(1)),
+    scope_version   LowCardinality(String)   CODEC(ZSTD(1)),
+    scope_attrs     JSON                     CODEC(ZSTD(1)),
+    attrs           JSON                     CODEC(ZSTD(1)),
+    attrs_other     String                   CODEC(ZSTD(1)),
+    dropped_attrs   UInt32                   CODEC(ZSTD(1)),
+    events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    dropped_events  UInt32                   CODEC(ZSTD(1)),
+    links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    dropped_links   UInt32                   CODEC(ZSTD(1))
+) ENGINE = ReplacingMergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))
+ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
+
+CREATE TABLE traces (
+    day           Date,
+    trace_id      FixedString(16)                                      CODEC(ZSTD(1)),
+    start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),
+    end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
+    root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
+    root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
+    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1))
+) ENGINE = AggregatingMergeTree
+PARTITION BY day
+ORDER BY trace_id
+SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
+
+CREATE TABLE resources (
+    day            Date,
+    resource_id    UInt128,
+    service        LowCardinality(String),
+    attrs          JSON,
+    attrs_other    String,
+    dropped_attrs  UInt32,
+    schema_url     String
+) ENGINE = ReplacingMergeTree
+PARTITION BY day
+ORDER BY (service, resource_id);
+
+CREATE TABLE tag_names (
+    scope  LowCardinality(String),   -- span | resource | event | link | instrumentation
+    key    String
+) ENGINE = ReplacingMergeTree
+ORDER BY (scope, key);
+
+CREATE TABLE tag_values (
+    scope     LowCardinality(String),
+    key       String,
+    value     String,
+    val_type  LowCardinality(String)  -- string | int | float | bool
+) ENGINE = ReplacingMergeTree
+ORDER BY (scope, key, value, val_type);
+
+CREATE MATERIALIZED VIEW spans_mv TO spans AS
+SELECT trace_id AS trace_id, span_id AS span_id, parent_span_id AS parent_span_id,
+       start_ns AS start_ns, duration_ns AS duration_ns, service AS service,
+       resource_id AS resource_id, name AS name, kind AS kind,
+       status_code AS status_code, status_message AS status_message,
+       trace_state AS trace_state, flags AS flags,
+       scope_name AS scope_name, scope_version AS scope_version,
+       scope_attrs AS scope_attrs, attrs AS attrs, attrs_other AS attrs_other,
+       dropped_attrs AS dropped_attrs, events AS events, dropped_events AS dropped_events,
+       links AS links, dropped_links AS dropped_links
+FROM trace_landing WHERE row_kind = 0;
+
+CREATE MATERIALIZED VIEW resources_mv TO resources AS
+SELECT day AS day, resource_id AS resource_id, service AS service, attrs AS attrs,
+       attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url
+FROM trace_landing WHERE row_kind = 1;
+
+CREATE MATERIALIZED VIEW traces_mv TO traces AS
+SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns,
+       rs AS root_service, rn AS root_name, sv AS services
+FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e,
+             maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,
+             maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,
+             groupUniqArray(toString(service)) AS sv
+      FROM trace_landing WHERE row_kind = 0
+      GROUP BY trace_id);
+
+CREATE MATERIALIZED VIEW tag_names_mv TO tag_names AS
+SELECT tag_scope AS scope, tag_key AS key
+FROM trace_landing WHERE row_kind = 2;
+
+CREATE MATERIALIZED VIEW tag_values_mv TO tag_values AS
+SELECT tag_scope AS scope, tag_key AS key, tag_value AS value, tag_type AS val_type
+FROM trace_landing WHERE row_kind = 3;
+```
+
+**Four discriminating values, five views, five targets.** `row_kind` says which
+landed event a row is; a row sets that kind's columns and the rest default.
+
+| `row_kind` | the landed event | emitted |
+|---|---|---|
+| 0 | a span | one per decoded span |
+| 1 | a resource | one per distinct `(resource_id, day)` **in the push** |
+| 2 | a tag name | one per distinct `(scope, key)` **in the push** |
+| 3 | a tag value | one per distinct `(scope, key, value, type)` **in the push** |
+
+- **The discriminator is `row_kind`, not `kind`.** A span carries an OTLP span
+  kind in a column already called `kind`, which `spans` and its
+  `ReplacingMergeTree` key both use; two columns cannot both be `kind`.
+- **`service`, `attrs`, `attrs_other` and `dropped_attrs` are shared between
+  kind 0 and kind 1.** A span's attributes and a resource's are never on one
+  row, so one JSON column serves both, the way `log_landing.timestamp_ns`
+  serves a line time and a pattern bucket.
+- **The sorting key has two runs because the kinds do.** After the
+  discriminator it mirrors `spans`' own `(trace_id, start_ns, span_id, kind)`;
+  `tag_key, tag_value` last order kinds 2 and 3 inside themselves, where the
+  four span columns are all at their defaults.
+- **There is no cache of anything already written, anywhere on this path.**
+  Kinds 1, 2 and 3 are deduplicated **inside the push only**, from the push's
+  own decoded spans. A push that fails re-emits everything next time. The two
+  shipped signals can key a commit-promoted LRU on a time bucket, so a
+  registration lost to a fan-out failure reappears at the next bucket;
+  `tag_names` and `tag_values` are time-less by contract (`docs/api.md` §4.3)
+  and have no heal interval at all.
+- **`async_insert = 0` is on the landing table because the query pin cannot
+  reach the table setting.** `executeQuery.cpp` disjoins
+  `table->areAsynchronousInsertsEnabled()` into a local that both the
+  eligibility and the execution block read, and the query setting's explicit
+  `0` is never consulted again. What the `CREATE` value defends against is a
+  server-wide `<merge_tree>` default; nothing defends against a deliberate
+  `ALTER TABLE … MODIFY SETTING` on this table.
+- **`event_id` is the landed event's identity and the writer never sets it.**
+  It is not the retry mechanism: that is the `insert_deduplication_token` the
+  writer mints per sealed block.
+- **The landing table has no `_dist` wrapper**, for the reason `log_landing`
+  has none: a push carries many trace ids, so inserting the push itself
+  through a `Distributed` wrapper would split one push per shard and one push
+  would stop being one block. The routing happens one step later, on the way
+  out of the two per-trace views (§7).
+- **Three of the five targets carry no TTL statement and two of those carry no
+  TTL at all.** `spans`, `traces` and `resources` take a saturating
+  delete-TTL at run time from `apply_ttl`, the shape §4.1's own
+  admitted-domain note describes; `tag_names` and `tag_values` carry a
+  deduplication window and no TTL, because `docs/api.md` §4.3 requires
+  catalog entries to outlive span retention.
+- **Six deduplication windows, one per write-path table.** A view's insert
+  into its target carries a block id derived from the source block, and only a
+  table with a window recognises the repeat.
+
 ## 5. Profiles
 
 **Query shapes served:** flamegraph merge over `(profile type, service, selector, time range)`; profile-value time series; diff between two ranges.

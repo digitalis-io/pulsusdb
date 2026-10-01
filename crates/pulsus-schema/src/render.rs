@@ -191,6 +191,15 @@ fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> 
             &ctx.log_landing_retention_hours.to_string(),
         )
         .replace("{{log_dedup_window}}", &ctx.log_dedup_window.to_string())
+        .replace(
+            "{{trace_landing_retention_hours}}",
+            &ctx.trace_landing_retention_hours.to_string(),
+        )
+        .replace(
+            "{{trace_dedup_window}}",
+            &ctx.trace_dedup_window.to_string(),
+        )
+        .replace("{{route_suffix}}", route_suffix(ctx))
         .replace("{{dedup_window_setting}}", dedup_window_setting(ctx))
         .replace(
             "{{dedup_window_seconds}}",
@@ -213,6 +222,27 @@ fn dedup_window_setting(ctx: &RenderCtx) -> &'static str {
     match ctx.cluster {
         Some(_) => "replicated_deduplication_window",
         None => "non_replicated_deduplication_window",
+    }
+}
+
+/// The suffix a materialized view's `TO` clause carries when its target is
+/// the **routing** table on a cluster and the local table on a single node.
+///
+/// **Rendered from the same field that renders the engine**, which is the
+/// rule `{{on_cluster}}` and `{{dedup_window_setting}}` already follow. It
+/// cannot be `{{dist_suffix}}`: that token renders the configured suffix
+/// unconditionally, and every template using it today is
+/// [`crate::catalog::Ddl::StaticClusterOnly`] or [`crate::catalog::Ddl::Dist`]
+/// and so is never rendered without a cluster. A view is rendered in both
+/// modes, so it needs the conditional form.
+///
+/// Two of the five trace views carry it: a trace's spans arrive from as many
+/// senders as there are services in it, and the whole trace read design rests
+/// on a trace being whole on one shard.
+fn route_suffix(ctx: &RenderCtx) -> &str {
+    match ctx.cluster {
+        Some(_) => &ctx.dist_suffix,
+        None => "",
     }
 }
 
@@ -450,6 +480,44 @@ mod tests {
             substitute_tokens("{{log_landing_retention_hours}}/{{log_dedup_window}}", &ctx),
             "24/5000"
         );
+    }
+
+    /// The two trace landing tokens render the context's own values, so a
+    /// statement hard-coding either passes at the default and fails here.
+    #[test]
+    fn the_trace_landing_tokens_render_the_configured_values() {
+        let ctx = RenderCtx {
+            trace_landing_retention_hours: 24,
+            trace_dedup_window: 5_000,
+            ..ctx()
+        };
+        assert_eq!(
+            substitute_tokens(
+                "{{trace_landing_retention_hours}}/{{trace_dedup_window}}",
+                &ctx
+            ),
+            "24/5000"
+        );
+    }
+
+    /// `{{route_suffix}}` follows the cluster, not the suffix: it renders
+    /// the configured suffix on a cluster and the empty string without one,
+    /// where `{{dist_suffix}}` renders the suffix in both modes.
+    #[test]
+    fn the_route_suffix_token_follows_the_cluster() {
+        const TMPL: &str = "TO {{db}}.spans{{route_suffix}}";
+        assert_eq!(substitute_tokens(TMPL, &ctx()), "TO pulsus.spans");
+        let clustered = RenderCtx {
+            cluster: Some("prod".to_string()),
+            ..ctx()
+        };
+        assert_eq!(substitute_tokens(TMPL, &clustered), "TO pulsus.spans_dist");
+        let renamed = RenderCtx {
+            cluster: Some("prod".to_string()),
+            dist_suffix: "_routed".to_string(),
+            ..ctx()
+        };
+        assert_eq!(substitute_tokens(TMPL, &renamed), "TO pulsus.spans_routed");
     }
 
     #[test]

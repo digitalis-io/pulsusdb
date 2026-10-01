@@ -188,10 +188,42 @@ async fn columns(client: &ChClient, db: &str, table: &str) -> Vec<(String, Strin
     out
 }
 
-/// One kind-0 landing row's `INSERT`, written as literal SQL so this suite
-/// stays inside `pulsus-schema`'s own dependency set — it does not depend on
-/// `pulsus-write`. The span's own columns only; every other column of every
-/// other kind defaults.
+/// Now, in epoch milliseconds. The fixtures below take their stamps from the
+/// clock rather than from a literal: `ttl_only_drop_parts = 1` makes a whole
+/// already-expired part eligible for deletion right after the insert, so a
+/// fixed past instant would leave a case reading an empty table.
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as i64
+}
+
+/// `count` kind-0 landing rows in **one** statement, so one block and one
+/// part — a hundred single-row inserts price a hundred parts' overhead
+/// rather than what one push's rows cost.
+///
+/// Written as literal SQL so this suite stays inside `pulsus-schema`'s own
+/// dependency set: it does not depend on `pulsus-write`.
+fn landing_span_block_sql(db: &str, received_ms: i64, base_ns: i64, count: u64) -> String {
+    format!(
+        "INSERT INTO {db}.trace_landing \
+         (received_ms, row_kind, trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+          resource_id, name, kind, status_code, service, attrs, scope_attrs) \
+         SELECT {received_ms}, 0, \
+          reinterpretAsFixedString(toUInt128(0x1000 + number)), \
+          reinterpretAsFixedString(toUInt64(0x2000 + number)), \
+          toFixedString('', 8), {base_ns} + number * 1000000, 1000000, 1, 'GET /api', 2, 0, \
+          'checkout', \
+          CAST('{{\"http%2Erequest%2Emethod\":\"GET\",\"http%2Eresponse%2Estatus_code\":200}}' AS JSON), \
+          CAST('{{}}' AS JSON) \
+         FROM numbers({count})"
+    )
+}
+
+/// One kind-0 landing row's `INSERT`, written as literal SQL for the same
+/// reason [`landing_span_block_sql`] gives. The span's own columns only;
+/// every other column of every other kind defaults.
 fn landing_span_sql(
     db: &str,
     received_ms: i64,
@@ -215,7 +247,7 @@ fn landing_span_sql(
 #[tokio::test]
 async fn trace_landing_and_its_views_exist_after_init() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_exist";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_exist");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -257,11 +289,16 @@ async fn trace_landing_and_its_views_exist_after_init() {
     );
 
     // The server's own record of what feeds what.
+    // The filter sits in a subquery: an outer `AS name` shadows
+    // `system.tables.name`, and the predicate would then read the projected
+    // value rather than the table's own name.
     let deps = names(
         &client,
         &format!(
-            "SELECT arrayJoin(dependencies_table) AS name FROM system.tables \
-             WHERE database = '{db}' AND name = 'trace_landing' ORDER BY name"
+            "SELECT mv AS name FROM (\
+               SELECT arrayJoin(dependencies_table) AS mv FROM system.tables \
+               WHERE database = '{db}' AND name = 'trace_landing'\
+             ) ORDER BY name"
         ),
     )
     .await;
@@ -281,7 +318,7 @@ async fn trace_landing_and_its_views_exist_after_init() {
 #[tokio::test]
 async fn the_landing_table_carries_the_async_insert_setting() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_async";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_async");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -302,7 +339,7 @@ async fn the_landing_table_carries_the_async_insert_setting() {
 #[tokio::test]
 async fn the_sorting_key_is_the_one_this_design_states() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_sortkey";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_sortkey");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -355,7 +392,7 @@ async fn the_sorting_key_is_the_one_this_design_states() {
 #[tokio::test]
 async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_aggcols";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_aggcols");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -392,7 +429,7 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
 #[tokio::test]
 async fn every_span_column_carries_a_codec() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_codecs";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_codecs");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -424,7 +461,7 @@ async fn every_span_column_carries_a_codec() {
 #[tokio::test]
 async fn applying_the_schema_twice_is_a_no_op() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_twice";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_twice");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
@@ -461,7 +498,7 @@ async fn applying_the_schema_twice_is_a_no_op() {
 #[tokio::test]
 async fn the_catalogs_carry_no_ttl_and_the_other_four_do() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_ttlset";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_ttlset");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -490,7 +527,7 @@ async fn the_catalogs_carry_no_ttl_and_the_other_four_do() {
 #[tokio::test]
 async fn dedup_settings_reach_all_six_trace_tables() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_dedupwin";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_dedupwin");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
@@ -513,16 +550,21 @@ async fn dedup_settings_reach_all_six_trace_tables() {
 #[tokio::test]
 async fn the_landing_ttl_is_installed_at_the_configured_hours() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_landingttl";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_landingttl");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     ctx.trace_landing_retention_hours = 3;
     run_init(&client, &ctx).await.expect("run_init");
 
+    // The expected text is the server's own rendering, not the statement
+    // this build sends: 26.3.29.7 re-prints the expression with its own
+    // parentheses and drops the default `DELETE` action.
+    // `the_rendered_ttl_statements_are_byte_exact` owns the statement text.
     let engine = engine_full(&client, db, "trace_landing").await;
     assert!(
-        engine.contains("intDiv(received_ms, 1000) + 3 * 3600"),
+        engine
+            .contains("TTL toDateTime(least(intDiv(received_ms, 1000) + (3 * 3600), 4294967295))"),
         "the landing TTL must carry the configured hours: {engine}"
     );
 
@@ -538,20 +580,21 @@ async fn the_landing_ttl_is_installed_at_the_configured_hours() {
 #[tokio::test]
 async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_ttlclamp";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_ttlclamp");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    /// The `TTL <expr> DELETE` expression out of one table's stored
-    /// definition.
+    /// The TTL expression out of one table's stored definition. The stored
+    /// text carries no `DELETE` — 26.3.29.7 drops the default action — so
+    /// the expression runs to the `SETTINGS` clause.
     fn ttl_expr(engine_full: &str, table: &str) -> String {
         let (_, after) = engine_full
             .split_once("TTL ")
             .unwrap_or_else(|| panic!("{table} carries no TTL: {engine_full}"));
         let (expr, _) = after
-            .split_once(" DELETE")
-            .unwrap_or_else(|| panic!("{table}'s TTL is not a DELETE: {engine_full}"));
+            .split_once(" SETTINGS")
+            .unwrap_or_else(|| panic!("{table}'s TTL has no SETTINGS after it: {engine_full}"));
         expr.to_string()
     }
 
@@ -590,17 +633,17 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
 #[tokio::test]
 async fn dropping_a_day_drops_no_rows_of_another() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_droppart";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_droppart");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
     // Two spans, one per UTC day, inside the retention window: the landing
     // insert's own views place them in `spans`.
-    let now_ms = 1_790_000_000_000i64;
-    let day_ns = 86_400_000_000_000i64 * 1_000;
-    let older_ns = 1_790_000_000_000_000_000i64;
-    let newer_ns = older_ns + day_ns;
+    let now_ms = now_unix_millis();
+    let day_ns = 86_400_000_000_000i64;
+    let newer_ns = now_ms * 1_000_000;
+    let older_ns = newer_ns - day_ns;
     exec(
         &client,
         &landing_span_sql(db, now_ms, &"aa".repeat(16), &"11".repeat(8), older_ns),
@@ -617,6 +660,19 @@ async fn dropping_a_day_drops_no_rows_of_another() {
         2,
         "both spans landed through the view"
     );
+
+    // `apply_ttl`'s own `MODIFY TTL` leaves one `MATERIALIZE TTL` row behind
+    // at init, so the property is that the DROP adds none rather than that
+    // the table has none. Measured on 26.3.29.7: one row, `(MATERIALIZE
+    // TTL)`, `parts_to_do = 0`, before any insert.
+    let mutations_before = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.mutations \
+             WHERE database = '{db}' AND table = 'spans'"
+        ),
+    )
+    .await;
 
     let older_day = scalar(
         &client,
@@ -655,7 +711,7 @@ async fn dropping_a_day_drops_no_rows_of_another() {
             )
         )
         .await,
-        0,
+        mutations_before,
         "a partition drop is not a mutation"
     );
     assert_eq!(
@@ -680,7 +736,7 @@ async fn dropping_a_day_drops_no_rows_of_another() {
 #[tokio::test]
 async fn the_attribute_columns_are_exactly_these() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_attrcols";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_attrcols");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -690,12 +746,14 @@ async fn the_attribute_columns_are_exactly_these() {
     // `attrs_other` (a protobuf `KeyValueList`) and the catalogs' own value
     // column.
     let sql = format!(
-        "SELECT concat(table, '.', name) AS name FROM system.columns \
-         WHERE database = '{db}' \
-           AND table IN ('trace_landing', 'spans', 'resources', 'tag_names', 'tag_values', \
-                         'traces') \
-           AND (position(type, 'JSON') > 0 OR name IN ('attrs_other', 'value')) \
-         ORDER BY name"
+        "SELECT concat(table, '.', name) AS name FROM (\
+           SELECT table, name, type FROM system.columns \
+           WHERE database = '{db}' \
+             AND table IN ('trace_landing', 'spans', 'resources', 'tag_names', 'tag_values', \
+                           'traces') \
+             AND (position(type, 'JSON') > 0 \
+                  OR name IN ('attrs_other', 'value', 'tag_value'))\
+         ) ORDER BY name"
     );
     let got: BTreeSet<String> = names(&client, &sql).await.into_iter().collect();
     let want: BTreeSet<String> = [
@@ -734,26 +792,14 @@ async fn the_attribute_columns_are_exactly_these() {
 #[tokio::test]
 async fn the_landed_storage_is_priced() {
     skip_unless_live!();
-    let db = "pulsus_tracev2_priced";
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_priced");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    let now_ms = 1_790_000_000_000i64;
-    let base_ns = 1_790_000_000_000_000_000i64;
-    for i in 0..100i64 {
-        exec(
-            &client,
-            &landing_span_sql(
-                db,
-                now_ms,
-                &format!("{:032x}", 0x1000 + i),
-                &format!("{:016x}", 0x2000 + i),
-                base_ns + i * 1_000_000,
-            ),
-        )
-        .await;
-    }
+    let now_ms = now_unix_millis();
+    let base_ns = now_ms * 1_000_000;
+    exec(&client, &landing_span_block_sql(db, now_ms, base_ns, 100)).await;
     assert_eq!(
         count(
             &client,

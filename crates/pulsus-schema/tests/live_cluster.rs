@@ -1098,7 +1098,7 @@ async fn the_clustered_form() {
             );
             let twin = format!("{name}_dist");
             assert!(
-                !present.iter().any(|n| *n == twin),
+                !present.contains(&twin),
                 "shard{}: {name} must have no routing twin: {present:?}",
                 i + 1
             );

@@ -671,6 +671,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-schema --test live_traces
 
+      # Issues #584 to #586: the trace landing table, its five views, the
+      # five tables the TraceQL reads query, their sorting keys and codecs,
+      # the six deduplication windows and the three saturating TTLs. Reuses
+      # this job's 26.3 container.
+      - name: Live trace landing schema tests (tables + views + TTLs)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_traces_v2
+
       # Issue #498: every `Row` struct that carries a fingerprint, read back
       # through the `UInt128` column it reads. The client validates a row
       # type per STATEMENT, so one row per table proves nothing about the
