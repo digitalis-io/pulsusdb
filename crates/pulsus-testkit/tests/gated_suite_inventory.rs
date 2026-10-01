@@ -237,7 +237,9 @@ const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
          (`Tuple(a Int64, b String)` -> `Unknown data type: a Int64`), so the insert fails \
          before a byte is sent. Unnaming the elements and disabling validation were both \
          measured and both unblock it; which is taken is a design decision and the suite's \
-         own module doc carries the evidence for each. Wire it up with that decision.",
+         own module doc carries the evidence for each. The suite itself is complete and was \
+         run to green under the first route, 13 of 13, with three of its cases deliberately \
+         broken and each failing. Wire it up with that decision.",
     ),
     (
         "live_tls",
