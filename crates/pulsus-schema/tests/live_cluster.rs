@@ -1682,9 +1682,11 @@ async fn two_ids_on_two_shards(client: &ChClient) -> (String, String) {
     let mut one = None;
     for n in 1..256u32 {
         let hex = format!("{n:032x}");
+        // `toUInt64`, because `%` over a `UInt64` and a literal `2`
+        // answers `UInt8` and the row type this reads into takes a `u64`.
         let slot = count_on(
             client,
-            &format!("SELECT cityHash64(unhex('{hex}')) % 2 AS n"),
+            &format!("SELECT toUInt64(cityHash64(unhex('{hex}')) % 2) AS n"),
         )
         .await;
         if slot == 0 && zero.is_none() {
