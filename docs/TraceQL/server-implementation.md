@@ -57,9 +57,12 @@ ClickHouse requires — two identical paths in one JSON value are refused).
 
 ### 2.2 Resources, catalogs and their caches
 
-`resource_id` is `sipHash128` over the resource's encoded attributes and schema
-url — 128 bits, the width issue #498 settled on for stream and series identity,
-for the same reason. The writer keeps a small map of `(resource_id, day)` and
+`resource_id` is `pulsus_model::compose128` over the resource's encoded
+attributes and schema url — `cityHash64` in the high half, `xxHash64` with seed
+0 in the low half, the composition issue #498 settled on for stream and series
+identity, for the same reason. Not a third hash primitive: with one
+composition, a change to either primitive moves every identity and one set of
+golden vectors catches it. The writer keeps a small map of `(resource_id, day)` and
 `(scope, key[, value, type])` it has already written, so a resource row is
 written once per day and a catalog row once per process lifetime, the way
 metric metadata already works. On g1: 68 resource rows, 48 name rows, 304,070

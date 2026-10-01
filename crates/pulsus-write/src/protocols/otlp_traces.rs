@@ -2798,13 +2798,13 @@ fn resource_identity_buffer(resource: Option<&Resource>, schema_url: &str) -> Ve
 /// One resource's 128-bit identity.
 ///
 /// **`pulsus_model::compose128`, not a third hash primitive.**
-/// `docs/TraceQL/server-implementation.md` §2.2 named `sipHash128`, which is
-/// not in this workspace and which no dependency provides; issue #498
-/// settled this composition — `cityHash64` in the high half, `xxHash64`
-/// seed 0 in the low half, over one canonical buffer — for both label
-/// families, so a change to either primitive moves every identity and the
-/// golden vectors catch it once. A third primitive for a third identity
-/// gives up exactly that.
+/// `docs/TraceQL/server-implementation.md` §2.2 named `sipHash128` until it
+/// was corrected to name this function; that primitive is not in this
+/// workspace and no dependency provides it. Issue #498 settled this
+/// composition — `cityHash64` in the high half, `xxHash64` seed 0 in the low
+/// half, over one canonical buffer — for both label families, so a change to
+/// either primitive moves every identity and the golden vectors catch it
+/// once. A third primitive for a third identity gives up exactly that.
 pub fn resource_identity(resource: Option<&Resource>, schema_url: &str) -> Fingerprint {
     pulsus_model::compose128(&resource_identity_buffer(resource, schema_url))
 }
