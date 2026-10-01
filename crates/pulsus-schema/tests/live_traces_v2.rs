@@ -571,12 +571,22 @@ async fn the_landing_ttl_is_installed_at_the_configured_hours() {
     drop_database(&client, db).await;
 }
 
-/// **T-R2, the clamp half.** At the top of the admitted domain both TTL
-/// forms answer one instant rather than a wrapped 1970 one.
+/// **T-R2, the clamp half.** The three stored TTLs carry the clamp, and at
+/// the top of the admitted domain they answer one instant.
 ///
 /// **Both expressions are read off the server's own stored definition**, not
 /// retyped: a case carrying its own copy of the expression would answer the
 /// clamped instant whatever this change installed.
+///
+/// **What the answer alone cannot show, measured rather than assumed.** On
+/// ClickHouse 26.3.29.7 `toDateTime` saturates by itself:
+/// `SELECT toDateTime(intDiv(4294943999000000000, 1000000000) + 7 * 86400)`
+/// answers `2106-02-07 06:28:15`, the same instant as the clamped form, so
+/// removing `least(…, 4294967295)` moves no answer on this version and the
+/// read below cannot discriminate it. The first assertion is therefore on
+/// the clamp being **in the stored text**, which is what a later version
+/// without that saturation would need, and the read is what shows the
+/// expression's value at the boundary rather than its shape.
 #[tokio::test]
 async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
     skip_unless_live!();
@@ -596,6 +606,20 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
             .split_once(" SETTINGS")
             .unwrap_or_else(|| panic!("{table}'s TTL has no SETTINGS after it: {engine_full}"));
         expr.to_string()
+    }
+
+    // The clamp is in the stored text of all three retained tables.
+    for (table, column) in [
+        ("spans", "intDiv(start_ns, 1000000000)"),
+        ("traces", "(toUInt32(day) * 86400)"),
+        ("resources", "(toUInt32(day) * 86400)"),
+    ] {
+        let engine = engine_full(&client, db, table).await;
+        let want = format!("TTL toDateTime(least({column} + (7 * 86400), 4294967295))");
+        assert!(
+            engine.contains(&want),
+            "{table}'s stored TTL must carry the clamp: wanted {want} in {engine}"
+        );
     }
 
     // The top of the admitted domain: 2106-02-06T23:59:59Z.
