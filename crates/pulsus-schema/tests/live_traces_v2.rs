@@ -35,6 +35,10 @@ const WRITE_PATH_TABLES: [&str; 6] = [
     "tag_values",
 ];
 
+/// The five tables the views maintain, as a `table IN (…)` list. The
+/// landing table is not one of them.
+const TARGET_TABLE_LIST: &str = "'spans', 'traces', 'resources', 'tag_names', 'tag_values'";
+
 /// The five views, one per target.
 const TRACE_MVS: [&str; 5] = [
     "spans_mv",
@@ -104,6 +108,13 @@ struct NameTypeRow {
     name: String,
     #[serde(rename = "type")]
     ty: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TableColumnCodecRow {
+    table: String,
+    name: String,
+    compression_codec: String,
 }
 
 async fn drop_database(client: &ChClient, db: &str) {
@@ -424,10 +435,14 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     drop_database(&client, db).await;
 }
 
-/// **T-S5.** Every column of `spans` carries a compression codec — none
-/// empty in `system.columns`.
+/// **T-S5.** Every column of the five target tables carries a compression
+/// codec — none empty in `system.columns`.
+///
+/// `trace_landing` is deliberately outside the domain: its `event_id`
+/// carries no codec, and a presence test with one carve-out is where the
+/// next bare column appears.
 #[tokio::test]
-async fn every_span_column_carries_a_codec() {
+async fn every_target_table_column_carries_a_codec() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_codecs");
     let client = ChClient::new(test_config()).await.expect("connect");
@@ -437,21 +452,124 @@ async fn every_span_column_carries_a_codec() {
     // The denominator first: an empty column set would pass the check below
     // while establishing nothing.
     assert_eq!(
-        columns(&client, db, "spans").await.len(),
-        23,
-        "the span table's own column count, so the codec check below has a \
-         non-empty domain"
+        count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM system.columns \
+                 WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST})"
+            ),
+        )
+        .await,
+        43,
+        "the five target tables' own column count (23 + 7 + 7 + 2 + 4), so \
+         the codec check below has a non-empty domain"
     );
     let bare = names(
         &client,
         &format!(
-            "SELECT name FROM system.columns \
-             WHERE database = '{db}' AND table = 'spans' AND compression_codec = '' \
+            "SELECT concat(table, '.', name) AS name FROM system.columns \
+             WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST}) \
+             AND compression_codec = '' \
              ORDER BY name"
         ),
     )
     .await;
     assert!(bare.is_empty(), "columns with no codec: {bare:?}");
+
+    drop_database(&client, db).await;
+}
+
+/// **T-S5b.** The exact codec spelling of every column of the five target
+/// tables, in declaration order within each table. A presence test cannot
+/// tell `ZSTD(1)` from `ZSTD(22)`.
+///
+/// The spellings are the server's normalised ones rather than the `CREATE`'s
+/// text, for the reason `live_schema.rs`'s `LANDING_COLUMNS` doc comment
+/// records: `spans.start_ns` is declared `CODEC(Delta, ZSTD(1))` and the
+/// argument is resolved from the column type, and `duration_ns`'s `T64`
+/// takes none.
+///
+/// The column **type** is not pinned here — the per-table `(name, type)`
+/// cases above own that.
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 43] = [
+    ("resources", "day", "CODEC(ZSTD(1))"),
+    ("resources", "resource_id", "CODEC(ZSTD(1))"),
+    ("resources", "service", "CODEC(ZSTD(1))"),
+    ("resources", "attrs", "CODEC(ZSTD(1))"),
+    ("resources", "attrs_other", "CODEC(ZSTD(1))"),
+    ("resources", "dropped_attrs", "CODEC(ZSTD(1))"),
+    ("resources", "schema_url", "CODEC(ZSTD(1))"),
+    ("spans", "trace_id", "CODEC(ZSTD(1))"),
+    ("spans", "span_id", "CODEC(ZSTD(1))"),
+    ("spans", "parent_span_id", "CODEC(ZSTD(1))"),
+    ("spans", "start_ns", "CODEC(Delta(8), ZSTD(1))"),
+    ("spans", "duration_ns", "CODEC(T64, ZSTD(1))"),
+    ("spans", "service", "CODEC(ZSTD(1))"),
+    ("spans", "resource_id", "CODEC(ZSTD(1))"),
+    ("spans", "name", "CODEC(ZSTD(1))"),
+    ("spans", "kind", "CODEC(ZSTD(1))"),
+    ("spans", "status_code", "CODEC(ZSTD(1))"),
+    ("spans", "status_message", "CODEC(ZSTD(1))"),
+    ("spans", "trace_state", "CODEC(ZSTD(1))"),
+    ("spans", "flags", "CODEC(ZSTD(1))"),
+    ("spans", "scope_name", "CODEC(ZSTD(1))"),
+    ("spans", "scope_version", "CODEC(ZSTD(1))"),
+    ("spans", "scope_attrs", "CODEC(ZSTD(1))"),
+    ("spans", "attrs", "CODEC(ZSTD(1))"),
+    ("spans", "attrs_other", "CODEC(ZSTD(1))"),
+    ("spans", "dropped_attrs", "CODEC(ZSTD(1))"),
+    ("spans", "events", "CODEC(ZSTD(1))"),
+    ("spans", "dropped_events", "CODEC(ZSTD(1))"),
+    ("spans", "links", "CODEC(ZSTD(1))"),
+    ("spans", "dropped_links", "CODEC(ZSTD(1))"),
+    ("tag_names", "scope", "CODEC(ZSTD(1))"),
+    ("tag_names", "key", "CODEC(ZSTD(1))"),
+    ("tag_values", "scope", "CODEC(ZSTD(1))"),
+    ("tag_values", "key", "CODEC(ZSTD(1))"),
+    ("tag_values", "value", "CODEC(ZSTD(1))"),
+    ("tag_values", "val_type", "CODEC(ZSTD(1))"),
+    ("traces", "day", "CODEC(ZSTD(1))"),
+    ("traces", "trace_id", "CODEC(ZSTD(1))"),
+    ("traces", "start_ns", "CODEC(ZSTD(1))"),
+    ("traces", "end_ns", "CODEC(ZSTD(1))"),
+    ("traces", "root_service", "CODEC(ZSTD(1))"),
+    ("traces", "root_name", "CODEC(ZSTD(1))"),
+    ("traces", "services", "CODEC(ZSTD(1))"),
+];
+
+#[tokio::test]
+async fn the_target_tables_carry_the_codecs_this_design_names() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_codec_text");
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let sql = format!(
+        "SELECT table, name, compression_codec FROM system.columns \
+         WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST}) \
+         ORDER BY table, position"
+    );
+    let mut stream = client
+        .query_stream::<TableColumnCodecRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("codec query failed: {e}\nSQL:\n{sql}"));
+    let mut seen: Vec<TableColumnCodecRow> = Vec::new();
+    while let Some(row) = stream.next().await {
+        seen.push(row.expect("decode TableColumnCodecRow"));
+    }
+    drop(stream);
+
+    assert_eq!(
+        seen.len(),
+        TARGET_TABLE_CODECS.len(),
+        "the five target tables' column count"
+    );
+    for (got, (table, name, codec)) in seen.iter().zip(TARGET_TABLE_CODECS) {
+        assert_eq!(got.table, table, "table order");
+        assert_eq!(got.name, name, "{table}'s column order");
+        assert_eq!(got.compression_codec, codec, "{table}.{name}'s codec");
+    }
 
     drop_database(&client, db).await;
 }
