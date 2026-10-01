@@ -2,7 +2,7 @@
 
 Status: **Accepted** (2026-08-09)
 Issue: [#382](https://github.com/digitalis-io/pulsusdb/issues/382) (a ClickHouse error after the first flush is parsed as code 0)
-Related: [ADR 0003](0003-promql-parser-vendor-patch.md) and [ADR 0004](0004-opentelemetry-proto-vendor-patch.md) establish the vendor+patch discipline this ADR reuses; [ADR 0001](0001-clickhouse-client.md) selected the client.
+Related: [ADR 0003](0003-promql-parser-vendor-patch.md) and [ADR 0004](0004-opentelemetry-proto-vendor-patch.md) establish the vendor+patch discipline this ADR reuses; [ADR 0001](0001-clickhouse-client.md) selected the client; [ADR 0009](0009-clickhouse-types-vendor-patch.md) decides §§3-4 of this same vendored crate's `PATCHES.md` and vendors a second crate from the same upstream.
 Depends on: [#376](https://github.com/digitalis-io/pulsusdb/issues/376) (ClickHouse LTS move) — see "What this does not decide".
 Spawned: [#412](https://github.com/digitalis-io/pulsusdb/issues/412) (the streaming path, pre-existing on `main`) — fixed, in the same vendored crate; see `vendor/clickhouse/PATCHES.md` §2.
 
@@ -85,6 +85,11 @@ Consequences:
   and no change to transport, compression, decoding or pooling.
 - We own one more vendored crate at each dependency bump. The re-vendor rule
   says to drop the patch the moment upstream surfaces the code itself.
+- Two further patches were later added to this same vendored crate and are
+  decided by [ADR 0009](0009-clickhouse-types-vendor-patch.md):
+  `validate_impl`'s `JSON` arm and its named-tuple arm,
+  `vendor/clickhouse/PATCHES.md` §§3-4, whose re-vendor rules are paired with
+  `vendor/clickhouse-types`'s.
 
 ## What this does not decide
 
