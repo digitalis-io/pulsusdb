@@ -83,6 +83,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::ingest::PushHeaders;
 use crate::ingest::metrics::ParsedMetrics;
+use crate::ingest::traces::ParsedTraces;
 use crate::protocols::otlp_logs::ParsedLogs;
 
 // ---------------------------------------------------------------------
@@ -156,6 +157,14 @@ impl DigestBuilder {
 
     fn u8(&mut self, v: u8) -> &mut Self {
         self.hasher.update(&[v]);
+        self
+    }
+
+    /// Length-prefixed, the same rule [`Self::str`] applies: a span's
+    /// payload blob and the blob beside it must not run together.
+    fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        self.hasher.update(&(b.len() as u64).to_le_bytes());
+        self.hasher.update(b);
         self
     }
 
@@ -300,6 +309,83 @@ pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders) -> PushIdentity {
 /// Resolves a metric push's identity — see [`log_identity`].
 pub fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIdentity {
     identity_from(metric_content_digest(batch), headers)
+}
+
+/// The content digest of a parsed trace push (issue #586).
+///
+/// Taken over the OLD path's [`ParsedTraces`] rather than over the landing
+/// decode, because that shape carries every span's own
+/// single-`ResourceSpans` protobuf `payload` — the resource, the scope and
+/// the span, as they arrived — so one walk covers everything the request
+/// sent. No receiver-generated field enters: the decode writes none onto
+/// either shape, and the one clock reading a trace push takes
+/// (`SpanRecord::timestamp_ns` for a span whose `start_time_unix_nano` is
+/// `0`) is the same instant for a retry a millisecond later only by
+/// accident — which is why a client that must have two identical bodies
+/// stored separately sends two `Idempotency-Key`s.
+fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
+    let mut d = DigestBuilder::new();
+    d.str("traces");
+    d.u64(batch.spans.len() as u64);
+    for span in &batch.spans {
+        d.bytes(&span.trace_id)
+            .bytes(&span.span_id)
+            .bytes(&span.parent_id)
+            .str(&span.name)
+            .str(&span.service)
+            .i64(span.timestamp_ns)
+            .i64(span.duration_ns)
+            .u8(span.status_code as u8)
+            .str(&span.status_message)
+            .u8(span.kind as u8)
+            .u8(span.shared)
+            .str(&span.scope_name)
+            .str(&span.scope_version)
+            .bytes(&span.payload);
+        d.u64(span.attr_key.len() as u64);
+        for key in &span.attr_key {
+            d.str(key);
+        }
+        for scope in &span.attr_scope {
+            d.str(scope);
+        }
+        for val in &span.attr_val {
+            d.str(val);
+        }
+        for ty in &span.attr_type {
+            d.str(ty.as_str());
+        }
+        for num in &span.attr_num {
+            match num {
+                Some(n) => d.u8(1).f64(*n),
+                None => d.u8(0),
+            };
+        }
+    }
+    d.u64(batch.attrs.len() as u64);
+    for attr in &batch.attrs {
+        d.u64(u64::from(attr.date))
+            .str(&attr.key)
+            .str(&attr.scope)
+            .str(&attr.val)
+            .str(attr.val_type.as_str())
+            .i64(attr.timestamp_ns)
+            .bytes(&attr.trace_id)
+            .bytes(&attr.span_id)
+            .i64(attr.duration_ns);
+        match attr.val_num {
+            Some(n) => d.u8(1).f64(n),
+            None => d.u8(0),
+        };
+    }
+    d.u64(batch.rejected);
+    d.opt_str(batch.rejected_message.as_deref());
+    d.finish()
+}
+
+/// Resolves a trace push's identity — see [`log_identity`].
+pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdentity {
+    identity_from(trace_content_digest(batch), headers)
 }
 
 fn identity_from(content: PushDigest, headers: &PushHeaders) -> PushIdentity {

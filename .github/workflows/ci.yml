@@ -1571,6 +1571,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_rows_v2
 
+      # Issue #586: the trace write path on the landing table — one push is
+      # one insert, the three per-push ceilings, the joint admission over both
+      # write paths, the suppression index over three targets, and the two
+      # trace transports' refusal containers. Every case but one is hermetic;
+      # the one that is not reads `system.asynchronous_insert_log`, which is
+      # the only observable that tells a synchronous insert from a queued one.
+      # Reuses this job's ClickHouse 26.3 container.
+      - name: Trace landing writer (one push, one insert)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test trace_landing
+
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as

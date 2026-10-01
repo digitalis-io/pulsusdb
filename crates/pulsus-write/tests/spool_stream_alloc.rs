@@ -49,12 +49,12 @@ use pulsus_model::{
 };
 use pulsus_model::{Date, UnixNano};
 use pulsus_write::writer::{
-    BlockInserter, LogWriter, MetricWriter, MetricWriterTables, SPOOL_CHUNK_BYTES, WriterRuntime,
-    WriterTables,
+    BlockInserter, LogWriter, MetricWriter, MetricWriterTables, SPOOL_CHUNK_BYTES, TraceWriter,
+    TraceWriterTables, WriterRuntime, WriterTables,
 };
 use pulsus_write::{
     HistogramPoint, LogRow, LogSink, MetricMetadata, MetricPoint, MetricSink, ParsedLogs,
-    ParsedMetrics, PushHeaders, SeriesRef, StreamRow,
+    ParsedMetrics, ParsedTraceLanding, ParsedTraces, PushHeaders, SeriesRef, StreamRow, TraceSink,
 };
 
 /// Held for the whole of each measuring `#[test]`, so two of them never share
@@ -677,6 +677,185 @@ fn spooling_a_log_block_holds_no_copy_of_the_push() {
             "four times the log line moved the spool path's overhead by {} \
              bytes ({short} at {STRING_BYTES} bytes, {long} at \
              {STRING_BYTES_4X}): it must stay fixed as the body grows, or the \
+             bound is one push's size and not a constant",
+            long.abs_diff(short)
+        );
+    });
+}
+
+// -- the traces half (issue #586) ------------------------------------------
+
+/// One span carrying 200 events, each with one attribute whose value is
+/// `bytes` long — the shape whose spool cost a whole-document encoder pays
+/// twice, in a value tree and again in the serialised body.
+fn wide_event_trace_push(bytes: usize) -> (ParsedTraces, ParsedTraceLanding) {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::span::Event;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span as OtlpSpan};
+
+    const TS: i64 = 1_760_000_000_000_000_000;
+    let kv = |key: &str, value: String| KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(value)),
+        }),
+        key_strindex: 0,
+    };
+    let events: Vec<Event> = (0..200)
+        .map(|i| Event {
+            time_unix_nano: TS as u64 + i,
+            name: format!("event-{i}"),
+            attributes: vec![kv(&format!("e{i}"), long_text(bytes / 200))],
+            dropped_attributes_count: 0,
+        })
+        .collect();
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "checkout".to_string())],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![OtlpSpan {
+                    trace_id: vec![0xaa; 16],
+                    span_id: vec![0xbb; 8],
+                    name: "GET /api".to_string(),
+                    start_time_unix_nano: TS as u64,
+                    end_time_unix_nano: TS as u64 + 1_000_000,
+                    events,
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    (
+        pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
+        pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
+    )
+}
+
+/// [`peak_over_push`]'s traces twin: the same window over a `TraceWriter`,
+/// with the OLD path's two inserters committing so only the landing block is
+/// ever spooled.
+async fn peak_over_trace_push(push: (ParsedTraces, ParsedTraceLanding), poison: bool) -> Measured {
+    let root = spool_root(if poison {
+        "trace-poison"
+    } else {
+        "trace-commit"
+    });
+    let mut runtime = WriterRuntime::from_config(&WriterConfig {
+        trace_landing_inserters: 1,
+        trace_landing_retries: 0,
+        // The push is one span with 200 events, whose landing charge is well
+        // past the default ceiling.
+        batch_bytes: pulsus_config::ByteSize(1024 * 1024 * 1024),
+        ingest_queue_bytes: pulsus_config::ByteSize(1024 * 1024 * 1024),
+        ..Default::default()
+    });
+    runtime.spool_dir = root.clone();
+    let writer = TraceWriter::with_inserters_and_runtime(
+        Arc::new(FixedInserter { poison: false }),
+        Arc::new(FixedInserter { poison: false }),
+        Arc::new(FixedInserter { poison }),
+        runtime,
+        TraceWriterTables::traces_default(),
+    );
+    let (parsed, landed) = push;
+    let peak = peak_bytes_of(async {
+        let wait = writer
+            .admit_flush(parsed, landed, PushHeaders::default())
+            .expect("the queue has room");
+        // The OLD path answers the caller, so the wait resolves `Ok` whether
+        // or not the landing block was spooled: the landing half carries no
+        // waiter at all.
+        tokio::time::timeout(Duration::from_secs(60), wait)
+            .await
+            .expect("the old path settles")
+            .expect("the old path commits");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while spooled_of(&root, "trace_landing").len() < usize::from(poison) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poisoned landing block never reached the spool"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    let documents = spooled_of(&root, "trace_landing");
+    assert_eq!(
+        documents.len(),
+        usize::from(poison),
+        "the poisoned block is on disk and the committed one is not"
+    );
+    let spooled_bytes = documents.iter().sum();
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+    Measured {
+        peak,
+        spooled_bytes,
+    }
+}
+
+/// **Spooling a trace landing block holds no copy of the push.**
+///
+/// A span row's `events` and `links` are arrays of tuples, each element with
+/// its own text and its own encoded `JSON`. The default encoder builds one
+/// `serde_json::Value` tree per row before writing it, and a span row can
+/// carry megabytes of events; the override writes the fields, the arrays and
+/// the text straight into the sink, and its overhead stays fixed as the span
+/// widens. **Keeping the default encoder reddens the second assertion.**
+#[test]
+fn spooling_a_trace_block_holds_no_copy_of_the_push() {
+    let _measuring = MEASURE.lock().expect("the measurement mutex is poisoned");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build a current-thread runtime");
+
+    runtime.block_on(async {
+        // Warm-up, so no measured window pays a one-time cost.
+        let _ = peak_over_trace_push(wide_event_trace_push(64), true).await;
+        let _ = peak_over_trace_push(wide_event_trace_push(64), false).await;
+
+        let mut extras = Vec::new();
+        for (label, bytes) in [("S", STRING_BYTES), ("4S", STRING_BYTES_4X)] {
+            let commit = peak_over_trace_push(wide_event_trace_push(bytes), false)
+                .await
+                .peak;
+            let spooled = peak_over_trace_push(wide_event_trace_push(bytes), true).await;
+            let extra = spooled.peak.saturating_sub(commit);
+            assert!(
+                spooled.spooled_bytes > 4 * SPOOL_CHUNK_BYTES as u64,
+                "the {label} case must cross the {SPOOL_CHUNK_BYTES} byte chunk \
+                 boundary several times over: its document is {} bytes",
+                spooled.spooled_bytes
+            );
+            assert!(
+                extra <= SPOOL_CEILING_BYTES,
+                "spooling one span of 200 events totalling {bytes} bytes \
+                 ({label}) held {extra} bytes more than committing it, over \
+                 the ceiling {SPOOL_CEILING_BYTES}: the encoder holds a copy \
+                 of the row's arrays that nothing charges the queue for \
+                 (commit peak {commit}, spool peak {})",
+                spooled.peak
+            );
+            extras.push(extra);
+        }
+        let (short, long) = (extras[0], extras[1]);
+        assert!(
+            long.abs_diff(short) <= WIDTH_SLACK_BYTES,
+            "four times the event text moved the spool path's overhead by {} \
+             bytes ({short} at {STRING_BYTES} bytes, {long} at \
+             {STRING_BYTES_4X}): it must stay fixed as the span widens, or the \
              bound is one push's size and not a constant",
             long.abs_diff(short)
         );

@@ -21,7 +21,7 @@ pub use ingest::traces::{
 };
 pub use ingest::{
     AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders,
-    push_too_large_message,
+    push_spans_too_many_days_message, push_too_large_message,
 };
 pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{
@@ -50,7 +50,7 @@ pub use writer::{
     PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome, TraceAttrRow, TraceEventTuple,
     TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow, TraceLinkTuple,
     TraceSpanRow, TraceWriter, TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables,
-    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities,
+    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities, trace_identity,
 };
 
 #[cfg(test)]

@@ -3601,6 +3601,114 @@ mod landing_tests {
             .collect()
     }
 
+    /// **A span attribute carrying a profiling string reference lands
+    /// nowhere** (issue #586): no path in `attrs`, no key in `attrs_other`,
+    /// no row in `tag_names` and no row in `tag_values`, in any of the five
+    /// scopes.
+    ///
+    /// The proto's own comment on that arm is the authority: a receiver for
+    /// a signal other than Profiling should "process the data as if this
+    /// value were absent or empty, ignoring its semantic content". It offers
+    /// two readings and this takes **absent**.
+    ///
+    /// `k4` is the control — a bytes value still goes to `attrs_other` — and
+    /// the scope attribute is what shows the drop is not the span scope's
+    /// alone.
+    #[test]
+    fn a_profiling_string_reference_lands_nowhere() {
+        let span = span_of(vec![
+            kv("k1", strindex_value(7)),
+            kv(
+                "k2",
+                array_value(vec![str_value("a"), strindex_value(7), str_value("b")]),
+            ),
+            kv("k3", array_value(vec![strindex_value(7)])),
+            kv("k4", bytes_value(b"x")),
+        ]);
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource_of(vec![kv("service.name", str_value("checkout"))])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "io.otel.http".to_string(),
+                        version: String::new(),
+                        attributes: vec![kv("s1", strindex_value(7))],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![span],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let parsed = landed(&req);
+        assert_eq!(parsed.spans.len(), 1);
+
+        // `attrs`: no path for `k1`; `k2` is a two-element string array;
+        // `k3` is a landed array of no elements.
+        assert_eq!(
+            paths(&parsed),
+            vec!["k2", "k3"],
+            "only the two arrays store a path; `k1`'s arm lands nowhere and \
+             `k4` is carried in `attrs_other`"
+        );
+        let by_path = |path: &str| {
+            parsed.spans[0]
+                .attrs
+                .entries()
+                .iter()
+                .find(|e| e.path == path)
+                .map(|e| e.value.clone())
+                .unwrap_or_else(|| panic!("no entry at {path}"))
+        };
+        assert_eq!(
+            by_path("k2"),
+            TraceJsonValue::StrArray(vec!["a".to_string(), "b".to_string()]),
+            "the element of that arm is dropped and the rest land"
+        );
+        // **Not the variant**: §4.2's two empty-array variants serialise to
+        // the same four bytes and no read can tell them apart.
+        let k3 = by_path("k3");
+        assert!(
+            matches!(k3, TraceJsonValue::EmptyArray)
+                || matches!(&k3, TraceJsonValue::StrArray(a) if a.is_empty()),
+            "an array whose every element is that arm lands as the empty \
+             array: {k3:?}"
+        );
+
+        // `attrs_other` carries `k4` and nothing else.
+        let other = KeyValueList::decode(parsed.spans[0].attrs_other.as_slice())
+            .expect("attrs_other decodes as a KeyValueList");
+        let keys: Vec<&str> = other.values.iter().map(|kv| kv.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["k4"],
+            "the index itself is never carried in the protobuf side-channel"
+        );
+
+        // Neither catalog lists the key, in either scope.
+        let names: Vec<&str> = parsed.tag_names.iter().map(|t| t.key.as_str()).collect();
+        assert!(!names.contains(&"k1"), "tag_names: {names:?}");
+        assert!(!names.contains(&"s1"), "nor the scope's own key: {names:?}");
+        for present in ["k2", "k3", "k4"] {
+            assert!(
+                names.contains(&present),
+                "every other key is still listed: {present} missing from {names:?}"
+            );
+        }
+        let values: Vec<(&str, &str)> = parsed
+            .tag_values
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str()))
+            .collect();
+        assert!(
+            !values.iter().any(|(k, _)| *k == "k1"),
+            "tag_values: {values:?}"
+        );
+        assert!(values.contains(&("k2", "a")), "{values:?}");
+        assert!(values.contains(&("k2", "b")), "{values:?}");
+    }
+
     /// **Each OTLP value arm lands where §4.2's table says.**
     ///
     /// The four shapes with no JSON representation — a bytes value, an empty

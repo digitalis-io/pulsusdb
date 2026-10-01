@@ -987,7 +987,8 @@ mod tests {
     }
 
     /// AC-2 (traces): the trace-writer snapshot emits its two tables, the
-    /// `signal="traces"` series, and the attrs backfill — and NO
+    /// `signal="traces"` series, the attrs backfill and issue #494's
+    /// push-suppression set (issue #586) — and NO
     /// registration-cache/collision/metadata/pattern series (traces track
     /// none). Exhaustive: EVERY emitted series is asserted for its exact
     /// seeded value AND its `# TYPE`. Fully-spelled struct literal.
@@ -1004,6 +1005,10 @@ mod tests {
             spool_uncertain_total: 73,
             rejected_total: 74,
             attrs_backfill: backfill_snap(220),
+            // Issue #586: the trace push joins issue #494's suppression
+            // index, so this signal renders the dedup set too. 230 is free
+            // beside the bases above.
+            dedup: dedup_snap(230),
         };
         let r = render_local(|| record_trace_ingest_snapshot(&snap));
 
@@ -1037,6 +1042,12 @@ mod tests {
 
         // Backfill values (6 series).
         assert_backfill_series(&r, "trace_attrs_idx", 220);
+
+        // Issue #586's push-suppression series, on this signal. The label
+        // value is `traces`, which is what every other series this writer
+        // renders carries.
+        assert_dedup_types(&r);
+        assert_dedup_series(&r, "traces", 230);
 
         // Traces track no registration-cache/collision/metadata/pattern series.
         assert!(!r.contains("pulsus_ingest_registrations_total"));

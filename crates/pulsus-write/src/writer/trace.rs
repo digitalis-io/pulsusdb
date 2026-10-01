@@ -32,16 +32,21 @@ use tokio::sync::{Notify, oneshot};
 use tracing::warn;
 
 use crate::error::LogsIngestError;
-use crate::ingest::traces::{ParsedTraces, TraceSink};
-use crate::ingest::{Backpressure, FlushWait};
+use crate::ingest::traces::{ParsedTraceLanding, ParsedTraces, TraceSink};
+use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 use crate::writer::backfill::{self, RegistrationBacklog};
 use crate::writer::buffer;
 use crate::writer::config::WriterRuntime;
+use crate::writer::drain::DrainBoundary;
 use crate::writer::error::WriteError;
-use crate::writer::metrics::{TraceWriterMetrics, TraceWriterMetricsSnapshot};
-use crate::writer::rows::{TraceAttrRow, TraceSpanRow};
+use crate::writer::metrics::{
+    TraceLandingSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot,
+};
+use crate::writer::push_dedup::PushDedup;
+use crate::writer::rows::{TraceAttrRow, TraceLandingRow, TraceSpanRow};
 use crate::writer::spool;
 use crate::writer::table::{self, BlockInserter, ChBlockInserter, ShutdownSignal, TableContext};
+use crate::writer::trace_landing::{self, TraceLandingPath};
 
 const SPANS_TABLE: &str = "trace_spans";
 const ATTRS_TABLE: &str = "trace_attrs_idx";
@@ -67,6 +72,11 @@ pub(crate) fn span_insert_settings() -> QuerySettings {
 pub struct TraceWriterTables {
     pub spans: Arc<str>,
     pub attrs: Arc<str>,
+    /// The landing table (issue #586). No `_dist` wrapper in any mode: a
+    /// push carries many trace ids, so inserting the push itself through one
+    /// would split one push per shard. The routing happens one step later,
+    /// on the way out of the two per-trace views.
+    pub landing: Arc<str>,
 }
 
 impl TraceWriterTables {
@@ -77,6 +87,7 @@ impl TraceWriterTables {
         TraceWriterTables {
             spans: Arc::from(SPANS_TABLE),
             attrs: Arc::from(ATTRS_TABLE),
+            landing: Arc::from(trace_landing::LANDING_TABLE),
         }
     }
 }
@@ -94,6 +105,18 @@ struct Shared {
     spans_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     attrs_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     attrs_backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The landing path (issue #586): its queue, its insert workers and its
+    /// own byte counter. Additional to the two tables above, which keep
+    /// writing until task 20.
+    landing: TraceLandingPath,
+    /// Issue #494's per-signal push-suppression index, extended to the trace
+    /// push by issue #586. `None` while `PULSUS_INGEST_DEDUP` is off.
+    dedup: Option<Arc<PushDedup>>,
+    /// The landing half's shutdown boundary: the admission gate, the
+    /// announced deadline and every task that half spawned
+    /// (`writer::drain`). The two old flush tasks and the backfill task keep
+    /// their own [`ShutdownSignal`] above.
+    boundary: DrainBoundary,
 }
 
 /// Implements issue #54's `TraceSink` over the generic per-table columnar
@@ -123,19 +146,50 @@ impl TraceWriter {
             client.clone(),
             span_insert_settings(),
         ));
-        let attrs_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
-        Self::with_inserters_with_tables(spans_inserter, attrs_inserter, cfg, tables)
+        let attrs_inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client.clone()));
+        let landing_inserter = TraceLandingPath::production_inserter(client);
+        Self::with_inserters_with_tables(
+            spans_inserter,
+            attrs_inserter,
+            landing_inserter,
+            cfg,
+            tables,
+        )
     }
 
-    /// Test/mock constructor: any [`BlockInserter`] pair — e.g. a
+    /// Test/mock constructor: any [`BlockInserter`] trio — e.g. a
     /// scriptable mock that can fail/hang on demand — against `tables`.
     pub fn with_inserters_with_tables(
         spans_inserter: Arc<dyn BlockInserter<TraceSpanRow>>,
         attrs_inserter: Arc<dyn BlockInserter<TraceAttrRow>>,
+        landing_inserter: Arc<dyn BlockInserter<TraceLandingRow>>,
         cfg: &WriterConfig,
         tables: TraceWriterTables,
     ) -> Self {
-        let runtime = Arc::new(WriterRuntime::from_config(cfg));
+        Self::with_inserters_and_runtime(
+            spans_inserter,
+            attrs_inserter,
+            landing_inserter,
+            WriterRuntime::from_config(cfg),
+            tables,
+        )
+    }
+
+    /// [`Self::with_inserters_with_tables`], but against a caller-supplied
+    /// [`WriterRuntime`] rather than one derived from a `&WriterConfig`. The
+    /// seam exists because `spool_dir` is set from a constant, so nothing
+    /// outside this crate could otherwise point a spool anywhere; the
+    /// constructors above build the runtime themselves and delegate here, so
+    /// no production call site and no production behaviour depends on it.
+    #[doc(hidden)]
+    pub fn with_inserters_and_runtime(
+        spans_inserter: Arc<dyn BlockInserter<TraceSpanRow>>,
+        attrs_inserter: Arc<dyn BlockInserter<TraceAttrRow>>,
+        landing_inserter: Arc<dyn BlockInserter<TraceLandingRow>>,
+        runtime: WriterRuntime,
+        tables: TraceWriterTables,
+    ) -> Self {
+        let runtime = Arc::new(runtime);
         let metrics = Arc::new(TraceWriterMetrics::default());
         let queued_bytes = Arc::new(AtomicU64::new(0));
         let spool = Arc::new(spool::SpoolWriter::new(
@@ -143,9 +197,28 @@ impl TraceWriter {
             metrics.clone(),
         ));
         let (shutdown, shutdown_rx) = ShutdownSignal::new();
+        let boundary = DrainBoundary::new();
 
-        let spans = Arc::new(buffer::TableBuffer::new());
-        let attrs = Arc::new(buffer::TableBuffer::new());
+        // Issue #494's index, built from `WriterRuntime` exactly as
+        // `writer::metric`'s is, so no constructor signature changes and no
+        // `TraceWriter::new*` call site moves.
+        let dedup = runtime.ingest_dedup.then(|| {
+            PushDedup::new(
+                runtime.ingest_dedup_max_bytes,
+                runtime.ingest_dedup_window,
+                runtime.claim_deadline,
+            )
+        });
+
+        // **The push's claim records three targets** (issue #586): the two
+        // old tables, which count toward the acknowledgement, and the
+        // landing block, which does not. A claim over the landing block
+        // alone would store twice — a push whose landing insert failed and
+        // whose two old-path inserts committed would leave the claim
+        // released, so the client's retry would be admitted and the old
+        // path would store it a second time.
+        let spans = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
+        let attrs = Arc::new(buffer::TableBuffer::with_dedup(dedup.clone(), true));
         let spans_notify = Arc::new(Notify::new());
         let attrs_notify = Arc::new(Notify::new());
 
@@ -184,8 +257,10 @@ impl TraceWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: None,
-            // Traces are out of scope for issue #494: no suppression
-            // index, so no claim, no ticket, no tick.
+            // This field drives `tick()` alone, and the landing path's
+            // `spawn_dedup_ticker` does that on a task of its own (issue
+            // #586). This table's claim is on its buffer, built with
+            // `with_dedup`.
             dedup: None,
         };
         let attrs_ctx = TableContext {
@@ -195,14 +270,26 @@ impl TraceWriter {
             inserter: attrs_inserter,
             runtime: runtime.clone(),
             table_metrics: metrics.attrs.clone(),
-            spool,
+            spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
             on_flush_poisoned: Some(on_attrs_flush_poisoned),
-            // Traces are out of scope for issue #494: no suppression
-            // index, so no claim, no ticket, no tick.
+            // This field drives `tick()` alone, and the landing path's
+            // `spawn_dedup_ticker` does that on a task of its own (issue
+            // #586). This table's claim is on its buffer, built with
+            // `with_dedup`.
             dedup: None,
         };
+
+        let landing = TraceLandingPath::new(
+            tables.landing,
+            landing_inserter,
+            runtime.clone(),
+            metrics.clone(),
+            spool,
+            dedup.clone(),
+            &boundary,
+        );
 
         let spans_task = table::spawn(spans_ctx, shutdown_rx.clone());
         let attrs_task = table::spawn(attrs_ctx, shutdown_rx.clone());
@@ -229,6 +316,9 @@ impl TraceWriter {
             spans_task: Mutex::new(Some(spans_task)),
             attrs_task: Mutex::new(Some(attrs_task)),
             attrs_backfill_task: Mutex::new(Some(attrs_backfill_task)),
+            landing,
+            dedup,
+            boundary,
         });
 
         TraceWriter { shared }
@@ -240,10 +330,15 @@ impl TraceWriter {
     fn admit_batch(
         &self,
         batch: ParsedTraces,
+        landing: ParsedTraceLanding,
         with_waiters: bool,
-    ) -> Result<Vec<oneshot::Receiver<Result<(), WriteError>>>, Backpressure> {
+        push: PushHeaders,
+    ) -> Result<Vec<oneshot::Receiver<Result<(), WriteError>>>, AdmitRefusal> {
+        // STUB (issue #586, the tests-first commit): the joint admission,
+        // the suppression index and the landing block are not wired yet.
+        let _ = (landing, push);
         if self.shared.shutting_down.load(Ordering::Acquire) {
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
         }
 
         self.shared
@@ -265,13 +360,14 @@ impl TraceWriter {
             &self.shared.metrics.backpressure_total,
             total_bytes,
             self.shared.runtime.queue_bytes_limit,
-        )?;
+        )
+        .map_err(AdmitRefusal::from)?;
 
         if self.shared.shutting_down.load(Ordering::Acquire) {
             self.shared
                 .queued_bytes
                 .fetch_sub(total_bytes, Ordering::AcqRel);
-            return Err(Backpressure);
+            return Err(AdmitRefusal::Backpressure);
         }
 
         // Reservation secured: only now materialize the target rows.
@@ -327,20 +423,51 @@ impl TraceWriter {
         Ok(receivers)
     }
 
-    /// A point-in-time metrics snapshot.
+    /// A point-in-time metrics snapshot. `queue_bytes` is the **old** path's
+    /// counter; the landing path's is [`Self::landing_metrics`].
     pub fn metrics(&self) -> TraceWriterMetricsSnapshot {
-        self.shared
-            .metrics
-            .snapshot(self.shared.queued_bytes.load(Ordering::Relaxed))
+        self.shared.metrics.snapshot(
+            self.shared.queued_bytes.load(Ordering::Relaxed),
+            self.shared
+                .dedup
+                .as_ref()
+                .map(|d| d.snapshot())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The landing path's own figures, which no exported series carries
+    /// (issue #586, `TraceLandingSnapshot`).
+    pub fn landing_metrics(&self) -> TraceLandingSnapshot {
+        self.shared.landing.snapshot()
+    }
+
+    /// This writer's push-suppression index (issue #494), or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off.
+    pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
+        self.shared.dedup.as_ref()
     }
 
     /// Graceful shutdown, mirroring [`crate::writer::LogWriter::shutdown`]:
     /// stops admitting immediately (subsequent `admit`/`admit_flush` calls
     /// return `Backpressure`), then drains every open/in-flight generation
     /// up to `deadline`. Idempotent.
+    /// Re-opens the landing half's admission gate after [`Self::shutdown`]
+    /// has returned, so the next admission takes a pass and meets the closed
+    /// queue. Nothing in the server calls this.
+    #[doc(hidden)]
+    pub fn reopen_admission_for_test(&self) {
+        self.shared.boundary.reopen_for_test();
+    }
+
     pub async fn shutdown(&self, deadline: Duration) {
         self.shared.shutting_down.store(true, Ordering::Release);
         self.shared.shutdown.begin(Instant::now() + deadline);
+        // The landing half's own boundary, beside the two flush tasks and
+        // the backfill task below: admission closes, the admissions inside
+        // it finish, the deadline is announced, and every task that half
+        // spawned is awaited.
+        self.shared.boundary.shutdown(deadline).await;
 
         let spans_task = self
             .shared
@@ -384,12 +511,22 @@ impl TraceWriter {
 }
 
 impl TraceSink for TraceWriter {
-    fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
-        self.admit_batch(batch, false).map(|_| ())
+    fn admit(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
+        self.admit_batch(batch, landing, false, push).map(|_| ())
     }
 
-    fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
-        let receivers = self.admit_batch(batch, true)?;
+    fn admit_flush(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
+        let receivers = self.admit_batch(batch, landing, true, push)?;
         Ok(FlushWait::new(async move {
             super::join_generations(receivers)
                 .await

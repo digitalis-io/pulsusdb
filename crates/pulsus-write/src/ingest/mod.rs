@@ -92,6 +92,14 @@ pub enum AdmitRefusal {
         bytes: u64,
         byte_limit: u64,
     },
+    /// Issue #586: the push's spans fall on more distinct UTC dates than one
+    /// block may touch partitions of. `spans`, `traces` and `resources` are
+    /// partitioned by UTC day, so a view's insert produces one part per day
+    /// the push's spans fall in, and the server throws above
+    /// `max_partitions_per_insert_block`. Refused whole (`413`) rather than
+    /// admitted, answered `200` by the route and left absent from the new
+    /// tables with nobody told.
+    PushSpansTooManyDays { days: u64, day_limit: u64 },
 }
 
 impl From<Backpressure> for AdmitRefusal {
@@ -114,6 +122,13 @@ pub fn push_too_large_message(rows: u64, row_limit: u64, bytes: u64, byte_limit:
         "push does not fit one block: {rows} rows (limit {row_limit}), \
          {bytes} estimated bytes (limit {byte_limit})"
     )
+}
+
+/// The message [`AdmitRefusal::PushSpansTooManyDays`] is answered with, on
+/// every transport that can reach it (issue #586). It names the push's own
+/// date count and the limit, the shape [`push_too_large_message`] has.
+pub fn push_spans_too_many_days_message(days: u64, day_limit: u64) -> String {
+    format!("push covers too many UTC dates for one block: {days} dates (limit {day_limit})")
 }
 
 /// A handle a sync-mode request (`X-Pulsus-Async` absent or `0`,

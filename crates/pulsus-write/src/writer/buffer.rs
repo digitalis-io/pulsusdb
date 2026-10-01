@@ -87,7 +87,10 @@ pub(crate) struct TableBuffer<R> {
 }
 
 impl<R> TableBuffer<R> {
-    /// A buffer with no suppression index behind it.
+    /// A buffer with no suppression index behind it. **Test-only from issue
+    /// #586 on**: the two trace buffers were the last production callers,
+    /// and they carry the trace push's claim now (`writer::trace`).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_dedup(None, true)
     }

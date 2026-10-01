@@ -17,7 +17,7 @@ use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_write::writer::{
     BlockInserter, ChBlockInserter, MetricWriter, MetricWriterTables, WriterRuntime,
 };
-use pulsus_write::{MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef};
+use pulsus_write::{MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef, TraceSink};
 
 #[path = "common/mock_ch_insert.rs"]
 mod mock_ch_insert;
@@ -488,4 +488,197 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     std::fs::remove_dir_all(&root).ok();
+}
+
+// -- issue #586: the trace landing insert ------------------------------
+
+/// A `BlockInserter` that answers every call `Ok` and records nothing — the
+/// old two-table path's stand-in, so the mock server serves the landing
+/// insert alone.
+struct NoopInserter;
+
+impl<R: pulsus_clickhouse::ChRow> BlockInserter<R> for NoopInserter {
+    fn insert<'a>(
+        &'a self,
+        _table: &'a str,
+        _rows: &'a [R],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// **What the production inserter puts on the wire for a trace landing
+/// insert is the client's MERGED set, not the constructor's.**
+///
+/// The merge order, read off `ChClient::insert_settings_with`, is: the
+/// `ConsistencyConfig`'s own entries first, then `async_insert = 0`, then the
+/// caller's entries by key, then `max_execution_time` last. So comparing the
+/// captured set against the constructor's alone is what this case must not
+/// do — the wire carries more than the constructor names, because
+/// `async_insert` is pinned one layer down, and an equality against the
+/// constructor would fail on a correct implementation.
+///
+/// Three assertions: the captured set **contains** every entry the
+/// constructor gives, derived from the constructor rather than listed;
+/// `async_insert = 0` appears **exactly once**; and its only other members
+/// are the ones a bare insert through the same client already carries, which
+/// is the deadline and whatever the configured `ConsistencyConfig` implies.
+#[tokio::test]
+async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() {
+    let mock = MockChInsert::start(DescribeAnswer::Ok, InsertAnswer::Ok);
+    let client = Arc::new(
+        ChClient::new(mock.conn_config())
+            .await
+            .expect("connect to the mock"),
+    );
+
+    // The baseline: the same client, the same adapter, no caller settings at
+    // all. Whatever query parameters this request carries are the driver's
+    // own plus the two the client pins for every insert it makes.
+    let bare = ChBlockInserter::new(client.clone());
+    BlockInserter::<OneCol>::insert_with(&bare, "t", &[OneCol { v: 1 }], &QuerySettings::new())
+        .await
+        .expect("the mock answers the insert with a 200");
+    let baseline_keys = param_keys(&mock.insert_request().target);
+
+    let cfg = WriterConfig::default();
+    let root = spool_root("trace-landing-wire");
+    let mut runtime = WriterRuntime::from_config(&cfg);
+    runtime.spool_dir = root.clone();
+    runtime.trace_landing_inserters = 1;
+    let writer = pulsus_write::TraceWriter::with_inserters_and_runtime(
+        Arc::new(NoopInserter),
+        Arc::new(NoopInserter),
+        Arc::new(ChBlockInserter::new(client)),
+        runtime,
+        pulsus_write::TraceWriterTables::traces_default(),
+    );
+
+    let (parsed, landed) = one_span_trace_push();
+    writer
+        .admit_flush(parsed, landed, pulsus_write::PushHeaders::default())
+        .expect("the queue has room")
+        .await
+        .expect("the old path's two no-op inserts commit");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while writer.landing_metrics().landing.flushes_total == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the landing insert never reached the mock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    writer.shutdown(Duration::from_secs(5)).await;
+
+    let insert = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.body.starts_with("INSERT INTO") && r.body.contains("trace_landing"))
+        .expect("the mock served no landing INSERT");
+
+    // (a) Every entry the constructor gives, at its own value.
+    let token = insert
+        .param("insert_deduplication_token")
+        .expect("every landing insert carries a token");
+    let expected = QuerySettings::trace_landing_insert(&token, cfg.trace_landing_max_rows);
+    let mut missing: Vec<(String, String, Option<String>)> = Vec::new();
+    for (key, value) in expected.entries() {
+        let got = insert.param(key);
+        if got.as_deref() != Some(value) {
+            missing.push((key.to_string(), value.to_string(), got));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the wire must carry every pin the constructor names: {missing:?} in {}",
+        insert.target
+    );
+
+    // (b) The already-shipped pin, exactly once.
+    let query = insert
+        .target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or_default();
+    let async_entries: Vec<&str> = query
+        .split('&')
+        .filter(|pair| pair.starts_with("async_insert="))
+        .collect();
+    assert_eq!(
+        async_entries,
+        vec!["async_insert=0"],
+        "`async_insert = 0` is pinned one layer down, so it must appear once \
+         and not twice: {}",
+        insert.target
+    );
+
+    // (c) Nothing else is a setting this path sends.
+    let keys = param_keys(&insert.target);
+    let constructor_keys: Vec<&str> = expected.entries().map(|(k, _)| k).collect();
+    let extra: Vec<&String> = keys
+        .iter()
+        .filter(|k| !baseline_keys.contains(k) && !constructor_keys.contains(&k.as_str()))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "the landing insert sends the constructor's entries and nothing a \
+         bare insert through the same client does not already carry: {extra:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Every query parameter name in a request target, in the order it appears.
+fn param_keys(target: &str) -> Vec<String> {
+    target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').map(|(k, _)| k.to_string()))
+        .collect()
+}
+
+/// One trace push of one span, decoded both ways exactly as a handler runs
+/// it.
+fn one_span_trace_push() -> (pulsus_write::ParsedTraces, pulsus_write::ParsedTraceLanding) {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    const TS: i64 = 1_760_000_000_000_000_000;
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue("checkout".to_string())),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: vec![0xaa; 16],
+                    span_id: vec![0xbb; 8],
+                    name: "GET /api".to_string(),
+                    start_time_unix_nano: TS as u64,
+                    end_time_unix_nano: TS as u64 + 1_000_000,
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    (
+        pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
+        pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
+    )
 }

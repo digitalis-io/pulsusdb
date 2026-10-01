@@ -239,7 +239,7 @@ fn dedup_window_setting(ctx: &RenderCtx) -> &'static str {
 /// Two of the five trace views carry it: a trace's spans arrive from as many
 /// senders as there are services in it, and the whole trace read design rests
 /// on a trace being whole on one shard.
-fn route_suffix(ctx: &RenderCtx) -> &str {
+pub(crate) fn route_suffix(ctx: &RenderCtx) -> &str {
     match ctx.cluster {
         Some(_) => &ctx.dist_suffix,
         None => "",

@@ -301,6 +301,11 @@ pub struct TraceWriterMetrics {
     /// `trace_attrs_idx` registration-backfill counters (issue #139) —
     /// its own `Arc` so the backfill task holds a cheap clone.
     pub attrs_backfill: Arc<BackfillMetrics>,
+    /// `trace_landing`'s own per-table counters (issue #586). One insert per
+    /// push, so `flushes_total` counts pushes stored and `rows_total` counts
+    /// landed events of every kind. **They reach no exported series while
+    /// both write paths run** — [`TraceLandingSnapshot`] says why.
+    pub landing: Arc<TableMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -310,6 +315,9 @@ pub struct TraceWriterMetricsSnapshot {
     /// The live `queued_bytes` gauge — passed in by the caller
     /// ([`crate::writer::TraceWriter::metrics`]), which owns the
     /// authoritative `AtomicU64` (not duplicated here).
+    ///
+    /// **The OLD path's counter alone** (issue #586): the landing path keeps
+    /// one of its own, read through [`TraceLandingSnapshot`].
     pub queue_bytes: u64,
     pub backpressure_total: u64,
     pub spool_poison_total: u64,
@@ -318,6 +326,32 @@ pub struct TraceWriterMetricsSnapshot {
     /// `trace_attrs_idx` registration-backfill counters (issue #139 —
     /// additive field).
     pub attrs_backfill: BackfillMetricsSnapshot,
+    /// Issue #494's push-suppression counters, extended to the trace push by
+    /// issue #586. All zero — and the two gauges zero with them — while
+    /// `PULSUS_INGEST_DEDUP` is off, because no index exists to report.
+    pub dedup: DedupMetricsSnapshot,
+}
+
+/// The trace landing path's own figures (issue #586), which **no exported
+/// series carries**.
+///
+/// `pulsus_ingest_queue_bytes{signal="traces"}` is set from
+/// [`TraceWriterMetricsSnapshot::queue_bytes`], and that field holds one
+/// number: a second emission of the same name and the same label pair would
+/// set one gauge twice per scrape with nothing saying which writer each
+/// reading came from, and a sum would stop being comparable with the ceiling
+/// the configuration names. So while both paths run the exposition cannot
+/// see the landing queue at any occupancy, the trace writer's buffered bytes
+/// are understated by whatever it holds, and this is where a caller that
+/// needs the figure reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceLandingSnapshot {
+    /// `trace_landing`'s per-table counters.
+    pub landing: TableMetricsSnapshot,
+    /// The landing queue's own live reservation, in bytes, bounded by
+    /// `PULSUS_INGEST_QUEUE_BYTES` — a per-writer ceiling, not a
+    /// per-process one.
+    pub queue_bytes: u64,
 }
 
 impl SpoolCounters for TraceWriterMetrics {
@@ -331,7 +365,11 @@ impl SpoolCounters for TraceWriterMetrics {
 }
 
 impl TraceWriterMetrics {
-    pub fn snapshot(&self, queue_bytes: u64) -> TraceWriterMetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        queue_bytes: u64,
+        dedup: DedupMetricsSnapshot,
+    ) -> TraceWriterMetricsSnapshot {
         TraceWriterMetricsSnapshot {
             spans: self.spans.snapshot(),
             attrs: self.attrs.snapshot(),
@@ -341,6 +379,16 @@ impl TraceWriterMetrics {
             spool_uncertain_total: self.spool_uncertain_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             attrs_backfill: self.attrs_backfill.snapshot(),
+            dedup,
+        }
+    }
+
+    /// The landing path's own figures, which no exported series carries —
+    /// [`TraceLandingSnapshot`].
+    pub fn landing_snapshot(&self, queue_bytes: u64) -> TraceLandingSnapshot {
+        TraceLandingSnapshot {
+            landing: self.landing.snapshot(),
+            queue_bytes,
         }
     }
 }
@@ -394,7 +442,7 @@ mod tests {
         let metrics = TraceWriterMetrics::default();
         metrics.backpressure_total.fetch_add(2, Ordering::Relaxed);
         metrics.rejected_total.fetch_add(5, Ordering::Relaxed);
-        let snap = metrics.snapshot(4096);
+        let snap = metrics.snapshot(4096, DedupMetricsSnapshot::default());
         assert_eq!(snap.queue_bytes, 4096);
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.rejected_total, 5);
@@ -433,7 +481,8 @@ mod tests {
             .attrs_backfill
             .enqueued_total
             .fetch_add(3, Ordering::Relaxed);
-        assert_eq!(trace_metrics.snapshot(0).attrs_backfill.enqueued_total, 3);
+        let snap = trace_metrics.snapshot(0, DedupMetricsSnapshot::default());
+        assert_eq!(snap.attrs_backfill.enqueued_total, 3);
     }
 
     #[test]
