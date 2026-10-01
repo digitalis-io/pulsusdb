@@ -342,6 +342,14 @@ fn request_with(
     }
 }
 
+/// The settings every landing insert this file makes carries — the writer's
+/// own constructor, so a case's insert is pinned the way a push's is. The
+/// token is minted per insert from the clock, which is all the landing
+/// table's own deduplication window needs of it here.
+fn landing_settings() -> QuerySettings {
+    QuerySettings::trace_landing_insert(&format!("it-{}", now_ns()), 1_048_576)
+}
+
 /// [`land`] without the panic, for the two cases whose own assertion is that
 /// the insert succeeded. A case that unwraps here reports neither the input
 /// nor the expectation.
@@ -380,7 +388,12 @@ async fn try_land(
             .cloned()
             .map(|t| TraceLandingRow::tag_value(received_ms, t)),
     );
-    client.insert_block("trace_landing", &rows).await?;
+    // **Through the landing insert's own pinned settings**, which is what a
+    // push carries: `materialized_views_ignore_errors = 0` among them, which
+    // is what makes a throwing view fail the insert rather than be ignored.
+    client
+        .insert_block_with("trace_landing", &rows, &landing_settings())
+        .await?;
     Ok(parsed)
 }
 
@@ -428,7 +441,7 @@ async fn land_at(
             .map(|t| TraceLandingRow::tag_value(received_ms, t)),
     );
     client
-        .insert_block("trace_landing", &rows)
+        .insert_block_with("trace_landing", &rows, &landing_settings())
         .await
         .expect("the landing insert");
     parsed
