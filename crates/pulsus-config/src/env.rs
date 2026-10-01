@@ -68,6 +68,11 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_LOG_LANDING_RETRIES",
     "PULSUS_LOG_LANDING_INSERTERS",
     "PULSUS_LOG_LANDING_MAX_ROWS",
+    "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+    "PULSUS_TRACE_DEDUP_WINDOW",
+    "PULSUS_TRACE_LANDING_RETRIES",
+    "PULSUS_TRACE_LANDING_INSERTERS",
+    "PULSUS_TRACE_LANDING_MAX_ROWS",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
     "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
@@ -297,6 +302,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_LOG_DEDUP_WINDOW") {
         cfg.log_dedup_window = parse_int("PULSUS_LOG_DEDUP_WINDOW", &v)?;
     }
+    if let Some(v) = read("PULSUS_TRACE_LANDING_RETENTION_HOURS") {
+        cfg.trace_landing_retention_hours = parse_int("PULSUS_TRACE_LANDING_RETENTION_HOURS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACE_DEDUP_WINDOW") {
+        cfg.trace_dedup_window = parse_int("PULSUS_TRACE_DEDUP_WINDOW", &v)?;
+    }
     if let Some(v) = read("PULSUS_CLUSTER") {
         cfg.cluster = Some(v);
     }
@@ -356,6 +367,15 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_LOG_LANDING_MAX_ROWS") {
         cfg.writer.log_landing_max_rows = parse_int("PULSUS_LOG_LANDING_MAX_ROWS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACE_LANDING_RETRIES") {
+        cfg.writer.trace_landing_retries = parse_int("PULSUS_TRACE_LANDING_RETRIES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACE_LANDING_INSERTERS") {
+        cfg.writer.trace_landing_inserters = parse_int("PULSUS_TRACE_LANDING_INSERTERS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACE_LANDING_MAX_ROWS") {
+        cfg.writer.trace_landing_max_rows = parse_int("PULSUS_TRACE_LANDING_MAX_ROWS", &v)?;
     }
     if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
         cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;
@@ -500,8 +520,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            92,
-            "docs/configuration.md §§1-8 document exactly 92 variables"
+            97,
+            "docs/configuration.md §§1-8 document exactly 97 variables"
         );
     }
 

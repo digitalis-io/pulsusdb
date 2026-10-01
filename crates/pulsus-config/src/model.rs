@@ -92,6 +92,20 @@ pub struct Config {
     /// below the landing budget would forget a token while the writer is
     /// still entitled to resend under it. Accepted range `1..=1000000`.
     pub log_dedup_window: u64,
+    /// `PULSUS_TRACE_LANDING_RETENTION_HOURS` (issues #584 to #586): the
+    /// traces landing table's delete-TTL, in hours. It is the replay window
+    /// — the five derived trace tables can only be rebuilt from landed rows
+    /// that are still there — so a deployment that wants a longer window
+    /// raises it. Accepted range `1..=168`.
+    pub trace_landing_retention_hours: u32,
+    /// `PULSUS_TRACE_DEDUP_WINDOW` (issues #584 to #586): how many recent
+    /// blocks the traces landing table and each of the five derived trace
+    /// tables remember for deduplication, so a resend of a block the server
+    /// already accepted is dropped before it is stored a second time.
+    ///
+    /// **A count of blocks**, with the same shape as the logs key's: see
+    /// [`Self::log_dedup_window`]. Accepted range `1..=1000000`.
+    pub trace_dedup_window: u64,
     // §4 Clustering
     pub cluster: Option<String>,
     pub dist_suffix: String,
@@ -156,6 +170,8 @@ impl Default for Config {
             metrics_dedup_window: 10_000,
             log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
+            trace_landing_retention_hours: 6,
+            trace_dedup_window: 10_000,
             cluster: None,
             dist_suffix: "_dist".to_string(),
             skip_unavailable_shards: false,
@@ -375,6 +391,21 @@ pub struct WriterConfig {
     /// insert's own `max_insert_block_size`. Accepted range
     /// `1000..=10000000`.
     pub log_landing_max_rows: u64,
+    /// `PULSUS_TRACE_LANDING_RETRIES` (issues #584 to #586): how many times
+    /// the writer resends a failed traces landing insert. The wall-clock
+    /// bound on the whole loop is the landing budget, not this count —
+    /// whichever binds first ends it. Accepted range `0..=10`.
+    pub trace_landing_retries: u32,
+    /// `PULSUS_TRACE_LANDING_INSERTERS` (issues #584 to #586): how many
+    /// insert workers take blocks off the traces landing queue, so how many
+    /// landing inserts can be in flight at once. Accepted range `1..=64`.
+    pub trace_landing_inserters: u32,
+    /// `PULSUS_TRACE_LANDING_MAX_ROWS` (issues #584 to #586): the per-push
+    /// landing row ceiling, counted over all four landed kinds. A push at or
+    /// above it is refused whole, never split, so an admitted push always
+    /// fits one block; the same figure is pinned as the insert's own
+    /// `max_insert_block_size`. Accepted range `1000..=10000000`.
+    pub trace_landing_max_rows: u64,
 }
 
 impl Default for WriterConfig {
@@ -395,6 +426,9 @@ impl Default for WriterConfig {
             log_landing_retries: 3,
             log_landing_inserters: 4,
             log_landing_max_rows: 1_048_576,
+            trace_landing_retries: 3,
+            trace_landing_inserters: 4,
+            trace_landing_max_rows: 1_048_576,
         }
     }
 }

@@ -45,6 +45,13 @@ pub struct RenderCtx {
     /// `PULSUS_LOG_DEDUP_WINDOW` (issue #603): the block-deduplication window
     /// the logs landing table and the five derived logs tables carry.
     pub log_dedup_window: u64,
+    /// `PULSUS_TRACE_LANDING_RETENTION_HOURS` (issues #584 to #586): the
+    /// traces landing table's delete-TTL, in hours.
+    pub trace_landing_retention_hours: u32,
+    /// `PULSUS_TRACE_DEDUP_WINDOW` (issues #584 to #586): the
+    /// block-deduplication window the traces landing table and the five
+    /// derived trace tables carry.
+    pub trace_dedup_window: u64,
 }
 
 impl RenderCtx {
@@ -68,6 +75,8 @@ impl RenderCtx {
             metrics_dedup_window: 10_000,
             log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
+            trace_landing_retention_hours: 6,
+            trace_dedup_window: 10_000,
         }
     }
 }
@@ -373,6 +382,8 @@ mod tests {
             metrics_dedup_window: 10_000,
             log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
+            trace_landing_retention_hours: 6,
+            trace_dedup_window: 10_000,
         }
     }
 

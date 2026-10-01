@@ -2022,11 +2022,197 @@ mod tests {
                 "metric_hist_samples_mv",
                 "metric_series_mv",
                 "metric_metadata_mv",
+                "spans_mv",
+                "resources_mv",
+                "traces_mv",
+                "tag_names_mv",
+                "tag_values_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );
         for mv in MVS {
             assert!(mv.tmpl.contains("CREATE MATERIALIZED VIEW"));
+        }
+    }
+
+    /// The five names the trace landing views carry, in the order [`MVS`]
+    /// declares them.
+    const TRACE_LANDING_MVS: [&str; 5] = [
+        "spans_mv",
+        "resources_mv",
+        "traces_mv",
+        "tag_names_mv",
+        "tag_values_mv",
+    ];
+
+    /// Every trace view reads the landing table. A view still reading a
+    /// target table would be second-level — its source written by another
+    /// view — and the whole decision of §1 is that the five trace targets
+    /// are each **one** view away from `trace_landing`.
+    ///
+    /// It is also the case that catches a second-level view being
+    /// reintroduced: `resources` cannot be derived from `spans` (the span
+    /// row does not carry the resource attributes), so a view reading
+    /// `pulsus.spans` is the shape this change exists to replace.
+    #[test]
+    fn every_view_reads_the_landing_table() {
+        let ctx = ctx();
+        for name in TRACE_LANDING_MVS {
+            let mv = MVS.iter().find(|mv| mv.name == name);
+            assert!(mv.is_some(), "MVS has no view named {name}");
+            let mv = mv.expect("checked above");
+            let rendered =
+                render::render(mv.tmpl, &render::render_name(mv.name, &ctx), &ctx, false);
+            assert!(
+                rendered.contains("FROM pulsus.trace_landing"),
+                "{name} must read the landing table: {rendered}"
+            );
+            for target in [
+                "FROM pulsus.spans",
+                "FROM pulsus.resources",
+                "FROM pulsus.traces",
+                "FROM pulsus.tag_names",
+                "FROM pulsus.tag_values",
+            ] {
+                assert!(
+                    !rendered.contains(target),
+                    "{name} reads a target table ({target}), so it is second-level: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// The landing table's own `CREATE`: the engine, the partition, the
+    /// sorting key, the three fixed settings — `async_insert = 0` among
+    /// them, which is the one pin the client cannot supply (§2.1) — and no
+    /// `Ddl::Dist` sibling, because a push carries many trace ids and
+    /// routing its block would split it per shard.
+    #[test]
+    fn the_trace_landing_migration_is_a_base_only_mergetree() {
+        let m = MIGRATIONS.iter().find(|m| m.name == "trace_landing");
+        assert!(m.is_some(), "MIGRATIONS has no trace_landing record");
+        let m = m.expect("checked above");
+        assert_eq!(m.id, 71);
+        assert_eq!(m.scope, MigrationScope::Checksum);
+        assert_eq!(m.replication, Replication::PerShard);
+        assert_eq!(m.family, Some(Family::Traces));
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|other| other.name == "trace_landing")
+                .count(),
+            1,
+            "no `_dist` sibling: the writer names the base table in every mode"
+        );
+
+        let Ddl::Static(tmpl) = m.ddl else {
+            panic!("the landing migration must be a static CREATE");
+        };
+        let ddl = render::render(tmpl, "trace_landing", &ctx(), false);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_landing"));
+        assert!(ddl.contains("event_id        UUID DEFAULT generateUUIDv7(),"));
+        assert!(ddl.contains("ENGINE = MergeTree"));
+        assert!(
+            ddl.contains("PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))"),
+            "one hour-wide partition per part: {ddl}"
+        );
+        assert!(
+            ddl.contains(
+                "ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)"
+            ),
+            "the sorting key has two runs because the kinds do: {ddl}"
+        );
+        assert!(
+            ddl.contains(
+                "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, \
+                 async_insert = 0;"
+            ),
+            "the MergeTree async_insert pin is on the CREATE, because the query \
+             pin cannot reach the table setting: {ddl}"
+        );
+        assert!(
+            !ddl.contains("{{"),
+            "every token must be substituted: {ddl}"
+        );
+    }
+
+    /// `{{route_suffix}}` renders the configured suffix when a cluster is
+    /// set and the empty string when it is not, so the two per-trace views
+    /// target the routing table on a cluster and the local table on a single
+    /// node. The other three target the local table in both modes, because
+    /// their targets are `Replication::Global`.
+    ///
+    /// **Rendering `{{dist_suffix}}` instead passes the clustered half and
+    /// fails the unclustered one**, which is the defect this case exists
+    /// for: that token renders `_dist` unconditionally.
+    #[test]
+    fn the_two_per_trace_views_target_the_routing_table() {
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let unclustered = ctx();
+
+        let rendered = |name: &str, ctx: &RenderCtx| -> String {
+            let mv = MVS.iter().find(|mv| mv.name == name);
+            assert!(mv.is_some(), "MVS has no view named {name}");
+            let mv = mv.expect("checked above");
+            render::render(mv.tmpl, &render::render_name(mv.name, ctx), ctx, false)
+        };
+
+        for (name, routed) in [("spans_mv", "spans_dist"), ("traces_mv", "traces_dist")] {
+            let text = rendered(name, &clustered);
+            assert!(
+                text.contains(&format!("TO pulsus.{routed}")),
+                "clustered, {name} must target the routing table: {text}"
+            );
+        }
+        for name in ["resources_mv", "tag_names_mv", "tag_values_mv"] {
+            let text = rendered(name, &clustered);
+            let base = name.trim_end_matches("_mv");
+            assert!(
+                text.contains(&format!("TO pulsus.{base} ON CLUSTER")),
+                "clustered, {name} must target the local table with no suffix: {text}"
+            );
+        }
+        for name in TRACE_LANDING_MVS {
+            let text = rendered(name, &unclustered);
+            let base = name.trim_end_matches("_mv");
+            assert!(
+                text.contains(&format!("TO pulsus.{base} AS")),
+                "unclustered, {name} must target the local table: {text}"
+            );
+            assert!(
+                !text.contains("_dist"),
+                "unclustered, no view may name a routing table: {text}"
+            );
+        }
+    }
+
+    /// The two routing wrappers carry their own literal DDL rather than
+    /// `Ddl::Dist`, because they need two engine settings `Ddl::Dist` cannot
+    /// carry. So their sharding expression is hand-written, and this is what
+    /// stops it drifting from the generated one: the expected text is taken
+    /// from [`Family::sharding_expr`] rather than retyped.
+    #[test]
+    fn the_routing_wrappers_use_the_family_sharding_expression() {
+        for (id, base) in [(72u32, "spans"), (73, "traces")] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id);
+            assert!(m.is_some(), "MIGRATIONS has no record with id {id}");
+            let m = m.expect("checked above");
+            assert_eq!(m.name, base);
+            assert_eq!(m.family, Some(Family::Traces));
+            let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+                panic!("migration {id} must be Ddl::StaticClusterOnly");
+            };
+            let text = render::render(tmpl, base, &ctx(), false);
+            assert!(
+                text.contains(Family::Traces.sharding_expr()),
+                "migration {id} must render the family's own sharding expression ({}): {text}",
+                Family::Traces.sharding_expr()
+            );
+            assert!(
+                text.contains("SETTINGS fsync_after_insert = 1, fsync_directories = 1"),
+                "migration {id} must keep the two recorded engine settings: {text}"
+            );
         }
     }
 

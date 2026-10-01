@@ -300,6 +300,14 @@ impl QuerySettings {
             .set("input_format_max_block_wait_ms", 0)
     }
 
+    /// The settings every insert of one traces landing block carries, and
+    /// every statement `rebuild-traces` issues.
+    ///
+    /// **Stub**: the pin set is not written yet.
+    pub fn trace_landing_insert(token: &str, max_rows: u64) -> Self {
+        Self::landing_insert(token, max_rows)
+    }
+
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
     /// `optimize_skip_unused_shards`, `optimize_distributed_group_by_sharding_key`,
     /// `distributed_aggregation_memory_efficient`, `prefer_localhost_replica`
@@ -585,6 +593,80 @@ mod tests {
             assert_eq!(s.get("max_insert_block_size"), Some(want.as_str()));
             assert_eq!(s.get("min_insert_block_size_rows"), Some(want.as_str()));
         }
+    }
+
+    /// **The trace landing insert's pin set is exactly the metrics one plus
+    /// the nineteen the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those nineteen — so
+    /// neither an added pin nor a removed one passes.
+    ///
+    /// It is the only place in this change that writes a setting name as a
+    /// literal. The seven classes behind the nineteen, and the catalogue
+    /// quotation behind each value, are
+    /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
+    ///
+    /// **`async_insert` is not one of them, and its absence is asserted.**
+    /// `ChClient::insert_settings_with` pins it on every insert this client
+    /// makes, so a second pin here would state one rule twice; the `MergeTree`
+    /// setting of the same name is not reachable from a query setting at all
+    /// and is pinned on the landing table's own `CREATE`.
+    #[test]
+    fn the_trace_landing_insert_pins_every_setting_this_design_names() {
+        use std::collections::BTreeMap;
+
+        const WANT: &[(&str, &str)] = &[
+            ("input_format_binary_read_json_as_string", "0"),
+            ("format_binary_max_object_size", "100000"),
+            ("max_partitions_per_insert_block", "100"),
+            ("throw_on_max_partitions_per_insert_block", "1"),
+            ("materialized_views_ignore_errors", "0"),
+            ("ignore_materialized_views_with_dropped_target_table", "0"),
+            ("min_insert_block_size_rows_for_materialized_views", "0"),
+            ("min_insert_block_size_bytes_for_materialized_views", "0"),
+            ("distributed_foreground_insert", "1"),
+            ("insert_shard_id", "0"),
+            ("json_type_escape_dots_in_keys", "0"),
+            ("type_json_skip_duplicated_paths", "0"),
+            ("read_overflow_mode", "throw"),
+            ("read_overflow_mode_leaf", "throw"),
+            ("timeout_overflow_mode", "throw"),
+            ("group_by_overflow_mode", "throw"),
+            ("distinct_overflow_mode", "throw"),
+            ("sort_overflow_mode", "throw"),
+            ("result_overflow_mode", "throw"),
+        ];
+
+        let base = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        let base_entries: BTreeMap<&str, &str> = base.entries().collect();
+        let trace_entries: BTreeMap<&str, &str> = traces.entries().collect();
+
+        let added: BTreeMap<&str, &str> = trace_entries
+            .iter()
+            .filter(|(k, _)| !base_entries.contains_key(**k))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let want: BTreeMap<&str, &str> = WANT.iter().copied().collect();
+        assert_eq!(
+            added, want,
+            "the difference against the metrics landing insert is exactly the \
+             nineteen pins this design names"
+        );
+
+        for (key, value) in &base_entries {
+            assert_eq!(
+                trace_entries.get(key),
+                Some(value),
+                "{key} must keep the value the metrics landing insert gives it"
+            );
+        }
+
+        assert_eq!(
+            traces.get("async_insert"),
+            None,
+            "async_insert is pinned one layer down, for every insert this \
+             client makes; a second pin here would state one rule twice"
+        );
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when
