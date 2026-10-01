@@ -7,10 +7,11 @@ path is unchanged. See
 [`docs/decisions/0007-clickhouse-vendor-patch.md`](../../docs/decisions/0007-clickhouse-vendor-patch.md)
 for the decision this copy implements, and issue #382 for the measurements.
 
-**Three patches, in three functions across two files**: §1
+**Four patches, in four functions across two files**: §1
 (`collect_bad_response`, issue #382) and §2 (`extract_exception` and
-`DetectDbException`, issue #412), both in `src/response.rs`, and §3
-(`validate_impl`, issue #585) in `src/rowbinary/validation.rs`. One
+`DetectDbException`, issue #412), both in `src/response.rs`, and §3 and §4
+(`validate_impl`, issue #585) in `src/rowbinary/validation.rs` — §3 in its
+`SerdeType::Seq(_)` arm and §4 in its `SerdeType::Tuple(len)` arm. One
 test-support export joins them in `src/lib.rs`'s `_priv` module and is
 named in §3; it is not a change to the driver's behaviour. Nothing else is
 modified. The vendored tree
@@ -436,3 +437,103 @@ sequence's contents, read what it validates against before taking it — this
 workspace writes the column's bytes itself and a validator that expects
 another shape refuses every trace push.
 
+
+## 4. `validate_impl` accepts a Rust tuple against a **named** tuple column
+
+`src/rowbinary/validation.rs`, in `validate_impl`'s `SerdeType::Tuple(len)`
+arm (issue #585).
+
+### What upstream does
+
+The arm matches `FixedString`, `Tuple`, `Array`, `IPv6`, `UUID` and `Point`,
+and falls to `err_on_schema_mismatch` for everything else. `DataTypeNode` has
+no named-tuple variant upstream, so there is nothing to match — the whole
+defect is one layer down, in `clickhouse-types`, where the type parser cannot
+read `Tuple(a Int64, b String)` at all.
+
+### Why that is a defect for us
+
+`vendor/clickhouse-types` is patched to read a named tuple, into a new
+`DataTypeNode::NamedTuple` variant (see its `PATCHES.md`). The variant's
+arrival is **silent everywhere in this crate**: `validate_impl` is a chain of
+arms each ending in a fallthrough, and `DataTypeNode` is `#[non_exhaustive]`,
+so nothing here fails to compile and nothing warns. Without this arm the
+variant reaches the arm's own `_ =>` and the insert is refused with
+`attempting to (de)serialize nested ClickHouse type … as a tuple or sequence
+with length N` — a client-side refusal for a column the server is perfectly
+happy with. `trace_landing` and `spans` both declare `events` and `links`
+with named tuple elements, and `TraceEventTuple` and `TraceLinkTuple` reach
+this arm through `serialize_tuple`.
+
+### The change
+
+One match arm, beside the positional `Tuple` one:
+
+```rust
+DataTypeNode::NamedTuple(elements) => Ok(Some(InnerDataTypeValidator {
+    root,
+    kind: InnerDataTypeValidatorKind::Tuple(elements.types()),
+})),
+```
+
+A named tuple's wire form **is** its positional one: the names are metadata the
+server renders into the type string (`DataTypeTuple::doGetName`) and the
+serialization does not carry them, so validation walks the element types
+exactly as for `Tuple`. `elements.types()` is the `&'caller [DataTypeNode]`
+that `InnerDataTypeValidatorKind::Tuple` already takes, with the lifetime
+coming from `column_data_type`, so the existing `split_first` cursor and
+`check_tuple_fully_validated` are reused unchanged and the element count is
+left to them.
+
+**Accepted here and nowhere else.** It is in the `SerdeType::Tuple(len)` arm
+only, so a Rust **sequence** against a named-tuple column stays a mismatch,
+exactly as it is for a positional tuple. Every other arm is untouched, and so
+is `null_encoding_for`'s `_ => None`, which is correct: a named tuple carries
+no null marker.
+
+Additive, no public API change, no `Error` variant added or altered, no
+semver impact.
+
+### What this patch does not reach
+
+**Too few element fields is not refused on the insert path.**
+`check_tuple_fully_validated` — the only producer of
+`tuple was not fully (de)serialized` — has exactly one caller in the crate,
+`rowbinary/de.rs`'s `next_element_seed`, so it runs when the last element of a
+sequence has been **de**serialized and never on the way out. Measured against
+26.3.29.7 with a one-field Rust tuple against `Array(Tuple(a Int64, b String))`:
+the driver accepts the short tuple, sends the block, and the server answers
+`Code: 32 … Attempt to read after eof`. The too-MANY direction **is** refused
+on the insert path, by the same cursor's `None` branch
+(`attempting to (de)serialize … while no more elements are allowed`). This is
+upstream's asymmetry, unchanged by this patch, and it is the same on a
+positional tuple.
+
+### Gates
+
+Neither the vendored crate's own `#[test]`s nor a CI step for them exists —
+`clickhouse` is a `[patch.crates-io]` path source, not a workspace member, so
+`cargo test --workspace` never compiles them. The gates live in
+`pulsus-clickhouse`'s and `pulsus-write`'s suites, as §§1-3's do:
+
+- **Live** (`pulsus-clickhouse/tests/live_named_tuple.rs`, the `schema-it`
+  job's `Live named-tuple insert and read-back` step):
+  `l1_an_insert_into_a_named_tuple_column_succeeds` inserts into
+  `Array(Tuple(a Int64, b String))` and reads the named element back;
+  `l4_a_wrong_element_type_is_refused_by_the_element_it_is_wrong_for` shows the
+  validator **descended into** the tuple rather than refusing it whole — the
+  message names `Int64`, the element type, not the column type;
+  `l3_an_element_tuple_short_of_a_field_is_refused` is the read-path half, and
+  `l2_an_insert_into_a_positional_tuple_column_still_succeeds` is the pin that
+  a positional tuple is unaffected.
+- **Live** (`pulsus-write/tests/trace_rows_v2.rs`, the `schema-it` job's
+  `Trace landing rows and the JSON column` step):
+  `two_events_and_two_links_in_one_span_all_land` is the one that needs the
+  cursor to be fresh per array element — a shared cursor would validate the
+  second event's first field against the first event's second type.
+
+**Re-vendor rule (§4):** on any `clickhouse` version bump, check whether
+upstream's `SerdeType::Tuple(len)` arm admits a named tuple. It can only do so
+once `clickhouse-types` has a variant for one, so this entry is paired with
+that crate's re-vendor rule: if upstream takes named tuples there, drop that
+patch and this arm together.

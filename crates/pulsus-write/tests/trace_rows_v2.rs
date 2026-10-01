@@ -9,15 +9,14 @@
 //! parameter or an HTTP route; those arrive with the read-path tasks, and
 //! each re-asserts the same behaviour through the route it adds.
 //!
-//! **This suite does not run yet, and the reason is a finding against the
-//! design rather than against the code below.** The trace landing table
-//! declares its `events` and `links` columns as
+//! **What had to be fixed before any of this could run.** The trace landing
+//! table declares its `events` and `links` columns as
 //! `Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON,
 //! dropped_attrs UInt32))` — named tuple elements, transcribed from
 //! `docs/TraceQL/measure/schema.sql` — and the type parser the driver uses
-//! for insert-side schema validation cannot parse a **named** tuple at any
-//! depth. Measured against `clickhouse-types` 0.1.2 and 0.1.3, which is the
-//! latest published:
+//! for insert-side schema validation could not parse a **named** tuple at
+//! any depth. Measured against `clickhouse-types` 0.1.2, the release the
+//! lockfile pins, and 0.1.3, the latest published:
 //!
 //! ```text
 //! Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))
@@ -28,36 +27,20 @@
 //!   -> OK
 //! ```
 //!
-//! So every insert into `trace_landing` fails before a byte is sent:
+//! so every insert into `trace_landing` failed before a byte was sent:
 //!
 //! ```text
 //! Decode("error while parsing columns header from the response: \
 //!   type parsing error: Unknown data type: \n    time_ns Int64")
 //! ```
 //!
-//! Two routes were measured, each unblocking this suite to the same point —
-//! nine of these cases passing, the other four being this file's own
-//! read-back SQL rather than the writer:
-//!
-//! * drop the element names from the two `Array(Tuple(…))` columns in
-//!   `spans` and `trace_landing`. Validation stays on and the driver patch
-//!   stays load-bearing; the cost is that a read says `events.2` rather
-//!   than `events.name`, and both this design's DDL and
-//!   `docs/TraceQL/measure/schema.sql` move.
-//! * build the client with `Client::with_validation(false)`. The names stay;
-//!   the cost is that insert-side schema validation disappears for every
-//!   insert of every signal, and the driver patch has nothing left to do.
-//!
-//! Which one is taken is a design decision, not an implementation one, so it
-//! is not taken here. **No CI step runs this file** until it is.
-//!
-//! **The suite itself is complete and was run to green under the first
-//! route**: thirteen of thirteen against 26.3.29.7 with the element names
-//! dropped and nothing else changed. Three of its cases were then
-//! deliberately broken and each failed — the path escape leaving `%` alone,
-//! an empty array landing as a mixed one, and a non-finite double being
-//! dropped rather than encoded. So what is outstanding is the decision, not
-//! this file.
+//! Two routes were measured and neither was taken: dropping the element
+//! names makes a read say `events.2` rather than `events.name` and moves the
+//! approved DDL, and `Client::with_validation(false)` removes insert-side
+//! validation for every insert of every signal. The route taken instead is
+//! `vendor/clickhouse-types`, vendored at 0.1.2 and patched — see its
+//! `PATCHES.md` and `crates/pulsus-clickhouse/tests/named_tuple_types.rs`,
+//! which is the parser's own case set. The schema did not move.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!

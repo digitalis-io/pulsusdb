@@ -195,8 +195,20 @@ async fn l2_an_insert_into_a_positional_tuple_column_still_succeeds() {
 }
 
 /// **L3.** A row whose element tuple has one field too few is refused by the
-/// driver, with the elements it never reached named. The validator descended
-/// **into** the named tuple rather than refusing it whole.
+/// driver, with the element it never reached named. The validator descended
+/// **into** the named tuple rather than refusing it whole, and the leftover
+/// element's **type** is rendered through `Display`.
+///
+/// **On the read, not on the insert, and that is a correction to the design.**
+/// `check_tuple_fully_validated` — the only producer of this message
+/// (`vendor/clickhouse/src/rowbinary/validation.rs`) — has exactly one caller
+/// in the crate, `rowbinary/de.rs`'s `next_element_seed`, so it is reached
+/// when the last element of a sequence has been **de**serialized and never on
+/// the way out. Measured with the row below on the insert path: the driver
+/// accepts the short tuple, sends the block, and the server answers
+/// `Code: 32 … Attempt to read after eof`, so an insert cannot carry this
+/// message at all. The too-MANY direction is the one the insert path sees, in
+/// the same cursor's `None` branch.
 #[tokio::test]
 async fn l3_an_element_tuple_short_of_a_field_is_refused() {
     skip_unless_live!();
@@ -204,16 +216,31 @@ async fn l3_an_element_tuple_short_of_a_field_is_refused() {
     let client = fresh_db(&db).await;
     named_tuple_table(&client).await;
 
-    let rows = vec![OneFieldRow { c: vec![(1_i64,)] }];
-    let r = client.insert_block("l1", &rows).await;
-    let msg = r
-        .as_ref()
-        .err()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let rows = vec![NamedTupleRow {
+        c: vec![(1_i64, "x".to_string())],
+    }];
+    let inserted = client.insert_block("l1", &rows).await;
+    assert!(inserted.is_ok(), "the insert returned {:?}", inserted.err());
+
+    let fetched = client
+        .query_stream::<OneFieldRow>("SELECT c FROM l1", &QuerySettings::new())
+        .await;
+    let first = match fetched {
+        Ok(mut stream) => stream.next().await,
+        Err(e) => Some(Err(e)),
+    };
+    let msg = match &first {
+        Some(Err(e)) => e.to_string(),
+        other => format!("not an error: {other:?}"),
+    };
     assert!(
         msg.contains("tuple was not fully (de)serialized"),
-        "the insert returned {r:?}; wanted an error naming the unreached elements"
+        "the read-back gave {msg}; wanted an error naming the unreached element"
+    );
+    assert!(
+        msg.contains("missing elements: String"),
+        "the read-back gave {msg}; wanted the leftover element's TYPE, rendered \
+         through `Display`"
     );
 
     drop_db(&db).await;

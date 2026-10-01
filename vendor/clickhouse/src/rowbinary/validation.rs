@@ -715,6 +715,18 @@ fn validate_impl<'serde, 'caller, R: Row>(
                 root,
                 kind: InnerDataTypeValidatorKind::Tuple(elements),
             })),
+            // PATCH (PATCHES.md §4): a named tuple's wire form is its
+            // positional one. The names are metadata the server renders into
+            // the type string (`DataTypeTuple::doGetName`) and the
+            // serialization does not carry them, so validation walks the
+            // element types exactly as for `Tuple`. Accepted HERE, in the
+            // `SerdeType::Tuple(len)` arm and nowhere else, so a SEQUENCE
+            // against a named tuple stays a mismatch. The element count is
+            // left to the existing cursor and `check_tuple_fully_validated`.
+            DataTypeNode::NamedTuple(elements) => Ok(Some(InnerDataTypeValidator {
+                root,
+                kind: InnerDataTypeValidatorKind::Tuple(elements.types()),
+            })),
             DataTypeNode::Array(inner_type) => Ok(Some(InnerDataTypeValidator {
                 root,
                 kind: InnerDataTypeValidatorKind::Array(inner_type),

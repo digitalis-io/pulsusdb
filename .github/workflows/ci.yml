@@ -1547,6 +1547,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_ingest_roundtrip
 
+      # Issue #585: the span row encoder and the `JSON` column, round-tripped
+      # against the landing table the catalogue creates — every value kind,
+      # the dotted-key escaping, the non-finite doubles, the resource
+      # identity, and the two catalogs. It could not run until the type
+      # parser read a named tuple (issue #585, `vendor/clickhouse-types`).
+      # Reuses this job's ClickHouse 26.3 container.
+      - name: Trace landing rows and the JSON column
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test trace_rows_v2
+
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as
@@ -1716,6 +1728,17 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-clickhouse --test injected_settings
+
+      # Issue #585: a NAMED tuple column on both paths — the insert, whose
+      # metadata read is `DESCRIBE TABLE` and so carries the pretty form, and
+      # the read, whose response header carries the compact one. Each case
+      # creates and drops its own database, so it is not in the read-only
+      # `live_clickhouse` step above.
+      - name: Live named-tuple insert and read-back
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-clickhouse --test live_named_tuple
 
       - name: Live cityHash64 fixture cross-check
         env:

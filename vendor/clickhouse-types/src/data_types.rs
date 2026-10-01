@@ -25,6 +25,45 @@ impl Display for Column {
     }
 }
 
+/// The elements of a named `Tuple`, in the order the type declares them.
+///
+/// The two vectors are the same length because the only constructor refuses
+/// any other pair and the fields are private. `Display` and the insert-side
+/// validator both rely on that: `Display` zips them, and a shorter name list
+/// would silently drop elements from the type string the server compares the
+/// insert header against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedTupleElements {
+    names: Vec<String>,
+    types: Vec<DataTypeNode>,
+}
+
+impl NamedTupleElements {
+    /// `None` unless the two lengths are equal and non-zero.
+    pub fn new(
+        names: Vec<String>,
+        types: Vec<DataTypeNode>,
+    ) -> Option<Self> {
+        if names.is_empty() || names.len() != types.len() {
+            return None;
+        }
+        Some(Self { names, types })
+    }
+
+    /// The element names **as the type string spells them** -- back-quoted
+    /// and backslash-escaped exactly when the server back-quoted them, not
+    /// unquoted. That is what makes the rendered type byte-identical to the
+    /// server's own, which is what an insert header is compared against.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The element types, in declaration order.
+    pub fn types(&self) -> &[DataTypeNode] {
+        &self.types
+    }
+}
+
 /// Represents a data type in ClickHouse.
 /// See <https://clickhouse.com/docs/sql-reference/data-types>
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +120,8 @@ pub enum DataTypeNode {
 
     Array(Box<DataTypeNode>),
     Tuple(Vec<DataTypeNode>),
+    /// A `Tuple` whose elements are named: `Tuple(a Int8, b String)`.
+    NamedTuple(NamedTupleElements),
     Enum(EnumType, HashMap<i16, String>),
 
     /// Key-Value pairs are defined as an array, so it can be used as a slice
@@ -249,6 +290,24 @@ impl Display for DataTypeNode {
                         write!(f, ", ")?;
                     }
                     write!(f, "{element}")?;
+                }
+                write!(f, ")")
+            }
+            // PATCH (vendor/clickhouse-types/PATCHES.md s5): the compact form
+            // by construction. `DataTypeTuple::doGetName` writes `", "`
+            // between elements and nothing after `Tuple(`, and that string is
+            // what the server compares an insert header against byte for
+            // byte. The `zip` cannot truncate: `NamedTupleElements`' only
+            // constructor refuses unequal lengths.
+            NamedTuple(elements) => {
+                write!(f, "Tuple(")?;
+                for (i, (name, element)) in
+                    elements.names().iter().zip(elements.types()).enumerate()
+                {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name} {element}")?;
                 }
                 write!(f, ")")
             }
@@ -502,7 +561,13 @@ impl Display for IntervalType {
 
 fn parse_fixed_string(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 14 {
-        let size_str = &input[12..input.len() - 1];
+        // PATCH (vendor/clickhouse-types/PATCHES.md s4): checked, and the
+        // function's own trailing error on `None`.
+        let size_str = input.get(12..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid FixedString format, expected FixedString(N), got {input}"
+            ))
+        })?;
         let size = size_str.parse::<usize>().map_err(|err| {
             TypesError::TypeParsingError(format!(
                 "Invalid FixedString size, expected a valid number. Underlying error: {err}, input: {input}, size_str: {size_str}"
@@ -522,7 +587,12 @@ fn parse_fixed_string(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_array(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 8 {
-        let inner_type_str = &input[6..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_type_str = input.get(6..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Array format, expected Array(InnerType), got {input}"
+            ))
+        })?;
         let inner_type = DataTypeNode::new(inner_type_str)?;
         return Ok(DataTypeNode::Array(Box::new(inner_type)));
     }
@@ -542,7 +612,12 @@ fn parse_enum(input: &str) -> Result<DataTypeNode, TypesError> {
                 "Invalid Enum type, expected Enum8 or Enum16, got {input}"
             )));
         };
-        let enum_values_map_str = &input[prefix_len..input.len() - 1];
+        // PATCH (s4): checked.
+        let enum_values_map_str = input.get(prefix_len..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Enum format, expected Enum8('name' = value), got {input}"
+            ))
+        })?;
         let enum_values_map = parse_enum_values_map(enum_values_map_str)?;
         return Ok(DataTypeNode::Enum(enum_type, enum_values_map));
     }
@@ -556,7 +631,15 @@ fn parse_datetime(input: &str) -> Result<DataTypeNode, TypesError> {
         return Ok(DataTypeNode::DateTime(None));
     }
     if input.len() >= 12 {
-        let timezone = input[10..input.len() - 2].to_string();
+        // PATCH (s4): checked.
+        let timezone = input
+            .get(10..input.len() - 2)
+            .ok_or_else(|| {
+                TypesError::TypeParsingError(format!(
+                    "Invalid DateTime format, expected DateTime('timezone'), got {input}"
+                ))
+            })?
+            .to_string();
         return Ok(DataTypeNode::DateTime(Some(timezone)));
     }
     Err(TypesError::TypeParsingError(format!(
@@ -566,7 +649,16 @@ fn parse_datetime(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_decimal(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 10 {
-        let precision_and_scale_str = input[8..input.len() - 1].split(", ").collect::<Vec<_>>();
+        // PATCH (s4): checked.
+        let precision_and_scale_str = input
+            .get(8..input.len() - 1)
+            .ok_or_else(|| {
+                TypesError::TypeParsingError(format!(
+                    "Invalid Decimal format, expected Decimal(P), got {input}"
+                ))
+            })?
+            .split(", ")
+            .collect::<Vec<_>>();
         if precision_and_scale_str.len() != 2 {
             return Err(TypesError::TypeParsingError(format!(
                 "Invalid Decimal format, expected Decimal(P, S), got {input}"
@@ -603,13 +695,34 @@ fn parse_decimal(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_datetime64(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 13 {
-        let mut chars = input[11..input.len() - 1].chars();
+        // PATCH (s4): checked.
+        let mut chars = input
+            .get(11..input.len() - 1)
+            .ok_or_else(|| {
+                TypesError::TypeParsingError(format!(
+                    "Invalid DateTime format, expected DateTime('timezone'), got {input}"
+                ))
+            })?
+            .chars();
         let precision_char = chars.next().ok_or(TypesError::TypeParsingError(format!(
             "Invalid DateTime64 precision, expected a positive number. Input: {input}"
         )))?;
         let precision = DateTimePrecision::new(precision_char)?;
+        // PATCH (s4): checked, and **the arm's error on `None`, not a
+        // `map`**. A `None` folded into `maybe_tz = None` would answer
+        // `Ok(DateTime64(3))` with the timezone silently dropped, which is a
+        // type the server never sent. This is the one changed site whose
+        // slice feeds an `Option` rather than a `?`.
         let maybe_tz = match chars.as_str() {
-            str if str.len() > 2 => Some(str[3..str.len() - 1].to_string()),
+            str if str.len() > 2 => Some(
+                str.get(3..str.len() - 1)
+                    .ok_or_else(|| {
+                        TypesError::TypeParsingError(format!(
+                            "Invalid DateTime format, expected DateTime('timezone'), got {input}"
+                        ))
+                    })?
+                    .to_string(),
+            ),
             _ => None,
         };
         return Ok(DataTypeNode::DateTime64(precision, maybe_tz));
@@ -621,7 +734,15 @@ fn parse_datetime64(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_time64(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 8 {
-        let mut chars = input[7..input.len() - 1].chars();
+        // PATCH (s4): checked.
+        let mut chars = input
+            .get(7..input.len() - 1)
+            .ok_or_else(|| {
+                TypesError::TypeParsingError(format!(
+                    "Invalid Time64 format, expected Time64(precision, 'timezone'), got {input}"
+                ))
+            })?
+            .chars();
         let precision_char = chars.next().ok_or(TypesError::TypeParsingError(format!(
             "Invalid Time64 precision, expected a positive number. Input: {input}"
         )))?;
@@ -636,7 +757,12 @@ fn parse_time64(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_low_cardinality(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 16 {
-        let inner_type_str = &input[15..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_type_str = input.get(15..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid LowCardinality format, expected LowCardinality(InnerType), got {input}"
+            ))
+        })?;
         let inner_type = DataTypeNode::new(inner_type_str)?;
         return Ok(DataTypeNode::LowCardinality(Box::new(inner_type)));
     }
@@ -652,7 +778,12 @@ fn parse_low_cardinality(input: &str) -> Result<DataTypeNode, TypesError> {
 /// when sending column type headers during INSERT (RBWNAT format).
 fn parse_simple_aggregate_function(input: &str) -> Result<DataTypeNode, TypesError> {
     let prefix = "SimpleAggregateFunction(";
-    let inner = &input[prefix.len()..input.len() - 1];
+    // PATCH (s4): checked. This function has no length guard, so
+    // `SimpleAggregateFunction(` on its own slices `[24..23]`; `str::get`
+    // answers `None` for `start > end` as well as for a non-boundary.
+    let inner = input.get(prefix.len()..input.len() - 1).ok_or_else(|| {
+        TypesError::TypeParsingError(format!("Invalid SimpleAggregateFunction: {input}"))
+    })?;
     // Find the first top-level comma (not inside parentheses) to split
     // the function name from the inner type.
     let mut depth = 0u32;
@@ -682,7 +813,12 @@ fn parse_simple_aggregate_function(input: &str) -> Result<DataTypeNode, TypesErr
 
 fn parse_nullable(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 10 {
-        let inner_type_str = &input[9..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_type_str = input.get(9..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Nullable format, expected Nullable(InnerType), got {input}"
+            ))
+        })?;
         let inner_type = DataTypeNode::new(inner_type_str)?;
         return Ok(DataTypeNode::Nullable(Box::new(inner_type)));
     }
@@ -693,7 +829,12 @@ fn parse_nullable(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn parse_map(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 5 {
-        let inner_types_str = &input[4..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_types_str = input.get(4..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Map format, expected Map(KeyType, ValueType), got {input}"
+            ))
+        })?;
         let inner_types = parse_inner_types(inner_types_str)?;
         if inner_types.len() != 2 {
             return Err(TypesError::TypeParsingError(format!(
@@ -720,7 +861,14 @@ fn parse_json(input: &str) -> Result<DataTypeNode, TypesError> {
         .map(|column| {
             let map = column.split(' ').collect::<Vec<_>>();
             let key_type = map[0].to_string();
-            let value_type = DataTypeNode::new(map[1])?;
+            // PATCH (s4): checked. `map[0]` stays -- `split(' ')` yields at
+            // least one element on any string, the empty one included.
+            let Some(value_type_str) = map.get(1) else {
+                return Err(TypesError::TypeParsingError(format!(
+                    "Invalid JSON format, expected a path and its type, got {column} in {input}"
+                )));
+            };
+            let value_type = DataTypeNode::new(value_type_str)?;
 
             Ok((key_type, Box::new(value_type)))
         })
@@ -735,7 +883,18 @@ fn parse_json(input: &str) -> Result<DataTypeNode, TypesError> {
 
 fn remove_json_header(input: &str) -> Result<&str, TypesError> {
     if input.starts_with("JSON") && input.ends_with(')') {
-        let new = input[5..].trim();
+        // PATCH (s4): checked. No input reaches the `None` branch -- this
+        // function's one caller is reached by `starts_with("JSON(")`, five
+        // ASCII bytes -- but its own guard tests four, so its safety is a
+        // property of its caller rather than of itself.
+        let new = input
+            .get(5..)
+            .ok_or_else(|| {
+                TypesError::TypeParsingError(format!(
+                    "Invalid JSON format, expected JSON(Type), got {input}"
+                ))
+            })?
+            .trim();
 
         Ok(new.trim_end_matches(')'))
     } else {
@@ -747,7 +906,23 @@ fn remove_json_header(input: &str) -> Result<&str, TypesError> {
 
 fn parse_tuple(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() > 7 {
-        let inner_types_str = &input[6..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_types_str = input.get(6..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Tuple format, expected Tuple(Type1, Type2, ...), got {input}"
+            ))
+        })?;
+        // PATCH (PATCHES.md s3): the named reading goes FIRST, and it cannot
+        // raise an error. On `None` the code below is upstream's, byte for
+        // byte, so `parse_tuple` returns exactly upstream's errors and no
+        // others. The named reading goes first because `Tuple(Timestamp
+        // UInt64)` parses today as `Tuple(Time)` -- `:156`'s
+        // `starts_with("Time")` is unanchored -- so a reading that preferred
+        // upstream's answer whenever upstream succeeds would send the server a
+        // header it refuses for an ordinary named column.
+        if let Some(elements) = parse_named_tuple(inner_types_str) {
+            return Ok(DataTypeNode::NamedTuple(elements));
+        }
         let inner_types = parse_inner_types(inner_types_str)?;
         if inner_types.is_empty() {
             return Err(TypesError::TypeParsingError(format!(
@@ -761,9 +936,177 @@ fn parse_tuple(input: &str) -> Result<DataTypeNode, TypesError> {
     )))
 }
 
+/// PATCH (PATCHES.md s2). `Some` only if every argument of a `Tuple(...)`
+/// argument list is an element name, one space, and a type whose own
+/// rendering reproduces the argument's type text byte for byte.
+///
+/// `DataTypeTuple::doGetName` writes `backQuoteIfNeed(name) << ' ' <<
+/// elems[i]->getName()`, so that is the shape; the re-rendering test is what
+/// confirms the type half was read whole rather than sliced.
+///
+/// **Every** failure in here returns `None`, and the caller then runs
+/// upstream's own code: the splitter, a missing name token, a name that is
+/// not an identifier, a type that does not parse, a type whose text the crate
+/// re-renders differently, an empty argument list.
+fn parse_named_tuple(inner: &str) -> Option<NamedTupleElements> {
+    let args = split_type_arguments(inner).ok()?;
+    let mut names = Vec::with_capacity(args.len());
+    let mut types = Vec::with_capacity(args.len());
+    for arg in args {
+        let (name, type_str) = split_element_name(arg)?;
+        let data_type = DataTypeNode::new(type_str).ok()?;
+        if data_type.to_string() != type_str {
+            return None;
+        }
+        names.push(name.to_string());
+        types.push(data_type);
+    }
+    // The two vectors are pushed in lockstep, so the only rejection this can
+    // reach is the empty argument list -- which an unclosed parenthesis
+    // produces, because the splitter's final push is conditional.
+    NamedTupleElements::new(names, types)
+}
+
+/// PATCH (PATCHES.md s2). Splits one `Tuple` argument into an element name
+/// and the type text that follows it. `None` if the argument does not have
+/// that shape.
+///
+/// A back-quoted name is kept verbatim, with both back quotes and every
+/// escape, because that is what makes the rendered type byte-identical to the
+/// server's.
+fn split_element_name(arg: &str) -> Option<(&str, &str)> {
+    let bytes = arg.as_bytes();
+    if bytes.first() == Some(&b'`') {
+        let mut i = 1;
+        let mut escaped = false;
+        while i < bytes.len() {
+            if escaped {
+                escaped = false;
+            } else if bytes[i] == b'\\' {
+                escaped = true;
+            } else if bytes[i] == b'`' {
+                if bytes.get(i + 1) != Some(&b' ') {
+                    return None;
+                }
+                return Some((arg.get(..=i)?, arg.get(i + 2..)?));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let space = arg.find(' ')?;
+    let (name, rest) = (arg.get(..space)?, arg.get(space + 1..)?);
+    // The engine's own identifier test (`isValidIdentifier`): the first byte
+    // an ASCII letter or `_`, every later byte ASCII alphanumeric or `_`.
+    // This narrows the accepted set to the names the server emits unquoted;
+    // it is NOT what makes the reading correct. A mistake here can only
+    // accept or refuse a candidate -- a refusal falls back to upstream's
+    // code, and an acceptance still has to pass the re-rendering test. The
+    // engine back-quotes `null` and the four keywords, so such a name arrives
+    // through the branch above and none of them is replicated here.
+    if !is_valid_identifier(name) {
+        return None;
+    }
+    Some((name, rest))
+}
+
+/// PATCH (PATCHES.md s2). The engine's `isValidIdentifier`, minus its own
+/// refusal of `null`, for the reason given at the call site.
+fn is_valid_identifier(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// PATCH (PATCHES.md s1). Splits a `Tuple` argument list at its top-level
+/// commas, returning each argument with leading ASCII whitespace removed.
+///
+/// A region inside single quotes (an `Enum` value name) or inside back quotes
+/// (an element name) is opaque: a comma, a parenthesis or the other quote
+/// character inside one is text. A backslash escapes the next byte anywhere.
+///
+/// **This is a new function rather than a change to `parse_inner_types`**,
+/// and the reason is measured: an unpaired back quote outside a quoted region
+/// makes a shared scanner swallow a comma that is a split point today.
+/// A tuple holding an unpaired back quote outside any element name --
+/// ``Tuple(Array Time`x, UInt8)`` -- answers `Ok("Tuple(Array(Time), UInt8)")`
+/// on the unpatched crate. A back-quote-aware `parse_inner_types` produces one
+/// argument instead, that argument parses, and the value becomes
+/// `Ok("Tuple(Array(Time))")` -- one element short, silently. A changed value
+/// rather than an error, which is the worse of the two.
+fn split_type_arguments(input: &str) -> Result<Vec<&str>, TypesError> {
+    let input_bytes = input.as_bytes();
+    let mut args: Vec<&str> = Vec::new();
+
+    let mut open_parens: i32 = 0;
+    let mut quote_open = false;
+    let mut bquote_open = false;
+    let mut char_escaped = false;
+    let mut last_element_index = 0;
+
+    let utf8_err = |from: usize| {
+        TypesError::TypeParsingError(format!(
+            "Invalid UTF-8 sequence in input for the inner data type: {}",
+            String::from_utf8_lossy(&input_bytes[from..])
+        ))
+    };
+
+    let mut i = 0;
+    while i < input_bytes.len() {
+        if char_escaped {
+            char_escaped = false;
+        } else if input_bytes[i] == b'\\' {
+            char_escaped = true;
+        } else if input_bytes[i] == b'\'' && !bquote_open {
+            quote_open = !quote_open;
+        } else if input_bytes[i] == b'`' && !quote_open {
+            bquote_open = !bquote_open;
+        } else if !quote_open && !bquote_open {
+            if input_bytes[i] == b'(' {
+                open_parens += 1;
+            } else if input_bytes[i] == b')' {
+                open_parens -= 1;
+            } else if input_bytes[i] == b',' && open_parens == 0 {
+                // A split lands on an ASCII byte, which is never inside a
+                // multi-byte sequence, so `None` is not reachable; the
+                // checked slice is what keeps that true rather than assumed.
+                let arg = input
+                    .get(last_element_index..i)
+                    .ok_or_else(|| utf8_err(last_element_index))?;
+                args.push(arg.trim_start_matches(|c: char| c.is_ascii_whitespace()));
+                i += 1;
+                last_element_index = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // The final push stays conditional on every parenthesis being closed, as
+    // upstream's is, so an unclosed one yields no final argument -- which is
+    // what makes `Tuple(()` an empty argument list and `Tuple(`a(b` String)`
+    // a one-element one.
+    if open_parens == 0 && last_element_index < input_bytes.len() {
+        let arg = input
+            .get(last_element_index..)
+            .ok_or_else(|| utf8_err(last_element_index))?;
+        args.push(arg.trim_start_matches(|c: char| c.is_ascii_whitespace()));
+    }
+
+    Ok(args)
+}
+
 fn parse_variant(input: &str) -> Result<DataTypeNode, TypesError> {
     if input.len() >= 9 {
-        let inner_types_str = &input[8..input.len() - 1];
+        // PATCH (s4): checked.
+        let inner_types_str = input.get(8..input.len() - 1).ok_or_else(|| {
+            TypesError::TypeParsingError(format!(
+                "Invalid Variant format, expected Variant(Type1, Type2, ...), got {input}"
+            ))
+        })?;
         let inner_types = parse_inner_types(inner_types_str)?;
         return Ok(DataTypeNode::Variant(inner_types));
     }
@@ -804,9 +1147,12 @@ fn parse_inner_types(input: &str) -> Result<Vec<DataTypeNode>, TypesError> {
             } else if input_bytes[i] == b',' && open_parens == 0 {
                 let data_type_str = String::from_utf8(input_bytes[last_element_index..i].to_vec())
                     .map_err(|_| {
+                        // PATCH (s4): lossy over the bytes in hand, same
+                        // extent. Unreachable: the slice is cut at an ASCII
+                        // comma, so `from_utf8` cannot fail on it.
                         TypesError::TypeParsingError(format!(
                             "Invalid UTF-8 sequence in input for the inner data type: {}",
-                            &input[last_element_index..]
+                            String::from_utf8_lossy(&input_bytes[last_element_index..])
                         ))
                     })?;
                 let data_type = DataTypeNode::new(&data_type_str)?;
@@ -828,9 +1174,11 @@ fn parse_inner_types(input: &str) -> Result<Vec<DataTypeNode>, TypesError> {
     if open_parens == 0 && last_element_index < input_bytes.len() {
         let data_type_str =
             String::from_utf8(input_bytes[last_element_index..].to_vec()).map_err(|_| {
+                // PATCH (s4): lossy over the bytes in hand, same extent.
+                // Unreachable, for the reason above.
                 TypesError::TypeParsingError(format!(
                     "Invalid UTF-8 sequence in input for the inner data type: {}",
-                    &input[last_element_index..]
+                    String::from_utf8_lossy(&input_bytes[last_element_index..])
                 ))
             })?;
         let data_type = DataTypeNode::new(&data_type_str)?;
@@ -876,9 +1224,12 @@ fn parse_enum_values_map(input: &str) -> Result<HashMap<i16, String>, TypesError
                 // non-escaped closing tick - push the name
                 let name_bytes = &input_bytes[start_index..i];
                 let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| {
+                    // PATCH (s4): lossy over the bytes in hand, same extent.
+                    // This one is measured panicking, on an input carrying a
+                    // two-byte character before an enum value's quote.
                     TypesError::TypeParsingError(format!(
                         "Invalid UTF-8 sequence in input for the enum name: {}",
-                        &input[start_index..i]
+                        String::from_utf8_lossy(name_bytes)
                     ))
                 })?;
                 names.push(name);
