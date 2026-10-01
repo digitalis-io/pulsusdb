@@ -53,6 +53,10 @@ static TEST_DB_DERIVED_REPLAY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived_replay");
 static TEST_DB_DEDUP_PROFILE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dedup_profile");
+// Issues #584 to #586: the trace landing table, its five targets and the two
+// routing wrappers, clustered.
+static TEST_DB_TRACE_LANDING: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_landing");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -118,6 +122,8 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         metrics_dedup_window: 10_000,
         log_landing_retention_hours: 6,
         log_dedup_window: 10_000,
+        trace_landing_retention_hours: 6,
+        trace_dedup_window: 10_000,
     }
 }
 
@@ -1039,6 +1045,90 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
+}
+
+/// **The clustered shape of the trace write path.** Two of the five targets
+/// carry a routing wrapper and three do not, and the landing table carries
+/// none at all — a push carries many trace ids, so inserting the push itself
+/// through a `Distributed` wrapper would split one push per shard.
+///
+/// **The `SETTINGS` clause is asserted, not merely the engine**: a setting
+/// the server accepts on a `CREATE` and then discards leaves no trace in
+/// this column, which is how `distributed_foreground_insert` behaves on a
+/// `Distributed` table. `fsync_after_insert` and `fsync_directories` are
+/// kept, and this is what shows it.
+#[tokio::test]
+async fn the_clustered_form() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_LANDING;
+    fresh_cluster_db(&shard1, db).await;
+
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        for base in ["spans", "traces"] {
+            let got = engine_full_on(shard, db, &format!("{base}_dist")).await;
+            let want = format!(
+                "Distributed('{CLUSTER_NAME}', '{db}', '{base}', {}) \
+                 SETTINGS fsync_after_insert = 1, fsync_directories = 1",
+                Family::Traces.sharding_expr()
+            );
+            assert_eq!(
+                got,
+                want,
+                "shard{}: {base}_dist's stored engine, settings clause included",
+                i + 1
+            );
+        }
+
+        // The three catalog targets and the landing table exist on every
+        // shard with no routing twin.
+        let present = table_names(shard, db).await;
+        for name in ["resources", "tag_names", "tag_values", "trace_landing"] {
+            assert!(
+                present.iter().any(|n| n == name),
+                "shard{}: {name} must exist on every shard: {present:?}",
+                i + 1
+            );
+            let twin = format!("{name}_dist");
+            assert!(
+                !present.contains(&twin),
+                "shard{}: {name} must have no routing twin: {present:?}",
+                i + 1
+            );
+        }
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// `system.tables.engine_full` for one object on one shard's own
+/// connection — the stored definition, not our own rendered string.
+async fn engine_full_on(client: &ChClient, db: &str, name: &str) -> String {
+    let sql = format!(
+        "SELECT engine_full AS create_table_query FROM system.tables \
+         WHERE database = '{db}' AND name = '{name}'"
+    );
+    let mut stream = client
+        .query_stream::<CreateQueryRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.tables engine_full");
+    stream
+        .next()
+        .await
+        .expect("row present")
+        .expect("decode")
+        .create_table_query
 }
 
 async fn exec_on(client: &ChClient, sql: &str) {

@@ -1439,6 +1439,274 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the five trace tables the TraceQL read design queries (issues
+    // #584 to #586) ---
+    //
+    // Transcribed from `docs/TraceQL/measure/schema.sql` with the
+    // repository's tokens. `spans` gains `{{on_cluster}}` and a TTL applied
+    // at run time by `controller::apply_ttl`, because migration identity is
+    // checksummed over the rendered template and a configuration value
+    // inside a CREATE reads as drift. The second difference is the codec:
+    // `resources`, `tag_names`, `tag_values` and `traces.day` carry
+    // `CODEC(ZSTD(1))` where that file declares none, because
+    // `docs/schemas.md` §8 sets `ZSTD(1)` as the minimum and the
+    // `trace_landing` columns they are projected from already carry it. The
+    // rest is that file's DDL unchanged.
+    //
+    // `resources`, `tag_names` and `tag_values` are `family: None` /
+    // `Replication::Global` with no routing sibling — the shape
+    // `trace_tag_catalog` already has at id 18, for the reason its comment
+    // gives: one cluster-wide replica set, read from the local replica
+    // without fan-out. Routing a resource or a catalog entry instead would
+    // put it on one shard and every other shard's read would miss it
+    // permanently.
+    Migration {
+        id: 66,
+        name: "spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}} (\n\
+                 trace_id        FixedString(16)          CODEC(ZSTD(1)),\n\
+                 span_id         FixedString(8)           CODEC(ZSTD(1)),\n\
+                 parent_span_id  FixedString(8)           CODEC(ZSTD(1)),\n\
+                 start_ns        Int64                    CODEC(Delta, ZSTD(1)),\n\
+                 duration_ns     Int64                    CODEC(T64, ZSTD(1)),\n\
+                 service         LowCardinality(String)   CODEC(ZSTD(1)),\n\
+                 resource_id     UInt128                  CODEC(ZSTD(1)),\n\
+                 name            LowCardinality(String)   CODEC(ZSTD(1)),\n\
+                 kind            UInt8                    CODEC(ZSTD(1)),\n\
+                 status_code     UInt8                    CODEC(ZSTD(1)),\n\
+                 status_message  String                   CODEC(ZSTD(1)),\n\
+                 trace_state     String                   CODEC(ZSTD(1)),\n\
+                 flags           UInt32                   CODEC(ZSTD(1)),\n\
+                 scope_name      LowCardinality(String)   CODEC(ZSTD(1)),\n\
+                 scope_version   LowCardinality(String)   CODEC(ZSTD(1)),\n\
+                 scope_attrs     JSON                     CODEC(ZSTD(1)),\n\
+                 attrs           JSON                     CODEC(ZSTD(1)),\n\
+                 attrs_other     String                   CODEC(ZSTD(1)),\n\
+                 dropped_attrs   UInt32                   CODEC(ZSTD(1)),\n\
+                 events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
+                 dropped_events  UInt32                   CODEC(ZSTD(1)),\n\
+                 links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
+                 dropped_links   UInt32                   CODEC(ZSTD(1))\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))\n\
+             ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)\n\
+             SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 67,
+        name: "traces",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}} (\n\
+                 day           Date                                                 CODEC(ZSTD(1)),\n\
+                 trace_id      FixedString(16)                                      CODEC(ZSTD(1)),\n\
+                 start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),\n\
+                 end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),\n\
+                 root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),\n\
+                 root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),\n\
+                 services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1))\n\
+             ) ENGINE = AggregatingMergeTree\n\
+             PARTITION BY day\n\
+             ORDER BY trace_id\n\
+             SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 68,
+        name: "resources",
+        family: None,
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}} (\n\
+                 day            Date                    CODEC(ZSTD(1)),\n\
+                 resource_id    UInt128                 CODEC(ZSTD(1)),\n\
+                 service        LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 attrs          JSON                    CODEC(ZSTD(1)),\n\
+                 attrs_other    String                  CODEC(ZSTD(1)),\n\
+                 dropped_attrs  UInt32                  CODEC(ZSTD(1)),\n\
+                 schema_url     String                  CODEC(ZSTD(1))\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             PARTITION BY day\n\
+             ORDER BY (service, resource_id);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::Global,
+    },
+    Migration {
+        id: 69,
+        name: "tag_names",
+        family: None,
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}} (\n\
+                 scope  LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 key    String                  CODEC(ZSTD(1))\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             ORDER BY (scope, key);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::Global,
+    },
+    Migration {
+        id: 70,
+        name: "tag_values",
+        family: None,
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}} (\n\
+                 scope     LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 key       String                  CODEC(ZSTD(1)),\n\
+                 value     String                  CODEC(ZSTD(1)),\n\
+                 val_type  LowCardinality(String)  CODEC(ZSTD(1))\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             ORDER BY (scope, key, value, val_type);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::Global,
+    },
+    // The traces landing table (issues #584 to #586). One row per landed
+    // trace event, whatever kind: a push is one INSERT of one block into
+    // this table, and the five tables the TraceQL reads query are maintained
+    // from it by the five `*_mv` views below.
+    //
+    // **The discriminator is `row_kind`, not `kind`.** A span carries an
+    // OTLP span kind in a column already called `kind`, which `spans` and
+    // its `ReplacingMergeTree` key both use; two columns cannot both be
+    // `kind`.
+    //
+    // `service`, `attrs`, `attrs_other` and `dropped_attrs` are shared
+    // between kind 0 and kind 1 — a span's attributes and a resource's are
+    // never on one row, so one JSON column serves both, the way
+    // `log_landing.timestamp_ns` serves a line time and a pattern bucket.
+    //
+    // **The sorting key has two runs because the kinds do.** After the
+    // discriminator it mirrors `spans`' own `(trace_id, start_ns, span_id,
+    // kind)`, so landed kind-0 rows compress the way the target's do;
+    // `tag_key, tag_value` last order kinds 2 and 3 inside themselves, where
+    // the four span columns are all at their defaults. `spans`' leading
+    // 5-minute bucket is left out: one push's spans lie inside one or two
+    // buckets, so it would discriminate nothing inside a block.
+    //
+    // `event_id` is the landed event's logical identity, filled by the
+    // server from the column default — `TraceLandingRow` deliberately omits
+    // the column. It is NOT the retry mechanism: that is the
+    // `insert_deduplication_token` the writer mints per block.
+    //
+    // **`async_insert = 0` is on the table because the query pin cannot
+    // reach the table setting.** `executeQuery.cpp` disjoins
+    // `table->areAsynchronousInsertsEnabled()` into a local that both the
+    // eligibility and the execution block read, and the query setting's
+    // explicit `0` is never consulted again — so the `MergeTree` setting of
+    // the same name wins over the pin every insert this client makes
+    // carries. What this value defends against is a server-wide
+    // `<merge_tree>` config default; it does not defend against a deliberate
+    // `ALTER TABLE ... MODIFY SETTING` on this table, and nothing does.
+    //
+    // **No `Ddl::Dist` sibling**, for the reason `log_landing`'s record
+    // gives: a push carries many trace ids, so inserting the push itself
+    // through a `Distributed` wrapper would split one push per shard and one
+    // push would stop being one block. The routing happens one step later,
+    // on the way out of the two per-trace views.
+    Migration {
+        id: 71,
+        name: "trace_landing",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}} (\n\
+                 event_id        UUID DEFAULT generateUUIDv7(),\n\
+                 received_ms     Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 row_kind        UInt8  CODEC(ZSTD(1)),\n\
+                 trace_id        FixedString(16)  CODEC(ZSTD(1)),\n\
+                 span_id         FixedString(8)  CODEC(ZSTD(1)),\n\
+                 parent_span_id  FixedString(8)  CODEC(ZSTD(1)),\n\
+                 start_ns        Int64  CODEC(Delta, ZSTD(1)),\n\
+                 duration_ns     Int64  CODEC(T64, ZSTD(1)),\n\
+                 resource_id     UInt128  CODEC(ZSTD(1)),\n\
+                 name            LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 kind            UInt8  CODEC(ZSTD(1)),\n\
+                 status_code     UInt8  CODEC(ZSTD(1)),\n\
+                 status_message  String  CODEC(ZSTD(1)),\n\
+                 trace_state     String  CODEC(ZSTD(1)),\n\
+                 flags           UInt32  CODEC(ZSTD(1)),\n\
+                 scope_name      LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 scope_version   LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 scope_attrs     JSON  CODEC(ZSTD(1)),\n\
+                 events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
+                 dropped_events  UInt32  CODEC(ZSTD(1)),\n\
+                 links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
+                 dropped_links   UInt32  CODEC(ZSTD(1)),\n\
+                 service         LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 attrs           JSON  CODEC(ZSTD(1)),\n\
+                 attrs_other     String  CODEC(ZSTD(1)),\n\
+                 dropped_attrs   UInt32  CODEC(ZSTD(1)),\n\
+                 day             Date  CODEC(ZSTD(1)),\n\
+                 schema_url      String  CODEC(ZSTD(1)),\n\
+                 tag_scope       LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 tag_key         String  CODEC(ZSTD(1)),\n\
+                 tag_value       String  CODEC(ZSTD(1)),\n\
+                 tag_type        LowCardinality(String)  CODEC(ZSTD(1))\n\
+             ) ENGINE = MergeTree\n\
+             PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))\n\
+             ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)\n\
+             SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The two routing wrappers, for `spans` and `traces` alone (issues #584
+    // to #586).
+    //
+    // **They carry their own literal DDL rather than `Ddl::Dist`, because
+    // they need two engine settings `Ddl::Dist` cannot carry.**
+    // `render::dist_ddl_template` is shared by every family, so adding a
+    // `SETTINGS` clause there would change the rendered template of all
+    // thirteen already-applied `Ddl::Dist` records and their
+    // `MigrationScope::Checksum` identity makes that a hard
+    // `SchemaError::MigrationDrift` on every initialised deployment.
+    //
+    // `fsync_after_insert` and `fsync_directories` put a routed block on the
+    // receiving node's disk before the insert returns. They are inert while
+    // `distributed_foreground_insert` holds — a foreground insert writes no
+    // send directory — so they cost nothing today and are the backstop if it
+    // stops holding. Both are **recorded** by the server, unlike
+    // `distributed_foreground_insert` itself, which a `Distributed` table
+    // accepts on a `CREATE` and discards; that one is pinned as a query
+    // setting on the landing insert instead.
+    //
+    // The sharding expression is hand-written here where
+    // `render::dist_ddl_template` would otherwise generate it from
+    // `Family::Traces`, and
+    // `the_routing_wrappers_use_the_family_sharding_expression` takes the
+    // expected text from `Family::sharding_expr` rather than retyping it, so
+    // the two cannot drift.
+    Migration {
+        id: 72,
+        name: "spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "CREATE TABLE IF NOT EXISTS {{db}}.spans{{dist_suffix}}{{on_cluster}} AS {{db}}.spans\n\
+             ENGINE = Distributed('{{cluster}}', {{db}}, spans, cityHash64(trace_id))\n\
+             SETTINGS fsync_after_insert = 1, fsync_directories = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 73,
+        name: "traces",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "CREATE TABLE IF NOT EXISTS {{db}}.traces{{dist_suffix}}{{on_cluster}} AS {{db}}.traces\n\
+             ENGINE = Distributed('{{cluster}}', {{db}}, traces, cityHash64(trace_id))\n\
+             SETTINGS fsync_after_insert = 1, fsync_directories = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1632,6 +1900,88 @@ pub const MVS: &[MvDef] = &[
                SELECT metric_name AS metric_name, metric_type AS metric_type, help AS help,\n\
                       unit AS unit, updated_ns AS updated_ns\n\
                FROM {{db}}.metric_landing WHERE kind = 3;",
+    },
+    // Issues #584 to #586: the five views that maintain the trace tables from
+    // `trace_landing`. Four discriminating values, five views, five targets,
+    // and no second-level view: `resources` cannot be derived from `spans`
+    // (the span row carries `resource_id` and not the resource attributes),
+    // so a resource is its own landed event shape rather than a projection of
+    // a span.
+    //
+    // Each projection lists the target's columns **in the target's own column
+    // order** under the target's own column names, so the view is correct
+    // whether the server matches by position or by name.
+    //
+    // **Two of the five name `{{route_suffix}}` and three do not.** A trace's
+    // spans arrive from as many senders as there are services in it, and the
+    // whole trace read design rests on a trace being whole on one shard, so
+    // the span rows and the per-trace rows leave their view into the routing
+    // table and the `Distributed` engine places them by
+    // `cityHash64(trace_id)`. The three catalog targets are
+    // `Replication::Global`: one replica set spanning every shard, so a write
+    // on any node reaches every node by replication rather than by routing,
+    // and routing one instead would put it on one shard and every other
+    // shard's read would miss it permanently.
+    MvDef {
+        name: "spans_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.spans_mv{{on_cluster}} TO {{db}}.spans{{route_suffix}} AS\n\
+               SELECT trace_id AS trace_id, span_id AS span_id, parent_span_id AS parent_span_id,\n\
+                      start_ns AS start_ns, duration_ns AS duration_ns, service AS service,\n\
+                      resource_id AS resource_id, name AS name, kind AS kind,\n\
+                      status_code AS status_code, status_message AS status_message,\n\
+                      trace_state AS trace_state, flags AS flags,\n\
+                      scope_name AS scope_name, scope_version AS scope_version,\n\
+                      scope_attrs AS scope_attrs, attrs AS attrs, attrs_other AS attrs_other,\n\
+                      dropped_attrs AS dropped_attrs, events AS events, dropped_events AS dropped_events,\n\
+                      links AS links, dropped_links AS dropped_links\n\
+               FROM {{db}}.trace_landing WHERE row_kind = 0;",
+    },
+    MvDef {
+        name: "resources_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.resources_mv{{on_cluster}} TO {{db}}.resources AS\n\
+               SELECT day AS day, resource_id AS resource_id, service AS service, attrs AS attrs,\n\
+                      attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url\n\
+               FROM {{db}}.trace_landing WHERE row_kind = 1;",
+    },
+    // `measure/schema.sql`'s own projection, with `WHERE row_kind = 0` added
+    // and the source repointed. Two of its output types are wider than the
+    // target's columns — `maxIf` over `LowCardinality(String)` returns
+    // `String`, and the target is
+    // `SimpleAggregateFunction(max, LowCardinality(String))` — so the
+    // conversion is the server's: the view pipeline's own
+    // `ActionsDAG::makeConvertingActions` converts the projection's header to
+    // the target's declared types before the target's metadata check runs.
+    //
+    // A trace whose spans arrive in several pushes gets one partial row per
+    // push, and the target is an `AggregatingMergeTree` keyed on `trace_id`,
+    // so the reads of `docs/TraceQL/sql-schema.md` §5.2 and §5.4 — both of
+    // which already `GROUP BY trace_id` over `traces` — combine them. A block
+    // with no root span for a trace writes `''` for `root_service` and
+    // `root_name`, and `SimpleAggregateFunction(max, ...)` lets the block
+    // that did carry the root win.
+    MvDef {
+        name: "traces_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}} AS\n\
+               SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns,\n\
+                      rs AS root_service, rn AS root_name, sv AS services\n\
+               FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e,\n\
+                            maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,\n\
+                            maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,\n\
+                            groupUniqArray(toString(service)) AS sv\n\
+                     FROM {{db}}.trace_landing WHERE row_kind = 0\n\
+                     GROUP BY trace_id);",
+    },
+    MvDef {
+        name: "tag_names_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.tag_names_mv{{on_cluster}} TO {{db}}.tag_names AS\n\
+               SELECT tag_scope AS scope, tag_key AS key\n\
+               FROM {{db}}.trace_landing WHERE row_kind = 2;",
+    },
+    MvDef {
+        name: "tag_values_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.tag_values_mv{{on_cluster}} TO {{db}}.tag_values AS\n\
+               SELECT tag_scope AS scope, tag_key AS key, tag_value AS value, tag_type AS val_type\n\
+               FROM {{db}}.trace_landing WHERE row_kind = 3;",
     },
 ];
 
@@ -2022,11 +2372,199 @@ mod tests {
                 "metric_hist_samples_mv",
                 "metric_series_mv",
                 "metric_metadata_mv",
+                "spans_mv",
+                "resources_mv",
+                "traces_mv",
+                "tag_names_mv",
+                "tag_values_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );
         for mv in MVS {
             assert!(mv.tmpl.contains("CREATE MATERIALIZED VIEW"));
+        }
+    }
+
+    /// The five names the trace landing views carry, in the order [`MVS`]
+    /// declares them.
+    const TRACE_LANDING_MVS: [&str; 5] = [
+        "spans_mv",
+        "resources_mv",
+        "traces_mv",
+        "tag_names_mv",
+        "tag_values_mv",
+    ];
+
+    /// Every trace view reads the landing table. A view still reading a
+    /// target table would be second-level — its source written by another
+    /// view — and the whole decision of §1 is that the five trace targets
+    /// are each **one** view away from `trace_landing`.
+    ///
+    /// It is also the case that catches a second-level view being
+    /// reintroduced: `resources` cannot be derived from `spans` (the span
+    /// row does not carry the resource attributes), so a view reading
+    /// `pulsus.spans` is the shape this change exists to replace.
+    #[test]
+    fn every_view_reads_the_landing_table() {
+        let ctx = ctx();
+        for name in TRACE_LANDING_MVS {
+            let mv = MVS.iter().find(|mv| mv.name == name);
+            assert!(mv.is_some(), "MVS has no view named {name}");
+            let mv = mv.expect("checked above");
+            let rendered =
+                render::render(mv.tmpl, &render::render_name(mv.name, &ctx), &ctx, false);
+            assert!(
+                rendered.contains("FROM pulsus.trace_landing"),
+                "{name} must read the landing table: {rendered}"
+            );
+            for target in [
+                "FROM pulsus.spans",
+                "FROM pulsus.resources",
+                "FROM pulsus.traces",
+                "FROM pulsus.tag_names",
+                "FROM pulsus.tag_values",
+            ] {
+                assert!(
+                    !rendered.contains(target),
+                    "{name} reads a target table ({target}), so it is second-level: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// The landing table's own `CREATE`: the engine, the partition, the
+    /// sorting key, the three fixed settings — `async_insert = 0` among
+    /// them, which is the one pin the client cannot supply (§2.1) — and no
+    /// `Ddl::Dist` sibling, because a push carries many trace ids and
+    /// routing its block would split it per shard.
+    #[test]
+    fn the_trace_landing_migration_is_a_base_only_mergetree() {
+        let m = MIGRATIONS.iter().find(|m| m.name == "trace_landing");
+        assert!(m.is_some(), "MIGRATIONS has no trace_landing record");
+        let m = m.expect("checked above");
+        assert_eq!(m.id, 71);
+        assert_eq!(m.scope, MigrationScope::Checksum);
+        assert_eq!(m.replication, Replication::PerShard);
+        assert_eq!(m.family, Some(Family::Traces));
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|other| other.name == "trace_landing")
+                .count(),
+            1,
+            "no `_dist` sibling: the writer names the base table in every mode"
+        );
+
+        let Ddl::Static(tmpl) = m.ddl else {
+            panic!("the landing migration must be a static CREATE");
+        };
+        let ddl = render::render(tmpl, "trace_landing", &ctx(), false);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_landing"));
+        assert!(ddl.contains("event_id        UUID DEFAULT generateUUIDv7(),"));
+        assert!(ddl.contains("ENGINE = MergeTree"));
+        assert!(
+            ddl.contains("PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))"),
+            "one hour-wide partition per part: {ddl}"
+        );
+        assert!(
+            ddl.contains(
+                "ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)"
+            ),
+            "the sorting key has two runs because the kinds do: {ddl}"
+        );
+        assert!(
+            ddl.contains(
+                "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, \
+                 async_insert = 0;"
+            ),
+            "the MergeTree async_insert pin is on the CREATE, because the query \
+             pin cannot reach the table setting: {ddl}"
+        );
+        assert!(
+            !ddl.contains("{{"),
+            "every token must be substituted: {ddl}"
+        );
+    }
+
+    /// `{{route_suffix}}` renders the configured suffix when a cluster is
+    /// set and the empty string when it is not, so the two per-trace views
+    /// target the routing table on a cluster and the local table on a single
+    /// node. The other three target the local table in both modes, because
+    /// their targets are `Replication::Global`.
+    ///
+    /// **Rendering `{{dist_suffix}}` instead passes the clustered half and
+    /// fails the unclustered one**, which is the defect this case exists
+    /// for: that token renders `_dist` unconditionally.
+    #[test]
+    fn the_two_per_trace_views_target_the_routing_table() {
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let unclustered = ctx();
+
+        let rendered = |name: &str, ctx: &RenderCtx| -> String {
+            let mv = MVS.iter().find(|mv| mv.name == name);
+            assert!(mv.is_some(), "MVS has no view named {name}");
+            let mv = mv.expect("checked above");
+            render::render(mv.tmpl, &render::render_name(mv.name, ctx), ctx, false)
+        };
+
+        for (name, routed) in [("spans_mv", "spans_dist"), ("traces_mv", "traces_dist")] {
+            let text = rendered(name, &clustered);
+            assert!(
+                text.contains(&format!("TO pulsus.{routed}")),
+                "clustered, {name} must target the routing table: {text}"
+            );
+        }
+        for name in ["resources_mv", "tag_names_mv", "tag_values_mv"] {
+            let text = rendered(name, &clustered);
+            let base = name.trim_end_matches("_mv");
+            // `AS` immediately after the target name is what shows there is
+            // no suffix between the two.
+            assert!(
+                text.contains(&format!("TO pulsus.{base} AS")),
+                "clustered, {name} must target the local table with no suffix: {text}"
+            );
+        }
+        for name in TRACE_LANDING_MVS {
+            let text = rendered(name, &unclustered);
+            let base = name.trim_end_matches("_mv");
+            assert!(
+                text.contains(&format!("TO pulsus.{base} AS")),
+                "unclustered, {name} must target the local table: {text}"
+            );
+            assert!(
+                !text.contains("_dist"),
+                "unclustered, no view may name a routing table: {text}"
+            );
+        }
+    }
+
+    /// The two routing wrappers carry their own literal DDL rather than
+    /// `Ddl::Dist`, because they need two engine settings `Ddl::Dist` cannot
+    /// carry. So their sharding expression is hand-written, and this is what
+    /// stops it drifting from the generated one: the expected text is taken
+    /// from [`Family::sharding_expr`] rather than retyped.
+    #[test]
+    fn the_routing_wrappers_use_the_family_sharding_expression() {
+        for (id, base) in [(72u32, "spans"), (73, "traces")] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id);
+            assert!(m.is_some(), "MIGRATIONS has no record with id {id}");
+            let m = m.expect("checked above");
+            assert_eq!(m.name, base);
+            assert_eq!(m.family, Some(Family::Traces));
+            let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+                panic!("migration {id} must be Ddl::StaticClusterOnly");
+            };
+            let text = render::render(tmpl, base, &ctx(), false);
+            assert!(
+                text.contains(Family::Traces.sharding_expr()),
+                "migration {id} must render the family's own sharding expression ({}): {text}",
+                Family::Traces.sharding_expr()
+            );
+            assert!(
+                text.contains("SETTINGS fsync_after_insert = 1, fsync_directories = 1"),
+                "migration {id} must keep the two recorded engine settings: {text}"
+            );
         }
     }
 
@@ -2845,7 +3383,11 @@ mod tests {
     #[test]
     fn only_catalog_and_bookkeeping_migrations_are_globally_replicated() {
         for m in MIGRATIONS {
-            let expected = matches!(m.id, 1..=3 | 18 | 41);
+            // 68 to 70 are `resources`, `tag_names` and `tag_values`: one
+            // cluster-wide replica set each, read from the local replica
+            // without fan-out, which is the shape `trace_tag_catalog` (18)
+            // already has.
+            let expected = matches!(m.id, 1..=3 | 18 | 41 | 68..=70);
             assert_eq!(
                 m.replication == Replication::Global,
                 expected,

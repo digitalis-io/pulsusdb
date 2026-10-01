@@ -83,6 +83,12 @@ Measured after one merge per table (`system.parts`, `system.columns`):
 | `tag_names` | 48 | 1,190 | 0.001 |
 | **total** | 2,374,663 | **74,551,799** | **37.275** |
 
+These figures were measured with no `CODEC` clause on `resources`, `tag_names`,
+`tag_values` or `traces.day`; the shipped migrations give those fourteen columns
+`CODEC(ZSTD(1))`, so the four non-span rows and the total price the measured
+schema rather than the shipped one. The `spans` rows and the ratio below are
+unchanged by that.
+
 Non-span tables are **6.605%** of the span table. Against today's six tables on
 the same bodies: 1,508,935,285 bytes, 754.44 per span (753.79 after a full
 merge). Against the reference's three active blocks: 209,324,594 bytes, 104.66
@@ -457,7 +463,7 @@ SELECT DISTINCT name FROM spans WHERE <window> ORDER BY name LIMIT 1001
 | shape | rows read | returned | warm | cold | reference |
 |---|---:|---:|---:|---:|---:|
 | names, five scopes | 48 | 1,123 | **1 ms** | 2 | 4 ms |
-| values for one key, unnarrowed | 8,192 | 1,445 | **1 ms** | 2 | 3 ms |
+| values for one key, unnarrowed | 8,192 | 1,445 | **2 ms** | 4 | 3 ms |
 | values narrowed by a query | 2,000,132 | 100 | **24 ms** | 36 | 30 ms |
 | `name` values, window-bounded | 2,000,064 | 6,547 | **15 ms** | 22 | — |
 

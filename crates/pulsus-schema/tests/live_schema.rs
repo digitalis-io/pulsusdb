@@ -1116,11 +1116,16 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 
     // And the cardinality, so a NEW mutation of an allowed kind is a
     // decision somebody makes rather than a line nobody reads. The split
-    // measured on this base is eleven `MATERIALIZE TTL` and four
+    // measured on this base is fifteen `MATERIALIZE TTL` and four
     // `PROJECTION` commands — issue #560 added two `MATERIALIZE TTL`, one
-    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`,
-    // and issue #603 added one for each landing table's own `MODIFY TTL`,
-    // `metric_landing`'s and then `log_landing`'s.
+    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`;
+    // issue #603 added one for each landing table's own `MODIFY TTL`,
+    // `metric_landing`'s and then `log_landing`'s; and issues #584 to #586
+    // added **four**, one each for `spans`, `traces`, `resources` and
+    // `trace_landing`, which are the four tables on the trace write path
+    // that carry a delete-TTL. The two tag catalogs carry none, because
+    // `docs/api.md` §4.3 requires catalog entries to outlive span
+    // retention, so they add no mutation here either.
     let ttl = commands
         .iter()
         .filter(|c| *c == "(MATERIALIZE TTL)")
@@ -1128,7 +1133,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     let projection = commands.len() - ttl;
     assert_eq!(
         (commands.len(), ttl, projection),
-        (15, 11, 4),
+        (19, 15, 4),
         "the mutations a fresh database issues moved; read each one before repinning: \
          {commands:?}"
     );

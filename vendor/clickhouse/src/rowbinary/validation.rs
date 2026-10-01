@@ -686,6 +686,14 @@ fn validate_impl<'serde, 'caller, R: Row>(
                 root,
                 kind: InnerDataTypeValidatorKind::Array(&DataTypeNode::LineString),
             })),
+            // PATCHES.md §3. The JSON type's RowBinary form is a path count
+            // then one (path, type tag, value) per path, and the caller owns
+            // those bytes. Returning `Ok(None)` stops validation for the
+            // whole sequence — `Option<InnerDataTypeValidator>::validate`
+            // returns `Ok(None)` the moment the validator is `None` — which
+            // is the patch's stated limit: a wrong type tag reaches the
+            // server rather than the driver.
+            DataTypeNode::JSON => Ok(None),
             _ => root.err_on_schema_mismatch(data_type, serde_type, is_inner),
         },
         SerdeType::Tuple(len) => match data_type {
@@ -706,6 +714,18 @@ fn validate_impl<'serde, 'caller, R: Row>(
             DataTypeNode::Tuple(elements) => Ok(Some(InnerDataTypeValidator {
                 root,
                 kind: InnerDataTypeValidatorKind::Tuple(elements),
+            })),
+            // PATCH (PATCHES.md §4): a named tuple's wire form is its
+            // positional one. The names are metadata the server renders into
+            // the type string (`DataTypeTuple::doGetName`) and the
+            // serialization does not carry them, so validation walks the
+            // element types exactly as for `Tuple`. Accepted HERE, in the
+            // `SerdeType::Tuple(len)` arm and nowhere else, so a SEQUENCE
+            // against a named tuple stays a mismatch. The element count is
+            // left to the existing cursor and `check_tuple_fully_validated`.
+            DataTypeNode::NamedTuple(elements) => Ok(Some(InnerDataTypeValidator {
+                root,
+                kind: InnerDataTypeValidatorKind::Tuple(elements.types()),
             })),
             DataTypeNode::Array(inner_type) => Ok(Some(InnerDataTypeValidator {
                 root,

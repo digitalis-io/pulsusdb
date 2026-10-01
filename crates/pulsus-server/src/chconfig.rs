@@ -158,6 +158,8 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         metrics_dedup_window: config.metrics_dedup_window,
         log_landing_retention_hours: config.log_landing_retention_hours,
         log_dedup_window: config.log_dedup_window,
+        trace_landing_retention_hours: config.trace_landing_retention_hours,
+        trace_dedup_window: config.trace_dedup_window,
     }
 }
 

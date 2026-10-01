@@ -26,3 +26,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 # Issue #133: test-only — the pool-size ceiling test references
 # `pulsus_config::POOL_SIZE_CEILING` rather than duplicating the literal.
 pulsus-config = { path = "../pulsus-config" }
+# Issue #585: test-only — the named-tuple cases call `DataTypeNode::new`
+# directly. `clickhouse` does not re-export it, so this is the only door to
+# the type parser from a workspace crate; the root `[patch.crates-io]` entry
+# redirects this requirement to `vendor/clickhouse-types`.
+clickhouse-types = "0.1.2"

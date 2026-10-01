@@ -25,6 +25,27 @@ pub(crate) fn max_execution_time_secs(d: Duration) -> String {
     format!("{secs:.3}")
 }
 
+/// `format_binary_max_object_size`, the server's own default on ClickHouse
+/// 26.3.29.7 and, in its words, "The maximum allowed number of paths in a
+/// single Object for JSON type RowBinary format".
+///
+/// **The decode gate and the pin carry this one constant**, so neither can
+/// admit what the other refuses: a span whose stored paths would exceed it is
+/// refused at decode with a `400`, where without the gate the push would be
+/// admitted and the insert would fail after the block was sent.
+pub const MAX_JSON_PATHS_PER_VALUE: u64 = 100_000;
+
+/// `max_partitions_per_insert_block`, the server's own default on ClickHouse
+/// 26.3.29.7. `spans`, `traces` and `resources` are partitioned by UTC day,
+/// so one view's insert produces one part per distinct day in the push and
+/// the server throws above this many.
+///
+/// **The admission gate and the pin carry this one constant**, for the reason
+/// [`MAX_JSON_PATHS_PER_VALUE`] gives: a push whose spans fall on more dates
+/// than this is refused `413` at admission rather than answered `200` with
+/// its spans and resources absent from the new tables.
+pub const MAX_PARTITIONS_PER_INSERT_BLOCK: u64 = 100;
+
 /// An ordered list of `(key, value)` ClickHouse settings, applied to exactly
 /// one statement.
 #[derive(Clone, Default, Debug)]
@@ -298,6 +319,85 @@ impl QuerySettings {
             .set("min_insert_block_size_bytes", 0)
             .set("input_format_connection_handling", 0)
             .set("input_format_max_block_wait_ms", 0)
+    }
+
+    /// The settings every insert of one traces landing block carries, and
+    /// every statement `pulsusdb rebuild-traces` issues (issues #584 to
+    /// #586): [`Self::landing_insert`] whole, plus **nineteen further pins
+    /// of seven classes the metrics set did not need**.
+    ///
+    /// The rule behind the set, stated once so it does not grow without
+    /// bound: **pin what a profile could use to make an answer wrong or a
+    /// loss silent; disclose what it could only use to make a push fail
+    /// loudly.** Every value below is this server's own default, read out of
+    /// `system.settings` on ClickHouse 26.3.29.7 with
+    /// `SELECT name, value, default FROM system.settings WHERE name IN (…)`,
+    /// so pinning changes nothing where a deployment keeps them. Each is in
+    /// `pulsus_schema::REQUIRED_SERVER_NAMES` and none is sent on the
+    /// strength of a name somebody remembered; the two lists are derived
+    /// from each other, both ways, by
+    /// `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`.
+    ///
+    /// | setting | pinned to | class, and why it is in the set |
+    /// |---|---|---|
+    /// | `input_format_binary_read_json_as_string` | `0` | **how the block's bytes are read.** At `1` the server reads a `JSON` column from RowBinary as a JSON *string*, and the writer sends the native binary form. A profile that set it would make every trace push fail, or store the encoder's bytes as text |
+    /// | `format_binary_max_object_size` | `100000` | the same class: it bounds the paths one JSON value may carry in RowBinary. A profile that lowered it would refuse spans the decode gate admitted, after the block was sent. The decode gate and this pin carry the **same constant**, so neither can admit what the other refuses |
+    /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
+    /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
+    /// | `materialized_views_ignore_errors` | `0` | **a third class: what an error does.** The server's own words: "Allows to ignore errors for MATERIALIZED VIEW, and deliver original block to the table regardless of MVs". At `1` a view's exception is ignored, the insert **succeeds**, and the target is short behind a `200` — the silent-loss shape the whole design exists to prevent. Every failure statement on this path rests on this value |
+    /// | `ignore_materialized_views_with_dropped_target_table` | `0` | the same class. `InsertDependenciesBuilder::observePath`, on a view whose target table cannot be locked: `if (!ignore_materialized_views_with_dropped_target_table) throw Exception(UNKNOWN_TABLE, …)` then `LOG_INFO(…); return false;` — so at `1` the view is **skipped and the insert returns success**, with that target's rows silently absent |
+    /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the class [`Self::landing_insert`] already owns — a setting that could divide the request into more than one block — reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
+    /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
+    /// | `distributed_foreground_insert` | `1` | **a fourth class: what an acknowledgement means.** The server's default is `0`, "data is inserted in background mode", and the two per-trace views insert into a routing table. At `1` the insert "succeeds only after all the data is saved on all shards (at least one replica for each shard if `internal_replication` is true)". **It is pinned here and not on the table**: a `Distributed` table accepts the clause on a `CREATE` and the server keeps nothing — the setting is absent from `SHOW CREATE TABLE` and from `system.tables.create_table_query`, and `ALTER TABLE … MODIFY SETTING` answers `Code: 48`. The chain that makes the query pin reach the view's insert is `InsertDependenciesBuilder::createSelectInsertContext` copying the parent context and changing four named settings, and `StorageDistributed::write` computing `insert_sync` from the context it is given |
+    /// | `insert_shard_id` | `0` | **a fifth class: where a row is placed.** `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
+    /// | `json_type_escape_dots_in_keys` | `0` | **a sixth class: what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
+    /// | `type_json_skip_duplicated_paths` | `0` | the block-forming class again. At `1` a repeated path in one value "will be ignored and only the first one will be inserted instead of an exception" — the same result the writer's own per-scope deduplication produces, which is why it must stay the **only** mechanism: at `1` a writer that emitted a duplicate would be silently absorbed instead of erroring |
+    /// | the seven overflow modes — `read_overflow_mode`, `read_overflow_mode_leaf`, `timeout_overflow_mode`, `group_by_overflow_mode`, `distinct_overflow_mode`, `sort_overflow_mode`, `result_overflow_mode` | `throw`, each one's own declared default | **a seventh class: whether exceeding a limit is an error or a success that need not be complete.** At `break` — and at `any` for the group-by one — the engine keeps what it had and the statement **succeeds**: `SizeLimits::softCheck` returns `false` and `executeJob` then cancels the source; `ExecutionSpeedLimits::handleOverflowMode` returns `false` for the deadline; and `Aggregator::checkLimits` returns `false` or sets `no_more_keys` instead of raising. A repair run's success would then stop meaning a complete replay, and nothing in the outcome would tell a complete replay from a strict prefix. **The cost, stated because it is not zero**: a deployment that has set both a cap and `break` gets a loud failure here where it had a quiet success. A total landing exactly on the cap is not that deployment — `softCheck` breaks at `>=` while `check` raises only at `>` — so only an overshoot turns loud |
+    ///
+    /// **Four members are inert for an `INSERT … SELECT` and are named here
+    /// so nobody prunes them and reintroduces the drift** the repair's
+    /// statements would then carry: `input_format_binary_read_json_as_string`
+    /// and `format_binary_max_object_size` govern a RowBinary input such a
+    /// statement has none of, and the two view settings govern views, which a
+    /// repair statement's target has none attached. Two are load-bearing
+    /// there — `distributed_foreground_insert` and `insert_shard_id`, because
+    /// the repair writes the routing table for `spans` and `traces` — and two
+    /// are moot by the repair's own shape rather than by a pin, since it
+    /// replays one target partition per statement and so reaches neither
+    /// partition limit.
+    ///
+    /// **`async_insert` is deliberately not in the set, because it is already
+    /// pinned one layer down.** [`crate::ChClient::insert_settings_of`]
+    /// begins every insert's settings with `async_insert = 0` and then
+    /// applies the call's own settings on top by key, so every insert this
+    /// client makes carries the pin whether or not a signal's constructor
+    /// names it. A second pin here would state one rule twice. What the query
+    /// pin cannot reach is the `MergeTree` setting of the same name, which the
+    /// landing table's own `CREATE` handles.
+    pub fn trace_landing_insert(token: &str, max_rows: u64) -> Self {
+        Self::landing_insert(token, max_rows)
+            .set("input_format_binary_read_json_as_string", 0)
+            .set("format_binary_max_object_size", MAX_JSON_PATHS_PER_VALUE)
+            .set(
+                "max_partitions_per_insert_block",
+                MAX_PARTITIONS_PER_INSERT_BLOCK,
+            )
+            .set("throw_on_max_partitions_per_insert_block", 1)
+            .set("materialized_views_ignore_errors", 0)
+            .set("ignore_materialized_views_with_dropped_target_table", 0)
+            .set("min_insert_block_size_rows_for_materialized_views", 0)
+            .set("min_insert_block_size_bytes_for_materialized_views", 0)
+            .set("distributed_foreground_insert", 1)
+            .set("insert_shard_id", 0)
+            .set("json_type_escape_dots_in_keys", 0)
+            .set("type_json_skip_duplicated_paths", 0)
+            .set("read_overflow_mode", "throw")
+            .set("read_overflow_mode_leaf", "throw")
+            .set("timeout_overflow_mode", "throw")
+            .set("group_by_overflow_mode", "throw")
+            .set("distinct_overflow_mode", "throw")
+            .set("sort_overflow_mode", "throw")
+            .set("result_overflow_mode", "throw")
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
@@ -585,6 +685,80 @@ mod tests {
             assert_eq!(s.get("max_insert_block_size"), Some(want.as_str()));
             assert_eq!(s.get("min_insert_block_size_rows"), Some(want.as_str()));
         }
+    }
+
+    /// **The trace landing insert's pin set is exactly the metrics one plus
+    /// the nineteen the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those nineteen — so
+    /// neither an added pin nor a removed one passes.
+    ///
+    /// It is the only place in this change that writes a setting name as a
+    /// literal. The seven classes behind the nineteen, and the catalogue
+    /// quotation behind each value, are
+    /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
+    ///
+    /// **`async_insert` is not one of them, and its absence is asserted.**
+    /// `ChClient::insert_settings_with` pins it on every insert this client
+    /// makes, so a second pin here would state one rule twice; the `MergeTree`
+    /// setting of the same name is not reachable from a query setting at all
+    /// and is pinned on the landing table's own `CREATE`.
+    #[test]
+    fn the_trace_landing_insert_pins_every_setting_this_design_names() {
+        use std::collections::BTreeMap;
+
+        const WANT: &[(&str, &str)] = &[
+            ("input_format_binary_read_json_as_string", "0"),
+            ("format_binary_max_object_size", "100000"),
+            ("max_partitions_per_insert_block", "100"),
+            ("throw_on_max_partitions_per_insert_block", "1"),
+            ("materialized_views_ignore_errors", "0"),
+            ("ignore_materialized_views_with_dropped_target_table", "0"),
+            ("min_insert_block_size_rows_for_materialized_views", "0"),
+            ("min_insert_block_size_bytes_for_materialized_views", "0"),
+            ("distributed_foreground_insert", "1"),
+            ("insert_shard_id", "0"),
+            ("json_type_escape_dots_in_keys", "0"),
+            ("type_json_skip_duplicated_paths", "0"),
+            ("read_overflow_mode", "throw"),
+            ("read_overflow_mode_leaf", "throw"),
+            ("timeout_overflow_mode", "throw"),
+            ("group_by_overflow_mode", "throw"),
+            ("distinct_overflow_mode", "throw"),
+            ("sort_overflow_mode", "throw"),
+            ("result_overflow_mode", "throw"),
+        ];
+
+        let base = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        let base_entries: BTreeMap<&str, &str> = base.entries().collect();
+        let trace_entries: BTreeMap<&str, &str> = traces.entries().collect();
+
+        let added: BTreeMap<&str, &str> = trace_entries
+            .iter()
+            .filter(|(k, _)| !base_entries.contains_key(**k))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let want: BTreeMap<&str, &str> = WANT.iter().copied().collect();
+        assert_eq!(
+            added, want,
+            "the difference against the metrics landing insert is exactly the \
+             nineteen pins this design names"
+        );
+
+        for (key, value) in &base_entries {
+            assert_eq!(
+                trace_entries.get(key),
+                Some(value),
+                "{key} must keep the value the metrics landing insert gives it"
+            );
+        }
+
+        assert_eq!(
+            traces.get("async_insert"),
+            None,
+            "async_insert is pinned one layer down, for every insert this \
+             client makes; a second pin here would state one rule twice"
+        );
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when

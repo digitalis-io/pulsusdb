@@ -58,6 +58,7 @@ pub(crate) mod rows;
 mod spool;
 mod table;
 mod trace;
+pub(crate) mod trace_json;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,11 +84,15 @@ pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
     LANDING_ROW_SLOT_BYTES, LOG_LANDING_ROW_SLOT_BYTES, LogLandingRow, LogPatternRow, LogSampleRow,
     LogStreamRow, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, TraceAttrRow, TraceSpanRow,
+    MetricSeriesRow, TRACE_LANDING_ROW_SLOT_BYTES, TraceAttrRow, TraceEventTuple, TraceLandingRow,
+    TraceLinkTuple, TraceSpanRow,
 };
 pub use spool::SPOOL_CHUNK_BYTES;
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};
+pub use trace_json::{
+    TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, escape_json_path,
+};
 
 use crate::error::LogsIngestError;
 use crate::ingest::Backpressure;

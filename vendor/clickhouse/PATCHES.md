@@ -7,9 +7,14 @@ path is unchanged. See
 [`docs/decisions/0007-clickhouse-vendor-patch.md`](../../docs/decisions/0007-clickhouse-vendor-patch.md)
 for the decision this copy implements, and issue #382 for the measurements.
 
-**Two patches, in two functions**, both in `src/response.rs`: §1
+**Four patches, in four functions across two files**: §1
 (`collect_bad_response`, issue #382) and §2 (`extract_exception` and
-`DetectDbException`, issue #412). Nothing else is modified. The vendored tree
+`DetectDbException`, issue #412), both in `src/response.rs`, and §3 and §4
+(`validate_impl`, issue #585) in `src/rowbinary/validation.rs` — §3 in its
+`SerdeType::Seq(_)` arm and §4 in its `SerdeType::Tuple(len)` arm. One
+test-support export joins them in `src/lib.rs`'s `_priv` module and is
+named in §3; it is not a change to the driver's behaviour. Nothing else is
+modified. The vendored tree
 drops upstream's `examples/`, `tests/`, `benches/`, CI and toolchain files and
 their `[[example]]`/`[[test]]`/`[[bench]]` target declarations; `src/`,
 `Cargo.toml`'s dependency and feature sets, `Cargo.lock`, `README.md`,
@@ -326,3 +331,211 @@ and request otherwise:
 
 Add `?default_format=RowBinary` and the last two stream on a stock 26.3
 container.
+## 3. `validate_impl` accepts a `Vec` against a `JSON` column
+
+`src/rowbinary/validation.rs`, in `validate_impl`'s `SerdeType::Seq(_)` arm.
+
+### What upstream does
+
+The arm matches `Array`, `Map`, `Ring`, `Polygon`, `MultiPolygon`,
+`LineString` and `MultiLineString`, and falls to `err_on_schema_mismatch` for
+everything else. The `SerdeType::Str | SerdeType::String` arm is what matches
+`DataTypeNode::JSON`. So a `Vec` against a `JSON` column is
+`Error::SchemaMismatch`.
+
+### Why that is a defect for us
+
+A `JSON` column's RowBinary form is a **path count, then per path a
+length-prefixed path string and the value as a binary-encoded `Dynamic`** — a
+type tag then the value's own bytes, with no length prefix on the column as a
+whole. Captured off ClickHouse 26.3.29.7 with
+`SELECT CAST('<text>' AS JSON) FORMAT RowBinary`:
+
+```text
+{"a":1}                              0101610a0100000000000000
+{"k":["a",1]}                        01016b1e2b20021501610a0100000000000000
+{"k":{}}                             00
+```
+
+The only shape a Rust type can take to produce that is a sequence of
+`(path, tagged value)` pairs. Writing the column as a Rust `String` instead is
+accepted and is the **JSON-as-string** form, which the server reads only at
+`input_format_binary_read_json_as_string = 1` and which cannot carry a
+non-finite double at all: text JSON refuses one on this engine — four
+attempts, each `SELECT toJSONString(CAST('<text>' AS JSON))` on 26.3.29.7,
+with `{"k":NaN}`, `{"k":Inf}`, `{"k":Infinity}` and `{"k":1e400}` each
+answering `Code: 117. DB::Exception: Cannot parse JSON object here`. A span
+attribute is a client-chosen `double`, so a path that cannot carry `±Inf` or
+`NaN` cannot carry what a sender sends.
+
+There is no length-prefix-free byte route either: `serialize_bytes` and
+`serialize_str` both write a LEB128 prefix, and the one exception,
+`WithoutLenPrefix` in `serialize_newtype_struct`, is gated on
+`name.starts_with(int256::MODULE_PATH)` and validates `Bytes(32)`.
+
+**No table in this workspace had a `JSON` column before this change**:
+`git grep -n 'JSON  *CODEC\|  JSON,' 53c2518e -- crates` returns nothing, and
+the three JSON-ish columns in the shipped schema (`log_streams.labels`,
+`log_landing.labels`, `trace_attrs_idx.val`) are `String`.
+
+### The change
+
+One match arm:
+
+```rust
+DataTypeNode::JSON => Ok(None),
+```
+
+`Option<InnerDataTypeValidator>::validate` returns `Ok(None)` the moment the
+validator is `None`, so nothing inside the sequence is validated and the
+writer owns every byte. The arm applies at **any depth**, which is what covers
+the `attrs` inside an `Array(Tuple(…, attrs JSON, …))` column.
+
+Additive, no public API change, no `Error` variant added or altered, no
+semver impact. Every other arm is untouched, so every other column type is
+validated exactly as before.
+
+### What this patch does not reach
+
+**Nothing inside the sequence is validated**, so a wrong type tag reaches the
+server rather than the driver, and the error is then a server exception on the
+insert rather than a `SchemaMismatch` before it. That is the patch's stated
+limit. What stands in for it is the byte-exact cases in
+`crates/pulsus-write/src/writer/trace_json.rs`, which reproduce from this
+workspace's own encoder all eleven captured frames in that file's own module
+header — three of them are quoted above — and whose case loop asserts
+`cases.len() == 11` before comparing any of them.
+
+### The test-support export in `_priv`
+
+`src/lib.rs`, `_priv::serialize_row_unvalidated`. The crate's own
+`serialize_row_binary` is `pub(crate)` and nothing public reaches a row's
+bytes without a client and a server, so the byte-exact cases above had no
+door. It serializes one row with no column metadata and so no validation, it
+is called from no production path, and the validating serializer the client
+uses is untouched.
+
+### Gates
+
+Neither the vendored crate's own `#[test]`s nor a new CI step for them exist —
+`clickhouse` is a `[patch.crates-io]` path source, not a workspace member, so
+`cargo test --workspace` never compiles them, and a `#[test]` added there
+would be a case that cannot fail. The gate therefore lives in
+`pulsus-clickhouse`'s suites, exactly as §1's and §2's do:
+
+- **Live** (`tests/live_clickhouse.rs`, the `schema-it` job's
+  `Live ClickHouse client suite` step):
+  `a_vec_against_a_json_column_is_accepted` inserts a sequence into a `JSON`
+  column, reads the stored path back, and checks that an `Array(Tuple(…))`
+  column still admits a sequence and a `UInt8` column still refuses one.
+  Measured with the arm removed: the insert fails
+  `Decode("schema mismatch: … attempting to (de)serialize ClickHouse type
+  JSON as Vec<T>")`.
+
+**Re-vendor rule (§3):** on any `clickhouse` version bump, check whether
+upstream's `SerdeType::Seq(_)` arm admits `DataTypeNode::JSON`. If it does,
+drop this patch and take theirs; if it admits it with **validation** of the
+sequence's contents, read what it validates against before taking it — this
+workspace writes the column's bytes itself and a validator that expects
+another shape refuses every trace push.
+
+
+## 4. `validate_impl` accepts a Rust tuple against a **named** tuple column
+
+`src/rowbinary/validation.rs`, in `validate_impl`'s `SerdeType::Tuple(len)`
+arm (issue #585).
+
+### What upstream does
+
+The arm matches `FixedString`, `Tuple`, `Array`, `IPv6`, `UUID` and `Point`,
+and falls to `err_on_schema_mismatch` for everything else. `DataTypeNode` has
+no named-tuple variant upstream, so there is nothing to match — the whole
+defect is one layer down, in `clickhouse-types`, where the type parser cannot
+read `Tuple(a Int64, b String)` at all.
+
+### Why that is a defect for us
+
+`vendor/clickhouse-types` is patched to read a named tuple, into a new
+`DataTypeNode::NamedTuple` variant (see its `PATCHES.md`). The variant's
+arrival is **silent everywhere in this crate**: `validate_impl` is a chain of
+arms each ending in a fallthrough, and `DataTypeNode` is `#[non_exhaustive]`,
+so nothing here fails to compile and nothing warns. Without this arm the
+variant reaches the arm's own `_ =>` and the insert is refused with
+`attempting to (de)serialize nested ClickHouse type … as a tuple or sequence
+with length N` — a client-side refusal for a column the server is perfectly
+happy with. `trace_landing` and `spans` both declare `events` and `links`
+with named tuple elements, and `TraceEventTuple` and `TraceLinkTuple` reach
+this arm through `serialize_tuple`.
+
+### The change
+
+One match arm, beside the positional `Tuple` one:
+
+```rust
+DataTypeNode::NamedTuple(elements) => Ok(Some(InnerDataTypeValidator {
+    root,
+    kind: InnerDataTypeValidatorKind::Tuple(elements.types()),
+})),
+```
+
+A named tuple's wire form **is** its positional one: the names are metadata the
+server renders into the type string (`DataTypeTuple::doGetName`) and the
+serialization does not carry them, so validation walks the element types
+exactly as for `Tuple`. `elements.types()` is the `&'caller [DataTypeNode]`
+that `InnerDataTypeValidatorKind::Tuple` already takes, with the lifetime
+coming from `column_data_type`, so the existing `split_first` cursor and
+`check_tuple_fully_validated` are reused unchanged and the element count is
+left to them.
+
+**Accepted here and nowhere else.** It is in the `SerdeType::Tuple(len)` arm
+only, so a Rust **sequence** against a named-tuple column stays a mismatch,
+exactly as it is for a positional tuple. Every other arm is untouched, and so
+is `null_encoding_for`'s `_ => None`, which is correct: a named tuple carries
+no null marker.
+
+Additive, no public API change, no `Error` variant added or altered, no
+semver impact.
+
+### What this patch does not reach
+
+**Too few element fields is not refused on the insert path.**
+`check_tuple_fully_validated` — the only producer of
+`tuple was not fully (de)serialized` — has exactly one caller in the crate,
+`rowbinary/de.rs`'s `next_element_seed`, so it runs when the last element of a
+sequence has been **de**serialized and never on the way out. Measured against
+26.3.29.7 with a one-field Rust tuple against `Array(Tuple(a Int64, b String))`:
+the driver accepts the short tuple, sends the block, and the server answers
+`Code: 32 … Attempt to read after eof`. The too-MANY direction **is** refused
+on the insert path, by the same cursor's `None` branch
+(`attempting to (de)serialize … while no more elements are allowed`). This is
+upstream's asymmetry, unchanged by this patch, and it is the same on a
+positional tuple.
+
+### Gates
+
+Neither the vendored crate's own `#[test]`s nor a CI step for them exists —
+`clickhouse` is a `[patch.crates-io]` path source, not a workspace member, so
+`cargo test --workspace` never compiles them. The gates live in
+`pulsus-clickhouse`'s and `pulsus-write`'s suites, as §§1-3's do:
+
+- **Live** (`pulsus-clickhouse/tests/live_named_tuple.rs`, the `schema-it`
+  job's `Live named-tuple insert and read-back` step):
+  `l1_an_insert_into_a_named_tuple_column_succeeds` inserts into
+  `Array(Tuple(a Int64, b String))` and reads the named element back;
+  `l4_a_wrong_element_type_is_refused_by_the_element_it_is_wrong_for` shows the
+  validator **descended into** the tuple rather than refusing it whole — the
+  message names `Int64`, the element type, not the column type;
+  `l3_an_element_tuple_short_of_a_field_is_refused` is the read-path half, and
+  `l2_an_insert_into_a_positional_tuple_column_still_succeeds` is the pin that
+  a positional tuple is unaffected.
+- **Live** (`pulsus-write/tests/trace_rows_v2.rs`, the `schema-it` job's
+  `Trace landing rows and the JSON column` step):
+  `two_events_and_two_links_in_one_span_all_land` is the one that needs the
+  cursor to be fresh per array element — a shared cursor would validate the
+  second event's first field against the first event's second type.
+
+**Re-vendor rule (§4):** on any `clickhouse` version bump, check whether
+upstream's `SerdeType::Tuple(len)` arm admits a named tuple. It can only do so
+once `clickhouse-types` has a variant for one, so this entry is paired with
+that crate's re-vendor rule: if upstream takes named tuples there, drop that
+patch and this arm together.

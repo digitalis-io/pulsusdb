@@ -232,6 +232,54 @@ pub const LOG_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`LOG_LANDING_MAX_ROWS_FLOOR`].
 pub const LOG_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
+/// `trace_landing_retention_hours` — the traces replay window: how long the
+/// traces landing table keeps a landed row. Both ends are the two shipped
+/// signals' keys', and for the same reasons — a shorter window than an hour
+/// leaves nothing to rebuild a derived table from; past a week the landing
+/// table is the deployment's primary storage rather than its replay window.
+pub const TRACE_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
+/// See [`TRACE_LANDING_RETENTION_HOURS_FLOOR`].
+pub const TRACE_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
+
+/// `trace_dedup_window` — how many recent blocks each of the six tables on
+/// the traces write path remembers. The floor is one block, the least that
+/// recognises an immediately repeated resend; the ceiling is a million, the
+/// largest the engine's own setting accepts as a useful window.
+///
+/// **A replicated table has a companion time window**, and it is pinned
+/// rather than configured: `pulsus_schema::DEDUP_WINDOW_SECONDS` says why.
+pub const TRACE_DEDUP_WINDOW_FLOOR: u64 = 1;
+/// See [`TRACE_DEDUP_WINDOW_FLOOR`].
+pub const TRACE_DEDUP_WINDOW_CEILING: u64 = 1_000_000;
+
+/// `writer.trace_landing_retries` — resends of a failed traces landing
+/// insert. Zero is meaningful (never resend), and the ceiling is ten: the
+/// landing budget bounds the loop in wall-clock time anyway, so a larger
+/// count only spends the same budget in smaller pieces.
+pub const TRACE_LANDING_RETRIES_CEILING: u32 = 10;
+
+/// `writer.trace_landing_inserters` — insert workers on the traces landing
+/// queue. The floor is one, or nothing takes a block off the queue at all;
+/// the ceiling is 64, past which the workers contend for the connection pool
+/// rather than adding throughput.
+pub const TRACE_LANDING_INSERTERS_FLOOR: u32 = 1;
+/// See [`TRACE_LANDING_INSERTERS_FLOOR`].
+pub const TRACE_LANDING_INSERTERS_CEILING: u32 = 64;
+
+/// `writer.trace_landing_max_rows` — the per-push traces landing row
+/// ceiling, counted over all four landed kinds, and the
+/// `max_insert_block_size` every traces landing insert pins. The floor is a
+/// thousand rows, below which an ordinary push is refused; the ceiling is
+/// ten million, past which one block is a memory event rather than a batch.
+///
+/// **The range is the other two signals' keys' and has to be**: the
+/// block-overhead figure the charge adds prices the insert's settings text at
+/// the largest accepted ceiling, so an identical range is what lets that
+/// figure be cited rather than recomputed.
+pub const TRACE_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
+/// See [`TRACE_LANDING_MAX_ROWS_FLOOR`].
+pub const TRACE_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
+
 /// `reader.cache_max_series` — the matched-set / IN-list cardinality
 /// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
 /// 1000x the default of 50_000; kept below
@@ -599,6 +647,60 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             cfg.writer.log_landing_max_rows,
             LOG_LANDING_MAX_ROWS_FLOOR,
             LOG_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
+    }
+
+    // Issues #584 to #586: the traces landing table's dials, the two shipped
+    // signals' blocks' twin.
+    if !(TRACE_LANDING_RETENTION_HOURS_FLOOR..=TRACE_LANDING_RETENTION_HOURS_CEILING)
+        .contains(&cfg.trace_landing_retention_hours)
+    {
+        return Err(range_err(
+            "trace_landing_retention_hours",
+            u64::from(cfg.trace_landing_retention_hours),
+            u64::from(TRACE_LANDING_RETENTION_HOURS_FLOOR),
+            u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING),
+            "hours",
+        ));
+    }
+    if !(TRACE_DEDUP_WINDOW_FLOOR..=TRACE_DEDUP_WINDOW_CEILING).contains(&cfg.trace_dedup_window) {
+        return Err(range_err(
+            "trace_dedup_window",
+            cfg.trace_dedup_window,
+            TRACE_DEDUP_WINDOW_FLOOR,
+            TRACE_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    if cfg.writer.trace_landing_retries > TRACE_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.trace_landing_retries",
+            u64::from(cfg.writer.trace_landing_retries),
+            0,
+            u64::from(TRACE_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(TRACE_LANDING_INSERTERS_FLOOR..=TRACE_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.trace_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.trace_landing_inserters",
+            u64::from(cfg.writer.trace_landing_inserters),
+            u64::from(TRACE_LANDING_INSERTERS_FLOOR),
+            u64::from(TRACE_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(TRACE_LANDING_MAX_ROWS_FLOOR..=TRACE_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.trace_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.trace_landing_max_rows",
+            cfg.writer.trace_landing_max_rows,
+            TRACE_LANDING_MAX_ROWS_FLOOR,
+            TRACE_LANDING_MAX_ROWS_CEILING,
             "rows",
         ));
     }
@@ -1580,6 +1682,90 @@ mod tests {
                     LOG_LANDING_MAX_ROWS_CEILING + 1,
                 ],
                 vec![LOG_LANDING_MAX_ROWS_FLOOR, LOG_LANDING_MAX_ROWS_CEILING],
+            ),
+        ];
+
+        for (name, set, bad, good) in cases {
+            for value in bad {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                match validate(&cfg) {
+                    Err(ConfigError::Value { field, .. }) => {
+                        assert_eq!(field, name, "{name} at {value}");
+                    }
+                    other => panic!("{name} at {value}: expected a Value error, got {other:?}"),
+                }
+            }
+            for value in good {
+                let mut cfg = Config::default();
+                set(&mut cfg, value);
+                assert!(validate(&cfg).is_ok(), "{name} at {value} must be accepted");
+            }
+        }
+    }
+
+    /// Each of the five traces landing dials resolves to the default this
+    /// design names, is accepted at both ends of its range, and is rejected
+    /// one step outside each end naming its own field. A key with no range
+    /// check accepts the out-of-range value and fails here.
+    ///
+    /// Every range is the two shipped signals' keys', and the row ceiling's
+    /// **has to be**: the block-overhead figure the charge adds prices the
+    /// insert's settings text at the largest accepted ceiling, so an
+    /// identical range is what lets that figure be cited rather than
+    /// recomputed.
+    #[test]
+    fn the_trace_landing_dials_reject_both_sides_and_accept_both_ends() {
+        let d = Config::default();
+        assert_eq!(d.trace_landing_retention_hours, 6);
+        assert_eq!(d.trace_dedup_window, 10_000);
+        assert_eq!(d.writer.trace_landing_retries, 3);
+        assert_eq!(d.writer.trace_landing_inserters, 4);
+        assert_eq!(d.writer.trace_landing_max_rows, 1_048_576);
+        assert!(validate(&d).is_ok());
+
+        // (field, setter, bad values, good values)
+        type Set = fn(&mut Config, u64);
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
+            (
+                "trace_landing_retention_hours",
+                |c, v| c.trace_landing_retention_hours = v as u32,
+                vec![0, u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING) + 1],
+                vec![
+                    u64::from(TRACE_LANDING_RETENTION_HOURS_FLOOR),
+                    u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING),
+                ],
+            ),
+            (
+                "trace_dedup_window",
+                |c, v| c.trace_dedup_window = v,
+                vec![TRACE_DEDUP_WINDOW_FLOOR - 1, TRACE_DEDUP_WINDOW_CEILING + 1],
+                vec![TRACE_DEDUP_WINDOW_FLOOR, TRACE_DEDUP_WINDOW_CEILING],
+            ),
+            (
+                "writer.trace_landing_retries",
+                |c, v| c.writer.trace_landing_retries = v as u32,
+                vec![u64::from(TRACE_LANDING_RETRIES_CEILING) + 1],
+                // Zero is meaningful here: never resend.
+                vec![0, u64::from(TRACE_LANDING_RETRIES_CEILING)],
+            ),
+            (
+                "writer.trace_landing_inserters",
+                |c, v| c.writer.trace_landing_inserters = v as u32,
+                vec![0, u64::from(TRACE_LANDING_INSERTERS_CEILING) + 1],
+                vec![
+                    u64::from(TRACE_LANDING_INSERTERS_FLOOR),
+                    u64::from(TRACE_LANDING_INSERTERS_CEILING),
+                ],
+            ),
+            (
+                "writer.trace_landing_max_rows",
+                |c, v| c.writer.trace_landing_max_rows = v,
+                vec![
+                    TRACE_LANDING_MAX_ROWS_FLOOR - 1,
+                    TRACE_LANDING_MAX_ROWS_CEILING + 1,
+                ],
+                vec![TRACE_LANDING_MAX_ROWS_FLOOR, TRACE_LANDING_MAX_ROWS_CEILING],
             ),
         ];
 

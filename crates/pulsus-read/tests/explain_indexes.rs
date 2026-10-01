@@ -569,20 +569,133 @@ fn plan_ctx(db: &str) -> PlanCtx<'_> {
 // specific predicate values).
 const FP_PROD: u64 = 18_374_000_000_000_000_001;
 
-/// Nanoseconds since the Unix epoch, right now. Fixture timestamps must be
-/// wall-clock-recent (not a fixed historical constant): `log_samples`'s
-/// `ttl_only_drop_parts = 1` retention (docs/schemas.md §3.1) makes an
-/// already-expired part eligible for background deletion almost
-/// immediately, which would flake a fixed-date fixture the same way
-/// `live_schema.rs`'s smoke insert documents (issue #5).
+/// How far back of [`now_ns`]'s instant the window [`range_params`] builds
+/// reaches, and how far forward.
+const WINDOW_BACK_NS: i64 = 6 * 3_600_000_000_000;
+const WINDOW_FORWARD_NS: i64 = 3_600_000_000_000;
+
+/// Nanoseconds since the Unix epoch, right now, moved inside the UTC
+/// calendar month it falls in so that the whole
+/// `[now - WINDOW_BACK_NS, now + WINDOW_FORWARD_NS]` window stays in that
+/// one month — see [`clamped_into_one_utc_month`].
+///
+/// Fixture timestamps must be wall-clock-recent (not a fixed historical
+/// constant): `log_samples`'s `ttl_only_drop_parts = 1` retention
+/// (docs/schemas.md §3.1) makes an already-expired part eligible for
+/// background deletion almost immediately, which would flake a fixed-date
+/// fixture the same way `live_schema.rs`'s smoke insert documents
+/// (issue #5). The clamp moves the instant by hours at most, so it stays
+/// recent and stays in the month the clock says it is.
 fn now_ns() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos(),
+    clamped_into_one_utc_month(
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        )
+        .expect("fits i64"),
     )
-    .expect("fits i64")
+}
+
+/// `ts_ns`, moved as little as possible so that
+/// `[ts_ns - WINDOW_BACK_NS, ts_ns + WINDOW_FORWARD_NS]` lies inside the
+/// one UTC calendar month `ts_ns` itself falls in. At most
+/// `WINDOW_BACK_NS` forward, at most `WINDOW_FORWARD_NS` back, and never
+/// out of that month.
+///
+/// **Why the window may not straddle a month boundary.** `log_streams`,
+/// `log_streams_idx` and `log_samples` are `PARTITION BY month`, and
+/// `month_clause` renders `month = …` for one month and `month IN (…)` for
+/// more than one. Every expectation in this file was captured with the
+/// one-month form, which the server reports as
+/// `Condition: (month in [#, #])`; on a two-month window it reports
+/// `Condition: (month in #-element set)` and six cases fail. Without the
+/// clamp that is what happened between 00:00 and 06:00 UTC on the first of
+/// any month, after which the suite went green by itself.
+fn clamped_into_one_utc_month(ts_ns: i64) -> i64 {
+    use chrono::{Datelike, TimeZone, Utc};
+
+    let first_of = |year: i32, month: u32| -> i64 {
+        Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+            .single()
+            .expect("midnight on the first of a month is one UTC instant")
+            .timestamp_nanos_opt()
+            .expect("a year nanoseconds since the epoch can hold")
+    };
+    let at = Utc.timestamp_nanos(ts_ns);
+    let (next_year, next_month) = if at.month() == 12 {
+        (at.year() + 1, 1)
+    } else {
+        (at.year(), at.month() + 1)
+    };
+    let earliest = first_of(at.year(), at.month()) + WINDOW_BACK_NS;
+    // One nanosecond short, so the window's end cannot land ON the next
+    // month's first instant, which belongs to that month.
+    let latest = first_of(next_year, next_month) - WINDOW_FORWARD_NS - 1;
+    ts_ns.clamp(earliest, latest)
+}
+
+/// Hermetic: [`clamped_into_one_utc_month`] keeps the whole window inside
+/// one UTC calendar month, for instants that need no move and for the two
+/// that do — the first six hours of a month, and the last hour of one.
+///
+/// The expectations are written as instants rather than as a re-derivation
+/// of the function's own arithmetic.
+#[test]
+fn the_fixture_instant_is_moved_inside_one_calendar_month() {
+    // 2026-10-01T00:00:00Z, 2026-11-01T00:00:00Z, 2027-01-01T00:00:00Z.
+    const OCT_1: i64 = 1_790_812_800_000_000_000;
+    const NOV_1: i64 = 1_793_491_200_000_000_000;
+    const JAN_1: i64 = 1_798_761_600_000_000_000;
+    const HOUR: i64 = 3_600_000_000_000;
+
+    for (label, input, want) in [
+        // Mid-month: no move.
+        (
+            "2026-10-15T12:00:00Z",
+            OCT_1 + 14 * 24 * HOUR + 12 * HOUR,
+            OCT_1 + 14 * 24 * HOUR + 12 * HOUR,
+        ),
+        // Exactly six hours in: the earliest instant needing no move.
+        ("2026-10-01T06:00:00Z", OCT_1 + 6 * HOUR, OCT_1 + 6 * HOUR),
+        // The failing band: pushed forward to six hours in.
+        ("2026-10-01T03:00:00Z", OCT_1 + 3 * HOUR, OCT_1 + 6 * HOUR),
+        ("2026-10-01T00:00:00Z", OCT_1, OCT_1 + 6 * HOUR),
+        // The last hour of the month: pulled back to one nanosecond short
+        // of an hour before the next month starts.
+        (
+            "2026-10-31T23:30:00Z",
+            NOV_1 - 30 * 60 * 1_000_000_000,
+            NOV_1 - HOUR - 1,
+        ),
+        // December, so the next month is in the next year.
+        (
+            "2026-12-31T23:59:59Z",
+            JAN_1 - 1_000_000_000,
+            JAN_1 - HOUR - 1,
+        ),
+    ] {
+        let got = clamped_into_one_utc_month(input);
+        assert_eq!(got, want, "{label}: the clamped instant");
+        assert_eq!(
+            utc_month(got - WINDOW_BACK_NS),
+            utc_month(got),
+            "{label}: the window's start is in another month"
+        );
+        assert_eq!(
+            utc_month(got + WINDOW_FORWARD_NS),
+            utc_month(got),
+            "{label}: the window's end is in another month"
+        );
+    }
+}
+
+/// `(year, month)` of an instant in UTC, for the case above.
+fn utc_month(ts_ns: i64) -> (i32, u32) {
+    use chrono::{Datelike, TimeZone, Utc};
+    let at = Utc.timestamp_nanos(ts_ns);
+    (at.year(), at.month())
 }
 
 async fn seed(client: &ChClient, db: &str, ts_ns: i64) {
@@ -683,14 +796,14 @@ async fn setup(db: &str, ts_ns: i64) -> ChClient {
     data_client
 }
 
-/// A `[now - 6h, now]` window bracketing `ts_ns` (the seeded samples'
-/// timestamp), matching docs/schemas.md §3.2's canonical "last 6h" example
-/// shape.
+/// A `[ts_ns - 6h, ts_ns + 1h]` window bracketing `ts_ns` (the seeded
+/// samples' timestamp), matching docs/schemas.md §3.2's canonical "last 6h"
+/// example shape.
 fn range_params(ts_ns: i64) -> QueryParams {
     QueryParams {
         spec: QuerySpec::Range {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
             step_ns: 60_000_000_000,
         },
         limit: 100,
@@ -1234,8 +1347,8 @@ async fn keyset_page_usage(
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
         },
         sql::KeysetLower::After {
             tuple: (
@@ -1370,8 +1483,8 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
         &table,
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
         },
     );
 

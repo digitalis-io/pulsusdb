@@ -113,6 +113,8 @@ fn cluster_ctx(db: &str) -> RenderCtx {
         metrics_dedup_window: 10_000,
         log_landing_retention_hours: 6,
         log_dedup_window: 10_000,
+        trace_landing_retention_hours: 6,
+        trace_dedup_window: 10_000,
     }
 }
 

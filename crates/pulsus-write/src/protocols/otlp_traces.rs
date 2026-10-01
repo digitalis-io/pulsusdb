@@ -54,17 +54,24 @@
 //! that helper's doc comment).
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
+};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 use prost::Message;
-use pulsus_model::Date;
+use pulsus_model::{Date, Fingerprint};
 
 use crate::error::LogsIngestError;
-use crate::ingest::traces::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord};
+use crate::ingest::traces::{
+    AttrRecord, AttrValueType, LandingEvent, LandingLink, LandingResource, LandingSpan,
+    LandingTagName, LandingTagValue, ParsedTraceLanding, ParsedTraces, SpanRecord, TagScope,
+};
+use crate::writer::trace_json::{TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
 
 /// The `scope` discriminator value for a resource attribute row.
 const SCOPE_RESOURCE: &str = "resource";
@@ -2617,6 +2624,1736 @@ mod tests {
         assert!(
             charge >= reservation,
             "the admission charge ({charge}) must cover the queue reservation ({reservation})"
+        );
+    }
+}
+
+// === The landing-shaped decode (issues #584 to #586) ======================
+//
+// [`parse`] above is the OLD two-table path's walk and is untouched. This
+// one produces [`ParsedTraceLanding`], which carries what the landing path
+// stores and the old path keeps inside the span's protobuf `payload` blob
+// instead: the events, the links, the scope's attributes, the resource's
+// attributes, the trace state, the flags and the four dropped counts.
+//
+// The two walks share this module's depth guard, its expansion budget and
+// its value renderer, and nothing else. **Neither path's behaviour depends
+// on the other's**: a change to one walk cannot move the other's rows.
+
+/// The reserved key the resource-identity buffer appends the schema url
+/// under.
+///
+/// **A single `0xFF` byte, which no OTLP key can spell.** An OTLP key is a
+/// protobuf `string` and so valid UTF-8, and `0xFF` is not a valid byte in
+/// any UTF-8 sequence — so no sender can construct an attribute whose key
+/// collides with this one. It is also the buffer's own separator, which
+/// costs nothing for the same reason: a real key contains no `0xFF`, so the
+/// reserved pair cannot be read as part of one.
+const IDENTITY_SCHEMA_URL_KEY: &[u8] = &[0xFF];
+
+/// The separator the identity buffer uses, which is
+/// `pulsus_model::build_stream_buffer`'s own.
+const IDENTITY_SEP: u8 = 0xFF;
+
+/// The one-byte type tag the identity buffer puts before a value, so an
+/// integer `1` and the string `"1"` are different resources.
+///
+/// One tag per arm of the `AnyValue` oneof, plus `u` for an `AnyValue` with
+/// no arm set and for an absent one — the protocol calls both "empty" and
+/// the stored attributes cannot tell them apart either.
+fn identity_type_tag(value: Option<&Value>) -> u8 {
+    match value {
+        None => b'u',
+        Some(Value::StringValue(_)) => b's',
+        Some(Value::BoolValue(_)) => b'b',
+        Some(Value::IntValue(_)) => b'i',
+        Some(Value::DoubleValue(_)) => b'f',
+        Some(Value::ArrayValue(_)) => b'a',
+        Some(Value::KvlistValue(_)) => b'm',
+        Some(Value::BytesValue(_)) => b'y',
+        Some(Value::StringValueStrindex(_)) => b'x',
+    }
+}
+
+/// Appends a length and then the bytes it counts, so a field whose width
+/// the type does not fix cannot run into its neighbour.
+fn identity_push_len_prefixed(bytes: &[u8], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Appends one value to the identity buffer: **its type tag, then its own
+/// bytes, at every depth**.
+///
+/// The shapes that can nest are the protocol's, not a chosen few:
+/// `AnyValue.value` is an optional oneof of eight arms, and exactly two of
+/// them carry further `AnyValue`s — `ArrayValue.values`, and
+/// `KeyValueList.values`' `KeyValue.value`. So this walks those two arms
+/// and tags what it finds, which makes the encoding injective over the
+/// whole value: the arms whose width the type does not fix carry a length,
+/// a container carries its element count, and every element and every
+/// kvlist entry's value carries its own tag.
+///
+/// **Rendering the value to text instead collapses distinct resources**, at
+/// any depth below the first: a bytes value renders as its base64 text and
+/// so cannot be told from a string carrying that text, and a non-finite
+/// double, a profiling string reference and an unset value all render as
+/// JSON `null`. `resources` is a `ReplacingMergeTree` keyed on
+/// `(service, resource_id)`, so a shared identity means one of the two
+/// resources replaces the other and the spans carrying that id join to
+/// whichever survived.
+///
+/// A double is encoded by its bits rather than its text, which keeps `+inf`,
+/// `-inf` and a NaN apart from each other and from every finite value.
+/// Equal wire values give equal bytes, which is what the identity needs; a
+/// finer distinction than the stored column can show costs nothing, because
+/// two identities for one stored content are two rows under two keys, while
+/// one identity for two contents loses one of them.
+///
+/// The recursion is bounded by the whole-request depth guard
+/// ([`crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH`], 32), which runs at the top of
+/// [`parse_landing`] before any value is encoded — the same bound
+/// [`any_value_to_json`] relies on.
+fn identity_encode_value(value: Option<&AnyValue>, buf: &mut Vec<u8>) {
+    let value = value.and_then(|v| v.value.as_ref());
+    buf.push(identity_type_tag(value));
+    match value {
+        None => {}
+        Some(Value::StringValue(s)) => identity_push_len_prefixed(s.as_bytes(), buf),
+        Some(Value::BoolValue(b)) => buf.push(u8::from(*b)),
+        Some(Value::IntValue(i)) => buf.extend_from_slice(&i.to_le_bytes()),
+        Some(Value::DoubleValue(d)) => buf.extend_from_slice(&d.to_bits().to_le_bytes()),
+        Some(Value::BytesValue(bytes)) => identity_push_len_prefixed(bytes, buf),
+        Some(Value::StringValueStrindex(index)) => buf.extend_from_slice(&index.to_le_bytes()),
+        Some(Value::ArrayValue(array)) => {
+            buf.extend_from_slice(&(array.values.len() as u64).to_le_bytes());
+            for element in &array.values {
+                identity_encode_value(Some(element), buf);
+            }
+        }
+        Some(Value::KvlistValue(kvlist)) => {
+            buf.extend_from_slice(&(kvlist.values.len() as u64).to_le_bytes());
+            for entry in &kvlist.values {
+                identity_push_len_prefixed(entry.key.as_bytes(), buf);
+                identity_encode_value(entry.value.as_ref(), buf);
+            }
+        }
+    }
+}
+
+/// The canonical buffer one resource's identity is taken over.
+///
+/// **Pairs sorted by key, key-unique, `key ++ 0xFF ++ <encoded value> ++
+/// 0xFF`** — `pulsus_model::build_stream_buffer`'s layout, with
+/// [`identity_encode_value`] in place of the value's text — then the schema
+/// url under [`IDENTITY_SCHEMA_URL_KEY`].
+///
+/// The encoded value starts with a type tag, which is an ASCII letter, and
+/// is self-delimiting from there; a key holds no `0xFF` because it is valid
+/// UTF-8. So the buffer can be read back as the pairs it was built from,
+/// which is what makes two different resources two buffers.
+///
+/// Three properties this gives, each with the case that holds it:
+///
+/// - **The identity does not depend on arrival order**, because the buffer
+///   is built from sorted, key-unique pairs. That is the invariant
+///   `LabelSet`'s own doc comment states, and an identity taken over the
+///   encoded bytes in arrival order breaks it. The sort is stable and the
+///   deduplication keeps the earlier pair, so a repeated key keeps its
+///   first value here as it does in the stored attributes.
+/// - **`service.name` is in the hash.** Only the *stored* `attrs` drops it,
+///   because `spans.service` already carries it. Leaving it out of the
+///   buffer would make two different services with otherwise equal
+///   resources share one `resource_id`, and the damage is on the read side:
+///   `resources`' key is `(service, resource_id)`, so the two rows have
+///   different keys and do not collapse, while the attribute join compiles
+///   to `resource_id IN (SELECT resource_id FROM resources WHERE …)` with
+///   no service term.
+/// - **A key present with an empty value differs from an absent key**,
+///   because a present key contributes its own `key ++ 0xFF ++ tag ++ 0xFF`.
+fn resource_identity_buffer(resource: Option<&Resource>, schema_url: &str) -> Vec<u8> {
+    let mut pairs: Vec<(&str, Option<&AnyValue>)> = Vec::new();
+    if let Some(resource) = resource {
+        for kv in &resource.attributes {
+            pairs.push((kv.key.as_str(), kv.value.as_ref()));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+
+    let mut buf = Vec::new();
+    for (key, value) in &pairs {
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(IDENTITY_SEP);
+        identity_encode_value(*value, &mut buf);
+        buf.push(IDENTITY_SEP);
+    }
+    buf.extend_from_slice(IDENTITY_SCHEMA_URL_KEY);
+    buf.push(IDENTITY_SEP);
+    buf.extend_from_slice(schema_url.as_bytes());
+    buf.push(IDENTITY_SEP);
+    buf
+}
+
+/// One resource's 128-bit identity.
+///
+/// **`pulsus_model::compose128`, not a third hash primitive.**
+/// `docs/TraceQL/server-implementation.md` §2.2 named `sipHash128` until it
+/// was corrected to name this function; that primitive is not in this
+/// workspace and no dependency provides it. Issue #498 settled this
+/// composition — `cityHash64` in the high half, `xxHash64` seed 0 in the low
+/// half, over one canonical buffer — for both label families, so a change to
+/// either primitive moves every identity and the golden vectors catch it
+/// once. A third primitive for a third identity gives up exactly that.
+pub fn resource_identity(resource: Option<&Resource>, schema_url: &str) -> Fingerprint {
+    pulsus_model::compose128(&resource_identity_buffer(resource, schema_url))
+}
+
+/// What one attribute's value becomes: a stored JSON value at one or more
+/// paths, or a key whose value no JSON path can hold.
+enum LandedValue {
+    /// One path under the attribute's own escaped key.
+    One(TraceJsonValue),
+    /// A non-empty kvlist: one leaf path per leaf, each already escaped and
+    /// prefixed with the attribute's own escaped key. The second element of
+    /// each pair is the leaf's **original** dotted key, which is what the
+    /// `tag_names` catalog lists.
+    Leaves(Vec<(String, String, TraceJsonValue)>),
+    /// `attrs_other`: a bytes value, an empty kvlist, an array holding a
+    /// bytes or kvlist element, or an `AnyValue` with no arm set. None of
+    /// these has a JSON representation this engine can store at a path, so
+    /// the key is carried in the protobuf side-channel under its original
+    /// OTLP key.
+    Other,
+}
+
+/// Classifies one OTLP `AnyValue` into [`LandedValue`], applying §4.2's
+/// table.
+fn land_value(key: &str, value: Option<&AnyValue>) -> LandedValue {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        return LandedValue::Other;
+    };
+    match value {
+        Value::StringValue(s) => {
+            LandedValue::One(TraceJsonValue::Scalar(TraceJsonScalar::Str(s.clone())))
+        }
+        Value::BoolValue(b) => LandedValue::One(TraceJsonValue::Scalar(TraceJsonScalar::Bool(*b))),
+        Value::IntValue(i) => LandedValue::One(TraceJsonValue::Scalar(TraceJsonScalar::Int(*i))),
+        Value::DoubleValue(d) => {
+            LandedValue::One(TraceJsonValue::Scalar(TraceJsonScalar::Double(*d)))
+        }
+        Value::ArrayValue(array) => land_array(array),
+        Value::KvlistValue(kvlist) => {
+            if kvlist.values.is_empty() {
+                return LandedValue::Other;
+            }
+            let mut leaves = Vec::new();
+            collect_leaves(key, key, kvlist, &mut leaves);
+            if leaves.is_empty() {
+                LandedValue::Other
+            } else {
+                LandedValue::Leaves(leaves)
+            }
+        }
+        // A bytes value has no JSON type on this engine, and a profiling
+        // string index is a reference into a table a trace receiver does
+        // not carry.
+        Value::BytesValue(_) | Value::StringValueStrindex(_) => LandedValue::Other,
+    }
+}
+
+/// An array's stored form: one typed array where every element is the same
+/// scalar arm, `Array(Dynamic)` where the arms are mixed,
+/// `Array(Nullable(String))` where it is empty, and `attrs_other` where any
+/// element is a bytes value or a kvlist.
+fn land_array(array: &ArrayValue) -> LandedValue {
+    if array.values.is_empty() {
+        return LandedValue::One(TraceJsonValue::EmptyArray);
+    }
+    let mut scalars: Vec<TraceJsonScalar> = Vec::with_capacity(array.values.len());
+    for element in &array.values {
+        match element.value.as_ref() {
+            Some(Value::StringValue(s)) => scalars.push(TraceJsonScalar::Str(s.clone())),
+            Some(Value::BoolValue(b)) => scalars.push(TraceJsonScalar::Bool(*b)),
+            Some(Value::IntValue(i)) => scalars.push(TraceJsonScalar::Int(*i)),
+            Some(Value::DoubleValue(d)) => scalars.push(TraceJsonScalar::Double(*d)),
+            // A nested array, a kvlist, a bytes value or an unset element:
+            // the whole attribute goes to `attrs_other`, because a stored
+            // array's element type has to be one thing.
+            _ => return LandedValue::Other,
+        }
+    }
+    let all_str = scalars.iter().all(|s| matches!(s, TraceJsonScalar::Str(_)));
+    let all_bool = scalars
+        .iter()
+        .all(|s| matches!(s, TraceJsonScalar::Bool(_)));
+    let all_int = scalars.iter().all(|s| matches!(s, TraceJsonScalar::Int(_)));
+    let all_double = scalars
+        .iter()
+        .all(|s| matches!(s, TraceJsonScalar::Double(_)));
+    if all_str {
+        return LandedValue::One(TraceJsonValue::StrArray(
+            scalars
+                .into_iter()
+                .map(|s| match s {
+                    TraceJsonScalar::Str(s) => s,
+                    _ => unreachable!("checked by all_str"),
+                })
+                .collect(),
+        ));
+    }
+    if all_bool {
+        return LandedValue::One(TraceJsonValue::BoolArray(
+            scalars
+                .into_iter()
+                .map(|s| match s {
+                    TraceJsonScalar::Bool(b) => b,
+                    _ => unreachable!("checked by all_bool"),
+                })
+                .collect(),
+        ));
+    }
+    if all_int {
+        return LandedValue::One(TraceJsonValue::IntArray(
+            scalars
+                .into_iter()
+                .map(|s| match s {
+                    TraceJsonScalar::Int(i) => i,
+                    _ => unreachable!("checked by all_int"),
+                })
+                .collect(),
+        ));
+    }
+    if all_double {
+        return LandedValue::One(TraceJsonValue::DoubleArray(
+            scalars
+                .into_iter()
+                .map(|s| match s {
+                    TraceJsonScalar::Double(d) => d,
+                    _ => unreachable!("checked by all_double"),
+                })
+                .collect(),
+        ));
+    }
+    LandedValue::One(TraceJsonValue::MixedArray(scalars))
+}
+
+/// Walks a kvlist into `(escaped path, original dotted key, value)` leaves.
+///
+/// **A nested object is dotted leaf paths and nothing else** — the engine
+/// stores no value at a parent path, measured: for
+/// `CAST('{"k":{"a":{"b":1}}}' AS JSON)`, `dynamicType(attrs.`k`)` answers
+/// `None` while `JSONAllPathsWithTypes(attrs)` answers `{'k.a.b':'Int64'}`.
+/// A leaf whose own value cannot be stored (a bytes value, an empty kvlist)
+/// is simply not a leaf: the composite key is listed in `tag_names` and no
+/// value is listed for it, which is the disagreement `docs/api.md` §4.3's
+/// two halves carry for a composite key.
+fn collect_leaves(
+    escaped_prefix: &str,
+    original_prefix: &str,
+    kvlist: &KeyValueList,
+    out: &mut Vec<(String, String, TraceJsonValue)>,
+) {
+    for entry in &kvlist.values {
+        let escaped = format!(
+            "{escaped_prefix}.{}",
+            crate::writer::trace_json::escape_json_path(&entry.key)
+        );
+        let original = format!("{original_prefix}.{}", entry.key);
+        match entry.value.as_ref().and_then(|v| v.value.as_ref()) {
+            Some(Value::KvlistValue(nested)) if !nested.values.is_empty() => {
+                collect_leaves(&escaped, &original, nested, out);
+            }
+            _ => match land_value(&entry.key, entry.value.as_ref()) {
+                LandedValue::One(value) => out.push((escaped, original, value)),
+                // A leaf whose value goes to `attrs_other` and a leaf that
+                // is itself an empty kvlist both store no path.
+                LandedValue::Leaves(_) | LandedValue::Other => {}
+            },
+        }
+    }
+}
+
+/// One attribute scope's landed attributes: the JSON column, the keys and
+/// values the catalogs list, and the keys whose values go to `attrs_other`.
+struct LandedAttrs {
+    json: TraceJson,
+    other: Vec<KeyValue>,
+}
+
+/// The catalog entries one part of a push contributes, distinct inside
+/// themselves.
+///
+/// **A stage is held back until a span has passed every check.** A
+/// resource's, a scope's and a span's entries each get their own, and
+/// [`TagStage::absorb`] moves them into the push's accepted sets at the one
+/// point a span is known to land. Writing them straight into the accepted
+/// sets leaves `tag_names` and `tag_values` rows behind for a push that
+/// stores no span — rows for data the store does not hold.
+#[derive(Default)]
+struct TagStage {
+    names: BTreeSet<LandingTagName>,
+    values: BTreeSet<LandingTagValue>,
+}
+
+impl TagStage {
+    /// Takes `staged`'s entries into this stage, which is the push's
+    /// accepted set. Both sides are sets, so a resource's or a scope's
+    /// entries taken once per landed span land once.
+    ///
+    /// **Not named `merge`.** `pulsus-server`'s route-inventory guard pins
+    /// the whole body of every function whose text contains a `.merge(`
+    /// token, and the one call site below is in a decode function that
+    /// composes no routes: pinning it would put that body in the route
+    /// snapshot and make every later edit to it a re-derivation there.
+    fn absorb(&mut self, staged: &TagStage) {
+        self.names.extend(staged.names.iter().cloned());
+        self.values.extend(staged.values.iter().cloned());
+    }
+}
+
+/// Lands one attribute list.
+///
+/// `scope` decides which catalog scope the names and values are recorded
+/// under; `stage` is the holding set for the part of the push these
+/// attributes belong to, merged into the accepted sets only once a span
+/// under them lands.
+fn land_attrs(
+    attrs: &[KeyValue],
+    scope: TagScope,
+    skip_key: Option<&str>,
+    stage: &mut TagStage,
+) -> LandedAttrs {
+    let TagStage { names, values } = stage;
+    let mut entries: Vec<TraceJsonEntry> = Vec::with_capacity(attrs.len());
+    let mut other: Vec<KeyValue> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    for kv in attrs {
+        // The writer's own duplicate-key rule: the first value of a key
+        // wins and the rest are dropped, per scope.
+        // `type_json_skip_duplicated_paths` is `0` on this server, so a
+        // repeated path in the block is an exception rather than a silent
+        // drop, and this has to be the only mechanism.
+        if !seen.insert(kv.key.as_str()) {
+            continue;
+        }
+        // **Every key the push carries in any of the five scopes gets a
+        // kind-2 row**, including a key whose value went to `attrs_other`
+        // and a key whose value is a kvlist.
+        if Some(kv.key.as_str()) != skip_key {
+            names.insert(LandingTagName {
+                scope,
+                key: kv.key.clone(),
+            });
+        }
+        if Some(kv.key.as_str()) == skip_key {
+            continue;
+        }
+        match land_value(&kv.key, kv.value.as_ref()) {
+            LandedValue::One(value) => {
+                record_values(scope, &kv.key, &value, values);
+                entries.push(TraceJsonEntry {
+                    path: crate::writer::trace_json::escape_json_path(&kv.key),
+                    value,
+                });
+            }
+            LandedValue::Leaves(leaves) => {
+                // The leaf paths each get their own kind-2 row under their
+                // full dotted key, and **no** kind-3 row: a kvlist has no
+                // scalar text and no `tag_type`.
+                for (path, original, value) in leaves {
+                    names.insert(LandingTagName {
+                        scope,
+                        key: original,
+                    });
+                    entries.push(TraceJsonEntry { path, value });
+                }
+            }
+            LandedValue::Other => other.push(kv.clone()),
+        }
+    }
+
+    LandedAttrs {
+        json: TraceJson::from_entries(entries),
+        other,
+    }
+}
+
+/// Records the kind-3 rows one landed value produces: one for a scalar and
+/// one for each element of a scalar array.
+///
+/// **No row for a mixed array**: its elements have no one `tag_type`, and
+/// an unnarrowed value lookup on such a key answers an empty list while a
+/// narrowed one reads the store and answers. That is a decision, not parity
+/// with the old `trace_tag_catalog`.
+fn record_values(
+    scope: TagScope,
+    key: &str,
+    value: &TraceJsonValue,
+    out: &mut BTreeSet<LandingTagValue>,
+) {
+    let mut push = |scalar: TraceJsonScalar| {
+        out.insert(LandingTagValue {
+            scope,
+            key: key.to_string(),
+            value: scalar.render(),
+            val_type: scalar.val_type(),
+        });
+    };
+    match value {
+        TraceJsonValue::Scalar(s) => push(s.clone()),
+        TraceJsonValue::StrArray(v) => {
+            for s in v {
+                push(TraceJsonScalar::Str(s.clone()));
+            }
+        }
+        TraceJsonValue::IntArray(v) => {
+            for i in v {
+                push(TraceJsonScalar::Int(*i));
+            }
+        }
+        TraceJsonValue::DoubleArray(v) => {
+            for d in v {
+                push(TraceJsonScalar::Double(*d));
+            }
+        }
+        TraceJsonValue::BoolArray(v) => {
+            for b in v {
+                push(TraceJsonScalar::Bool(*b));
+            }
+        }
+        TraceJsonValue::MixedArray(_) | TraceJsonValue::EmptyArray => {}
+    }
+}
+
+/// The protobuf serialization of an
+/// `opentelemetry.proto.common.v1.KeyValueList` carrying `attrs`, or the
+/// empty vector when there are none.
+///
+/// The keys are the **original OTLP keys** rather than escaped paths: they
+/// are not JSON paths, and `traces_api/assemble.rs` decodes this back into
+/// the OTLP response.
+fn encode_attrs_other(attrs: Vec<KeyValue>) -> Vec<u8> {
+    if attrs.is_empty() {
+        return Vec::new();
+    }
+    KeyValueList { values: attrs }.encode_to_vec()
+}
+
+/// Refuses a value whose stored path count exceeds
+/// `format_binary_max_object_size`.
+///
+/// **The decode gate and the pin carry the same constant**, so neither can
+/// admit what the other refuses: without the gate the push is admitted, the
+/// insert fails after the block was sent, and the caller gets an uncertain
+/// ending for a push that could never have succeeded.
+fn check_json_paths(json: &TraceJson) -> Result<(), LogsIngestError> {
+    let limit = pulsus_clickhouse::MAX_JSON_PATHS_PER_VALUE as usize;
+    if json.len() > limit {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "stored JSON paths in one trace attribute value",
+            limit,
+            actual: json.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Decodes `req` into the landing path's four landed event shapes.
+///
+/// `Err` on the same two whole-request structural failures [`parse`] has —
+/// the `AnyValue` recursion-depth guard and the [`MAX_EXPANDED_BYTES`]
+/// expansion budget — plus one of its own: a value whose stored path count
+/// would exceed `format_binary_max_object_size`. Everything else (bad ids,
+/// bad timestamps) stays a per-span partial-success rejection inside the
+/// `Ok`.
+pub fn parse_landing(
+    req: &ExportTraceServiceRequest,
+    now_ns: i64,
+) -> Result<ParsedTraceLanding, LogsIngestError> {
+    crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
+
+    let mut out = ParsedTraceLanding::default();
+    let mut expanded_bytes: usize = 0;
+    // The catalog entries of the spans that landed. Every entry reaches it
+    // through a [`TagStage`] merged at the one point below where a span has
+    // passed every check, the UTC-day check included.
+    let mut accepted = TagStage::default();
+    // One row per distinct `(resource_id, day)` in the push. The day comes
+    // from the spans that resource carried, so a push whose spans straddle
+    // midnight emits two rows for one resource.
+    let mut resources: BTreeMap<(Fingerprint, u16), LandingResource> = BTreeMap::new();
+
+    for resource_spans in &req.resource_spans {
+        let resource = resource_spans.resource.as_ref();
+        let service_kv = find_service_kv(resource);
+        if let Some(kv) = service_kv {
+            charge_budget(&mut expanded_bytes, attr_budget_charge(kv))?;
+        }
+        let service = service_kv
+            .map(|kv| any_value_to_string(kv.value.as_ref()))
+            .unwrap_or_default();
+        let resource_id = resource_identity(resource, &resource_spans.schema_url);
+
+        // The resource's own landed attributes, built once per
+        // `ResourceSpans` block: every span in it shares them, and so do
+        // the catalog entries they contribute.
+        let mut resource_stage = TagStage::default();
+        let resource_attrs = match resource {
+            Some(resource) => {
+                for kv in &resource.attributes {
+                    charge_budget(&mut expanded_bytes, attr_budget_charge(kv))?;
+                }
+                land_attrs(
+                    &resource.attributes,
+                    TagScope::Resource,
+                    // `service.name` is dropped from the STORED attributes
+                    // because `spans.service` already carries it. It stays
+                    // in the identity buffer above.
+                    Some("service.name"),
+                    &mut resource_stage,
+                )
+            }
+            None => LandedAttrs {
+                json: TraceJson::empty(),
+                other: Vec::new(),
+            },
+        };
+        check_json_paths(&resource_attrs.json)?;
+        let resource_dropped = resource.map(|r| r.dropped_attributes_count).unwrap_or(0);
+
+        for scope_spans in &resource_spans.scope_spans {
+            let scope = scope_spans.scope.as_ref();
+            let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
+            let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
+            let mut scope_stage = TagStage::default();
+            let scope_attrs = match scope {
+                Some(scope) => {
+                    for kv in &scope.attributes {
+                        charge_budget(&mut expanded_bytes, attr_budget_charge(kv))?;
+                    }
+                    land_attrs(
+                        &scope.attributes,
+                        TagScope::Instrumentation,
+                        None,
+                        &mut scope_stage,
+                    )
+                }
+                None => LandedAttrs {
+                    json: TraceJson::empty(),
+                    other: Vec::new(),
+                },
+            };
+            check_json_paths(&scope_attrs.json)?;
+
+            for span in &scope_spans.spans {
+                let mut span_stage = TagStage::default();
+                let Some(landed) = land_span(
+                    &mut out,
+                    &mut expanded_bytes,
+                    span,
+                    now_ns,
+                    resource_id,
+                    &service,
+                    &scope_name,
+                    &scope_version,
+                    &scope_attrs,
+                    &mut span_stage,
+                )?
+                else {
+                    continue;
+                };
+                let day = match pulsus_model::Date::start_of_day_utc_datetime_safe(landed.start_ns)
+                {
+                    Some(date) => date.days_since_epoch(),
+                    None => {
+                        reject_landing(
+                            &mut out,
+                            format!(
+                                "span {:?}: start time {} is outside the admitted UTC day domain",
+                                diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                                landed.start_ns
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                // **The staging boundary.** The span has passed every check
+                // from here, so its own entries and the resource's and the
+                // scope's are merged, and its resource row is emitted. A
+                // span refused above — by its ids, its timestamp or the day
+                // check — reaches neither.
+                accepted.absorb(&resource_stage);
+                accepted.absorb(&scope_stage);
+                accepted.absorb(&span_stage);
+                resources
+                    .entry((resource_id, day))
+                    .or_insert_with(|| LandingResource {
+                        resource_id,
+                        day,
+                        service: service.clone(),
+                        attrs: resource_attrs.json.clone(),
+                        attrs_other: encode_attrs_other(resource_attrs.other.clone()),
+                        dropped_attrs: resource_dropped,
+                        schema_url: resource_spans.schema_url.clone(),
+                    });
+                out.spans.push(landed);
+            }
+        }
+    }
+
+    out.resources = resources.into_values().collect();
+    out.tag_names = accepted.names.into_iter().collect();
+    out.tag_values = accepted.values.into_iter().collect();
+    Ok(out)
+}
+
+/// Lands one span, or rejects it wholesale into partial success.
+///
+/// `stage` is this span's own holding set — its attributes', its events'
+/// and its links' catalog entries. The caller merges it only once the span
+/// has passed the UTC-day check as well, which this function does not run.
+#[allow(clippy::too_many_arguments)]
+fn land_span(
+    out: &mut ParsedTraceLanding,
+    expanded_bytes: &mut usize,
+    span: &Span,
+    now_ns: i64,
+    resource_id: Fingerprint,
+    service: &str,
+    scope_name: &str,
+    scope_version: &str,
+    scope_attrs: &LandedAttrs,
+    stage: &mut TagStage,
+) -> Result<Option<LandingSpan>, LogsIngestError> {
+    let Ok(trace_id) = <[u8; 16]>::try_from(span.trace_id.as_slice()) else {
+        reject_landing(
+            out,
+            format!(
+                "span {:?}: trace_id must be exactly 16 bytes, got {}",
+                diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                span.trace_id.len()
+            ),
+        );
+        return Ok(None);
+    };
+    let Ok(span_id) = <[u8; 8]>::try_from(span.span_id.as_slice()) else {
+        reject_landing(
+            out,
+            format!(
+                "span {:?}: span_id must be exactly 8 bytes, got {}",
+                diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                span.span_id.len()
+            ),
+        );
+        return Ok(None);
+    };
+    let parent_span_id = if span.parent_span_id.is_empty() {
+        [0u8; 8]
+    } else {
+        match <[u8; 8]>::try_from(span.parent_span_id.as_slice()) {
+            Ok(parent) => parent,
+            Err(_) => {
+                reject_landing(
+                    out,
+                    format!(
+                        "span {:?}: parent_span_id must be empty or exactly 8 bytes, got {}",
+                        diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                        span.parent_span_id.len()
+                    ),
+                );
+                return Ok(None);
+            }
+        }
+    };
+    let start_ns = if span.start_time_unix_nano == 0 {
+        now_ns
+    } else {
+        match i64::try_from(span.start_time_unix_nano) {
+            Ok(ns) => ns,
+            Err(_) => {
+                reject_landing(
+                    out,
+                    format!(
+                        "span {:?}: start_time_unix_nano {} is not representable",
+                        diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                        span.start_time_unix_nano
+                    ),
+                );
+                return Ok(None);
+            }
+        }
+    };
+
+    for kv in &span.attributes {
+        charge_budget(expanded_bytes, attr_budget_charge(kv))?;
+    }
+    let span_attrs = land_attrs(&span.attributes, TagScope::Span, None, stage);
+    check_json_paths(&span_attrs.json)?;
+
+    let mut events = Vec::with_capacity(span.events.len());
+    for event in &span.events {
+        for kv in &event.attributes {
+            charge_budget(expanded_bytes, attr_budget_charge(kv))?;
+        }
+        let landed = land_attrs(&event.attributes, TagScope::Event, None, stage);
+        check_json_paths(&landed.json)?;
+        events.push(LandingEvent {
+            time_ns: i64::try_from(event.time_unix_nano).unwrap_or(i64::MAX),
+            name: event.name.clone(),
+            attrs: landed.json,
+            dropped_attrs: event.dropped_attributes_count,
+        });
+    }
+
+    let mut links = Vec::with_capacity(span.links.len());
+    for link in &span.links {
+        for kv in &link.attributes {
+            charge_budget(expanded_bytes, attr_budget_charge(kv))?;
+        }
+        let landed = land_attrs(&link.attributes, TagScope::Link, None, stage);
+        check_json_paths(&landed.json)?;
+        links.push(LandingLink {
+            trace_id: <[u8; 16]>::try_from(link.trace_id.as_slice()).unwrap_or([0u8; 16]),
+            span_id: <[u8; 8]>::try_from(link.span_id.as_slice()).unwrap_or([0u8; 8]),
+            trace_state: link.trace_state.clone(),
+            flags: link.flags,
+            attrs: landed.json,
+            dropped_attrs: link.dropped_attributes_count,
+        });
+    }
+
+    Ok(Some(LandingSpan {
+        trace_id,
+        span_id,
+        parent_span_id,
+        start_ns,
+        duration_ns: resolve_duration_ns(span.start_time_unix_nano, span.end_time_unix_nano),
+        resource_id,
+        name: span.name.clone(),
+        // The OTLP span kind is `0..=5`; a value outside that is the
+        // sender's and is stored as it arrived, saturating rather than
+        // wrapping.
+        kind: u8::try_from(span.kind).unwrap_or(0),
+        status_code: span
+            .status
+            .as_ref()
+            .map(|s| u8::try_from(s.code).unwrap_or(0))
+            .unwrap_or(0),
+        status_message: span
+            .status
+            .as_ref()
+            .map(|s| s.message.clone())
+            .unwrap_or_default(),
+        trace_state: span.trace_state.clone(),
+        flags: span.flags,
+        scope_name: scope_name.to_string(),
+        scope_version: scope_version.to_string(),
+        scope_attrs: scope_attrs.json.clone(),
+        events,
+        dropped_events: span.dropped_events_count,
+        links,
+        dropped_links: span.dropped_links_count,
+        service: service.to_string(),
+        attrs: span_attrs.json,
+        attrs_other: encode_attrs_other(span_attrs.other),
+        dropped_attrs: span.dropped_attributes_count,
+    }))
+}
+
+/// Records one span's rejection into the landing decode's partial-success
+/// accounting, keeping only the first message — [`reject_span`]'s rule.
+fn reject_landing(out: &mut ParsedTraceLanding, message: String) {
+    out.rejected += 1;
+    if out.rejected_message.is_none() {
+        out.rejected_message = Some(message);
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+    use opentelemetry_proto::tonic::trace::v1::span;
+
+    fn str_value(s: &str) -> AnyValue {
+        AnyValue {
+            value: Some(Value::StringValue(s.to_string())),
+        }
+    }
+
+    fn int_value(i: i64) -> AnyValue {
+        AnyValue {
+            value: Some(Value::IntValue(i)),
+        }
+    }
+
+    fn double_value(d: f64) -> AnyValue {
+        AnyValue {
+            value: Some(Value::DoubleValue(d)),
+        }
+    }
+
+    fn bool_value(b: bool) -> AnyValue {
+        AnyValue {
+            value: Some(Value::BoolValue(b)),
+        }
+    }
+
+    fn array_value(values: Vec<AnyValue>) -> AnyValue {
+        AnyValue {
+            value: Some(Value::ArrayValue(ArrayValue { values })),
+        }
+    }
+
+    fn kvlist_value(pairs: Vec<(&str, AnyValue)>) -> AnyValue {
+        AnyValue {
+            value: Some(Value::KvlistValue(KeyValueList {
+                values: pairs.into_iter().map(|(k, v)| kv(k, v)).collect(),
+            })),
+        }
+    }
+
+    fn bytes_value(bytes: &[u8]) -> AnyValue {
+        AnyValue {
+            value: Some(Value::BytesValue(bytes.to_vec())),
+        }
+    }
+
+    /// The profiling signal's reference into its own string table, which a
+    /// non-profiling receiver processes as absent or empty.
+    fn strindex_value(index: i32) -> AnyValue {
+        AnyValue {
+            value: Some(Value::StringValueStrindex(index)),
+        }
+    }
+
+    /// An `AnyValue` with no arm set, which the protocol calls "empty".
+    fn unset_value() -> AnyValue {
+        AnyValue { value: None }
+    }
+
+    fn kv(key: &str, value: AnyValue) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(value),
+            key_strindex: 0,
+        }
+    }
+
+    const TS: u64 = 1_700_000_000_000_000_000;
+
+    fn resource_of(pairs: Vec<KeyValue>) -> Resource {
+        Resource {
+            attributes: pairs,
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        }
+    }
+
+    fn span_of(attrs: Vec<KeyValue>) -> Span {
+        Span {
+            trace_id: vec![0xab; 16],
+            span_id: vec![0xcd; 8],
+            parent_span_id: Vec::new(),
+            trace_state: String::new(),
+            flags: 0,
+            name: "GET /api".to_string(),
+            kind: 2,
+            start_time_unix_nano: TS,
+            end_time_unix_nano: TS + 1_000_000,
+            attributes: attrs,
+            dropped_attributes_count: 0,
+            events: Vec::new(),
+            dropped_events_count: 0,
+            links: Vec::new(),
+            dropped_links_count: 0,
+            status: None,
+        }
+    }
+
+    fn request_of(service: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource_of(vec![kv("service.name", str_value(service))])),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn landed(req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
+        parse_landing(req, TS as i64).expect("the landing decode")
+    }
+
+    /// The stored paths one span's `attrs` carries, in the encoder's own
+    /// sorted order.
+    fn paths(parsed: &ParsedTraceLanding) -> Vec<&str> {
+        parsed.spans[0]
+            .attrs
+            .entries()
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect()
+    }
+
+    /// **Each OTLP value arm lands where §4.2's table says.**
+    ///
+    /// The four shapes with no JSON representation — a bytes value, an empty
+    /// kvlist, an array holding a bytes or kvlist element, and an `AnyValue`
+    /// with no arm set — store no path at all and are carried in
+    /// `attrs_other` under their original OTLP keys.
+    #[test]
+    fn each_value_arm_lands_where_the_type_table_says() {
+        let req = request_of(
+            "checkout",
+            vec![span_of(vec![
+                kv("s", str_value("v")),
+                kv("b", bool_value(true)),
+                kv("i", int_value(1)),
+                kv("f", double_value(1.5)),
+                kv("arr_s", array_value(vec![str_value("a")])),
+                kv("arr_i", array_value(vec![int_value(1), int_value(2)])),
+                kv("arr_f", array_value(vec![double_value(1.5)])),
+                kv("arr_b", array_value(vec![bool_value(false)])),
+                kv("arr_mixed", array_value(vec![str_value("a"), int_value(1)])),
+                kv("arr_empty", array_value(vec![])),
+                kv("nested", kvlist_value(vec![("a", int_value(1))])),
+                // The four with no JSON representation.
+                kv("opaque", bytes_value(&[1, 2])),
+                kv("empty_map", kvlist_value(vec![])),
+                kv("arr_opaque", array_value(vec![bytes_value(&[1])])),
+                KeyValue {
+                    key: "unset".to_string(),
+                    value: Some(AnyValue { value: None }),
+                    key_strindex: 0,
+                },
+            ])],
+        );
+        let parsed = landed(&req);
+        assert_eq!(parsed.spans.len(), 1);
+
+        assert_eq!(
+            paths(&parsed),
+            vec![
+                "arr_b",
+                "arr_empty",
+                "arr_f",
+                "arr_i",
+                "arr_mixed",
+                "arr_s",
+                "b",
+                "f",
+                "i",
+                "nested.a",
+                "s",
+            ],
+            "eleven stored paths, and the four opaque keys store none; a \
+             nested object stores its dotted leaf and nothing at the parent"
+        );
+
+        let by_path = |path: &str| {
+            parsed.spans[0]
+                .attrs
+                .entries()
+                .iter()
+                .find(|e| e.path == path)
+                .map(|e| e.value.clone())
+                .unwrap_or_else(|| panic!("no entry at {path}"))
+        };
+        assert_eq!(
+            by_path("s"),
+            TraceJsonValue::Scalar(TraceJsonScalar::Str("v".to_string()))
+        );
+        assert_eq!(
+            by_path("b"),
+            TraceJsonValue::Scalar(TraceJsonScalar::Bool(true))
+        );
+        assert_eq!(
+            by_path("i"),
+            TraceJsonValue::Scalar(TraceJsonScalar::Int(1))
+        );
+        assert_eq!(
+            by_path("f"),
+            TraceJsonValue::Scalar(TraceJsonScalar::Double(1.5))
+        );
+        assert_eq!(
+            by_path("arr_s"),
+            TraceJsonValue::StrArray(vec!["a".to_string()])
+        );
+        assert_eq!(by_path("arr_i"), TraceJsonValue::IntArray(vec![1, 2]));
+        assert_eq!(by_path("arr_f"), TraceJsonValue::DoubleArray(vec![1.5]));
+        assert_eq!(by_path("arr_b"), TraceJsonValue::BoolArray(vec![false]));
+        assert_eq!(
+            by_path("arr_mixed"),
+            TraceJsonValue::MixedArray(vec![
+                TraceJsonScalar::Str("a".to_string()),
+                TraceJsonScalar::Int(1),
+            ])
+        );
+        assert_eq!(by_path("arr_empty"), TraceJsonValue::EmptyArray);
+        assert_eq!(
+            by_path("nested.a"),
+            TraceJsonValue::Scalar(TraceJsonScalar::Int(1))
+        );
+
+        // The four opaque keys, under their original OTLP keys.
+        let other = KeyValueList::decode(parsed.spans[0].attrs_other.as_slice())
+            .expect("attrs_other decodes as a KeyValueList");
+        let mut keys: Vec<&str> = other.values.iter().map(|kv| kv.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["arr_opaque", "empty_map", "opaque", "unset"],
+            "the keys no JSON path can hold are carried in the side channel"
+        );
+    }
+
+    /// **The two catalogs disagree on a composite key: the name is listed,
+    /// the value is not.**
+    ///
+    /// A kind-2 row is emitted for every key the push carries in any scope,
+    /// including a key whose value went to `attrs_other` and a key whose
+    /// value is a kvlist, whose stored leaf paths also each get their own
+    /// row under their full dotted key. A kind-3 row is emitted for a scalar
+    /// and for each element of a scalar array, and for nothing else.
+    #[test]
+    fn the_catalogs_list_every_key_and_only_the_scalar_values() {
+        let req = request_of(
+            "checkout",
+            vec![span_of(vec![
+                kv("plain", str_value("v")),
+                kv("tags", array_value(vec![str_value("x"), str_value("y")])),
+                kv("mixed", array_value(vec![str_value("x"), int_value(1)])),
+                kv("opaque", bytes_value(&[1])),
+                kv(
+                    "composite",
+                    kvlist_value(vec![("a", kvlist_value(vec![("b", int_value(1))]))]),
+                ),
+            ])],
+        );
+        let parsed = landed(&req);
+
+        let span_names: Vec<&str> = parsed
+            .tag_names
+            .iter()
+            .filter(|t| t.scope == TagScope::Span)
+            .map(|t| t.key.as_str())
+            .collect();
+        assert_eq!(
+            span_names,
+            vec![
+                "composite",
+                "composite.a.b",
+                "mixed",
+                "opaque",
+                "plain",
+                "tags",
+            ],
+            "every key the push carried is named, the composite's leaf included"
+        );
+
+        let span_values: Vec<String> = parsed
+            .tag_values
+            .iter()
+            .filter(|t| t.scope == TagScope::Span)
+            .map(|t| format!("{}={}:{}", t.key, t.value, t.val_type))
+            .collect();
+        assert_eq!(
+            span_values,
+            vec![
+                "plain=v:string".to_string(),
+                "tags=x:string".to_string(),
+                "tags=y:string".to_string(),
+            ],
+            "one value row per scalar and per element of a scalar array; none \
+             for a mixed array, a kvlist or a value in attrs_other"
+        );
+
+        // The resource's own `service.name` is neither named nor valued: the
+        // span row carries it as a column.
+        assert!(
+            !parsed
+                .tag_names
+                .iter()
+                .any(|t| t.scope == TagScope::Resource && t.key == "service.name"),
+            "service.name is a column, not a catalog entry: {:?}",
+            parsed.tag_names
+        );
+    }
+
+    /// **The five scopes, each under its own discriminator.** A same-named
+    /// key in two scopes is two catalog entries.
+    #[test]
+    fn the_five_scopes_are_discriminated() {
+        let mut span = span_of(vec![kv("k", str_value("span"))]);
+        span.events = vec![span::Event {
+            time_unix_nano: TS,
+            name: "e".to_string(),
+            attributes: vec![kv("k", str_value("event"))],
+            dropped_attributes_count: 0,
+        }];
+        span.links = vec![span::Link {
+            trace_id: vec![0x11; 16],
+            span_id: vec![0x22; 8],
+            trace_state: String::new(),
+            attributes: vec![kv("k", str_value("link"))],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }];
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource_of(vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("k", str_value("resource")),
+                ])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "io.otel.http".to_string(),
+                        version: "1.4.2".to_string(),
+                        attributes: vec![kv("k", str_value("instrumentation"))],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![span],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let parsed = landed(&req);
+
+        let mut scopes: Vec<&str> = parsed
+            .tag_names
+            .iter()
+            .filter(|t| t.key == "k")
+            .map(|t| t.scope.as_str())
+            .collect();
+        scopes.sort_unstable();
+        assert_eq!(
+            scopes,
+            vec!["event", "instrumentation", "link", "resource", "span"],
+            "one key in five scopes is five catalog entries"
+        );
+
+        let mut valued: Vec<String> = parsed
+            .tag_values
+            .iter()
+            .filter(|t| t.key == "k")
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.value))
+            .collect();
+        valued.sort();
+        assert_eq!(
+            valued,
+            vec![
+                "event:event".to_string(),
+                "instrumentation:instrumentation".to_string(),
+                "link:link".to_string(),
+                "resource:resource".to_string(),
+                "span:span".to_string(),
+            ]
+        );
+    }
+
+    /// **Kinds 1, 2 and 3 are deduplicated inside the push only.** Two spans
+    /// of one resource on one day land **one** resource row, and a key or a
+    /// value repeated across spans lands once.
+    ///
+    /// There is no cache of anything already written: a second push repeats
+    /// every one of these rows, which is what makes a fan-out failure heal
+    /// without a repair that cannot be expressed.
+    #[test]
+    fn the_push_is_deduplicated_inside_itself_and_nowhere_else() {
+        let req = request_of(
+            "checkout",
+            vec![
+                span_of(vec![kv("k", str_value("v"))]),
+                span_of(vec![kv("k", str_value("v"))]),
+                span_of(vec![kv("k", str_value("w"))]),
+            ],
+        );
+        let parsed = landed(&req);
+        assert_eq!(parsed.spans.len(), 3, "one row per decoded span");
+        assert_eq!(
+            parsed.resources.len(),
+            1,
+            "one row per distinct (resource_id, day) in the push"
+        );
+        assert_eq!(
+            parsed
+                .tag_names
+                .iter()
+                .filter(|t| t.scope == TagScope::Span && t.key == "k")
+                .count(),
+            1,
+            "one row per distinct (scope, key)"
+        );
+        assert_eq!(
+            parsed
+                .tag_values
+                .iter()
+                .filter(|t| t.scope == TagScope::Span)
+                .map(|t| t.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v", "w"],
+            "one row per distinct (scope, key, value, type)"
+        );
+        assert_eq!(
+            parsed.total_rows(),
+            3 + 1 + 1 + 2,
+            "the per-push row ceiling counts all four kinds"
+        );
+
+        // A second decode of the same request produces the same rows again:
+        // nothing is remembered across pushes.
+        let again = landed(&req);
+        assert_eq!(again.resources.len(), 1);
+        assert_eq!(again.tag_names, parsed.tag_names);
+        assert_eq!(again.tag_values, parsed.tag_values);
+    }
+
+    /// **A duplicate key inside one span keeps the first value**, per scope.
+    /// `type_json_skip_duplicated_paths` is `0` on this server, so a
+    /// repeated path in the block is an exception rather than a silent drop
+    /// and the deduplication has to be the writer's.
+    #[test]
+    fn a_duplicate_key_in_one_span_keeps_the_first_value() {
+        let req = request_of(
+            "checkout",
+            vec![span_of(vec![
+                kv("k", str_value("first")),
+                kv("k", str_value("second")),
+            ])],
+        );
+        let parsed = landed(&req);
+        assert_eq!(paths(&parsed), vec!["k"], "one stored path, not two");
+        assert_eq!(
+            parsed.spans[0].attrs.entries()[0].value,
+            TraceJsonValue::Scalar(TraceJsonScalar::Str("first".to_string()))
+        );
+        assert_eq!(
+            parsed
+                .tag_values
+                .iter()
+                .filter(|t| t.scope == TagScope::Span)
+                .map(|t| t.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first"],
+            "and the dropped value is not catalogued either"
+        );
+    }
+
+    /// **A span whose stored path count exceeds
+    /// `format_binary_max_object_size` is refused at decode**, naming the
+    /// count and the limit, and a span at the limit is accepted.
+    ///
+    /// The decode gate and the query pin carry the **same constant**, so
+    /// neither can admit what the other refuses. Without the gate the push
+    /// is admitted, the insert fails after the block was sent, and the
+    /// caller gets an uncertain ending for a push that could never have
+    /// succeeded.
+    #[test]
+    fn a_span_with_too_many_paths_is_refused_at_decode() {
+        let limit = pulsus_clickhouse::MAX_JSON_PATHS_PER_VALUE as usize;
+        let attrs = |n: usize| -> Vec<KeyValue> {
+            (0..n)
+                .map(|i| kv(&format!("k{i:06}"), int_value(i as i64)))
+                .collect()
+        };
+
+        let at_limit = request_of("checkout", vec![span_of(attrs(limit))]);
+        let parsed = parse_landing(&at_limit, TS as i64).expect("a span at the limit is admitted");
+        assert_eq!(parsed.spans[0].attrs.len(), limit);
+
+        let over = request_of("checkout", vec![span_of(attrs(limit + 1))]);
+        let err = parse_landing(&over, TS as i64).expect_err("one path over is refused");
+        match err {
+            LogsIngestError::OversizeMessage {
+                field,
+                limit: reported,
+                actual,
+            } => {
+                assert_eq!(reported, limit, "the message names the limit");
+                assert_eq!(actual, limit + 1, "and the push's own count");
+                assert!(
+                    field.contains("JSON paths"),
+                    "and what was exceeded: {field}"
+                );
+            }
+            other => panic!("wanted OversizeMessage, got {other:?}"),
+        }
+    }
+
+    /// **The resource identity is 128 bits and stable.** Eight pairs, each
+    /// one property; the eighth is the one an implementation that strips
+    /// `service.name` before hashing fails while passing the first seven.
+    #[test]
+    fn the_resource_id_is_128_bits_and_stable() {
+        let id = |pairs: Vec<KeyValue>, schema_url: &str| {
+            resource_identity(Some(&resource_of(pairs)), schema_url)
+        };
+        let base = || {
+            vec![
+                kv("service.name", str_value("checkout")),
+                kv("host.name", str_value("node-a")),
+                kv("k", int_value(1)),
+            ]
+        };
+
+        // 1. Byte-identical resources.
+        assert_eq!(id(base(), ""), id(base(), ""));
+
+        // 2. The same pairs in a different order.
+        assert_eq!(
+            id(base(), ""),
+            id(
+                vec![
+                    kv("k", int_value(1)),
+                    kv("service.name", str_value("checkout")),
+                    kv("host.name", str_value("node-a")),
+                ],
+                ""
+            ),
+            "the identity does not depend on arrival order"
+        );
+
+        // 3. One changed value.
+        let mut changed_value = base();
+        changed_value[1] = kv("host.name", str_value("node-b"));
+        assert_ne!(id(base(), ""), id(changed_value, ""));
+
+        // 4. One changed key.
+        let mut changed_key = base();
+        changed_key[1] = kv("host.id", str_value("node-a"));
+        assert_ne!(id(base(), ""), id(changed_key, ""));
+
+        // 5. A different schema url.
+        assert_ne!(
+            id(base(), ""),
+            id(base(), "https://example.invalid/v1"),
+            "the schema url is part of the identity"
+        );
+
+        // 6. An integer `1` and the string `"1"`.
+        let mut as_text = base();
+        as_text[2] = kv("k", str_value("1"));
+        assert_ne!(id(base(), ""), id(as_text, ""), "the value is type-tagged");
+
+        // 7. A key present with an empty value against an absent key.
+        let mut empty_value = base();
+        empty_value[2] = kv("k", str_value(""));
+        assert_ne!(
+            id(empty_value, ""),
+            id(
+                vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("host.name", str_value("node-a")),
+                ],
+                ""
+            ),
+            "a present key with an empty value is not an absent key"
+        );
+
+        // 8. Two resources differing only in `service.name`.
+        let mut other_service = base();
+        other_service[0] = kv("service.name", str_value("pay"));
+        assert_ne!(
+            id(base(), ""),
+            id(other_service, ""),
+            "service.name is in the hash, and only the STORED copy drops it"
+        );
+
+        // And the stored copy does drop it.
+        let req = request_of("checkout", vec![span_of(Vec::new())]);
+        let parsed = landed(&req);
+        assert_eq!(parsed.resources.len(), 1);
+        assert!(
+            parsed.resources[0].attrs.is_empty(),
+            "the stored resource attributes omit service.name: {:?}",
+            parsed.resources[0].attrs
+        );
+        assert_eq!(parsed.resources[0].service, "checkout");
+        assert_eq!(
+            parsed.resources[0].resource_id, parsed.spans[0].resource_id,
+            "the span and its resource row carry one identity"
+        );
+    }
+
+    /// **Every value a resource carries is type-tagged at every depth.**
+    ///
+    /// The shapes that can nest are taken from the protocol definition
+    /// rather than from one example: `AnyValue.value` is an optional oneof
+    /// of eight arms (`opentelemetry.proto.common.v1`, tags 1 to 8) and
+    /// exactly two of them carry further `AnyValue`s — `ArrayValue.values`,
+    /// and `KeyValueList.values`' `KeyValue.value`. Every nesting shape is
+    /// a composition of those two, every arm can appear at every depth, and
+    /// so the tag has to be written at every depth.
+    ///
+    /// Four pairs, each of which one flat render of the whole value
+    /// collapses: a bytes value against the string of its own base64 text,
+    /// `+inf` against `-inf`, and a NaN and a profiling string reference
+    /// each against an unset value. A collapse is wrong data rather than
+    /// untidiness: `resources` is a `ReplacingMergeTree` keyed on
+    /// `(service, resource_id)`, so one of the two replaces the other and
+    /// the spans carrying that id join to whichever survived.
+    #[test]
+    fn nested_values_are_type_tagged_at_every_depth() {
+        type Wrap = fn(AnyValue) -> AnyValue;
+        let wrappers: Vec<(&str, Wrap)> = vec![
+            ("array", |v| array_value(vec![v])),
+            ("array beside a sibling", |v| {
+                array_value(vec![int_value(0), v])
+            }),
+            ("kvlist", |v| kvlist_value(vec![("n", v)])),
+            ("kvlist beside a sibling", |v| {
+                kvlist_value(vec![("m", int_value(0)), ("n", v)])
+            }),
+            ("array(array)", |v| array_value(vec![array_value(vec![v])])),
+            ("array(kvlist)", |v| {
+                array_value(vec![kvlist_value(vec![("n", v)])])
+            }),
+            ("kvlist(array)", |v| {
+                kvlist_value(vec![("n", array_value(vec![v]))])
+            }),
+            ("kvlist(kvlist)", |v| {
+                kvlist_value(vec![("n", kvlist_value(vec![("n", v)]))])
+            }),
+            ("array(kvlist(array))", |v| {
+                array_value(vec![kvlist_value(vec![("n", array_value(vec![v]))])])
+            }),
+        ];
+
+        // `base64("x")` is `eA==`, so one render of the whole value gives
+        // the bytes value and that string the same text.
+        let pairs: Vec<(&str, AnyValue, AnyValue)> = vec![
+            (
+                "a bytes value against its own base64 text",
+                bytes_value(b"x"),
+                str_value("eA=="),
+            ),
+            (
+                "+inf against -inf",
+                double_value(f64::INFINITY),
+                double_value(f64::NEG_INFINITY),
+            ),
+            (
+                "a NaN against an unset value",
+                double_value(f64::NAN),
+                unset_value(),
+            ),
+            (
+                "a string reference against an unset value",
+                strindex_value(7),
+                unset_value(),
+            ),
+        ];
+
+        let id_of = |value: AnyValue| {
+            resource_identity(
+                Some(&resource_of(vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("k", value),
+                ])),
+                "",
+            )
+        };
+
+        for (shape, wrap) in &wrappers {
+            for (what, left, right) in &pairs {
+                assert_ne!(
+                    id_of(wrap(left.clone())),
+                    id_of(wrap(right.clone())),
+                    "{shape}: {what} are two resources"
+                );
+                // And one nested value is one resource, so none of the
+                // assertions above can pass on an unstable identity.
+                assert_eq!(
+                    id_of(wrap(left.clone())),
+                    id_of(wrap(left.clone())),
+                    "{shape}: {what}, the first value twice, is one resource"
+                );
+            }
+        }
+    }
+
+    /// **A push that lands no span catalogs nothing.** A push carrying no
+    /// span at all, and a push whose only span the UTC-day check rejects,
+    /// each produce no row of any kind — so the push makes no block and no
+    /// insert and the store gains nothing for data it does not hold.
+    ///
+    /// The entries a resource, a scope and a span contribute are staged and
+    /// merged only once a span has passed **every** check, the day check
+    /// included: that check sits after the span itself has been landed, so
+    /// a stage merged any earlier leaves `tag_names` and `tag_values` rows
+    /// behind for a span that was refused.
+    #[test]
+    fn a_push_that_lands_no_span_catalogs_nothing() {
+        // The first nanosecond of day 49_710: inside `i64`, inside `Date`'s
+        // own range, and outside the DateTime-safe day domain the landing
+        // tables partition by.
+        const OUTSIDE_THE_DAY_DOMAIN: u64 = 86_400_000_000_000 * 49_710;
+
+        let request = |spans: Vec<Span>| ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource_of(vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("host.name", str_value("node-a")),
+                ])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "io.otel.http".to_string(),
+                        version: "1.4.2".to_string(),
+                        attributes: vec![kv("scope.key", str_value("scope-value"))],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        // 1. A push carrying no span.
+        let parsed = landed(&request(Vec::new()));
+        assert!(
+            parsed.tag_names.is_empty(),
+            "a zero-span push names no tag: {:?}",
+            parsed.tag_names
+        );
+        assert!(
+            parsed.tag_values.is_empty(),
+            "and catalogs no value: {:?}",
+            parsed.tag_values
+        );
+        assert!(parsed.spans.is_empty());
+        assert!(parsed.resources.is_empty());
+        assert_eq!(parsed.total_rows(), 0);
+        assert!(
+            parsed.is_empty(),
+            "a push carrying no span makes no block and no insert"
+        );
+
+        // 2. A push whose only span the UTC-day check rejects. Its own
+        // attributes, its event's and its link's are all refused with it.
+        let doomed = || {
+            let mut span = span_of(vec![kv("span.key", str_value("span-value"))]);
+            span.span_id = vec![0x01; 8];
+            span.start_time_unix_nano = OUTSIDE_THE_DAY_DOMAIN;
+            span.end_time_unix_nano = OUTSIDE_THE_DAY_DOMAIN + 1;
+            span.events = vec![span::Event {
+                time_unix_nano: OUTSIDE_THE_DAY_DOMAIN,
+                name: "e".to_string(),
+                attributes: vec![kv("event.key", str_value("event-value"))],
+                dropped_attributes_count: 0,
+            }];
+            span.links = vec![span::Link {
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
+                trace_state: String::new(),
+                attributes: vec![kv("link.key", str_value("link-value"))],
+                dropped_attributes_count: 0,
+                flags: 0,
+            }];
+            span
+        };
+        let parsed = landed(&request(vec![doomed()]));
+        assert_eq!(parsed.rejected, 1, "the span is refused, not stored");
+        assert!(
+            parsed
+                .rejected_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("UTC day domain"),
+            "and the day check is what refused it: {:?}",
+            parsed.rejected_message
+        );
+        assert!(parsed.spans.is_empty());
+        assert!(parsed.resources.is_empty());
+        assert!(
+            parsed.tag_names.is_empty(),
+            "a push that stores no span names no tag: {:?}",
+            parsed.tag_names
+        );
+        assert!(
+            parsed.tag_values.is_empty(),
+            "and catalogs no value: {:?}",
+            parsed.tag_values
+        );
+        assert_eq!(parsed.total_rows(), 0);
+        assert!(
+            parsed.is_empty(),
+            "a push that stores no span makes no block and no insert"
+        );
+
+        // 3. One span landing beside the refused one: the catalogs carry
+        // the landed span's keys, the resource's and the scope's, and
+        // nothing the refused span brought.
+        let parsed = landed(&request(vec![
+            doomed(),
+            span_of(vec![kv("kept.key", str_value("kept-value"))]),
+        ]));
+        assert_eq!(parsed.spans.len(), 1, "one span of the two lands");
+        assert_eq!(parsed.resources.len(), 1, "and its resource with it");
+        assert_eq!(parsed.rejected, 1);
+        let named: Vec<String> = parsed
+            .tag_names
+            .iter()
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.key))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                "span:kept.key".to_string(),
+                "resource:host.name".to_string(),
+                "instrumentation:scope.key".to_string(),
+            ],
+            "the refused span's own, its event's and its link's keys are absent"
+        );
+        let valued: Vec<String> = parsed
+            .tag_values
+            .iter()
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.value))
+            .collect();
+        assert_eq!(
+            valued,
+            vec![
+                "span:kept-value".to_string(),
+                "resource:node-a".to_string(),
+                "instrumentation:scope-value".to_string(),
+            ],
+            "and so are their values"
+        );
+    }
+
+    /// A push whose spans straddle midnight lands **two** rows for one
+    /// resource, which is what `resources`' "one row per distinct resource
+    /// per day" means: a resource joined at read time by a day-bounded
+    /// predicate needs a row in each day it appears in.
+    #[test]
+    fn a_push_straddling_midnight_lands_a_resource_row_per_day() {
+        // 2026-09-22T00:00:00Z and one nanosecond before it.
+        let midnight: u64 = 1_790_035_200_000_000_000;
+        let mut before = span_of(Vec::new());
+        before.span_id = vec![0x01; 8];
+        before.start_time_unix_nano = midnight - 1;
+        before.end_time_unix_nano = midnight;
+        let mut after = span_of(Vec::new());
+        after.span_id = vec![0x02; 8];
+        after.start_time_unix_nano = midnight;
+        after.end_time_unix_nano = midnight + 1;
+
+        let parsed = landed(&request_of("checkout", vec![before, after]));
+        assert_eq!(parsed.spans.len(), 2);
+        let mut days: Vec<u16> = parsed.resources.iter().map(|r| r.day).collect();
+        days.sort_unstable();
+        assert_eq!(days.len(), 2, "one resource row per day: {days:?}");
+        assert_eq!(days[1], days[0] + 1, "and the two days are adjacent");
+        assert_eq!(
+            parsed.resources[0].resource_id, parsed.resources[1].resource_id,
+            "one resource, two days"
         );
     }
 }

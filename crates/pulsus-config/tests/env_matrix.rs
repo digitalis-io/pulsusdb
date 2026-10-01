@@ -306,6 +306,31 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.log_landing_max_rows == 2_000_000,
     },
     Row {
+        var: "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        value: "12",
+        check: |c| c.trace_landing_retention_hours == 12,
+    },
+    Row {
+        var: "PULSUS_TRACE_DEDUP_WINDOW",
+        value: "7000",
+        check: |c| c.trace_dedup_window == 7_000,
+    },
+    Row {
+        var: "PULSUS_TRACE_LANDING_RETRIES",
+        value: "5",
+        check: |c| c.writer.trace_landing_retries == 5,
+    },
+    Row {
+        var: "PULSUS_TRACE_LANDING_INSERTERS",
+        value: "8",
+        check: |c| c.writer.trace_landing_inserters == 8,
+    },
+    Row {
+        var: "PULSUS_TRACE_LANDING_MAX_ROWS",
+        value: "2000000",
+        check: |c| c.writer.trace_landing_max_rows == 2_000_000,
+    },
+    Row {
         var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
         value: "native",
         check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
@@ -518,8 +543,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        92,
-        "docs/configuration.md §§1-8 document exactly 92 variables"
+        97,
+        "docs/configuration.md §§1-8 document exactly 97 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

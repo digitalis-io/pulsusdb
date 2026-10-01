@@ -109,6 +109,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Issue #585: `vendor/clickhouse-types` is a `[patch.crates-io]` path
+      # source, not a workspace member, so `cargo test --workspace` never
+      # compiles its 42 `#[test]`s. The patch there makes nineteen byte
+      # indices checked across seventeen parse functions, and a checked
+      # slice must return the same slice wherever the unchecked one did not
+      # panic — upstream's own compound-parser cases, which assert exact
+      # values and exact messages, are what holds that. The vendored crate
+      # carries an empty `[workspace]` table so this manifest resolves.
+      - name: Vendored type-parser crate's own suite
+        run: cargo test --manifest-path vendor/clickhouse-types/Cargo.toml
+
       # Issue #156: the upstream promqltest corpus is no longer vendored —
       # the test driver fetches it once from the pinned Prometheus commit,
       # verifies it against the committed upstream-manifest.json, and
@@ -632,11 +643,23 @@ jobs:
       - name: Install cargo-nextest (pinned)
         run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      # Pinned by digest rather than by the floating `26.3` tag, the way the
+      # reference images below already are: that tag moves to each new LTS
+      # patch, so any branch can go red with no commit behind it. This digest
+      # is clickhouse-server 26.3.38.2 — what `26.3` resolved to on
+      # 2026-10-01, and the image the last green run on this branch pulled.
+      # The two compose files under `ci/` carry the same digest and the
+      # matching clickhouse-keeper one; this comment is the reason for all
+      # nine references.
+      #
+      # The 24.8 start further down is deliberately left on its tag: it is
+      # the negative test that the version floor is enforced, so what it
+      # needs is a server below the floor, not a reproducible one.
       - name: Start ClickHouse 26.3
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
-            clickhouse/clickhouse-server:26.3
+            clickhouse/clickhouse-server@sha256:e6b2c8a8146ad052062ca38bee3b29f9c20b2bfab7aa0720b10b201b202bf83a
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
             sleep 1
@@ -670,6 +693,16 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-schema --test live_traces
+
+      # Issues #584 to #586: the trace landing table, its five views, the
+      # five tables the TraceQL reads query, their sorting keys and codecs,
+      # the six deduplication windows and the three saturating TTLs. Reuses
+      # this job's 26.3 container.
+      - name: Live trace landing schema tests (tables + views + TTLs)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_traces_v2
 
       # Issue #498: every `Row` struct that carries a fingerprint, read back
       # through the `UInt128` column it reads. The client validates a row
@@ -1526,6 +1559,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_ingest_roundtrip
 
+      # Issue #585: the span row encoder and the `JSON` column, round-tripped
+      # against the landing table the catalogue creates — every value kind,
+      # the dotted-key escaping, the non-finite doubles, the resource
+      # identity, and the two catalogs. It could not run until the type
+      # parser read a named tuple (issue #585, `vendor/clickhouse-types`).
+      # Reuses this job's ClickHouse 26.3 container.
+      - name: Trace landing rows and the JSON column
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test trace_rows_v2
+
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as
@@ -1695,6 +1740,17 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-clickhouse --test injected_settings
+
+      # Issue #585: a NAMED tuple column on both paths — the insert, whose
+      # metadata read is `DESCRIBE TABLE` and so carries the pretty form, and
+      # the read, whose response header carries the compact one. Each case
+      # creates and drops its own database, so it is not in the read-only
+      # `live_clickhouse` step above.
+      - name: Live named-tuple insert and read-back
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-clickhouse --test live_named_tuple
 
       - name: Live cityHash64 fixture cross-check
         env:

@@ -514,6 +514,7 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
         .iter()
         .chain(METRIC_LANDING_STMTS)
         .chain(LOG_LANDING_STMTS)
+        .chain(TRACE_LANDING_STMTS)
         .chain(if ctx.cluster.is_some() {
             CLUSTER_DEDUP_SECONDS_STMTS
         } else {
@@ -575,6 +576,46 @@ const LOG_LANDING_STMTS: &[&str] = &[
     "ALTER TABLE {{db}}.log_landing{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{log_dedup_window}};",
 ];
 
+/// The traces landing table's own delete-TTL, the three day-column TTLs of
+/// the retained trace tables, and the block-deduplication window every table
+/// on the traces write path carries (issues #584 to #586).
+///
+/// [`METRIC_LANDING_STMTS`]'s and [`LOG_LANDING_STMTS`]'s twin, chained after
+/// both in [`apply_ttl`] for the same reasons, and with the same order rule:
+/// the two naming `trace_landing` come last, so a schema managed by hand
+/// without that table stops nothing that does not name it.
+///
+/// **Six windows, one per write-path table.** A view's insert into its target
+/// carries a block id derived from the source block, and only a table with a
+/// window recognises the repeat. `tag_names` and `tag_values` carry a window
+/// and **no TTL**: `docs/api.md` §4.3 requires catalog entries to outlive
+/// span retention.
+///
+/// The three day-column TTLs clamp at the top of the 32-bit `DateTime`
+/// domain, as every statement in [`TTL_STMTS`] does: at
+/// `{{retention_days}} = 7` and a span at 2106-02-06T23:59:59Z both the
+/// nanosecond and the `Date` form answer `2106-02-07 06:28:15` rather than a
+/// wrapped 1970 instant.
+const TRACE_LANDING_STMTS: &[&str] = &[
+    "ALTER TABLE {{db}}.spans{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(start_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.traces{{on_cluster}} MODIFY TTL \
+     toDateTime(least(toUInt32(day) * 86400 + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.traces{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.resources{{on_cluster}} MODIFY TTL \
+     toDateTime(least(toUInt32(day) * 86400 + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.resources{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.spans{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+    "ALTER TABLE {{db}}.traces{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+    "ALTER TABLE {{db}}.resources{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+    "ALTER TABLE {{db}}.tag_names{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+    "ALTER TABLE {{db}}.tag_values{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+    "ALTER TABLE {{db}}.trace_landing{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(received_ms, 1000) + {{trace_landing_retention_hours}} * 3600, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_landing{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = {{trace_dedup_window}};",
+];
+
 /// The seconds half of a replicated table's block-deduplication window, one
 /// statement per write-path table (issue #603).
 ///
@@ -602,6 +643,12 @@ const CLUSTER_DEDUP_SECONDS_STMTS: &[&str] = &[
     "ALTER TABLE {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
     "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
     "ALTER TABLE {{db}}.log_landing{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.spans{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.traces{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.resources{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.tag_names{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.tag_values{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
+    "ALTER TABLE {{db}}.trace_landing{{on_cluster}} MODIFY SETTING replicated_deduplication_window_seconds = {{dedup_window_seconds}};",
 ];
 
 /// The seconds deduplication window every clustered write-path table is
@@ -692,6 +739,58 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
+    // The nineteen further settings one TRACE landing insert pins, of seven
+    // classes the metrics set did not need: how the block's bytes are read,
+    // a limit that refuses a block rather than dividing it, what an error
+    // does, what an acknowledgement means, where a row is placed, what path
+    // a value is stored under, and whether exceeding a limit is an error or
+    // a success that need not be complete.
+    // `QuerySettings::trace_landing_insert` names them together and quotes
+    // what each one's own catalogue entry says. A pin added there without a
+    // row here is caught by
+    // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`,
+    // which derives both directions rather than carrying a list.
+    (
+        "input_format_binary_read_json_as_string",
+        NameCatalogue::Setting,
+    ),
+    ("format_binary_max_object_size", NameCatalogue::Setting),
+    ("max_partitions_per_insert_block", NameCatalogue::Setting),
+    (
+        "throw_on_max_partitions_per_insert_block",
+        NameCatalogue::Setting,
+    ),
+    ("materialized_views_ignore_errors", NameCatalogue::Setting),
+    (
+        "ignore_materialized_views_with_dropped_target_table",
+        NameCatalogue::Setting,
+    ),
+    (
+        "min_insert_block_size_rows_for_materialized_views",
+        NameCatalogue::Setting,
+    ),
+    (
+        "min_insert_block_size_bytes_for_materialized_views",
+        NameCatalogue::Setting,
+    ),
+    ("distributed_foreground_insert", NameCatalogue::Setting),
+    ("insert_shard_id", NameCatalogue::Setting),
+    ("json_type_escape_dots_in_keys", NameCatalogue::Setting),
+    ("type_json_skip_duplicated_paths", NameCatalogue::Setting),
+    // The seven overflow modes the repair's statements reach. Each is one
+    // `DECLARE` line in the engine's own `src/Core/Settings.cpp` at
+    // `v26.3.29.7-lts`, defaulting to `throw`, and each is present in
+    // `system.settings` on that build with that default — so pinning
+    // changes nothing where a deployment keeps them, and makes a
+    // deployment that set `break` fail loudly where it had a success that
+    // need not have been complete.
+    ("read_overflow_mode", NameCatalogue::Setting),
+    ("read_overflow_mode_leaf", NameCatalogue::Setting),
+    ("timeout_overflow_mode", NameCatalogue::Setting),
+    ("group_by_overflow_mode", NameCatalogue::Setting),
+    ("distinct_overflow_mode", NameCatalogue::Setting),
+    ("sort_overflow_mode", NameCatalogue::Setting),
+    ("result_overflow_mode", NameCatalogue::Setting),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
     ("tupleElement", NameCatalogue::Function),
@@ -855,6 +954,8 @@ mod tests {
             metrics_dedup_window: window,
             log_landing_retention_hours: retention_hours,
             log_dedup_window: window,
+            trace_landing_retention_hours: retention_hours,
+            trace_dedup_window: window,
         }
     }
 
@@ -1051,6 +1152,13 @@ mod tests {
             "log_metrics_5s",
             "log_patterns",
             "log_landing",
+            // The six traces write-path tables (issues #584 to #586).
+            "spans",
+            "traces",
+            "resources",
+            "tag_names",
+            "tag_values",
+            "trace_landing",
         ]
         .iter()
         .map(|t| {
@@ -1259,15 +1367,34 @@ mod tests {
             "input_format_max_block_wait_ms",
         ]);
 
+        // The trace landing insert's own nineteen pins are rows too (issues
+        // #584 to #586), and they are **derived from that constructor** here
+        // rather than written out a second time: this case owns the eight
+        // above as a literal set, and
+        // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
+        // owns the rest, both ways.
+        let trace_only_set = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        let trace_only: BTreeSet<&str> = trace_only_set
+            .entries()
+            .map(|(k, _)| k)
+            .filter(|k| !ALREADY_SHIPPED.contains(k) && !want.contains(k))
+            .collect();
+        assert!(
+            !trace_only.is_empty(),
+            "the trace landing insert adds no pin of its own, so the union \
+             below is the metrics set and this case closes nothing new"
+        );
+        let want_all: BTreeSet<&str> = want.union(&trace_only).copied().collect();
+
         let read_back: BTreeSet<&str> = REQUIRED_SERVER_NAMES
             .iter()
             .filter(|(_, c)| *c == NameCatalogue::Setting)
             .map(|(n, _)| *n)
             .collect();
         assert_eq!(
-            read_back, want,
-            "the settings catalogue's required names are the landing insert's \
-             pins and nothing else"
+            read_back, want_all,
+            "the settings catalogue's required names are the two landing \
+             inserts' pins and nothing else"
         );
 
         let settings = QuerySettings::landing_insert("tok-1", 1_048_576);
@@ -1310,7 +1437,20 @@ mod tests {
                      ('insert_deduplication_token', 'max_insert_block_size', \
                      'max_insert_block_size_bytes', 'input_format_max_block_size_bytes', \
                      'min_insert_block_size_rows', 'min_insert_block_size_bytes', \
-                     'input_format_connection_handling', 'input_format_max_block_wait_ms')"
+                     'input_format_connection_handling', 'input_format_max_block_wait_ms', \
+                     'input_format_binary_read_json_as_string', \
+                     'format_binary_max_object_size', 'max_partitions_per_insert_block', \
+                     'throw_on_max_partitions_per_insert_block', \
+                     'materialized_views_ignore_errors', \
+                     'ignore_materialized_views_with_dropped_target_table', \
+                     'min_insert_block_size_rows_for_materialized_views', \
+                     'min_insert_block_size_bytes_for_materialized_views', \
+                     'distributed_foreground_insert', 'insert_shard_id', \
+                     'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
+                     'read_overflow_mode', 'read_overflow_mode_leaf', \
+                     'timeout_overflow_mode', 'group_by_overflow_mode', \
+                     'distinct_overflow_mode', 'sort_overflow_mode', \
+                     'result_overflow_mode')"
                         .to_string()
                 ),
                 (
@@ -1329,6 +1469,176 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // -- the traces landing statements (issues #584 to #586) -----------
+
+    /// **T-R2, the rendering half.** The three day-column TTLs, the landing
+    /// TTL and the six windows, rendered. The `spans` statement is asserted
+    /// byte for byte — a TTL that read the wrong column, or dropped the
+    /// `least(…, 4294967295)` clamp, renders differently — and the `traces`
+    /// one is asserted to take its seconds from the `Date` column rather than
+    /// from a nanosecond one.
+    #[test]
+    fn the_rendered_ttl_statements_are_byte_exact() {
+        let ctx = metrics_ctx(6, 10_000);
+        let rendered: Vec<String> = TRACE_LANDING_STMTS
+            .iter()
+            .map(|s| render::substitute_tokens(s, &ctx))
+            .collect();
+
+        assert!(
+            rendered.iter().any(|s| s
+                == "ALTER TABLE pulsus.spans MODIFY TTL toDateTime(least(intDiv(start_ns, \
+                    1000000000) + 7 * 86400, 4294967295)) DELETE;"),
+            "the spans TTL statement is not byte-exact: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|s| s
+                == "ALTER TABLE pulsus.traces MODIFY TTL toDateTime(least(toUInt32(day) * 86400 \
+                    + 7 * 86400, 4294967295)) DELETE;"),
+            "the traces TTL takes its seconds from the Date column: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|s| s
+                == "ALTER TABLE pulsus.resources MODIFY TTL toDateTime(least(toUInt32(day) * \
+                    86400 + 7 * 86400, 4294967295)) DELETE;"),
+            "the resources TTL takes its seconds from the Date column: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|s| s
+                == "ALTER TABLE pulsus.trace_landing MODIFY TTL \
+                    toDateTime(least(intDiv(received_ms, 1000) + 6 * 3600, 4294967295)) DELETE;"),
+            "the landing TTL is the configured hours: {rendered:#?}"
+        );
+
+        // Six windows, one per write-path table; the two catalogs carry a
+        // window and no TTL, because docs/api.md §4.3 requires catalog
+        // entries to outlive span retention.
+        for table in [
+            "spans",
+            "traces",
+            "resources",
+            "tag_names",
+            "tag_values",
+            "trace_landing",
+        ] {
+            let want = format!(
+                "ALTER TABLE pulsus.{table} MODIFY SETTING \
+                 non_replicated_deduplication_window = 10000;"
+            );
+            assert!(
+                rendered.contains(&want),
+                "no window statement for {table}: {rendered:#?}"
+            );
+        }
+        for catalog in ["tag_names", "tag_values"] {
+            assert!(
+                !rendered
+                    .iter()
+                    .any(|s| s.contains(&format!("pulsus.{catalog} MODIFY TTL"))),
+                "{catalog} must carry no TTL: {rendered:#?}"
+            );
+        }
+
+        // The two naming the landing table come last, so a schema managed by
+        // hand without that table stops nothing that does not name it.
+        let first_landing = TRACE_LANDING_STMTS
+            .iter()
+            .position(|s| s.contains("trace_landing"));
+        assert!(
+            first_landing.is_some(),
+            "no statement names the landing table: {rendered:#?}"
+        );
+        let first_landing = first_landing.expect("checked above");
+        assert!(
+            TRACE_LANDING_STMTS[first_landing..]
+                .iter()
+                .all(|s| s.contains("trace_landing")),
+            "the landing statements must be contiguous and last"
+        );
+        assert_eq!(TRACE_LANDING_STMTS.len() - first_landing, 2);
+    }
+
+    /// **The setting names read back at startup are exactly the setting names
+    /// the trace landing insert sends**, derived both ways with no list on
+    /// either side.
+    ///
+    /// **Forward**: every key `QuerySettings::trace_landing_insert` sends has
+    /// a `REQUIRED_SERVER_NAMES` row of catalogue `Setting`, bar the pair the
+    /// shipped span insert already sent — the same exemption
+    /// `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends`
+    /// carries, and for the same reason: they were in `crates/` before this
+    /// work, which is the class the startup check draws.
+    ///
+    /// **Reverse**: the rows this change added, taken as the set difference
+    /// between the `Setting` rows and the keys the **metrics** landing insert
+    /// sends — which is what those rows were at the base revision, pinned by
+    /// the case named above — must every one be a key the trace constructor
+    /// sends.
+    ///
+    /// Neither direction names a count or a name, so a pin added without a
+    /// row, a row added without a pin, and a row added for one of the
+    /// nineteen while the reverse check only walked some of them all fail.
+    #[test]
+    fn the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends() {
+        use std::collections::BTreeSet;
+
+        /// In `crates/` before this work, so outside the probed class.
+        const ALREADY_SHIPPED: &[&str] = &[
+            "deduplicate_insert",
+            "deduplicate_blocks_in_dependent_materialized_views",
+        ];
+
+        let rows: BTreeSet<&str> = REQUIRED_SERVER_NAMES
+            .iter()
+            .filter(|(_, c)| *c == NameCatalogue::Setting)
+            .map(|(n, _)| *n)
+            .collect();
+        let trace_sent_set = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        let trace_sent: BTreeSet<&str> = trace_sent_set.entries().map(|(k, _)| k).collect();
+        let metrics_sent_set = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let metrics_sent: BTreeSet<&str> = metrics_sent_set.entries().map(|(k, _)| k).collect();
+
+        // Forward.
+        let unread: Vec<&str> = trace_sent
+            .iter()
+            .copied()
+            .filter(|k| !ALREADY_SHIPPED.contains(k) && !rows.contains(k))
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "the trace landing insert sends settings nothing reads back at \
+             startup: {unread:?}"
+        );
+
+        // Reverse: the rows this change added.
+        let added: Vec<&str> = rows
+            .iter()
+            .copied()
+            .filter(|k| !metrics_sent.contains(k))
+            .collect();
+        assert!(
+            !added.is_empty(),
+            "this change adds no setting row at all, so the reverse direction \
+             checks nothing"
+        );
+        let unsent: Vec<&str> = added
+            .iter()
+            .copied()
+            .filter(|k| !trace_sent.contains(k))
+            .collect();
+        assert!(
+            unsent.is_empty(),
+            "a required-name row was added for a setting the trace landing \
+             insert does not send: {unsent:?}"
+        );
+        for name in ALREADY_SHIPPED {
+            assert!(
+                trace_sent.contains(name),
+                "{name} is exempted from the check but is not sent at all"
+            );
+        }
     }
 
     /// Issue #603 code review, finding 6: a catalogue read that failed for a
@@ -1436,6 +1746,8 @@ mod tests {
             metrics_dedup_window: 10_000,
             log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
+            trace_landing_retention_hours: 6,
+            trace_dedup_window: 10_000,
         };
         let trace_ttl_stmts: Vec<String> = TTL_STMTS
             .iter()
@@ -1497,6 +1809,8 @@ mod tests {
             metrics_dedup_window: 10_000,
             log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
+            trace_landing_retention_hours: 6,
+            trace_dedup_window: 10_000,
         };
         let rendered: Vec<String> = TTL_STMTS
             .iter()
