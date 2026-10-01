@@ -401,8 +401,10 @@ validated exactly as before.
 server rather than the driver, and the error is then a server exception on the
 insert rather than a `SchemaMismatch` before it. That is the patch's stated
 limit. What stands in for it is the byte-exact cases in
-`crates/pulsus-write/src/writer/trace_json.rs`, which reproduce all eleven
-captured frames above from this workspace's own encoder.
+`crates/pulsus-write/src/writer/trace_json.rs`, which reproduce from this
+workspace's own encoder all eleven captured frames in that file's own module
+header — three of them are quoted above — and whose case loop asserts
+`cases.len() == 11` before comparing any of them.
 
 ### The test-support export in `_priv`
 

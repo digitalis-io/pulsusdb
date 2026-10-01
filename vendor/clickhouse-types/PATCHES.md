@@ -141,10 +141,11 @@ whitespace and then either fails to parse or re-renders without it.
   re-enters `DataTypeNode::new` — `Array`, `Nullable`, `LowCardinality`,
   `Tuple`, `Variant`, `Map` — the named reading parses the type half and, on
   failure, the fallback parses `<key> <type half>`, which re-enters the parser
-  on nearly the same text. Each nesting level then doubles: counted on a
-  simulation of the two arms the family uses, 4 parse units at depth 1 and
-  8,212,991 at depth 22, a factor of 1.95 per level, against one linear chain
-  before. Reaching it needs a column whose tuple element is named exactly one of
+  on nearly the same text. Each level then roughly doubles the work: counted
+  on a simulation of the two arms the family uses, in units of simulated
+  parses, 4 at depth 1, 2,930 at depth 10 and 8,212,991 at depth 22, against
+  one chain linear in the depth before. Reaching it needs a column whose tuple
+  element is named exactly one of
   those six keys at **every** level and whose innermost type the crate cannot
   parse; any other element name makes the fallback a single dispatch miss and
   the cost linear. A type string is parsed once per request and never per row.
