@@ -1446,7 +1446,12 @@ pub const MIGRATIONS: &[Migration] = &[
     // repository's tokens. `spans` gains `{{on_cluster}}` and a TTL applied
     // at run time by `controller::apply_ttl`, because migration identity is
     // checksummed over the rendered template and a configuration value
-    // inside a CREATE reads as drift; the rest is that file's DDL unchanged.
+    // inside a CREATE reads as drift. The second difference is the codec:
+    // `resources`, `tag_names`, `tag_values` and `traces.day` carry
+    // `CODEC(ZSTD(1))` where that file declares none, because
+    // `docs/schemas.md` §8 sets `ZSTD(1)` as the minimum and the
+    // `trace_landing` columns they are projected from already carry it. The
+    // rest is that file's DDL unchanged.
     //
     // `resources`, `tag_names` and `tag_values` are `family: None` /
     // `Replication::Global` with no routing sibling — the shape
@@ -1498,7 +1503,7 @@ pub const MIGRATIONS: &[Migration] = &[
         family: Some(Family::Traces),
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}} (\n\
-                 day           Date,\n\
+                 day           Date                                                 CODEC(ZSTD(1)),\n\
                  trace_id      FixedString(16)                                      CODEC(ZSTD(1)),\n\
                  start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),\n\
                  end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),\n\
@@ -1519,13 +1524,13 @@ pub const MIGRATIONS: &[Migration] = &[
         family: None,
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}} (\n\
-                 day            Date,\n\
-                 resource_id    UInt128,\n\
-                 service        LowCardinality(String),\n\
-                 attrs          JSON,\n\
-                 attrs_other    String,\n\
-                 dropped_attrs  UInt32,\n\
-                 schema_url     String\n\
+                 day            Date                    CODEC(ZSTD(1)),\n\
+                 resource_id    UInt128                 CODEC(ZSTD(1)),\n\
+                 service        LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 attrs          JSON                    CODEC(ZSTD(1)),\n\
+                 attrs_other    String                  CODEC(ZSTD(1)),\n\
+                 dropped_attrs  UInt32                  CODEC(ZSTD(1)),\n\
+                 schema_url     String                  CODEC(ZSTD(1))\n\
              ) ENGINE = ReplacingMergeTree\n\
              PARTITION BY day\n\
              ORDER BY (service, resource_id);",
@@ -1539,8 +1544,8 @@ pub const MIGRATIONS: &[Migration] = &[
         family: None,
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}} (\n\
-                 scope  LowCardinality(String),\n\
-                 key    String\n\
+                 scope  LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 key    String                  CODEC(ZSTD(1))\n\
              ) ENGINE = ReplacingMergeTree\n\
              ORDER BY (scope, key);",
         ),
@@ -1553,10 +1558,10 @@ pub const MIGRATIONS: &[Migration] = &[
         family: None,
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}} (\n\
-                 scope     LowCardinality(String),\n\
-                 key       String,\n\
-                 value     String,\n\
-                 val_type  LowCardinality(String)\n\
+                 scope     LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 key       String                  CODEC(ZSTD(1)),\n\
+                 value     String                  CODEC(ZSTD(1)),\n\
+                 val_type  LowCardinality(String)  CODEC(ZSTD(1))\n\
              ) ENGINE = ReplacingMergeTree\n\
              ORDER BY (scope, key, value, val_type);",
         ),

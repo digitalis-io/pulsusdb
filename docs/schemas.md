@@ -1217,7 +1217,7 @@ ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
 
 CREATE TABLE traces (
-    day           Date,
+    day           Date                                                 CODEC(ZSTD(1)),
     trace_id      FixedString(16)                                      CODEC(ZSTD(1)),
     start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),
     end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
@@ -1230,28 +1230,28 @@ ORDER BY trace_id
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
 
 CREATE TABLE resources (
-    day            Date,
-    resource_id    UInt128,
-    service        LowCardinality(String),
-    attrs          JSON,
-    attrs_other    String,
-    dropped_attrs  UInt32,
-    schema_url     String
+    day            Date                    CODEC(ZSTD(1)),
+    resource_id    UInt128                 CODEC(ZSTD(1)),
+    service        LowCardinality(String)  CODEC(ZSTD(1)),
+    attrs          JSON                    CODEC(ZSTD(1)),
+    attrs_other    String                  CODEC(ZSTD(1)),
+    dropped_attrs  UInt32                  CODEC(ZSTD(1)),
+    schema_url     String                  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
 PARTITION BY day
 ORDER BY (service, resource_id);
 
 CREATE TABLE tag_names (
-    scope  LowCardinality(String),   -- span | resource | event | link | instrumentation
-    key    String
+    scope  LowCardinality(String)  CODEC(ZSTD(1)),  -- span | resource | event | link | instrumentation
+    key    String                  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
 ORDER BY (scope, key);
 
 CREATE TABLE tag_values (
-    scope     LowCardinality(String),
-    key       String,
-    value     String,
-    val_type  LowCardinality(String)  -- string | int | float | bool
+    scope     LowCardinality(String)  CODEC(ZSTD(1)),
+    key       String                  CODEC(ZSTD(1)),
+    value     String                  CODEC(ZSTD(1)),
+    val_type  LowCardinality(String)  CODEC(ZSTD(1))  -- string | int | float | bool
 ) ENGINE = ReplacingMergeTree
 ORDER BY (scope, key, value, val_type);
 
