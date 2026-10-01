@@ -686,18 +686,76 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The charge covers everything a queued block holds: a span's events and
-/// links are client-chosen and unbounded short of the expansion ceiling, so
-/// a charge that priced the two vectors' headers alone would be short by
-/// every element's own text and encoded attributes.
+/// **The charge covers everything a queued block holds.** A span's events
+/// and links are arrays of tuples, each element with its own text and its
+/// own encoded `JSON`, and both are client-chosen and unbounded short of the
+/// expansion ceiling — so a charge that priced the two vectors' headers
+/// alone would not bound what the queue holds.
+///
+/// **It is asserted as a growth with the row count held fixed**, which is
+/// what makes it discriminate: an assertion that the charge merely exceeds
+/// the row slots plus the element text passes with the arrays' own term
+/// deleted, because at 200 events of 20 attributes each the slots of the
+/// catalog rows those attributes produce swamp the elements' text. So each
+/// pair below lengthens one field that **no other kind's row carries**, four
+/// times over, with every row count identical on both sides:
+///
+/// * an event's `name` — it produces no catalog row at all;
+/// * an event attribute's value, under one key shared by all 200 events, so
+///   the push's catalog rows are one name and one value whatever its length;
+/// * a link's `trace_state`, likewise carried nowhere else.
 #[tokio::test]
 async fn the_charge_covers_everything_a_queued_block_holds() {
     let root = spool_root("charge");
-    let req = wide_span_request();
-    let (parsed, landed) = decode_both(&req);
-    let rows = landed.total_rows();
-    let charge = refused_charge(&root, parsed, landed.clone()).await;
 
+    const SHORT: usize = 64;
+    const LONG: usize = SHORT * 4;
+    const EVENTS: u64 = 200;
+    const LINKS: u64 = 50;
+
+    for (what, short, long, copies) in [
+        (
+            "the events' own names",
+            wide_span_request(SHORT, SHORT, SHORT),
+            wide_span_request(LONG, SHORT, SHORT),
+            EVENTS,
+        ),
+        (
+            "the events' own attribute values",
+            wide_span_request(SHORT, SHORT, SHORT),
+            wide_span_request(SHORT, LONG, SHORT),
+            EVENTS,
+        ),
+        (
+            "the links' own trace states",
+            wide_span_request(SHORT, SHORT, SHORT),
+            wide_span_request(SHORT, SHORT, LONG),
+            LINKS,
+        ),
+    ] {
+        let (ps, ls) = decode_both(&short);
+        let (pl, ll) = decode_both(&long);
+        assert_eq!(
+            ls.total_rows(),
+            ll.total_rows(),
+            "{what}: the two sides must carry the same landed rows, or the \
+             growth could be a row count rather than the field"
+        );
+        let charge_short = refused_charge(&root, ps, ls).await;
+        let charge_long = refused_charge(&root, pl, ll).await;
+        let added = (LONG - SHORT) as u64 * copies;
+        assert!(
+            charge_long >= charge_short + added,
+            "{what}: {copies} elements grew by {} bytes each, so the charge \
+             had to grow by at least {added}: {charge_short} -> {charge_long}",
+            LONG - SHORT
+        );
+    }
+
+    // And the whole block's rows are charged their slots beside that text.
+    let (parsed, landed) = decode_both(&wide_span_request(SHORT, SHORT, SHORT));
+    let rows = landed.total_rows();
+    let charge = refused_charge(&root, parsed, landed).await;
     let slots = rows * std::mem::size_of::<TraceLandingRow>() as u64;
     assert!(
         charge >= slots + landing_block_overhead_bytes::<TraceLandingRow>(),
@@ -705,32 +763,18 @@ async fn the_charge_covers_everything_a_queued_block_holds() {
          holds ({slots} bytes of slots) and the block they are sealed into"
     );
 
-    // Walked field by field off the decoded batch: the events' and links'
-    // own text and encoded attributes, which a vector-header charge omits.
-    let span = &landed.spans[0];
-    let inner: u64 = span
-        .events
-        .iter()
-        .map(|e| e.name.len() as u64 + e.attrs.encoded_len())
-        .sum::<u64>()
-        + span
-            .links
-            .iter()
-            .map(|l| l.trace_state.len() as u64 + l.attrs.encoded_len())
-            .sum::<u64>();
-    assert!(inner > 0, "the fixture has to carry event and link content");
-    assert!(
-        charge >= slots + inner,
-        "the charge ({charge}) is short of the events' and links' own content \
-         ({inner} bytes) beside the row slots ({slots})"
-    );
-
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The charge covers the catalog rows the block holds, not only the spans:
-/// one more distinct attribute value is one more landed row, and the
-/// reservation grows by at least a row slot.
+/// **The charge covers the catalog rows the block holds**, not only the
+/// spans: a push of mostly catalog rows would otherwise exceed
+/// `PULSUS_INGEST_QUEUE_BYTES` while being charged a span's text.
+///
+/// The discriminator is the **row count**, not one row's text: both pushes
+/// carry one span, and the second's 500 distinct attributes are 1,000 more
+/// landed catalog rows. Each of them is charged a whole row slot, because
+/// the row type is the union of four kinds' columns; a charge over kind 0
+/// alone would grow only by the span's own attribute paths.
 #[tokio::test]
 async fn the_queue_charge_covers_the_catalog_rows_it_holds() {
     let root = spool_root("catalog-charge");
@@ -739,28 +783,36 @@ async fn the_queue_charge_covers_the_catalog_rows_it_holds() {
         "checkout",
         vec![span_at(0xaa, 0x11, base, vec![kv("app.user", "u-1")])],
     );
-    let two = request_of(
+    let many = request_of(
         "checkout",
-        vec![
-            span_at(0xaa, 0x11, base, vec![kv("app.user", "u-1")]),
-            span_at(0xaa, 0x12, base + 1_000, vec![kv("app.user", "u-2")]),
-        ],
+        vec![span_at(
+            0xaa,
+            0x11,
+            base,
+            (0..500)
+                .map(|i| kv(&format!("app.k{i:03}"), &format!("v{i:03}")))
+                .collect(),
+        )],
     );
     let (p1, l1) = decode_both(&one);
-    let (p2, l2) = decode_both(&two);
-    assert_eq!(
-        l2.tag_values.len(),
-        l1.tag_values.len() + 1,
-        "the second push carries exactly one more distinct value"
+    let (p2, l2) = decode_both(&many);
+    assert_eq!(l1.spans.len(), 1);
+    assert_eq!(l2.spans.len(), 1, "both pushes carry exactly one span");
+    let added_rows = l2.total_rows() - l1.total_rows();
+    assert!(
+        added_rows >= 998,
+        "the second push has to carry about a thousand more catalog rows:          {added_rows}"
     );
 
     let first = refused_charge(&root, p1, l1).await;
     let second = refused_charge(&root, p2, l2).await;
     let slot = std::mem::size_of::<TraceLandingRow>() as u64;
     assert!(
-        second >= first + slot,
-        "a charge that priced kind 0 only would let a push of mostly catalog \
-         rows exceed the ceiling: {first} -> {second}, one slot is {slot}"
+        second >= first + added_rows * slot,
+        "a charge that priced kind 0 only would grow by the span's own \
+         attribute paths and not by {added_rows} row slots ({} bytes): \
+         {first} -> {second}",
+        added_rows * slot
     );
 
     std::fs::remove_dir_all(&root).ok();
@@ -787,19 +839,29 @@ async fn refused_charge(root: &Path, parsed: ParsedTraces, landed: ParsedTraceLa
     }
 }
 
-/// One span carrying 200 events of 20 attributes each and 50 links — the
-/// shape whose charge a vector-header estimate under-prices.
-fn wide_span_request() -> ExportTraceServiceRequest {
+/// One span carrying 200 events and 50 links, the three fields the charge
+/// case grows written to order.
+///
+/// **Every event shares one attribute key and one attribute value**, so the
+/// push's catalog rows are one name and one value whatever `attr_bytes` is:
+/// the only thing that grows with it is the 200 copies the span row's
+/// `events` column holds.
+fn wide_span_request(
+    name_bytes: usize,
+    attr_bytes: usize,
+    state_bytes: usize,
+) -> ExportTraceServiceRequest {
     use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
     let base = base_ns();
+    let name = "n".repeat(name_bytes);
+    let value = "v".repeat(attr_bytes);
+    let state = "s".repeat(state_bytes);
     let mut span = span_at(0xaa, 0x11, base, vec![kv("http.route", "/api")]);
     span.events = (0..200)
         .map(|i| Event {
             time_unix_nano: u64::try_from(base + i).expect("post-epoch"),
-            name: format!("event-{i}-with-a-name-long-enough-to-count"),
-            attributes: (0..20)
-                .map(|j| kv(&format!("e{i}.k{j}"), &format!("value-{i}-{j}")))
-                .collect(),
+            name: name.clone(),
+            attributes: vec![kv("event.payload", &value)],
             dropped_attributes_count: 0,
         })
         .collect();
@@ -807,8 +869,8 @@ fn wide_span_request() -> ExportTraceServiceRequest {
         .map(|i| Link {
             trace_id: [0xcc; 16].to_vec(),
             span_id: [(i % 251) as u8 + 1; 8].to_vec(),
-            trace_state: format!("vendor=link-state-{i}"),
-            attributes: vec![kv(&format!("l{i}.k"), &format!("link-value-{i}"))],
+            trace_state: state.clone(),
+            attributes: vec![kv("link.payload", "p")],
             dropped_attributes_count: 0,
             flags: 0,
         })
