@@ -463,7 +463,7 @@ SELECT DISTINCT name FROM spans WHERE <window> ORDER BY name LIMIT 1001
 | shape | rows read | returned | warm | cold | reference |
 |---|---:|---:|---:|---:|---:|
 | names, five scopes | 48 | 1,123 | **1 ms** | 2 | 4 ms |
-| values for one key, unnarrowed | 8,192 | 1,445 | **1 ms** | 2 | 3 ms |
+| values for one key, unnarrowed | 8,192 | 1,445 | **2 ms** | 4 | 3 ms |
 | values narrowed by a query | 2,000,132 | 100 | **24 ms** | 36 | 30 ms |
 | `name` values, window-bounded | 2,000,064 | 6,547 | **15 ms** | 22 | — |
 
