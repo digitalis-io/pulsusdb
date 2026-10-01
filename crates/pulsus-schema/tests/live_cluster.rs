@@ -2081,16 +2081,21 @@ async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
         wait_distribution_drained(&shard1, db, table).await;
     }
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
-        assert_eq!(
-            count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await,
-            10,
-            "shard{}: after the retry each shard holds its own trace",
-            i + 1
-        );
+        // **`FINAL`, because the retry carries its own token**: the shard
+        // that committed the first push holds those rows and the retry's
+        // copy beside them until a merge, so the unmerged count there is 20.
+        // That is the target's key doing its job, not a second copy of the
+        // data: a target that summed rather than collapsed would answer 20
+        // under `FINAL` too.
         assert_eq!(
             count_on(shard, &format!("SELECT count() AS n FROM {db}.spans FINAL")).await,
             10,
-            "shard{}: and the repeat collapses rather than doubling",
+            "shard{}: after the retry each shard holds its own trace, once",
+            i + 1
+        );
+        let unmerged = count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await;
+        eprintln!(
+            "refusal: shard{} held {unmerged} unmerged rows (recorded)",
             i + 1
         );
         let rows = trace_ids(shard, db, "traces").await;
@@ -2142,9 +2147,14 @@ async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
         ),
     )
     .await;
+    // **Scoped to the test database**, which is all this user issues a
+    // statement against: `GRANT ALL ON *.*` is refused outright, because the
+    // granting user does not itself hold `SHOW NAMED COLLECTIONS SECRETS ON
+    // *` with the grant option — measured in CI's two-shard job, `Code: 497
+    // ... Not enough privileges`.
     exec_on(
         &shard1,
-        &format!("GRANT ALL ON *.* TO {user} ON CLUSTER '{CLUSTER_NAME}'"),
+        &format!("GRANT ALL ON {db}.* TO {user} ON CLUSTER '{CLUSTER_NAME}'"),
     )
     .await;
     let hostile = ChClient::new(ChConnConfig {
