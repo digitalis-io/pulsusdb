@@ -614,7 +614,26 @@ fn now_ns() -> i64 {
 /// clamp that is what happened between 00:00 and 06:00 UTC on the first of
 /// any month, after which the suite went green by itself.
 fn clamped_into_one_utc_month(ts_ns: i64) -> i64 {
-    ts_ns
+    use chrono::{Datelike, TimeZone, Utc};
+
+    let first_of = |year: i32, month: u32| -> i64 {
+        Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+            .single()
+            .expect("midnight on the first of a month is one UTC instant")
+            .timestamp_nanos_opt()
+            .expect("a year nanoseconds since the epoch can hold")
+    };
+    let at = Utc.timestamp_nanos(ts_ns);
+    let (next_year, next_month) = if at.month() == 12 {
+        (at.year() + 1, 1)
+    } else {
+        (at.year(), at.month() + 1)
+    };
+    let earliest = first_of(at.year(), at.month()) + WINDOW_BACK_NS;
+    // One nanosecond short, so the window's end cannot land ON the next
+    // month's first instant, which belongs to that month.
+    let latest = first_of(next_year, next_month) - WINDOW_FORWARD_NS - 1;
+    ts_ns.clamp(earliest, latest)
 }
 
 /// Hermetic: [`clamped_into_one_utc_month`] keeps the whole window inside
@@ -777,14 +796,14 @@ async fn setup(db: &str, ts_ns: i64) -> ChClient {
     data_client
 }
 
-/// A `[now - 6h, now]` window bracketing `ts_ns` (the seeded samples'
-/// timestamp), matching docs/schemas.md §3.2's canonical "last 6h" example
-/// shape.
+/// A `[ts_ns - 6h, ts_ns + 1h]` window bracketing `ts_ns` (the seeded
+/// samples' timestamp), matching docs/schemas.md §3.2's canonical "last 6h"
+/// example shape.
 fn range_params(ts_ns: i64) -> QueryParams {
     QueryParams {
         spec: QuerySpec::Range {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
             step_ns: 60_000_000_000,
         },
         limit: 100,
@@ -1328,8 +1347,8 @@ async fn keyset_page_usage(
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
         },
         sql::KeysetLower::After {
             tuple: (
@@ -1464,8 +1483,8 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
         &table,
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
-            start_ns: ts_ns - 6 * 3_600_000_000_000,
-            end_ns: ts_ns + 3_600_000_000_000,
+            start_ns: ts_ns - WINDOW_BACK_NS,
+            end_ns: ts_ns + WINDOW_FORWARD_NS,
         },
     );
 
