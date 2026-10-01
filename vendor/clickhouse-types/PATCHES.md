@@ -425,12 +425,22 @@ Three parts, and none of them is a reading of the arms.
    everything `DataTypeNode::new` can reach is that file, `error.rs` and `std`.
    `error.rs` holds no index, no arithmetic and no panicking call.
 2. **In safe Rust the panic sources are a closed set, and each one is a sweep
-   over the file.** Indexing and slicing: the command above. `unwrap` /
+   over the file.** Indexing and slicing: the command above, which over the
+   **patched** file also lists this patch's own new lines. Each of those is
+   either a `get` or bounded in the same expression or by the enclosing loop
+   condition: `bytes[i]` and `input_bytes[i]` sit inside
+   `while i < <that slice>.len()`; `bytes[0]` is behind `!bytes.is_empty() &&`
+   in the same expression and `bytes[1..]` behind the same test; and the two
+   `&input_bytes[from..]` in the splitter's error closure take a start that is
+   a comma's index plus one, so at most the length, where a byte slice is
+   empty rather than out of bounds. `unwrap` /
    `expect` / `panic!` / `assert*!` / `unreachable!` / `todo!` /
    `unimplemented!` / `unsafe`: a grep over the non-test lines returns
    **nothing**. Division and remainder: **nothing**. Arithmetic overflow, which
-   panics under `debug-assertions`: nine sites, each a `+=` or `-=` run at most
-   once per input byte, so an overflow needs an input of at least 2^31 bytes.
+   panics under `debug-assertions`: `/usr/bin/grep -nE '\+=|-=' ` over the
+   non-test lines lists **fourteen** sites, nine upstream's and five this
+   patch's two new functions'; each is a `+=` or `-=` executed at most once per
+   input byte, so an overflow needs an input of at least 2^31 bytes.
    What is left is `std`, where `String::from_utf8` and `str::parse` return
    `Result` and `Vec::push` and `format!` abort on allocation failure rather
    than panic.
