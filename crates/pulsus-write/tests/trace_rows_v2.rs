@@ -1,5 +1,5 @@
-//! The span row encoder and the `JSON` column, round-tripped against a real
-//! ClickHouse server (issue #585).
+//! The span row encoder and the `JSON` column, round-tripped against a
+//! running ClickHouse server (issue #585).
 //!
 //! **The test seam, because there is no compiler and no route on the new
 //! tables yet.** Every case here decodes an OTLP request with the landing

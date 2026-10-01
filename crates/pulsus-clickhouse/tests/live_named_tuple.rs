@@ -1,4 +1,4 @@
-//! A **named** tuple column, inserted into and read back from a real
+//! A **named** tuple column, inserted into and read back from a running
 //! ClickHouse server (issue #585).
 //!
 //! `get_insert_metadata` runs `DESCRIBE TABLE` and calls `DataTypeNode::new`
