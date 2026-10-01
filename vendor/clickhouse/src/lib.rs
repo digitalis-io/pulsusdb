@@ -707,6 +707,26 @@ pub mod _priv {
     }
 
     pub use crate::sql::escape::identifier as sql_escape_identifier;
+
+    /// Serializes one row to `RowBinary` with **no** column metadata and so
+    /// no schema validation, for a test that asserts the exact bytes a
+    /// value produces.
+    ///
+    /// Added by this vendored copy, and the reason is in `PATCHES.md` §3:
+    /// the crate's own `serialize_row_binary` is `pub(crate)` and nothing
+    /// public reaches a row's bytes without a client and a server, so a
+    /// hermetic byte-exact case on a `JSON` column's own wire form had no
+    /// door. **It is not a change to the driver's behaviour**: no
+    /// production path calls it, and the validating serializer the client
+    /// uses is untouched.
+    pub fn serialize_row_unvalidated<R>(row: &R) -> super::Result<Vec<u8>>
+    where
+        R: crate::Row + serde::Serialize,
+    {
+        let mut buffer = Vec::new();
+        crate::rowbinary::serialize_row_binary(&mut buffer, row)?;
+        Ok(buffer)
+    }
 }
 
 #[cfg(test)]

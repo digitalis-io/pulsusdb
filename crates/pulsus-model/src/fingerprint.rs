@@ -74,7 +74,14 @@ pub fn build_metric_buffer(labels: &LabelSet) -> Vec<u8> {
 ///
 /// Both label families use it over their own buffer, so a change to either
 /// primitive moves both identities and the golden vectors catch it once.
-fn compose128(buf: &[u8]) -> Fingerprint {
+///
+/// **`pub` so a third identity can use it rather than a third primitive**
+/// (issue #585): a trace's `resource_id` is this composition over a buffer
+/// the writer builds in [`build_stream_buffer`]'s layout. The point of one
+/// composition is that a change to either primitive moves every identity
+/// and the golden vectors catch it once; a third primitive for a third
+/// identity gives up exactly that.
+pub fn compose128(buf: &[u8]) -> Fingerprint {
     Fingerprint::from_raw(((raw_cityhash64(buf) as u128) << 64) | (xxh64(buf, 0) as u128))
 }
 

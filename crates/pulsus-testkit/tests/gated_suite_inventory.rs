@@ -229,6 +229,17 @@ fn at_least_the_migrated_population_still_mentions_the_testkit() {
 /// been wired up, or has been deleted, fails.
 const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
     (
+        "trace_rows_v2",
+        "every case in it inserts into trace_landing, and no insert into that table can \
+         succeed while its `events` and `links` columns declare NAMED tuple elements: the \
+         type parser the driver uses for insert-side schema validation refuses a named tuple \
+         at any depth, measured against clickhouse-types 0.1.2 and 0.1.3 \
+         (`Tuple(a Int64, b String)` -> `Unknown data type: a Int64`), so the insert fails \
+         before a byte is sent. Unnaming the elements and disabling validation were both \
+         measured and both unblock it; which is taken is a design decision and the suite's \
+         own module doc carries the evidence for each. Wire it up with that decision.",
+    ),
+    (
         "live_tls",
         "needs a TLS-enabled ClickHouse; no job starts one. The hermetic half of TLS is \
          covered by pulsus-server/tests/tls_live.rs, which does have a step.",

@@ -1003,6 +1003,130 @@ mod tests {
         ]
     }
 
+    /// Each TRACES landing row kind streams the shape that kind declares,
+    /// for the reason the logs twin above gives, and with the same limit:
+    /// it fails on an override that drops a field or misspells a key and
+    /// cannot see a missing override at all.
+    #[tokio::test]
+    async fn every_trace_landing_kind_streams_the_shape_it_declares() {
+        let dir = tempdir();
+        for (name, row) in trace_landing_rows_of_every_kind() {
+            let path = dir.join(format!("{name}.json"));
+            let whole = serde_json::to_vec(&SpoolRecord {
+                table: "trace_landing",
+                error: "boom",
+                spooled_at_ns: 1_700_000_000_123_456_789,
+                rows: vec![row.to_spool_value()],
+            })
+            .expect("the record serializes");
+            write_record(
+                &path,
+                "trace_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let streamed = std::fs::read(&path).expect("read the document back");
+            assert_eq!(
+                String::from_utf8(streamed).expect("the document is UTF-8"),
+                String::from_utf8(whole).expect("the record is UTF-8"),
+                "the streamed {name} row is not the shape it declares"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One row of each traces kind, each carrying text long enough that the
+    /// string path spills the chunk rather than fitting one piece, and a
+    /// span row carrying one event and one link so the two array terms are
+    /// exercised.
+    fn trace_landing_rows_of_every_kind()
+    -> Vec<(&'static str, crate::writer::rows::TraceLandingRow)> {
+        use crate::ingest::traces::{
+            LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName,
+            LandingTagValue, TagScope,
+        };
+        use crate::writer::rows::TraceLandingRow;
+        use crate::writer::trace_json::{
+            TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue,
+        };
+
+        const TS: i64 = 1_700_000_000_000_000_000;
+        let json = |path: &str, text: &str| {
+            TraceJson::from_entries(vec![TraceJsonEntry {
+                path: path.to_string(),
+                value: TraceJsonValue::Scalar(TraceJsonScalar::Str(text.to_string())),
+            }])
+        };
+        let long = "x".repeat(STRING_PAST_CHUNK);
+
+        let span = LandingSpan {
+            trace_id: [0xab; 16],
+            span_id: [0xcd; 8],
+            parent_span_id: [0xef; 8],
+            start_ns: TS,
+            duration_ns: 4_000_000,
+            resource_id: Fingerprint::from_raw(7),
+            name: long.clone(),
+            kind: 3,
+            status_code: 2,
+            status_message: "\"quoted\"\n".to_string(),
+            trace_state: "rojo=00f067aa0ba902b7".to_string(),
+            flags: 0x301,
+            scope_name: "io.otel.http".to_string(),
+            scope_version: "1.4.2".to_string(),
+            scope_attrs: json("otel%2Escope%2Ebuild", "release"),
+            events: vec![LandingEvent {
+                time_ns: TS + 1_000_000,
+                name: "exception".to_string(),
+                attrs: json("exception%2Etype", "IOError"),
+                dropped_attrs: 1,
+            }],
+            dropped_events: 3,
+            links: vec![LandingLink {
+                trace_id: [0x11; 16],
+                span_id: [0x22; 8],
+                trace_state: "congo=t61rcWkgMzE".to_string(),
+                flags: 0x100,
+                attrs: json("link%2Ekind", "follows"),
+                dropped_attrs: 4,
+            }],
+            dropped_links: 5,
+            service: "checkout".to_string(),
+            attrs: json("k", &long),
+            attrs_other: vec![0x0a, 0x03, 0x6b, 0x65, 0x79],
+            dropped_attrs: 2,
+        };
+        let resource = LandingResource {
+            resource_id: Fingerprint::from_raw(7),
+            day: 19_600,
+            service: "checkout".to_string(),
+            attrs: json("host%2Ename", &long),
+            attrs_other: vec![0x0a, 0x01, 0x6b],
+            dropped_attrs: 1,
+            schema_url: "https://example.invalid/\"v1\"".to_string(),
+        };
+        let tag_name = LandingTagName {
+            scope: TagScope::Event,
+            key: long.clone(),
+        };
+        let tag_value = LandingTagValue {
+            scope: TagScope::Link,
+            key: "k".to_string(),
+            value: long,
+            val_type: "string",
+        };
+
+        vec![
+            ("span", TraceLandingRow::span(5, span)),
+            ("resource", TraceLandingRow::resource(5, resource)),
+            ("tag_name", TraceLandingRow::tag_name(5, tag_name)),
+            ("tag_value", TraceLandingRow::tag_value(5, tag_value)),
+        ]
+    }
+
     /// How long a string a case gives a row's `labels`, `help` or `unit` when
     /// it wants the encoder's string path to spill several times inside one
     /// value rather than at a field boundary.

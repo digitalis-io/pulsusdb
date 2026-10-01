@@ -686,6 +686,14 @@ fn validate_impl<'serde, 'caller, R: Row>(
                 root,
                 kind: InnerDataTypeValidatorKind::Array(&DataTypeNode::LineString),
             })),
+            // PATCHES.md §3. The JSON type's RowBinary form is a path count
+            // then one (path, type tag, value) per path, and the caller owns
+            // those bytes. Returning `Ok(None)` stops validation for the
+            // whole sequence — `Option<InnerDataTypeValidator>::validate`
+            // returns `Ok(None)` the moment the validator is `None` — which
+            // is the patch's stated limit: a wrong type tag reaches the
+            // server rather than the driver.
+            DataTypeNode::JSON => Ok(None),
             _ => root.err_on_schema_mismatch(data_type, serde_type, is_inner),
         },
         SerdeType::Tuple(len) => match data_type {

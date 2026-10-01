@@ -99,7 +99,7 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:752	crates/pulsus-write/src/protocols/otlp_traces.rs	752		prose	numeric_val_num	numeric_val_num
+docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:759	crates/pulsus-write/src/protocols/otlp_traces.rs	759		prose	numeric_val_num	numeric_val_num
 docs/query-lowering.md	exec.rs:2983-2989	crates/pulsus-read/src/traces/exec.rs	2983	2989	prose	TRACE_SEARCH_MAX_BLOCK_ROWS	read_overflow_mode
 docs/query-lowering.md	exec.rs:3023	crates/pulsus-read/src/traces/exec.rs	3023		prose	generator_settings	generator_settings
 docs/query-lowering.md	exec.rs:808	crates/pulsus-read/src/traces/exec.rs	808		prose	map_trace_generator_error	map_trace_generator_error

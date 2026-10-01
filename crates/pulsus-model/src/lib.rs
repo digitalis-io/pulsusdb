@@ -16,7 +16,7 @@ pub use canonical::{
     log_label_name,
 };
 pub use fingerprint::{
-    build_metric_buffer, build_stream_buffer, metric_fingerprint, raw_cityhash64,
+    build_metric_buffer, build_stream_buffer, compose128, metric_fingerprint, raw_cityhash64,
     stream_fingerprint,
 };
 pub use float_histogram::{

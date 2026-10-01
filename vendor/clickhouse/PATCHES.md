@@ -7,9 +7,13 @@ path is unchanged. See
 [`docs/decisions/0007-clickhouse-vendor-patch.md`](../../docs/decisions/0007-clickhouse-vendor-patch.md)
 for the decision this copy implements, and issue #382 for the measurements.
 
-**Two patches, in two functions**, both in `src/response.rs`: §1
+**Three patches, in three functions across two files**: §1
 (`collect_bad_response`, issue #382) and §2 (`extract_exception` and
-`DetectDbException`, issue #412). Nothing else is modified. The vendored tree
+`DetectDbException`, issue #412), both in `src/response.rs`, and §3
+(`validate_impl`, issue #585) in `src/rowbinary/validation.rs`. One
+test-support export joins them in `src/lib.rs`'s `_priv` module and is
+named in §3; it is not a change to the driver's behaviour. Nothing else is
+modified. The vendored tree
 drops upstream's `examples/`, `tests/`, `benches/`, CI and toolchain files and
 their `[[example]]`/`[[test]]`/`[[bench]]` target declarations; `src/`,
 `Cargo.toml`'s dependency and feature sets, `Cargo.lock`, `README.md`,
@@ -326,3 +330,109 @@ and request otherwise:
 
 Add `?default_format=RowBinary` and the last two stream on a stock 26.3
 container.
+## 3. `validate_impl` accepts a `Vec` against a `JSON` column
+
+`src/rowbinary/validation.rs`, in `validate_impl`'s `SerdeType::Seq(_)` arm.
+
+### What upstream does
+
+The arm matches `Array`, `Map`, `Ring`, `Polygon`, `MultiPolygon`,
+`LineString` and `MultiLineString`, and falls to `err_on_schema_mismatch` for
+everything else. The `SerdeType::Str | SerdeType::String` arm is what matches
+`DataTypeNode::JSON`. So a `Vec` against a `JSON` column is
+`Error::SchemaMismatch`.
+
+### Why that is a defect for us
+
+A `JSON` column's RowBinary form is a **path count, then per path a
+length-prefixed path string and the value as a binary-encoded `Dynamic`** — a
+type tag then the value's own bytes, with no length prefix on the column as a
+whole. Captured off ClickHouse 26.3.29.7 with
+`SELECT CAST('<text>' AS JSON) FORMAT RowBinary`:
+
+```text
+{"a":1}                              0101610a0100000000000000
+{"k":["a",1]}                        01016b1e2b20021501610a0100000000000000
+{"k":{}}                             00
+```
+
+The only shape a Rust type can take to produce that is a sequence of
+`(path, tagged value)` pairs. Writing the column as a Rust `String` instead is
+accepted and is the **JSON-as-string** form, which the server reads only at
+`input_format_binary_read_json_as_string = 1` and which cannot carry a
+non-finite double at all: text JSON refuses one on this engine — four
+attempts, each `SELECT toJSONString(CAST('<text>' AS JSON))` on 26.3.29.7,
+with `{"k":NaN}`, `{"k":Inf}`, `{"k":Infinity}` and `{"k":1e400}` each
+answering `Code: 117. DB::Exception: Cannot parse JSON object here`. A span
+attribute is a client-chosen `double`, so a path that cannot carry `±Inf` or
+`NaN` cannot carry what a sender sends.
+
+There is no length-prefix-free byte route either: `serialize_bytes` and
+`serialize_str` both write a LEB128 prefix, and the one exception,
+`WithoutLenPrefix` in `serialize_newtype_struct`, is gated on
+`name.starts_with(int256::MODULE_PATH)` and validates `Bytes(32)`.
+
+**No table in this workspace had a `JSON` column before this change**:
+`git grep -n 'JSON  *CODEC\|  JSON,' 53c2518e -- crates` returns nothing, and
+the three JSON-ish columns in the shipped schema (`log_streams.labels`,
+`log_landing.labels`, `trace_attrs_idx.val`) are `String`.
+
+### The change
+
+One match arm:
+
+```rust
+DataTypeNode::JSON => Ok(None),
+```
+
+`Option<InnerDataTypeValidator>::validate` returns `Ok(None)` the moment the
+validator is `None`, so nothing inside the sequence is validated and the
+writer owns every byte. The arm applies at **any depth**, which is what covers
+the `attrs` inside an `Array(Tuple(…, attrs JSON, …))` column.
+
+Additive, no public API change, no `Error` variant added or altered, no
+semver impact. Every other arm is untouched, so every other column type is
+validated exactly as before.
+
+### What this patch does not reach
+
+**Nothing inside the sequence is validated**, so a wrong type tag reaches the
+server rather than the driver, and the error is then a server exception on the
+insert rather than a `SchemaMismatch` before it. That is the patch's stated
+limit. What stands in for it is the byte-exact cases in
+`crates/pulsus-write/src/writer/trace_json.rs`, which reproduce all eleven
+captured frames above from this workspace's own encoder.
+
+### The test-support export in `_priv`
+
+`src/lib.rs`, `_priv::serialize_row_unvalidated`. The crate's own
+`serialize_row_binary` is `pub(crate)` and nothing public reaches a row's
+bytes without a client and a server, so the byte-exact cases above had no
+door. It serializes one row with no column metadata and so no validation, it
+is called from no production path, and the validating serializer the client
+uses is untouched.
+
+### Gates
+
+Neither the vendored crate's own `#[test]`s nor a new CI step for them exist —
+`clickhouse` is a `[patch.crates-io]` path source, not a workspace member, so
+`cargo test --workspace` never compiles them, and a `#[test]` added there
+would be a case that cannot fail. The gate therefore lives in
+`pulsus-clickhouse`'s suites, exactly as §1's and §2's do:
+
+- **Live** (`tests/live_clickhouse.rs`, the `schema-it` job's
+  `Live ClickHouse client suite` step):
+  `a_vec_against_a_json_column_is_accepted` inserts a sequence into a `JSON`
+  column, reads the stored path back, and checks that an `Array(Tuple(…))`
+  column still admits a sequence and a `UInt8` column still refuses one.
+  Measured with the arm removed: the insert fails
+  `Decode("schema mismatch: … attempting to (de)serialize ClickHouse type
+  JSON as Vec<T>")`.
+
+**Re-vendor rule (§3):** on any `clickhouse` version bump, check whether
+upstream's `SerdeType::Seq(_)` arm admits `DataTypeNode::JSON`. If it does,
+drop this patch and take theirs; if it admits it with **validation** of the
+sequence's contents, read what it validates against before taking it — this
+workspace writes the column's bytes itself and a validator that expects
+another shape refuses every trace push.
+

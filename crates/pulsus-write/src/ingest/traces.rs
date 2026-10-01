@@ -255,3 +255,194 @@ mod tests {
         assert_eq!(parsed.rejected_message, None);
     }
 }
+
+// === The landing-shaped decode (issues #584 to #586) ======================
+//
+// `SpanRecord`/`AttrRecord` above are the OLD two-table path's shape and are
+// untouched: the reads that have not moved still answer from `trace_spans`
+// and `trace_attrs_idx`. The types below are what the landing path decodes
+// into, and they carry what that path stores and the old one does not —
+// events, links, the scope's attributes, the resource's attributes, the
+// trace state, the flags and the four dropped counts, all of which the old
+// path keeps inside the span's protobuf `payload` blob instead.
+//
+// **The decode is a second walk over the same request, not a projection of
+// the first.** A `SpanRecord` cannot be widened into one of these: it holds
+// a rendered-text view of the attributes it indexed and no resource
+// identity, and the two walks are kept independent so neither path's
+// behaviour depends on the other's.
+
+use pulsus_model::Fingerprint;
+
+use crate::writer::trace_json::TraceJson;
+
+/// One span event, as the `events` column's element tuple stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingEvent {
+    pub time_ns: i64,
+    pub name: String,
+    pub attrs: TraceJson,
+    pub dropped_attrs: u32,
+}
+
+/// One span link, as the `links` column's element tuple stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingLink {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub trace_state: String,
+    pub flags: u32,
+    pub attrs: TraceJson,
+    pub dropped_attrs: u32,
+}
+
+/// One decoded span, in the shape the kind-0 landing row is built from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingSpan {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    /// `[0u8; 8]` for a root span, which is what `traces_mv`'s
+    /// `parent_span_id = toFixedString('', 8)` tests.
+    pub parent_span_id: [u8; 8],
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    /// The resource this span belongs to, which is also the key of the
+    /// kind-1 row the push lands for it.
+    pub resource_id: Fingerprint,
+    pub name: String,
+    pub kind: u8,
+    pub status_code: u8,
+    pub status_message: String,
+    pub trace_state: String,
+    pub flags: u32,
+    pub scope_name: String,
+    pub scope_version: String,
+    pub scope_attrs: TraceJson,
+    pub events: Vec<LandingEvent>,
+    pub dropped_events: u32,
+    pub links: Vec<LandingLink>,
+    pub dropped_links: u32,
+    /// The resource's `service.name`, rendered verbatim, `""` when absent.
+    pub service: String,
+    pub attrs: TraceJson,
+    /// The protobuf serialization of an
+    /// `opentelemetry.proto.common.v1.KeyValueList` carrying the keys whose
+    /// values no JSON path can hold, under their **original OTLP keys**
+    /// rather than escaped paths — they are not JSON paths.
+    pub attrs_other: Vec<u8>,
+    pub dropped_attrs: u32,
+}
+
+/// One resource, as the kind-1 landing row stores it: one per distinct
+/// `(resource_id, day)` **in the push**.
+///
+/// `day` is the UTC day of the spans that resource carried in this push, so
+/// a push whose spans straddle midnight emits two rows for one resource.
+/// That is what `resources`' "one row per distinct resource per day" means,
+/// and a resource joined at read time by a day-bounded predicate needs a row
+/// in each day it appears in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingResource {
+    pub resource_id: Fingerprint,
+    /// Days since the Unix epoch, the bare `u16` the `Date` column takes.
+    pub day: u16,
+    pub service: String,
+    /// The resource's attributes **without** `service.name`: the span row
+    /// carries it as a column. The identity above still covers it — see
+    /// `otlp_traces`'s resource-identity note.
+    pub attrs: TraceJson,
+    pub attrs_other: Vec<u8>,
+    pub dropped_attrs: u32,
+    pub schema_url: String,
+}
+
+/// The five attribute scopes the tag catalogs discriminate on, which are the
+/// five `docs/TraceQL/measure/schema.sql`'s own `tag_names` comment admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TagScope {
+    Span,
+    Resource,
+    Event,
+    Link,
+    Instrumentation,
+}
+
+impl TagScope {
+    /// The stored spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TagScope::Span => "span",
+            TagScope::Resource => "resource",
+            TagScope::Event => "event",
+            TagScope::Link => "link",
+            TagScope::Instrumentation => "instrumentation",
+        }
+    }
+}
+
+/// One tag name, as the kind-2 landing row stores it: one per distinct
+/// `(scope, key)` **in the push**.
+///
+/// The key is the **original OTLP key**, not the escaped JSON path: the
+/// catalog answers `GET /api/v2/search/tags`, whose values are the keys a
+/// client writes in a query.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandingTagName {
+    pub scope: TagScope,
+    pub key: String,
+}
+
+/// One tag value, as the kind-3 landing row stores it: one per distinct
+/// `(scope, key, value, type)` **in the push**.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandingTagValue {
+    pub scope: TagScope,
+    pub key: String,
+    pub value: String,
+    /// `string`, `int`, `float` or `bool` — the four values
+    /// `tag_values`' own comment admits.
+    pub val_type: &'static str,
+}
+
+/// The landing-shaped decode of one trace push: the four landed event
+/// shapes, each already deduplicated **inside the push**, plus the
+/// per-request partial-success accounting.
+///
+/// **There is no cache of anything already written.** Kinds 1, 2 and 3 are
+/// deduplicated from this push's own decoded spans and nothing else: no
+/// per-process set, no LRU, no cross-push state. A push that fails re-emits
+/// everything next time. The two shipped signals can key a commit-promoted
+/// LRU on a time bucket, so a registration lost to a fan-out failure
+/// reappears at the next bucket; `tag_names` and `tag_values` are time-less
+/// by contract (`docs/api.md` §4.3) and have no heal interval at all.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParsedTraceLanding {
+    pub spans: Vec<LandingSpan>,
+    pub resources: Vec<LandingResource>,
+    pub tag_names: Vec<LandingTagName>,
+    pub tag_values: Vec<LandingTagValue>,
+    /// Count of individual spans dropped during parsing.
+    pub rejected: u64,
+    /// The first rejection's error message, surfaced verbatim as the OTLP
+    /// `partial_success.error_message`.
+    pub rejected_message: Option<String>,
+}
+
+impl ParsedTraceLanding {
+    /// The landed rows this push produces, over all four kinds. The per-push
+    /// row ceiling is counted over this figure: a case counting kind 0 alone
+    /// passes at a push the server would split.
+    pub fn total_rows(&self) -> u64 {
+        (self.spans.len() + self.resources.len() + self.tag_names.len() + self.tag_values.len())
+            as u64
+    }
+
+    /// `true` when the push carried no span at all. Such a push makes no
+    /// block and no insert and is charged for nothing.
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+            && self.resources.is_empty()
+            && self.tag_names.is_empty()
+            && self.tag_values.is_empty()
+    }
+}

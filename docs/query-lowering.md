@@ -2795,7 +2795,7 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 drops any of them answers differently from the evaluator.
 
 - **Compare `val_num`, not `val`, and gate on `isNotNull(val_num)`.** The `f64` rounding happens at
-  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:752`) is
+  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:759`) is
   `val.parse::<f64>().filter(is_finite)` — so both sides of the comparison already read the rounded
   number and there is no unrounded side to disagree with. But the `val` String still holds the
   original text:

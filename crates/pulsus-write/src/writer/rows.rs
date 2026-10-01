@@ -9,11 +9,14 @@ use pulsus_model::{Fingerprint, LabelSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
-use crate::ingest::traces::{AttrRecord, SpanRecord};
+use crate::ingest::traces::{
+    AttrRecord, LandingResource, LandingSpan, LandingTagName, LandingTagValue, SpanRecord,
+};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::backfill::BackfillRow;
 use crate::writer::registration::StreamKey;
 use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
+use crate::writer::trace_json::TraceJson;
 
 /// One `log_samples` row (docs/schemas.md §3.1). `structured_metadata` is a
 /// canonical sorted-key JSON String (issue #97), the LAST field so the
@@ -2723,6 +2726,810 @@ mod tests {
             "the labels the row holds ({}) are inside the kind's own estimate ({})",
             row.labels.capacity(),
             MetricSeriesRow::est_source_bytes(&series)
+        );
+    }
+}
+
+// === The traces landing row (issues #584 to #586) =========================
+
+/// One span event, as the `events` column's element tuple serialises.
+///
+/// **Serialized as a tuple, not as a struct.** RowBinary's
+/// `serialize_struct` hands the row serializer back unchanged and never
+/// consults the column validator, so a nested struct is written against the
+/// root's next column rather than against the tuple's elements;
+/// `serialize_tuple` is what `DataTypeNode::Tuple` validates. The element
+/// order is the column's declared order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceEventTuple {
+    pub time_ns: i64,
+    pub name: String,
+    pub attrs: TraceJson,
+    pub dropped_attrs: u32,
+}
+
+impl Serialize for TraceEventTuple {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(4)?;
+        t.serialize_element(&self.time_ns)?;
+        t.serialize_element(self.name.as_str())?;
+        t.serialize_element(&self.attrs)?;
+        t.serialize_element(&self.dropped_attrs)?;
+        t.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceEventTuple {
+    /// Refuses, for [`TraceJson`]'s own reason: the landing table is written
+    /// and never read back through this row type.
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a landing row is written by this encoder and never read back through it",
+        ))
+    }
+}
+
+/// One span link, as the `links` column's element tuple serialises. See
+/// [`TraceEventTuple`] for why this is a tuple.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceLinkTuple {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub trace_state: String,
+    pub flags: u32,
+    pub attrs: TraceJson,
+    pub dropped_attrs: u32,
+}
+
+impl Serialize for TraceLinkTuple {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(6)?;
+        t.serialize_element(&self.trace_id)?;
+        t.serialize_element(&self.span_id)?;
+        t.serialize_element(self.trace_state.as_str())?;
+        t.serialize_element(&self.flags)?;
+        t.serialize_element(&self.attrs)?;
+        t.serialize_element(&self.dropped_attrs)?;
+        t.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceLinkTuple {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a landing row is written by this encoder and never read back through it",
+        ))
+    }
+}
+
+/// One `trace_landing` row: the union of the four landed event shapes'
+/// columns, discriminated by `row_kind`.
+///
+/// **Thirty-one fields, and `event_id` is not one of them.** The table has
+/// thirty-two columns; the writer leaves the landed event's own identity out
+/// of the insert so the server fills it from `DEFAULT generateUUIDv7()`.
+/// It is not the retry mechanism: that is the `insert_deduplication_token`
+/// the writer mints per sealed block.
+///
+/// **The discriminator is `row_kind`, not `kind`.** A span carries an OTLP
+/// span kind in a column already called `kind`, which `spans` and its
+/// `ReplacingMergeTree` key both use.
+///
+/// **`service`, `attrs`, `attrs_other` and `dropped_attrs` are shared
+/// between kind 0 and kind 1** — a span's attributes and a resource's are
+/// never on one row, so one JSON column serves both, the way
+/// `log_landing.timestamp_ns` serves a line time and a pattern bucket.
+///
+/// No `Deserialize` that returns a value: this row is written and the five
+/// targets are read through their own column lists.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct TraceLandingRow {
+    pub received_ms: i64,
+    pub row_kind: u8,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_span_id: [u8; 8],
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    pub resource_id: Fingerprint,
+    pub name: String,
+    pub kind: u8,
+    pub status_code: u8,
+    pub status_message: String,
+    pub trace_state: String,
+    pub flags: u32,
+    pub scope_name: String,
+    pub scope_version: String,
+    pub scope_attrs: TraceJson,
+    pub events: Vec<TraceEventTuple>,
+    pub dropped_events: u32,
+    pub links: Vec<TraceLinkTuple>,
+    pub dropped_links: u32,
+    pub service: String,
+    pub attrs: TraceJson,
+    /// A binary protobuf blob in a `String` column, routed through
+    /// `serde_bytes` so it serializes length-prefixed rather than as
+    /// serde's default `Vec<u8>`-as-sequence, which would target
+    /// `Array(UInt8)` and fail the insert.
+    #[serde(with = "serde_bytes")]
+    pub attrs_other: Vec<u8>,
+    pub dropped_attrs: u32,
+    /// The bare `u16` days-since-epoch the `Date` column takes.
+    pub day: u16,
+    pub schema_url: String,
+    pub tag_scope: String,
+    pub tag_key: String,
+    pub tag_value: String,
+    pub tag_type: String,
+}
+
+/// One traces landing row's own inline footprint, in the shape the WRITER
+/// QUEUE holds it. Taken from `size_of` rather than written down, so it
+/// cannot drift from the fields it prices — [`LANDING_ROW_SLOT_BYTES`]'s
+/// rule.
+///
+/// **Every row of every kind holds every slot**: the type is the union of
+/// four kinds' columns, so a kind-3 row carrying four short strings occupies
+/// the same inline footprint as a span row.
+pub const TRACE_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<TraceLandingRow>() as u64;
+
+impl TraceLandingRow {
+    /// A span, whose targets are `spans` and `traces`.
+    pub const KIND_SPAN: u8 = 0;
+    /// A resource, whose target is `resources`.
+    pub const KIND_RESOURCE: u8 = 1;
+    /// A tag name, whose target is `tag_names`.
+    pub const KIND_TAG_NAME: u8 = 2;
+    /// A tag value, whose target is `tag_values`.
+    pub const KIND_TAG_VALUE: u8 = 3;
+
+    /// What the ingest queue is charged for one landing row whose kind's own
+    /// owned text prices `kind_bytes`.
+    ///
+    /// `PULSUS_INGEST_QUEUE_BYTES` names the buffered bytes, and a landing
+    /// row is held as a whole [`TraceLandingRow`] until its block is
+    /// encoded, so the row's inline slots are charged beside the text it
+    /// owns.
+    pub fn est_landing_bytes(kind_bytes: u64) -> u64 {
+        kind_bytes + TRACE_LANDING_ROW_SLOT_BYTES
+    }
+
+    /// A row of `row_kind` with every kind-specific column at its default.
+    fn of_kind(received_ms: i64, row_kind: u8) -> Self {
+        TraceLandingRow {
+            received_ms,
+            row_kind,
+            trace_id: [0u8; 16],
+            span_id: [0u8; 8],
+            parent_span_id: [0u8; 8],
+            start_ns: 0,
+            duration_ns: 0,
+            resource_id: Fingerprint::from_raw(0),
+            name: String::new(),
+            kind: 0,
+            status_code: 0,
+            status_message: String::new(),
+            trace_state: String::new(),
+            flags: 0,
+            scope_name: String::new(),
+            scope_version: String::new(),
+            scope_attrs: TraceJson::empty(),
+            events: Vec::new(),
+            dropped_events: 0,
+            links: Vec::new(),
+            dropped_links: 0,
+            service: String::new(),
+            attrs: TraceJson::empty(),
+            attrs_other: Vec::new(),
+            dropped_attrs: 0,
+            day: 0,
+            schema_url: String::new(),
+            tag_scope: String::new(),
+            tag_key: String::new(),
+            tag_value: String::new(),
+            tag_type: String::new(),
+        }
+    }
+
+    /// A kind-0 row: the columns `spans_mv` and `traces_mv` read, and no
+    /// others.
+    ///
+    /// **Takes its argument by value** and moves the span's text and its
+    /// encoded attributes out of it, so the decoded span and the landing row
+    /// never hold the same bytes at once.
+    pub fn span(received_ms: i64, span: LandingSpan) -> Self {
+        TraceLandingRow {
+            trace_id: span.trace_id,
+            span_id: span.span_id,
+            parent_span_id: span.parent_span_id,
+            start_ns: span.start_ns,
+            duration_ns: span.duration_ns,
+            resource_id: span.resource_id,
+            name: span.name,
+            kind: span.kind,
+            status_code: span.status_code,
+            status_message: span.status_message,
+            trace_state: span.trace_state,
+            flags: span.flags,
+            scope_name: span.scope_name,
+            scope_version: span.scope_version,
+            scope_attrs: span.scope_attrs,
+            events: span
+                .events
+                .into_iter()
+                .map(|e| TraceEventTuple {
+                    time_ns: e.time_ns,
+                    name: e.name,
+                    attrs: e.attrs,
+                    dropped_attrs: e.dropped_attrs,
+                })
+                .collect(),
+            dropped_events: span.dropped_events,
+            links: span
+                .links
+                .into_iter()
+                .map(|l| TraceLinkTuple {
+                    trace_id: l.trace_id,
+                    span_id: l.span_id,
+                    trace_state: l.trace_state,
+                    flags: l.flags,
+                    attrs: l.attrs,
+                    dropped_attrs: l.dropped_attrs,
+                })
+                .collect(),
+            dropped_links: span.dropped_links,
+            service: span.service,
+            attrs: span.attrs,
+            attrs_other: span.attrs_other,
+            dropped_attrs: span.dropped_attrs,
+            ..Self::of_kind(received_ms, Self::KIND_SPAN)
+        }
+    }
+
+    /// A kind-1 row: the columns `resources_mv` reads, and no others.
+    pub fn resource(received_ms: i64, resource: LandingResource) -> Self {
+        TraceLandingRow {
+            resource_id: resource.resource_id,
+            service: resource.service,
+            attrs: resource.attrs,
+            attrs_other: resource.attrs_other,
+            dropped_attrs: resource.dropped_attrs,
+            day: resource.day,
+            schema_url: resource.schema_url,
+            ..Self::of_kind(received_ms, Self::KIND_RESOURCE)
+        }
+    }
+
+    /// A kind-2 row: the columns `tag_names_mv` reads, and no others.
+    pub fn tag_name(received_ms: i64, tag: LandingTagName) -> Self {
+        TraceLandingRow {
+            tag_scope: tag.scope.as_str().to_string(),
+            tag_key: tag.key,
+            ..Self::of_kind(received_ms, Self::KIND_TAG_NAME)
+        }
+    }
+
+    /// A kind-3 row: the columns `tag_values_mv` reads, and no others.
+    pub fn tag_value(received_ms: i64, tag: LandingTagValue) -> Self {
+        TraceLandingRow {
+            tag_scope: tag.scope.as_str().to_string(),
+            tag_key: tag.key,
+            tag_value: tag.value,
+            tag_type: tag.val_type.to_string(),
+            ..Self::of_kind(received_ms, Self::KIND_TAG_VALUE)
+        }
+    }
+
+    /// The bytes one kind-0 row's own owned content prices, **walked field
+    /// by field**: the text it owns, the encoded length of its two JSON
+    /// columns, and **for `events` and `links` their vectors by capacity
+    /// plus every element's own text and encoded attributes**.
+    ///
+    /// The arrays are the term that has to be walked rather than counted: a
+    /// span's events and links are client-chosen and unbounded short of the
+    /// expansion ceiling, so a charge that priced the vector headers alone
+    /// would not bound what the queue holds.
+    pub fn est_span_bytes(span: &LandingSpan) -> u64 {
+        let text = span.name.len()
+            + span.service.len()
+            + span.status_message.len()
+            + span.trace_state.len()
+            + span.scope_name.len()
+            + span.scope_version.len()
+            + span.attrs_other.len();
+        let events = span.events.capacity() as u64 * std::mem::size_of::<TraceEventTuple>() as u64
+            + span
+                .events
+                .iter()
+                .map(|e| e.name.len() as u64 + e.attrs.encoded_len() + e.attrs.allocated_bytes())
+                .sum::<u64>();
+        let links = span.links.capacity() as u64 * std::mem::size_of::<TraceLinkTuple>() as u64
+            + span
+                .links
+                .iter()
+                .map(|l| {
+                    l.trace_state.len() as u64 + l.attrs.encoded_len() + l.attrs.allocated_bytes()
+                })
+                .sum::<u64>();
+        text as u64
+            + span.attrs.encoded_len()
+            + span.attrs.allocated_bytes()
+            + span.scope_attrs.encoded_len()
+            + span.scope_attrs.allocated_bytes()
+            + events
+            + links
+    }
+
+    /// The bytes one kind-1 row's own owned content prices.
+    pub fn est_resource_bytes(resource: &LandingResource) -> u64 {
+        (resource.service.len() + resource.schema_url.len() + resource.attrs_other.len()) as u64
+            + resource.attrs.encoded_len()
+            + resource.attrs.allocated_bytes()
+    }
+
+    /// The bytes one kind-2 row's own owned content prices.
+    pub fn est_tag_name_bytes(tag: &LandingTagName) -> u64 {
+        (tag.scope.as_str().len() + tag.key.len()) as u64
+    }
+
+    /// The bytes one kind-3 row's own owned content prices.
+    pub fn est_tag_value_bytes(tag: &LandingTagValue) -> u64 {
+        (tag.scope.as_str().len() + tag.key.len() + tag.value.len() + tag.val_type.len()) as u64
+    }
+}
+
+impl SpoolEncode for TraceLandingRow {
+    /// `row_kind` and `received_ms`, then exactly the columns that kind
+    /// sets. One encoder emitting every column of the union would put
+    /// another kind's fields in a row that does not carry them.
+    ///
+    /// The two JSON columns and the two arrays are rendered as their stored
+    /// **paths**, not as a JSON document: the column's own form is binary,
+    /// and an audit record claiming to be the stored JSON would be a second
+    /// encoding nothing checks.
+    fn to_spool_value(&self) -> serde_json::Value {
+        match self.row_kind {
+            Self::KIND_SPAN => serde_json::json!({
+                "row_kind": self.row_kind,
+                "received_ms": self.received_ms,
+                "trace_id": hex_lower(&self.trace_id),
+                "span_id": hex_lower(&self.span_id),
+                "parent_span_id": hex_lower(&self.parent_span_id),
+                "start_ns": self.start_ns,
+                "duration_ns": self.duration_ns,
+                "resource_id": self.resource_id,
+                "name": self.name,
+                "kind": self.kind,
+                "status_code": self.status_code,
+                "status_message": self.status_message,
+                "trace_state": self.trace_state,
+                "flags": self.flags,
+                "scope_name": self.scope_name,
+                "scope_version": self.scope_version,
+                "scope_attrs": self.scope_attrs.to_string(),
+                "attrs": self.attrs.to_string(),
+                "attrs_other_bytes": self.attrs_other.len() as u64,
+                "dropped_attrs": self.dropped_attrs,
+                "events": self.events.len() as u64,
+                "dropped_events": self.dropped_events,
+                "links": self.links.len() as u64,
+                "dropped_links": self.dropped_links,
+                "service": self.service,
+            }),
+            Self::KIND_RESOURCE => serde_json::json!({
+                "row_kind": self.row_kind,
+                "received_ms": self.received_ms,
+                "resource_id": self.resource_id,
+                "service": self.service,
+                "attrs": self.attrs.to_string(),
+                "attrs_other_bytes": self.attrs_other.len() as u64,
+                "dropped_attrs": self.dropped_attrs,
+                "day": self.day,
+                "schema_url": self.schema_url,
+            }),
+            Self::KIND_TAG_NAME => serde_json::json!({
+                "row_kind": self.row_kind,
+                "received_ms": self.received_ms,
+                "tag_scope": self.tag_scope,
+                "tag_key": self.tag_key,
+            }),
+            // Every row is one of the four kinds — nothing else constructs
+            // one — so this arm is the tag value's. Matching it as the
+            // fallback rather than panicking keeps the audit record readable
+            // on the one path that reaches this encoder at all, which is a
+            // failure path.
+            _ => serde_json::json!({
+                "row_kind": self.row_kind,
+                "received_ms": self.received_ms,
+                "tag_scope": self.tag_scope,
+                "tag_key": self.tag_key,
+                "tag_value": self.tag_value,
+                "tag_type": self.tag_type,
+            }),
+        }
+    }
+
+    /// The same shape, written field by field into the sink.
+    ///
+    /// **Why this row overrides the default.** The default builds
+    /// [`Self::to_spool_value`] first — one row's whole value tree — beside
+    /// rows the queue reservation has already been charged for, and a span
+    /// row can carry megabytes of events. Written this way the row has no
+    /// value of its own.
+    ///
+    /// **The keys are in sorted order because that is the order the declared
+    /// shape serialises in.** `serde_json::Map` is a `BTreeMap` in this
+    /// workspace (no `preserve_order` feature), so a field added to a kind
+    /// above has to be added here in its sorted place;
+    /// `every_trace_landing_kind_streams_the_shape_it_declares` compares the
+    /// two documents byte for byte and reddens if it is not.
+    async fn write_spool_json(&self, out: &mut SpoolSink) -> std::io::Result<()> {
+        let mut o = out.begin_object().await?;
+        match self.row_kind {
+            Self::KIND_SPAN => {
+                o.str_field("attrs", &self.attrs.to_string()).await?;
+                o.field("attrs_other_bytes", &(self.attrs_other.len() as u64))
+                    .await?;
+                o.field("dropped_attrs", &self.dropped_attrs).await?;
+                o.field("dropped_events", &self.dropped_events).await?;
+                o.field("dropped_links", &self.dropped_links).await?;
+                o.field("duration_ns", &self.duration_ns).await?;
+                o.field("events", &(self.events.len() as u64)).await?;
+                o.field("flags", &self.flags).await?;
+                o.field("kind", &self.kind).await?;
+                o.field("links", &(self.links.len() as u64)).await?;
+                o.str_field("name", &self.name).await?;
+                o.str_field("parent_span_id", &hex_lower(&self.parent_span_id))
+                    .await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.field("resource_id", &self.resource_id).await?;
+                o.field("row_kind", &self.row_kind).await?;
+                o.str_field("scope_attrs", &self.scope_attrs.to_string())
+                    .await?;
+                o.str_field("scope_name", &self.scope_name).await?;
+                o.str_field("scope_version", &self.scope_version).await?;
+                o.str_field("service", &self.service).await?;
+                o.str_field("span_id", &hex_lower(&self.span_id)).await?;
+                o.field("start_ns", &self.start_ns).await?;
+                o.field("status_code", &self.status_code).await?;
+                o.str_field("status_message", &self.status_message).await?;
+                o.str_field("trace_id", &hex_lower(&self.trace_id)).await?;
+                o.str_field("trace_state", &self.trace_state).await?;
+            }
+            Self::KIND_RESOURCE => {
+                o.str_field("attrs", &self.attrs.to_string()).await?;
+                o.field("attrs_other_bytes", &(self.attrs_other.len() as u64))
+                    .await?;
+                o.field("day", &self.day).await?;
+                o.field("dropped_attrs", &self.dropped_attrs).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.field("resource_id", &self.resource_id).await?;
+                o.field("row_kind", &self.row_kind).await?;
+                o.str_field("schema_url", &self.schema_url).await?;
+                o.str_field("service", &self.service).await?;
+            }
+            Self::KIND_TAG_NAME => {
+                o.field("received_ms", &self.received_ms).await?;
+                o.field("row_kind", &self.row_kind).await?;
+                o.str_field("tag_key", &self.tag_key).await?;
+                o.str_field("tag_scope", &self.tag_scope).await?;
+            }
+            // The tag value's arm, as the fallback, for the reason
+            // [`Self::to_spool_value`]'s own fallback gives.
+            _ => {
+                o.field("received_ms", &self.received_ms).await?;
+                o.field("row_kind", &self.row_kind).await?;
+                o.str_field("tag_key", &self.tag_key).await?;
+                o.str_field("tag_scope", &self.tag_scope).await?;
+                o.str_field("tag_type", &self.tag_type).await?;
+                o.str_field("tag_value", &self.tag_value).await?;
+            }
+        }
+        o.end().await
+    }
+}
+
+#[cfg(test)]
+mod trace_landing_tests {
+    use super::*;
+    use crate::ingest::traces::{LandingEvent, LandingLink, TagScope};
+    use crate::writer::trace_json::{TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn json(path: &str, value: i64) -> TraceJson {
+        TraceJson::from_entries(vec![TraceJsonEntry {
+            path: path.to_string(),
+            value: TraceJsonValue::Scalar(TraceJsonScalar::Int(value)),
+        }])
+    }
+
+    fn span_fixture() -> LandingSpan {
+        LandingSpan {
+            trace_id: [0xab; 16],
+            span_id: [0xcd; 8],
+            parent_span_id: [0xef; 8],
+            start_ns: TS,
+            duration_ns: 4_000_000,
+            resource_id: Fingerprint::from_raw(7),
+            name: "GET /api".to_string(),
+            kind: 3,
+            status_code: 2,
+            status_message: "it broke".to_string(),
+            trace_state: "rojo=1".to_string(),
+            flags: 0x301,
+            scope_name: "io.otel.http".to_string(),
+            scope_version: "1.4.2".to_string(),
+            scope_attrs: json("build", 1),
+            events: vec![LandingEvent {
+                time_ns: TS + 1,
+                name: "exception".to_string(),
+                attrs: json("type", 2),
+                dropped_attrs: 1,
+            }],
+            dropped_events: 3,
+            links: vec![LandingLink {
+                trace_id: [0x11; 16],
+                span_id: [0x22; 8],
+                trace_state: "congo=1".to_string(),
+                flags: 0x100,
+                attrs: json("kind", 3),
+                dropped_attrs: 4,
+            }],
+            dropped_links: 5,
+            service: "checkout".to_string(),
+            attrs: json("k", 4),
+            attrs_other: vec![1, 2, 3],
+            dropped_attrs: 2,
+        }
+    }
+
+    fn resource_fixture() -> LandingResource {
+        LandingResource {
+            resource_id: Fingerprint::from_raw(7),
+            day: 19_600,
+            service: "checkout".to_string(),
+            attrs: json("host", 5),
+            attrs_other: vec![4, 5],
+            dropped_attrs: 1,
+            schema_url: "https://example.invalid/v1".to_string(),
+        }
+    }
+
+    /// **The insert omits `event_id`, so the server fills it.** The table has
+    /// thirty-two columns and the row type declares the other thirty-one;
+    /// the landed event's own identity comes from the column's
+    /// `DEFAULT generateUUIDv7()`.
+    ///
+    /// It is not the retry mechanism: that is the
+    /// `insert_deduplication_token` the writer mints per sealed block.
+    #[test]
+    fn the_insert_omits_event_id_so_the_server_fills_it() {
+        let names = <TraceLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
+        assert_eq!(
+            names.len(),
+            31,
+            "the table has 32 columns and the row type declares the other 31: {names:?}"
+        );
+        assert!(
+            !names.contains(&"event_id"),
+            "the landed event's own identity is the server's to fill: {names:?}"
+        );
+        // The insert's column list is exactly the row's own field order, so
+        // the first column is the one the DDL declares after `event_id`.
+        assert_eq!(names[0], "received_ms");
+        assert_eq!(names[1], "row_kind");
+    }
+
+    /// **Every landing column is the value its kind was built from**, and
+    /// every other column of that row is the type's default.
+    ///
+    /// It is what catches a column set on the wrong kind: a kind-3 row that
+    /// carried a `trace_id`, or a kind-0 row that carried a `tag_key`, would
+    /// reach the view for a kind it does not belong to.
+    #[test]
+    fn every_landing_column_is_the_value_its_kind_was_built_from() {
+        let received_ms = 5i64;
+        let span = TraceLandingRow::span(received_ms, span_fixture());
+        let resource = TraceLandingRow::resource(received_ms, resource_fixture());
+        let tag_name = TraceLandingRow::tag_name(
+            received_ms,
+            LandingTagName {
+                scope: TagScope::Span,
+                key: "k".to_string(),
+            },
+        );
+        let tag_value = TraceLandingRow::tag_value(
+            received_ms,
+            LandingTagValue {
+                scope: TagScope::Event,
+                key: "k".to_string(),
+                value: "v".to_string(),
+                val_type: "string",
+            },
+        );
+
+        // `received_ms` and `row_kind` are on every row.
+        for (label, row, kind) in [
+            ("span", &span, TraceLandingRow::KIND_SPAN),
+            ("resource", &resource, TraceLandingRow::KIND_RESOURCE),
+            ("tag_name", &tag_name, TraceLandingRow::KIND_TAG_NAME),
+            ("tag_value", &tag_value, TraceLandingRow::KIND_TAG_VALUE),
+        ] {
+            assert_eq!(row.received_ms, received_ms, "{label}");
+            assert_eq!(row.row_kind, kind, "{label}");
+        }
+
+        // The kind-0 row: every span column set, and nothing of the other
+        // three kinds.
+        let want = span_fixture();
+        assert_eq!(span.trace_id, want.trace_id);
+        assert_eq!(span.span_id, want.span_id);
+        assert_eq!(span.parent_span_id, want.parent_span_id);
+        assert_eq!(span.start_ns, want.start_ns);
+        assert_eq!(span.duration_ns, want.duration_ns);
+        assert_eq!(span.resource_id, want.resource_id);
+        assert_eq!(span.name, want.name);
+        assert_eq!(span.kind, want.kind);
+        assert_eq!(span.status_code, want.status_code);
+        assert_eq!(span.status_message, want.status_message);
+        assert_eq!(span.trace_state, want.trace_state);
+        assert_eq!(span.flags, want.flags);
+        assert_eq!(span.scope_name, want.scope_name);
+        assert_eq!(span.scope_version, want.scope_version);
+        assert_eq!(span.scope_attrs, want.scope_attrs);
+        assert_eq!(span.events.len(), 1);
+        assert_eq!(span.events[0].time_ns, want.events[0].time_ns);
+        assert_eq!(span.events[0].name, want.events[0].name);
+        assert_eq!(span.events[0].attrs, want.events[0].attrs);
+        assert_eq!(span.events[0].dropped_attrs, want.events[0].dropped_attrs);
+        assert_eq!(span.dropped_events, want.dropped_events);
+        assert_eq!(span.links.len(), 1);
+        assert_eq!(span.links[0].trace_id, want.links[0].trace_id);
+        assert_eq!(span.links[0].span_id, want.links[0].span_id);
+        assert_eq!(span.links[0].trace_state, want.links[0].trace_state);
+        assert_eq!(span.links[0].flags, want.links[0].flags);
+        assert_eq!(span.links[0].attrs, want.links[0].attrs);
+        assert_eq!(span.links[0].dropped_attrs, want.links[0].dropped_attrs);
+        assert_eq!(span.dropped_links, want.dropped_links);
+        assert_eq!(span.service, want.service);
+        assert_eq!(span.attrs, want.attrs);
+        assert_eq!(span.attrs_other, want.attrs_other);
+        assert_eq!(span.dropped_attrs, want.dropped_attrs);
+        // Not a span's: the resource's day and schema url, and the four tag
+        // columns.
+        assert_eq!(span.day, 0, "a span row carries no day");
+        assert_eq!(span.schema_url, "", "nor a schema url");
+        assert_eq!(span.tag_scope, "");
+        assert_eq!(span.tag_key, "");
+        assert_eq!(span.tag_value, "");
+        assert_eq!(span.tag_type, "");
+
+        // The kind-1 row: the seven columns `resources_mv` reads, and no
+        // others. `service`, `attrs`, `attrs_other` and `dropped_attrs` are
+        // the four shared with kind 0.
+        let want = resource_fixture();
+        assert_eq!(resource.resource_id, want.resource_id);
+        assert_eq!(resource.day, want.day);
+        assert_eq!(resource.service, want.service);
+        assert_eq!(resource.attrs, want.attrs);
+        assert_eq!(resource.attrs_other, want.attrs_other);
+        assert_eq!(resource.dropped_attrs, want.dropped_attrs);
+        assert_eq!(resource.schema_url, want.schema_url);
+        assert_eq!(resource.trace_id, [0u8; 16], "a resource row has no trace");
+        assert_eq!(resource.span_id, [0u8; 8]);
+        assert_eq!(resource.start_ns, 0);
+        assert_eq!(resource.duration_ns, 0);
+        assert_eq!(resource.name, "");
+        assert_eq!(resource.kind, 0);
+        assert_eq!(resource.status_code, 0);
+        assert_eq!(resource.status_message, "");
+        assert_eq!(resource.trace_state, "");
+        assert_eq!(resource.flags, 0);
+        assert_eq!(resource.scope_name, "");
+        assert_eq!(resource.scope_version, "");
+        assert!(resource.scope_attrs.is_empty());
+        assert!(resource.events.is_empty());
+        assert_eq!(resource.dropped_events, 0);
+        assert!(resource.links.is_empty());
+        assert_eq!(resource.dropped_links, 0);
+        assert_eq!(resource.tag_scope, "");
+        assert_eq!(resource.tag_key, "");
+
+        // The kind-2 row: two columns, and nothing else.
+        assert_eq!(tag_name.tag_scope, "span");
+        assert_eq!(tag_name.tag_key, "k");
+        assert_eq!(tag_name.tag_value, "", "a name row carries no value");
+        assert_eq!(tag_name.tag_type, "", "nor a type");
+        assert_eq!(tag_name.service, "", "nor the shared service column");
+        assert!(tag_name.attrs.is_empty());
+        assert_eq!(tag_name.attrs_other, Vec::<u8>::new());
+        assert_eq!(tag_name.dropped_attrs, 0);
+        assert_eq!(tag_name.day, 0);
+        assert_eq!(tag_name.resource_id, Fingerprint::from_raw(0));
+        assert_eq!(tag_name.trace_id, [0u8; 16]);
+
+        // The kind-3 row: four columns, and nothing else.
+        assert_eq!(tag_value.tag_scope, "event");
+        assert_eq!(tag_value.tag_key, "k");
+        assert_eq!(tag_value.tag_value, "v");
+        assert_eq!(tag_value.tag_type, "string");
+        assert_eq!(tag_value.service, "");
+        assert!(tag_value.attrs.is_empty());
+        assert_eq!(tag_value.day, 0);
+        assert_eq!(tag_value.trace_id, [0u8; 16]);
+        assert_eq!(tag_value.start_ns, 0);
+    }
+
+    /// **Every row of every kind holds every slot.** The row type is the
+    /// union of four kinds' columns, so a kind-3 row carrying four short
+    /// strings occupies the same inline footprint as a span row — and the
+    /// charge is that footprint plus the kind's own owned text.
+    #[test]
+    fn the_slot_figure_is_the_types_own_size_and_every_kind_pays_it() {
+        assert_eq!(
+            TRACE_LANDING_ROW_SLOT_BYTES,
+            std::mem::size_of::<TraceLandingRow>() as u64,
+            "the figure is taken from size_of rather than written down"
+        );
+        for kind_bytes in [0u64, 1, 4096] {
+            assert_eq!(
+                TraceLandingRow::est_landing_bytes(kind_bytes),
+                kind_bytes + TRACE_LANDING_ROW_SLOT_BYTES
+            );
+        }
+    }
+
+    /// **The charge walks the two arrays rather than counting their
+    /// headers.** A span's events and links are client-chosen and unbounded
+    /// short of the expansion ceiling, so a charge over the vector headers
+    /// alone would not bound what the queue holds — which is the term the
+    /// metrics work had to fix twice.
+    #[test]
+    fn the_span_charge_grows_with_every_event_and_link_it_holds() {
+        let one = span_fixture();
+        let base = TraceLandingRow::est_span_bytes(&one);
+
+        let mut more_events = span_fixture();
+        for i in 0..200 {
+            more_events.events.push(LandingEvent {
+                time_ns: TS + i,
+                name: format!("event-{i}-with-a-name-long-enough-to-notice"),
+                attrs: json("k", i),
+                dropped_attrs: 0,
+            });
+        }
+        let with_events = TraceLandingRow::est_span_bytes(&more_events);
+        let event_text: u64 = more_events.events.iter().map(|e| e.name.len() as u64).sum();
+        assert!(
+            with_events >= base + event_text,
+            "the charge ({with_events}) must cover the {event_text} bytes of \
+             event names it holds, over the one-event charge ({base})"
+        );
+
+        let mut more_links = span_fixture();
+        for i in 0..50 {
+            more_links.links.push(LandingLink {
+                trace_id: [0x11; 16],
+                span_id: [0x22; 8],
+                trace_state: format!("congo=link-{i}-with-a-long-enough-state"),
+                flags: 0,
+                attrs: json("k", i),
+                dropped_attrs: 0,
+            });
+        }
+        let with_links = TraceLandingRow::est_span_bytes(&more_links);
+        let link_text: u64 = more_links
+            .links
+            .iter()
+            .map(|l| l.trace_state.len() as u64)
+            .sum();
+        assert!(
+            with_links >= base + link_text,
+            "the charge ({with_links}) must cover the {link_text} bytes of \
+             link trace states it holds, over the one-link charge ({base})"
         );
     }
 }

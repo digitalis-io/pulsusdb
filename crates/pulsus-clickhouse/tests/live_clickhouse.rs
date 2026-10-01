@@ -861,3 +861,147 @@ async fn clustered_reader_settings_do_not_change_query_result_shape() {
     let row = stream.next().await.expect("one row").expect("decode");
     assert_eq!(row.fingerprint, 1);
 }
+
+/// **The gate that proves `vendor/clickhouse/PATCHES.md` §3 is still doing
+/// its job**: a `Vec` against a `JSON` column is accepted by the driver's
+/// insert-side schema validator.
+///
+/// Upstream's `SerdeType::Seq(_)` arm matches `Array`, `Map`, `Ring`,
+/// `Polygon`, `MultiPolygon`, `LineString` and `MultiLineString` and falls to
+/// `err_on_schema_mismatch` for everything else, so a `Vec` against a `JSON`
+/// column was `Error::SchemaMismatch`. The `JSON` type's RowBinary form is a
+/// path count then one `(path, type tag, value)` per path, and the writer
+/// owns those bytes, so the arm returns `Ok(None)` and the sequence is not
+/// validated.
+///
+/// **It is live and not hermetic, for the reason PATCHES.md's own Gates
+/// section gives**: the validating serializer runs only with column metadata
+/// the client reads off the server, and the vendored crate is a
+/// `[patch.crates-io]` path source rather than a workspace member, so a
+/// `#[test]` inside it is never compiled by `cargo test --workspace` and
+/// would be a case that cannot fail.
+///
+/// Three assertions, because the arm has to admit one thing and keep
+/// refusing the rest: the `JSON` column takes the sequence and the value
+/// reads back, an `Array(Tuple(…))` column still takes it, and a scalar
+/// column still refuses it. **One table per shape**, because the driver
+/// refuses an insert that leaves a non-default column out.
+///
+/// **The patch's stated limit is what this cannot show.** `Ok(None)` stops
+/// validation for the whole sequence, so a wrong type tag reaches the server
+/// rather than the driver; the byte-exact cases in
+/// `crates/pulsus-write/src/writer/trace_json.rs` stand in for that.
+#[tokio::test]
+async fn a_vec_against_a_json_column_is_accepted() {
+    skip_unless_live!();
+    use futures::StreamExt;
+
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    /// The `JSON` column's wire form for `{"k":7}`: one path, the path
+    /// string, the `Int64` type tag and eight little-endian bytes.
+    /// `serialize_tuple` writes no framing, so the nested tuple is the tag
+    /// followed by the value.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct JsonRow {
+        js: Vec<(String, (u8, i64))>,
+    }
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ArrRow {
+        arr: Vec<(String, u8)>,
+    }
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ScalarRow {
+        n: Vec<(String, u8)>,
+    }
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct OneInt {
+        /// `js.k.:Int64` is `Nullable(Int64)` — a subcolumn read of a
+        /// `JSON` path is null where the path is absent or holds another
+        /// type.
+        v: Option<i64>,
+    }
+
+    async fn fresh(client: &ChClient, table: &str, columns: &str) {
+        for sql in [
+            format!("DROP TABLE IF EXISTS {table}"),
+            format!("CREATE TABLE {table} ({columns}) ENGINE = MergeTree ORDER BY tuple()"),
+        ] {
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    let json_table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_json_seq");
+    let arr_table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_json_seq_arr");
+    let scalar_table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_json_seq_scalar");
+
+    fresh(&client, json_table, "js JSON").await;
+    fresh(&client, arr_table, "arr Array(Tuple(String, UInt8))").await;
+    fresh(&client, scalar_table, "n UInt8").await;
+
+    client
+        .insert_block(
+            json_table,
+            &[JsonRow {
+                js: vec![("k".to_string(), (0x0a, 7i64))],
+            }],
+        )
+        .await
+        .expect("a Vec against a JSON column is the patch's whole point");
+
+    let mut rows = client
+        .query_stream::<OneInt>(
+            &format!("SELECT js.k.:Int64 AS v FROM {json_table}"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the stored path back");
+    let stored = rows.next().await.expect("one row").expect("decode").v;
+    drop(rows);
+    assert_eq!(
+        stored,
+        Some(7),
+        "the bytes the writer sent are what the server stored"
+    );
+
+    client
+        .insert_block(
+            arr_table,
+            &[ArrRow {
+                arr: vec![("k".to_string(), 1u8)],
+            }],
+        )
+        .await
+        .expect("the arms the patch leaves alone still admit a Vec");
+
+    let err = client
+        .insert_block(
+            scalar_table,
+            &[ScalarRow {
+                n: vec![("k".to_string(), 1u8)],
+            }],
+        )
+        .await
+        .expect_err("a Vec against UInt8 is still refused by the driver");
+    assert!(
+        err.to_string().to_lowercase().contains("schema") || err.to_string().contains("UInt8"),
+        "wanted a schema mismatch naming the column type, got {err}"
+    );
+
+    for table in [json_table, arr_table, scalar_table] {
+        client
+            .execute(
+                &format!("DROP TABLE IF EXISTS {table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop");
+    }
+}
