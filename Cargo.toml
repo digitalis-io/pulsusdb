@@ -205,6 +205,24 @@ opentelemetry-proto = { path = "vendor/opentelemetry-proto" }
 # `extract_exception` runs per chunk and a non-final chunk ending `))\n`
 # still reaches `rfind(b"Code:")`. #412 stays open.
 clickhouse = { path = "vendor/clickhouse" }
+# ADR 0009 (vendor+patch `clickhouse-types 0.1.2`, issue #585): the type parser
+# cannot read a NAMED tuple at any depth — `Tuple(a Int64, b String)` gives
+# `Unknown data type: a Int64`, on 0.1.2 and on 0.1.3 — so insert-side schema
+# validation fails for every table with a named-tuple column, and
+# `DESCRIBE TABLE` returns the pretty form, which arrives with a newline and
+# four spaces before each element. Separately, `DataTypeNode::new` slices its
+# input at fixed byte offsets without checking either end is a character
+# boundary, so 103 inputs of a 1,073-input corpus abort the caller at 16 sites;
+# the parser's domain is bytes off the wire, so those are checked too. The
+# vendored copy tries a named reading first, accepts it only when the element
+# type's own rendering reproduces the argument's type text, and otherwise falls
+# back to the untouched existing code — additive: every string that parses today
+# keeps today's value and today's errors keep their bytes. See
+# vendor/clickhouse-types/PATCHES.md for the exhaustive change list and the
+# re-vendor rule, which is to re-run the indexing sweep over the new release's
+# `data_types.rs` rather than the corpus. This entry only redirects the
+# requirement, so every `clickhouse_types::...` import path is unchanged.
+clickhouse-types = { path = "vendor/clickhouse-types" }
 
 # Dev-profile debuginfo is line-tables-only: full DWARF across the workspace's
 # ~70 test binaries accumulated 45+ GB in target/debug/deps and filled the

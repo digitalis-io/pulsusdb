@@ -93,7 +93,9 @@ use prost::Message as _;
 // And one expected value: the server names a mixed array's stored type
 // `Array(Dynamic)`, without the `max_types` parameter the wire form carries.
 
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_clickhouse::{
+    ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
+};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 use pulsus_write::{ParsedTraceLanding, TraceLandingRow, parse_trace_landing, resource_identity};
 
@@ -357,9 +359,13 @@ fn request_with(
     }
 }
 
-/// Decodes `req` and inserts every row it produces into `trace_landing`
-/// through the production client, in **one** block — one push is one insert.
-async fn land(client: &ChClient, req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
+/// [`land`] without the panic, for the two cases whose own assertion is that
+/// the insert succeeded. A case that unwraps here reports neither the input
+/// nor the expectation.
+async fn try_land(
+    client: &ChClient,
+    req: &ExportTraceServiceRequest,
+) -> Result<ParsedTraceLanding, ChError> {
     let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
     let received_ms = now_ms();
     let mut rows: Vec<TraceLandingRow> = Vec::with_capacity(parsed.total_rows() as usize);
@@ -391,11 +397,14 @@ async fn land(client: &ChClient, req: &ExportTraceServiceRequest) -> ParsedTrace
             .cloned()
             .map(|t| TraceLandingRow::tag_value(received_ms, t)),
     );
-    client
-        .insert_block("trace_landing", &rows)
-        .await
-        .expect("the landing insert");
-    parsed
+    client.insert_block("trace_landing", &rows).await?;
+    Ok(parsed)
+}
+
+/// Decodes `req` and inserts every row it produces into `trace_landing`
+/// through the production client, in **one** block — one push is one insert.
+async fn land(client: &ChClient, req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
+    try_land(client, req).await.expect("the landing insert")
 }
 
 // --- the cases ------------------------------------------------------------
@@ -1184,7 +1193,13 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
             code: 2,
         }),
     };
-    land(&client, &request("checkout", vec![span])).await;
+    // **W1.** The insert's own `Result` is the first assertion, because this
+    // is the only case here that exercises the **approved** column types
+    // against a server — the table comes from the catalogue through
+    // `run_init`, so this is where `Display`'s compact form is checked against
+    // the server's own `getName()` byte for byte. Nothing unwraps.
+    let r = try_land(&client, &request("checkout", vec![span])).await;
+    assert!(r.is_ok(), "the landing insert returned {:?}", r.err());
 
     // The scalar columns, as one tab-separated row so one statement covers
     // them and the comparison names what differed.
@@ -1268,6 +1283,110 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
         )
         .await,
         "text|false|-7|2.5|[3,4]"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **W2.** One push, one span carrying **two** events and **two** links: both
+/// of each land, in declaration order.
+///
+/// Its mechanism is the validator's tuple cursor. `InnerDataTypeValidatorKind
+/// ::Tuple` is a slice consumed by `split_first`, so the **second** array
+/// element must be given a fresh one; a shared cursor would validate the
+/// second event's first field against `LowCardinality(String)` and the server
+/// would never see the block. One array element cannot see that.
+#[tokio::test]
+async fn two_events_and_two_links_in_one_span_all_land() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_w2")).await;
+
+    let start = now_ns();
+    let span = Span {
+        trace_id: vec![0x5a; 16],
+        span_id: vec![0x6b; 8],
+        parent_span_id: Vec::new(),
+        trace_state: String::new(),
+        flags: 0,
+        name: "two of each".to_string(),
+        kind: 2,
+        start_time_unix_nano: start as u64,
+        end_time_unix_nano: start as u64 + 2_000_000,
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        events: vec![
+            span::Event {
+                time_unix_nano: start as u64 + 100_000,
+                name: "first".to_string(),
+                attributes: vec![kv("e", str_value("one"))],
+                dropped_attributes_count: 1,
+            },
+            span::Event {
+                time_unix_nano: start as u64 + 200_000,
+                name: "second".to_string(),
+                attributes: vec![kv("e", str_value("two"))],
+                dropped_attributes_count: 2,
+            },
+        ],
+        dropped_events_count: 0,
+        links: vec![
+            span::Link {
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x21; 8],
+                trace_state: "a=1".to_string(),
+                attributes: vec![kv("l", str_value("one"))],
+                dropped_attributes_count: 3,
+                flags: 1,
+            },
+            span::Link {
+                trace_id: vec![0x12; 16],
+                span_id: vec![0x22; 8],
+                trace_state: "a=2".to_string(),
+                attributes: vec![kv("l", str_value("two"))],
+                dropped_attributes_count: 4,
+                flags: 2,
+            },
+        ],
+        dropped_links_count: 0,
+        status: None,
+    };
+
+    let r = try_land(&client, &request("checkout", vec![span])).await;
+    assert!(r.is_ok(), "the landing insert returned {:?}", r.err());
+
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT concat(\
+                toString(length(events)), '|', \
+                toString(events[1].2), '|', toString(events[2].2), '|', \
+                toString(events[1].4), '|', toString(events[2].4), '|', \
+                toString(events[1].3.`e`), '|', toString(events[2].3.`e`)\
+             ) AS s FROM spans"
+        )
+        .await,
+        "2|first|second|1|2|one|two",
+        "both events land, in declaration order, with their own attributes"
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT concat(\
+                toString(length(links)), '|', \
+                hex(links[1].1), '|', hex(links[2].1), '|', \
+                links[1].3, '|', links[2].3, '|', \
+                toString(links[1].6), '|', toString(links[2].6), '|', \
+                toString(links[1].5.`l`), '|', toString(links[2].5.`l`)\
+             ) AS s FROM spans"
+        )
+        .await,
+        format!(
+            "2|{}|{}|a=1|a=2|3|4|one|two",
+            "11".repeat(16),
+            "12".repeat(16)
+        ),
+        "both links land, keyed by their own trace ids, with their own \
+         attributes"
     );
 
     drop_db(&db).await;

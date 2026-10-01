@@ -109,6 +109,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Issue #585: `vendor/clickhouse-types` is a `[patch.crates-io]` path
+      # source, not a workspace member, so `cargo test --workspace` never
+      # compiles its 42 `#[test]`s. The patch there makes nineteen byte
+      # indices checked across seventeen parse functions, and a checked
+      # slice must return the same slice wherever the unchecked one did not
+      # panic — upstream's own compound-parser cases, which assert exact
+      # values and exact messages, are what holds that. The vendored crate
+      # carries an empty `[workspace]` table so this manifest resolves.
+      - name: Vendored type-parser crate's own suite
+        run: cargo test --manifest-path vendor/clickhouse-types/Cargo.toml
+
       # Issue #156: the upstream promqltest corpus is no longer vendored —
       # the test driver fetches it once from the pinned Prometheus commit,
       # verifies it against the committed upstream-manifest.json, and
