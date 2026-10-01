@@ -1036,6 +1036,90 @@ async fn the_resource_id_is_128_bits_and_stable() {
     drop_db(&db).await;
 }
 
+/// **Two resources differing only in a nested value's type stay two rows.**
+///
+/// `resources` is a `ReplacingMergeTree` keyed on `(service, resource_id)`,
+/// so this is the read that sees a shared identity: both resources carry one
+/// service, and an identity that tags only the outermost value gives them one
+/// id, the key collapses them under `FINAL`, and one resource's attributes
+/// are gone while the spans that carried its id join to the survivor.
+///
+/// The pair is a bytes value against the string of its own base64 text,
+/// nested two deep — `base64("x")` is `eA==`. One of the two stores the path
+/// `k.n` and the other carries its value in `attrs_other`, so the collapse
+/// also loses a stored attribute rather than a duplicate of one.
+///
+/// Every assertion here is a read: the identities themselves are held by
+/// `nested_values_are_type_tagged_at_every_depth` in `otlp_traces`, and an
+/// identity assertion in front of these would fire first and leave the reads
+/// unexercised.
+#[tokio::test]
+async fn two_resources_differing_in_a_nested_type_stay_two_rows() {
+    skip_unless_live!();
+
+    let resource = |value: AnyValue| Resource {
+        attributes: vec![kv("service.name", str_value("checkout")), kv("k", value)],
+        dropped_attributes_count: 0,
+        entity_refs: Vec::new(),
+    };
+    let nested = |leaf: AnyValue| kvlist_value(vec![("n", array_value(vec![leaf]))]);
+    let opaque = resource(nested(bytes_value(b"x")));
+    let text = resource(nested(str_value("eA==")));
+
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_nested_id")).await;
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: Some(opaque),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![span_with(0x73, 0x73, Vec::new())],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+            ResourceSpans {
+                resource: Some(text),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![span_with(0x74, 0x74, Vec::new())],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+        ],
+    };
+    land(&client, &req).await;
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        2,
+        "one service and two identities: a shared identity is one row here, \
+         because this table's key is (service, resource_id)"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM resources FINAL \
+             WHERE dynamicType(attrs.k.n) != 'None'"
+        )
+        .await,
+        1,
+        "the string-valued resource stores the path"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM resources FINAL WHERE attrs_other != ''"
+        )
+        .await,
+        1,
+        "and the bytes-valued one carries its value in the side channel"
+    );
+
+    drop_db(&db).await;
+}
+
 /// **T-S2.** The service name is a column, not a stored resource attribute.
 #[tokio::test]
 async fn t_s2_the_service_name_is_not_in_the_resource_attributes() {

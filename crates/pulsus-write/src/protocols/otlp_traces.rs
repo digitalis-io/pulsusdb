@@ -3401,6 +3401,19 @@ mod landing_tests {
         }
     }
 
+    /// The profiling signal's reference into its own string table, which a
+    /// non-profiling receiver processes as absent or empty.
+    fn strindex_value(index: i32) -> AnyValue {
+        AnyValue {
+            value: Some(Value::StringValueStrindex(index)),
+        }
+    }
+
+    /// An `AnyValue` with no arm set, which the protocol calls "empty".
+    fn unset_value() -> AnyValue {
+        AnyValue { value: None }
+    }
+
     fn kv(key: &str, value: AnyValue) -> KeyValue {
         KeyValue {
             key: key.to_string(),
@@ -3947,6 +3960,252 @@ mod landing_tests {
         assert_eq!(
             parsed.resources[0].resource_id, parsed.spans[0].resource_id,
             "the span and its resource row carry one identity"
+        );
+    }
+
+    /// **Every value a resource carries is type-tagged at every depth.**
+    ///
+    /// The shapes that can nest are taken from the protocol definition
+    /// rather than from one example: `AnyValue.value` is an optional oneof
+    /// of eight arms (`opentelemetry.proto.common.v1`, tags 1 to 8) and
+    /// exactly two of them carry further `AnyValue`s — `ArrayValue.values`,
+    /// and `KeyValueList.values`' `KeyValue.value`. Every nesting shape is
+    /// a composition of those two, every arm can appear at every depth, and
+    /// so the tag has to be written at every depth.
+    ///
+    /// Four pairs, each of which one flat render of the whole value
+    /// collapses: a bytes value against the string of its own base64 text,
+    /// `+inf` against `-inf`, and a NaN and a profiling string reference
+    /// each against an unset value. A collapse is wrong data rather than
+    /// untidiness: `resources` is a `ReplacingMergeTree` keyed on
+    /// `(service, resource_id)`, so one of the two replaces the other and
+    /// the spans carrying that id join to whichever survived.
+    #[test]
+    fn nested_values_are_type_tagged_at_every_depth() {
+        type Wrap = fn(AnyValue) -> AnyValue;
+        let wrappers: Vec<(&str, Wrap)> = vec![
+            ("array", |v| array_value(vec![v])),
+            ("array beside a sibling", |v| {
+                array_value(vec![int_value(0), v])
+            }),
+            ("kvlist", |v| kvlist_value(vec![("n", v)])),
+            ("kvlist beside a sibling", |v| {
+                kvlist_value(vec![("m", int_value(0)), ("n", v)])
+            }),
+            ("array(array)", |v| array_value(vec![array_value(vec![v])])),
+            ("array(kvlist)", |v| {
+                array_value(vec![kvlist_value(vec![("n", v)])])
+            }),
+            ("kvlist(array)", |v| {
+                kvlist_value(vec![("n", array_value(vec![v]))])
+            }),
+            ("kvlist(kvlist)", |v| {
+                kvlist_value(vec![("n", kvlist_value(vec![("n", v)]))])
+            }),
+            ("array(kvlist(array))", |v| {
+                array_value(vec![kvlist_value(vec![("n", array_value(vec![v]))])])
+            }),
+        ];
+
+        // `base64("x")` is `eA==`, so one render of the whole value gives
+        // the bytes value and that string the same text.
+        let pairs: Vec<(&str, AnyValue, AnyValue)> = vec![
+            (
+                "a bytes value against its own base64 text",
+                bytes_value(b"x"),
+                str_value("eA=="),
+            ),
+            (
+                "+inf against -inf",
+                double_value(f64::INFINITY),
+                double_value(f64::NEG_INFINITY),
+            ),
+            (
+                "a NaN against an unset value",
+                double_value(f64::NAN),
+                unset_value(),
+            ),
+            (
+                "a string reference against an unset value",
+                strindex_value(7),
+                unset_value(),
+            ),
+        ];
+
+        let id_of = |value: AnyValue| {
+            resource_identity(
+                Some(&resource_of(vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("k", value),
+                ])),
+                "",
+            )
+        };
+
+        for (shape, wrap) in &wrappers {
+            for (what, left, right) in &pairs {
+                assert_ne!(
+                    id_of(wrap(left.clone())),
+                    id_of(wrap(right.clone())),
+                    "{shape}: {what} are two resources"
+                );
+                // And one nested value is one resource, so none of the
+                // assertions above can pass on an unstable identity.
+                assert_eq!(
+                    id_of(wrap(left.clone())),
+                    id_of(wrap(left.clone())),
+                    "{shape}: {what}, the first value twice, is one resource"
+                );
+            }
+        }
+    }
+
+    /// **A push that lands no span catalogs nothing.** A push carrying no
+    /// span at all, and a push whose only span the UTC-day check rejects,
+    /// each produce no row of any kind — so the push makes no block and no
+    /// insert and the store gains nothing for data it does not hold.
+    ///
+    /// The entries a resource, a scope and a span contribute are staged and
+    /// merged only once a span has passed **every** check, the day check
+    /// included: that check sits after the span itself has been landed, so
+    /// a stage merged any earlier leaves `tag_names` and `tag_values` rows
+    /// behind for a span that was refused.
+    #[test]
+    fn a_push_that_lands_no_span_catalogs_nothing() {
+        // The first nanosecond of day 49_710: inside `i64`, inside `Date`'s
+        // own range, and outside the DateTime-safe day domain the landing
+        // tables partition by.
+        const OUTSIDE_THE_DAY_DOMAIN: u64 = 86_400_000_000_000 * 49_710;
+
+        let request = |spans: Vec<Span>| ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource_of(vec![
+                    kv("service.name", str_value("checkout")),
+                    kv("host.name", str_value("node-a")),
+                ])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "io.otel.http".to_string(),
+                        version: "1.4.2".to_string(),
+                        attributes: vec![kv("scope.key", str_value("scope-value"))],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        // 1. A push carrying no span.
+        let parsed = landed(&request(Vec::new()));
+        assert!(
+            parsed.tag_names.is_empty(),
+            "a zero-span push names no tag: {:?}",
+            parsed.tag_names
+        );
+        assert!(
+            parsed.tag_values.is_empty(),
+            "and catalogs no value: {:?}",
+            parsed.tag_values
+        );
+        assert!(parsed.spans.is_empty());
+        assert!(parsed.resources.is_empty());
+        assert_eq!(parsed.total_rows(), 0);
+        assert!(
+            parsed.is_empty(),
+            "a push carrying no span makes no block and no insert"
+        );
+
+        // 2. A push whose only span the UTC-day check rejects. Its own
+        // attributes, its event's and its link's are all refused with it.
+        let doomed = || {
+            let mut span = span_of(vec![kv("span.key", str_value("span-value"))]);
+            span.span_id = vec![0x01; 8];
+            span.start_time_unix_nano = OUTSIDE_THE_DAY_DOMAIN;
+            span.end_time_unix_nano = OUTSIDE_THE_DAY_DOMAIN + 1;
+            span.events = vec![span::Event {
+                time_unix_nano: OUTSIDE_THE_DAY_DOMAIN,
+                name: "e".to_string(),
+                attributes: vec![kv("event.key", str_value("event-value"))],
+                dropped_attributes_count: 0,
+            }];
+            span.links = vec![span::Link {
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
+                trace_state: String::new(),
+                attributes: vec![kv("link.key", str_value("link-value"))],
+                dropped_attributes_count: 0,
+                flags: 0,
+            }];
+            span
+        };
+        let parsed = landed(&request(vec![doomed()]));
+        assert_eq!(parsed.rejected, 1, "the span is refused, not stored");
+        assert!(
+            parsed
+                .rejected_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("UTC day domain"),
+            "and the day check is what refused it: {:?}",
+            parsed.rejected_message
+        );
+        assert!(parsed.spans.is_empty());
+        assert!(parsed.resources.is_empty());
+        assert!(
+            parsed.tag_names.is_empty(),
+            "a push that stores no span names no tag: {:?}",
+            parsed.tag_names
+        );
+        assert!(
+            parsed.tag_values.is_empty(),
+            "and catalogs no value: {:?}",
+            parsed.tag_values
+        );
+        assert_eq!(parsed.total_rows(), 0);
+        assert!(
+            parsed.is_empty(),
+            "a push that stores no span makes no block and no insert"
+        );
+
+        // 3. One span landing beside the refused one: the catalogs carry
+        // the landed span's keys, the resource's and the scope's, and
+        // nothing the refused span brought.
+        let parsed = landed(&request(vec![
+            doomed(),
+            span_of(vec![kv("kept.key", str_value("kept-value"))]),
+        ]));
+        assert_eq!(parsed.spans.len(), 1, "one span of the two lands");
+        assert_eq!(parsed.resources.len(), 1, "and its resource with it");
+        assert_eq!(parsed.rejected, 1);
+        let named: Vec<String> = parsed
+            .tag_names
+            .iter()
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.key))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                "span:kept.key".to_string(),
+                "resource:host.name".to_string(),
+                "instrumentation:scope.key".to_string(),
+            ],
+            "the refused span's own, its event's and its link's keys are absent"
+        );
+        let valued: Vec<String> = parsed
+            .tag_values
+            .iter()
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.value))
+            .collect();
+        assert_eq!(
+            valued,
+            vec![
+                "span:kept-value".to_string(),
+                "resource:node-a".to_string(),
+                "instrumentation:scope-value".to_string(),
+            ],
+            "and so are their values"
         );
     }
 
