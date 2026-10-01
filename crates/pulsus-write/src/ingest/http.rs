@@ -307,12 +307,22 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
-    // STUB (issue #586, the tests-first commit): the landing decode and the
-    // push-identity headers are not wired yet.
-    let landing = ParsedTraceLanding::default();
+    // The landing path's own decode, beside `parse` (issue #586). It runs
+    // **here** rather than in the writer because its own refusal — a value
+    // whose stored JSON paths exceed `format_binary_max_object_size` — is a
+    // decode-class failure and leaves through this route's whole-request
+    // error writer, which an `AdmitRefusal` cannot carry.
+    //
+    // **The route's `rejected` figure stays `parse`'s own**: the two walks
+    // can reject different spans, the OTLP partial-success message carries
+    // one count, and this route's answer is the old path's byte for byte.
+    let landing = match otlp_traces::parse_landing(&request, now_ns) {
+        Ok(landing) => landing,
+        Err(err) => return error_response(err),
+    };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
-    let push = PushHeaders::default();
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(parsed, landing, push) {
@@ -675,9 +685,7 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Ok(parsed) => parsed,
         Err(err) => return zipkin_decode_error_response(&err),
     };
-    // STUB (issue #586, the tests-first commit): the push-identity headers
-    // are not wired yet.
-    let push = PushHeaders::default();
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
         return match sink.admit(parsed, landing, push) {
@@ -720,9 +728,14 @@ fn decode_zipkin(
     let spans = zipkin::decode(&decompressed)?;
     let request = zipkin::to_otlp(spans)?;
     let parsed = otlp_traces::parse(&request, now_ns)?;
-    // STUB (issue #586, the tests-first commit): the landing decode is not
-    // wired yet, so no landing count joins the promotion below.
-    let landing = ParsedTraceLanding::default();
+    // The landing path's own decode (issue #586), here because this is where
+    // this route's parse already is — so the all-or-nothing promotion below
+    // stays in one place.
+    let landing = otlp_traces::parse_landing(&request, now_ns)?;
+    // **The promotion reads BOTH batches**, so it does not depend on their
+    // staying identical: a non-zero count on either is the same whole-request
+    // `ZipkinDecode` a non-zero `parse` count already is, and no partly
+    // accepted batch is admitted here.
     if parsed.rejected > 0 || landing.rejected > 0 {
         return Err(LogsIngestError::ZipkinDecode(
             parsed
@@ -949,8 +962,11 @@ fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
             8,
             push_too_large_message(rows, row_limit, bytes, byte_limit),
         ),
-        // STUB (issue #586, the tests-first commit).
-        AdmitRefusal::PushSpansTooManyDays { .. } => backpressure_response(),
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            8,
+            push_spans_too_many_days_message(days, day_limit),
+        ),
     }
 }
 
@@ -970,9 +986,22 @@ fn zipkin_refusal_response(refusal: AdmitRefusal) -> Response {
         AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
             zipkin_backpressure_response()
         }
-        // STUB (issue #586, the tests-first commit): the other three arms do
-        // not have this endpoint's own container yet.
-        other => otlp_refusal_response(other),
+        AdmitRefusal::KeyReused => {
+            plain_text_response(StatusCode::BAD_REQUEST, KEY_REUSED_MESSAGE.to_string())
+        }
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_spans_too_many_days_message(days, day_limit),
+        ),
     }
 }
 

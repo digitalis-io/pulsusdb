@@ -331,9 +331,16 @@ fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
 }
 
 /// The trace writer's `pulsus_ingest_*` series: per-table (`trace_spans`/
-/// `trace_attrs_idx`), per-signal (`signal="traces"`), and backfill
-/// (`backlog="trace_attrs_idx"`). Traces have no registration-cache or
-/// collision counters (no label sets / LRU).
+/// `trace_attrs_idx`), per-signal (`signal="traces"`), backfill
+/// (`backlog="trace_attrs_idx"`) and issue #494's push-suppression set,
+/// which the trace push joined with issue #586. Traces have no
+/// registration-cache or collision counters (no label sets / LRU).
+///
+/// **`trace_landing` has no per-table series and the landing queue has no
+/// gauge**, while both write paths run: `pulsus_ingest_queue_bytes` is set
+/// from the one `queue_bytes` field, which holds the old path's counter, so
+/// a second emission of the same name and label pair would set one gauge
+/// twice per scrape. `TraceLandingSnapshot` is where that figure is read.
 fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
     record_table_metrics("trace_spans", &s.spans);
     record_table_metrics("trace_attrs_idx", &s.attrs);
@@ -349,6 +356,7 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
         .absolute(s.rejected_total);
 
     record_backfill_metrics("trace_attrs_idx", &s.attrs_backfill);
+    record_dedup_metrics("traces", &s.dedup);
 }
 
 /// Emits the `pulsus_ingest_backfill_*` registration-backfill series for one

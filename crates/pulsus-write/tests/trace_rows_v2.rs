@@ -1699,6 +1699,54 @@ fn trace_id_of(seed: u8) -> [u8; 16] {
     [seed; 16]
 }
 
+/// One request carrying several resources, so a case that needs more than
+/// one service in **one** push — and therefore one `received_ms` — can build
+/// it.
+fn request_of_services(groups: Vec<(&str, Vec<Span>)>) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: groups
+            .into_iter()
+            .map(|(service, spans)| ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", str_value(service))],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            })
+            .collect(),
+    }
+}
+
+/// Detaches or re-attaches the five views, so a case can land a row into the
+/// landing table **without** the targets being written — which is the only
+/// way to observe a row a replay has not yet carried over, since a committed
+/// landing insert otherwise fans out as part of its own processing.
+async fn set_views_attached(client: &ChClient, attached: bool) {
+    let verb = if attached { "ATTACH" } else { "DETACH" };
+    for mv in [
+        "spans_mv",
+        "resources_mv",
+        "traces_mv",
+        "tag_names_mv",
+        "tag_values_mv",
+    ] {
+        client
+            .execute(
+                &format!("{verb} TABLE {mv}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{verb} {mv}: {e}"));
+    }
+}
+
 /// **`T-W1`.** The fixture's six bodies with one sent twice, in **one**
 /// push: the target's `ReplacingMergeTree` key collapses the repeat, and
 /// the landing table holds both copies — which is what shows the collapse is
@@ -2067,7 +2115,7 @@ async fn a_profiling_string_reference_lands_nowhere() {
     assert_eq!(
         count(
             &client,
-            "SELECT length(attrs.`k2`.:`Array(Nullable(String))`) AS n FROM spans"
+            "SELECT toUInt64(length(attrs.`k2`.:`Array(Nullable(String))`)) AS n FROM spans"
         )
         .await,
         2,
@@ -2076,7 +2124,7 @@ async fn a_profiling_string_reference_lands_nowhere() {
     assert_eq!(
         count(
             &client,
-            "SELECT has(attrs.`k2`.:`Array(Nullable(String))`, 'b') AS n FROM spans"
+            "SELECT toUInt64(has(attrs.`k2`.:`Array(Nullable(String))`, 'b')) AS n FROM spans"
         )
         .await,
         1
@@ -2084,7 +2132,7 @@ async fn a_profiling_string_reference_lands_nowhere() {
     assert_eq!(
         count(
             &client,
-            "SELECT length(attrs.`k3`.:`Array(Nullable(String))`) AS n FROM spans"
+            "SELECT toUInt64(length(attrs.`k3`.:`Array(Nullable(String))`)) AS n FROM spans"
         )
         .await,
         0,
@@ -2194,8 +2242,16 @@ async fn the_repair_replays_one_partition_per_statement() {
     let before = (
         count(&client, "SELECT count() AS n FROM spans FINAL").await,
         count(&client, "SELECT count() AS n FROM traces FINAL").await,
-        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        count(
+            &client,
+            "SELECT toUInt64(uniqExact(day)) AS n FROM resources",
+        )
+        .await,
     );
+    // **`resources` is read by its day count and without `FINAL`**: its
+    // sorting key is `(service, resource_id)` and `day` is only its
+    // partition key, so `FINAL` collapses one resource's five day-rows into
+    // one.
     assert_eq!(before, (10, 5, 5), "the fixture spans five UTC dates");
     truncate_targets(&client).await;
 
@@ -2252,7 +2308,11 @@ async fn the_repair_replays_one_partition_per_statement() {
         (
             count(&client, "SELECT count() AS n FROM spans FINAL").await,
             count(&client, "SELECT count() AS n FROM traces FINAL").await,
-            count(&client, "SELECT count() AS n FROM resources FINAL").await,
+            count(
+                &client,
+                "SELECT toUInt64(uniqExact(day)) AS n FROM resources"
+            )
+            .await,
         ),
         before,
         "the replay completes and each day-partitioned target holds all five days"
@@ -2299,64 +2359,58 @@ async fn the_repair_converges_after_a_partition_is_left_part_written() {
         ),
     )
     .await;
-    // Push B, once the first push's millisecond has passed.
+    // Push B, once the first push's millisecond has passed — **one** landing
+    // insert carrying all three of its spans under three resources, so the
+    // window below holds exactly two stamps.
     tokio::time::sleep(Duration::from_millis(3)).await;
     land(
         &client,
-        &request_with(
-            "checkout",
-            Vec::new(),
-            vec![span_full(&t, 0xa0, None, "/api", 2, t0 + 100, 800, vec![])],
-            None,
-            "",
-        ),
-    )
-    .await;
-    land(
-        &client,
-        &request(
-            "cart",
-            vec![span_full(
-                &t,
-                0xa3,
-                Some(0xa0),
-                "child-3",
-                2,
-                t0 + 500,
-                100,
-                vec![],
-            )],
-        ),
-    )
-    .await;
-    land(
-        &client,
-        &request(
-            "pay",
-            vec![span_full(
-                &u,
-                0xb1,
-                None,
-                "charge",
-                2,
-                t0 + 200,
-                100,
-                vec![],
-            )],
-        ),
+        &request_of_services(vec![
+            (
+                "checkout",
+                vec![span_full(&t, 0xa0, None, "/api", 2, t0 + 100, 800, vec![])],
+            ),
+            (
+                "cart",
+                vec![span_full(
+                    &t,
+                    0xa3,
+                    Some(0xa0),
+                    "child-3",
+                    2,
+                    t0 + 500,
+                    100,
+                    vec![],
+                )],
+            ),
+            (
+                "pay",
+                vec![span_full(
+                    &u,
+                    0xb1,
+                    None,
+                    "charge",
+                    2,
+                    t0 + 200,
+                    100,
+                    vec![],
+                )],
+            ),
+        ]),
     )
     .await;
 
-    // Two distinct stamps, and the case fails here rather than in the phases
-    // below if the pushes shared one.
+    // **Exactly two stamps**, and the case fails here rather than in the
+    // phases below if the two pushes shared one.
     let stamps = count(
         &client,
         "SELECT uniqExact(received_ms) AS n FROM trace_landing",
     )
     .await;
-    assert!(
-        stamps >= 2,
-        "the fixture needs at least two distinct received_ms stamps, got {stamps}"
+    assert_eq!(
+        stamps, 2,
+        "the window has to hold exactly two received_ms stamps, so the \
+         half-window run replays push A alone"
     );
 
     let ingest_names = count(&client, "SELECT count() AS n FROM tag_names FINAL").await;
@@ -2538,7 +2592,11 @@ async fn a_row_arriving_behind_the_repair_is_recovered_by_the_next_run() {
     );
 
     // A row for an already-processed day, stamped inside the same window,
-    // committed behind the run.
+    // committed behind the run. The five views are detached while it lands:
+    // a committed landing insert otherwise fans out as part of its own
+    // processing, which is the whole point of the design and would put the
+    // row in `spans` with no replay involved.
+    set_views_attached(&client, false).await;
     land_at(
         &client,
         &request(
@@ -2557,6 +2615,7 @@ async fn a_row_arriving_behind_the_repair_is_recovered_by_the_next_run() {
         early,
     )
     .await;
+    set_views_attached(&client, true).await;
     assert_eq!(
         count(
             &client,
@@ -2747,9 +2806,14 @@ async fn a_read_cap_cannot_turn_a_repair_run_into_a_short_success() {
         "the error carries TOO_MANY_ROWS: {text}"
     );
     assert!(
-        text.contains("Limit for rows or bytes to read exceeded"),
-        "{text}"
+        text.contains("max_rows_to_read"),
+        "the error names the cap the deployment set: {text}"
     );
+    // **The text is the server's own, read off 26.3.29.7**: `Limit for rows
+    // (controlled by 'max_rows_to_read' setting) exceeded, max rows: 200.00,
+    // current rows: 401.00`. It is not the shorter `Limit for rows or bytes
+    // to read exceeded` the plan quoted — the engine produces that one for
+    // the combined row-or-byte check and this one for the row cap alone.
     assert_eq!(count(&client, "SELECT count() AS n FROM spans").await, 0);
     assert_eq!(count(&client, "SELECT count() AS n FROM traces").await, 0);
 

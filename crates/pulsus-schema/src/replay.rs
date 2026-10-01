@@ -21,6 +21,7 @@
 
 use pulsus_clickhouse::{ChClient, ChError, Idempotency, QuerySettings};
 
+use crate::controller::mv_projection;
 use crate::render::{self, RenderCtx};
 
 /// The five targets, each with the materialized view that maintains it and
@@ -35,7 +36,6 @@ use crate::render::{self, RenderCtx};
 /// the caller also asks for their partitions to be dropped.
 ///
 /// `None` is an unpartitioned target: one statement for the whole window.
-#[allow(dead_code)]
 const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "spans",
@@ -94,15 +94,124 @@ pub async fn replay_trace_window(
     to_ms: i64,
     max_rows: u64,
 ) -> Result<ReplayReport, ChError> {
-    // STUB (issue #586, the tests-first commit).
-    let _ = (client, ctx, from_ms, to_ms, max_rows);
-    Ok(ReplayReport::default())
+    let db = &ctx.db;
+    let run = run_stamp();
+    let mut report = ReplayReport::default();
+
+    for (target, mv, partition_expr) in TARGETS {
+        let projection = mv_projection(mv, ctx).ok_or_else(|| {
+            ChError::Config(format!("no materialized view named {mv} in the catalogue"))
+        })?;
+        // The window goes **inside** the projection's own landing-table
+        // predicate rather than after it: the per-trace view's projection
+        // ends in a `GROUP BY` inside a subquery, so appending a conjunct to
+        // the whole statement would not parse.
+        let select = windowed(&projection, from_ms, to_ms)?;
+        let table = format!("{db}.{target}{}", target_suffix(ctx, target));
+
+        match partition_expr {
+            None => {
+                // An unpartitioned target: one statement for the window.
+                let sql = format!("INSERT INTO {table} {select}");
+                let token = replay_token(run, target, "all");
+                let settings = QuerySettings::trace_landing_insert(&token, max_rows);
+                execute_recorded(client, &mut report, sql, &settings).await?;
+            }
+            Some(expr) => {
+                // **One statement per target partition**, so every block a
+                // statement emits carries rows of exactly one partition —
+                // which is at or below every positive value
+                // `max_partitions_per_insert_block` can take.
+                let partitions =
+                    distinct_partitions(client, &mut report, &select, expr, run, target, max_rows)
+                        .await?;
+                for partition in &partitions {
+                    let sql = format!(
+                        "INSERT INTO {table} SELECT * FROM ({select}) WHERE {expr} = {}",
+                        quote_literal(partition)
+                    );
+                    let token = replay_token(run, target, partition);
+                    let settings = QuerySettings::trace_landing_insert(&token, max_rows);
+                    execute_recorded(client, &mut report, sql, &settings).await?;
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// The partition values the replayed rows fall in, read by applying the
+/// target's own partition expression to the rows the replay would insert.
+///
+/// **It carries the same settings every other statement does**, from the one
+/// constructor: three of those pins — the distinct, sort and result overflow
+/// modes — bind on this read alone, so a version that passed
+/// `QuerySettings::new()` here would leave the partition list a profile could
+/// shorten.
+///
+/// It **races**: a landing row committed between this read and the inserts
+/// below adds a partition this list never saw, and that row is missed by this
+/// run. A re-run recovers it, which is the whole of what the repair promises.
+#[allow(clippy::too_many_arguments)]
+async fn distinct_partitions(
+    client: &ChClient,
+    report: &mut ReplayReport,
+    select: &str,
+    partition_expr: &str,
+    run: u128,
+    target: &str,
+    max_rows: u64,
+) -> Result<Vec<String>, ChError> {
+    let sql = format!("SELECT DISTINCT toString({partition_expr}) AS s FROM ({select}) ORDER BY s");
+    let token = replay_token(run, target, "partitions");
+    let settings = QuerySettings::trace_landing_insert(&token, max_rows);
+    report.statements.push(sql.clone());
+    client.query_strings(&sql, &settings).await
+}
+
+/// Puts the window inside the projection's own `WHERE row_kind = <n>`, which
+/// is the landing-table scan's predicate and the only `WHERE` any of the five
+/// projections carries.
+fn windowed(projection: &str, from_ms: i64, to_ms: i64) -> Result<String, ChError> {
+    let marker = "WHERE row_kind = ";
+    let at = projection.find(marker).ok_or_else(|| {
+        ChError::Config(format!(
+            "a trace view's projection must scan the landing table under a \
+             row_kind predicate: {projection}"
+        ))
+    })?;
+    // One digit: the four discriminating values are 0 to 3.
+    let after = at + marker.len() + 1;
+    let mut out = String::with_capacity(projection.len() + 64);
+    out.push_str(&projection[..after]);
+    out.push_str(&format!(
+        " AND received_ms >= {from_ms} AND received_ms < {to_ms}"
+    ));
+    out.push_str(&projection[after..]);
+    Ok(out)
+}
+
+/// A single-quoted SQL string literal. The values are partition keys the
+/// server itself rendered with `toString`, not caller input, but a stray
+/// quote should give a clear refusal rather than invalid SQL.
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// One clock reading per run, which is what makes a token unique per
+/// statement across runs.
+fn run_stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// The suffix the two per-trace targets take: a replay routes exactly as the
 /// view does, because it issues the view's own projection and that view's
-/// target is the routing table on a cluster.
-#[allow(dead_code)]
+/// target is the routing table on a cluster. A replay run on one node
+/// therefore places rows on the same shards the original push did.
 fn target_suffix(ctx: &RenderCtx, target: &str) -> String {
     if matches!(target, "spans" | "traces") {
         render::route_suffix(ctx).to_string()
@@ -118,13 +227,16 @@ fn target_suffix(ctx: &RenderCtx, target: &str) -> String {
 /// string the server hashes into a block id, so the statement's own identity
 /// plus one clock reading per run is enough to make it unique per statement
 /// and stable inside one.
-#[allow(dead_code)]
+///
+/// Two statements over different partitions could not collide however the
+/// token were chosen — the server's own block identity already carries the
+/// chunk's source block number and the partition id — so this is not what
+/// keeps them apart.
 fn replay_token(run: u128, target: &str, partition: &str) -> String {
     format!("rebuild-traces-{run:032x}-{target}-{partition}")
 }
 
 /// Issues one statement, recording it.
-#[allow(dead_code)]
 async fn execute_recorded(
     client: &ChClient,
     report: &mut ReplayReport,

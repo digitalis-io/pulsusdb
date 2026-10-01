@@ -38,10 +38,6 @@
 //! reservation and never this one, and a granted landing reservation is
 //! always followed by a queued block.
 
-// STUB (issue #586, the tests-first commit): `writer::trace` does not call
-// this path's helpers yet, so each of them reads as dead.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

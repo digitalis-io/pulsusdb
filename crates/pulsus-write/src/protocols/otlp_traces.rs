@@ -2825,6 +2825,29 @@ enum LandedValue {
     /// the key is carried in the protobuf side-channel under its original
     /// OTLP key.
     Other,
+    /// **Nowhere.** The attribute lands as though it were not present: no
+    /// path in `attrs`, no key in `attrs_other`, no row in `tag_names`, no
+    /// row in `tag_values`. Returned for the profiling signal's string
+    /// reference — the eighth and last arm of the `AnyValue` oneof — and for
+    /// nothing else.
+    ///
+    /// The proto's own comment on that arm is the authority: a receiver for
+    /// a signal other than Profiling should "process the data as if this
+    /// value were absent or empty, ignoring its semantic content for the
+    /// non-Profiling signal". It offers two readings and this takes
+    /// **absent**, because the value is an index into
+    /// `ProfilesDictionary.string_table`, which a trace receiver does not
+    /// carry (issue #586).
+    ///
+    /// **Nothing is logged.** The quote's first sentence asks for an error
+    /// or a warning; neither signal logs one today, and one line per
+    /// attribute on the ingest path is a flood at trace volumes.
+    ///
+    /// **The resource identity is not touched**: `identity_encode_value`
+    /// tags and hashes all eight arms, so two resources differing only in a
+    /// dropped attribute hold two ids over one stored content — two rows
+    /// under two keys rather than one row losing a content.
+    Absent,
 }
 
 /// Classifies one OTLP `AnyValue` into [`LandedValue`], applying §4.2's
@@ -2855,10 +2878,11 @@ fn land_value(key: &str, value: Option<&AnyValue>) -> LandedValue {
                 LandedValue::Leaves(leaves)
             }
         }
-        // A bytes value has no JSON type on this engine, and a profiling
-        // string index is a reference into a table a trace receiver does
-        // not carry.
-        Value::BytesValue(_) | Value::StringValueStrindex(_) => LandedValue::Other,
+        // A bytes value has no JSON type on this engine, so the key is
+        // carried in the protobuf side-channel.
+        Value::BytesValue(_) => LandedValue::Other,
+        // A profiling string reference lands NOWHERE (issue #586).
+        Value::StringValueStrindex(_) => LandedValue::Absent,
     }
 }
 
@@ -2867,9 +2891,6 @@ fn land_value(key: &str, value: Option<&AnyValue>) -> LandedValue {
 /// `Array(Nullable(String))` where it is empty, and `attrs_other` where any
 /// element is a bytes value or a kvlist.
 fn land_array(array: &ArrayValue) -> LandedValue {
-    if array.values.is_empty() {
-        return LandedValue::One(TraceJsonValue::EmptyArray);
-    }
     let mut scalars: Vec<TraceJsonScalar> = Vec::with_capacity(array.values.len());
     for element in &array.values {
         match element.value.as_ref() {
@@ -2877,11 +2898,22 @@ fn land_array(array: &ArrayValue) -> LandedValue {
             Some(Value::BoolValue(b)) => scalars.push(TraceJsonScalar::Bool(*b)),
             Some(Value::IntValue(i)) => scalars.push(TraceJsonScalar::Int(*i)),
             Some(Value::DoubleValue(d)) => scalars.push(TraceJsonScalar::Double(*d)),
+            // A profiling string reference is skipped, not fatal to the
+            // array: the remaining elements land, and an array of nothing
+            // else lands as the empty array (issue #586).
+            Some(Value::StringValueStrindex(_)) => continue,
             // A nested array, a kvlist, a bytes value or an unset element:
             // the whole attribute goes to `attrs_other`, because a stored
             // array's element type has to be one thing.
             _ => return LandedValue::Other,
         }
+    }
+    // **After the loop**, so an array whose every element was skipped is the
+    // empty array rather than reaching `all_str` — which is vacuously true
+    // over no elements and lands `StrArray(vec![])`. The two are one stored
+    // value: both serialise to `1e 23 15` and a zero element count.
+    if scalars.is_empty() {
+        return LandedValue::One(TraceJsonValue::EmptyArray);
     }
     let all_str = scalars.iter().all(|s| matches!(s, TraceJsonScalar::Str(_)));
     let all_bool = scalars
@@ -2966,9 +2998,11 @@ fn collect_leaves(
             }
             _ => match land_value(&entry.key, entry.value.as_ref()) {
                 LandedValue::One(value) => out.push((escaped, original, value)),
-                // A leaf whose value goes to `attrs_other` and a leaf that
-                // is itself an empty kvlist both store no path.
-                LandedValue::Leaves(_) | LandedValue::Other => {}
+                // A leaf whose value goes to `attrs_other`, a leaf that is
+                // itself an empty kvlist, and a leaf of the profiling arm all
+                // store no path. Inside a kvlist that arm already landed
+                // nowhere before issue #586: only `One` is kept here.
+                LandedValue::Leaves(_) | LandedValue::Other | LandedValue::Absent => {}
             },
         }
     }
@@ -3038,19 +3072,25 @@ fn land_attrs(
         if !seen.insert(kv.key.as_str()) {
             continue;
         }
-        // **Every key the push carries in any of the five scopes gets a
-        // kind-2 row**, including a key whose value went to `attrs_other`
-        // and a key whose value is a kvlist.
-        if Some(kv.key.as_str()) != skip_key {
-            names.insert(LandingTagName {
-                scope,
-                key: kv.key.clone(),
-            });
-        }
         if Some(kv.key.as_str()) == skip_key {
             continue;
         }
-        match land_value(&kv.key, kv.value.as_ref()) {
+        // **The classifying runs BEFORE the name is listed** (issue #586),
+        // because one arm's key is not listed at all: a profiling string
+        // reference lands nowhere, catalogs included. One function still
+        // does the classifying.
+        let landed = land_value(&kv.key, kv.value.as_ref());
+        if matches!(landed, LandedValue::Absent) {
+            continue;
+        }
+        // **Every other key the push carries in any of the five scopes gets
+        // a kind-2 row**, including a key whose value went to `attrs_other`
+        // and a key whose value is a kvlist.
+        names.insert(LandingTagName {
+            scope,
+            key: kv.key.clone(),
+        });
+        match landed {
             LandedValue::One(value) => {
                 record_values(scope, &kv.key, &value, values);
                 entries.push(TraceJsonEntry {
@@ -3071,6 +3111,8 @@ fn land_attrs(
                 }
             }
             LandedValue::Other => other.push(kv.clone()),
+            // Unreachable: the `continue` above takes this arm out.
+            LandedValue::Absent => {}
         }
     }
 

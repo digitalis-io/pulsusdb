@@ -64,24 +64,29 @@ enum Act {
 
 /// A scriptable mock [`BlockInserter`], generic over the row type so one
 /// struct serves the landing table and both old-path tables. Records every
-/// call's table, rows and settings.
-struct MockInserter {
+/// call's table, **rows** and settings.
+///
+/// The rows are kept as themselves rather than as `serde_json::Value`:
+/// `TraceLandingRow::resource_id` is a `UInt128` and `serde_json` refuses a
+/// `u128` above the `u64` range, so a JSON copy of a span row or a resource
+/// row fails to serialise at all — measured, `number out of range`.
+struct MockInserter<R> {
     act: Act,
     record: bool,
     calls: AtomicUsize,
-    rows: Mutex<Vec<Vec<serde_json::Value>>>,
+    rows: Mutex<Vec<Vec<R>>>,
     settings: Mutex<Vec<Vec<(String, String)>>>,
     tables: Mutex<Vec<String>>,
     empty: QuerySettings,
 }
 
-impl MockInserter {
+impl<R> MockInserter<R> {
     fn always(act: Act) -> Arc<Self> {
         Self::built(act, true)
     }
 
     /// [`Self::always`], keeping no copy of what it was handed — for a case
-    /// that pushes enough rows that a JSON copy of each would dominate it.
+    /// that pushes enough rows that a copy of each would dominate it.
     fn unrecorded(act: Act) -> Arc<Self> {
         Self::built(act, false)
     }
@@ -102,15 +107,6 @@ impl MockInserter {
         self.calls.load(Ordering::SeqCst)
     }
 
-    fn rows_of(&self, call: usize) -> Vec<serde_json::Value> {
-        self.rows
-            .lock()
-            .expect("mock mutex poisoned")
-            .get(call)
-            .cloned()
-            .unwrap_or_else(|| panic!("no insert call at index {call}"))
-    }
-
     fn settings_of(&self, call: usize) -> Vec<(String, String)> {
         self.settings
             .lock()
@@ -125,7 +121,18 @@ impl MockInserter {
     }
 }
 
-impl<R: ChRow> BlockInserter<R> for MockInserter {
+impl<R: Clone> MockInserter<R> {
+    fn rows_of(&self, call: usize) -> Vec<R> {
+        self.rows
+            .lock()
+            .expect("mock mutex poisoned")
+            .get(call)
+            .cloned()
+            .unwrap_or_else(|| panic!("no insert call at index {call}"))
+    }
+}
+
+impl<R: ChRow + Clone> BlockInserter<R> for MockInserter<R> {
     fn insert<'a>(
         &'a self,
         table: &'a str,
@@ -146,11 +153,10 @@ impl<R: ChRow> BlockInserter<R> for MockInserter {
                 .lock()
                 .expect("mock mutex poisoned")
                 .push(table.to_string());
-            self.rows.lock().expect("mock mutex poisoned").push(
-                rows.iter()
-                    .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-                    .collect(),
-            );
+            self.rows
+                .lock()
+                .expect("mock mutex poisoned")
+                .push(rows.to_vec());
             self.settings.lock().expect("mock mutex poisoned").push(
                 extra
                     .entries()
@@ -281,10 +287,14 @@ fn writer_with(
 fn writer_ok_old(
     cfg: &WriterConfig,
     spool: &Path,
-    landing: Arc<MockInserter>,
-) -> (TraceWriter, Arc<MockInserter>, Arc<MockInserter>) {
-    let spans = MockInserter::always(Act::Ok);
-    let attrs = MockInserter::always(Act::Ok);
+    landing: Arc<MockInserter<TraceLandingRow>>,
+) -> (
+    TraceWriter,
+    Arc<MockInserter<TraceSpanRow>>,
+    Arc<MockInserter<TraceAttrRow>>,
+) {
+    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
+    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
     let writer = writer_with(cfg, spool, spans.clone(), attrs.clone(), landing);
     (writer, spans, attrs)
 }
@@ -431,19 +441,9 @@ fn spans_over_days(days: u64) -> ExportTraceServiceRequest {
     request_of("checkout", spans)
 }
 
-/// The `row_kind` of each row of one recorded insert call.
-fn kinds_of(rows: &[serde_json::Value]) -> Vec<u64> {
-    rows.iter()
-        .map(|r| {
-            r["row_kind"]
-                .as_u64()
-                .expect("every landed row carries a row_kind")
-        })
-        .collect()
-}
-
-fn count_of_kind(rows: &[serde_json::Value], kind: u64) -> usize {
-    kinds_of(rows).into_iter().filter(|k| *k == kind).count()
+/// How many rows of one recorded insert call carry `kind`.
+fn count_of_kind(rows: &[TraceLandingRow], kind: u8) -> usize {
+    rows.iter().filter(|r| r.row_kind == kind).count()
 }
 
 // -- T1/T2: one push, one insert --------------------------------------
@@ -454,7 +454,7 @@ fn count_of_kind(rows: &[serde_json::Value], kind: u64) -> usize {
 #[tokio::test]
 async fn one_push_is_one_insert_into_the_landing_table() {
     let root = spool_root("one-insert");
-    let landing = MockInserter::always(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, spans_mock, _attrs) =
         writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
@@ -486,17 +486,17 @@ async fn one_push_is_one_insert_into_the_landing_table() {
     }
 
     let rows = landing.rows_of(0);
-    assert_eq!(rows.len(), expected_rows, "{rows:#?}");
-    assert_eq!(count_of_kind(&rows, 0), 6, "six spans: {rows:#?}");
+    assert_eq!(rows.len(), expected_rows);
+    assert_eq!(count_of_kind(&rows, 0), 6, "six spans");
     assert_eq!(count_of_kind(&rows, 1), 1, "one resource for one day");
     assert!(
         count_of_kind(&rows, 2) >= 2,
-        "both span attribute keys are listed: {rows:#?}"
+        "both span attribute keys are listed"
     );
     assert!(count_of_kind(&rows, 3) >= 2, "and both of their values");
 
     // The old path keeps writing, which is this change's whole premise.
-    assert_eq!(spans_mock.tables(), vec![SPANS.to_string()]);
+    assert_eq!(spans_mock.call_count(), 1);
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
@@ -507,7 +507,7 @@ async fn one_push_is_one_insert_into_the_landing_table() {
 #[tokio::test]
 async fn two_pushes_are_two_inserts() {
     let root = spool_root("two-inserts");
-    let landing = MockInserter::always(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
     for (trace, service) in [(0xa1u8, "checkout"), (0xa2, "cart")] {
@@ -537,8 +537,8 @@ async fn two_pushes_are_two_inserts() {
 async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     let root = spool_root("token");
     let landing = ResendOnceInserter::new();
-    let spans = MockInserter::always(Act::Ok);
-    let attrs = MockInserter::always(Act::Ok);
+    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
+    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
     let cfg = WriterConfig::default();
     let writer = writer_with(
         &cfg,
@@ -570,7 +570,7 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
         ingest_dedup: false,
         ..Default::default()
     };
-    let landing2 = MockInserter::always(Act::Ok);
+    let landing2: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer2, _s, _a) = writer_ok_old(&cfg, &root, landing2.clone());
     for _ in 0..2 {
         let (parsed, landed) = decode_both(&six_spans());
@@ -616,7 +616,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         trace_landing_max_rows: rows,
         ..Default::default()
     };
-    let landing = MockInserter::always(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
     let before = writer.metrics().dedup.rollbacks_total;
     let err = writer
@@ -657,7 +657,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
             batch_bytes: ByteSize(limit),
             ..Default::default()
         };
-        let landing = MockInserter::always(Act::Ok);
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
         let (writer, _s, _a) = writer_ok_old(&cfg, &root, landing.clone());
         let result = writer.admit_flush(parsed.clone(), landed.clone(), PushHeaders::default());
         if refused {
@@ -775,7 +775,7 @@ async fn refused_charge(root: &Path, parsed: ParsedTraces, landed: ParsedTraceLa
         ingest_queue_bytes: ByteSize(1024 * 1024 * 1024),
         ..Default::default()
     };
-    let landing = MockInserter::unrecorded(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
     let (writer, _s, _a) = writer_ok_old(&cfg, root, landing);
     let err = writer
         .admit_flush(parsed, landed, PushHeaders::default())
@@ -822,7 +822,7 @@ fn wide_span_request() -> ExportTraceServiceRequest {
 #[tokio::test]
 async fn an_empty_push_is_a_success_and_is_charged_for_nothing() {
     let root = spool_root("empty");
-    let landing = MockInserter::always(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, spans_mock, attrs_mock) =
         writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
@@ -916,15 +916,18 @@ async fn one_sided_old_path_saturation_refuses_the_push() {
     // A hanging OLD span inserter: its generation never settles, so its
     // bytes stay reserved and the old counter climbs to its ceiling. The
     // landing inserter succeeds, so the landing counter returns to zero.
+    // `PULSUS_BATCH_BYTES` is the landing path's own per-push ceiling now, so
+    // it is left at its default: lowering it to force the old path's buffers
+    // to flush would refuse every push `413` instead. The old path's
+    // generations settle on `batch_age` instead.
     let cfg = WriterConfig {
-        batch_bytes: ByteSize(1),
         ingest_queue_bytes: ByteSize(64 * 1024),
         ingest_dedup: false,
         ..Default::default()
     };
-    let spans = MockInserter::unrecorded(Act::Hang);
-    let attrs = MockInserter::unrecorded(Act::Ok);
-    let landing = MockInserter::unrecorded(Act::Ok);
+    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Hang);
+    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
     let writer = writer_with(
         &cfg,
         &root,
@@ -975,17 +978,24 @@ async fn one_sided_old_path_saturation_refuses_the_push() {
 /// and a succeeding old path, and returns the refusal point.
 async fn saturated_landing(
     root: &Path,
-) -> (TraceWriter, Arc<MockInserter>, Arc<MockInserter>, u64) {
+) -> (
+    TraceWriter,
+    Arc<MockInserter<TraceLandingRow>>,
+    Arc<MockInserter<TraceSpanRow>>,
+    u64,
+) {
     let limit = 256 * 1024;
+    // `PULSUS_BATCH_BYTES` stays at its default: it is the landing path's own
+    // per-push byte ceiling, and lowering it would refuse every push `413`
+    // rather than saturating anything.
     let cfg = WriterConfig {
-        batch_bytes: ByteSize(1),
         ingest_queue_bytes: ByteSize(limit),
         ingest_dedup: false,
         ..Default::default()
     };
-    let spans = MockInserter::unrecorded(Act::Ok);
-    let attrs = MockInserter::unrecorded(Act::Ok);
-    let landing = MockInserter::unrecorded(Act::Hang);
+    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
+    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
     let mut runtime = runtime_at(&cfg, root);
     runtime.trace_landing_inserters = 1;
     let writer = TraceWriter::with_inserters_and_runtime(
@@ -1026,7 +1036,7 @@ async fn saturated_landing(
 #[tokio::test]
 async fn a_retry_is_suppressed_when_only_the_landing_insert_failed() {
     let root = spool_root("mixed-outcome");
-    let landing = MockInserter::always(Act::Poison);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
     let (writer, spans_mock, _attrs) =
         writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
@@ -1075,7 +1085,7 @@ async fn a_retry_is_suppressed_when_only_the_landing_insert_failed() {
 #[tokio::test]
 async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
     let root = spool_root("distinct-key");
-    let landing = MockInserter::always(Act::Ok);
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, spans_mock, _attrs) =
         writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
@@ -1168,7 +1178,7 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
 
     for transport in ["otlp", "zipkin"] {
         // The admitted side: exactly the limit's worth of dates lands.
-        let landing = MockInserter::unrecorded(Act::Ok);
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
         let (writer, spans_mock, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
         let ok = post(transport, &writer, TRACE_LANDING_DAY_LIMIT).await;
         let (status, _h, _b) = parts(ok).await;
@@ -1184,7 +1194,7 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
         writer.shutdown(Duration::from_secs(5)).await;
 
         // One date past it is refused whole.
-        let landing = MockInserter::unrecorded(Act::Ok);
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
         let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
         let refused = post(transport, &writer, TRACE_LANDING_DAY_LIMIT + 1).await;
         let (status, headers, body) = parts(refused).await;
@@ -1283,20 +1293,24 @@ fn decode_status(body: &[u8]) -> (i32, String) {
 }
 
 /// **A span whose stored JSON paths exceed `format_binary_max_object_size`
-/// is refused `400` at decode, on each trace transport** — through that
-/// route's **decode** writer, not its refusal mapper, because the refusal is
-/// at decode and the Zipkin endpoint is split by stage.
+/// is refused `400` at decode**, through this route's **decode** writer, not
+/// its refusal mapper, because the refusal is at decode.
 ///
-/// The sniff header and the terminator are asserted in the **opposite**
-/// direction here from the refusal cases above, and that is the point of the
-/// pair: an implementation answering every Zipkin `400` and every Zipkin
-/// `413` through one writer fails one of the two.
+/// **`/v1/traces` only, and the two shipped bounds that make the Zipkin
+/// transport unreachable are why.** The gate counts the stored paths of one
+/// attribute list, and 100,001 of them cannot be built out of a Zipkin v2
+/// span: `zipkin::decode` refuses above 65,536 tags per span, and a Zipkin
+/// tag's value is a string, so there is no nested value to raise the path
+/// count above the tag count. On `/v1/traces` the paths come from four
+/// `kvlist` attributes instead, which keeps the OTLP pre-scan's own
+/// 65,536-attributes-per-element bound out of the way — 100,000 flat
+/// attributes are refused by that bound before this gate is reached.
 #[tokio::test]
 async fn a_span_with_too_many_paths_is_refused_at_decode_over_http() {
     let root = spool_root("path-gate");
-    // 100,000 distinct attribute keys are 100,000 landed catalog rows, each
-    // charged a whole row slot: at the default byte ceiling the ACCEPTED
-    // half is refused `413` and never reaches the assertion it exists for.
+    // 100,000 stored paths are 100,004 landed catalog rows, each charged a
+    // whole row slot: at the default byte ceiling the ACCEPTED half is
+    // refused `413` and never reaches the assertion it exists for.
     let cfg = WriterConfig {
         batch_bytes: ByteSize(1024 * 1024 * 1024),
         ingest_queue_bytes: ByteSize(1024 * 1024 * 1024),
@@ -1304,97 +1318,82 @@ async fn a_span_with_too_many_paths_is_refused_at_decode_over_http() {
         ..Default::default()
     };
     let limit = MAX_JSON_PATHS_PER_VALUE;
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+    let (writer, spans_mock, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
 
-    for transport in ["otlp", "zipkin"] {
-        let landing = MockInserter::unrecorded(Act::Ok);
-        let (writer, spans_mock, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
+    let ok = post_paths(&writer, limit).await;
+    let (status, _h, _b) = parts(ok).await;
+    assert!(
+        status.is_success(),
+        "a span at the path limit is admitted, got {status}"
+    );
+    settle_until("the admitted push's landing insert", || {
+        landing.call_count() == 1
+    })
+    .await;
 
-        let ok = post_paths(transport, &writer, limit).await;
-        let (status, _h, _b) = parts(ok).await;
-        assert!(
-            status.is_success(),
-            "{transport}: a span at the path limit is admitted, got {status}"
-        );
-        settle_until("the admitted push's landing insert", || {
-            landing.call_count() == 1
-        })
-        .await;
-
-        let refused = post_paths(transport, &writer, limit + 1).await;
-        let (status, headers, body) = parts(refused).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{transport}: one path past the limit is a decode refusal"
-        );
-        match transport {
-            "otlp" => {
-                assert_eq!(
-                    header_of(&headers, header::CONTENT_TYPE).as_deref(),
-                    Some("application/x-protobuf")
-                );
-                assert_eq!(header_of(&headers, header::X_CONTENT_TYPE_OPTIONS), None);
-                assert_eq!(decode_status(&body).0, 3);
-            }
-            _ => {
-                assert_eq!(
-                    header_of(&headers, header::CONTENT_TYPE).as_deref(),
-                    Some("text/plain; charset=utf-8")
-                );
-                assert_eq!(
-                    header_of(&headers, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
-                    Some("nosniff"),
-                    "a decode refusal takes this endpoint's PRE-admission writer"
-                );
-                assert_eq!(
-                    body.last(),
-                    Some(&b'\n'),
-                    "which ends in exactly one terminator"
-                );
-            }
-        }
-        assert_eq!(
-            landing.call_count(),
-            1,
-            "{transport}: the refused push never reached admission"
-        );
-        assert_eq!(spans_mock.call_count(), 1, "{transport}: on either path");
-        writer.shutdown(Duration::from_secs(10)).await;
-    }
+    let refused = post_paths(&writer, limit + 1).await;
+    let (status, headers, body) = parts(refused).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "one path past the limit is a decode refusal"
+    );
+    assert_eq!(
+        header_of(&headers, header::CONTENT_TYPE).as_deref(),
+        Some("application/x-protobuf"),
+        "it leaves through this route's whole-request error writer"
+    );
+    assert_eq!(header_of(&headers, header::X_CONTENT_TYPE_OPTIONS), None);
+    assert_eq!(
+        decode_status(&body).0,
+        3,
+        "`classify` already maps the oversize-message variant to code 3"
+    );
+    assert_eq!(
+        landing.call_count(),
+        1,
+        "the refused push never reached admission"
+    );
+    assert_eq!(spans_mock.call_count(), 1, "on either path");
+    writer.shutdown(Duration::from_secs(10)).await;
 
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// One span carrying `paths` distinct attribute keys, all under one value so
-/// the push's distinct-value count stays at one.
+/// One span whose attributes are four `kvlist`s holding `paths` leaves
+/// between them, all under one value so the push's distinct-value count
+/// stays at nothing — a kvlist contributes no kind-3 row.
 fn paths_request(paths: u64) -> ExportTraceServiceRequest {
-    let attrs: Vec<KeyValue> = (0..paths).map(|i| kv(&format!("k{i:06}"), "v")).collect();
+    use opentelemetry_proto::tonic::common::v1::KeyValueList;
+    const GROUPS: u64 = 4;
+    let per = paths / GROUPS;
+    let remainder = paths % GROUPS;
+    let attrs: Vec<KeyValue> = (0..GROUPS)
+        .map(|g| {
+            let count = per + u64::from(g == 0) * remainder;
+            KeyValue {
+                key: format!("g{g}"),
+                value: Some(AnyValue {
+                    value: Some(Value::KvlistValue(KeyValueList {
+                        values: (0..count).map(|i| kv(&format!("k{i:06}"), "v")).collect(),
+                    })),
+                }),
+                key_strindex: 0,
+            }
+        })
+        .collect();
     request_of("checkout", vec![span_at(0xaa, 0x11, base_ns(), attrs)])
 }
 
-async fn post_paths(transport: &str, writer: &TraceWriter, paths: u64) -> axum::response::Response {
-    match transport {
-        "otlp" => {
-            let body = paths_request(paths).encode_to_vec();
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                "application/x-protobuf".parse().unwrap(),
-            );
-            pulsus_write::ingest_traces(writer, headers, Body::from(body)).await
-        }
-        _ => {
-            let tags: Vec<String> = (0..paths).map(|i| format!(r#""k{i:06}":"v""#)).collect();
-            let body = format!(
-                r#"[{{"traceId":"aa000000000000000000000000000001","id":"0000000000000011","name":"get","timestamp":{},"duration":1000,"localEndpoint":{{"serviceName":"checkout"}},"tags":{{{}}}}}]"#,
-                base_ns() / 1_000,
-                tags.join(",")
-            );
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-            pulsus_write::ingest_zipkin(writer, headers, Body::from(body.into_bytes())).await
-        }
-    }
+async fn post_paths(writer: &TraceWriter, paths: u64) -> axum::response::Response {
+    let body = paths_request(paths).encode_to_vec();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-protobuf".parse().unwrap(),
+    );
+    pulsus_write::ingest_traces(writer, headers, Body::from(body)).await
 }
 
 /// **A push above the per-push ceilings is `413` on both trace transports,
@@ -1413,7 +1412,7 @@ async fn a_push_too_large_is_413_on_the_trace_transports() {
     };
 
     for transport in ["otlp", "zipkin"] {
-        let landing = MockInserter::unrecorded(Act::Ok);
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
         let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
         let response = match transport {
             "otlp" => {
