@@ -606,7 +606,7 @@ answer; `measure/sql/<file>.sql` is the statement it must compile to.
 | `T-W3` | one span id with kinds 2 and 3 (a shared span) | rows after `FINAL` | 2 | `kind` must be in the sorting key |
 | `T-W4` | insert the corpus into replica 1, `SYSTEM SYNC REPLICA` on replica 2 | replica 2's `part_log` fetched bytes / 2,000,064, against the active part bytes per span | within 5% — measured **34.965** fetched against **34.923** stored, 1.0012×. The excess is part metadata and checksums, not a second copy of a column; a ratio near 2 would be one | — |
 | `T-W5` | 1,000 spans of one resource in one day | rows in `resources` | 1 | the writer cache is new |
-| `T-W6` | break the per-trace view, then insert | the insert | fails; no span stored without its index row | matches today's behaviour and must be kept |
+| `T-W6` | break the per-trace view, then insert | the insert, the throwing view's target, and the healthy siblings | the insert fails and `traces` is empty; the siblings' counts are **recorded and asserted against nothing** — the fan-out is not a transaction, and a measurement over 300 trials found healthy siblings committing in 28, 25 and 32 of them, so an assertion that `spans` is empty would fail about a tenth of the time | matches today's behaviour and must be kept |
 | `T-W7` | a span carrying every field, an event, a link, and all five value types | fetch it back and compare as an OTLP value | equal; attribute order is not significant | today compares against the payload blob |
 
 ### 8.6 Protections

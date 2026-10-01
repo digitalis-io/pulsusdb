@@ -3703,3 +3703,45 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **Disposition.** Deliberate. Documented in docs/api.md §4.2 (the `422` row
   of the error table).
+
+### `trace-push-too-many-utc-dates-413` (issue #586) — **a push whose spans span more than a hundred UTC dates is refused**
+
+- **What:** `POST /v1/traces` and `POST /api/v2/spans` (with its `/tempo/spans`
+  alias) answer **`413`** for a push whose spans fall on more than `100` distinct
+  UTC dates. `100` dates is admitted and `101` is refused. The message names the
+  push's own count and the limit:
+
+  ```
+  push covers too many UTC dates for one block: 101 dates (limit 100)
+  ```
+
+  On `/v1/traces` it is a `google.rpc.Status` with `code = 8`; on the Zipkin
+  receiver it is that same text as the whole plain-text body, in that endpoint's
+  post-admission container (docs/api.md §8.2). Both are deliberate.
+
+- **What the reference does:** accepts the push. Its receivers have no ceiling on
+  the span of dates one request may cover — there is no equivalent code on either
+  endpoint — so any such request stores.
+
+- **Why we do not match it.** A trace push is stored as one `INSERT` of one block
+  into one landing table, and `spans`, `traces` and `resources` are partitioned by
+  UTC day: one materialized view's insert therefore produces one part per day the
+  push's spans fall in, and ClickHouse refuses a block above
+  `max_partitions_per_insert_block` — `100`, the server's own default, which this
+  build pins so the gate and the engine cannot disagree about the same limit.
+  Without the gate such a push is admitted, stored by the path that answers the
+  client, and answered `200` while its landing insert fails: the spans and the
+  resources are then absent from the new tables with nobody told, which is the
+  silent-loss shape this project treats as the worst kind of defect. The `413`
+  turns that into a refusal the sender can act on.
+
+- **Consumer impact.** It needs a sender that batches spans across more than a
+  hundred calendar days in **one** request. A live collector does not: it batches
+  by time and by size over spans it has just received. What reaches it is a backfill
+  or a replay of historical data sent in one request, which has to be split — and a
+  `413` naming the count and the limit says exactly how. Nothing splits for it,
+  because a split push is not one block.
+
+- **Where it is pinned.** `a_push_spanning_more_than_a_hundred_dates_is_refused` in
+  `crates/pulsus-write/tests/trace_landing.rs`, once per trace transport, over both
+  sides of the boundary and over both write paths' stores.

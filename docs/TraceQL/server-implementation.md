@@ -55,17 +55,17 @@ value is kept, which is the rule `docs/api.md` §4.2 already states, and which
 ClickHouse requires — two identical paths in one JSON value are refused).
 `T-W7` compares a round trip as an OTLP value.
 
-### 2.2 Resources, catalogs and their caches
+### 2.2 Resources and catalogs
 
 `resource_id` is `pulsus_model::compose128` over the resource's encoded
 attributes and schema url — `cityHash64` in the high half, `xxHash64` with seed
 0 in the low half, the composition issue #498 settled on for stream and series
 identity, for the same reason. Not a third hash primitive: with one
 composition, a change to either primitive moves every identity and one set of
-golden vectors catches it. The writer keeps a small map of `(resource_id, day)` and
-`(scope, key[, value, type])` it has already written, so a resource row is
-written once per day and a catalog row once per process lifetime, the way
-metric metadata already works. On g1: 68 resource rows, 48 name rows, 304,070
+golden vectors catches it. The writer keeps no map of what it has
+already written: a push lands the distinct `(resource_id, day)` and
+`(scope, key[, value, type])` tuples of its own spans, and each target
+collapses the repeats on its own key. On g1: 68 resource rows, 48 name rows, 304,070
 value rows, against 2,000,064 spans.
 
 ### 2.3 Attributes: paths, types, and the binary encoding
@@ -95,8 +95,16 @@ of the three: the same 40 retried bodies stored 19,669 extra span rows.
 
 `traces_mv` aggregates each insert block into one row per `(day, trace)`. It
 performs no join and no lookup, so it adds no read to the write path. A failing
-view fails the insert, as today's derived tables do, so a span is never stored
-without its index row (`T-W6`).
+view fails the insert, as today's derived tables do (`T-W6`).
+
+**What that gives, and no more.** The insert fails, and the throwing view's own
+target holds nothing — measured over 300 trials of one throwing view on one
+source table. **It does not make the five targets whole together**: the
+fan-out from the committed block to the targets is not a transaction, and in
+the same 300 trials three healthy sibling views committed in 28, 25 and 32 of
+them. So "a span is never stored without its index row" is not claimed here
+and `T-W6` does not assert it: the sibling counts are recorded, and asserting
+`spans` is empty would fail about a tenth of the time.
 
 ### 2.6 What the write path costs
 
