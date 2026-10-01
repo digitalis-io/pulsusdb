@@ -2657,8 +2657,12 @@ const IDENTITY_SEP: u8 = 0xFF;
 
 /// The one-byte type tag the identity buffer puts before a value, so an
 /// integer `1` and the string `"1"` are different resources.
-fn identity_type_tag(value: Option<&AnyValue>) -> u8 {
-    match value.and_then(|v| v.value.as_ref()) {
+///
+/// One tag per arm of the `AnyValue` oneof, plus `u` for an `AnyValue` with
+/// no arm set and for an absent one — the protocol calls both "empty" and
+/// the stored attributes cannot tell them apart either.
+fn identity_type_tag(value: Option<&Value>) -> u8 {
+    match value {
         None => b'u',
         Some(Value::StringValue(_)) => b's',
         Some(Value::BoolValue(_)) => b'b',
@@ -2671,18 +2675,92 @@ fn identity_type_tag(value: Option<&AnyValue>) -> u8 {
     }
 }
 
+/// Appends a length and then the bytes it counts, so a field whose width
+/// the type does not fix cannot run into its neighbour.
+fn identity_push_len_prefixed(bytes: &[u8], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Appends one value to the identity buffer: **its type tag, then its own
+/// bytes, at every depth**.
+///
+/// The shapes that can nest are the protocol's, not a chosen few:
+/// `AnyValue.value` is an optional oneof of eight arms, and exactly two of
+/// them carry further `AnyValue`s — `ArrayValue.values`, and
+/// `KeyValueList.values`' `KeyValue.value`. So this walks those two arms
+/// and tags what it finds, which makes the encoding injective over the
+/// whole value: the arms whose width the type does not fix carry a length,
+/// a container carries its element count, and every element and every
+/// kvlist entry's value carries its own tag.
+///
+/// **Rendering the value to text instead collapses distinct resources**, at
+/// any depth below the first: a bytes value renders as its base64 text and
+/// so cannot be told from a string carrying that text, and a non-finite
+/// double, a profiling string reference and an unset value all render as
+/// JSON `null`. `resources` is a `ReplacingMergeTree` keyed on
+/// `(service, resource_id)`, so a shared identity means one of the two
+/// resources replaces the other and the spans carrying that id join to
+/// whichever survived.
+///
+/// A double is encoded by its bits rather than its text, which keeps `+inf`,
+/// `-inf` and a NaN apart from each other and from every finite value.
+/// Equal wire values give equal bytes, which is what the identity needs; a
+/// finer distinction than the stored column can show costs nothing, because
+/// two identities for one stored content are two rows under two keys, while
+/// one identity for two contents loses one of them.
+///
+/// The recursion is bounded by the whole-request depth guard
+/// ([`crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH`], 32), which runs at the top of
+/// [`parse_landing`] before any value is encoded — the same bound
+/// [`any_value_to_json`] relies on.
+fn identity_encode_value(value: Option<&AnyValue>, buf: &mut Vec<u8>) {
+    let value = value.and_then(|v| v.value.as_ref());
+    buf.push(identity_type_tag(value));
+    match value {
+        None => {}
+        Some(Value::StringValue(s)) => identity_push_len_prefixed(s.as_bytes(), buf),
+        Some(Value::BoolValue(b)) => buf.push(u8::from(*b)),
+        Some(Value::IntValue(i)) => buf.extend_from_slice(&i.to_le_bytes()),
+        Some(Value::DoubleValue(d)) => buf.extend_from_slice(&d.to_bits().to_le_bytes()),
+        Some(Value::BytesValue(bytes)) => identity_push_len_prefixed(bytes, buf),
+        Some(Value::StringValueStrindex(index)) => buf.extend_from_slice(&index.to_le_bytes()),
+        Some(Value::ArrayValue(array)) => {
+            buf.extend_from_slice(&(array.values.len() as u64).to_le_bytes());
+            for element in &array.values {
+                identity_encode_value(Some(element), buf);
+            }
+        }
+        Some(Value::KvlistValue(kvlist)) => {
+            buf.extend_from_slice(&(kvlist.values.len() as u64).to_le_bytes());
+            for entry in &kvlist.values {
+                identity_push_len_prefixed(entry.key.as_bytes(), buf);
+                identity_encode_value(entry.value.as_ref(), buf);
+            }
+        }
+    }
+}
+
 /// The canonical buffer one resource's identity is taken over.
 ///
-/// **Pairs sorted by key, key-unique, `key ++ 0xFF ++ <type tag> ++ value
-/// ++ 0xFF`** — `pulsus_model::build_stream_buffer`'s layout with a type tag
-/// added — then the schema url under [`IDENTITY_SCHEMA_URL_KEY`].
+/// **Pairs sorted by key, key-unique, `key ++ 0xFF ++ <encoded value> ++
+/// 0xFF`** — `pulsus_model::build_stream_buffer`'s layout, with
+/// [`identity_encode_value`] in place of the value's text — then the schema
+/// url under [`IDENTITY_SCHEMA_URL_KEY`].
+///
+/// The encoded value starts with a type tag, which is an ASCII letter, and
+/// is self-delimiting from there; a key holds no `0xFF` because it is valid
+/// UTF-8. So the buffer can be read back as the pairs it was built from,
+/// which is what makes two different resources two buffers.
 ///
 /// Three properties this gives, each with the case that holds it:
 ///
 /// - **The identity does not depend on arrival order**, because the buffer
 ///   is built from sorted, key-unique pairs. That is the invariant
 ///   `LabelSet`'s own doc comment states, and an identity taken over the
-///   encoded bytes in arrival order breaks it.
+///   encoded bytes in arrival order breaks it. The sort is stable and the
+///   deduplication keeps the earlier pair, so a repeated key keeps its
+///   first value here as it does in the stored attributes.
 /// - **`service.name` is in the hash.** Only the *stored* `attrs` drops it,
 ///   because `spans.service` already carries it. Leaving it out of the
 ///   buffer would make two different services with otherwise equal
@@ -2694,25 +2772,20 @@ fn identity_type_tag(value: Option<&AnyValue>) -> u8 {
 /// - **A key present with an empty value differs from an absent key**,
 ///   because a present key contributes its own `key ++ 0xFF ++ tag ++ 0xFF`.
 fn resource_identity_buffer(resource: Option<&Resource>, schema_url: &str) -> Vec<u8> {
-    let mut pairs: Vec<(&str, u8, String)> = Vec::new();
+    let mut pairs: Vec<(&str, Option<&AnyValue>)> = Vec::new();
     if let Some(resource) = resource {
         for kv in &resource.attributes {
-            pairs.push((
-                kv.key.as_str(),
-                identity_type_tag(kv.value.as_ref()),
-                any_value_to_string(kv.value.as_ref()),
-            ));
+            pairs.push((kv.key.as_str(), kv.value.as_ref()));
         }
     }
     pairs.sort_by(|a, b| a.0.cmp(b.0));
     pairs.dedup_by(|a, b| a.0 == b.0);
 
     let mut buf = Vec::new();
-    for (key, tag, value) in &pairs {
+    for (key, value) in &pairs {
         buf.extend_from_slice(key.as_bytes());
         buf.push(IDENTITY_SEP);
-        buf.push(*tag);
-        buf.extend_from_slice(value.as_bytes());
+        identity_encode_value(*value, &mut buf);
         buf.push(IDENTITY_SEP);
     }
     buf.extend_from_slice(IDENTITY_SCHEMA_URL_KEY);
@@ -2908,18 +2981,50 @@ struct LandedAttrs {
     other: Vec<KeyValue>,
 }
 
+/// The catalog entries one part of a push contributes, distinct inside
+/// themselves.
+///
+/// **A stage is held back until a span has passed every check.** A
+/// resource's, a scope's and a span's entries each get their own, and
+/// [`TagStage::absorb`] moves them into the push's accepted sets at the one
+/// point a span is known to land. Writing them straight into the accepted
+/// sets leaves `tag_names` and `tag_values` rows behind for a push that
+/// stores no span — rows for data the store does not hold.
+#[derive(Default)]
+struct TagStage {
+    names: BTreeSet<LandingTagName>,
+    values: BTreeSet<LandingTagValue>,
+}
+
+impl TagStage {
+    /// Takes `staged`'s entries into this stage, which is the push's
+    /// accepted set. Both sides are sets, so a resource's or a scope's
+    /// entries taken once per landed span land once.
+    ///
+    /// **Not named `merge`.** `pulsus-server`'s route-inventory guard pins
+    /// the whole body of every function whose text contains a `.merge(`
+    /// token, and the one call site below is in a decode function that
+    /// composes no routes: pinning it would put that body in the route
+    /// snapshot and make every later edit to it a re-derivation there.
+    fn absorb(&mut self, staged: &TagStage) {
+        self.names.extend(staged.names.iter().cloned());
+        self.values.extend(staged.values.iter().cloned());
+    }
+}
+
 /// Lands one attribute list.
 ///
 /// `scope` decides which catalog scope the names and values are recorded
-/// under; `names` and `values` are the push-wide distinct sets, so a key or
-/// a value repeated across spans lands once.
+/// under; `stage` is the holding set for the part of the push these
+/// attributes belong to, merged into the accepted sets only once a span
+/// under them lands.
 fn land_attrs(
     attrs: &[KeyValue],
     scope: TagScope,
     skip_key: Option<&str>,
-    names: &mut BTreeSet<LandingTagName>,
-    values: &mut BTreeSet<LandingTagValue>,
+    stage: &mut TagStage,
 ) -> LandedAttrs {
+    let TagStage { names, values } = stage;
     let mut entries: Vec<TraceJsonEntry> = Vec::with_capacity(attrs.len());
     let mut other: Vec<KeyValue> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -3071,8 +3176,10 @@ pub fn parse_landing(
 
     let mut out = ParsedTraceLanding::default();
     let mut expanded_bytes: usize = 0;
-    let mut names: BTreeSet<LandingTagName> = BTreeSet::new();
-    let mut values: BTreeSet<LandingTagValue> = BTreeSet::new();
+    // The catalog entries of the spans that landed. Every entry reaches it
+    // through a [`TagStage`] merged at the one point below where a span has
+    // passed every check, the UTC-day check included.
+    let mut accepted = TagStage::default();
     // One row per distinct `(resource_id, day)` in the push. The day comes
     // from the spans that resource carried, so a push whose spans straddle
     // midnight emits two rows for one resource.
@@ -3090,7 +3197,9 @@ pub fn parse_landing(
         let resource_id = resource_identity(resource, &resource_spans.schema_url);
 
         // The resource's own landed attributes, built once per
-        // `ResourceSpans` block: every span in it shares them.
+        // `ResourceSpans` block: every span in it shares them, and so do
+        // the catalog entries they contribute.
+        let mut resource_stage = TagStage::default();
         let resource_attrs = match resource {
             Some(resource) => {
                 for kv in &resource.attributes {
@@ -3103,8 +3212,7 @@ pub fn parse_landing(
                     // because `spans.service` already carries it. It stays
                     // in the identity buffer above.
                     Some("service.name"),
-                    &mut names,
-                    &mut values,
+                    &mut resource_stage,
                 )
             }
             None => LandedAttrs {
@@ -3119,6 +3227,7 @@ pub fn parse_landing(
             let scope = scope_spans.scope.as_ref();
             let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
             let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
+            let mut scope_stage = TagStage::default();
             let scope_attrs = match scope {
                 Some(scope) => {
                     for kv in &scope.attributes {
@@ -3128,8 +3237,7 @@ pub fn parse_landing(
                         &scope.attributes,
                         TagScope::Instrumentation,
                         None,
-                        &mut names,
-                        &mut values,
+                        &mut scope_stage,
                     )
                 }
                 None => LandedAttrs {
@@ -3140,6 +3248,7 @@ pub fn parse_landing(
             check_json_paths(&scope_attrs.json)?;
 
             for span in &scope_spans.spans {
+                let mut span_stage = TagStage::default();
                 let Some(landed) = land_span(
                     &mut out,
                     &mut expanded_bytes,
@@ -3150,8 +3259,7 @@ pub fn parse_landing(
                     &scope_name,
                     &scope_version,
                     &scope_attrs,
-                    &mut names,
-                    &mut values,
+                    &mut span_stage,
                 )?
                 else {
                     continue;
@@ -3171,6 +3279,14 @@ pub fn parse_landing(
                         continue;
                     }
                 };
+                // **The staging boundary.** The span has passed every check
+                // from here, so its own entries and the resource's and the
+                // scope's are merged, and its resource row is emitted. A
+                // span refused above — by its ids, its timestamp or the day
+                // check — reaches neither.
+                accepted.absorb(&resource_stage);
+                accepted.absorb(&scope_stage);
+                accepted.absorb(&span_stage);
                 resources
                     .entry((resource_id, day))
                     .or_insert_with(|| LandingResource {
@@ -3188,12 +3304,16 @@ pub fn parse_landing(
     }
 
     out.resources = resources.into_values().collect();
-    out.tag_names = names.into_iter().collect();
-    out.tag_values = values.into_iter().collect();
+    out.tag_names = accepted.names.into_iter().collect();
+    out.tag_values = accepted.values.into_iter().collect();
     Ok(out)
 }
 
 /// Lands one span, or rejects it wholesale into partial success.
+///
+/// `stage` is this span's own holding set — its attributes', its events'
+/// and its links' catalog entries. The caller merges it only once the span
+/// has passed the UTC-day check as well, which this function does not run.
 #[allow(clippy::too_many_arguments)]
 fn land_span(
     out: &mut ParsedTraceLanding,
@@ -3205,8 +3325,7 @@ fn land_span(
     scope_name: &str,
     scope_version: &str,
     scope_attrs: &LandedAttrs,
-    names: &mut BTreeSet<LandingTagName>,
-    values: &mut BTreeSet<LandingTagValue>,
+    stage: &mut TagStage,
 ) -> Result<Option<LandingSpan>, LogsIngestError> {
     let Ok(trace_id) = <[u8; 16]>::try_from(span.trace_id.as_slice()) else {
         reject_landing(
@@ -3270,7 +3389,7 @@ fn land_span(
     for kv in &span.attributes {
         charge_budget(expanded_bytes, attr_budget_charge(kv))?;
     }
-    let span_attrs = land_attrs(&span.attributes, TagScope::Span, None, names, values);
+    let span_attrs = land_attrs(&span.attributes, TagScope::Span, None, stage);
     check_json_paths(&span_attrs.json)?;
 
     let mut events = Vec::with_capacity(span.events.len());
@@ -3278,7 +3397,7 @@ fn land_span(
         for kv in &event.attributes {
             charge_budget(expanded_bytes, attr_budget_charge(kv))?;
         }
-        let landed = land_attrs(&event.attributes, TagScope::Event, None, names, values);
+        let landed = land_attrs(&event.attributes, TagScope::Event, None, stage);
         check_json_paths(&landed.json)?;
         events.push(LandingEvent {
             time_ns: i64::try_from(event.time_unix_nano).unwrap_or(i64::MAX),
@@ -3293,7 +3412,7 @@ fn land_span(
         for kv in &link.attributes {
             charge_budget(expanded_bytes, attr_budget_charge(kv))?;
         }
-        let landed = land_attrs(&link.attributes, TagScope::Link, None, names, values);
+        let landed = land_attrs(&link.attributes, TagScope::Link, None, stage);
         check_json_paths(&landed.json)?;
         links.push(LandingLink {
             trace_id: <[u8; 16]>::try_from(link.trace_id.as_slice()).unwrap_or([0u8; 16]),
