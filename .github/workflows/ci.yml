@@ -643,11 +643,23 @@ jobs:
       - name: Install cargo-nextest (pinned)
         run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      # Pinned by digest rather than by the floating `26.3` tag, the way the
+      # reference images below already are: that tag moves to each new LTS
+      # patch, so any branch can go red with no commit behind it. This digest
+      # is clickhouse-server 26.3.38.2 — what `26.3` resolved to on
+      # 2026-10-01, and the image the last green run on this branch pulled.
+      # The two compose files under `ci/` carry the same digest and the
+      # matching clickhouse-keeper one; this comment is the reason for all
+      # nine references.
+      #
+      # The 24.8 start further down is deliberately left on its tag: it is
+      # the negative test that the version floor is enforced, so what it
+      # needs is a server below the floor, not a reproducible one.
       - name: Start ClickHouse 26.3
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
-            clickhouse/clickhouse-server:26.3
+            clickhouse/clickhouse-server@sha256:e6b2c8a8146ad052062ca38bee3b29f9c20b2bfab7aa0720b10b201b202bf83a
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
             sleep 1
