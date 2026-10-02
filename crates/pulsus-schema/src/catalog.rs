@@ -3623,6 +3623,14 @@ mod tests {
     /// **Every passage saying which tables are written under their bare
     /// name names all three.** One named two, one named "the two ingest
     /// landing tables" — both written before `trace_landing` existed.
+    ///
+    /// The conventions preamble read here is also a `rewrite` row in
+    /// `ci/checks/doc_sites.txt`, and the two instruments answer different
+    /// questions: that row records that this change edited the line, and
+    /// `ci/checks/doc_sites.sh` says in its own header what it cannot tell
+    /// you — whether the replacement is true. That is what this case reads,
+    /// for this passage as for the other two, so the row does not relieve it
+    /// of any of the three.
     #[test]
     fn the_bare_name_passages_name_all_three_landing_tables() {
         let landing: Vec<&str> = tables_with_no_wrapper()
