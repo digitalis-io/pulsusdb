@@ -3661,4 +3661,30 @@ mod tests {
             }
         }
     }
+
+    /// **The two passages that carry the claim without the list say where
+    /// the list is.** `docs/architecture.md` §7 and `docs/schemas.md` §7
+    /// own the ten exceptions, read by
+    /// [`the_wrapper_sentences_name_every_table_without_a_routing_sibling`];
+    /// the conventions preamble and the features row state the claim and
+    /// cite them instead of repeating it. The features row cited nothing.
+    #[test]
+    fn the_citing_clustering_passages_name_the_section_holding_the_list() {
+        assert!(
+            doc("schemas.md").contains("\n## 7. Distributed layout"),
+            "docs/schemas.md must still hold the section the other two cite"
+        );
+        let preamble = doc_line("schemas.md", "Conventions used below:");
+        assert!(
+            preamble.contains("§7 lists all ten"),
+            "docs/schemas.md's conventions preamble must cite its own §7 for \
+             the ten: {preamble}"
+        );
+        let row = doc_line("features.md", "| Clustered ClickHouse |");
+        assert!(
+            row.contains("[schemas.md §7](schemas.md) lists all ten"),
+            "docs/features.md's clustering row must cite schemas.md §7 for \
+             the ten: {row}"
+        );
+    }
 }
