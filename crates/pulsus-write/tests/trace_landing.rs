@@ -1615,6 +1615,29 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
         .expect("connect to the test database"),
     );
 
+    // **The window this case reads is bounded at both ends.**
+    // `system.asynchronous_insert_log` is server-wide and append-only, and
+    // this suite's database name repeats across runs, so a row an earlier
+    // run of this same case left behind is still there — measured: a run
+    // with the client's `async_insert` pin removed left one, and the next
+    // run read it and failed. The read starts at this instant.
+    //
+    // Each read below is in a block of its own, so its stream — and the
+    // pooled connection it holds — is dropped before the next statement
+    // runs; two live streams exhaust this client's two-connection pool and
+    // the `DROP DATABASE` at the end times out.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct TextRow {
+        s: String,
+    }
+    let started = {
+        let mut stream = admin
+            .query_stream::<TextRow>("SELECT toString(now64(6)) AS s", &QuerySettings::new())
+            .await
+            .expect("read the server's own clock");
+        stream.next().await.expect("one row").expect("decode").s
+    };
+
     let root = spool_root("async-queue");
     let mut runtime = runtime_at(&WriterConfig::default(), &root);
     runtime.trace_landing_inserters = 1;
@@ -1643,13 +1666,18 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
         )
         .await
         .expect("flush the system logs");
-    let sql = "SELECT count() AS n FROM system.asynchronous_insert_log \
-               WHERE table = 'trace_landing'";
-    let mut stream = admin
-        .query_stream::<CountRow>(sql, &QuerySettings::new())
-        .await
-        .expect("read the asynchronous insert log");
-    let queued = stream.next().await.expect("one row").expect("decode").n;
+    let sql = format!(
+        "SELECT count() AS n FROM system.asynchronous_insert_log \
+         WHERE database = '{db}' AND table = 'trace_landing' \
+           AND event_time_microseconds >= toDateTime64('{started}', 6)"
+    );
+    let queued = {
+        let mut stream = admin
+            .query_stream::<CountRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the asynchronous insert log");
+        stream.next().await.expect("one row").expect("decode").n
+    };
     assert_eq!(
         queued, 0,
         "a landing insert must never be queued: a queued block can carry two \
