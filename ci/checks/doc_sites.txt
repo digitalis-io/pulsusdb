@@ -14,7 +14,7 @@ rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
-rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586
+rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126
