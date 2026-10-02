@@ -3423,6 +3423,28 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// The one line of `name` containing `anchor`, which must occur once,
+    /// **cut off at the anchor**.
+    ///
+    /// The cut is the point. A passage that lists tables and then explains
+    /// itself can satisfy a bare `contains` with its own explanation rather
+    /// than with its list: dropping `spans` from the sharding-key table's
+    /// first column left the case green, because the third column still
+    /// said the word. The anchor is the column boundary, so only the list
+    /// is read.
+    fn doc_line_before(name: &str, anchor: &str) -> String {
+        let text = doc(name);
+        let hits: Vec<&str> = text.lines().filter(|l| l.contains(anchor)).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "docs/{name} must carry exactly one line containing {anchor:?}, found {}",
+            hits.len()
+        );
+        let at = hits[0].find(anchor).expect("the line contains the anchor");
+        hits[0][..at].to_string()
+    }
+
     /// The one line of `name` containing `anchor`, which must occur once.
     fn doc_line(name: &str, anchor: &str) -> String {
         let text = doc(name);
@@ -3436,20 +3458,15 @@ mod tests {
         hits[0].to_string()
     }
 
-    /// Whether this migration declares a routing wrapper rather than a base
-    /// table: either the generated `Ddl::Dist` form or a literal template
-    /// that renders the `{{dist_suffix}}` name.
-    fn declares_a_wrapper(m: &Migration) -> bool {
-        match m.ddl {
-            Ddl::Dist => true,
-            Ddl::Static(t) | Ddl::StaticClusterOnly(t) => t.contains("{{dist_suffix}}"),
-        }
-    }
-
-    /// Every table name a `CREATE TABLE` migration declares as a base
-    /// table, and every name a routing wrapper exists for.
-    fn base_and_wrapped_names() -> (Vec<&'static str>, Vec<&'static str>) {
-        let mut base = Vec::new();
+    /// Every base table a `CREATE TABLE` migration declares, with the
+    /// family it carries, and every name a routing wrapper exists for.
+    ///
+    /// A wrapper is either the generated `Ddl::Dist` form or a literal
+    /// template that renders the `{{dist_suffix}}` name — `spans` and
+    /// `traces` take the second, because their wrappers carry two engine
+    /// settings `Ddl::Dist` cannot.
+    fn base_and_wrapped_names() -> (Vec<(&'static str, Option<Family>)>, Vec<&'static str>) {
+        let mut base: Vec<(&'static str, Option<Family>)> = Vec::new();
         let mut wrapped = Vec::new();
         for m in MIGRATIONS {
             let tmpl = match m.ddl {
@@ -3459,10 +3476,10 @@ mod tests {
                 }
                 Ddl::Static(t) | Ddl::StaticClusterOnly(t) => t,
             };
-            if declares_a_wrapper(m) {
+            if tmpl.contains("{{dist_suffix}}") {
                 wrapped.push(m.name);
-            } else if tmpl.contains("CREATE TABLE") && !base.contains(&m.name) {
-                base.push(m.name);
+            } else if tmpl.contains("CREATE TABLE") && !base.iter().any(|(n, _)| *n == m.name) {
+                base.push((m.name, m.family));
             }
         }
         (base, wrapped)
@@ -3472,7 +3489,10 @@ mod tests {
     /// and the cluster-wide ones.
     fn tables_with_no_wrapper() -> Vec<&'static str> {
         let (base, wrapped) = base_and_wrapped_names();
-        base.into_iter().filter(|n| !wrapped.contains(n)).collect()
+        base.into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !wrapped.contains(n))
+            .collect()
     }
 
     /// **The two wrapper sentences name every table that has no routing
@@ -3528,45 +3548,45 @@ mod tests {
     /// **The trace sharding-key passages name every routed trace table.**
     /// `spans` and `traces` are routed on `cityHash64(trace_id)` by
     /// migrations 72 and 73 and neither passage named them.
+    ///
+    /// Only the names column of each passage is read, for the reason
+    /// [`doc_line_before`] gives.
     #[test]
     fn the_trace_sharding_key_passages_name_every_routed_trace_table() {
-        let (_, wrapped) = base_and_wrapped_names();
-        let routed: Vec<&str> = MIGRATIONS
-            .iter()
-            .filter(|m| m.family == Some(Family::Traces) && wrapped.contains(&m.name))
-            .map(|m| m.name)
-            .fold(Vec::new(), |mut acc, n| {
-                if !acc.contains(&n) {
-                    acc.push(n);
-                }
-                acc
-            });
-        assert!(
-            routed.len() >= 7,
-            "every trace table but the landing one is routed, found {routed:?}"
+        let (base, wrapped) = base_and_wrapped_names();
+        let routed: Vec<&str> = base
+            .into_iter()
+            .filter(|(n, family)| *family == Some(Family::Traces) && wrapped.contains(n))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            routed.len(),
+            7,
+            "every trace base table but the landing one is routed, found {routed:?}"
         );
         let passages = [
             (
                 "architecture.md",
-                doc_line(
+                doc_line_before(
                     "architecture.md",
                     "`cityHash64(trace_id)` — a trace is whole on one shard",
                 ),
             ),
             (
                 "schemas.md",
-                doc_line(
+                doc_line_before(
                     "schemas.md",
                     "| `cityHash64(trace_id)` | a trace is whole on one shard",
                 ),
             ),
         ];
-        for (name, line) in &passages {
+        for (name, names_column) in &passages {
             for table in &routed {
                 assert!(
-                    line.contains(&format!("`{table}`")),
+                    names_column.contains(&format!("`{table}`")),
                     "docs/{name}'s trace sharding-key passage must name \
-                     `{table}`, which is routed on that key: {line}"
+                     `{table}` among the tables that key, and its names \
+                     column is: {names_column}"
                 );
             }
         }
