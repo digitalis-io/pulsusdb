@@ -3572,23 +3572,65 @@ mod tests {
         }
     }
 
-    /// **The passage saying which tables are written under their bare name
-    /// names all three landing tables.** It named two, and the trace
-    /// landing insert has gone the same way since issue #586.
+    /// **Among per-shard tables, the three landing tables are the only ones
+    /// with no routing wrapper.** Four passages across three documents
+    /// restrict their claim to per-shard tables, and this is the fact that
+    /// restriction rests on: a per-shard table added without a wrapper
+    /// makes all four false at once, and reddens here rather than in a
+    /// document nobody reads.
     #[test]
-    fn the_bare_name_passage_names_all_three_landing_tables() {
+    fn only_the_three_landing_tables_are_per_shard_without_a_wrapper() {
+        let per_shard: Vec<&str> = MIGRATIONS
+            .iter()
+            .filter(|m| m.replication == Replication::PerShard)
+            .map(|m| m.name)
+            .collect();
+        let mut without: Vec<&str> = tables_with_no_wrapper()
+            .into_iter()
+            .filter(|n| per_shard.contains(n))
+            .collect();
+        without.sort_unstable();
+        assert_eq!(
+            without,
+            vec!["log_landing", "metric_landing", "trace_landing"],
+            "a per-shard table with no routing wrapper that is not a landing \
+             table falsifies the clustering claim in docs/architecture.md §7, \
+             docs/schemas.md §7, docs/schemas.md's conventions preamble and \
+             docs/features.md's clustering row"
+        );
+    }
+
+    /// **Every passage saying which tables are written under their bare
+    /// name names all three.** One named two, one named "the two ingest
+    /// landing tables" — both written before `trace_landing` existed.
+    #[test]
+    fn the_bare_name_passages_name_all_three_landing_tables() {
         let landing: Vec<&str> = tables_with_no_wrapper()
             .into_iter()
             .filter(|n| n.ends_with("_landing"))
             .collect();
         assert_eq!(landing.len(), 3, "three landing tables: {landing:?}");
-        let line = doc_line("architecture.md", "The landing tables have no wrapper");
-        for table in &landing {
-            assert!(
-                line.contains(&format!("`{table}`")),
-                "docs/architecture.md's bare-name passage must name \
-                 `{table}`: {line}"
-            );
+        let passages = [
+            (
+                "architecture.md",
+                doc_line("architecture.md", "The landing tables have no wrapper"),
+            ),
+            (
+                "schemas.md",
+                doc_line("schemas.md", "Conventions used below:"),
+            ),
+            (
+                "features.md",
+                doc_line("features.md", "| Clustered ClickHouse |"),
+            ),
+        ];
+        for (name, line) in &passages {
+            for table in &landing {
+                assert!(
+                    line.contains(&format!("`{table}`")),
+                    "docs/{name}'s bare-name passage must name `{table}`: {line}"
+                );
+            }
         }
     }
 }
