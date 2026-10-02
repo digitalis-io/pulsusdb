@@ -1436,7 +1436,7 @@ ORDER BY mv_name;
 
 ## 7. Distributed layout
 
-Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every table but the two landing tables gets a Distributed wrapper — `log_landing` and `metric_landing` get none (issue #603; the reason, and what it costs, are below and in [ingest-one-source-table.md](ingest-one-source-table.md)). **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
+Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every table but the three landing tables gets a Distributed wrapper — `log_landing`, `metric_landing` and `trace_landing` get none (issues #603 and #586; the reason, and what it costs, are below, in [ingest-one-source-table.md](ingest-one-source-table.md), and in §4.3's own bullet for the trace landing table). **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|
