@@ -1335,19 +1335,27 @@ async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
 }
 
 /// **The other half of the rule: the start time the request DID send is
-/// still content.** Two bodies alike but for one span's
-/// `start_time_unix_nano`, both decoded at one receive clock, are two
-/// identities and both store — the digest reads that value out of the span's
-/// own `payload`, which is the span re-encoded verbatim.
+/// still content.** Two bodies alike but for one span's own instant, both
+/// decoded at one receive clock, are two identities and both store — the
+/// digest reads that instant out of the span's `payload`, which is the span
+/// re-encoded verbatim.
+///
+/// **Both ends of the span move by the same nanosecond**, which is what
+/// makes the `payload` term the only thing that can discriminate the pair:
+/// shifting the start alone also shifts `duration_ns`, and the case then
+/// passes with `payload` deleted from the digest — measured, that is what it
+/// did.
 #[tokio::test]
-async fn two_bodies_differing_only_in_a_span_start_time_both_store() {
+async fn two_bodies_differing_only_in_a_span_instant_both_store() {
     let root = spool_root("start-time-differs");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let (writer, spans_mock, _attrs) =
         writer_ok_old(&WriterConfig::default(), &root, landing.clone());
 
     let mut later = six_spans();
-    later.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano += 1;
+    let span = &mut later.resource_spans[0].scope_spans[0].spans[0];
+    span.start_time_unix_nano += 1;
+    span.end_time_unix_nano += 1;
 
     for body in [six_spans(), later] {
         let (parsed, landed) = decode_both_at(&body, base_ns());
@@ -1362,7 +1370,7 @@ async fn two_bodies_differing_only_in_a_span_start_time_both_store() {
     assert_eq!(
         landing.call_count(),
         2,
-        "a changed span start time is a changed body"
+        "a span moved by one nanosecond is a changed body"
     );
     assert_eq!(spans_mock.call_count(), 2, "on the old path too");
 
