@@ -209,8 +209,41 @@ fn run_stamp() -> u128 {
 
 /// One identifier per run, which is what makes a token unique per statement
 /// across runs.
+///
+/// **Not the clock reading itself.** Two runs that read the clock in the
+/// same nanosecond — two processes on a cluster, or one clock stepped back
+/// — would mint one identifier, hand one target partition the same token
+/// twice, and the server, which hashes the token into the block id instead
+/// of hashing the block, would discard the second block as a duplicate. The
+/// replay would drop those rows in silence, which is the one thing it
+/// promises not to do.
+///
+/// 128 bits from two `std::collections::hash_map::RandomState`s, which are
+/// documented to be built from random keys, over a stream that also carries
+/// `stamp`, the process id and a count of this process's runs — so two runs
+/// differ even if one of the four sources repeats. Hand-rolled rather than
+/// taken from a dependency, for the reason `writer::landing`'s own token
+/// mint gives: one opaque string per run is the whole requirement.
 fn run_id(stamp: u128) -> u128 {
-    stamp
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let seed = (
+        stamp,
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed),
+    );
+    let half = |state: RandomState| {
+        let mut hasher = state.build_hasher();
+        seed.hash(&mut hasher);
+        hasher.finish()
+    };
+    // Two states, because one `Hasher` yields 64 bits: they are two
+    // different keyed functions of the same stream, so the halves are
+    // independent of each other.
+    (u128::from(half(RandomState::new())) << 64) | u128::from(half(RandomState::new()))
 }
 
 /// The suffix the two per-trace targets take: a replay routes exactly as the
@@ -230,8 +263,8 @@ fn target_suffix(ctx: &RenderCtx, target: &str) -> String {
 /// **Minted per statement**, which keeps each statement's identity
 /// independent and costs nothing. It is not a UUID: the token is an opaque
 /// string the server hashes into a block id, so the statement's own identity
-/// plus one clock reading per run is enough to make it unique per statement
-/// and stable inside one.
+/// plus [`run_id`]'s identifier is enough to make it unique per statement and
+/// stable inside one run.
 ///
 /// Two statements over different partitions could not collide however the
 /// token were chosen — the server's own block identity already carries the
