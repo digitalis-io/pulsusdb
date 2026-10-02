@@ -95,7 +95,7 @@ pub async fn replay_trace_window(
     max_rows: u64,
 ) -> Result<ReplayReport, ChError> {
     let db = &ctx.db;
-    let run = run_id(run_stamp());
+    let run = run_id()?;
     let mut report = ReplayReport::default();
 
     for (target, mv, partition_expr) in TARGETS {
@@ -199,46 +199,28 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// One clock reading per run, the input [`run_id`] mixes.
-fn run_stamp() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+/// A stub. The construction, and the bound it gives, land in the next
+/// commit (issue #586).
+fn run_nonce() -> Result<u64, ChError> {
+    Ok(0)
 }
 
-/// One identifier per run, which is what makes a token unique per statement
-/// across runs.
-///
-/// **Not the clock reading itself.** Two runs that read the clock in the
-/// same nanosecond — two processes on a cluster, or one clock stepped back
-/// — would mint one identifier, hand one target partition the same token
-/// twice, and the server, which hashes the token into the block id instead
-/// of hashing the block, would discard the second block as a duplicate. The
-/// replay would drop those rows in silence, which is the one thing it
-/// promises not to do.
-///
-/// 128 bits from two `std::collections::hash_map::RandomState`s, which are
-/// documented to be built from random keys, over a stream that also carries
-/// `stamp`, the process id and a count of this process's runs — so two runs
-/// differ even if one of those three repeats. Hand-rolled rather than taken
-/// from a dependency, for the reason `writer::landing`'s own token mint
-/// gives: one opaque string per run is the whole requirement.
-fn run_id(stamp: u128) -> u128 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// A stub. The construction, and the bound it gives, land in the next
+/// commit (issue #586).
+fn next_run_counter() -> u64 {
+    0
+}
 
-    static RUNS: AtomicU64 = AtomicU64::new(0);
-    let seed = (
-        stamp,
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::Relaxed),
-    );
-    let half = |state: RandomState| state.hash_one(seed);
-    // Two states, because one `Hasher` yields 64 bits: each is its own
-    // keyed function of the same stream, and the two keys differ.
-    (u128::from(half(RandomState::new())) << 64) | u128::from(half(RandomState::new()))
+/// A stub. The construction, and the bound it gives, land in the next
+/// commit (issue #586).
+fn compose_run_id(_nonce: u64, _counter: u64) -> u128 {
+    0
+}
+
+/// A stub. The construction, and the bound it gives, land in the next
+/// commit (issue #586).
+fn run_id() -> Result<u128, ChError> {
+    Ok(compose_run_id(run_nonce()?, next_run_counter()))
 }
 
 /// The suffix the two per-trace targets take: a replay routes exactly as the
@@ -286,39 +268,110 @@ async fn execute_recorded(
 mod tests {
     use super::*;
 
-    /// **Two runs that read the same clock are still two runs.** Wall-clock
-    /// nanoseconds are not unique across concurrent processes or across a
-    /// clock that steps back, and two runs that minted one identifier would
-    /// hand one target partition the same token twice: the server hashes the
-    /// token into the block id and discards the second block as a duplicate,
-    /// so the second run's rows would be dropped in silence and the repair
-    /// would not converge.
+    /// **The counter enters the identifier unchanged.** That is what the
+    /// construction rests on: the low half is this process's run counter
+    /// verbatim and the high half is the run's nonce, so two runs of one
+    /// process hold different counters and therefore different
+    /// identifiers. A construction that mixed the two — a hash over both,
+    /// say — would replace that with a collision probability no hash used
+    /// here promises a bound on.
     ///
-    /// The clock reading is forced equal, which is the whole of what the
-    /// case needs: it asserts the identifier is not a function of it.
+    /// Both boundary halves are included, because a construction that
+    /// masked or shifted by the wrong width passes on small values.
     #[test]
-    fn two_run_identifiers_from_one_clock_reading_differ() {
-        let stamp = 1_760_000_000_000_000_000u128;
-        let ids: Vec<u128> = (0..64).map(|_| run_id(stamp)).collect();
-        for (i, a) in ids.iter().enumerate() {
-            for b in &ids[i + 1..] {
-                assert_ne!(
-                    a, b,
-                    "two runs reading the clock in the same nanosecond must \
-                     still mint different identifiers"
-                );
-            }
+    fn the_identifier_is_a_nonce_above_the_run_counter_unchanged() {
+        for (nonce, counter) in [
+            (0u64, 0u64),
+            (0, 1),
+            (1, 0),
+            (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+            (u64::MAX, u64::MAX),
+        ] {
+            let id = compose_run_id(nonce, counter);
+            assert_eq!(
+                (id >> 64) as u64,
+                nonce,
+                "the high half is the nonce ({nonce:#018x} over {counter:#018x})"
+            );
+            assert_eq!(
+                id as u64, counter,
+                "the low half is the counter ({nonce:#018x} over {counter:#018x})"
+            );
         }
+        assert_eq!(
+            compose_run_id(0x0123_4567_89ab_cdef, 7),
+            0x0123_4567_89ab_cdef_0000_0000_0000_0007u128,
+            "the two halves sit side by side, nothing mixed"
+        );
+    }
+
+    /// **Two runs of one process never take one counter value**, whatever
+    /// else runs between them: each caller is handed a value no other
+    /// caller gets, and a later caller's value is larger. That is a fact
+    /// about the counter rather than a probability, and it is the whole of
+    /// the within-process bound.
+    #[test]
+    fn the_run_counter_hands_out_each_value_once_and_only_rises() {
+        let taken: Vec<u64> = (0..1_000).map(|_| next_run_counter()).collect();
+        let mut seen = taken.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            taken.len(),
+            "every value the counter hands out is its own"
+        );
+        for pair in taken.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the counter only rises: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// **The nonce is the operating system's, drawn per run.** Two draws
+    /// returning one value is a 2^-64 event, so a repeat here is the draw
+    /// not being a draw.
+    #[test]
+    fn two_run_nonces_differ() {
+        let a = run_nonce().expect("the operating system's random source answers");
+        let b = run_nonce().expect("the operating system's random source answers");
+        assert_ne!(a, b, "each run draws its own nonce");
+    }
+
+    /// **Two runs mint different identifiers, and differ in both halves.**
+    /// The nonce is drawn per run rather than once per process, so a
+    /// process that forks between two runs does not hand the child the
+    /// parent's nonce; the counter rises, so the low halves differ as well.
+    ///
+    /// Two runs that minted one identifier would hand one target partition
+    /// the same token twice, and the server hashes the token into the block
+    /// id rather than hashing the block, so it would discard the second
+    /// block as a duplicate — the replay would drop those rows in silence,
+    /// which is the one thing it promises not to do.
+    #[test]
+    fn two_runs_mint_different_identifiers_in_both_halves() {
+        let a = run_id().expect("an identifier");
+        let b = run_id().expect("an identifier");
+        assert_ne!(a, b, "two runs are two identifiers");
+        assert_ne!(a >> 64, b >> 64, "each run draws its own nonce");
+        assert!(
+            (b as u64) > (a as u64),
+            "the later run carries the larger counter: {:#018x} then {:#018x}",
+            a as u64,
+            b as u64
+        );
     }
 
     /// And the token carries the identifier, so two runs over one target
     /// partition carry two tokens.
     #[test]
     fn two_runs_give_one_target_partition_two_tokens() {
-        let stamp = 1_760_000_000_000_000_000u128;
         assert_ne!(
-            replay_token(run_id(stamp), "spans", "2026-10-02"),
-            replay_token(run_id(stamp), "spans", "2026-10-02"),
+            replay_token(run_id().expect("an identifier"), "spans", "2026-10-02"),
+            replay_token(run_id().expect("an identifier"), "spans", "2026-10-02"),
             "the token is what the server deduplicates the block on"
         );
     }
