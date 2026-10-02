@@ -3,7 +3,7 @@
 # rows are claims ABOUT that revision's sentences — a `leave` row says its
 # text is still there, and a `rewrite` row says its text is gone.
 # base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#461
 rewrite docs/schemas.md:1089-1089
 rewrite docs/architecture.md:378-378 refs=#560
 rewrite docs/116.md:64-64
