@@ -1334,6 +1334,42 @@ async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// **The other half of the rule: the start time the request DID send is
+/// still content.** Two bodies alike but for one span's
+/// `start_time_unix_nano`, both decoded at one receive clock, are two
+/// identities and both store — the digest reads that value out of the span's
+/// own `payload`, which is the span re-encoded verbatim.
+#[tokio::test]
+async fn two_bodies_differing_only_in_a_span_start_time_both_store() {
+    let root = spool_root("start-time-differs");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let (writer, spans_mock, _attrs) =
+        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+
+    let mut later = six_spans();
+    later.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano += 1;
+
+    for body in [six_spans(), later] {
+        let (parsed, landed) = decode_both_at(&body, base_ns());
+        writer
+            .admit_flush(parsed, landed, PushHeaders::default())
+            .expect("both bodies are admitted")
+            .await
+            .expect("and both commit");
+    }
+    settle_until("both landing inserts", || landing.call_count() == 2).await;
+
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "a changed span start time is a changed body"
+    );
+    assert_eq!(spans_mock.call_count(), 2, "on the old path too");
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // -- the two trace transports -----------------------------------------
 
 /// Reads a rendered response into its status, its headers and its body.

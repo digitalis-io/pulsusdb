@@ -317,12 +317,24 @@ pub fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIden
 /// decode, because that shape carries every span's own
 /// single-`ResourceSpans` protobuf `payload` — the resource, the scope and
 /// the span, as they arrived — so one walk covers everything the request
-/// sent. No receiver-generated field enters: the decode writes none onto
-/// either shape, and the one clock reading a trace push takes
-/// (`SpanRecord::timestamp_ns` for a span whose `start_time_unix_nano` is
-/// `0`) is the same instant for a retry a millisecond later only by
-/// accident — which is why a client that must have two identical bodies
-/// stored separately sends two `Idempotency-Key`s.
+/// sent.
+///
+/// **Three of that shape's values are the receiver's and are left out:**
+/// `SpanRecord::timestamp_ns`, and `AttrRecord::timestamp_ns` and
+/// `AttrRecord::date` on every row a span produces. A span whose
+/// `start_time_unix_nano` is `0` ("unknown or missing" on the wire) takes
+/// the request's own receive clock instead (`otlp_traces::parse`), the
+/// attribute rows carry that instant, and the attribute day is derived from
+/// it — so hashing any of the three would give the same bytes two
+/// identities, and a retry would be stored a second time with no key and
+/// refused as changed content under one. Each span's wire start time is in
+/// the digest where the request put it: inside `payload`, which is that
+/// span re-encoded verbatim.
+///
+/// So this is the rule, and the reason the three are named rather than the
+/// field list simply being shorter: **a value the decode generates is not
+/// content**, and a field added here has to be a function of the request's
+/// own bytes.
 fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
     let mut d = DigestBuilder::new();
     d.str("traces");
@@ -333,7 +345,6 @@ fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
             .bytes(&span.parent_id)
             .str(&span.name)
             .str(&span.service)
-            .i64(span.timestamp_ns)
             .i64(span.duration_ns)
             .u8(span.status_code as u8)
             .str(&span.status_message)
@@ -364,12 +375,10 @@ fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
     }
     d.u64(batch.attrs.len() as u64);
     for attr in &batch.attrs {
-        d.u64(u64::from(attr.date))
-            .str(&attr.key)
+        d.str(&attr.key)
             .str(&attr.scope)
             .str(&attr.val)
             .str(attr.val_type.as_str())
-            .i64(attr.timestamp_ns)
             .bytes(&attr.trace_id)
             .bytes(&attr.span_id)
             .i64(attr.duration_ns);
