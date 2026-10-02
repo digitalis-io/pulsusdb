@@ -95,7 +95,7 @@ pub async fn replay_trace_window(
     max_rows: u64,
 ) -> Result<ReplayReport, ChError> {
     let db = &ctx.db;
-    let run = run_stamp();
+    let run = run_id(run_stamp());
     let mut report = ReplayReport::default();
 
     for (target, mv, partition_expr) in TARGETS {
@@ -199,13 +199,18 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// One clock reading per run, which is what makes a token unique per
-/// statement across runs.
+/// One clock reading per run, the input [`run_id`] mixes.
 fn run_stamp() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+/// One identifier per run, which is what makes a token unique per statement
+/// across runs.
+fn run_id(stamp: u128) -> u128 {
+    stamp
 }
 
 /// The suffix the two per-trace targets take: a replay routes exactly as the
@@ -252,6 +257,43 @@ async fn execute_recorded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Two runs that read the same clock are still two runs.** Wall-clock
+    /// nanoseconds are not unique across concurrent processes or across a
+    /// clock that steps back, and two runs that minted one identifier would
+    /// hand one target partition the same token twice: the server hashes the
+    /// token into the block id and discards the second block as a duplicate,
+    /// so the second run's rows would be dropped in silence and the repair
+    /// would not converge.
+    ///
+    /// The clock reading is forced equal, which is the whole of what the
+    /// case needs: it asserts the identifier is not a function of it.
+    #[test]
+    fn two_run_identifiers_from_one_clock_reading_differ() {
+        let stamp = 1_760_000_000_000_000_000u128;
+        let ids: Vec<u128> = (0..64).map(|_| run_id(stamp)).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "two runs reading the clock in the same nanosecond must \
+                     still mint different identifiers"
+                );
+            }
+        }
+    }
+
+    /// And the token carries the identifier, so two runs over one target
+    /// partition carry two tokens.
+    #[test]
+    fn two_runs_give_one_target_partition_two_tokens() {
+        let stamp = 1_760_000_000_000_000_000u128;
+        assert_ne!(
+            replay_token(run_id(stamp), "spans", "2026-10-02"),
+            replay_token(run_id(stamp), "spans", "2026-10-02"),
+            "the token is what the server deduplicates the block on"
+        );
+    }
 
     /// The five targets are the five views' targets and nothing else, and
     /// each names a view the catalogue holds (issue #586).

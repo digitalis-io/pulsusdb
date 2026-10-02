@@ -366,7 +366,15 @@ fn request_of(service: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
 /// Both decodes of one request, exactly as a handler runs them: the old
 /// path's and the landing path's, independently, over the same bytes.
 fn decode_both(req: &ExportTraceServiceRequest) -> (ParsedTraces, ParsedTraceLanding) {
-    let now_ns = base_ns();
+    decode_both_at(req, base_ns())
+}
+
+/// [`decode_both`] at a named receive clock — for a case that decodes one
+/// body twice at two instants, as two requests carrying it would.
+fn decode_both_at(
+    req: &ExportTraceServiceRequest,
+    now_ns: i64,
+) -> (ParsedTraces, ParsedTraceLanding) {
     (
         pulsus_write::parse_traces(req, now_ns).expect("the old path's decode"),
         pulsus_write::parse_trace_landing(req, now_ns).expect("the landing decode"),
@@ -393,6 +401,37 @@ fn six_spans() -> ExportTraceServiceRequest {
             })
             .collect(),
     )
+}
+
+/// `six_spans` carrying **no `start_time_unix_nano` and no
+/// `end_time_unix_nano`** — the shape the decode has a fallback for: a span
+/// with no start time takes the request's own receive clock, and the
+/// attribute day of every row that span produces is derived from it.
+fn six_spans_without_start_times() -> ExportTraceServiceRequest {
+    request_of(
+        "checkout",
+        (0..6u8)
+            .map(|i| Span {
+                start_time_unix_nano: 0,
+                end_time_unix_nano: 0,
+                ..span_at(
+                    0xaa,
+                    0x10 + i,
+                    base_ns(),
+                    vec![kv("http.route", "/api"), kv("http.method", "GET")],
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Two receive clocks either side of one UTC midnight, both inside the
+/// admitted day domain: the same bytes decoded at the first and at the
+/// second take a different fallback timestamp **and** a different attribute
+/// day, so a case over the pair reaches every value the fallback feeds.
+fn clocks_across_midnight() -> (i64, i64) {
+    let midnight = (base_ns() / NS_PER_DAY + 1) * NS_PER_DAY;
+    (midnight - 1_000_000_000, midnight + 1_000_000_000)
 }
 
 /// `six_spans` under a different trace id, so two pushes are two distinct
@@ -1176,6 +1215,120 @@ async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
          suppressed"
     );
     assert_eq!(spans_mock.call_count(), 2, "on the old path too");
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **The same bytes sent twice with no key are one push.** Every span in the
+/// body carries no start time, so each decode stamps it with that request's
+/// own receive clock and derives the attribute day of every row from it; the
+/// two decodes here are the same bytes at two instants either side of a UTC
+/// midnight. With no `Idempotency-Key` the identity IS the content digest, so
+/// a receiver-generated value inside that digest makes the retry a second
+/// identity and the body is stored twice — on both write paths.
+#[tokio::test]
+async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
+    let root = spool_root("no-start-times");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let (writer, spans_mock, _attrs) =
+        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+
+    let body = six_spans_without_start_times();
+    let (first, second) = clocks_across_midnight();
+
+    let (parsed, landed) = decode_both_at(&body, first);
+    writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("the first push is admitted")
+        .await
+        .expect("and commits");
+    settle_until("the first landing insert", || landing.call_count() == 1).await;
+
+    let (parsed, landed) = decode_both_at(&body, second);
+    writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("the retry is suppressed, not admitted")
+        .await
+        .expect("and is answered the first push's outcome");
+
+    assert_eq!(
+        landing.call_count(),
+        1,
+        "the retry queued no second landing block: one body is one identity \
+         whatever the receive clock read"
+    );
+    assert_eq!(
+        spans_mock.call_count(),
+        1,
+        "and the old path did not store the body a second time"
+    );
+    assert_eq!(
+        writer.metrics().dedup.duplicate_pushes_total,
+        1,
+        "one suppressed push"
+    );
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **The same bytes sent twice under one key are one push, not a changed
+/// body.** The fixture and the two clocks are the case above's; what differs
+/// is that both pushes carry the same `Idempotency-Key`, so the digest is the
+/// content the claim entry recorded rather than the identity. A
+/// receiver-generated value inside it makes the retry read as one key
+/// carrying two contents — a `400` over a body the client sent once.
+#[tokio::test]
+async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
+    let root = spool_root("no-start-times-keyed");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let (writer, spans_mock, _attrs) =
+        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+
+    let body = six_spans_without_start_times();
+    let (first, second) = clocks_across_midnight();
+    let keyed = || PushHeaders {
+        idempotency_key: Some("k-1".to_string()),
+        declared_retry: false,
+    };
+
+    let (parsed, landed) = decode_both_at(&body, first);
+    writer
+        .admit_flush(parsed, landed, keyed())
+        .expect("the first push is admitted")
+        .await
+        .expect("and commits");
+    settle_until("the first landing insert", || landing.call_count() == 1).await;
+
+    let (parsed, landed) = decode_both_at(&body, second);
+    let outcome = writer.admit_flush(parsed, landed, keyed());
+    assert!(
+        outcome.is_ok(),
+        "the retry under one key is suppressed, not refused as changed \
+         content: {:?}",
+        outcome.err()
+    );
+    outcome
+        .expect("asserted above")
+        .await
+        .expect("and is answered the first push's outcome");
+
+    assert_eq!(
+        writer.metrics().dedup.key_reused_total,
+        0,
+        "no push was refused as a key carrying different content"
+    );
+    assert_eq!(
+        landing.call_count(),
+        1,
+        "the retry queued no second landing block"
+    );
+    assert_eq!(
+        spans_mock.call_count(),
+        1,
+        "and the old path did not store the body a second time"
+    );
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
