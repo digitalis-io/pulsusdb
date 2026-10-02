@@ -226,7 +226,7 @@ fn run_stamp() -> u128 {
 /// mint gives: one opaque string per run is the whole requirement.
 fn run_id(stamp: u128) -> u128 {
     use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::hash::BuildHasher;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static RUNS: AtomicU64 = AtomicU64::new(0);
@@ -235,11 +235,7 @@ fn run_id(stamp: u128) -> u128 {
         std::process::id(),
         RUNS.fetch_add(1, Ordering::Relaxed),
     );
-    let half = |state: RandomState| {
-        let mut hasher = state.build_hasher();
-        seed.hash(&mut hasher);
-        hasher.finish()
-    };
+    let half = |state: RandomState| state.hash_one(seed);
     // Two states, because one `Hasher` yields 64 bits: they are two
     // different keyed functions of the same stream, so the halves are
     // independent of each other.
