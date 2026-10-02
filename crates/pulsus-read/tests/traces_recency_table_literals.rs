@@ -134,20 +134,41 @@ fn a_recency_bucket_never_straddles_a_utc_day() {
     assert_eq!(RECENT_BUCKET_NS, 300_000_000_000);
 }
 
+/// Issue #560's two derived tables are named in the sharding bullet, among
+/// the tables it keys on the trace id.
+///
+/// **It no longer pins the whole sentence.** It did, and the sentence was
+/// wrong in a way a verbatim pin cannot see: it omitted `trace_edges`,
+/// `spans` and `traces`, which take the same key. Correcting that broke
+/// this case for the wording rather than for the claim.
+///
+/// The full set has one owning passage —
+/// `the_trace_sharding_key_passages_name_every_routed_trace_table` in
+/// `crates/pulsus-schema/src/catalog.rs`, which derives it from the
+/// migrations rather than retyping it. What is left here is #560's own two
+/// names and the reason they are in that bullet.
 #[test]
 fn the_architecture_sharding_bullet_names_both_new_tables() {
-    let doc = collapse(&read(ARCHITECTURE_MD));
-    let needle = collapse(
-        "- `trace_spans`, `trace_attrs_idx`, `trace_recent`, `trace_error_spans`: \
-         `cityHash64(trace_id)` — a trace is whole on one shard; span-level intersections are \
-         shard-local, and the two derived trace tables sit on the shard that holds the spans \
-         they are written from.",
-    );
-    assert!(
-        doc.contains(&needle),
-        "{ARCHITECTURE_MD} must carry the trace-family sharding bullet naming both derived \
-         tables:\n{needle}"
-    );
+    let doc = read(ARCHITECTURE_MD);
+    let anchor = "`cityHash64(trace_id)` — a trace is whole on one shard";
+    let bullet = doc
+        .lines()
+        .find(|l| l.contains(anchor))
+        .map(collapse)
+        .unwrap_or_else(|| {
+            panic!("{ARCHITECTURE_MD} must carry the trace-family sharding bullet: {anchor}")
+        });
+    // The names column alone: the explanation after the key can mention a
+    // table the bullet does not key.
+    let at = bullet.find(anchor).expect("the bullet contains the anchor");
+    let names = &bullet[..at];
+    for table in ["trace_recent", "trace_error_spans"] {
+        assert!(
+            names.contains(&format!("`{table}`")),
+            "{ARCHITECTURE_MD}'s trace-family sharding bullet must name `{table}` \
+             (issue #560) among the tables it keys on the trace id: {names}"
+        );
+    }
 }
 
 /// The paragraph that begins with the line `lead` and ends at the next
