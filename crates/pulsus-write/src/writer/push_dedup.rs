@@ -331,10 +331,9 @@ pub fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIden
 /// the digest where the request put it: inside `payload`, which is that
 /// span re-encoded verbatim.
 ///
-/// So this is the rule, and the reason the three are named rather than the
-/// field list simply being shorter: **a value the decode generates is not
-/// content**, and a field added here has to be a function of the request's
-/// own bytes.
+/// **The rule, so a field added here is judged by it:** a value the decode
+/// generates is not content, and every field this walk reads is a function
+/// of the request's own bytes.
 fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
     let mut d = DigestBuilder::new();
     d.str("traces");

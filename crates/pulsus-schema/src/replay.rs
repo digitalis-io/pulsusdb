@@ -221,9 +221,9 @@ fn run_stamp() -> u128 {
 /// 128 bits from two `std::collections::hash_map::RandomState`s, which are
 /// documented to be built from random keys, over a stream that also carries
 /// `stamp`, the process id and a count of this process's runs — so two runs
-/// differ even if one of the four sources repeats. Hand-rolled rather than
-/// taken from a dependency, for the reason `writer::landing`'s own token
-/// mint gives: one opaque string per run is the whole requirement.
+/// differ even if one of those three repeats. Hand-rolled rather than taken
+/// from a dependency, for the reason `writer::landing`'s own token mint
+/// gives: one opaque string per run is the whole requirement.
 fn run_id(stamp: u128) -> u128 {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
@@ -236,9 +236,8 @@ fn run_id(stamp: u128) -> u128 {
         RUNS.fetch_add(1, Ordering::Relaxed),
     );
     let half = |state: RandomState| state.hash_one(seed);
-    // Two states, because one `Hasher` yields 64 bits: they are two
-    // different keyed functions of the same stream, so the halves are
-    // independent of each other.
+    // Two states, because one `Hasher` yields 64 bits: each is its own
+    // keyed function of the same stream, and the two keys differ.
     (u128::from(half(RandomState::new())) << 64) | u128::from(half(RandomState::new()))
 }
 
