@@ -389,28 +389,54 @@ mod tests {
         assert_ne!(a, b, "each run draws its own nonce");
     }
 
-    /// **Two runs mint different identifiers, and differ in both halves.**
-    /// The nonce is drawn per run rather than once per process, so a
-    /// process that forks between two runs does not hand the child the
-    /// parent's nonce; the counter rises, so the low halves differ as well.
+    /// **Sixty-four runs mint sixty-four identifiers, no two alike, and no
+    /// two alike in either half.** The nonce is drawn per run rather than
+    /// once per process, so a process that forks between two runs does not
+    /// hand the child the parent's nonce; the counter rises, so the low
+    /// halves differ as well.
     ///
     /// Two runs that minted one identifier would hand one target partition
     /// the same token twice, and the server hashes the token into the block
     /// id rather than hashing the block, so it would discard the second
     /// block as a duplicate — the replay would drop those rows in silence,
     /// which is the one thing it promises not to do.
+    ///
+    /// **Sixty-four mints and every pair of them, not one pair.** A pair of
+    /// assertions over one pair of identifiers says nothing about the
+    /// sequence: an implementation that cycles between two values satisfies
+    /// every one of them, because the two values differ in both halves.
+    /// Code review round three wrote that implementation and the five cases
+    /// here passed. Uniqueness over a run of mints is the property, so the
+    /// case has to mint a run of them.
     #[test]
-    fn two_runs_mint_different_identifiers_in_both_halves() {
-        let a = run_id().expect("an identifier");
-        let b = run_id().expect("an identifier");
-        assert_ne!(a, b, "two runs are two identifiers");
-        assert_ne!(a >> 64, b >> 64, "each run draws its own nonce");
-        assert!(
-            (b as u64) > (a as u64),
-            "the later run carries the larger counter: {:#018x} then {:#018x}",
-            a as u64,
-            b as u64
-        );
+    fn sixty_four_runs_mint_sixty_four_identifiers_differing_in_both_halves() {
+        let ids: Vec<u128> = (0..64).map(|_| run_id().expect("an identifier")).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for (j, b) in ids.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "runs {i} and {j} minted one identifier {a:#034x}");
+                assert_ne!(
+                    a >> 64,
+                    b >> 64,
+                    "runs {i} and {j} drew one nonce {:#018x}",
+                    (a >> 64) as u64
+                );
+                assert_ne!(
+                    *a as u64, *b as u64,
+                    "runs {i} and {j} took one counter value {:#018x}",
+                    *a as u64
+                );
+            }
+        }
+        for (i, pair) in ids.windows(2).enumerate() {
+            assert!(
+                (pair[1] as u64) > (pair[0] as u64),
+                "the later run carries the larger counter: run {i} {:#018x} \
+                 then run {} {:#018x}",
+                pair[0] as u64,
+                i + 1,
+                pair[1] as u64
+            );
+        }
     }
 
     /// And the token carries the identifier, so two runs over one target
