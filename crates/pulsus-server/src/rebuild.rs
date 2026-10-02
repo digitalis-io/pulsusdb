@@ -175,6 +175,71 @@ async fn distinct_partitions(
         .map_err(|e| format!("reading the partitions to drop: {e}"))
 }
 
+/// `pulsusdb rebuild-traces`: replays a window of `trace_landing` into
+/// **all five** tables the trace materialized views maintain (issue #586).
+///
+/// Two of [`RebuildMetrics`]'s arguments are not taken. There is no
+/// `--target`, because one run replays all five; and no
+/// `--drop-target-partitions`, because no partition is dropped — every trace
+/// target is idempotent under the key it collapses on, so a replay changes no
+/// answer.
+///
+/// **What it promises** is `pulsus_schema::replay_trace_window`'s, whole: a
+/// run may leave a partition partly written and may miss a row committed
+/// behind it, and a re-run converges.
+#[derive(Args, Debug)]
+pub(crate) struct RebuildTraces {
+    /// Replay landed rows stamped at or after this instant, RFC3339.
+    #[arg(long)]
+    from: String,
+
+    /// Replay landed rows stamped strictly before this instant, RFC3339.
+    #[arg(long)]
+    to: String,
+}
+
+pub(crate) async fn run_traces(config: &Config, args: RebuildTraces) -> ExitCode {
+    match rebuild_traces(config, args).await {
+        Ok(msg) => {
+            println!("pulsusdb: {msg}");
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("pulsusdb: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn rebuild_traces(config: &Config, args: RebuildTraces) -> Result<String, String> {
+    let from_ms = parse_rfc3339_millis(&args.from).map_err(|e| format!("--from: {e}"))?;
+    let to_ms = parse_rfc3339_millis(&args.to).map_err(|e| format!("--to: {e}"))?;
+    if to_ms <= from_ms {
+        return Err("--to must be after --from".to_string());
+    }
+
+    let ctx = schema_params_from(config);
+    let client = ChClient::new(conn_config_from(config))
+        .await
+        .map_err(|e| e.to_string())?;
+    let report = pulsus_schema::replay_trace_window(
+        &client,
+        &ctx,
+        from_ms,
+        to_ms,
+        config.writer.trace_landing_max_rows,
+    )
+    .await
+    .map_err(|e| format!("replaying the trace landing window: {e}"))?;
+
+    Ok(format!(
+        "replayed {} statements over the landed rows stamped in [{}, {})",
+        report.statements.len(),
+        args.from,
+        args.to
+    ))
+}
+
 /// An RFC3339 instant as epoch milliseconds, the unit `received_ms` carries.
 fn parse_rfc3339_millis(text: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(text)

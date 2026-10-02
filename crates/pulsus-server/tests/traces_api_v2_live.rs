@@ -75,6 +75,11 @@ fn should_run() -> bool {
 struct RawResponse {
     status: u16,
     body: Vec<u8>,
+    /// Lower-cased response header names and values (issue #586): the two
+    /// trace routes' refusal containers are told apart by the content type
+    /// and by whether `X-Content-Type-Options` is set, neither of which is
+    /// visible to a reader of the body.
+    headers: HashMap<String, String>,
 }
 
 impl RawResponse {
@@ -172,7 +177,11 @@ fn request(
         raw_body.to_vec()
     };
 
-    Some(RawResponse { status, body })
+    Some(RawResponse {
+        status,
+        body,
+        headers,
+    })
 }
 
 fn get(port: u16, path: &str, ctx: &str) -> RawResponse {
@@ -775,6 +784,407 @@ async fn the_compare_totals_cover_the_population_whatever_the_selection_window()
             2.0,
             "{label}: the two totals cover the whole population the outer filter admits \
              (b3 and b4)\nbody: {json}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #586 — the push-suppression index over the trace push
+// ---------------------------------------------------------------------
+//
+// The trace push joins issue #494's suppression index, and it is the one
+// behaviour on the OLD two-table path this change alters: a push the index
+// recognises stores nothing on either path, where today the old path stores
+// it twice. So these cases read BOTH stores, each against its own expected
+// value — no case here compares one with the other.
+
+/// `pulsusdb` with extra environment, for the cases that need the compat
+/// endpoints or a short suppression window.
+fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra: &[(&str, &str)]) -> ChildGuard {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    cmd.env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("CLICKHOUSE_SERVER", live_db::ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
+        .env("CLICKHOUSE_DB", db.name());
+    for (name, value) in extra {
+        cmd.env(name, value);
+    }
+    let guard = ChildGuard(cmd.spawn().expect("spawn pulsusdb"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if request(port, "GET", "/ready", None, &[]).is_some_and(|r| r.status == 200) {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("/ready never reached 200 within 60s");
+}
+
+/// One trace push of `spans` under `service`, with the request headers
+/// given, answered raw so a case can read its status and its container.
+fn push_otlp(port: u16, service: &str, spans: Vec<Span>, headers: &[(&str, &str)]) -> RawResponse {
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", service)],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+        headers,
+    )
+    .expect("the OTLP trace route must be reachable")
+}
+
+/// One Zipkin v2 JSON push of `names`, one span per name.
+fn push_zipkin(port: u16, names: &[&str], headers: &[(&str, &str)]) -> RawResponse {
+    let base_us = day_start_ns() / 1_000 + 3_600_000_000;
+    let spans: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            format!(
+                r#"{{"traceId":"aa00000000000000000000000000000{}","id":"{:016x}","name":"{name}","timestamp":{},"duration":1000,"localEndpoint":{{"serviceName":"checkout"}}}}"#,
+                1,
+                0x20 + i,
+                base_us + i as i64
+            )
+        })
+        .collect();
+    let body = format!("[{}]", spans.join(","));
+    request(
+        port,
+        "POST",
+        "/api/v2/spans",
+        Some(("application/json", body.as_bytes())),
+        headers,
+    )
+    .expect("the Zipkin trace route must be reachable")
+}
+
+/// `SELECT toString(<expr>) FROM <table>` against the test database.
+async fn scalar_of(db: &str, sql: &str) -> String {
+    let client = pulsus_clickhouse::ChClient::new(live_db::conn_config(db))
+        .await
+        .expect("connect to the test database");
+    let rows = client
+        .query_strings(sql, &pulsus_clickhouse::QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    rows.into_iter().next().unwrap_or_default()
+}
+
+async fn count_of(db: &str, table_sql: &str) -> u64 {
+    scalar_of(
+        db,
+        &format!("SELECT toString(count()) AS s FROM {table_sql}"),
+    )
+    .await
+    .parse()
+    .expect("a count")
+}
+
+/// Waits until `count_of` answers `want`, so a case can read the landing
+/// table after a `200` — the landing block carries no waiter, because the
+/// route's answer is the old path's.
+async fn settle_count(db: &str, table_sql: &str, want: u64, ctx: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = count_of(db, table_sql).await;
+        if got == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{ctx}: {table_sql} answered {got}, not {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `(code, message)` out of a `google.rpc.Status` body.
+fn decode_status(body: &[u8]) -> (i32, String) {
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct Status {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+    }
+    let decoded = Status::decode(body).expect("a google.rpc.Status body");
+    (decoded.code, decoded.message)
+}
+
+fn fixture_spans(names: &[&str]) -> Vec<Span> {
+    let day = day_start_ns();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            span(
+                sid(0x30 + i as u8),
+                None,
+                name,
+                SpanKind::Server,
+                day + 3_600_000_000_000 + i as i64,
+                vec![],
+            )
+        })
+        .collect()
+}
+
+/// **A suppressed trace push sends nothing**, on **both** write paths.
+///
+/// This is the one behaviour on the old path that this change alters, so the
+/// case has to see both: a retry that skipped only the landing branch while
+/// `trace_spans` stored twice would pass every other assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suppressed_trace_push_sends_nothing() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_259;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_suppress")).await;
+    let _server = spawn_ready(port, &db);
+
+    let spans = fixture_spans(&["s1", "s2", "s3"]);
+    let first = push_otlp(port, "checkout", spans.clone(), &[]);
+    assert_eq!(first.status, 200, "the first push is stored");
+    settle_count(db.name(), "trace_landing WHERE row_kind = 0", 3, "first").await;
+    let landing_rows = count_of(db.name(), "trace_landing").await;
+
+    let second = push_otlp(port, "checkout", spans, &[]);
+    assert_eq!(
+        second.status, 200,
+        "the suppressed push is answered the original push's outcome"
+    );
+
+    assert_eq!(
+        count_of(db.name(), "trace_landing").await,
+        landing_rows,
+        "the landing table holds the SINGLE push's row count"
+    );
+    assert_eq!(
+        count_of(db.name(), "spans FINAL").await,
+        3,
+        "and the target collapses to the body's span count"
+    );
+    assert_eq!(
+        count_of(db.name(), "trace_spans").await,
+        3,
+        "the old path's own table holds the single push's span count, not \
+         twice it: the suppression index is upstream of both paths"
+    );
+}
+
+/// A retry **outside** the suppression window stores a second copy in the
+/// landing table, and the target still collapses to the body's span count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_outside_the_window_stores_one_copy() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_260;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_window")).await;
+    let _server = spawn_ready_with_env(port, &db, &[("PULSUS_INGEST_DEDUP_WINDOW", "1s")]);
+
+    let spans = fixture_spans(&["w1", "w2"]);
+    assert_eq!(push_otlp(port, "checkout", spans.clone(), &[]).status, 200);
+    settle_count(db.name(), "trace_landing WHERE row_kind = 0", 2, "first").await;
+
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    assert_eq!(push_otlp(port, "checkout", spans, &[]).status, 200);
+    settle_count(
+        db.name(),
+        "trace_landing WHERE row_kind = 0",
+        4,
+        "outside the window",
+    )
+    .await;
+
+    assert_eq!(
+        count_of(db.name(), "spans FINAL").await,
+        2,
+        "the target collapses the second copy on its own key"
+    );
+}
+
+/// **Two distinct `Idempotency-Key`s store both pushes**, on each trace
+/// transport.
+///
+/// (b) is the discriminator, and it does not turn on block deduplication:
+/// each sealed landing block mints its own token.
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_idempotency_keys_store_both_trace_pushes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let otlp_port = 31_261;
+    let zipkin_port = 31_262;
+
+    {
+        let db =
+            ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_keys_otlp")).await;
+        let _server = spawn_ready(otlp_port, &db);
+        let spans = fixture_spans(&["k1", "k2"]);
+        for key in ["k-1", "k-2"] {
+            let res = push_otlp(
+                otlp_port,
+                "checkout",
+                spans.clone(),
+                &[("idempotency-key", key)],
+            );
+            assert_eq!(res.status, 200, "/v1/traces: both pushes succeed");
+        }
+        settle_count(
+            db.name(),
+            "trace_landing WHERE row_kind = 0",
+            4,
+            "/v1/traces",
+        )
+        .await;
+        assert_eq!(
+            count_of(db.name(), "spans FINAL").await,
+            2,
+            "/v1/traces: the target's own collapse, not a discriminator"
+        );
+        let old = count_of(db.name(), "trace_spans").await;
+        eprintln!("/v1/traces: trace_spans held {old} rows (recorded)");
+    }
+
+    {
+        let db = ScopedDb::fresh(pulsus_testkit::test_db(
+            "pulsus_traces_api_v2_it_keys_zipkin",
+        ))
+        .await;
+        let _server =
+            spawn_ready_with_env(zipkin_port, &db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+        for key in ["k-1", "k-2"] {
+            let res = push_zipkin(zipkin_port, &["z1", "z2"], &[("idempotency-key", key)]);
+            assert_eq!(res.status, 202, "/api/v2/spans: both pushes succeed");
+        }
+        settle_count(
+            db.name(),
+            "trace_landing WHERE row_kind = 0",
+            4,
+            "/api/v2/spans",
+        )
+        .await;
+        assert_eq!(count_of(db.name(), "spans FINAL").await, 2);
+        let old = count_of(db.name(), "trace_spans").await;
+        eprintln!("/api/v2/spans: trace_spans held {old} rows (recorded)");
+    }
+}
+
+/// **One key carrying two different contents is refused**, in each route's
+/// own container, and the refusal stores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_key_with_two_contents_is_refused_on_each_trace_transport() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let otlp_port = 31_263;
+    let zipkin_port = 31_264;
+    let key = [("idempotency-key", "k-9")];
+
+    {
+        let db = ScopedDb::fresh(pulsus_testkit::test_db(
+            "pulsus_traces_api_v2_it_reuse_otlp",
+        ))
+        .await;
+        let _server = spawn_ready(otlp_port, &db);
+        assert_eq!(
+            push_otlp(otlp_port, "checkout", fixture_spans(&["r1", "r2"]), &key).status,
+            200
+        );
+        settle_count(
+            db.name(),
+            "trace_landing WHERE row_kind = 0",
+            2,
+            "/v1/traces first",
+        )
+        .await;
+        let after_first = count_of(db.name(), "trace_landing").await;
+
+        let res = push_otlp(
+            otlp_port,
+            "checkout",
+            fixture_spans(&["r1", "changed"]),
+            &key,
+        );
+        assert_eq!(
+            res.status, 400,
+            "/v1/traces: a reused key is a client error"
+        );
+        assert_eq!(
+            res.headers.get("content-type").map(String::as_str),
+            Some("application/x-protobuf")
+        );
+        let (code, message) = decode_status(&res.body);
+        assert_eq!(code, 3);
+        assert_eq!(message, pulsus_write::KEY_REUSED_MESSAGE);
+        assert_eq!(
+            count_of(db.name(), "trace_landing").await,
+            after_first,
+            "/v1/traces: the refusal stored nothing"
+        );
+    }
+
+    {
+        let db = ScopedDb::fresh(pulsus_testkit::test_db(
+            "pulsus_traces_api_v2_it_reuse_zipkin",
+        ))
+        .await;
+        let _server =
+            spawn_ready_with_env(zipkin_port, &db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+        assert_eq!(push_zipkin(zipkin_port, &["r1", "r2"], &key).status, 202);
+        settle_count(
+            db.name(),
+            "trace_landing WHERE row_kind = 0",
+            2,
+            "/api/v2/spans first",
+        )
+        .await;
+        let after_first = count_of(db.name(), "trace_landing").await;
+
+        let res = push_zipkin(zipkin_port, &["r1", "changed"], &key);
+        assert_eq!(res.status, 400, "/api/v2/spans: a reused key is 400");
+        assert_eq!(
+            res.headers.get("content-type").map(String::as_str),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            res.headers.get("x-content-type-options"),
+            None,
+            "the post-admission container sets no sniff header"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&res.body),
+            pulsus_write::KEY_REUSED_MESSAGE,
+            "the message is the whole body"
+        );
+        assert_ne!(res.body.last(), Some(&b'\n'), "and carries no terminator");
+        assert_eq!(
+            count_of(db.name(), "trace_landing").await,
+            after_first,
+            "/api/v2/spans: the refusal stored nothing"
         );
     }
 }

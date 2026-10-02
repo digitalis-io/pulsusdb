@@ -18,7 +18,9 @@ use pulsus_config::WriterConfig;
 use pulsus_write::writer::{
     BackfillMetricsSnapshot, BlockInserter, TraceWriter, TraceWriterTables,
 };
-use pulsus_write::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceSink};
+use pulsus_write::{
+    AttrRecord, AttrValueType, ParsedTraceLanding, ParsedTraces, PushHeaders, SpanRecord, TraceSink,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum MockBehavior {
@@ -114,12 +116,22 @@ impl<R: ChRow> BlockInserter<R> for MockInserter {
     }
 }
 
+/// Issue #586: the landing path is additional, and every case in this file
+/// pins the OLD two-table path. Each pushes `ParsedTraceLanding::default()`,
+/// which lands no row and queues no block, so this inserter is never called
+/// — it is here because the constructor takes one.
 fn writer_with(
     cfg: WriterConfig,
     spans: Arc<MockInserter>,
     attrs: Arc<MockInserter>,
 ) -> TraceWriter {
-    TraceWriter::with_inserters_with_tables(spans, attrs, &cfg, TraceWriterTables::traces_default())
+    TraceWriter::with_inserters_with_tables(
+        spans,
+        attrs,
+        MockInserter::new(MockBehavior::Ok),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    )
 }
 
 const TS_NS: i64 = 1_700_000_000_000_000_000;
@@ -206,7 +218,13 @@ async fn attrs_backfill_reinserts_a_failed_attr_index_generation_until_durable()
     let attrs = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenOk, 1);
     let writer = writer_with(cfg, spans.clone(), attrs.clone());
 
-    let wait = writer.admit_flush(batch_for(0x61)).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            batch_for(0x61),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout");
@@ -257,7 +275,13 @@ async fn attrs_uncertain_generation_failure_is_never_enqueued_or_replayed() {
     let attrs = MockInserter::new(MockBehavior::Uncertain);
     let writer = writer_with(cfg, spans, attrs.clone());
 
-    let wait = writer.admit_flush(batch_for(0x62)).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            batch_for(0x62),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout")
@@ -289,7 +313,13 @@ async fn attrs_deterministic_backfill_failure_abandons_without_spinning() {
     let attrs = MockInserter::new(MockBehavior::Poison);
     let writer = writer_with(cfg, spans, attrs.clone());
 
-    let wait = writer.admit_flush(batch_for(0x63)).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            batch_for(0x63),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout")
@@ -328,7 +358,13 @@ async fn attrs_uncertain_backfill_outcome_is_terminally_abandoned_never_retried(
     let attrs = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenUncertain, 1);
     let writer = writer_with(cfg, spans, attrs.clone());
 
-    let wait = writer.admit_flush(batch_for(0x64)).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            batch_for(0x64),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout")
@@ -361,7 +397,13 @@ async fn poisoned_span_flush_never_touches_the_attrs_backfill_backlog() {
     let attrs = MockInserter::new(MockBehavior::Ok);
     let writer = writer_with(cfg, spans.clone(), attrs);
 
-    let wait = writer.admit_flush(batch_for(0x65)).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            batch_for(0x65),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(60), wait)
         .await
         .expect("flush settles within the test timeout")

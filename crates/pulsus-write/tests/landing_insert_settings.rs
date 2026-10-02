@@ -17,7 +17,7 @@ use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_write::writer::{
     BlockInserter, ChBlockInserter, MetricWriter, MetricWriterTables, WriterRuntime,
 };
-use pulsus_write::{MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef};
+use pulsus_write::{MetricPoint, MetricSink, ParsedMetrics, PushHeaders, SeriesRef, TraceSink};
 
 #[path = "common/mock_ch_insert.rs"]
 mod mock_ch_insert;
@@ -488,4 +488,284 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     std::fs::remove_dir_all(&root).ok();
+}
+
+// -- issue #586: the trace landing insert ------------------------------
+
+/// A `BlockInserter` that answers every call `Ok` and records nothing — the
+/// old two-table path's stand-in, so the mock server serves the landing
+/// insert alone.
+struct NoopInserter;
+
+impl<R: pulsus_clickhouse::ChRow> BlockInserter<R> for NoopInserter {
+    fn insert<'a>(
+        &'a self,
+        _table: &'a str,
+        _rows: &'a [R],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// **What the production inserter puts on the wire for a trace landing
+/// insert is the client's MERGED set, not the constructor's** — and the
+/// writer is what builds the constructor's half.
+///
+/// The merge order, read off `ChClient::insert_settings_with`, is: the
+/// `ConsistencyConfig`'s own entries first, then `async_insert = 0`, then the
+/// caller's entries by key, then `max_execution_time` last. So comparing the
+/// captured set against the constructor's alone is what this case must not
+/// do — the wire carries more than the constructor names, because
+/// `async_insert` is pinned one layer down, and an equality against the
+/// constructor would fail on a correct implementation.
+///
+/// **Two halves, because one mock cannot serve both.** The wire half drives
+/// the production `ChBlockInserter` against the hermetic mock server, over a
+/// one-column row: the driver reads `DESCRIBE TABLE` before it sends the
+/// insert and refuses a 31-column landing row against the mock's one-column
+/// answer, so a `TraceWriter` pointed at that mock never puts an `INSERT` on
+/// the wire at all — measured, the mock serves the `DESCRIBE` and nothing
+/// after it. The writer half therefore reads what the writer handed its own
+/// `BlockInserter`, which is the other end of the same seam.
+#[tokio::test]
+async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() {
+    let cfg = WriterConfig::default();
+    let mock = MockChInsert::start(DescribeAnswer::Ok, InsertAnswer::Ok);
+    let client = Arc::new(
+        ChClient::new(mock.conn_config())
+            .await
+            .expect("connect to the mock"),
+    );
+
+    // The baseline: the same client, the same adapter, no caller settings at
+    // all. Whatever query parameters this request carries are the driver's
+    // own plus the two the client pins for every insert it makes.
+    let bare = ChBlockInserter::new(client.clone());
+    BlockInserter::<OneCol>::insert_with(&bare, "t", &[OneCol { v: 1 }], &QuerySettings::new())
+        .await
+        .expect("the mock answers the insert with a 200");
+    let baseline_keys = param_keys(&mock.insert_request().target);
+
+    // The wire half.
+    let token = "tok-trace-1";
+    let expected = QuerySettings::trace_landing_insert(token, cfg.trace_landing_max_rows);
+    let inserter = ChBlockInserter::new(client);
+    BlockInserter::<OneCol>::insert_with(&inserter, "trace_landing", &[OneCol { v: 7 }], &expected)
+        .await
+        .expect("the mock answers the insert with a 200");
+    let insert = mock
+        .requests()
+        .into_iter()
+        .rfind(|r| r.body.starts_with("INSERT INTO"))
+        .expect("the mock served the landing INSERT");
+
+    // (a) Every entry the constructor gives, at its own value.
+    let mut missing: Vec<(String, String, Option<String>)> = Vec::new();
+    for (key, value) in expected.entries() {
+        let got = insert.param(key);
+        if got.as_deref() != Some(value) {
+            missing.push((key.to_string(), value.to_string(), got));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the wire must carry every pin the constructor names: {missing:?} in {}",
+        insert.target
+    );
+
+    // (b) The already-shipped pin, exactly once.
+    let query = insert
+        .target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or_default();
+    let async_entries: Vec<&str> = query
+        .split('&')
+        .filter(|pair| pair.starts_with("async_insert="))
+        .collect();
+    assert_eq!(
+        async_entries,
+        vec!["async_insert=0"],
+        "`async_insert = 0` is pinned one layer down, so it must appear once \
+         and not twice: {}",
+        insert.target
+    );
+
+    // (c) Nothing else is a setting this path sends.
+    let keys = param_keys(&insert.target);
+    let constructor_keys: Vec<&str> = expected.entries().map(|(k, _)| k).collect();
+    let extra: Vec<&String> = keys
+        .iter()
+        .filter(|k| !baseline_keys.contains(k) && !constructor_keys.contains(&k.as_str()))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "the landing insert sends the constructor's entries and nothing a \
+         bare insert through the same client does not already carry: {extra:?}"
+    );
+
+    // The writer half: what `TraceWriter` hands its own `BlockInserter` for
+    // one push is the trace constructor at the CONFIGURED ceiling, under a
+    // token it minted. A writer that handed over `landing_insert` instead —
+    // the metrics constructor — would be short the nineteen trace pins.
+    let root = spool_root("trace-landing-wire");
+    let recorder = Arc::new(SettingsRecorder::default());
+    let mut runtime = WriterRuntime::from_config(&cfg);
+    runtime.spool_dir = root.clone();
+    runtime.trace_landing_inserters = 1;
+    let writer = pulsus_write::TraceWriter::with_inserters_and_runtime(
+        Arc::new(NoopInserter),
+        Arc::new(NoopInserter),
+        recorder.clone(),
+        runtime,
+        pulsus_write::TraceWriterTables::traces_default(),
+    );
+    let (parsed, landed) = one_span_trace_push();
+    writer
+        .admit_flush(parsed, landed, pulsus_write::PushHeaders::default())
+        .expect("the queue has room")
+        .await
+        .expect("the old path's two no-op inserts commit");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while recorder.calls() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never handed a landing block over"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let (table, handed) = recorder.first();
+    assert_eq!(table, "trace_landing");
+    let handed_token = handed
+        .iter()
+        .find(|(k, _)| k == "insert_deduplication_token")
+        .map(|(_, v)| v.clone())
+        .expect("every landing insert carries a minted token");
+    let want = QuerySettings::trace_landing_insert(&handed_token, cfg.trace_landing_max_rows);
+    let mut want_entries: Vec<(String, String)> = want
+        .entries()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut got_entries = handed;
+    want_entries.sort();
+    got_entries.sort();
+    assert_eq!(
+        got_entries, want_entries,
+        "the writer hands over the trace constructor's own entries, at the \
+         configured row ceiling"
+    );
+}
+
+/// One recorded call: the table it named and the settings it carried.
+type RecordedCall = (String, Vec<(String, String)>);
+
+/// A `BlockInserter` that records the table and settings of every call and
+/// answers `Ok`.
+#[derive(Default)]
+struct SettingsRecorder {
+    calls: std::sync::Mutex<Vec<RecordedCall>>,
+}
+
+impl SettingsRecorder {
+    fn calls(&self) -> usize {
+        self.calls.lock().expect("recorder mutex poisoned").len()
+    }
+
+    fn record(&self, table: &str, settings: &QuerySettings) {
+        self.calls.lock().expect("recorder mutex poisoned").push((
+            table.to_string(),
+            settings
+                .entries()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ));
+    }
+
+    fn first(&self) -> RecordedCall {
+        self.calls
+            .lock()
+            .expect("recorder mutex poisoned")
+            .first()
+            .cloned()
+            .expect("at least one call")
+    }
+}
+
+impl<R: pulsus_clickhouse::ChRow> BlockInserter<R> for SettingsRecorder {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        _rows: &'a [R],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.record(table, &QuerySettings::new());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        table: &'a str,
+        _rows: &'a [R],
+        extra: &'a QuerySettings,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.record(table, extra);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Every query parameter name in a request target, in the order it appears.
+fn param_keys(target: &str) -> Vec<String> {
+    target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').map(|(k, _)| k.to_string()))
+        .collect()
+}
+
+/// One trace push of one span, decoded both ways exactly as a handler runs
+/// it.
+fn one_span_trace_push() -> (pulsus_write::ParsedTraces, pulsus_write::ParsedTraceLanding) {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    const TS: i64 = 1_760_000_000_000_000_000;
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue("checkout".to_string())),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: vec![0xaa; 16],
+                    span_id: vec![0xbb; 8],
+                    name: "GET /api".to_string(),
+                    start_time_unix_nano: TS as u64,
+                    end_time_unix_nano: TS as u64 + 1_000_000,
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    (
+        pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
+        pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
+    )
 }

@@ -118,8 +118,8 @@ use pulsus_config::WriterConfig;
 use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
-use pulsus_write::TraceSink;
 use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
+use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
 
 mod projection_cases;
 
@@ -1029,6 +1029,7 @@ async fn traces_search_projection_differential() {
     let writer = TraceWriter::with_inserters_with_tables(
         Arc::new(ChBlockInserter::new(client.clone())),
         Arc::new(ChBlockInserter::new(client.clone())),
+        Arc::new(ChBlockInserter::new(client.clone())),
         &cfg,
         TraceWriterTables::traces_default(),
     );
@@ -1037,7 +1038,13 @@ async fn traces_search_projection_differential() {
     let parsed =
         pulsus_write::parse_traces(&req, base).expect("our own ingest parses the same body");
     assert_eq!(parsed.spans.len(), 4, "the corpus is four spans");
-    let wait = writer.admit_flush(parsed).expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            parsed,
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(20), wait)
         .await
         .expect("flush settles")

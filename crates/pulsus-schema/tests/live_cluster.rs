@@ -1630,3 +1630,704 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
     .await;
     assert!(mismatches.is_empty(), "T32 mismatches: {mismatches:?}");
 }
+
+// ---------------------------------------------------------------------
+// Issue #586 — the trace write path, clustered
+// ---------------------------------------------------------------------
+//
+// **None of these can run on a single node**: each needs the two-shard
+// compose fixture, and each reads a target straight after a push, so each
+// waits on `system.distribution_queue.data_files` reaching 0 for the routing
+// table rather than sleeping — except the second, whose whole assertion is
+// the value of that column at the moment the insert returns.
+//
+// The push is issued as a literal `INSERT INTO trace_landing` carrying
+// `QuerySettings::trace_landing_insert`, which is what the writer sends: this
+// crate cannot reach `pulsus-write`'s row type, because that crate depends on
+// this one.
+
+static TEST_DB_TRACE_SHARDS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_shards");
+static TEST_DB_TRACE_FOREGROUND: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_foreground");
+static TEST_DB_TRACE_COLUMNS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_columns");
+static TEST_DB_TRACE_REFUSAL: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_refusal");
+static TEST_DB_TRACE_PROFILE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_profile");
+static TEST_DB_TRACE_CATALOGS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_catalogs");
+
+/// The per-push row ceiling both pinned row limits carry, the shipped
+/// default.
+const TRACE_LANDING_MAX_ROWS: u64 = 1_048_576;
+
+/// An instant inside the span retention, so no TTL merge can drop a part in
+/// the middle of a case.
+fn trace_t0() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_nanos() as i64;
+    (now / 86_400_000_000_000) * 86_400_000_000_000 + 3_600_000_000_000
+}
+
+/// Two trace ids `cityHash64` places on **different** shards, asked of the
+/// server rather than assumed: the selection is `slots[hash % total_weight]`
+/// over a slot map keyed by shard weight, and the fixture's two shards carry
+/// equal weight.
+async fn two_ids_on_two_shards(client: &ChClient) -> (String, String) {
+    let mut zero = None;
+    let mut one = None;
+    for n in 1..256u32 {
+        let hex = format!("{n:032x}");
+        // `toUInt64`, because `%` over a `UInt64` and a literal `2`
+        // answers `UInt8` and the row type this reads into takes a `u64`.
+        let slot = count_on(
+            client,
+            &format!("SELECT toUInt64(cityHash64(unhex('{hex}')) % 2) AS n"),
+        )
+        .await;
+        if slot == 0 && zero.is_none() {
+            zero = Some(hex);
+        } else if slot == 1 && one.is_none() {
+            one = Some(hex);
+        }
+        if zero.is_some() && one.is_some() {
+            break;
+        }
+    }
+    (
+        zero.expect("a trace id on slot 0"),
+        one.expect("a trace id on slot 1"),
+    )
+}
+
+/// The `INSERT` one push of `spans` per trace id makes: one kind-0 row per
+/// span, one kind-1 row per trace's service, one kind-2 and one kind-3 row.
+fn trace_landing_insert_sql(
+    db: &str,
+    traces: &[(&str, &str)],
+    spans: usize,
+    attrs: &str,
+) -> String {
+    let t0 = trace_t0();
+    let mut rows: Vec<String> = Vec::new();
+    for (i, (trace_hex, service)) in traces.iter().enumerate() {
+        for s in 0..spans {
+            rows.push(format!(
+                "(1, 0, unhex('{trace_hex}'), unhex('{:016x}'), unhex('0000000000000000'), \
+                 {}, 1000, {}, 'GET /api', 2, '{service}', '{attrs}', toDate(0), '', '', '', '')",
+                0x100 + (i * spans + s),
+                t0 + (i * spans + s) as i64,
+                i + 1,
+            ));
+        }
+        rows.push(format!(
+            "(1, 1, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
+             unhex('0000000000000000'), 0, 0, {}, '', 0, '{service}', '{attrs}', \
+             toDate(fromUnixTimestamp64Nano({t0})), '', '', '', '')",
+            i + 1,
+        ));
+    }
+    rows.push(
+        "(1, 2, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
+         unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
+         'http.route', '', '')"
+            .to_string(),
+    );
+    rows.push(
+        "(1, 3, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
+         unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
+         'http.route', '/api', 'string')"
+            .to_string(),
+    );
+    format!(
+        "INSERT INTO {db}.trace_landing (received_ms, row_kind, trace_id, span_id, \
+         parent_span_id, start_ns, duration_ns, resource_id, name, kind, service, attrs, day, \
+         tag_scope, tag_key, tag_value, tag_type) VALUES {}",
+        rows.join(", ")
+    )
+}
+
+/// Issues one landing insert carrying the settings the writer pins.
+async fn push_landing(
+    client: &ChClient,
+    db: &str,
+    traces: &[(&str, &str)],
+    spans: usize,
+    attrs: &str,
+    token: &str,
+) -> Result<(), pulsus_clickhouse::ChError> {
+    client
+        .execute(
+            &trace_landing_insert_sql(db, traces, spans, attrs),
+            &QuerySettings::trace_landing_insert(token, TRACE_LANDING_MAX_ROWS),
+            Idempotency::NonIdempotent,
+        )
+        .await
+}
+
+/// Waits until `table`'s send directory is empty on `client`, which is the
+/// deterministic settle this fixture offers — never a sleep.
+async fn wait_distribution_drained(client: &ChClient, db: &str, table: &str) {
+    let sql = format!(
+        "SELECT toUInt64(sum(data_files)) AS n FROM system.distribution_queue \
+         WHERE database = '{db}' AND table = '{table}'"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if count_on(client, &sql).await == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{db}.{table}'s send directory never drained"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **A trace lands whole on one shard.** Without the routing both traces'
+/// spans sit on whichever node took the push, and one shard holds 20 while
+/// the other holds 0.
+#[tokio::test]
+async fn a_trace_lands_whole_on_one_shard() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_SHARDS;
+    fresh_cluster_db(&shard1, db).await;
+    let (a, b) = two_ids_on_two_shards(&shard1).await;
+    push_landing(
+        &shard1,
+        db,
+        &[(&a, "checkout"), (&b, "cart")],
+        10,
+        "{}",
+        "cluster-whole-1",
+    )
+    .await
+    .expect("the routed push commits");
+    for table in ["spans_dist", "traces_dist"] {
+        wait_distribution_drained(&shard1, db, table).await;
+    }
+
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        assert_eq!(
+            count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await,
+            10,
+            "shard{}: one whole trace's spans and no other's",
+            i + 1
+        );
+        assert_eq!(
+            count_on(
+                shard,
+                &format!("SELECT toUInt64(uniqExact(trace_id)) AS n FROM {db}.spans")
+            )
+            .await,
+            1,
+            "shard{}: exactly one trace id",
+            i + 1
+        );
+        let span_trace = trace_ids(shard, db, "spans").await;
+        let index_trace = trace_ids(shard, db, "traces").await;
+        assert_eq!(
+            span_trace,
+            index_trace,
+            "shard{}: the per-trace row is on the SAME shard as that trace's \
+             spans",
+            i + 1
+        );
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **`distributed_foreground_insert` reaches the view's insert.** With the
+/// remote shard's target renamed away — so every routed block for that shard
+/// fails and no background sender can ever drain it — the push must **fail**
+/// rather than queue.
+///
+/// A queued success is a failure of this case, not an alternative outcome it
+/// records: a success followed by a read that misses the routed rows is the
+/// exact behaviour it exists to exclude.
+#[tokio::test]
+async fn distributed_foreground_insert_reaches_the_views_insert() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_FOREGROUND;
+    fresh_cluster_db(&shard1, db).await;
+    let (a, b) = two_ids_on_two_shards(&shard1).await;
+    let traces: Vec<(&str, &str)> = vec![(&a, "checkout"), (&b, "cart")];
+
+    exec_on(
+        &shard2,
+        &format!("RENAME TABLE {db}.spans TO {db}.spans_parked"),
+    )
+    .await;
+    let err = push_landing(&shard1, db, &traces, 10, "{}", "cluster-foreground-1")
+        .await
+        .expect_err("the push must fail: the pin makes the view's insert wait");
+    eprintln!("foreground: the push failed with {err}");
+
+    assert_eq!(
+        count_on(
+            &shard1,
+            &format!(
+                "SELECT toUInt64(sum(data_files)) AS n FROM system.distribution_queue \
+                 WHERE database = '{db}' AND table = 'spans_dist'"
+            )
+        )
+        .await,
+        0,
+        "nothing was queued: a foreground insert writes no send directory"
+    );
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        let table = if i == 0 { "spans" } else { "spans_parked" };
+        let n = count_on(shard, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        eprintln!(
+            "foreground: shard{} {table} held {n} rows (recorded)",
+            i + 1
+        );
+    }
+
+    exec_on(
+        &shard2,
+        &format!("RENAME TABLE {db}.spans_parked TO {db}.spans"),
+    )
+    .await;
+    push_landing(&shard1, db, &traces, 10, "{}", "cluster-foreground-2")
+        .await
+        .expect("with the target back, the same push succeeds");
+    for table in ["spans_dist", "traces_dist"] {
+        wait_distribution_drained(&shard1, db, table).await;
+    }
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        assert_eq!(
+            count_on(shard, &format!("SELECT count() AS n FROM {db}.spans FINAL")).await,
+            10,
+            "shard{}: each shard holds its own trace",
+            i + 1
+        );
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **A `JSON` value and an aggregate column cross the routed hop intact.**
+/// The column types survive the wrapper's `AS` copy — read back from
+/// `system.columns` — and nothing else yet shows the values do.
+#[tokio::test]
+async fn a_json_and_an_aggregate_column_cross_the_hop() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_COLUMNS;
+    fresh_cluster_db(&shard1, db).await;
+    let (_a, b) = two_ids_on_two_shards(&shard1).await;
+    let attrs = r#"{\"s\":\"v\",\"i\":1,\"f\":1.5,\"b\":true,\"arr\":[\"x\",\"y\"]}"#;
+    push_landing(&shard1, db, &[(&b, "checkout")], 1, attrs, "cluster-json-1")
+        .await
+        .expect("the routed push commits");
+    for table in ["spans_dist", "traces_dist"] {
+        wait_distribution_drained(&shard1, db, table).await;
+    }
+
+    // Shard 2 is the one slot 1 selects, so the row crossed the hop.
+    assert_eq!(
+        count_on(&shard2, &format!("SELECT count() AS n FROM {db}.spans")).await,
+        1,
+        "the span crossed to the shard its trace id selects"
+    );
+    for (predicate, what) in [
+        ("assumeNotNull(attrs.s.:String) = 'v'", "a string"),
+        ("assumeNotNull(attrs.i.:Int64) = 1", "an integer"),
+        ("assumeNotNull(attrs.f.:Float64) = 1.5", "a double"),
+        ("assumeNotNull(attrs.b.:Bool) = true", "a bool"),
+        (
+            "has(attrs.arr.:`Array(Nullable(String))`, 'y')",
+            "an array element",
+        ),
+    ] {
+        assert_eq!(
+            count_on(
+                &shard2,
+                &format!("SELECT count() AS n FROM {db}.spans WHERE {predicate}")
+            )
+            .await,
+            1,
+            "{what} must cross the hop intact: {predicate}"
+        );
+    }
+    assert_eq!(
+        count_on(
+            &shard2,
+            &format!(
+                "SELECT count() AS n FROM {db}.traces WHERE has(services, 'checkout') \
+                 AND start_ns = {}",
+                trace_t0()
+            )
+        )
+        .await,
+        1,
+        "and the per-trace row's aggregate columns carry the push's own values"
+    );
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **A shard that refuses loses whole traces, and a retry restores them.**
+/// Without the routing a shard failure takes an arbitrary subset of each
+/// trace's spans; a target that summed rather than collapsed would answer 20
+/// after the retry.
+#[tokio::test]
+async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_REFUSAL;
+    fresh_cluster_db(&shard1, db).await;
+    let (a, b) = two_ids_on_two_shards(&shard1).await;
+    let traces: Vec<(&str, &str)> = vec![(&a, "checkout"), (&b, "cart")];
+
+    // Shard 2's span table replaced by one that refuses every insert.
+    exec_on(
+        &shard2,
+        &format!("RENAME TABLE {db}.spans TO {db}.spans_held"),
+    )
+    .await;
+    exec_on(
+        &shard2,
+        &format!(
+            "CREATE TABLE {db}.spans AS {db}.spans_held ENGINE = MergeTree \
+             ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind) \
+             PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))"
+        ),
+    )
+    .await;
+    exec_on(
+        &shard2,
+        &format!("ALTER TABLE {db}.spans ADD CONSTRAINT refuse CHECK start_ns < 0"),
+    )
+    .await;
+
+    let err = push_landing(&shard1, db, &traces, 10, "{}", "cluster-refuse-1")
+        .await
+        .expect_err("the refusing shard fails the routed insert");
+    eprintln!("refusal: the push failed with {err}");
+    assert_eq!(
+        count_on(&shard1, &format!("SELECT count() AS n FROM {db}.spans")).await,
+        10,
+        "the surviving shard's own trace is COMPLETE: the routing makes the \
+         missing unit a whole trace rather than an arbitrary subset of one"
+    );
+    assert_eq!(
+        count_on(&shard2, &format!("SELECT count() AS n FROM {db}.spans")).await,
+        0,
+        "and the refused shard holds none of it"
+    );
+
+    // Restore the shard and re-send the identical rows under a new token,
+    // which is what a client's retry outside the suppression window is.
+    exec_on(&shard2, &format!("DROP TABLE {db}.spans")).await;
+    exec_on(
+        &shard2,
+        &format!("RENAME TABLE {db}.spans_held TO {db}.spans"),
+    )
+    .await;
+    push_landing(&shard1, db, &traces, 10, "{}", "cluster-refuse-2")
+        .await
+        .expect("the retry commits");
+    for table in ["spans_dist", "traces_dist"] {
+        wait_distribution_drained(&shard1, db, table).await;
+    }
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        // **`FINAL`, because the retry carries its own token**: the shard
+        // that committed the first push holds those rows and the retry's
+        // copy beside them until a merge, so the unmerged count there is 20.
+        // That is the target's key doing its job, not a second copy of the
+        // data: a target that summed rather than collapsed would answer 20
+        // under `FINAL` too.
+        assert_eq!(
+            count_on(shard, &format!("SELECT count() AS n FROM {db}.spans FINAL")).await,
+            10,
+            "shard{}: after the retry each shard holds its own trace, once",
+            i + 1
+        );
+        let unmerged = count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await;
+        eprintln!(
+            "refusal: shard{} held {unmerged} unmerged rows (recorded)",
+            i + 1
+        );
+        let rows = trace_ids(shard, db, "traces").await;
+        assert_eq!(rows.len(), 1, "shard{}: one per-trace row", i + 1);
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **A hostile profile cannot move rows off their shard**, cannot turn a
+/// view's exception into a success, and cannot make a dropped target a
+/// silent absence. The push's own pinned settings win all three ways.
+///
+/// `async_insert` is not in this case: a profile cannot beat the client's own
+/// pin, and the setting that can — the table's — is not reachable from a
+/// profile at all.
+#[tokio::test]
+async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_PROFILE;
+    fresh_cluster_db(&shard1, db).await;
+    let (a, b) = two_ids_on_two_shards(&shard1).await;
+    let traces: Vec<(&str, &str)> = vec![(&a, "checkout"), (&b, "cart")];
+
+    let user = format!("{db}_hostile");
+    exec_on(
+        &shard1,
+        &format!("DROP USER IF EXISTS {user} ON CLUSTER '{CLUSTER_NAME}'"),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!(
+            "CREATE USER {user} ON CLUSTER '{CLUSTER_NAME}' IDENTIFIED WITH no_password \
+             SETTINGS insert_shard_id = 1, materialized_views_ignore_errors = 1, \
+             ignore_materialized_views_with_dropped_target_table = 1"
+        ),
+    )
+    .await;
+    // **Scoped to the test database**, which is all this user issues a
+    // statement against: `GRANT ALL ON *.*` is refused outright, because the
+    // granting user does not itself hold `SHOW NAMED COLLECTIONS SECRETS ON
+    // *` with the grant option — measured in CI's two-shard job, `Code: 497
+    // ... Not enough privileges`.
+    exec_on(
+        &shard1,
+        &format!("GRANT ALL ON {db}.* TO {user} ON CLUSTER '{CLUSTER_NAME}'"),
+    )
+    .await;
+    let hostile = ChClient::new(ChConnConfig {
+        database: db.to_string(),
+        user: user.clone(),
+        password: String::new(),
+        ..shard1_config()
+    })
+    .await
+    .expect("connect as the hostile profile");
+
+    // (a) Placement: each trace's spans are on the shard its id selects.
+    push_landing(&hostile, db, &traces, 10, "{}", "cluster-profile-1")
+        .await
+        .expect("the push commits");
+    for table in ["spans_dist", "traces_dist"] {
+        wait_distribution_drained(&shard1, db, table).await;
+    }
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        assert_eq!(
+            count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await,
+            10,
+            "shard{}: `insert_shard_id` must not put both traces on one shard",
+            i + 1
+        );
+    }
+
+    // (b) A view pointed at an incompatible table still fails the insert.
+    exec_on(&shard1, &format!("DROP VIEW {db}.traces_mv")).await;
+    exec_on(
+        &shard1,
+        &format!(
+            "CREATE TABLE {db}.traces_broken (day Date, trace_id Int8, start_ns Int64, \
+             end_ns Int64, root_service String, root_name String, services Array(String)) \
+             ENGINE = MergeTree ORDER BY trace_id"
+        ),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!(
+            "CREATE MATERIALIZED VIEW {db}.traces_mv TO {db}.traces_broken AS \
+             SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, \
+                    e AS end_ns, rs AS root_service, rn AS root_name, sv AS services \
+             FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e, \
+                          maxIf(service, parent_span_id = toFixedString('', 8)) AS rs, \
+                          maxIf(name, parent_span_id = toFixedString('', 8)) AS rn, \
+                          groupUniqArray(toString(service)) AS sv \
+                   FROM {db}.trace_landing WHERE row_kind = 0 GROUP BY trace_id)"
+        ),
+    )
+    .await;
+    let err = push_landing(&hostile, db, &traces, 10, "{}", "cluster-profile-2")
+        .await
+        .expect_err("`materialized_views_ignore_errors = 1` must not win");
+    eprintln!("hostile profile: the broken view failed the insert with {err}");
+
+    // (c) A view whose target cannot be locked **fails the insert**, rather
+    // than being skipped with that target's rows silently absent — which is
+    // what `observePath` returns at
+    // `ignore_materialized_views_with_dropped_target_table = 1`. The
+    // failure is the assertion: a success here is the silent absence.
+    //
+    // **Not a claim about the landing table.** A view's exception fails the
+    // insert, and the source rows are present in 297 of 300 measured trials
+    // anyway: the fan-out is not a transaction, and this design discloses
+    // that rather than preventing it. So the landing count is recorded.
+    exec_on(
+        &shard1,
+        &format!("RENAME TABLE {db}.resources TO {db}.resources_parked"),
+    )
+    .await;
+    let err = push_landing(&hostile, db, &traces, 10, "{}", "cluster-profile-3")
+        .await
+        .expect_err("`ignore_materialized_views_with_dropped_target_table = 1` must not win");
+    eprintln!("hostile profile: the missing target failed the insert with {err}");
+    let landed = count_on(
+        &shard1,
+        &format!("SELECT count() AS n FROM {db}.trace_landing"),
+    )
+    .await;
+    eprintln!("hostile profile: trace_landing held {landed} rows (recorded)");
+    exec_on(
+        &shard1,
+        &format!("RENAME TABLE {db}.resources_parked TO {db}.resources"),
+    )
+    .await;
+
+    exec_on(
+        &shard1,
+        &format!("DROP USER IF EXISTS {user} ON CLUSTER '{CLUSTER_NAME}'"),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **The three catalog targets reach every shard**, and none of them has a
+/// routing twin.
+///
+/// All three, not two: a version of this case that checked `resources` and
+/// `tag_values` only would pass a per-shard `tag_names` and lose **name
+/// discovery** on every other shard — the one catalog read the API makes
+/// time-less and unconditional.
+///
+/// The `SYSTEM SYNC REPLICA` is the assertion's precondition, not a
+/// convenience: the reach is eventual on the shipped consistency defaults,
+/// so a case that read straight after the push would be a flake dressed as a
+/// guarantee.
+#[tokio::test]
+async fn the_catalog_targets_reach_every_shard() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_TRACE_CATALOGS;
+    fresh_cluster_db(&shard1, db).await;
+    let (a, b) = two_ids_on_two_shards(&shard1).await;
+    push_landing(
+        &shard1,
+        db,
+        &[(&a, "checkout"), (&b, "cart")],
+        2,
+        "{}",
+        "cluster-catalogs-1",
+    )
+    .await
+    .expect("the push commits");
+
+    for table in ["resources", "tag_names", "tag_values"] {
+        exec_on(&shard2, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+    }
+    for table in ["resources", "tag_names", "tag_values"] {
+        let on_one = count_on(
+            &shard1,
+            &format!("SELECT count() AS n FROM {db}.{table} FINAL"),
+        )
+        .await;
+        let on_two = count_on(
+            &shard2,
+            &format!("SELECT count() AS n FROM {db}.{table} FINAL"),
+        )
+        .await;
+        assert!(on_one > 0, "{table} must hold the push's own rows");
+        assert_eq!(
+            on_one, on_two,
+            "{table} is one cluster-wide replica set, so both connections \
+             answer the same"
+        );
+    }
+    for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
+        let present = table_names(shard, db).await;
+        for table in ["resources", "tag_names", "tag_values"] {
+            let twin = format!("{table}_dist");
+            assert!(
+                !present.contains(&twin),
+                "shard{}: {table} must have no routing twin: {present:?}",
+                i + 1
+            );
+        }
+    }
+
+    exec_on(
+        &shard1,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}

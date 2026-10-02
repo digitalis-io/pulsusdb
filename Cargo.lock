@@ -1812,6 +1812,7 @@ version = "0.0.0"
 dependencies = [
  "clickhouse",
  "futures",
+ "getrandom 0.3.4",
  "pulsus-clickhouse",
  "pulsus-testkit",
  "serde",

@@ -331,9 +331,16 @@ fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
 }
 
 /// The trace writer's `pulsus_ingest_*` series: per-table (`trace_spans`/
-/// `trace_attrs_idx`), per-signal (`signal="traces"`), and backfill
-/// (`backlog="trace_attrs_idx"`). Traces have no registration-cache or
-/// collision counters (no label sets / LRU).
+/// `trace_attrs_idx`), per-signal (`signal="traces"`), backfill
+/// (`backlog="trace_attrs_idx"`) and issue #494's push-suppression set,
+/// which the trace push joined with issue #586. Traces have no
+/// registration-cache or collision counters (no label sets / LRU).
+///
+/// **`trace_landing` has no per-table series and the landing queue has no
+/// gauge**, while both write paths run: `pulsus_ingest_queue_bytes` is set
+/// from the one `queue_bytes` field, which holds the old path's counter, so
+/// a second emission of the same name and label pair would set one gauge
+/// twice per scrape. `TraceLandingSnapshot` is where that figure is read.
 fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
     record_table_metrics("trace_spans", &s.spans);
     record_table_metrics("trace_attrs_idx", &s.attrs);
@@ -349,6 +356,7 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
         .absolute(s.rejected_total);
 
     record_backfill_metrics("trace_attrs_idx", &s.attrs_backfill);
+    record_dedup_metrics("traces", &s.dedup);
 }
 
 /// Emits the `pulsus_ingest_backfill_*` registration-backfill series for one
@@ -987,7 +995,8 @@ mod tests {
     }
 
     /// AC-2 (traces): the trace-writer snapshot emits its two tables, the
-    /// `signal="traces"` series, and the attrs backfill — and NO
+    /// `signal="traces"` series, the attrs backfill and issue #494's
+    /// push-suppression set (issue #586) — and NO
     /// registration-cache/collision/metadata/pattern series (traces track
     /// none). Exhaustive: EVERY emitted series is asserted for its exact
     /// seeded value AND its `# TYPE`. Fully-spelled struct literal.
@@ -1004,6 +1013,10 @@ mod tests {
             spool_uncertain_total: 73,
             rejected_total: 74,
             attrs_backfill: backfill_snap(220),
+            // Issue #586: the trace push joins issue #494's suppression
+            // index, so this signal renders the dedup set too. 230 is free
+            // beside the bases above.
+            dedup: dedup_snap(230),
         };
         let r = render_local(|| record_trace_ingest_snapshot(&snap));
 
@@ -1037,6 +1050,12 @@ mod tests {
 
         // Backfill values (6 series).
         assert_backfill_series(&r, "trace_attrs_idx", 220);
+
+        // Issue #586's push-suppression series, on this signal. The label
+        // value is `traces`, which is what every other series this writer
+        // renders carries.
+        assert_dedup_types(&r);
+        assert_dedup_series(&r, "traces", 230);
 
         // Traces track no registration-cache/collision/metadata/pattern series.
         assert!(!r.contains("pulsus_ingest_registrations_total"));

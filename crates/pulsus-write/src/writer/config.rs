@@ -166,6 +166,19 @@ pub struct WriterRuntime {
     /// insert pins carry, so an admitted push is strictly under the count the
     /// server would end a block at.
     pub log_landing_max_rows: u64,
+    /// `PULSUS_TRACE_LANDING_RETRIES` (issue #586): resends of a failed
+    /// traces landing insert. [`Self::landing_budget`] is the wall-clock
+    /// bound on the whole loop; whichever binds first ends it.
+    pub trace_landing_retries: u32,
+    /// `PULSUS_TRACE_LANDING_INSERTERS` (issue #586): insert workers on the
+    /// traces landing queue, so the landing inserts in flight at once.
+    pub trace_landing_inserters: u32,
+    /// `PULSUS_TRACE_LANDING_MAX_ROWS` (issue #586): the per-push traces
+    /// landing row ceiling, counted over **all four landed kinds**, and the
+    /// value both row limits every traces landing insert pins carry, so an
+    /// admitted push is strictly under the count the server would end a
+    /// block at.
+    pub trace_landing_max_rows: u64,
 }
 
 impl WriterRuntime {
@@ -194,6 +207,9 @@ impl WriterRuntime {
             log_landing_retries: cfg.log_landing_retries,
             log_landing_inserters: cfg.log_landing_inserters,
             log_landing_max_rows: cfg.log_landing_max_rows,
+            trace_landing_retries: cfg.trace_landing_retries,
+            trace_landing_inserters: cfg.trace_landing_inserters,
+            trace_landing_max_rows: cfg.trace_landing_max_rows,
         }
     }
 }

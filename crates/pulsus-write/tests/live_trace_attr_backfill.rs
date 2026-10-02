@@ -38,7 +38,10 @@ use pulsus_clickhouse::{
 use pulsus_config::WriterConfig;
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
-use pulsus_write::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
+use pulsus_write::{
+    AttrRecord, AttrValueType, ParsedTraceLanding, ParsedTraces, PushHeaders, SpanRecord,
+    TraceAttrRow, TraceSink,
+};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -323,6 +326,7 @@ async fn l_t1_lost_attr_index_heals_and_the_primary_key_probe_finds_the_span() {
     let writer = TraceWriter::with_inserters_with_tables(
         Arc::new(ChBlockInserter::new(client.clone())),
         attrs.clone(),
+        Arc::new(ChBlockInserter::new(client.clone())),
         &cfg,
         TraceWriterTables::traces_default(),
     );
@@ -330,7 +334,11 @@ async fn l_t1_lost_attr_index_heals_and_the_primary_key_probe_finds_the_span() {
     let ts_ns = now_ns();
     let date = (ts_ns / 86_400_000_000_000) as u16; // UTC day since epoch
     let wait = writer
-        .admit_flush(batch(ts_ns, date))
+        .admit_flush(
+            batch(ts_ns, date),
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let result = tokio::time::timeout(Duration::from_secs(10), wait)
         .await

@@ -59,6 +59,7 @@ mod spool;
 mod table;
 mod trace;
 pub(crate) mod trace_json;
+mod trace_landing;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -72,13 +73,13 @@ pub use log::{LogWriter, WriterTables};
 pub use metric::{MetricWriter, MetricWriterTables};
 pub use metrics::{
     BackfillMetricsSnapshot, MetricWriterMetrics, MetricWriterMetricsSnapshot,
-    TableMetricsSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot, WriterMetrics,
-    WriterMetricsSnapshot,
+    TableMetricsSnapshot, TraceLandingSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot,
+    WriterMetrics, WriterMetricsSnapshot,
 };
 pub use push_dedup::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
     PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
-    metric_identity, plan_capacities,
+    metric_identity, plan_capacities, trace_identity,
 };
 pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
@@ -93,6 +94,7 @@ pub use trace::{TraceWriter, TraceWriterTables};
 pub use trace_json::{
     TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, escape_json_path,
 };
+pub use trace_landing::TRACE_LANDING_DAY_LIMIT;
 
 use crate::error::LogsIngestError;
 use crate::ingest::Backpressure;

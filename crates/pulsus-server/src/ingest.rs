@@ -31,8 +31,8 @@ use pulsus_write::writer::{
     MetricWriterMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
 };
 use pulsus_write::{
-    AdmitRefusal, Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter,
-    ParsedLogs, ParsedMetrics, ParsedTraces, PushHeaders, TraceSink, TraceWriter,
+    AdmitRefusal, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
+    ParsedMetrics, ParsedTraceLanding, ParsedTraces, PushHeaders, TraceSink, TraceWriter,
 };
 
 use crate::app::AppState;
@@ -203,17 +203,27 @@ impl TraceWriterSink {
 }
 
 impl TraceSink for TraceWriterSink {
-    fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
+    fn admit(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit(batch, landing, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 
-    fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
+    fn admit_flush(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch),
-            None => Err(Backpressure),
+            Some(writer) => writer.admit_flush(batch, landing, push),
+            None => Err(AdmitRefusal::Backpressure),
         }
     }
 }
@@ -444,12 +454,26 @@ mod tests {
     #[test]
     fn trace_admit_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
-        assert_eq!(sink.admit(traces_batch()), Err(Backpressure));
+        assert_eq!(
+            sink.admit(
+                traces_batch(),
+                ParsedTraceLanding::default(),
+                PushHeaders::default()
+            ),
+            Err(AdmitRefusal::Backpressure)
+        );
     }
 
     #[test]
     fn trace_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
-        assert!(sink.admit_flush(traces_batch()).is_err());
+        assert!(
+            sink.admit_flush(
+                traces_batch(),
+                ParsedTraceLanding::default(),
+                PushHeaders::default()
+            )
+            .is_err()
+        );
     }
 }

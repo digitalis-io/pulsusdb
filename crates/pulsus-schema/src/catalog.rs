@@ -3398,4 +3398,293 @@ mod tests {
             );
         }
     }
+
+    // === the two documents' clustering passages, against this catalogue
+    // === (issue #586)
+    //
+    // **Why these are here.** Both documents said "every table but the three
+    // landing tables gets a Distributed wrapper", and seven more tables have
+    // no routing sibling: the cluster-wide ones. Nothing read either
+    // sentence, so each correction to it was a sentence someone had to
+    // remember, and the sentence was wrong again after `resources`,
+    // `tag_names` and `tag_values` were added. These take the set from
+    // [`MIGRATIONS`] instead, so a table added or given a wrapper moves the
+    // documents with it.
+    //
+    // Each case **keys on text, never on a line number**, for the reason
+    // `migration_amendment_policy.rs` gives: a document growing above a
+    // passage would otherwise need the check corrected by hand.
+
+    /// The document, read from the repository root.
+    fn doc(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The one line of `name` containing `anchor`, which must occur once,
+    /// **cut off at the anchor**.
+    ///
+    /// The cut is the point. A passage that lists tables and then explains
+    /// itself can satisfy a bare `contains` with its own explanation rather
+    /// than with its list: dropping `spans` from the sharding-key table's
+    /// first column left the case green, because the third column still
+    /// said the word. The anchor is the column boundary, so only the list
+    /// is read.
+    fn doc_line_before(name: &str, anchor: &str) -> String {
+        let text = doc(name);
+        let hits: Vec<&str> = text.lines().filter(|l| l.contains(anchor)).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "docs/{name} must carry exactly one line containing {anchor:?}, found {}",
+            hits.len()
+        );
+        let at = hits[0].find(anchor).expect("the line contains the anchor");
+        hits[0][..at].to_string()
+    }
+
+    /// The one line of `name` containing `anchor`, which must occur once.
+    fn doc_line(name: &str, anchor: &str) -> String {
+        let text = doc(name);
+        let hits: Vec<&str> = text.lines().filter(|l| l.contains(anchor)).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "docs/{name} must carry exactly one line containing {anchor:?}, found {}",
+            hits.len()
+        );
+        hits[0].to_string()
+    }
+
+    /// Every base table a `CREATE TABLE` migration declares, with the
+    /// family it carries, and every name a routing wrapper exists for.
+    ///
+    /// A wrapper is either the generated `Ddl::Dist` form or a literal
+    /// template that renders the `{{dist_suffix}}` name — `spans` and
+    /// `traces` take the second, because their wrappers carry two engine
+    /// settings `Ddl::Dist` cannot.
+    fn base_and_wrapped_names() -> (Vec<(&'static str, Option<Family>)>, Vec<&'static str>) {
+        let mut base: Vec<(&'static str, Option<Family>)> = Vec::new();
+        let mut wrapped = Vec::new();
+        for m in MIGRATIONS {
+            let tmpl = match m.ddl {
+                Ddl::Dist => {
+                    wrapped.push(m.name);
+                    continue;
+                }
+                Ddl::Static(t) | Ddl::StaticClusterOnly(t) => t,
+            };
+            if tmpl.contains("{{dist_suffix}}") {
+                wrapped.push(m.name);
+            } else if tmpl.contains("CREATE TABLE") && !base.iter().any(|(n, _)| *n == m.name) {
+                base.push((m.name, m.family));
+            }
+        }
+        (base, wrapped)
+    }
+
+    /// Every base table with no routing sibling: the three landing tables
+    /// and the cluster-wide ones.
+    fn tables_with_no_wrapper() -> Vec<&'static str> {
+        let (base, wrapped) = base_and_wrapped_names();
+        base.into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !wrapped.contains(n))
+            .collect()
+    }
+
+    /// **The two wrapper sentences name every table that has no routing
+    /// sibling, and no table that has one.**
+    ///
+    /// Both directions matter. Without the first the sentence keeps a false
+    /// absolute — which is what it carried; without the second the fix is
+    /// "list every table", which says nothing.
+    ///
+    /// A name holding a render token (`log_metrics_{{log_rollup_suffix}}`)
+    /// is skipped in the second direction, because the documents print its
+    /// resolved name and this case does not resolve one.
+    #[test]
+    fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
+        let no_wrapper = tables_with_no_wrapper();
+        assert!(
+            no_wrapper.len() >= 10,
+            "the catalogue should hold at least the three landing and seven \
+             cluster-wide tables, found {no_wrapper:?}"
+        );
+        let (_, wrapped) = base_and_wrapped_names();
+        let sentences = [
+            (
+                "architecture.md",
+                doc_line("architecture.md", "**Sharded** (`PULSUS_CLUSTER` set):"),
+            ),
+            (
+                "schemas.md",
+                doc_line("schemas.md", "Enabled by `PULSUS_CLUSTER`."),
+            ),
+        ];
+        for (name, line) in &sentences {
+            for table in &no_wrapper {
+                assert!(
+                    line.contains(&format!("`{table}`")),
+                    "docs/{name}'s clustering sentence must name `{table}`, \
+                     which has no routing sibling: {line}"
+                );
+            }
+            for table in &wrapped {
+                if table.contains("{{") {
+                    continue;
+                }
+                assert!(
+                    !line.contains(&format!("`{table}`")),
+                    "docs/{name}'s clustering sentence names `{table}` among \
+                     the tables with no routing sibling, and it has one: {line}"
+                );
+            }
+        }
+    }
+
+    /// **The trace sharding-key passages name every routed trace table.**
+    /// `spans` and `traces` are routed on `cityHash64(trace_id)` by
+    /// migrations 72 and 73 and neither passage named them.
+    ///
+    /// Only the names column of each passage is read, for the reason
+    /// [`doc_line_before`] gives.
+    #[test]
+    fn the_trace_sharding_key_passages_name_every_routed_trace_table() {
+        let (base, wrapped) = base_and_wrapped_names();
+        let routed: Vec<&str> = base
+            .into_iter()
+            .filter(|(n, family)| *family == Some(Family::Traces) && wrapped.contains(n))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            routed.len(),
+            7,
+            "every trace base table but the landing one is routed, found {routed:?}"
+        );
+        let passages = [
+            (
+                "architecture.md",
+                doc_line_before(
+                    "architecture.md",
+                    "`cityHash64(trace_id)` — a trace is whole on one shard",
+                ),
+            ),
+            (
+                "schemas.md",
+                doc_line_before(
+                    "schemas.md",
+                    "| `cityHash64(trace_id)` | a trace is whole on one shard",
+                ),
+            ),
+        ];
+        for (name, names_column) in &passages {
+            for table in &routed {
+                assert!(
+                    names_column.contains(&format!("`{table}`")),
+                    "docs/{name}'s trace sharding-key passage must name \
+                     `{table}` among the tables that key, and its names \
+                     column is: {names_column}"
+                );
+            }
+        }
+    }
+
+    /// **Among per-shard tables, the three landing tables are the only ones
+    /// with no routing wrapper.** Four passages across three documents
+    /// restrict their claim to per-shard tables, and this is the fact that
+    /// restriction rests on: a per-shard table added without a wrapper
+    /// makes all four false at once, and reddens here rather than in a
+    /// document nobody reads.
+    #[test]
+    fn only_the_three_landing_tables_are_per_shard_without_a_wrapper() {
+        let per_shard: Vec<&str> = MIGRATIONS
+            .iter()
+            .filter(|m| m.replication == Replication::PerShard)
+            .map(|m| m.name)
+            .collect();
+        let mut without: Vec<&str> = tables_with_no_wrapper()
+            .into_iter()
+            .filter(|n| per_shard.contains(n))
+            .collect();
+        without.sort_unstable();
+        assert_eq!(
+            without,
+            vec!["log_landing", "metric_landing", "trace_landing"],
+            "a per-shard table with no routing wrapper that is not a landing \
+             table falsifies the clustering claim in docs/architecture.md §7, \
+             docs/schemas.md §7, docs/schemas.md's conventions preamble and \
+             docs/features.md's clustering row"
+        );
+    }
+
+    /// **Every passage saying which tables are written under their bare
+    /// name names all three.** One named two, one named "the two ingest
+    /// landing tables" — both written before `trace_landing` existed.
+    ///
+    /// The conventions preamble read here is also a `rewrite` row in
+    /// `ci/checks/doc_sites.txt`, and the two instruments answer different
+    /// questions: that row records that the line was edited, and
+    /// `ci/checks/doc_sites.sh` says in its own header what it cannot tell
+    /// you — whether the replacement is true. That is what this case reads,
+    /// for this passage as for the other two, so the row relieves it of
+    /// none of the three.
+    #[test]
+    fn the_bare_name_passages_name_all_three_landing_tables() {
+        let landing: Vec<&str> = tables_with_no_wrapper()
+            .into_iter()
+            .filter(|n| n.ends_with("_landing"))
+            .collect();
+        assert_eq!(landing.len(), 3, "three landing tables: {landing:?}");
+        let passages = [
+            (
+                "architecture.md",
+                doc_line("architecture.md", "The landing tables have no wrapper"),
+            ),
+            (
+                "schemas.md",
+                doc_line("schemas.md", "Conventions used below:"),
+            ),
+            (
+                "features.md",
+                doc_line("features.md", "| Clustered ClickHouse |"),
+            ),
+        ];
+        for (name, line) in &passages {
+            for table in &landing {
+                assert!(
+                    line.contains(&format!("`{table}`")),
+                    "docs/{name}'s bare-name passage must name `{table}`: {line}"
+                );
+            }
+        }
+    }
+
+    /// **The two passages that carry the claim without the list say where
+    /// the list is.** `docs/architecture.md` §7 and `docs/schemas.md` §7
+    /// own the ten exceptions, read by
+    /// [`the_wrapper_sentences_name_every_table_without_a_routing_sibling`];
+    /// the conventions preamble and the features row state the claim and
+    /// cite them instead of repeating it. The features row cited nothing.
+    #[test]
+    fn the_citing_clustering_passages_name_the_section_holding_the_list() {
+        assert!(
+            doc("schemas.md").contains("\n## 7. Distributed layout"),
+            "docs/schemas.md must still hold the section the other two cite"
+        );
+        let preamble = doc_line("schemas.md", "Conventions used below:");
+        assert!(
+            preamble.contains("§7 lists all ten"),
+            "docs/schemas.md's conventions preamble must cite its own §7 for \
+             the ten: {preamble}"
+        );
+        let row = doc_line("features.md", "| Clustered ClickHouse |");
+        assert!(
+            row.contains("[schemas.md §7](schemas.md) lists all ten"),
+            "docs/features.md's clustering row must cite schemas.md §7 for \
+             the ten: {row}"
+        );
+    }
 }

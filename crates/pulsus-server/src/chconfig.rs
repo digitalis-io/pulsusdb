@@ -260,6 +260,10 @@ pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
     TraceWriterTables {
         spans: Arc::from(format!("trace_spans{dist}")),
         attrs: Arc::from(format!("trace_attrs_idx{dist}")),
+        // Bare in every mode (issue #586), the way `metric_landing` and
+        // `log_landing` are: the landing table has no `Distributed` wrapper,
+        // because one push sent through one would stop being one block.
+        landing: Arc::from("trace_landing"),
     }
 }
 

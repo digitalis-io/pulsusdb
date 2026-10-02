@@ -342,6 +342,14 @@ fn request_with(
     }
 }
 
+/// The settings every landing insert this file makes carries — the writer's
+/// own constructor, so a case's insert is pinned the way a push's is. The
+/// token is minted per insert from the clock, which is all the landing
+/// table's own deduplication window needs of it here.
+fn landing_settings() -> QuerySettings {
+    QuerySettings::trace_landing_insert(&format!("it-{}", now_ns()), 1_048_576)
+}
+
 /// [`land`] without the panic, for the two cases whose own assertion is that
 /// the insert succeeded. A case that unwraps here reports neither the input
 /// nor the expectation.
@@ -380,7 +388,12 @@ async fn try_land(
             .cloned()
             .map(|t| TraceLandingRow::tag_value(received_ms, t)),
     );
-    client.insert_block("trace_landing", &rows).await?;
+    // **Through the landing insert's own pinned settings**, which is what a
+    // push carries: `materialized_views_ignore_errors = 0` among them, which
+    // is what makes a throwing view fail the insert rather than be ignored.
+    client
+        .insert_block_with("trace_landing", &rows, &landing_settings())
+        .await?;
     Ok(parsed)
 }
 
@@ -388,6 +401,50 @@ async fn try_land(
 /// through the production client, in **one** block — one push is one insert.
 async fn land(client: &ChClient, req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
     try_land(client, req).await.expect("the landing insert")
+}
+
+/// [`land`] at a `received_ms` the caller chooses, so a case can place a
+/// push inside or outside a replay window it names (issue #586).
+async fn land_at(
+    client: &ChClient,
+    req: &ExportTraceServiceRequest,
+    received_ms: i64,
+) -> ParsedTraceLanding {
+    let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let mut rows: Vec<TraceLandingRow> = Vec::with_capacity(parsed.total_rows() as usize);
+    rows.extend(
+        parsed
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        parsed
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| TraceLandingRow::resource(received_ms, r)),
+    );
+    rows.extend(
+        parsed
+            .tag_names
+            .iter()
+            .cloned()
+            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+    );
+    rows.extend(
+        parsed
+            .tag_values
+            .iter()
+            .cloned()
+            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+    );
+    client
+        .insert_block_with("trace_landing", &rows, &landing_settings())
+        .await
+        .expect("the landing insert");
+    parsed
 }
 
 // --- the cases ------------------------------------------------------------
@@ -1614,4 +1671,1262 @@ async fn a_scalar_array_contributes_one_value_row_per_element() {
     );
 
     drop_db(&db).await;
+}
+
+// === The write path on the five targets (issue #586) ======================
+
+/// A span of `trace`/`id` at `start_ns` with `duration_ns`, in `service`,
+/// optionally rooted.
+#[allow(clippy::too_many_arguments)]
+fn span_full(
+    trace: &[u8; 16],
+    id: u8,
+    parent: Option<u8>,
+    name: &str,
+    kind: i32,
+    start_ns: i64,
+    duration_ns: i64,
+    attrs: Vec<KeyValue>,
+) -> Span {
+    Span {
+        trace_id: trace.to_vec(),
+        span_id: vec![id; 8],
+        parent_span_id: parent.map(|p| vec![p; 8]).unwrap_or_default(),
+        trace_state: String::new(),
+        flags: 0,
+        name: name.to_string(),
+        kind,
+        start_time_unix_nano: u64::try_from(start_ns).expect("a post-epoch fixture"),
+        end_time_unix_nano: u64::try_from(start_ns + duration_ns).expect("a post-epoch fixture"),
+        attributes: attrs,
+        dropped_attributes_count: 0,
+        events: Vec::new(),
+        dropped_events_count: 0,
+        links: Vec::new(),
+        dropped_links_count: 0,
+        status: None,
+    }
+}
+
+fn trace_id_of(seed: u8) -> [u8; 16] {
+    [seed; 16]
+}
+
+/// One request carrying several resources, so a case that needs more than
+/// one service in **one** push — and therefore one `received_ms` — can build
+/// it.
+fn request_of_services(groups: Vec<(&str, Vec<Span>)>) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: groups
+            .into_iter()
+            .map(|(service, spans)| ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", str_value(service))],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            })
+            .collect(),
+    }
+}
+
+/// Detaches or re-attaches the five views, so a case can land a row into the
+/// landing table **without** the targets being written — which is the only
+/// way to observe a row a replay has not yet carried over, since a committed
+/// landing insert otherwise fans out as part of its own processing.
+async fn set_views_attached(client: &ChClient, attached: bool) {
+    let verb = if attached { "ATTACH" } else { "DETACH" };
+    for mv in [
+        "spans_mv",
+        "resources_mv",
+        "traces_mv",
+        "tag_names_mv",
+        "tag_values_mv",
+    ] {
+        client
+            .execute(
+                &format!("{verb} TABLE {mv}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{verb} {mv}: {e}"));
+    }
+}
+
+/// **`T-W1`.** The fixture's six bodies with one sent twice, in **one**
+/// push: the target's `ReplacingMergeTree` key collapses the repeat, and
+/// the landing table holds both copies — which is what shows the collapse is
+/// the target's doing and not a writer filter.
+#[tokio::test]
+async fn t_w1_a_repeated_body_in_one_block_collapses_on_the_target_key() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w1")).await;
+
+    let t0 = now_ns();
+    // Six bodies, nine spans: three carry two spans and three carry one.
+    let mut spans = Vec::new();
+    for (i, n) in [2u8, 2, 2, 1, 1, 1].into_iter().enumerate() {
+        let trace = trace_id_of(0xb0 + i as u8);
+        for j in 0..n {
+            spans.push(span_full(
+                &trace,
+                0x10 + j,
+                None,
+                "GET /api",
+                2,
+                t0 + (i as i64) * 1_000_000 + i64::from(j),
+                1_000,
+                vec![kv("http.route", str_value("/api"))],
+            ));
+        }
+    }
+    // The first body again, in the same push.
+    let repeated = trace_id_of(0xb0);
+    for j in 0..2u8 {
+        spans.push(span_full(
+            &repeated,
+            0x10 + j,
+            None,
+            "GET /api",
+            2,
+            t0 + i64::from(j),
+            1_000,
+            vec![kv("http.route", str_value("/api"))],
+        ));
+    }
+    assert_eq!(spans.len(), 11, "nine spans plus one body's two again");
+    land(&client, &request("checkout", spans)).await;
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        9,
+        "the repeated body's two spans collapse on the ReplacingMergeTree key"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM trace_landing WHERE row_kind = 0"
+        )
+        .await,
+        11,
+        "and the landing table holds both copies: the collapse is the \
+         target's key, not a writer filter"
+    );
+    // Recorded, not asserted: it is 9 only while `optimize_on_insert` is 1.
+    let unmerged = count(&client, "SELECT count() AS n FROM spans").await;
+    eprintln!("T-W1: SELECT count() FROM spans (recorded) = {unmerged}");
+
+    drop_db(&db).await;
+}
+
+/// **`T-W2`.** The same body in two separate pushes, outside any
+/// suppression window — the landing inserts here carry no claim at all —
+/// collapses to nine spans before any merge.
+#[tokio::test]
+async fn t_w2_the_same_body_in_two_pushes_collapses_before_any_merge() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w2")).await;
+
+    let t0 = now_ns();
+    let mut spans = Vec::new();
+    for (i, n) in [2u8, 2, 2, 1, 1, 1].into_iter().enumerate() {
+        let trace = trace_id_of(0xc0 + i as u8);
+        for j in 0..n {
+            spans.push(span_full(
+                &trace,
+                0x20 + j,
+                None,
+                "GET /api",
+                2,
+                t0 + (i as i64) * 1_000_000 + i64::from(j),
+                1_000,
+                vec![kv("http.route", str_value("/api"))],
+            ));
+        }
+    }
+    let body = request("checkout", spans);
+    land(&client, &body).await;
+    land(&client, &body).await;
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        9,
+        "two pushes of the same nine spans are nine spans"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **`T-W3`.** One span id arriving with two OTLP kinds — a shared span,
+/// both RPC halves under one id — is two rows after `FINAL`, because `kind`
+/// is in the sorting key.
+#[tokio::test]
+async fn t_w3_one_span_id_with_two_kinds_is_two_rows() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w3")).await;
+
+    let t0 = now_ns();
+    let trace = trace_id_of(0xd0);
+    land(
+        &client,
+        &request(
+            "checkout",
+            vec![
+                span_full(&trace, 0x31, None, "GET /api", 2, t0, 1_000, vec![]),
+                span_full(&trace, 0x31, None, "GET /api", 3, t0, 1_000, vec![]),
+            ],
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        2,
+        "a shared span keeps both halves: `kind` is in the sorting key"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **`T-W5`.** A thousand spans of one resource in one day land **one**
+/// kind-1 row, not a thousand collapsed by the target. The second half is
+/// the load-bearing one: a writer emitting one resource row per span passes
+/// the first and fails this.
+#[tokio::test]
+async fn t_w5_a_thousand_spans_of_one_resource_land_one_resource_row() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w5")).await;
+
+    let t0 = (now_ns() / 86_400_000_000_000) * 86_400_000_000_000 + 3_600_000_000_000;
+    let trace = trace_id_of(0xe0);
+    let spans: Vec<Span> = (0..1_000i64)
+        .map(|i| {
+            span_full(
+                &trace,
+                (i % 251) as u8 + 1,
+                None,
+                "GET /api",
+                2,
+                t0 + i,
+                1_000,
+                vec![],
+            )
+        })
+        .collect();
+    land(&client, &request("checkout", spans)).await;
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM trace_landing WHERE row_kind = 1"
+        )
+        .await,
+        1,
+        "the writer emits one resource row per distinct (resource, day) in \
+         the push, and does not lean on the target to collapse a thousand"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **A second push re-emits the same resource and catalog rows**, and this
+/// is the case a cross-push cache fails: any per-process set of
+/// already-written keys makes the second push emit none of them, and then a
+/// fan-out failure on the first push leaves the entries missing for good.
+#[tokio::test]
+async fn a_second_push_re_emits_the_same_resource_and_catalog_rows() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_reemit")).await;
+
+    let t0 = now_ns();
+    let trace = trace_id_of(0xf0);
+    let body = request(
+        "checkout",
+        vec![span_full(
+            &trace,
+            0x41,
+            None,
+            "GET /api",
+            2,
+            t0,
+            1_000,
+            vec![kv("http.route", str_value("/api"))],
+        )],
+    );
+    let parsed = land(&client, &body).await;
+    let single = count(
+        &client,
+        "SELECT count() AS n FROM trace_landing WHERE row_kind IN (1, 2, 3)",
+    )
+    .await;
+    assert!(single > 0, "the push lands catalog and resource rows");
+    let names = count(&client, "SELECT count() AS n FROM tag_names FINAL").await;
+    let values = count(&client, "SELECT count() AS n FROM tag_values FINAL").await;
+    let resources = count(&client, "SELECT count() AS n FROM resources FINAL").await;
+
+    land(&client, &body).await;
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM trace_landing WHERE row_kind IN (1, 2, 3)"
+        )
+        .await,
+        single * 2,
+        "the second push re-emits every kind-1, kind-2 and kind-3 row: there \
+         is no cache of anything already written anywhere on this path"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM tag_names FINAL").await,
+        names,
+        "and the targets collapse the repeats on their own keys"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM tag_values FINAL").await,
+        values
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        resources
+    );
+    assert_eq!(parsed.resources.len(), 1);
+
+    drop_db(&db).await;
+}
+
+/// **`T-W6`.** A view pointed at a table with an incompatible column fails
+/// the insert, and the throwing view's own target holds nothing.
+///
+/// **Three assertions and no fourth.** The healthy siblings' counts are
+/// recorded and asserted against nothing: a measurement over 300 trials of
+/// one throwing view and three healthy siblings on one source table found
+/// the siblings committing in 28, 25 and 32 of them, so a fourth assertion
+/// that `spans` is empty would fail about a tenth of the time — and it would
+/// state a guarantee this design does not make.
+#[tokio::test]
+async fn t_w6_a_throwing_view_fails_the_insert_and_its_target_holds_nothing() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w6")).await;
+
+    // Point `traces_mv` at a table whose `trace_id` cannot take the
+    // projection's `FixedString(16)`.
+    for sql in [
+        "DROP VIEW IF EXISTS traces_mv",
+        "CREATE TABLE traces_broken (day Date, trace_id Int8, start_ns Int64, end_ns Int64, \
+         root_service String, root_name String, services Array(String)) \
+         ENGINE = MergeTree ORDER BY trace_id",
+        "CREATE MATERIALIZED VIEW traces_mv TO traces_broken AS \
+         SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns, \
+                rs AS root_service, rn AS root_name, sv AS services \
+         FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e, \
+                      maxIf(service, parent_span_id = toFixedString('', 8)) AS rs, \
+                      maxIf(name, parent_span_id = toFixedString('', 8)) AS rn, \
+                      groupUniqArray(toString(service)) AS sv \
+               FROM trace_landing WHERE row_kind = 0 GROUP BY trace_id)",
+    ] {
+        client
+            .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let t0 = now_ns();
+    let trace = trace_id_of(0x5a);
+    let err = try_land(
+        &client,
+        &request(
+            "checkout",
+            vec![span_full(
+                &trace,
+                0x51,
+                None,
+                "GET /api",
+                2,
+                t0,
+                1_000,
+                vec![kv("http.route", str_value("/api"))],
+            )],
+        ),
+    )
+    .await
+    .expect_err("a view's exception fails the insert");
+    eprintln!("T-W6: the insert failed with {err}");
+
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM traces").await,
+        0,
+        "the throwing view's own target holds nothing"
+    );
+    for table in ["spans", "resources", "tag_names", "tag_values"] {
+        let n = count(&client, &format!("SELECT count() AS n FROM {table}")).await;
+        eprintln!("T-W6: {table} held {n} rows (recorded, asserted against nothing)");
+    }
+
+    drop_db(&db).await;
+}
+
+/// **A profiling string reference lands nowhere** (the live half): not in
+/// either attribute column, not in either catalog, in any of the five
+/// scopes.
+#[tokio::test]
+async fn a_profiling_string_reference_lands_nowhere() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_strindex")).await;
+
+    let strindex = AnyValue {
+        value: Some(any_value::Value::StringValueStrindex(7)),
+    };
+    let scope = InstrumentationScope {
+        name: "io.otel.http".to_string(),
+        version: String::new(),
+        attributes: vec![kv("s1", strindex.clone())],
+        dropped_attributes_count: 0,
+    };
+    let span = span_with(
+        0x6a,
+        0x61,
+        vec![
+            kv("k1", strindex.clone()),
+            kv(
+                "k2",
+                array_value(vec![str_value("a"), strindex.clone(), str_value("b")]),
+            ),
+            kv("k3", array_value(vec![strindex.clone()])),
+            kv("k4", bytes_value(b"x")),
+        ],
+    );
+    land(
+        &client,
+        &request_with("checkout", Vec::new(), vec![span], Some(scope), ""),
+    )
+    .await;
+
+    assert_eq!(
+        scalar(&client, "SELECT dynamicType(attrs.`k1`) AS s FROM spans").await,
+        "None",
+        "no path is stored for the profiling reference"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM tag_names FINAL WHERE key IN ('k1', 's1')"
+        )
+        .await,
+        0,
+        "and neither catalog lists the key, in either scope"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT toUInt64(length(attrs.`k2`.:`Array(Nullable(String))`)) AS n FROM spans"
+        )
+        .await,
+        2,
+        "the element of that arm is dropped and the rest land"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT toUInt64(has(attrs.`k2`.:`Array(Nullable(String))`, 'b')) AS n FROM spans"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT toUInt64(length(attrs.`k3`.:`Array(Nullable(String))`)) AS n FROM spans"
+        )
+        .await,
+        0,
+        "an array whose every element is that arm lands as the empty array"
+    );
+
+    let other = blob(&client, "SELECT attrs_other AS b FROM spans").await;
+    let decoded = KeyValueList::decode(other.as_slice()).expect("a KeyValueList");
+    let keys: Vec<&str> = decoded.values.iter().map(|kv| kv.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["k4"],
+        "the bytes value is still carried and the index is not"
+    );
+
+    drop_db(&db).await;
+}
+
+// === `rebuild-traces`: replaying a landing window (issue #586) ============
+//
+// Every case here drives `pulsus_schema::replay_trace_window`, which is the
+// engine `pulsusdb rebuild-traces` wraps: the command parses its two RFC3339
+// arguments into the epoch milliseconds this function takes, and does nothing
+// else. The window is half-open — `received_ms >= from AND received_ms < to`
+// — so a one-millisecond window selects one stamp.
+
+/// The replay's own row ceiling, the value both pinned row limits carry on
+/// every statement it sends.
+const REPLAY_MAX_ROWS: u64 = 1_048_576;
+
+async fn replay(
+    client: &ChClient,
+    db: &str,
+    from_ms: i64,
+    to_ms: i64,
+) -> pulsus_schema::ReplayReport {
+    let ctx: SchemaParams = RenderCtx::for_tests(db);
+    pulsus_schema::replay_trace_window(client, &ctx, from_ms, to_ms, REPLAY_MAX_ROWS)
+        .await
+        .unwrap_or_else(|e| panic!("the replay failed: {e}"))
+}
+
+async fn received_ms_bounds(client: &ChClient) -> (i64, i64) {
+    let text = scalar(
+        client,
+        "SELECT concat(toString(min(received_ms)), ':', toString(max(received_ms))) AS s \
+         FROM trace_landing",
+    )
+    .await;
+    let (lo, hi) = text.split_once(':').expect("two bounds");
+    (lo.parse().expect("a stamp"), hi.parse().expect("a stamp"))
+}
+
+async fn truncate_targets(client: &ChClient) {
+    for table in ["spans", "traces", "resources", "tag_names", "tag_values"] {
+        client
+            .execute(
+                &format!("TRUNCATE TABLE {table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("truncating {table}: {e}"));
+    }
+}
+
+/// **The repair replays one target partition per statement.** The shape
+/// assertion is the whole case: a repair emitting one statement for the
+/// window, or one spanning two partitions, fails on the count and on the
+/// predicate.
+///
+/// There is deliberately **no hostile `max_partitions_per_insert_block`** in
+/// this setup: every repair statement carries it at the plan's constant
+/// through the shared constructor, and a per-query value overrides a
+/// profile, so a lowered partition-count limit could not discriminate
+/// anything here. That is a statement about that one setting and not about
+/// limits — two cases below do give the repair a hostile profile.
+#[tokio::test]
+async fn the_repair_replays_one_partition_per_statement() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db(
+        "pulsus_trace_landing_it_partitions",
+    ))
+    .await;
+
+    // Five distinct UTC dates, one trace per date so `traces` has five
+    // partitions too, and one resource so `resources` has one row per day.
+    let day = 86_400_000_000_000i64;
+    let today = (now_ns() / day) * day + 3_600_000_000_000;
+    let mut spans = Vec::new();
+    for d in 0..5i64 {
+        let trace = trace_id_of(0x70 + d as u8);
+        for j in 0..2u8 {
+            spans.push(span_full(
+                &trace,
+                0x81 + j,
+                None,
+                "GET /api",
+                2,
+                today - d * day + i64::from(j),
+                1_000,
+                vec![kv("http.route", str_value("/api"))],
+            ));
+        }
+    }
+    land(&client, &request("checkout", spans)).await;
+    let before = (
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        count(&client, "SELECT count() AS n FROM traces FINAL").await,
+        count(
+            &client,
+            "SELECT toUInt64(uniqExact(day)) AS n FROM resources",
+        )
+        .await,
+    );
+    // **`resources` is read by its day count and without `FINAL`**: its
+    // sorting key is `(service, resource_id)` and `day` is only its
+    // partition key, so `FINAL` collapses one resource's five day-rows into
+    // one.
+    assert_eq!(before, (10, 5, 5), "the fixture spans five UTC dates");
+    truncate_targets(&client).await;
+
+    let (lo, hi) = received_ms_bounds(&client).await;
+    let report = replay(&client, &db, lo, hi + 1).await;
+    let inserts = report.inserts();
+
+    let per_target = |target: &str| {
+        inserts
+            .iter()
+            .filter(|s| s.contains(&format!("INSERT INTO {db}.{target} ")))
+            .count()
+    };
+    assert_eq!(
+        per_target("spans"),
+        5,
+        "one statement per span partition: {inserts:#?}"
+    );
+    assert_eq!(per_target("traces"), 5, "{inserts:#?}");
+    assert_eq!(per_target("resources"), 5, "{inserts:#?}");
+    assert_eq!(per_target("tag_names"), 1, "unpartitioned: one statement");
+    assert_eq!(per_target("tag_values"), 1);
+    assert_eq!(inserts.len(), 17, "{inserts:#?}");
+    for target in ["spans", "traces", "resources"] {
+        let mut predicates: Vec<&str> = inserts
+            .iter()
+            .filter(|s| s.contains(&format!("INSERT INTO {db}.{target} ")))
+            .map(|s| {
+                s.rsplit_once(" WHERE ")
+                    .unwrap_or_else(|| panic!("{target}: no partition predicate in {s}"))
+                    .1
+            })
+            .collect();
+        predicates.sort_unstable();
+        predicates.dedup();
+        assert_eq!(
+            predicates.len(),
+            5,
+            "{target}: five statements, five distinct single-partition \
+             predicates: {predicates:?}"
+        );
+        for predicate in &predicates {
+            assert!(
+                predicate.contains(" = '")
+                    && !predicate.contains(" OR ")
+                    && !predicate.contains(" IN "),
+                "{target}: each statement restricts the partition expression \
+                 to a single value: {predicate}"
+            );
+        }
+    }
+
+    assert_eq!(
+        (
+            count(&client, "SELECT count() AS n FROM spans FINAL").await,
+            count(&client, "SELECT count() AS n FROM traces FINAL").await,
+            count(
+                &client,
+                "SELECT toUInt64(uniqExact(day)) AS n FROM resources"
+            )
+            .await,
+        ),
+        before,
+        "the replay completes and each day-partitioned target holds all five days"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **The repair converges after a partition is left part-written.**
+///
+/// The part-written partition is made by a run that **completes over half
+/// the window**, not by a run that fails: the first run's `--to` is push B's
+/// own stamp and the bound is exclusive, so it replays push A alone. All
+/// five of the phase-one values differ from the whole-window ones, which is
+/// what makes this a part-written partition rather than a smaller correct
+/// one.
+///
+/// Every `start_ns` is on one UTC day and that is load-bearing: `traces` is
+/// partitioned by `day` over the block's own `min(start_ns)`, so a partial
+/// block and a whole one land in the same partition — and therefore merge on
+/// `trace_id` — only while the trace sits inside one day.
+#[tokio::test]
+async fn the_repair_converges_after_a_partition_is_left_part_written() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_converge")).await;
+
+    // One instant inside the span retention, and one UTC day for every
+    // span: a `start_ns` of a few hundred nanoseconds is 1970 and past
+    // `spans`' own delete-TTL.
+    let day = 86_400_000_000_000i64;
+    let t0 = (now_ns() / day) * day + 3_600_000_000_000;
+    let t = trace_id_of(0x91);
+    let u = trace_id_of(0x92);
+
+    // Push A: two children of T in `cart`.
+    land(
+        &client,
+        &request(
+            "cart",
+            vec![
+                span_full(&t, 0xa1, Some(0xa0), "child-1", 2, t0 + 300, 100, vec![]),
+                span_full(&t, 0xa2, Some(0xa0), "child-2", 2, t0 + 400, 100, vec![]),
+            ],
+        ),
+    )
+    .await;
+    // Push B, once the first push's millisecond has passed — **one** landing
+    // insert carrying all three of its spans under three resources, so the
+    // window below holds exactly two stamps.
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    land(
+        &client,
+        &request_of_services(vec![
+            (
+                "checkout",
+                vec![span_full(&t, 0xa0, None, "/api", 2, t0 + 100, 800, vec![])],
+            ),
+            (
+                "cart",
+                vec![span_full(
+                    &t,
+                    0xa3,
+                    Some(0xa0),
+                    "child-3",
+                    2,
+                    t0 + 500,
+                    100,
+                    vec![],
+                )],
+            ),
+            (
+                "pay",
+                vec![span_full(
+                    &u,
+                    0xb1,
+                    None,
+                    "charge",
+                    2,
+                    t0 + 200,
+                    100,
+                    vec![],
+                )],
+            ),
+        ]),
+    )
+    .await;
+
+    // **Exactly two stamps**, and the case fails here rather than in the
+    // phases below if the two pushes shared one.
+    let stamps = count(
+        &client,
+        "SELECT uniqExact(received_ms) AS n FROM trace_landing",
+    )
+    .await;
+    assert_eq!(
+        stamps, 2,
+        "the window has to hold exactly two received_ms stamps, so the \
+         half-window run replays push A alone"
+    );
+
+    let ingest_names = count(&client, "SELECT count() AS n FROM tag_names FINAL").await;
+    let ingest_values = count(&client, "SELECT count() AS n FROM tag_values FINAL").await;
+    truncate_targets(&client).await;
+
+    let (lo, hi) = received_ms_bounds(&client).await;
+    assert!(hi > lo, "the window has two ends");
+
+    // Phase one: the half-window run, which replays push A alone.
+    replay(&client, &db, lo, hi).await;
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        2,
+        "the half-window run replayed push A alone"
+    );
+    assert_eq!(
+        traces_row(&client, &t).await,
+        format!("{}|{}|||['cart']", t0 + 300, t0 + 500),
+        "a part-written partition: no root, one service, the children's own \
+         bounds"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM traces WHERE trace_id = unhex('{}')",
+                hex_of(&u)
+            )
+        )
+        .await,
+        0,
+        "and nothing of the second trace at all"
+    );
+
+    // Phase two: the whole window. A re-run completes what was left, and
+    // the duplicates collapse on the key each target collapses on.
+    replay(&client, &db, lo, hi + 1).await;
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        5
+    );
+    assert_eq!(
+        traces_row(&client, &t).await,
+        format!(
+            "{}|{}|checkout|/api|['cart','checkout']",
+            t0 + 100,
+            t0 + 900
+        ),
+        "the re-run converges"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM traces FINAL WHERE trace_id = unhex('{}')",
+                hex_of(&u)
+            )
+        )
+        .await,
+        1,
+        "and the second trace has its own row"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        3,
+        "three distinct resources, one per service name"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM tag_names FINAL").await,
+        ingest_names,
+        "the replay reaches the same catalog rows the ingest did"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM tag_values FINAL").await,
+        ingest_values
+    );
+
+    // Recorded, not asserted: the second is 2 until a merge combines the
+    // partial row with the complete one, and the read above answers
+    // correctly whether or not it has.
+    let unmerged_spans = count(&client, "SELECT count() AS n FROM spans").await;
+    let unmerged_traces = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM traces WHERE trace_id = unhex('{}')",
+            hex_of(&t)
+        ),
+    )
+    .await;
+    eprintln!(
+        "converge: SELECT count() FROM spans = {unmerged_spans}, \
+         traces rows for T = {unmerged_traces} (both recorded)"
+    );
+
+    drop_db(&db).await;
+}
+
+/// The `traces` read of `docs/TraceQL/sql-schema.md` §5.2's own shape, as one
+/// string: `min(start_ns)|max(end_ns)|root_service|root_name|services`.
+async fn traces_row(client: &ChClient, trace: &[u8; 16]) -> String {
+    scalar(
+        client,
+        &format!(
+            "SELECT concat(toString(min(start_ns)), '|', toString(max(end_ns)), '|', \
+                    max(root_service), '|', max(root_name), '|', \
+                    toString(arraySort(groupUniqArrayArray(services)))) AS s \
+             FROM traces WHERE trace_id = unhex('{}') GROUP BY trace_id",
+            hex_of(trace)
+        ),
+    )
+    .await
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// **A row arriving behind the repair is recovered by the next run.**
+///
+/// The first run leaves that row's span **absent** — asserted, not merely
+/// allowed, because it is what the repair discloses — and a second run with
+/// no further arrivals leaves every landed row present, the late one
+/// included, with nothing doubled.
+///
+/// The late row's stamp is **inside** the first run's window and in a
+/// partition that run had already processed; what the run missed is a row
+/// that was not committed when it read. The seam is after the run rather
+/// than between two of its statements, which the engine's fixed window makes
+/// the only expressible one.
+#[tokio::test]
+async fn a_row_arriving_behind_the_repair_is_recovered_by_the_next_run() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_behind")).await;
+
+    let day = 86_400_000_000_000i64;
+    let t0 = (now_ns() / day) * day + 3_600_000_000_000;
+    let early = now_ms();
+    let late_window_end = early + 10;
+
+    // A window over two UTC days.
+    land_at(
+        &client,
+        &request(
+            "checkout",
+            vec![
+                span_full(
+                    &trace_id_of(0xc1),
+                    0xd1,
+                    None,
+                    "day-1",
+                    2,
+                    t0,
+                    1_000,
+                    vec![],
+                ),
+                span_full(
+                    &trace_id_of(0xc2),
+                    0xd2,
+                    None,
+                    "day-2",
+                    2,
+                    t0 - day,
+                    1_000,
+                    vec![],
+                ),
+            ],
+        ),
+        early,
+    )
+    .await;
+    truncate_targets(&client).await;
+
+    replay(&client, &db, early, late_window_end).await;
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        2,
+        "the first run replays the window it read"
+    );
+
+    // A row for an already-processed day, stamped inside the same window,
+    // committed behind the run. The five views are detached while it lands:
+    // a committed landing insert otherwise fans out as part of its own
+    // processing, which is the whole point of the design and would put the
+    // row in `spans` with no replay involved.
+    set_views_attached(&client, false).await;
+    land_at(
+        &client,
+        &request(
+            "checkout",
+            vec![span_full(
+                &trace_id_of(0xc3),
+                0xd3,
+                None,
+                "late",
+                2,
+                t0 + 5_000,
+                1_000,
+                vec![],
+            )],
+        ),
+        early,
+    )
+    .await;
+    set_views_attached(&client, true).await;
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM spans FINAL WHERE name = 'late'"
+        )
+        .await,
+        0,
+        "the first run left the late row's span absent, which is what the \
+         repair discloses rather than prevents"
+    );
+
+    replay(&client, &db, early, late_window_end).await;
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        3,
+        "a second run with no further arrivals recovers it"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM spans FINAL WHERE name = 'late'"
+        )
+        .await,
+        1,
+        "and nothing is doubled"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **A replay of a landing window changes no answer.** It is the case the
+/// repair's "no partition drop" rests on: metrics refuses a replay into its
+/// append-only targets for exactly the reason this fixture would expose if
+/// any trace target summed.
+#[tokio::test]
+async fn a_replay_of_a_landing_window_changes_no_answer() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_replay")).await;
+
+    let day = 86_400_000_000_000i64;
+    let t0 = (now_ns() / day) * day + 3_600_000_000_000;
+    let services = ["checkout", "cart", "pay"];
+    for (s, service) in services.iter().enumerate() {
+        let spans: Vec<Span> = (0..34i64)
+            .filter(|i| (s as i64) * 34 + i < 100)
+            .map(|i| {
+                let n = (s as i64) * 34 + i;
+                span_full(
+                    &trace_id_of(0xe1 + s as u8),
+                    (n % 251) as u8 + 1,
+                    None,
+                    "GET /api",
+                    2,
+                    t0 + n,
+                    1_000,
+                    vec![
+                        kv("http.route", str_value("/api")),
+                        kv(&format!("app.k{}", n % 12), str_value("v")),
+                    ],
+                )
+            })
+            .collect();
+        land(&client, &request(service, spans)).await;
+    }
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        100,
+        "the fixture is a hundred spans over three resources"
+    );
+    let single = (
+        count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        count(&client, "SELECT count() AS n FROM tag_names FINAL").await,
+        count(&client, "SELECT count() AS n FROM tag_values FINAL").await,
+    );
+    assert_eq!(single.0, 3);
+    let traces_before = all_traces_rows(&client).await;
+
+    let (lo, hi) = received_ms_bounds(&client).await;
+    for pass in 1..=2 {
+        let report = replay(&client, &db, lo, hi + 1).await;
+        // **The one thing that tells a replay which changed no answer from a
+        // replay that never ran.** Every other assertion below is satisfied
+        // by a command that did nothing at all. All hundred spans are on one
+        // UTC day and all three traces' own minima with them, so each
+        // day-partitioned target has one partition and the two catalogs one
+        // statement each.
+        assert_eq!(
+            report.inserts().len(),
+            5,
+            "pass {pass}: one statement per target partition: {:#?}",
+            report.inserts()
+        );
+        assert_eq!(
+            count(&client, "SELECT count() AS n FROM spans FINAL").await,
+            100,
+            "pass {pass}: no partition was dropped and nothing doubled"
+        );
+        assert_eq!(
+            (
+                count(&client, "SELECT count() AS n FROM resources FINAL").await,
+                count(&client, "SELECT count() AS n FROM tag_names FINAL").await,
+                count(&client, "SELECT count() AS n FROM tag_values FINAL").await,
+            ),
+            single,
+            "pass {pass}"
+        );
+        assert_eq!(
+            all_traces_rows(&client).await,
+            traces_before,
+            "pass {pass}: every column of every `traces` row equals the \
+             single-push value"
+        );
+    }
+
+    // Allowed to be 300: the collapse is the target's own key.
+    let unmerged = count(&client, "SELECT count() AS n FROM spans").await;
+    eprintln!("replay: SELECT count() FROM spans (recorded) = {unmerged}");
+
+    drop_db(&db).await;
+}
+
+/// Every `traces` row, reduced the way §5.2 reads that table.
+async fn all_traces_rows(client: &ChClient) -> Vec<String> {
+    texts(
+        client,
+        "SELECT concat(hex(trace_id), '|', toString(min(start_ns)), '|', \
+                toString(max(end_ns)), '|', max(root_service), '|', max(root_name), '|', \
+                toString(arraySort(groupUniqArrayArray(services)))) AS s \
+         FROM traces GROUP BY trace_id ORDER BY s",
+    )
+    .await
+}
+
+/// **A read cap cannot turn a repair run into a short success.**
+///
+/// The profile is reproduced as a per-user setting, which is how a
+/// deployment's profile is reached without touching the shared server's
+/// configuration. Those two settings are the whole profile: this case bounds
+/// nothing about how the rows arrive in chunks, because each part of the
+/// outcome holds for every arrangement the engine can produce.
+///
+/// The raise is certain because the window's 400 rows are more than the cap
+/// of 200 and `SizeLimits::check` raises on `rows > max_rows`. The two zeros
+/// are certain because the squash threshold is the pinned row ceiling and
+/// the window's 400 rows never reach it, so nothing reaches a sink before
+/// the pipeline finishes and the raise aborts it.
+#[tokio::test]
+async fn a_read_cap_cannot_turn_a_repair_run_into_a_short_success() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_readcap")).await;
+
+    let day = 86_400_000_000_000i64;
+    let t0 = (now_ns() / day) * day + 3_600_000_000_000;
+    let spans: Vec<Span> = (0..400i64)
+        .map(|i| {
+            span_full(
+                &trace_id_of(0xf1),
+                (i % 251) as u8 + 1,
+                None,
+                "GET /api",
+                2,
+                t0 + i,
+                1_000,
+                vec![],
+            )
+        })
+        .collect();
+    land(&client, &request("checkout", spans)).await;
+    truncate_targets(&client).await;
+
+    let user = format!("{db}_capped");
+    let capped = capped_client(
+        &client,
+        &db,
+        &user,
+        "max_rows_to_read = 200, read_overflow_mode = 'break'",
+    )
+    .await;
+
+    let (lo, hi) = received_ms_bounds(&client).await;
+    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    let err = pulsus_schema::replay_trace_window(&capped, &ctx, lo, hi + 1, REPLAY_MAX_ROWS)
+        .await
+        .expect_err("the run must fail: the pinned mode makes the cap loud");
+    let text = err.to_string();
+    assert!(
+        text.contains("158"),
+        "the error carries TOO_MANY_ROWS: {text}"
+    );
+    assert!(
+        text.contains("max_rows_to_read"),
+        "the error names the cap the deployment set: {text}"
+    );
+    // **The text is the server's own, read off 26.3.29.7**: `Limit for rows
+    // (controlled by 'max_rows_to_read' setting) exceeded, max rows: 200.00,
+    // current rows: 401.00`. It is not the shorter `Limit for rows or bytes
+    // to read exceeded` the plan quoted — the engine produces that one for
+    // the combined row-or-byte check and this one for the row cap alone.
+    assert_eq!(count(&client, "SELECT count() AS n FROM spans").await, 0);
+    assert_eq!(count(&client, "SELECT count() AS n FROM traces").await, 0);
+
+    drop_user(&client, &user).await;
+    drop_db(&db).await;
+}
+
+/// **A group-by cap cannot turn the per-trace replay into a short success.**
+/// `traces_mv` is the one view whose projection groups, and at `break` the
+/// aggregation would stop consuming its input and the statement would
+/// succeed having written at least 3 of the 10 traces and at most all 10 —
+/// which is why **no count is the expected value** and the run's outcome is.
+#[tokio::test]
+async fn a_group_by_cap_cannot_turn_the_traces_replay_into_a_short_success() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_groupcap")).await;
+
+    let day = 86_400_000_000_000i64;
+    let t0 = (now_ns() / day) * day + 3_600_000_000_000;
+    let mut spans = Vec::new();
+    for t in 0..10u8 {
+        for i in 0..40i64 {
+            spans.push(span_full(
+                &trace_id_of(0x11 + t),
+                (i % 251) as u8 + 1,
+                None,
+                "GET /api",
+                2,
+                t0 + i64::from(t) * 1_000 + i,
+                1_000,
+                vec![],
+            ));
+        }
+    }
+    land(&client, &request("checkout", spans)).await;
+    truncate_targets(&client).await;
+
+    let user = format!("{db}_grouped");
+    let capped = capped_client(
+        &client,
+        &db,
+        &user,
+        "max_rows_to_group_by = 2, group_by_overflow_mode = 'break'",
+    )
+    .await;
+
+    let (lo, hi) = received_ms_bounds(&client).await;
+    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    let err = pulsus_schema::replay_trace_window(&capped, &ctx, lo, hi + 1, REPLAY_MAX_ROWS)
+        .await
+        .expect_err("the run must fail: the pinned mode makes the cap loud");
+    let text = err.to_string();
+    assert!(text.contains("158"), "{text}");
+    assert!(
+        text.contains("Limit for rows to GROUP BY exceeded"),
+        "{text}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM traces FINAL").await,
+        0
+    );
+    // Recorded, not asserted: the `spans` statement has no `GROUP BY` and
+    // may have run and committed before the per-trace one raised.
+    let spans_rows = count(&client, "SELECT count() AS n FROM spans FINAL").await;
+    eprintln!("group-by cap: spans FINAL = {spans_rows} (recorded)");
+
+    drop_user(&client, &user).await;
+    drop_db(&db).await;
+}
+
+/// Creates a user carrying `settings`, grants it the test database, and
+/// returns a client bound to it. Dropped by exact name by [`drop_user`].
+async fn capped_client(admin: &ChClient, db: &str, user: &str, settings: &str) -> ChClient {
+    for sql in [
+        format!("DROP USER IF EXISTS {user}"),
+        format!("CREATE USER {user} IDENTIFIED WITH no_password SETTINGS {settings}"),
+        format!("GRANT ALL ON {db}.* TO {user}"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    ChClient::new(ChConnConfig {
+        database: db.to_string(),
+        user: user.to_string(),
+        password: String::new(),
+        ..base_config()
+    })
+    .await
+    .expect("connect as the capped user")
+}
+
+async fn drop_user(admin: &ChClient, user: &str) {
+    admin
+        .execute(
+            &format!("DROP USER IF EXISTS {user}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the capped user");
 }

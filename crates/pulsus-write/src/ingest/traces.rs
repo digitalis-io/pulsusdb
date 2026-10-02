@@ -6,7 +6,7 @@
 //! `collisions`), no registration/metadata carriers (`trace_tag_catalog` is
 //! MV-populated, never writer-written — issue #53).
 
-use crate::ingest::{Backpressure, FlushWait};
+use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 
 /// One `trace_spans` row's source data (docs/schemas.md §4.1), produced by
 /// the OTLP traces parser. IDs are raw wire bytes (`FixedString(16)`/
@@ -191,15 +191,40 @@ pub struct ParsedTraces {
 /// exactly, including the reuse of [`FlushWait`] (whose `Output` is
 /// `Result<(), LogsIngestError>` — see `MetricSink`'s doc comment for the
 /// task-manager resolution deferring a neutral `IngestError` rename to M6).
+/// **Three arguments, one more than the log and metric sinks take, and one
+/// decode more than this seam used to carry** (issue #586). A trace push
+/// feeds two paths: `batch` is the old two-table path's rows and `landing`
+/// is the landing path's. Both are decoded in the handler, because the
+/// landing decode's own refusal — a value carrying more stored JSON paths
+/// than `format_binary_max_object_size` admits — is a decode-class failure
+/// that leaves through each route's whole-request error writer rather than
+/// through a refusal mapper, and an [`AdmitRefusal`] carries no decode class.
+///
+/// `push` carries the request's `Idempotency-Key`/`Retry-Attempt` headers.
+/// A handler that forwards a default answers a client success over a push it
+/// never stored: two bodies carrying identical content under different keys
+/// resolve to one identity, and the second is suppressed before either
+/// path's insert.
 pub trait TraceSink: Send + Sync {
     /// Admits `batch` for async-mode requests: the caller responds
     /// immediately once this returns `Ok`, without waiting for the batch
     /// to be flushed.
-    fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure>;
+    fn admit(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal>;
 
     /// Admits `batch` for sync-mode requests: the caller `.await`s the
-    /// returned [`FlushWait`] before responding.
-    fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure>;
+    /// returned [`FlushWait`] before responding. For a suppressed push the
+    /// returned wait resolves to **the original push's** outcome.
+    fn admit_flush(
+        &self,
+        batch: ParsedTraces,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal>;
 }
 
 #[cfg(test)]

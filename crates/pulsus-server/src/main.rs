@@ -162,6 +162,9 @@ enum Command {
     /// Replay a window of the metrics landing table into one of the four
     /// tables its materialized views maintain. See `src/rebuild.rs`.
     RebuildMetrics(rebuild::RebuildMetrics),
+    /// Replay a window of the trace landing table into all five tables its
+    /// materialized views maintain. See `src/rebuild.rs`.
+    RebuildTraces(rebuild::RebuildTraces),
 }
 
 #[tokio::main]
@@ -177,6 +180,7 @@ async fn main() -> ExitCode {
             azdetect::resolve_local_zone(&mut config).await;
             match cli.command {
                 Some(Command::RebuildMetrics(args)) => rebuild::run(&config, args).await,
+                Some(Command::RebuildTraces(args)) => rebuild::run_traces(&config, args).await,
                 None if config.mode == Mode::Init => {
                     schema_init::run(&config, pulsus_schema::REQUIRED_SERVER_NAMES).await
                 }

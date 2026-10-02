@@ -13,6 +13,7 @@ mod catalog;
 mod controller;
 mod error;
 mod render;
+mod replay;
 mod rotation;
 
 pub use controller::{
@@ -22,6 +23,7 @@ pub use controller::{
 };
 pub use error::SchemaError;
 pub use render::{Family, RenderCtx, rollup_suffix};
+pub use replay::{ReplayReport, replay_trace_window};
 pub use rotation::spawn_rotation;
 
 #[cfg(test)]

@@ -56,9 +56,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
+use crate::ingest::traces::ParsedTraceLanding;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{
-    AdmitRefusal, Backpressure, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_too_large_message,
+    AdmitRefusal, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_spans_too_many_days_message,
+    push_too_large_message,
 };
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
@@ -305,22 +307,36 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
+    // The landing path's own decode, beside `parse` (issue #586). It runs
+    // **here** rather than in the writer because its own refusal — a value
+    // whose stored JSON paths exceed `format_binary_max_object_size` — is a
+    // decode-class failure and leaves through this route's whole-request
+    // error writer, which an `AdmitRefusal` cannot carry.
+    //
+    // **The route's `rejected` figure stays `parse`'s own**: the two walks
+    // can reject different spans, the OTLP partial-success message carries
+    // one count, and this route's answer is the old path's byte for byte.
+    let landing = match otlp_traces::parse_landing(&request, now_ns) {
+        Ok(landing) => landing,
+        Err(err) => return error_response(err),
+    };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, landing, push) {
             Ok(()) => export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
-            Err(Backpressure) => backpressure_response(),
+            Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, landing, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_traces_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
         },
-        Err(Backpressure) => backpressure_response(),
+        Err(refusal) => otlp_refusal_response(refusal),
     }
 }
 
@@ -665,26 +681,27 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Err(err) => return zipkin_decode_error_response(&err),
     };
 
-    let parsed = match decode_zipkin(&headers, &body, now_ns) {
+    let (parsed, landing) = match decode_zipkin(&headers, &body, now_ns) {
         Ok(parsed) => parsed,
         Err(err) => return zipkin_decode_error_response(&err),
     };
+    let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed) {
+        return match sink.admit(parsed, landing, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
-            Err(Backpressure) => zipkin_backpressure_response(),
+            Err(refusal) => zipkin_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed) {
+    match sink.admit_flush(parsed, landing, push) {
         Ok(wait) => match wait.await {
             // 202 (not 200) on sync success too — the Zipkin oracle answers
             // 202 Accepted regardless of the async header.
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
             Err(err) => zipkin_sink_error_response(&err),
         },
-        Err(Backpressure) => zipkin_backpressure_response(),
+        Err(refusal) => zipkin_refusal_response(refusal),
     }
 }
 
@@ -705,20 +722,29 @@ fn decode_zipkin(
     headers: &HeaderMap,
     body: &[u8],
     now_ns: i64,
-) -> Result<crate::ingest::traces::ParsedTraces, LogsIngestError> {
+) -> Result<(crate::ingest::traces::ParsedTraces, ParsedTraceLanding), LogsIngestError> {
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
     let spans = zipkin::decode(&decompressed)?;
     let request = zipkin::to_otlp(spans)?;
     let parsed = otlp_traces::parse(&request, now_ns)?;
-    if parsed.rejected > 0 {
+    // The landing path's own decode (issue #586), here because this is where
+    // this route's parse already is — so the all-or-nothing promotion below
+    // stays in one place.
+    let landing = otlp_traces::parse_landing(&request, now_ns)?;
+    // **The promotion reads BOTH batches**, so it does not depend on their
+    // staying identical: a non-zero count on either is the same whole-request
+    // `ZipkinDecode` a non-zero `parse` count already is, and no partly
+    // accepted batch is admitted here.
+    if parsed.rejected > 0 || landing.rejected > 0 {
         return Err(LogsIngestError::ZipkinDecode(
             parsed
                 .rejected_message
+                .or(landing.rejected_message)
                 .unwrap_or_else(|| "a span was rejected during parsing".to_string()),
         ));
     }
-    Ok(parsed)
+    Ok((parsed, landing))
 }
 
 /// `true` when the request's `Content-Type` selects a JSON body — the Loki
@@ -936,6 +962,46 @@ fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
             8,
             push_too_large_message(rows, row_limit, bytes, byte_limit),
         ),
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            8,
+            push_spans_too_many_days_message(days, day_limit),
+        ),
+    }
+}
+
+/// `/api/v2/spans`'s (and `/tempo/spans`') form of [`otlp_refusal_response`]
+/// (issue #586). **Every `AdmitRefusal` is raised at the sink**, so on this
+/// endpoint every arm takes the **post**-admission container —
+/// [`plain_text_response`], with no `X-Content-Type-Options` and no
+/// terminator — which is this endpoint's rule: it is split by stage, not by
+/// status ([`zipkin_backpressure_response`]).
+///
+/// Separate from [`otlp_refusal_response`] because the two routes do not
+/// answer alike: that one writes a `google.rpc.Status` protobuf, and sending
+/// the Zipkin route's clients a protobuf body on a text endpoint is what this
+/// mapper exists to prevent.
+fn zipkin_refusal_response(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            zipkin_backpressure_response()
+        }
+        AdmitRefusal::KeyReused => {
+            plain_text_response(StatusCode::BAD_REQUEST, KEY_REUSED_MESSAGE.to_string())
+        }
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_spans_too_many_days_message(days, day_limit),
+        ),
     }
 }
 
@@ -960,6 +1026,13 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
                 "{}\n",
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
+        ),
+        // Issue #586: no metric sink builds this variant, and nothing here
+        // asserts that it cannot be reached — rendering the status is the
+        // cheap answer, and a panic inside a response mapper is not one.
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => go_http_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{}\n", push_spans_too_many_days_message(days, day_limit)),
         ),
     }
 }
@@ -988,6 +1061,12 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
                 "{}\n",
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
+        ),
+        // Issue #586: as on remote write — no log sink builds this variant,
+        // and the status is rendered rather than asserted unreachable.
+        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => loki_plain_text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{}\n", push_spans_too_many_days_message(days, day_limit)),
         ),
     }
 }
@@ -2434,6 +2513,10 @@ mod tests {
     struct MockTraceSink {
         outcome: Outcome,
         admitted: Mutex<Vec<ParsedTraces>>,
+        /// Issue #586: the push-identity headers each admission carried, so
+        /// a test can assert what the handler read off the request. The
+        /// shape [`MockSink`] already has.
+        pushes: Mutex<Vec<PushHeaders>>,
     }
 
     impl MockTraceSink {
@@ -2441,35 +2524,45 @@ mod tests {
             Arc::new(MockTraceSink {
                 outcome,
                 admitted: Mutex::new(Vec::new()),
+                pushes: Mutex::new(Vec::new()),
             })
         }
     }
 
     impl TraceSink for MockTraceSink {
-        fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
+        fn admit(
+            &self,
+            batch: ParsedTraces,
+            _landing: ParsedTraceLanding,
+            push: PushHeaders,
+        ) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
-            match self.outcome {
-                // Traces are out of scope for issue #494: the trace sink
-                // has no suppression index and no `KeyReused` refusal, so
-                // that outcome is unreachable here.
-                Outcome::Admit
-                | Outcome::FlushFails
-                | Outcome::KeyReused
-                | Outcome::PushTooLarge => Ok(()),
-                Outcome::Backpressure => Err(Backpressure),
+            self.pushes.lock().unwrap().push(push);
+            // Issue #586: the trace sink now has a suppression index and
+            // the two per-push ceilings, so it returns the refusal rather
+            // than answering `Ok(())` to a refusal outcome.
+            match self.outcome.refusal() {
+                Some(refusal) => Err(refusal),
+                None => Ok(()),
             }
         }
 
-        fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
+        fn admit_flush(
+            &self,
+            batch: ParsedTraces,
+            _landing: ParsedTraceLanding,
+            push: PushHeaders,
+        ) -> Result<FlushWait, AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
+            self.pushes.lock().unwrap().push(push);
+            if let Some(refusal) = self.outcome.refusal() {
+                return Err(refusal);
+            }
             match self.outcome {
-                Outcome::Admit | Outcome::KeyReused | Outcome::PushTooLarge => {
-                    Ok(FlushWait::new(async { Ok(()) }))
-                }
                 Outcome::FlushFails => Ok(FlushWait::new(async {
                     Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
                 })),
-                Outcome::Backpressure => Err(Backpressure),
+                _ => Ok(FlushWait::new(async { Ok(()) })),
             }
         }
     }
@@ -2797,9 +2890,10 @@ mod tests {
     #[test]
     fn zipkin_in_range_timestamp_parses_without_rejection() {
         let body = br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
-        let parsed = decode_zipkin(&HeaderMap::new(), body, 1_700_000_000_000_000_000)
+        let (parsed, landing) = decode_zipkin(&HeaderMap::new(), body, 1_700_000_000_000_000_000)
             .expect("in-range span parses");
         assert_eq!(parsed.rejected, 0);
+        assert_eq!(landing.rejected, 0);
     }
 
     // -- `/api/v1/write` (issue #28) --------------------------------------
@@ -4437,5 +4531,278 @@ mod tests {
         .await;
         assert_bare_writer_container(res, StatusCode::TOO_MANY_REQUESTS, "backpressure, async")
             .await;
+    }
+    // -- issue #586: the trace routes' own refusal containers ------------
+
+    /// The six `AdmitRefusal` values the trace sink can raise. **An array,
+    /// not a completeness gate**: a seventh variant is caught by the
+    /// compiler on the four mappers, which match with no catch-all.
+    fn trace_refusals() -> [AdmitRefusal; 6] {
+        [
+            AdmitRefusal::Backpressure,
+            AdmitRefusal::DedupShed,
+            AdmitRefusal::DedupWaitShed,
+            AdmitRefusal::KeyReused,
+            AdmitRefusal::PushTooLarge {
+                rows: 5,
+                row_limit: 5,
+                bytes: 178,
+                byte_limit: 16_777_216,
+            },
+            AdmitRefusal::PushSpansTooManyDays {
+                days: 101,
+                day_limit: 100,
+            },
+        ]
+    }
+
+    /// The `(status, code, message)` §6.2's table gives for one refusal,
+    /// each message taken from its own function rather than retyped.
+    fn expected_refusal(refusal: AdmitRefusal) -> (StatusCode, i32, String) {
+        match refusal {
+            AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => (
+                StatusCode::TOO_MANY_REQUESTS,
+                8,
+                "sink is applying backpressure: buffers are full".to_string(),
+            ),
+            AdmitRefusal::KeyReused => (StatusCode::BAD_REQUEST, 3, KEY_REUSED_MESSAGE.to_string()),
+            AdmitRefusal::PushTooLarge {
+                rows,
+                row_limit,
+                bytes,
+                byte_limit,
+            } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                8,
+                push_too_large_message(rows, row_limit, bytes, byte_limit),
+            ),
+            AdmitRefusal::PushSpansTooManyDays { days, day_limit } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                8,
+                push_spans_too_many_days_message(days, day_limit),
+            ),
+        }
+    }
+
+    /// `/v1/traces` answers every refusal in the OTLP receivers' own
+    /// container: the status of §6.2's table, `application/x-protobuf`, **no**
+    /// `X-Content-Type-Options`, and a `google.rpc.Status` body whose `code`
+    /// and `message` are that row's.
+    ///
+    /// There is no terminator assertion: a protobuf body has no text
+    /// terminator.
+    #[tokio::test]
+    async fn every_trace_refusal_is_the_otlp_status_container() {
+        for refusal in trace_refusals() {
+            let ctx = format!("{refusal:?}");
+            let (want_status, want_code, want_message) = expected_refusal(refusal);
+            let res = otlp_refusal_response(refusal);
+            assert_eq!(res.status(), want_status, "{ctx}: status");
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.as_bytes()),
+                Some(b"application/x-protobuf".as_slice()),
+                "{ctx}: content type"
+            );
+            assert_eq!(
+                res.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                None,
+                "{ctx}: `protobuf_response` sets only the content type"
+            );
+            let status = decode_status_body(res).await;
+            assert_eq!(status.code, want_code, "{ctx}: google.rpc.Status.code");
+            assert_eq!(status.message, want_message, "{ctx}: message");
+        }
+    }
+
+    /// Asserts `/api/v2/spans`'s POST-admission container, all four
+    /// properties together. Each of them catches a different wrong writer:
+    /// `go_http_error_response` sets the sniff header and appends one `\n`,
+    /// `status_response` sets the protobuf content type, and a status-only
+    /// case passes all three.
+    async fn assert_zipkin_refusal_container(
+        res: Response,
+        status: StatusCode,
+        message: &str,
+        ctx: &str,
+    ) {
+        assert_eq!(res.status(), status, "{ctx}: status");
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"text/plain; charset=utf-8".as_slice()),
+            "{ctx}: content type"
+        );
+        assert_eq!(
+            res.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            None,
+            "{ctx}: the post-admission container sets no sniff header"
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            message,
+            "{ctx}: the message is the whole body"
+        );
+        assert_ne!(
+            bytes.last(),
+            Some(&b'\n'),
+            "{ctx}: and carries no terminator"
+        );
+    }
+
+    /// `/api/v2/spans` answers every refusal in **its own** bare writer's
+    /// container, not the OTLP receivers' protobuf one.
+    #[tokio::test]
+    async fn every_zipkin_refusal_is_the_bare_writer_container() {
+        for refusal in trace_refusals() {
+            let ctx = format!("{refusal:?}");
+            let (want_status, _code, want_message) = expected_refusal(refusal);
+            assert_zipkin_refusal_container(
+                zipkin_refusal_response(refusal),
+                want_status,
+                &want_message,
+                &ctx,
+            )
+            .await;
+        }
+    }
+
+    /// **Each trace route renders its own refusal container**, through its
+    /// own handler and in both admission modes — `admit` and `admit_flush`
+    /// are two call sites per handler, and a handler can render one of them
+    /// through the wrong mapper.
+    #[tokio::test]
+    async fn each_trace_route_renders_its_own_refusal_container() {
+        let zipkin_body =
+            br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
+        for async_mode in [false, true] {
+            let mode = if async_mode { "async" } else { "sync" };
+            let mut otlp_headers: Vec<(&str, &str)> = Vec::new();
+            if async_mode {
+                otlp_headers.push(("x-pulsus-async", "1"));
+            }
+
+            let sink = MockTraceSink::new(Outcome::KeyReused);
+            let res = post_traces_body(
+                traces_router(sink),
+                valid_traces_request_body(),
+                &otlp_headers,
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "/v1/traces {mode}: status"
+            );
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.as_bytes()),
+                Some(b"application/x-protobuf".as_slice()),
+                "/v1/traces {mode}: the OTLP route keeps its protobuf container"
+            );
+            assert_eq!(decode_status_body(res).await.code, 3);
+
+            let mut zipkin_headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+            if async_mode {
+                zipkin_headers.push(("x-pulsus-async", "1"));
+            }
+            let sink = MockTraceSink::new(Outcome::KeyReused);
+            let res = call_zipkin(&sink, zipkin_body.to_vec(), &zipkin_headers).await;
+            assert_zipkin_refusal_container(
+                res,
+                StatusCode::BAD_REQUEST,
+                KEY_REUSED_MESSAGE,
+                &format!("/api/v2/spans {mode}"),
+            )
+            .await;
+        }
+    }
+
+    /// The two push-identity headers reach the trace sink verbatim, on
+    /// `/v1/traces`, in both admission modes.
+    ///
+    /// **A handler that forwards a default answers a client success over a
+    /// push it never stored**, which is why this is asserted on the pair
+    /// rather than on a status: under a default two bodies carrying
+    /// identical content under different keys resolve to one identity, and
+    /// the second is suppressed before either path's insert.
+    #[tokio::test]
+    async fn the_push_identity_headers_reach_the_trace_sink() {
+        for async_mode in [false, true] {
+            let mode = if async_mode { "async" } else { "sync" };
+            for (with_headers, want_key, want_retry) in
+                [(true, Some("k-7"), true), (false, None, false)]
+            {
+                let mut headers: Vec<(&str, &str)> = Vec::new();
+                if with_headers {
+                    headers.push(("idempotency-key", " k-7 "));
+                    headers.push(("retry-attempt", "2"));
+                }
+                if async_mode {
+                    headers.push(("x-pulsus-async", "1"));
+                }
+                let sink = MockTraceSink::new(Outcome::Admit);
+                let res = post_traces_body(
+                    traces_router(sink.clone()),
+                    valid_traces_request_body(),
+                    &headers,
+                )
+                .await;
+                assert!(res.status().is_success(), "{mode}: the push is admitted");
+                let pushes = sink.pushes.lock().unwrap();
+                assert_eq!(pushes.len(), 1, "{mode}: one recorded admission");
+                assert_eq!(
+                    pushes[0].idempotency_key.as_deref(),
+                    want_key,
+                    "{mode}: the key is trimmed and passed through"
+                );
+                assert_eq!(pushes[0].declared_retry, want_retry, "{mode}: the flag");
+            }
+        }
+    }
+
+    /// The same on the Zipkin receiver — **the route a sweep for
+    /// `push_headers` call sites misses**, because `ingest_zipkin` reaches
+    /// the sink through `decode_zipkin` rather than through a shared parse.
+    #[tokio::test]
+    async fn the_push_identity_headers_reach_the_zipkin_sink() {
+        let body =
+            br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
+        for async_mode in [false, true] {
+            let mode = if async_mode { "async" } else { "sync" };
+            for (with_headers, want_key, want_retry) in
+                [(true, Some("k-7"), true), (false, None, false)]
+            {
+                let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+                if with_headers {
+                    headers.push(("idempotency-key", " k-7 "));
+                    headers.push(("retry-attempt", "2"));
+                }
+                if async_mode {
+                    headers.push(("x-pulsus-async", "1"));
+                }
+                let sink = MockTraceSink::new(Outcome::Admit);
+                let res = call_zipkin(&sink, body.to_vec(), &headers).await;
+                assert_eq!(
+                    res.status(),
+                    StatusCode::ACCEPTED,
+                    "{mode}: the Zipkin receiver answers 202"
+                );
+                let pushes = sink.pushes.lock().unwrap();
+                assert_eq!(pushes.len(), 1, "{mode}: one recorded admission");
+                assert_eq!(
+                    pushes[0].idempotency_key.as_deref(),
+                    want_key,
+                    "{mode}: the key is trimmed and passed through"
+                );
+                assert_eq!(pushes[0].declared_retry, want_retry, "{mode}: the flag");
+            }
+        }
     }
 }
