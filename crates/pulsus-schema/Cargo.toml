@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 clickhouse.workspace = true
+# Issue #586: the per-run nonce in `replay::run_nonce`, which is what gives
+# `rebuild-traces`' deduplication tokens a stated collision bound. The
+# workspace entry says why this crate and not `rand`.
+getrandom.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "rt"] }

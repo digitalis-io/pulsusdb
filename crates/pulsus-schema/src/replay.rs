@@ -199,26 +199,74 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// A stub. The construction, and the bound it gives, land in the next
-/// commit (issue #586).
+/// Sixty-four bits from the operating system's own random source, drawn
+/// once per run.
+///
+/// **A failed draw refuses the run.** There is no fallback, because every
+/// fallback available here is a value with no collision bound, and a run
+/// whose identifier has no bound can hand one target partition a token it
+/// has already used — which the server answers by discarding the block.
+/// Refusing is the outcome that loses nothing.
 fn run_nonce() -> Result<u64, ChError> {
-    Ok(0)
+    getrandom::u64().map_err(|e| {
+        ChError::Config(format!(
+            "a trace replay needs 64 bits from the operating system's random \
+             source to identify the run, and the draw failed ({e}); without \
+             it the run's deduplication tokens carry no collision bound, and \
+             a token this server has already seen is answered by discarding \
+             the block"
+        ))
+    })
 }
 
-/// A stub. The construction, and the bound it gives, land in the next
-/// commit (issue #586).
+/// How many runs this process has started before this one. `fetch_add`
+/// hands each caller a value no other caller gets, so two runs of one
+/// process hold two values — a fact about the counter, not a probability.
 fn next_run_counter() -> u64 {
-    0
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    RUNS.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A stub. The construction, and the bound it gives, land in the next
-/// commit (issue #586).
-fn compose_run_id(_nonce: u64, _counter: u64) -> u128 {
-    0
+/// The nonce in the high half, the counter in the low half, **neither
+/// altered**. Concatenated rather than mixed: a hash of the two would
+/// destroy the counter's exactness and put nothing in its place, because
+/// nothing promises how a hasher's output is distributed.
+fn compose_run_id(nonce: u64, counter: u64) -> u128 {
+    (u128::from(nonce) << 64) | u128::from(counter)
 }
 
-/// A stub. The construction, and the bound it gives, land in the next
-/// commit (issue #586).
+/// One identifier per run, which is what makes a token unique per statement
+/// across runs: a nonce from the operating system above this process's run
+/// counter, [`compose_run_id`].
+///
+/// **Why a run needs its own identifier.** Two runs that minted one
+/// identifier would hand one target partition the same token twice, and the
+/// server hashes the token into the block id instead of hashing the block,
+/// so it would discard the second block as a duplicate. The replay would
+/// drop those rows in silence, which is the one thing it promises not to do.
+///
+/// **The bound, in full.**
+///
+/// * *Two runs of one process* hold different counters, and the counter is
+///   the low half unaltered, so their identifiers differ. Not a
+///   probability. It holds for a process's first `2^64` runs.
+/// * *Two runs in different processes* — across a restart, across a
+///   cluster, or either side of a `fork`, since the nonce is drawn per run
+///   rather than per process — collide only if both halves match, so at
+///   most if the nonces match. Over `k` runs that is at most
+///   `k(k-1)/2 · 2^-64` by the birthday bound: below `3 · 10^-8` at
+///   `k = 10^6`.
+///
+/// **What the second rests on.** `getrandom`'s own contract: the buffer is
+/// filled from the system's cryptographically secure random source — the
+/// `getrandom(2)` system call on Linux — and any failure, a partial read
+/// included, is an error rather than a fill. Nothing here rests on a hash
+/// function's output distribution, which is what the previous construction
+/// rested on and what nothing promises. A draw that fails refuses the run
+/// ([`run_nonce`]), so there is no path on which an identifier is minted
+/// without that contract.
 fn run_id() -> Result<u128, ChError> {
     Ok(compose_run_id(run_nonce()?, next_run_counter()))
 }

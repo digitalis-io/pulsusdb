@@ -79,6 +79,27 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # index keys on. Same crate, one more feature — no new dependency.
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 ch_cityhash102 = "0.1"
+
+# The operating system's own random source, for the one value in this
+# workspace whose collision probability has to carry a stated bound:
+# `rebuild-traces`' per-run identifier (issue #586, `pulsus-schema`'s
+# `replay::run_nonce`). A keyed hash cannot carry that bound — the standard
+# library documents random keys and promises nothing about the distribution
+# of what a hasher built from them emits — and this crate's contract does:
+# it fills the buffer from the system's cryptographically secure source
+# (`getrandom(2)` on Linux) and returns an error on any failure, a partial
+# read included.
+#
+# **It adds no crate to the graph.** 0.3.4 already compiles into
+# `pulsus-server`'s production dependencies through
+# `metrics-exporter-prometheus` → `metrics-util` → `rand` → `rand_core`,
+# and again through `opentelemetry_sdk`; this promotes it to a shared
+# workspace entry so its version cannot drift apart from theirs silently.
+# That is what separates it from `rand` and `uuid`, which `writer::table`'s
+# `XorShift64` and `writer::landing`'s token mint decline for retry jitter
+# and for one opaque string per admitted push — neither of those two needs
+# a bound, and this one is nothing but a bound.
+getrandom = "0.3"
 # `raw_value` is a feature of serde_json itself and pulls in no further
 # dependency. The Loki JSON push decoder uses it to capture a value it discards
 # as borrowed text, so the reference's own nesting bound can be applied to it
