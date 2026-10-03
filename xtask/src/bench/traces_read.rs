@@ -153,6 +153,42 @@ enum Roster {
     /// `trace_id`-keyed reads — exactly the shards owning one of these
     /// ids under `cityHash64(trace_id) % total_weight`.
     TraceIds(Vec<[u8; 16]>),
+    /// **No roster is claimed for ONE named stage.** Not a category and
+    /// not a property of the SQL: the `stage` field is the single stage
+    /// name this exemption was written for, and [`capture_stage`] refuses
+    /// it if it is attached to any other stage — so copying the line onto
+    /// a second stage is a hard error rather than a silent inheritance.
+    ///
+    /// A stage added later gets a verdicted roster by default. There is no
+    /// way to reach this arm except by writing a stage's name into it, and
+    /// `exactly_one_stage_is_exempt_from_the_roster_verdict` counts the
+    /// arms in use, so a second exemption reddens rather than passing.
+    #[allow(dead_code)]
+    Unmeasured {
+        /// The one stage this exemption is written for.
+        stage: &'static str,
+        /// Why there is no roster to verdict, and whose decision that is.
+        /// It travels in the data so it cannot be left behind in a commit
+        /// message, and it is asserted non-empty by the case above.
+        decision: &'static str,
+    },
+}
+
+impl Roster {
+    /// The stage name an exemption is written for, or `None` for a roster
+    /// that is verdicted.
+    ///
+    /// **The default is "checked".** Every arm that answers `None` here is
+    /// compared against a client-computed shard set; only
+    /// [`Roster::Unmeasured`] answers `Some`, and only for the one stage
+    /// written inside it.
+    #[allow(dead_code)]
+    fn exempt_stage(&self) -> Option<&'static str> {
+        match self {
+            Roster::Full | Roster::TraceIds(_) => None,
+            Roster::Unmeasured { stage, .. } => Some(stage),
+        }
+    }
 }
 
 struct StageSpec {
@@ -442,6 +478,9 @@ async fn capture_stage(
     let by_shard = read_shard_rows(client, cluster, topology, query_id).await?;
 
     let expected: BTreeSet<u32> = match &spec.roster {
+        // Issue #587, the cases-first commit: no stage carries this arm
+        // yet, so nothing reaches it.
+        Roster::Unmeasured { .. } => unreachable!("no stage is exempt yet"),
         Roster::Full => topology.all_shards(),
         Roster::TraceIds(ids) => ids
             .iter()
@@ -491,6 +530,7 @@ async fn capture_stage(
             }),
             _ => {
                 let reason = match &spec.roster {
+                    Roster::Unmeasured { .. } => unreachable!("no stage is exempt yet"),
                     Roster::Full => anyhow::bail!(
                         "stage {:?}: shard {shard_num} missing from a Full-roster stage \
                          (unreachable after the observed == expected verdict)",
@@ -1369,6 +1409,103 @@ mod tests {
                 }
             }
             other => panic!("expected an expression, found {other:?}, in:\n{sql}"),
+        }
+    }
+
+    /// Issue #587: **exactly one stage may skip the roster verdict, and
+    /// the case is a count rather than a lookup.**
+    ///
+    /// The verdict is the gate — a clustered deployment is the normal one,
+    /// and which node does the work is the whole point of this harness. So
+    /// the risk in exempting a stage is not the stage exempted, it is the
+    /// exemption widening afterwards. Three things are asserted, and the
+    /// first is the load-bearing one:
+    ///
+    /// * **how many** stages are exempt, derived from the specs in the
+    ///   assertion itself. A second exemption appearing later reddens here
+    ///   rather than passing silently, which is what a lookup for one
+    ///   known name would have done.
+    /// * **which** stage, by name — and that the name written inside the
+    ///   exemption is the stage it is attached to, so the line cannot be
+    ///   moved to another stage by copying it.
+    /// * **that the rest are verdicted**, by naming the complement
+    ///   explicitly. A stage added later is in neither list and reddens.
+    ///
+    /// The reason is asserted too, because an exemption whose reason has
+    /// been emptied is an exemption nobody can audit: it must name the
+    /// decision's date and the document row it mirrors.
+    ///
+    /// *RED when:* a second stage is exempted; the exemption moves to a
+    /// different stage; the one exempt stage goes back to a verdicted
+    /// roster while the documents still say the prune is unmeasured; or a
+    /// stage is added or removed without this partition being re-derived.
+    #[test]
+    fn exactly_one_stage_is_exempt_from_the_roster_verdict() {
+        let base = 1_700_000_000_000_000_000i64;
+        let now = base + WINDOW_NS;
+        let (plan, attr_plan) = evidence_plans(base, now).expect("the evidence queries plan");
+        let batch = [trace_id_of(1), trace_id_of(2)];
+        let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
+
+        // (a) the COUNT, derived here and not written beside a list.
+        let exempt: Vec<(&'static str, &'static str)> = stages
+            .iter()
+            .filter_map(|s| s.roster.exempt_stage().map(|named| (s.stage, named)))
+            .collect();
+        assert_eq!(
+            exempt.len(),
+            1,
+            "exactly one stage may skip the roster verdict; exempt now: {exempt:?}"
+        );
+
+        // (b) WHICH stage — and that the exemption names the stage it is
+        // attached to. The pair is compared, so an exemption written for
+        // `trace_by_id` and pasted onto another stage fails here as well
+        // as in `capture_stage`.
+        assert_eq!(
+            exempt[0],
+            ("trace_by_id", "trace_by_id"),
+            "the one exemption is the trace fetch's, and it names its own stage"
+        );
+
+        // (c) the COMPLEMENT, named, so an added stage is in neither list.
+        let verdicted: Vec<&'static str> = stages
+            .iter()
+            .filter(|s| s.roster.exempt_stage().is_none())
+            .map(|s| s.stage)
+            .collect();
+        assert_eq!(
+            verdicted,
+            vec![
+                "phase1_generator_service",
+                "phase1_generator_attr",
+                "phase2_hydration",
+                "phase2_membership",
+                "root_hydration",
+            ],
+            "every stage but the fetch is verdicted against a computed shard set"
+        );
+        assert_eq!(
+            verdicted.len() + exempt.len(),
+            stages.len(),
+            "the two lists must partition the stages"
+        );
+
+        // The reason travels in the data. It names the decision's date and
+        // the document row it mirrors, so the two carriers cannot drift
+        // apart again — which is how this exemption came to be needed.
+        let Some(Roster::Unmeasured { decision, .. }) = stages
+            .iter()
+            .find(|s| s.stage == "trace_by_id")
+            .map(|s| &s.roster)
+        else {
+            panic!("the fetch stage must carry the Unmeasured roster");
+        };
+        for needle in ["2026-10-02", "docs/schemas.md"] {
+            assert!(
+                decision.contains(needle),
+                "the exemption's reason must name {needle:?}; it reads: {decision}"
+            );
         }
     }
 
