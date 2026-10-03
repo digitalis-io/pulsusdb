@@ -885,7 +885,7 @@ In SQL the promotion needs no iteration. After the forest walk, every remaining
 span's parent is also remaining, so the spans that can reach a span X are
 exactly X's own parent chain; X is promoted when X is the smallest
 `(start_ns, span_id)` on that chain, which is one more bounded climb. The walk's
-bound is `MAX_SPANS_PER_TRACE` (10,000, `crates/pulsus-read/src/traces/exec.rs:125`),
+bound is `MAX_SPANS_PER_TRACE` (10,000, `crates/pulsus-read/src/traces/exec.rs:130`),
 deeper than ClickHouse's default recursive-CTE depth, so the statement carries
 `max_recursive_cte_evaluation_depth`. Any span the two passes still do not
 number is counted in `unnumbered`, a column of the one row the statement

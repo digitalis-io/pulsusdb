@@ -2748,11 +2748,18 @@ pub const EXPLICITLY_PINNED_FUNCTIONS: &[(&str, &str)] = &[
         "encode_protobuf",
     ),
     // Issue #587: the three fetch handlers' shared bodies. Each now reads
-    // a request window, mints a statement-id prefix and returns it in a
-    // response header, and reports the one degraded state a fetch can
-    // detect — four things a route's own signature does not show. Pinning
-    // the bodies is what makes a parameter or a header reaching a fetch
-    // handler a snapshot change rather than a silent one.
+    // a request window, takes the statement-id prefix its caller minted,
+    // reports the one degraded state a fetch can detect, and reports which
+    // route answered — four things a route's own signature does not show.
+    // Pinning the bodies is what makes a parameter or a report reaching a
+    // fetch handler a snapshot change rather than a silent one.
+    //
+    // Re-derived in the 2026-10-03 review round: the query-id header moved
+    // OUT of these bodies to the three wrappers, so it is attached to the
+    // errors as well as the `200` (docs/api.md §4.1), and the route report
+    // came in. The header's absence from the pinned text is the point —
+    // putting it back into either `200` tuple is what this snapshot now
+    // refuses.
     (
         "crates/pulsus-server/src/traces_api/handlers.rs",
         "trace_by_id_impl",
@@ -2801,12 +2808,12 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/traces_api/handlers.rs",
         function: "trace_by_id_impl",
-        body: "let hex32 = params::parse_trace_id(raw_trace_id)?; let window = params::parse_fetch_window(raw_query)?; let stmt_prefix = new_statement_prefix(); let engine = engine_for(&state).await?.with_statement_prefix(&stmt_prefix); let fetched = engine.fetch_by_id(&hex32, window).await?; if fetched.spans.is_empty() {return Err(ApiError::NotFound);} let data = AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?; report_missing_resources(&state, data.missing_resources()); let wants = match negotiate_headers {None => Wants::Json, Some(headers) => negotiate::negotiate_from_headers(headers)?,}; let (content_type, body) = match wants {Wants::Json => (\"application/json\", assemble::encode_json(&data).map_err(AssembleError::from)?), Wants::Protobuf => (\"application/protobuf\", assemble::encode_protobuf(&data)),}; Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type.to_string()), (QUERY_ID_HEADER, stmt_prefix)], body).into_response())",
+        body: "let hex32 = params::parse_trace_id(raw_trace_id)?; let window = params::parse_fetch_window(raw_query)?; let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix); let fetched = engine.fetch_by_id(&hex32, window).await?; report_fetch_route(fetched.route); if fetched.spans.is_empty() {return Err(ApiError::NotFound);} let data = AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?; report_missing_resources(&state, data.missing_resources()); let wants = match negotiate_headers {None => Wants::Json, Some(headers) => negotiate::negotiate_from_headers(headers)?,}; let (content_type, body) = match wants {Wants::Json => (\"application/json\", assemble::encode_json(&data).map_err(AssembleError::from)?), Wants::Protobuf => (\"application/protobuf\", assemble::encode_protobuf(&data)),}; Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type.to_string())], body).into_response())",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/traces_api/handlers.rs",
         function: "trace_by_id_v2_impl",
-        body: "let hex32 = params::parse_trace_id(raw_trace_id)?; let window = params::parse_fetch_window(raw_query)?; let stmt_prefix = new_statement_prefix(); let engine = engine_for(&state).await?.with_statement_prefix(&stmt_prefix); let fetched = engine.fetch_by_id(&hex32, window).await?; let trace = if fetched.spans.is_empty() {AssembledTrace::empty()} else {AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?}; report_missing_resources(&state, trace.missing_resources()); let wants = negotiate::negotiate_from_headers(negotiate_headers)?; let (content_type, body) = match wants {Wants::Json => (\"application/json\", fetch_v2::encode_json(&trace).map_err(AssembleError::from)?), Wants::Protobuf => (\"application/protobuf\", fetch_v2::encode_protobuf(&trace)),}; Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type.to_string()), (QUERY_ID_HEADER, stmt_prefix)], body).into_response())",
+        body: "let hex32 = params::parse_trace_id(raw_trace_id)?; let window = params::parse_fetch_window(raw_query)?; let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix); let fetched = engine.fetch_by_id(&hex32, window).await?; report_fetch_route(fetched.route); let trace = if fetched.spans.is_empty() {AssembledTrace::empty()} else {AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?}; report_missing_resources(&state, trace.missing_resources()); let wants = negotiate::negotiate_from_headers(negotiate_headers)?; let (content_type, body) = match wants {Wants::Json => (\"application/json\", fetch_v2::encode_json(&trace).map_err(AssembleError::from)?), Wants::Protobuf => (\"application/protobuf\", fetch_v2::encode_protobuf(&trace)),}; Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type.to_string())], body).into_response())",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/app.rs",

@@ -124,6 +124,49 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// The trace fetch's missing-resource counter (issue #587).
+///
+/// Incremented once per span whose `resource_id` had no row in the
+/// resource array the fetch returned — a `200` going out without the
+/// sender's resource attributes, which is reachable on a cluster whose
+/// resource replica is behind and after a partial view fan-out.
+///
+/// **It makes no answer correct**, and it is the only one of the eight
+/// consistency states §3.3 enumerates that a fetch can detect from its own
+/// inputs: the others need an expected span count to compare against, and
+/// there is none.
+///
+/// A counter rather than a gauge: the quantity is an event count over the
+/// process's life, which is what the `metrics` facade's `counter!` means.
+/// `.increment()` rather than the `.absolute()` the snapshot bridges below
+/// use, because this surface owns the count — there is no underlying
+/// atomic for it to mirror.
+pub(crate) fn record_fetch_missing_resources(missing: u64) {
+    if missing == 0 {
+        return;
+    }
+    metrics::counter!("pulsus_trace_fetch_missing_resources_total").increment(missing);
+}
+
+/// The trace fetch's truncated-set counter (issue #587 §3.4), the second
+/// of the two this part adds.
+///
+/// Incremented once per fetch that took the complete-predicate route: the
+/// trace occupies 4,096 or more five-minute buckets, so the per-trace
+/// table's stored set may have been cut and a second statement was issued
+/// to read the trace without it. The branch that decides this lives in
+/// `pulsus-read`, which holds no `metrics` dependency, so the route
+/// travels out on `FetchedTrace` and `traces_api::handlers` increments
+/// here (§3.4a).
+///
+/// **It makes no answer correct either** — the route answers the whole
+/// trace. It exists so that paying for two statements is visible rather
+/// than silent, and it is reachable only by a trace spanning about
+/// fourteen days.
+pub(crate) fn record_fetch_truncated_set() {
+    metrics::counter!("pulsus_trace_fetch_truncated_set_total").increment(1);
+}
+
 /// Bridges [`pulsus_read::CacheMetricsSnapshot`] (plus the scrape-time-
 /// derived [`LabelCache::age_ms`]) through the `metrics` facade. Counters
 /// use `.absolute()`, not `.increment()`: this crate does not own the
@@ -133,32 +176,6 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// exporter's own running total). `misses_total` carries one `reason`
 /// label per [`pulsus_read::FallbackReason`] variant, matching Prometheus's
 /// labelled-counter idiom rather than five separate metric names.
-/// The trace fetch's missing-resource counter (issue #587).
-///
-/// Incremented once per span whose `resource_id` had no row in the
-/// resource array the fetch returned — a `200` going out without the
-/// sender's resource attributes, which is reachable on a cluster whose
-/// resource replica is behind and after a partial view fan-out.
-///
-/// **It makes no answer correct**, and it is deliberately the only one of
-/// the degraded read states this surface reports: the others are not
-/// detectable from a fetch's own inputs, because there is no expected span
-/// count to compare against.
-///
-/// A counter rather than a gauge, and absolute rather than a snapshot
-/// read at render time: the quantity is an event count over the process's
-/// life, which is what the `metrics` facade's `counter!` means.
-pub(crate) fn record_fetch_missing_resources(missing: u64) {
-    if missing == 0 {
-        return;
-    }
-    metrics::counter!("pulsus_trace_fetch_missing_resources_total").increment(missing);
-}
-
-/// Empty stub — this is the cases-first commit.
-#[allow(dead_code)]
-pub(crate) fn record_fetch_truncated_set() {}
-
 fn record_label_cache_metrics(cache: &LabelCache) {
     let snap = cache.metrics();
     metrics::gauge!("pulsus_label_cache_series_count").set(snap.series_count as f64);

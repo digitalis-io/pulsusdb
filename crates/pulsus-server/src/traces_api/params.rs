@@ -45,20 +45,27 @@ pub(crate) fn parse_trace_id(raw: &str) -> Result<String, TraceIdError> {
 
 /// The fetch routes' optional request window (issue #587).
 ///
-/// **Both bounds or neither.** The window is read only by the fallback,
-/// which answers a trace the per-trace table has not indexed; a half-open
-/// request has no window to answer over, so one bound alone is the same as
-/// none. Either bound present but unparseable is a `400`, the same
-/// grammar and the same refusal as the search surface's — accepting a
-/// malformed timestamp silently would answer over a window the caller did
-/// not ask for.
+/// **Every supplied bound is read before anything is decided.** A bound
+/// present and unparseable is a `400` — the same grammar and the same
+/// refusal as the search surface's — and that holds for a bound arriving
+/// ALONE as much as for one half of a pair. Accepting a malformed
+/// timestamp silently would answer over a window the caller did not ask
+/// for, and the lone form is the likelier one: a half-filled time control
+/// sends `start` with no `end`. The code review of 2026-10-03 found the
+/// reverse order here, with "both or neither" applied first, so a lone
+/// `?start=yesterday` was never parsed at all.
+///
+/// **Both bounds or neither, once both are known good.** The window is
+/// read only by the fallback, which answers a trace the per-trace table
+/// has not indexed; a half-open request has no window to answer over, so
+/// one *valid* bound alone is the same as none. That rule chooses the
+/// window to answer over; it was never a rule about which bounds to read.
 ///
 /// **An empty or inverted window yields `None`.** The indexed statement
 /// never reads the window, so the only thing a window can do is ADD an
 /// answer; a window that cannot contain a span adds nothing, and refusing
 /// it would turn a harmless request into an error on a route that
 /// previously ignored these parameters altogether.
-///
 pub(crate) fn parse_fetch_window(
     query: Option<&str>,
 ) -> Result<Option<FetchWindow>, SearchParamError> {
@@ -66,21 +73,36 @@ pub(crate) fn parse_fetch_window(
         return Ok(None);
     };
     let pairs = parse_pairs(raw);
-    let start = get(&pairs, "start").filter(|s| !s.is_empty());
-    let end = get(&pairs, "end").filter(|s| !s.is_empty());
-    let (Some(start), Some(end)) = (start, end) else {
+    // Both parses happen before the both-or-neither test, so neither
+    // bound's validity depends on the other's presence.
+    let start_ns = parse_supplied_bound(&pairs, "start")?;
+    let end_ns = parse_supplied_bound(&pairs, "end")?;
+    let (Some(start_ns), Some(end_ns)) = (start_ns, end_ns) else {
         return Ok(None);
     };
-    // The same grammar as the search surface's — seconds, nanoseconds or
-    // RFC3339 — through the one parser, so the two endpoints cannot drift.
-    let start_ns = parse_timestamp_ns(start)
-        .ok_or_else(|| SearchParamError::InvalidTimestamp(start.to_string()))?;
-    let end_ns = parse_timestamp_ns(end)
-        .ok_or_else(|| SearchParamError::InvalidTimestamp(end.to_string()))?;
     if end_ns <= start_ns {
         return Ok(None);
     }
     Ok(Some(FetchWindow { start_ns, end_ns }))
+}
+
+/// One fetch-window bound: `None` when the caller did not supply it (or
+/// supplied it empty, which this surface has always read as absent), the
+/// parsed nanosecond instant when they did, and a `400` when they
+/// supplied something this grammar cannot read.
+///
+/// The same grammar as the search surface's — seconds, nanoseconds or
+/// RFC3339 — through the one parser, so the two endpoints cannot drift.
+fn parse_supplied_bound(
+    pairs: &[(String, String)],
+    name: &str,
+) -> Result<Option<i64>, SearchParamError> {
+    let Some(raw) = get(pairs, name).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    parse_timestamp_ns(raw)
+        .map(Some)
+        .ok_or_else(|| SearchParamError::InvalidTimestamp(raw.to_string()))
 }
 
 /// Default `limit` when the param is absent (docs/api.md §4.2).

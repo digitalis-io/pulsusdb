@@ -438,7 +438,7 @@ come from the request.
 
 Eight builder functions, all in `crates/pulsus-read/src/traces/search_sql.rs`. A search issues one
 statement per selector branch, then **one to four statements per batch of 32 candidate traces**
-(`exec.rs:123`), then one final statement. An attribute CONDITION adds none of them: since
+(`exec.rs:125`), then one final statement. An attribute CONDITION adds none of them: since
 [#557](https://github.com/digitalis-io/pulsusdb/issues/557) it is one predicate column on the
 batch's hydration statement.
 
@@ -5383,9 +5383,9 @@ engine will read, and what it will return:
 | LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:532`, default at `:686`. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:544`, default at `:688`. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:125` |
-| spans per trace | 10,000 | `traces/exec.rs:127`; a trace over it is reported incomplete |
-| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:152` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:169`, applied at `:3074` |
+| spans per trace | 10,000 | `traces/exec.rs:130`; a trace over it is reported incomplete |
+| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:155` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:172`, applied at `:3074` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |
 

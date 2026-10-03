@@ -592,7 +592,7 @@ per-trace instead of per-group; the shape it reads is the shape it gets, and it 
 Lowering one more stage always removes a round trip and never adds one. It can add rows read: the
 lowered form loses the client-side early termination the TraceQL loop has, and the crossover is at
 about one batch of `BATCH_TRACES` = 32 candidates
-(`crates/pulsus-read/src/traces/exec.rs:123`). The accepted worst case is bounded by one key-range
+(`crates/pulsus-read/src/traces/exec.rs:125`). The accepted worst case is bounded by one key-range
 scan — which is exactly what the phase-1 generator already costs — so there is no chain on which
 greedy lowering costs more than one generator's read. §2.7.5 gives the argument in full, together
 with the two measurements that looked like counterexamples and are not, and what would falsify it.
@@ -846,7 +846,7 @@ measurement.
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
-  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:488`,
+  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`,
   `crates/pulsus-read/src/traces/search_sql.rs:596`). The seed is the winners' trace ids, bounded
   by the request `limit`.
 
@@ -867,7 +867,7 @@ link's `source_of` and emits an `Sql` part, not an `Engine` part.
 | rendered SQL text | 8 MiB, `422 query_too_broad` | `MAX_QUERY_TEXT_BYTES`, `crates/pulsus-read/src/querytext.rs:52` |
 
 Over either, the part becomes `Issue::PerSeed(Driver::Chunks { .. })`. That is today's phase-2 batch
-loop named for what it is: `BATCH_TRACES = 32` (`crates/pulsus-read/src/traces/exec.rs:123`).
+loop named for what it is: `BATCH_TRACES = 32` (`crates/pulsus-read/src/traces/exec.rs:125`).
 
 **And the chunk is 32 because the language says so, not because a ceiling says so** (issue #492
 part 3). The ceilings above answer *what a statement CAN hold*; they do not answer *what the
@@ -1258,7 +1258,7 @@ Four consequences fall out of the table rather than being written down.
 - **`Emit` is `Never`, and a lowered TraceQL search is three statements, not one.** The root summary
   is read trace-wide with **no time predicate** (the true root may predate the search window —
   [schemas.md §4.2](schemas.md)), and `TraceSearchResult.root` is not optional
-  (`crates/pulsus-read/src/traces/exec.rs:487`), so every search response needs it. That is exactly
+  (`crates/pulsus-read/src/traces/exec.rs:490`), so every search response needs it. That is exactly
   why the winners' root read exists today (`exec.rs:2165`), and lowering does not remove it: it
   removes the 1,108 round trips between it and the generator. The window-bounded hydration read
   survives lowering for its own reason — `spanSets[].matched` and `spanSets[].spans[]` are written
@@ -1472,7 +1472,7 @@ nobody later reads them as unfinished work.
 | **the nested-set numbering** `nestedSetLeft`, `nestedSetRight`, and `nestedSetParent` outside the root sentinel | a modified-preorder numbering computed per trace at query time from the `parent_id` forest; no stored column carries it. The root sentinel **is** expressible and is already lowered (`metrics_sql.rs:562`) |
 | **trace-level intrinsics** `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | resolved from a co-load that is deliberately trace-wide with **no time predicate**, because the true root may predate the window. A window-bounded statement cannot read those rows at all. Already refused on the metrics path for this reason (`lower_leaf`, `metrics_sql.rs:546`) |
 | **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:423`) |
-| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:488`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
+| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
 
 **Cross-attribute comparison is deliberately not in this table.** `{ .a = .b }` compares two rows
 of the attribute index sharing a `(trace_id, span_id)`; the information is present, and the SQL
@@ -1850,7 +1850,7 @@ output kind**, and each kind has exactly one bound:
 **The cap is keyed on the SQL part, not on the request.** Each `Part::Sql` picks its cap from its
 own `yields` (§2.7.1), and a part whose `issue` is `PerSeed` applies that cap **per issue** against
 a cumulative request-scoped budget — which is exactly what `HYDRATION_BYTE_BUDGET`
-(`crates/pulsus-read/src/traces/exec.rs:153`) and `reader.logql_scan_budget_bytes` already do across
+(`crates/pulsus-read/src/traces/exec.rs:155`) and `reader.logql_scan_budget_bytes` already do across
 today's loops. A plan with three SQL parts therefore has three enforcement points, not one, and
 saying which is which is the whole reason the cap table is keyed this way. The table is the core's:
 LogQL's own compiler places its own caps — the scan budget and the limits in
@@ -1859,7 +1859,7 @@ LogQL's own compiler places its own caps — the scan budget and the limits in
 | `SqlPart::yields` | what crosses | the cap that applies |
 |---|---|---|
 | `Candidates` | up to `reader.traceql_max_candidates` keys | the candidate cap — today's mechanism, unchanged |
-| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:160-168`) plus the `HYDRATION_BYTE_BUDGET` retention counter (`exec.rs:149`) — today's mechanism, unchanged |
+| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:162-172`) plus the `HYDRATION_BYTE_BUDGET` retention counter (`traces/exec.rs:155`) — today's mechanism, unchanged |
 | `Reduced` | at most `limit` rows | **nothing bounds the grouping that produced them** — the gap |
 
 So the placement question is answered once, structurally. The gap needs `max_rows_to_group_by`
@@ -5462,7 +5462,7 @@ choice. What changes is what a reader is entitled to conclude.
 
 | `NeverReason` | what it rules out | why no state can change it |
 |---|---|---|
-| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:487`). A window-bounded statement cannot produce it, whatever has accumulated |
+| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`). A window-bounded statement cannot produce it, whatever has accumulated |
 | `StructuralRelation` | pushing `>`, `>>`, `<`, `<<`, `~` into the seed statement | the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it |
 | `NestedSetNumbering` | pushing the modified-preorder numbering | it is computed per trace at query time; no stored column carries it, so there is nothing for SQL to read |
 | `TraceLevelIntrinsic` | pushing `traceDuration`, `rootName`, `rootServiceName` or `span:childCount` | they resolve from co-loads that are deliberately trace-wide and unwindowed, so they evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state |
@@ -5532,19 +5532,19 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | quantity | at this revision |
 |---|---|
 | citation occurrences in the five artefacts | 725 |
-| of those, citing a bare basename | 550 |
+| of those, citing a bare basename | 549 |
 | of those, written as a continuation of a citation earlier in the paragraph | 77 |
 | of those continuations, on a later line than the citation they continue | 33 |
-| `(document, token)` pairs the rule resolves | 385 |
-| occurrences those resolved pairs cover | 526 |
-| `(document, token)` pairs it cannot resolve | 109 |
-| occurrences those frozen pairs cover | 199 |
+| `(document, token)` pairs the rule resolves | 384 |
+| occurrences those resolved pairs cover | 527 |
+| `(document, token)` pairs it cannot resolve | 108 |
+| occurrences those frozen pairs cover | 198 |
 | resolved rows anchored on a token the citing prose prints | 174 |
-| resolved rows anchored on a snapshot of the cited line | 211 |
+| resolved rows anchored on a snapshot of the cited line | 210 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 100 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 99 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 7 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
@@ -5559,7 +5559,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 725 citation occurrences the five artefacts make, 550 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 385 `(document, token)` pairs covering 526 occurrences, and cannot resolve 109 covering 199. Of the resolved rows, 174 are anchored on a token the citing prose prints and 211 on a snapshot of the cited line.
+Of the 725 citation occurrences the five artefacts make, 549 name a bare basename and 77 are written as a continuation of a citation earlier on the same line. The rule resolves 384 `(document, token)` pairs covering 527 occurrences, and cannot resolve 108 covering 198. Of the resolved rows, 174 are anchored on a token the citing prose prints and 210 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

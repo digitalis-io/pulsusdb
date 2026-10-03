@@ -171,8 +171,7 @@ fn assert_query_id(res: &RawResponse, ctx: &str) {
         .unwrap_or_else(|| panic!("{ctx}: no X-Pulsus-Query-Id, headers {:?}", res.headers));
     assert_eq!(got.len(), 32, "{ctx}: prefix width, got {got:?}");
     assert!(
-        got.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        got.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
         "{ctx}: prefix is not 32 lowercase hex chars, got {got:?}"
     );
 }

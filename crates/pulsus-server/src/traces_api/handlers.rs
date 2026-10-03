@@ -7,14 +7,16 @@
 //! Thin by design — SQL/execution stays in `pulsus-read`, OTLP assembly in
 //! `assemble.rs`.
 //!
-//! **Two things each handler owns since issue #587.** It mints one
-//! statement-id prefix per request and returns it in an
-//! `X-Pulsus-Query-Id` response header, so a caller — and a test — reads
-//! the prefix of the statement ids the request issued rather than
-//! recomputing it. And it reports the one degraded state a fetch can
-//! detect from its own inputs: a span whose `resource_id` has no row in
-//! the resource array, which is a `200` going out without the sender's
-//! resource attributes.
+//! **Three things each handler owns since issue #587.** It mints one
+//! statement-id prefix per request — before parsing anything — and
+//! returns it in an `X-Pulsus-Query-Id` response header on **every**
+//! response, the errors included, so a caller (or a test) reads the prefix
+//! of the statement ids the request issued rather than recomputing it. It
+//! reports the one degraded state a fetch can detect from its own inputs:
+//! a span whose `resource_id` has no row in the resource array, which is a
+//! `200` going out without the sender's resource attributes. And it
+//! reports the route the read took, which is how the complete-predicate
+//! fetch's second statement becomes visible to an operator.
 //!
 //! [`trace_by_id_v2`] (issue #474) serves the `/api/v2/traces/{traceId}`
 //! compat alias through the same steps, wrapping the result in
@@ -66,10 +68,20 @@ pub(crate) async fn trace_by_id(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = match trace_by_id_impl(state, &trace_id, query.as_deref(), Some(&headers)).await {
+    let stmt_prefix = new_statement_prefix();
+    let mut res = match trace_by_id_impl(
+        state,
+        &trace_id,
+        query.as_deref(),
+        Some(&headers),
+        &stmt_prefix,
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     };
+    attach_query_id(&mut res, &stmt_prefix);
     res.headers_mut()
         .insert(header::VARY, HeaderValue::from_static("accept"));
     res
@@ -83,28 +95,33 @@ pub(crate) async fn trace_by_id_json(
     RawQuery(query): RawQuery,
     _headers: HeaderMap,
 ) -> Response {
-    match trace_by_id_impl(state, &trace_id, query.as_deref(), None).await {
-        Ok(res) => res,
-        Err(e) => e.into_response(),
-    }
+    let stmt_prefix = new_statement_prefix();
+    let mut res =
+        match trace_by_id_impl(state, &trace_id, query.as_deref(), None, &stmt_prefix).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        };
+    attach_query_id(&mut res, &stmt_prefix);
+    res
 }
 
 /// Shared fetch path. `negotiate_headers` is `Some` for the negotiating
 /// route and `None` for the `/json` route (forced JSON — `Accept` is never
-/// consulted, so it can never 406).
+/// consulted, so it can never 406). `stmt_prefix` is minted by the caller,
+/// because the caller is what attaches it to the response and it must be
+/// attached to the errors this function returns as well as to its `200`.
 async fn trace_by_id_impl(
     state: AppState,
     raw_trace_id: &str,
     raw_query: Option<&str>,
     negotiate_headers: Option<&HeaderMap>,
+    stmt_prefix: &str,
 ) -> Result<Response, ApiError> {
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let stmt_prefix = new_statement_prefix();
-    let engine = engine_for(&state)
-        .await?
-        .with_statement_prefix(&stmt_prefix);
+    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
+    report_fetch_route(fetched.route);
     if fetched.spans.is_empty() {
         return Err(ApiError::NotFound);
     }
@@ -129,10 +146,7 @@ async fn trace_by_id_impl(
     };
     Ok((
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            (QUERY_ID_HEADER, stmt_prefix),
-        ],
+        [(header::CONTENT_TYPE, content_type.to_string())],
         body,
     )
         .into_response())
@@ -142,6 +156,23 @@ async fn trace_by_id_impl(
 /// statements the request issued are `<prefix>-1`, `<prefix>-2`, … in
 /// issue order.
 pub(super) const QUERY_ID_HEADER: HeaderName = HeaderName::from_static("x-pulsus-query-id");
+
+/// Attaches the prefix to whatever the fetch path produced — the `200`
+/// and **every error alike** (docs/api.md §4.1: *"every response from the
+/// fetch routes"*).
+///
+/// On the way out rather than on the success path, and that is the point.
+/// An operator chasing a `404` or a `500` through `system.query_log` needs
+/// that request's own prefix more than a successful caller does; on a
+/// `400` or a `503` no statement ran, so the prefix correctly names an
+/// empty set rather than somebody else's rows. One insert at the exit
+/// cannot have a branch that forgets it, which is what the code review of
+/// 2026-10-03 found: the header was built into the `200` tuple, so the
+/// four error statuses went out without it.
+fn attach_query_id(res: &mut Response, prefix: &str) {
+    let value = HeaderValue::from_str(prefix).expect("the prefix is 32 hex characters");
+    res.headers_mut().insert(QUERY_ID_HEADER, value);
+}
 
 /// One prefix per request: **32 hex chars** of operating-system
 /// randomness, so it is a legal `query_id` and two concurrent requests
@@ -194,9 +225,25 @@ fn report_missing_resources(state: &AppState, missing: u64) {
     crate::ops::record_fetch_missing_resources(missing);
 }
 
-/// Empty stub — this is the cases-first commit.
-#[allow(dead_code)]
-fn report_fetch_route(_route: FetchRoute) {}
+/// Reports a fetch that took the complete-predicate route (§3.4), through
+/// the same metric facade.
+///
+/// **Only `TruncatedSet`.** A counter that fired on every route would
+/// report nothing; this one says a trace occupied 4,096 or more
+/// five-minute buckets, so the per-trace table's stored set may have been
+/// cut and the fetch paid for a second statement. `statements == 2` cannot
+/// carry that signal, because the window fallback gives 2 as well — which
+/// is why the route travels on `FetchedTrace` as an enum rather than being
+/// inferred from the count (§3.4a).
+///
+/// **It makes no answer correct either.** The complete-predicate route
+/// answers the whole trace; the counter exists so that paying twice for it
+/// is visible.
+fn report_fetch_route(route: FetchRoute) {
+    if route == FetchRoute::TruncatedSet {
+        crate::ops::record_fetch_truncated_set();
+    }
+}
 
 /// `GET /api/v2/traces/{traceId}` (issue #474) — the fourteenth compat
 /// alias. Same order of operations as [`trace_by_id_impl`] (pool, then id
@@ -220,10 +267,14 @@ pub(crate) async fn trace_by_id_v2(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = match trace_by_id_v2_impl(state, &trace_id, query.as_deref(), &headers).await {
-        Ok(res) => res,
-        Err(e) => e.into_response(),
-    };
+    let stmt_prefix = new_statement_prefix();
+    let mut res =
+        match trace_by_id_v2_impl(state, &trace_id, query.as_deref(), &headers, &stmt_prefix).await
+        {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        };
+    attach_query_id(&mut res, &stmt_prefix);
     res.headers_mut()
         .insert(header::VARY, HeaderValue::from_static("accept"));
     res
@@ -234,14 +285,13 @@ async fn trace_by_id_v2_impl(
     raw_trace_id: &str,
     raw_query: Option<&str>,
     negotiate_headers: &HeaderMap,
+    stmt_prefix: &str,
 ) -> Result<Response, ApiError> {
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let stmt_prefix = new_statement_prefix();
-    let engine = engine_for(&state)
-        .await?
-        .with_statement_prefix(&stmt_prefix);
+    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
+    report_fetch_route(fetched.route);
     // The empty case is the whole reason this route exists: a present,
     // empty trace, not a 404.
     let trace = if fetched.spans.is_empty() {
@@ -260,10 +310,7 @@ async fn trace_by_id_v2_impl(
     };
     Ok((
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            (QUERY_ID_HEADER, stmt_prefix),
-        ],
+        [(header::CONTENT_TYPE, content_type.to_string())],
         body,
     )
         .into_response())
@@ -422,8 +469,7 @@ mod tests {
                     .to_string();
                 assert_eq!(got.len(), 32, "prefix width on {where_}: {got:?}");
                 assert!(
-                    got.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    got.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
                     "prefix is not 32 lowercase hex chars on {where_}: {got:?}"
                 );
             }
