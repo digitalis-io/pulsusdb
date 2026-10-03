@@ -14,7 +14,15 @@ rewrite docs/schemas.md:33-33
 # different lines. Declaring them records that, and the presence rule above
 # keeps the declaration honest about the file.
 rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555
-rewrite docs/schemas.md:1089-1089
+# `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
+# writer-contract paragraph gained the reason the read path does not route on
+# `metric_series.value_type`, and that reason is the decision A1's plan v5
+# recorded on #112 — a closed issue the sentence cites, not a follow-up this
+# change invented. The column is per FILE, so the entry records the decision for
+# `docs/schemas.md` wherever in the file the reference sits; it is declared here
+# rather than appended to the row above, whose column records a different
+# decision.
+rewrite docs/schemas.md:1089-1089 refs=#112
 rewrite docs/architecture.md:378-378 refs=#560
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
