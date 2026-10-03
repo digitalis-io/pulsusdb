@@ -34,12 +34,12 @@ pub use traces::{
     MetricLabel, MetricLabelValue, MetricsCtx, MetricsParams, PlanError as TracePlanError,
     ProjectedAttribute, RETAINED_ENTRY_OVERHEAD, RootSummary, SERVICE_GRAPH_MAX_EDGES,
     SPAN_NAME_VALUE_TYPE, SearchCtx, SearchOutput, SearchParams, SearchPlan, ServiceGraph,
-    SpanFilterCtx, SpanSetGroup, SpanSummary, StoredSpan, StoredType, TAG_NAMES_MAX,
-    TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
-    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues, TagValuesRequest, TraceContext,
-    TraceEngine, TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig,
-    TraceSearchResult, WireKey, compile_span_filter, non_finite_double_spelling, plan_search,
-    plan_trace_metrics, service_graph_sql, wire_arm,
+    SpanFilterCtx, SpanSetGroup, SpanSummary, StoredType, TAG_NAMES_MAX, TAG_VALUES_MAX,
+    TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames,
+    TagValue, TagValues, TagValuesRequest, TraceContext, TraceEngine, TraceMetricSeries,
+    TraceMetricsPlan, TraceMetricsResult, TraceReadConfig, TraceSearchResult, WireKey,
+    compile_span_filter, non_finite_double_spelling, plan_search, plan_trace_metrics,
+    service_graph_sql, wire_arm,
 };
 
 #[cfg(test)]

@@ -417,11 +417,16 @@ struct OneCol {
     v: String,
 }
 
-/// The trace point read's exact projection (`traces/sql.rs:22`) and column
-/// types (`traces/rows.rs:20-34`). `payload` is `String` here rather than
-/// `StoredSpanRow`'s `Vec<u8> + serde_bytes` — the same RowBinary
-/// length-prefixed byte string on the wire, readable as `String` because this
-/// fixture's payload is UTF-8.
+/// A row whose LAST projected column is a long byte string, which is the
+/// shape this driver regression is about.
+///
+/// It was the trace point read's own projection until issue #587 deleted
+/// that statement; the fetch's span tuple ends in a byte-string element
+/// too (`traces/spans/fetch.rs`'s `scope_attrs_other`, read as
+/// `serde_bytes::ByteBuf`), so the shape is still production's. The column
+/// here is `String` rather than a byte buffer — the same RowBinary
+/// length-prefixed byte string on the wire, readable as `String` because
+/// this fixture's bytes are UTF-8.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct SpanShapedRow {
     trace_id: [u8; 16],
@@ -482,12 +487,12 @@ async fn a_successful_read_whose_last_row_ends_in_close_parens_is_not_an_error()
     );
 }
 
-/// **AC2 — the reachability criterion**, on the production projection rather
-/// than a synthetic one. `traces/sql.rs:22` projects `payload` **last**, and
-/// `StoredSpanRow.payload` is the raw stored OTLP blob, so the last bytes of
-/// the last row of a trace-by-ID read are tenant bytes with no alignment
-/// involved. One span whose payload ends `))\n` returned `rows=0` +
-/// `Code: 210` on `cb9524c`.
+/// **AC2 — the reachability criterion**, on a projection whose last column
+/// is a long byte string rather than a synthetic one. The trace fetch's
+/// span tuple ends in `scope_attrs_other`, a byte buffer holding whatever
+/// the sender sent, so the last bytes of a fetch's last row are tenant
+/// bytes with no alignment involved. One row whose trailing bytes end
+/// `))\n` returned `rows=0` + `Code: 210` on `cb9524c`.
 #[tokio::test]
 async fn a_trace_shaped_read_whose_payload_ends_in_close_parens_delivers_its_span() {
     skip_unless_live!();

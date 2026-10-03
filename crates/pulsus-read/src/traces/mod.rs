@@ -22,8 +22,8 @@
 //! and its day-partition bound are rendered from, so the two cannot
 //! disagree), [`spans`] (the issue #587 trace fetch on the span,
 //! per-trace and resource tables — three pure SQL builders and their
-//! row shapes), [`sql`]/[`rows`]
-//! (point-read builder + `ChClient` result-row shapes), `dispatch` (the
+//! row shapes), [`rows`]
+//! (the `ChClient` result-row shapes), `dispatch` (the
 //! private issue #509 choke point that owns the `ChClient` and is the
 //! only place a `?` in query text is doubled), and [`exec`]
 //! (`TraceEngine`, which plans and frames every read but reaches
@@ -55,7 +55,6 @@ pub mod search_sql;
 // that one is permanent by design.
 
 pub mod spans;
-pub mod sql;
 pub mod tag_narrow;
 pub mod tags_sql;
 pub mod window_sql;
@@ -76,7 +75,7 @@ pub use metrics_plan::{
 pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
-pub use rows::{GraphEdgeRow, SpanNameRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
+pub use rows::{GraphEdgeRow, SpanNameRow, TagNameRow, TagValueRow};
 pub use search_eval::{
     GroupValue, ProjectedAttribute, SpanSetGroup, SpanSummary, StoredType,
     non_finite_double_spelling, wire_arm,

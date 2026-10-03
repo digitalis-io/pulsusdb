@@ -44,6 +44,10 @@ const INJECTED_SETTINGS: &[&str] = &[
     "distributed_aggregation_memory_efficient",
     "distributed_foreground_insert",
     "distributed_product_mode",
+    // Issue #587: the trace fetch's own settings root carries `final = 1`
+    // as a SETTING rather than as SQL text, which is what makes a retried
+    // span single on a read taken before the next merge.
+    "final",
     "format_binary_max_object_size",
     "group_by_overflow_mode",
     "ignore_materialized_views_with_dropped_target_table",

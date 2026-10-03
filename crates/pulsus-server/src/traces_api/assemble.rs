@@ -57,12 +57,20 @@
 //! what proves `AssembledTrace`'s "the walk ran" invariant and it costs
 //! nothing.
 
-use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue, KeyValueList};
+use std::collections::{BTreeMap, HashMap};
+
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
+};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{Status, TracesData};
+use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData};
 use prost::Message;
-use pulsus_clickhouse::json_column::JsonColumn;
-use pulsus_read::traces::spans::rows::{FetchedResource, FetchedTrace};
+use pulsus_clickhouse::json_column::{
+    JsonColumn, TraceJsonScalar, TraceJsonValue, unescape_json_path,
+};
+use pulsus_read::traces::spans::rows::{FetchedResource, FetchedSpan, FetchedTrace};
 use thiserror::Error;
 
 /// The OTLP key the reader reconstructs a service name under, and the one
@@ -104,30 +112,148 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// One attribute list, from the two disjoint carriers that can hold it,
-/// ascending by reconstructed OTLP key.
+/// **ascending by reconstructed OTLP key**.
 ///
 /// `column` and `subject` name the carrier in a decode error, because a
 /// span carries four of them and a message naming none of them is a `500`
 /// nobody can act on.
-///
-/// STUB (issue #587): the reconstruction from the two carriers is the
-/// change. The carrier's decode and its error are already here, because an
-/// undecodable carrier must never be a silently dropped attribute.
 fn otlp_attributes(
     attrs: &JsonColumn,
     other: &[u8],
     column: &'static str,
     subject: &str,
 ) -> Result<Vec<KeyValue>, AssembleError> {
-    let _ = attrs;
-    if !other.is_empty() {
-        KeyValueList::decode(other).map_err(|source| AssembleError::Decode {
+    let mut tree = AttrTree::default();
+    for entry in attrs.entries() {
+        // **Split on `.` FIRST, then unescape each segment.** Unescaping
+        // first turns a one-segment `http%2Eroute` into the two-segment
+        // `http.route` and reports a kvlist where the sender sent a dotted
+        // key.
+        let segments: Vec<String> = entry.path.split('.').map(unescape_json_path).collect();
+        tree.insert(&segments, stored_value(&entry.value));
+    }
+    for kv in decode_other(other, column, subject)? {
+        // The second carrier's keys are OTLP keys already — not paths —
+        // and they merge into the SAME sort as the first's.
+        tree.insert(std::slice::from_ref(&kv.key), kv.value.unwrap_or_default());
+    }
+    Ok(tree.into_attributes())
+}
+
+/// One attribute list under construction: a `BTreeMap` at every level, so
+/// the emitted order is ascending by key at the top AND inside every
+/// kvlist, with no second sort pass and no key exempt.
+#[derive(Default)]
+struct AttrTree(BTreeMap<String, AttrNode>);
+
+enum AttrNode {
+    Leaf(AnyValue),
+    Nested(AttrTree),
+}
+
+impl AttrTree {
+    fn insert(&mut self, segments: &[impl AsRef<str>], value: AnyValue) {
+        let Some((head, rest)) = segments.split_first() else {
+            return;
+        };
+        let head = head.as_ref().to_string();
+        if rest.is_empty() {
+            self.0.insert(head, AttrNode::Leaf(value));
+            return;
+        }
+        match self
+            .0
+            .entry(head)
+            .or_insert_with(|| AttrNode::Nested(AttrTree::default()))
+        {
+            AttrNode::Nested(child) => child.insert(rest, value),
+            // A path and a longer path through it cannot both be stored:
+            // the write rule puts a kvlist in `attrs` only when every leaf
+            // at every depth is storable, and a scalar at a parent path is
+            // then not written. Keeping the deeper value is the one that
+            // carries the kvlist.
+            slot @ AttrNode::Leaf(_) => {
+                let mut child = AttrTree::default();
+                child.insert(rest, value);
+                *slot = AttrNode::Nested(child);
+            }
+        }
+    }
+
+    fn into_attributes(self) -> Vec<KeyValue> {
+        self.0
+            .into_iter()
+            .map(|(key, node)| KeyValue {
+                key,
+                value: Some(match node {
+                    AttrNode::Leaf(value) => value,
+                    AttrNode::Nested(child) => AnyValue {
+                        value: Some(Value::KvlistValue(KeyValueList {
+                            values: child.into_attributes(),
+                        })),
+                    },
+                }),
+                key_strindex: 0,
+            })
+            .collect()
+    }
+}
+
+/// One stored value as the OTLP arm it was written from. **Each arm is its
+/// own**: an `Int64` is never a `Double`, and an array keeps its element
+/// order.
+fn stored_value(value: &TraceJsonValue) -> AnyValue {
+    let arm = match value {
+        TraceJsonValue::Scalar(s) => stored_scalar(s),
+        TraceJsonValue::StrArray(v) => array_of(v.iter().map(|s| Value::StringValue(s.clone()))),
+        TraceJsonValue::IntArray(v) => array_of(v.iter().map(|i| Value::IntValue(*i))),
+        TraceJsonValue::DoubleArray(v) => array_of(v.iter().map(|d| Value::DoubleValue(*d))),
+        TraceJsonValue::BoolArray(v) => array_of(v.iter().map(|b| Value::BoolValue(*b))),
+        TraceJsonValue::MixedArray(v) => array_of(v.iter().map(stored_scalar_value)),
+        TraceJsonValue::EmptyArray => array_of(std::iter::empty()),
+    };
+    AnyValue { value: Some(arm) }
+}
+
+fn stored_scalar(scalar: &TraceJsonScalar) -> Value {
+    stored_scalar_value(scalar)
+}
+
+fn stored_scalar_value(scalar: &TraceJsonScalar) -> Value {
+    match scalar {
+        TraceJsonScalar::Str(s) => Value::StringValue(s.clone()),
+        TraceJsonScalar::Bool(b) => Value::BoolValue(*b),
+        TraceJsonScalar::Int(i) => Value::IntValue(*i),
+        TraceJsonScalar::Double(d) => Value::DoubleValue(*d),
+    }
+}
+
+fn array_of(values: impl Iterator<Item = Value>) -> Value {
+    Value::ArrayValue(ArrayValue {
+        values: values
+            .map(|value| AnyValue { value: Some(value) })
+            .collect(),
+    })
+}
+
+/// The second carrier's attributes: a `KeyValueList`, with empty meaning
+/// zero bytes. **An undecodable carrier is an error naming the column and
+/// the subject**, never a silently dropped attribute.
+fn decode_other(
+    other: &[u8],
+    column: &'static str,
+    subject: &str,
+) -> Result<Vec<KeyValue>, AssembleError> {
+    if other.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(KeyValueList::decode(other)
+        .map_err(|source| AssembleError::Decode {
             column,
             subject: subject.to_string(),
             source,
-        })?;
-    }
-    Ok(Vec::new())
+        })?
+        .values)
 }
 
 /// The `Resource` and its schema url for one span, from the resource entry
@@ -149,14 +275,73 @@ fn otlp_attributes(
 /// **The reconstructed attribute is sorted in with the rest, not placed
 /// first.** One rule with no exception is cheaper to state and cheaper to
 /// test.
-///
-/// STUB (issue #587).
 fn render_resource(
     service: &str,
     entry: Option<&FetchedResource>,
 ) -> Result<(Resource, String), AssembleError> {
-    let _ = (service, entry);
-    Ok((Resource::default(), String::new()))
+    let Some(entry) = entry else {
+        // A resource that is present with zero attributes is not
+        // "repaired" into anything, so an empty service column
+        // synthesises nothing.
+        let attributes = if service.is_empty() {
+            Vec::new()
+        } else {
+            vec![service_name_kv(service)]
+        };
+        return Ok((
+            Resource {
+                attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            },
+            String::new(),
+        ));
+    };
+    let subject = format!("resource {:#034x}", entry.resource_id);
+    let mut attributes = otlp_attributes(
+        &entry.attrs,
+        &entry.attrs_other,
+        "resources.attrs_other",
+        &subject,
+    )?;
+    if !service.is_empty() && !attributes.iter().any(|a| a.key == SERVICE_NAME_KEY) {
+        attributes.push(service_name_kv(service));
+        // Sorted in, not appended: the one rule has no exception.
+        attributes.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+    let entity_refs = if entry.entity_refs.is_empty() {
+        Vec::new()
+    } else {
+        // The carrier is a `Resource` with only its entity-reference
+        // field populated — an OTLP message in its own right used as a
+        // carrier, so its other two fields come back at their defaults
+        // and are NOT the resource's.
+        Resource::decode(entry.entity_refs.as_slice())
+            .map_err(|source| AssembleError::Decode {
+                column: "resources.entity_refs",
+                subject: subject.clone(),
+                source,
+            })?
+            .entity_refs
+    };
+    Ok((
+        Resource {
+            attributes,
+            dropped_attributes_count: entry.dropped_attrs,
+            entity_refs,
+        },
+        entry.schema_url.clone(),
+    ))
+}
+
+fn service_name_kv(service: &str) -> KeyValue {
+    KeyValue {
+        key: SERVICE_NAME_KEY.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(service.to_string())),
+        }),
+        key_strindex: 0,
+    }
 }
 
 /// The OTLP `parent_span_id` for a stored one.
@@ -171,11 +356,11 @@ fn render_resource(
 /// than a consequence: a link's `trace_id`/`span_id` are emitted as
 /// stored. Nothing in the tree pins an all-zero link id, and the root rule
 /// has two independent witnesses where this one would have none.
-///
-/// STUB (issue #587).
 fn otlp_parent_span_id(stored: &[u8; 8]) -> Vec<u8> {
-    let _ = stored;
-    Vec::new()
+    if stored.iter().all(|b| *b == 0) {
+        return Vec::new();
+    }
+    stored.to_vec()
 }
 
 /// Every `ResourceSpans.resource`, `ScopeSpans.scope` and `Span.status`
@@ -250,22 +435,136 @@ impl AssembledTrace {
 /// Empty input yields an empty `TracesData` — the v1 handler maps an empty
 /// fetch to `404` before ever calling this, so the empty case only matters
 /// for the unit-level contract.
-///
-/// STUB (issue #587): the rebuild is the change.
 fn rebuild(trace_id: &[u8; 16], fetched: FetchedTrace) -> Result<(TracesData, u64), AssembleError> {
-    let _ = trace_id;
-    for span in &fetched.spans {
-        otlp_attributes(
+    // Order-independent dedup: reduce into a map keyed on
+    // `(span_id, kind)`, keeping the row with the greatest start. The
+    // module doc has why that totalises it.
+    let mut winners: HashMap<([u8; 8], i32), FetchedSpan> =
+        HashMap::with_capacity(fetched.spans.len());
+    for span in fetched.spans {
+        match winners.entry((span.span_id, span.kind)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(span);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if span.start_ns > slot.get().start_ns {
+                    slot.insert(span);
+                }
+            }
+        }
+    }
+
+    let resources: HashMap<u128, FetchedResource> = fetched
+        .resources
+        .into_iter()
+        .map(|r| (r.resource_id, r))
+        .collect();
+
+    let mut spans: Vec<FetchedSpan> = winners.into_values().collect();
+    // The canonical order, unchanged from before this part:
+    // `(start_time_unix_nano, span_id, kind)`. The start is ordered as the
+    // unsigned field the protocol declares, so a stored zero sorts first.
+    spans.sort_by_key(|s| (s.start_ns as u64, s.span_id, s.kind));
+
+    let mut missing_resources = 0u64;
+    let mut groups = Vec::with_capacity(spans.len());
+    for span in spans {
+        let span_subject = format!("span {}", hex(&span.span_id));
+        let entry = resources.get(&span.resource_id);
+        if entry.is_none() {
+            missing_resources += 1;
+        }
+        let (resource, resource_schema_url) = render_resource(&span.service, entry)?;
+        let scope = InstrumentationScope {
+            name: span.scope_name,
+            version: span.scope_version,
+            attributes: otlp_attributes(
+                &span.scope_attrs,
+                &span.scope_attrs_other,
+                "spans.scope_attrs_other",
+                &span_subject,
+            )?,
+            dropped_attributes_count: span.scope_dropped_attrs,
+        };
+        let attributes = otlp_attributes(
             &span.attrs,
             &span.attrs_other,
-            "attrs_other",
-            &hex(&span.span_id),
+            "spans.attrs_other",
+            &span_subject,
         )?;
-        render_resource(&span.service, fetched.resources.first())?;
-        otlp_parent_span_id(&span.parent_span_id);
-        let _ = SERVICE_NAME_KEY;
+        let mut events = Vec::with_capacity(span.events.len());
+        for event in span.events {
+            events.push(Event {
+                // Verbatim: the stored column is unsigned and so is the
+                // protocol's field.
+                time_unix_nano: event.time_ns,
+                name: event.name,
+                attributes: otlp_attributes(
+                    &event.attrs,
+                    &event.attrs_other,
+                    "spans.events[].attrs_other",
+                    &span_subject,
+                )?,
+                dropped_attributes_count: event.dropped_attrs,
+            });
+        }
+        let mut links = Vec::with_capacity(span.links.len());
+        for link in span.links {
+            links.push(Link {
+                // As stored, whatever their length.
+                trace_id: link.trace_id.into_vec(),
+                span_id: link.span_id.into_vec(),
+                trace_state: link.trace_state,
+                flags: link.flags,
+                attributes: otlp_attributes(
+                    &link.attrs,
+                    &link.attrs_other,
+                    "spans.links[].attrs_other",
+                    &span_subject,
+                )?,
+                dropped_attributes_count: link.dropped_attrs,
+            });
+        }
+        groups.push(ResourceSpans {
+            resource: Some(resource),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope),
+                spans: vec![Span {
+                    // The REQUEST's own sixteen bytes: the span table
+                    // carries the trace id as a key and the statements do
+                    // not project it.
+                    trace_id: trace_id.to_vec(),
+                    span_id: span.span_id.to_vec(),
+                    trace_state: span.trace_state,
+                    parent_span_id: otlp_parent_span_id(&span.parent_span_id),
+                    flags: span.flags,
+                    name: span.name,
+                    // The protocol's own signed values, verbatim.
+                    kind: span.kind,
+                    start_time_unix_nano: span.start_ns as u64,
+                    end_time_unix_nano: span.end_ns,
+                    attributes,
+                    dropped_attributes_count: span.dropped_attrs,
+                    events,
+                    dropped_events_count: span.dropped_events,
+                    links,
+                    dropped_links_count: span.dropped_links,
+                    status: Some(Status {
+                        code: span.status_code,
+                        message: span.status_message,
+                    }),
+                }],
+                schema_url: span.scope_schema_url,
+            }],
+            schema_url: resource_schema_url,
+        });
     }
-    Ok((TracesData::default(), 0))
+    Ok((
+        TracesData {
+            resource_spans: groups,
+        },
+        missing_resources,
+    ))
 }
 
 /// The protobuf rendering (`Content-Type: application/protobuf`).
@@ -448,7 +747,9 @@ mod tests {
 
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::trace::v1::Span;
-    use pulsus_clickhouse::json_column::{TraceJson, TraceJsonScalar, TraceJsonValue};
+    use pulsus_clickhouse::json_column::{
+        TraceJson, TraceJsonScalar, TraceJsonValue, escape_json_path,
+    };
     use pulsus_read::traces::spans::rows::{FetchedEventTuple, FetchedLinkTuple};
     use serde_bytes::ByteBuf;
 
@@ -564,8 +865,11 @@ mod tests {
         let mut span = span_row([0x04; 8], START);
         span.service = "7".to_string();
         let mut resource = resource_row(1);
+        // The ESCAPED path, which is what the column stores for a dotted
+        // OTLP key: the raw `service.name` would be two stored segments
+        // and would come back as the kvlist `service = { name: 7 }`.
         resource.attrs = json(&[(
-            SERVICE_NAME_KEY,
+            &escape_json_path(SERVICE_NAME_KEY),
             TraceJsonValue::Scalar(TraceJsonScalar::Int(7)),
         )]);
         let data = assembled(fetched(vec![span], vec![resource]));

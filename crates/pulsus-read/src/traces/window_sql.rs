@@ -240,15 +240,16 @@ impl WindowSql {
     ///
     /// [`time_clause_on`]: WindowSql::time_clause_on
     pub fn span_time_clause(self) -> String {
-        // STUB (issue #587).
-        String::new()
+        self.time_clause_on("start_ns")
     }
 
     /// The resource table's `day` partition bound (issue #587), from this
     /// window's own two nanoseconds. [`resources_day_bound`] is the text.
     pub fn resources_day_clause(self) -> String {
-        // STUB (issue #587): the bound's own two nanoseconds are the change.
-        String::new()
+        resources_day_bound(
+            &self.first_included_ns().to_string(),
+            &self.last_included_ns().to_string(),
+        )
     }
 
     /// The span table's leading sort-key bound (issue #587).
@@ -259,8 +260,12 @@ impl WindowSql {
     /// below the epoch. Handing the engine the nanoseconds and letting it
     /// divide removes the question rather than answering it.
     pub fn span_bucket_clause(self) -> String {
-        // STUB (issue #587).
-        String::new()
+        format!(
+            "intDiv(start_ns, {bucket}) BETWEEN intDiv({}, {bucket}) AND intDiv({}, {bucket})",
+            self.first_included_ns(),
+            self.last_included_ns(),
+            bucket = RECENT_BUCKET_NS
+        )
     }
 
     /// The daily-partition pruning clause on the `date` column —

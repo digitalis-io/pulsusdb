@@ -76,6 +76,7 @@
 //! | heap→winners Vec + output slots + root-summary clones | COMPLETE output-slot capacity pre-charged before `Vec::with_capacity` (round 4); each root clone's string bytes charged before that clone |
 //! | `PlanExplain` stage SQL/note clones (explained mode) | [`charge_explain`] before every clone/format (retained for the request) |
 //! | per-query SQL text `String`s | stated residual: bounded by construction (template + ≤ 48 B × batch ids ≈ ≤ 2 KB per read at `BATCH_TRACES` = 32), same class as the driver's one-block transient |
+//! | the trace FETCH's one row ([`TraceEngine::fetch_by_id`], issue #587) | **no charge, and no allocation site of its own**: each of the three statements aggregates its span read into one scalar and returns exactly ONE row, so there is no stream to collect and no per-row cost to charge. What bounds it is the engine's own `max_memory_usage` from [`fetch_settings`], applied server-side: a trace too large for it answers `422` where the old path streamed, and this part predicts no span count for where that bites. The `Vec`s the row holds are the driver's, built inside the row's own deserializer |
 //!
 //! This table (and `search_eval`'s) is enforced MECHANICALLY by
 //! `tests/traces_alloc_audit.rs` (round 4): any new collection-allocation
@@ -94,7 +95,10 @@ use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsP
 use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
-use super::spans::rows::{FetchRoute, FetchWindow, FetchedTrace};
+use super::spans::fetch as span_fetch;
+use super::spans::rows::{
+    FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, WideFetchRow,
+};
 
 use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow,
@@ -1881,13 +1885,80 @@ impl TraceEngine {
         hex32: &str,
         window: Option<FetchWindow>,
     ) -> Result<FetchedTrace, ReadError> {
-        // STUB (issue #587): the fetch's own three statements are the
-        // change.
-        let _ = (
-            fetch_settings(&self.config),
-            fetch_route_and_second(&self.config, hex32, 0, 0, false, window),
+        let settings = fetch_settings(&self.config);
+        let sql = span_fetch::indexed_fetch_sql(
+            &self.config.traces_table,
+            &self.config.spans_v2_table,
+            &self.config.resources_table,
+            hex32,
         );
-        Ok(FetchedTrace::empty_at_one_statement())
+        // Statement 1 returns exactly ONE row whatever `index_rows` turns
+        // out to be — three scalars and no `FROM` for an absent trace —
+        // so no row at all is an engine fault rather than an absent
+        // trace.
+        let first: IndexedFetchRow = self.one_fetch_row(&sql, &settings).await?;
+        let (route, second) = fetch_route_and_second(
+            &self.config,
+            hex32,
+            first.index_rows,
+            first.bucket_count,
+            !first.spans.is_empty(),
+            window,
+        );
+        let Some(second_sql) = second else {
+            return Ok(FetchedTrace {
+                spans: first.spans,
+                resources: first.resources,
+                statements: 1,
+                route,
+            });
+        };
+        if route == FetchRoute::TruncatedSet {
+            let wide: WideFetchRow = self.one_fetch_row(&second_sql, &settings).await?;
+            return Ok(FetchedTrace {
+                spans: wide.spans,
+                resources: wide.resources,
+                statements: 2,
+                route,
+            });
+        }
+        let fallback: FallbackFetchRow = self.one_fetch_row(&second_sql, &settings).await?;
+        Ok(FetchedTrace {
+            spans: fallback.spans,
+            resources: fallback.resources,
+            statements: 2,
+            route,
+        })
+    }
+
+    /// One statement that returns exactly one row.
+    ///
+    /// Every one of the fetch's three statements does: each aggregates its
+    /// span read into one scalar and projects it beside the resource
+    /// scalar, so there is no stream to collect and no per-row budget to
+    /// charge — the whole answer is one row, and the engine's own
+    /// `max_memory_usage` is what bounds the aggregate state behind it
+    /// (the limit this part records rather than predicts).
+    async fn one_fetch_row<R: ChRow>(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<R, ReadError> {
+        let mut stream = self
+            .dispatch
+            .query_stream::<R, _>(sql, settings, |e| map_trace_read_error(e, &self.config))
+            .await?;
+        stream
+            .next()
+            .await
+            .ok_or_else(|| {
+                ReadError::Clickhouse(ChError::Decode(
+                    "a trace fetch statement returned no row; each of the three returns \
+                     exactly one"
+                        .to_string(),
+                ))
+            })?
+            .map_err(|e| map_trace_read_error(e, &self.config))
     }
 
     /// Streams the §4.3 tag-names read (issue #58): distinct
@@ -3115,9 +3186,18 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 /// preference puts two reads on one *host*, which is not one *position*,
 /// so it closes none of the visibility states it was once proposed for.
 fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
-    // STUB (issue #587): the entry set is the change.
-    let _ = config;
-    QuerySettings::new()
+    let base = if config.distributed {
+        QuerySettings::clustered_reader(config.skip_unavailable_shards)
+    } else {
+        QuerySettings::new()
+    };
+    base.set("max_rows_to_read", config.scan_budget_rows)
+        .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
+        .set("read_overflow_mode", "throw")
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        .set("max_memory_usage", config.read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
+        .set("final", 1)
 }
 
 /// What §2.4's branch decides: which route answers, and the second
@@ -3152,16 +3232,36 @@ fn fetch_route_and_second(
     spans_non_empty: bool,
     window: Option<FetchWindow>,
 ) -> (FetchRoute, Option<String>) {
-    // STUB (issue #587): the branch is the change.
-    let _ = (
-        config,
-        hex32,
-        index_rows,
-        bucket_count,
-        spans_non_empty,
-        window,
-    );
-    (FetchRoute::Indexed, None)
+    // The stored set may have truncated. `>=` and not `==`: an uncapped
+    // union of a truncated row with one further bucket is 4,097,
+    // measured, so equality is false exactly when truncation has
+    // happened.
+    if bucket_count >= span_fetch::BUCKET_SET_CAP {
+        return (
+            FetchRoute::TruncatedSet,
+            Some(span_fetch::wide_fetch_sql(
+                &config.traces_table,
+                &config.spans_v2_table,
+                &config.resources_table,
+                hex32,
+            )),
+        );
+    }
+    if index_rows != 0 && spans_non_empty {
+        return (FetchRoute::Indexed, None);
+    }
+    match window {
+        None => (FetchRoute::Indexed, None),
+        Some(window) => (
+            FetchRoute::Fallback,
+            Some(span_fetch::fallback_fetch_sql(
+                &config.spans_v2_table,
+                &config.resources_table,
+                hex32,
+                window,
+            )),
+        ),
+    }
 }
 
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
@@ -4493,6 +4593,7 @@ mod tests {
             .entries()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        let mem = TEST_READ_MEM.to_string();
         let want: Vec<(String, String)> = [
             ("optimize_skip_unused_shards", "1"),
             ("optimize_distributed_group_by_sharding_key", "1"),
@@ -4503,7 +4604,9 @@ mod tests {
             ("max_bytes_to_read", "53687091200"),
             ("read_overflow_mode", "throw"),
             ("max_query_size", "8388608"),
-            ("max_memory_usage", "8589934592"),
+            // From the fixture's own ceiling, not restated: a literal here
+            // would pass against a config that carried something else.
+            ("max_memory_usage", mem.as_str()),
             ("max_bytes_before_external_group_by", "0"),
             ("final", "1"),
         ]

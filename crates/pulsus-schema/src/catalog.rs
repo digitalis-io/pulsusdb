@@ -933,11 +933,12 @@ pub const MIGRATIONS: &[Migration] = &[
     //
     // Id 16's frozen CREATE declares `service_time` as `SELECT *`, so every
     // span's `payload` is stored a SECOND time inside the projection and
-    // re-compressed on every merge. Nothing reads it there: the only
-    // statement that selects `payload` is the trace-by-id point read
-    // (`crates/pulsus-read/src/traces/sql.rs:22`), which filters on
-    // `trace_id` — the BASE table's first sort key — so the optimizer never
-    // reaches the projection for it.
+    // re-compressed on every merge. Nothing on the read path reads it
+    // there, and since issue #587 nothing on the read path reads `payload`
+    // at all: the trace fetch projects the span, per-trace and resource
+    // tables' own columns. The two write-path round-trip suites that still
+    // decode it filter on `trace_id` — the BASE table's first sort key —
+    // so the optimizer never reaches the projection for them either.
     //
     // Ids 44-46 replace `service_time` with the same key order over the 14
     // non-payload columns; ids 47/48 add `name_time`, the same 14 sorted by
@@ -2120,8 +2121,8 @@ mod tests {
     /// `docs/schemas.md` §4.1 prints the six base-table ones verbatim.
     ///
     /// This is what this repository means by binding documented SQL — the
-    /// `point_read_sql_is_byte_exact_to_schemas_md_4_2` convention
-    /// (`crates/pulsus-read/src/traces/sql.rs`), strengthened from a
+    /// `all_three_builders_are_byte_frozen` convention
+    /// (`crates/pulsus-read/src/traces/spans/fetch.rs`), strengthened from a
     /// human-maintained literal to a read of the document itself.
     ///
     /// What it does NOT do, said rather than left: it does not bind the

@@ -1193,7 +1193,7 @@ WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 ```
 
-Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:121`). **Today that is two
+Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:125`). **Today that is two
 statements per batch** — one to fetch the spans, one to ask the index which of
 them carry the attribute:
 
@@ -2988,7 +2988,7 @@ Every column, type, codec, sort key, partition key, projection column list and
 materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256, 266-281, 335-407,
 648-936, 934-1000`); every statement and its `SELECT` list (`crates/pulsus-read/src/traces/search_sql.rs:231,
 230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:89, 118, 253, 282`;
-`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:121`,
+`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:125`,
 `crates/pulsus-config/src/model.rs:569-571`); which aggregates push down and what they read
 (`crates/pulsus-read/src/traces/compile.rs:439-489, 560-562`); the write path's failure modes
 (`crates/pulsus-write/src/writer/trace.rs:9-19, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442`;
@@ -3160,7 +3160,7 @@ from its source; the pointer is not reproduced here.
 
 | what | value | where |
 |---|---|---|
-| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:121` |
+| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:125` |
 | candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:569` |
 | scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:570` |
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:571` |

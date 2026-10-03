@@ -131,6 +131,76 @@ fn resource_subquery(resources_table: &str, day: &str) -> String {
         .replace("{day}", day)
 }
 
+/// Statement 1's own text, with the span scalar and the resource
+/// subquery substituted in. A `const` at column zero, like the two shared
+/// blocks above, so the SQL reads as SQL and no source indentation can
+/// leak into it.
+const INDEXED: &str = r"WITH (SELECT (count(), min(start_ns), max(last_start_ns),
+              groupUniqArrayArray({cap})(buckets))
+      FROM {traces}
+      WHERE trace_id = {key}) AS ext,
+     ifNull(ext.1, 0)  AS idx_rows,
+     ifNull(ext.2, 0)  AS ext_lo,
+     ifNull(ext.3, 0)  AS ext_hi,
+     ifNull(ext.4, []) AS bk,
+     {span}
+SELECT idx_rows               AS index_rows,
+       toUInt32(length(bk))   AS bucket_count,
+       sp.1                   AS spans,
+{resources}";
+
+/// Statement 1's span predicate. The key condition is the whole prefix of
+/// the sort key — the bucket and the trace id — against a tuple `IN` over
+/// a subquery that reads **no table**: `arrayJoin(bk)` runs over a
+/// materialised array from the extent scalar, so the set is a constant at
+/// analysis time and becomes a key condition. One granule range per bucket
+/// the trace actually occupies.
+const INDEXED_PREDICATE: &str = r"(intDiv(start_ns, {bucket_ns}), trace_id) IN
+            (SELECT (k, {key})
+             FROM (SELECT arrayJoin(bk) AS k))
+        AND length(bk) < {cap}";
+
+/// Statement 1w's own text.
+const WIDE: &str = r"WITH (SELECT (min(start_ns), max(last_start_ns)) FROM {traces}
+      WHERE trace_id = {key}) AS ext,
+     ifNull(ext.1, 0) AS lo,
+     ifNull(ext.2, 0) AS hi,
+     {span}
+SELECT sp.1 AS spans,
+{resources}";
+
+/// Statement 1w's span predicate: **no bucket condition at all.**
+///
+/// A stored set that may be incomplete would make a key `IN` EXCLUDE
+/// rows, and a wrong answer is worse than a slow one. Every span of the
+/// trace has its start inside the extent by the extent's own definition,
+/// and its partition date inside the date range those bounds fall in — so
+/// this predicate is complete.
+///
+/// **The partition clause is byte identical to the span table's own
+/// `PARTITION BY` expression.** A bare conversion is not, so the prune
+/// would be lost and the read would fall back to every partition in
+/// retention or to a refusal.
+const WIDE_PREDICATE: &str = r"trace_id = {key}
+        AND start_ns >= lo AND start_ns <= hi
+        AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
+            BETWEEN toDate(fromUnixTimestamp64Nano(lo), 'UTC')
+                AND toDate(fromUnixTimestamp64Nano(hi), 'UTC')";
+
+/// Statement 2's own text.
+const FALLBACK: &str = r"WITH {span}
+SELECT sp.1 AS spans,
+{resources}";
+
+/// Statement 2's span predicate.
+///
+/// **The bucket clause is the whole pushdown.** The engine does not derive
+/// it from a condition on the row's own start: measured on this table, 980
+/// of 980 granules without it and 26 of 980 with it.
+const FALLBACK_PREDICATE: &str = r"trace_id = {key}
+        AND {time}
+        AND {bucket}";
+
 /// Statement 1 — the indexed fetch. Issued on every fetch request,
 /// always, first.
 pub fn indexed_fetch_sql(
@@ -139,14 +209,20 @@ pub fn indexed_fetch_sql(
     resources_table: &str,
     hex32: &str,
 ) -> String {
-    // STUB (issue #587): the statement's own text is the change.
-    let _ = (
-        traces_table,
-        trace_key(hex32),
-        span_scalar(spans_table, ""),
-        resource_subquery(resources_table, &resources_day_bound("ext_lo", "ext_hi")),
-    );
-    String::new()
+    let key = trace_key(hex32);
+    let predicate = INDEXED_PREDICATE
+        .replace("{bucket_ns}", &BUCKET_NS.to_string())
+        .replace("{key}", &key)
+        .replace("{cap}", &BUCKET_SET_CAP.to_string());
+    INDEXED
+        .replace("{cap}", &BUCKET_SET_CAP.to_string())
+        .replace("{traces}", traces_table)
+        .replace("{key}", &key)
+        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace(
+            "{resources}",
+            &resource_subquery(resources_table, &resources_day_bound("ext_lo", "ext_hi")),
+        )
 }
 
 /// Statement 1w — the complete-predicate read, for a stored bucket set
@@ -158,14 +234,15 @@ pub fn wide_fetch_sql(
     resources_table: &str,
     hex32: &str,
 ) -> String {
-    // STUB (issue #587).
-    let _ = (
-        traces_table,
-        trace_key(hex32),
-        span_scalar(spans_table, ""),
-        resource_subquery(resources_table, &resources_day_bound("lo", "hi")),
-    );
-    String::new()
+    let key = trace_key(hex32);
+    let predicate = WIDE_PREDICATE.replace("{key}", &key);
+    WIDE.replace("{traces}", traces_table)
+        .replace("{key}", &key)
+        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace(
+            "{resources}",
+            &resource_subquery(resources_table, &resources_day_bound("lo", "hi")),
+        )
 }
 
 /// Statement 2 — the window fallback, for a trace the per-trace table has
@@ -177,15 +254,18 @@ pub fn fallback_fetch_sql(
     hex32: &str,
     window: FetchWindow,
 ) -> String {
-    // STUB (issue #587).
+    // `[start, end)` — the one rule every request window is built with.
     let w = WindowSql::start_closed_end_open(window.start_ns, window.end_ns);
-    let _ = (
-        trace_key(hex32),
-        span_scalar(spans_table, &w.span_time_clause()),
-        resource_subquery(resources_table, &w.resources_day_clause()),
-        w.span_bucket_clause(),
-    );
-    String::new()
+    let predicate = FALLBACK_PREDICATE
+        .replace("{key}", &trace_key(hex32))
+        .replace("{time}", &w.span_time_clause())
+        .replace("{bucket}", &w.span_bucket_clause());
+    FALLBACK
+        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace(
+            "{resources}",
+            &resource_subquery(resources_table, &w.resources_day_clause()),
+        )
 }
 
 #[cfg(test)]

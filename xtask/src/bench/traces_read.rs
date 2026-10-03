@@ -44,10 +44,11 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::rows::{
-    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, TypedStrValueRow,
+    CandidateRow, HydrationRow, MembershipRow, RootRow, TypedStrValueRow,
 };
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
-use pulsus_read::traces::sql::point_read_sql;
+use pulsus_read::traces::spans::fetch::indexed_fetch_sql;
+use pulsus_read::traces::spans::rows::IndexedFetchRow;
 use pulsus_read::{SearchPlan, SpanFilterCtx, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -178,7 +179,7 @@ struct StageSpec {
 /// to the SQL without a second list to keep in step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decoder {
-    StoredSpan,
+    IndexedFetch,
     Candidate,
     Hydration,
     /// The membership read with NO fused value — two columns.
@@ -193,7 +194,7 @@ impl Decoder {
     #[cfg_attr(not(test), allow(dead_code))]
     fn columns(self) -> &'static [&'static str] {
         match self {
-            Decoder::StoredSpan => StoredSpanRow::COLUMN_NAMES,
+            Decoder::IndexedFetch => IndexedFetchRow::COLUMN_NAMES,
             Decoder::Candidate => CandidateRow::COLUMN_NAMES,
             Decoder::Hydration => HydrationRow::COLUMN_NAMES,
             Decoder::Membership => MembershipRow::COLUMN_NAMES,
@@ -259,9 +260,12 @@ fn evidence_stages(
     vec![
         StageSpec {
             stage: "trace_by_id",
-            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
+            // Issue #587: the fetch's own indexed statement, over the
+            // span, per-trace and resource tables. `resources` is read
+            // from the local replica and is never `_dist`-suffixed.
+            sql: indexed_fetch_sql("traces_dist", "spans_dist", "resources", &hex32(&target)),
             roster: Roster::TraceIds(vec![target]),
-            decoder: Decoder::StoredSpan,
+            decoder: Decoder::IndexedFetch,
         },
         StageSpec {
             stage: "phase1_generator_service",
@@ -802,7 +806,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         // membership read came to be built four-column and decoded
         // three-column.
         let returned_rows = match spec.decoder {
-            Decoder::StoredSpan => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
+            Decoder::IndexedFetch => {
+                drain::<IndexedFetchRow>(&client, &spec.sql, &settings).await?
+            }
             Decoder::Candidate => drain::<CandidateRow>(&client, &spec.sql, &settings).await?,
             Decoder::Hydration => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
             Decoder::Membership => drain::<MembershipRow>(&client, &spec.sql, &settings).await?,
@@ -1021,7 +1027,38 @@ mod tests {
         let batch = [trace_id_of(1), trace_id_of(2)];
         let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
         assert_eq!(stages.len(), 6, "every stage must be checked");
+        // Issue #587: the fetch stage is EXEMPT from this reader, and the
+        // exemption is stated here rather than left as a silent skip.
+        //
+        // This reader accepts a narrow grammar over a statement that opens
+        // with `SELECT`. The fetch's indexed statement opens with `WITH`
+        // and binds four scalars before its projection — a `[]` default,
+        // a tuple member access, a zone literal and two nested scalar
+        // subqueries — none of which is in the closed alphabet, and
+        // widening the alphabet to admit them would make the reader accept
+        // very nearly anything, which is the one thing it exists not to do.
+        //
+        // **What holds the property for that stage instead**, so this is a
+        // carve-out and not a hole: the statement's projection aliases are
+        // byte-frozen by `all_three_builders_are_byte_frozen`, and the row
+        // type's own `COLUMN_NAMES` are asserted against those four
+        // literals by `each_row_types_column_names_are_its_statements_aliases`
+        // — both in `pulsus-read`. Two cases over one pair of facts, where
+        // every other stage has this one.
+        const EXEMPT_STAGES: [&str; 1] = ["trace_by_id"];
+        let mut checked = 0;
         for spec in &stages {
+            if EXEMPT_STAGES.contains(&spec.stage) {
+                assert!(
+                    spec.sql.starts_with("WITH "),
+                    "stage {:?} is exempt because its statement opens with a WITH prelude; \
+                     a statement that no longer does belongs back under the reader.\nSQL:\n{}",
+                    spec.stage,
+                    spec.sql
+                );
+                continue;
+            }
+            checked += 1;
             assert_eq!(
                 projection_names(&spec.sql),
                 spec.decoder.columns(),
@@ -1031,6 +1068,11 @@ mod tests {
                 spec.sql
             );
         }
+        assert_eq!(
+            checked,
+            stages.len() - EXEMPT_STAGES.len(),
+            "every stage is either checked or named in the exemption"
+        );
         // The membership stage takes the FUSED arm for this query, which
         // is the arm issue #510 widened. Pinned so a planner change that
         // silently stopped fusing would not turn this test into a check
@@ -1104,7 +1146,7 @@ mod tests {
     ///
     /// **Why the names are read from SQL at all.** None of the five
     /// builders holds its output names as a list: `hydration_sql`,
-    /// `root_sql` and `point_read_sql` write the projection inline in a
+    /// `root_sql` and the fetch's builders write the projection inline in a
     /// `format!`, `membership_sql` builds a projection String first and
     /// interpolates it, and `generator_sql` opens with a
     /// `String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n")`.

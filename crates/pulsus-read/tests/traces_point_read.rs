@@ -100,7 +100,35 @@ async fn fresh_db(db: String) -> String {
     let admin = admin().await;
     exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
     run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    hold_the_fetch_tables(&admin, &db).await;
     db
+}
+
+/// A fixed past instant and a delete TTL are not compatible without this.
+///
+/// **Most fixtures here are anchored on a CALENDAR instant** rather than
+/// on the clock, because the derived values each case asserts — the UTC
+/// days a row files under, the buckets a span occupies — were computed
+/// from those literals. The three fetch tables carry a delete TTL at the
+/// configured retention with `ttl_only_drop_parts = 1`, and **a part
+/// whose rows are all already expired is dropped by a BACKGROUND
+/// operation**: measured on this server, a single row dated 2023-11-14
+/// inserted into a table with that TTL was gone within three seconds. The
+/// case would then assert against an empty table.
+///
+/// `SYSTEM STOP MERGES` is what holds them, because a TTL part drop is a
+/// merge. **Table-scoped, which is the whole of why no restart is
+/// needed**: the scoped form resolves a storage object, so the stop is
+/// held against the table and dropping the database destroys the holder.
+/// The argument-less form is server-wide and no drop undoes it.
+///
+/// It also gives the one case that asserts a PHYSICAL row count a stable
+/// state to assert — but that is a second reason, and this one applies to
+/// every case in the file.
+async fn hold_the_fetch_tables(admin: &ChClient, db: &str) {
+    for table in ["spans", "traces", "resources"] {
+        exec(admin, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
+    }
 }
 
 async fn drop_db(db: &str) {
@@ -120,6 +148,19 @@ struct U32Row {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct TextRow {
     s: String,
+}
+
+/// `DESCRIBE`'s first two columns. The statement returns seven, so the
+/// row carries all of them positionally and the case reads the first two.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DescribeRow {
+    name: String,
+    r#type: String,
+    default_type: String,
+    default_expression: String,
+    comment: String,
+    codec_expression: String,
+    ttl_expression: String,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -438,25 +479,35 @@ async fn each_statements_reported_column_types_are_the_row_types() {
     ];
     assert_eq!(cases.len(), 3, "one sub-case per builder");
 
+    // **The server's own report, taken once and frozen.** Two things in
+    // it are the engine's and neither is this statement's choice, so both
+    // are written out rather than guessed at: the aggregate ERASES
+    // `LowCardinality` from every element it carries, and the two NESTED
+    // tuples keep their declared element names where the outer one — built
+    // from anonymous expressions — does not.
     const SPAN_TUPLE: &str = "Array(Tuple(FixedString(8), FixedString(8), Int64, UInt64, \
-         LowCardinality(String), UInt128, LowCardinality(String), Int32, Int32, String, String, \
-         UInt32, LowCardinality(String), LowCardinality(String), JSON, JSON, String, UInt32, \
-         Array(Tuple(UInt64, LowCardinality(String), JSON, String, UInt32)), UInt32, \
-         Array(Tuple(String, String, String, UInt32, JSON, String, UInt32)), UInt32, String, \
-         UInt32, String))";
+         String, UInt128, String, Int32, Int32, String, String, UInt32, String, String, JSON, \
+         JSON, String, UInt32, Array(Tuple(\n    time_ns UInt64,\n    name String,\n    \
+         attrs JSON,\n    attrs_other String,\n    dropped_attrs UInt32)), UInt32, \
+         Array(Tuple(\n    trace_id String,\n    span_id String,\n    trace_state String,\n    \
+         flags UInt32,\n    attrs JSON,\n    attrs_other String,\n    dropped_attrs UInt32)), \
+         UInt32, String, UInt32, String))";
     const RESOURCE_TUPLE: &str = "Array(Tuple(UInt128, JSON, String, UInt32, String, String))";
 
     for (label, sql, want_columns) in cases {
-        let describe = format!(
-            "SELECT concat(name, ' ', type) AS s FROM (DESCRIBE ({sql})) SETTINGS final = 1"
-        );
+        // `DESCRIBE (<statement>)` and not a wrapping `SELECT … FROM
+        // (DESCRIBE …)`: a `WITH` prelude inside a subquery is a syntax
+        // error, and the describe's own first two columns are the name
+        // and the type.
+        let describe = format!("DESCRIBE ({sql})");
         let mut stream = client
-            .query_stream::<TextRow>(&describe, &QuerySettings::new())
+            .query_stream::<DescribeRow>(&describe, &QuerySettings::new())
             .await
             .unwrap_or_else(|e| panic!("{label}: describe failed: {e}\nSQL:\n{sql}"));
         let mut got = Vec::new();
         while let Some(row) = stream.next().await {
-            got.push(row.expect("decode describe row").s);
+            let row = row.expect("decode a describe row");
+            got.push(format!("{} {}", row.name, row.r#type));
         }
         assert_eq!(
             got.len(),
@@ -712,12 +763,14 @@ async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it
         "both spans must share one bucket, or the fixture's stored set is wrong"
     );
 
-    exec(&client, &format!("SYSTEM STOP MERGES {db}.spans")).await;
+    // Merges are already stopped on all three tables by `fresh_db`, which
+    // is where that device and its reason live.
 
     let insert = format!(
         "INSERT INTO {db}.spans \
          (trace_id, span_id, parent_span_id, start_ns, end_ns, service, resource_id, \
-          name, kind, status_code) VALUES \
+          name, kind, status_code) \
+         SETTINGS insert_deduplication_token = '{{token}}' VALUES \
          (unhex('{tid}'), unhex('0000000000000001'), toFixedString('', 8), {first_ns}, \
           {first_end}, 'checkout', 0, 'op', 2, 0), \
          (unhex('{tid}'), unhex('0000000000000002'), toFixedString('', 8), {second_ns}, \
@@ -728,8 +781,20 @@ async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it
     );
     // TWO separate statements, so the rows land in two parts and no
     // block-level collapse applies.
-    exec(&client, &insert).await;
-    exec(&client, &insert).await;
+    //
+    // **Each carries its own deduplication token, and that is not a
+    // convenience.** The table carries a block-deduplication window, so
+    // two byte-identical inserts are ONE block and the second is
+    // suppressed — the fixture would make two rows, not four, and the
+    // case would be red for a reason that is not its subject. Two
+    // distinct tokens is what a genuine at-least-once duplicate from two
+    // different pushes looks like: the same span, two blocks, and the
+    // read's own `final = 1` is the only thing that collapses them.
+    for token in ["fetch-final-fixture-a", "fetch-final-fixture-b"] {
+        // `SETTINGS` goes BEFORE `VALUES` in an insert; after it the
+        // value parser reads the clause as another row.
+        exec(&client, &insert.replace("{token}", token)).await;
+    }
 
     exec(
         &client,
@@ -784,7 +849,6 @@ async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it
         "`final = 1` is what collapses the duplicates before the reader sees them"
     );
 
-    exec(&client, &format!("SYSTEM START MERGES {db}.spans")).await;
     drop_db(&db).await;
 }
 

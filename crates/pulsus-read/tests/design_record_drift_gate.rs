@@ -1849,35 +1849,35 @@ enum ReviewedVerdict {
 // Issue #587: the three TraceQL-executor cases below moved their
 // coordinates and nothing else. The fetch's additions to
 // `traces/exec.rs` shifted every line below the trace read config, so
-// `exec.rs:2983-2989` is now `:3008-3014`, `exec.rs:3023` is now
-// `:3048`, and `exec.rs:808` is now `:826`. Each still cites the same
+// `exec.rs:2983-2989` is now `:3079-3085`, `exec.rs:3023` is now
+// `:3119`, and `exec.rs:808` is now `:830`. Each still cites the same
 // expression it cited before — the verdicts are unchanged and the
 // reasoning below is the same sentence.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:3048",
+        "exec.rs:3119",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3048",
+        "exec.rs:3119",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3008-3014",
+        "exec.rs:3079-3085",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:826",
+        "exec.rs:830",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
@@ -2866,7 +2866,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 /// ```text
 ///   citing document        cites                 times   the cited line must carry
 ///   --------------------   -------------------   -----   -------------------------
-///   docs/query-to-sql.md   docs/schemas.md:995       2   never a `UNION ALL`
+///   docs/query-to-sql.md   docs/schemas.md:1010      2   never a `UNION ALL`
 /// ```
 ///
 /// **The count is not decoration, and leaving it out was the same defect
@@ -2885,7 +2885,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 fn every_cross_document_line_citation_names_the_line_it_quotes() {
     const CROSS_DOC_CITATIONS: &[(&str, &str, usize, &str)] = &[(
         "docs/query-to-sql.md",
-        "docs/schemas.md:995",
+        "docs/schemas.md:1010",
         2,
         "never a `UNION ALL`",
     )];

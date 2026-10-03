@@ -132,7 +132,12 @@ fn graph_statement() -> String {
 }
 
 fn fetch_statement() -> String {
-    pulsus_read::traces::sql::point_read_sql(SPANS_TABLE, "000102030405060708090a0b0c0d0e0f")
+    pulsus_read::traces::spans::fetch::indexed_fetch_sql(
+        "traces",
+        "spans",
+        "resources",
+        "000102030405060708090a0b0c0d0e0f",
+    )
 }
 
 fn tag_values_statement() -> String {

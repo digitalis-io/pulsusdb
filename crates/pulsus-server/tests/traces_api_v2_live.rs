@@ -219,7 +219,12 @@ fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
         .env("PULSUS_PORT", port.to_string())
         .env("CLICKHOUSE_SERVER", live_db::ch_host())
         .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
-        .env("CLICKHOUSE_DB", db.name());
+        .env("CLICKHOUSE_DB", db.name())
+        // Issue #587: the fetch cases below read `/api/v2/traces/{id}`,
+        // which is a compat alias and so is mounted only with the flag
+        // on. Additive — it adds routes and changes none — so the cases
+        // that predate it are unaffected.
+        .env("PULSUS_COMPAT_ENDPOINTS", "true");
     let guard = ChildGuard(cmd.spawn().expect("spawn pulsusdb"));
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -810,7 +815,12 @@ fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra: &[(&str, &str)]) -> Chi
         .env("PULSUS_PORT", port.to_string())
         .env("CLICKHOUSE_SERVER", live_db::ch_host())
         .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
-        .env("CLICKHOUSE_DB", db.name());
+        .env("CLICKHOUSE_DB", db.name())
+        // Issue #587: the fetch cases below read `/api/v2/traces/{id}`,
+        // which is a compat alias and so is mounted only with the flag
+        // on. Additive — it adds routes and changes none — so the cases
+        // that predate it are unaffected.
+        .env("PULSUS_COMPAT_ENDPOINTS", "true");
     for (name, value) in extra {
         cmd.env(name, value);
     }
@@ -1233,8 +1243,13 @@ const BUCKET_NS: i64 = 300_000_000_000;
 /// It also gives the one case that asserts a PHYSICAL row count a stable
 /// state to assert — but that is a second reason, and this one applies to
 /// every case.
+/// **The OLD span table is deliberately not held.** A scoped
+/// `ALTER … DELETE` is executed by the merge scheduler, so stopping merges
+/// on that table stops the provenance marker's own scoped delete and it
+/// never finishes. It needs no hold either: the marker's job is to make
+/// the trace absent from it, and a part the TTL drops first is absent too.
 async fn hold_the_fetch_tables(admin: &ChClient, db: &str) {
-    for table in ["spans", "traces", "resources", "trace_spans"] {
+    for table in ["spans", "traces", "resources"] {
         ch_exec(admin, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
     }
 }
@@ -1245,6 +1260,19 @@ async fn ch_admin() -> ChClient {
     ChClient::new(live_db::conn_config("default"))
         .await
         .expect("connect the admin ClickHouse client")
+}
+
+/// A ClickHouse connection ON the run database.
+///
+/// **Re-issuing a recorded statement needs this and not the admin
+/// client.** The read config carries UNQUALIFIED table names and the
+/// connection carries the database, so production's own text says
+/// `FROM traces` — which resolves on a connection to the run database and
+/// nowhere else.
+async fn ch_data(db: &str) -> ChClient {
+    ChClient::new(live_db::conn_config(db))
+        .await
+        .expect("connect a data ClickHouse client")
 }
 
 async fn ch_exec(client: &ChClient, sql: &str) {
@@ -1340,11 +1368,17 @@ async fn not_in_the_old_table(admin: &ChClient, db: &str, hex: &str, expected_ne
 
 /// §5.0b's **P2**: the answer came from **the new statements**.
 ///
-/// The recorded text of `<prefix>-1` contains `FROM <db>.traces` — a token
-/// the old point read cannot produce, since it reads the old span table and
+/// The recorded text of `<prefix>-1` contains `FROM traces` — a token the
+/// old point read cannot produce, since it reads the old span table and
 /// never the per-trace one. `<prefix>` comes from the request's own
 /// `X-Pulsus-Query-Id` response header, so the case READS the prefix
 /// rather than recomputing it.
+///
+/// **The table name is bare and not database-qualified**: the read config
+/// carries unqualified names and the connection carries the database, so
+/// a qualified token would match nothing. The `query_log` row is scoped to
+/// the run database instead, which is what keeps one run from reading
+/// another's.
 ///
 /// This is what covers the two kinds P1 cannot: a case whose expected
 /// answer is EMPTY, where an empty old-path answer passes P1 silently, and
@@ -1354,7 +1388,7 @@ async fn the_new_statements_ran(admin: &ChClient, db: &str, prefix: &str) {
         .await
         .unwrap_or_else(|| panic!("P2: statement 1 must be recorded as {prefix}-1"));
     assert!(
-        text.contains(&format!("FROM {db}.traces")),
+        text.contains("FROM traces"),
         "P2: statement 1 must read the per-trace table, which the old point read cannot:\n{text}"
     );
 }
@@ -2860,6 +2894,62 @@ async fn a_trace_landed_by_three_pushes_across_buckets_and_a_day_boundary_fetche
             "every span's resource carries its service name, on both days"
         );
     }
+
+    // --- the control, with cross-partition final merging DISABLED ---
+    //
+    // **Measured, and it is why this control exists.** Under the fetch's
+    // own settings `FINAL` collapses this trace's three per-push rows
+    // into one BEFORE the statement's aggregate runs, and the collapse
+    // applies each column's own merge function — so over one already
+    // merged row `any(buckets)` returns the full union and `any(start_ns)`
+    // returns the true minimum, and NO assertion on the answer can tell
+    // the statement's own aggregates from an `any()`. On a two-row
+    // fixture: `any(start_ns), any(last_start_ns)` returned `100, 400`
+    // under the default and `300, 400` with the setting on, against
+    // `min, max`'s `100, 400` under both.
+    //
+    // So the statement's text is re-issued with the setting ON, where it
+    // sees three rows and the union is load-bearing. The bucket set is
+    // what this control holds: whichever single row an `any()` took, its
+    // own set is at most two of the four buckets and at least two spans
+    // are lost.
+    //
+    // **The EXTENT's own aggregation is not discriminated here**, and that
+    // is recorded rather than implied: the extent bounds the resource-day
+    // range only, this trace has ONE resource identity referenced on both
+    // days, and the push that straddles midnight carries a row whose own
+    // extent spans both — so a single-row extent can still cover
+    // everything. What holds the extent is
+    // `all_three_builders_are_byte_frozen`, which freezes `min(start_ns)`
+    // and `max(last_start_ns)` as text.
+    let recorded = recorded_statement(&admin, db.name(), &format!("{prefix}-1"))
+        .await
+        .expect("statement 1 is recorded");
+    let data = ch_data(db.name()).await;
+    let unmerged = format!(
+        "SELECT toUInt64(length(spans)) AS spans, toUInt64(bucket_count) AS resources \
+         FROM ({recorded}) \
+         SETTINGS final = 1, do_not_merge_across_partitions_select_final = 1"
+    );
+    let mut stream = data
+        .query_stream::<LengthsRow>(&unmerged, &QuerySettings::new())
+        .await
+        .expect("the control re-issue executes");
+    let got = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode the control row");
+    assert_eq!(
+        got,
+        LengthsRow {
+            spans: 6,
+            resources: 4
+        },
+        "the control: with the day rows unmerged the statement must still union \
+         FOUR buckets and return all SIX spans — an extent or a bucket set taken \
+         from one row gives at most two buckets and loses spans with them"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -3371,7 +3461,7 @@ struct LengthsRow {
 /// carries no format token — and asserting the ABSENCE means a future
 /// change that starts appending one reddens this case rather than silently
 /// changing the quantity measured.
-async fn statement_body_bytes(admin: &ChClient, recorded: &str) -> u64 {
+async fn statement_body_bytes(data: &ChClient, recorded: &str) -> u64 {
     assert!(
         !recorded.contains("FORMAT "),
         "production SQL carries no format token — the driver sends it as a URL \
@@ -3387,7 +3477,7 @@ async fn statement_body_bytes(admin: &ChClient, recorded: &str) -> u64 {
         "SELECT sum(b) AS n FROM (SELECT arrayJoin([byteSize(spans), byteSize(resources)]) AS b \
          FROM ({recorded}))"
     );
-    ch_count_with(admin, &sql, "final = 1").await
+    ch_count_with(data, &sql, "final = 1").await
 }
 
 async fn ch_count_with(client: &ChClient, sql: &str, settings: &str) -> u64 {
@@ -3407,12 +3497,12 @@ async fn ch_count_with(client: &ChClient, sql: &str, settings: &str) -> u64 {
 /// The two array cardinalities one statement returns, read by wrapping
 /// the recorded text — legitimate because both statements return exactly
 /// one row.
-async fn statement_lengths(admin: &ChClient, recorded: &str) -> LengthsRow {
+async fn statement_lengths(data: &ChClient, recorded: &str) -> LengthsRow {
     let sql = format!(
         "SELECT toUInt64(length(spans)) AS spans, toUInt64(length(resources)) AS resources \
          FROM ({recorded}) SETTINGS final = 1"
     );
-    let mut stream = admin
+    let mut stream = data
         .query_stream::<LengthsRow>(&sql, &QuerySettings::new())
         .await
         .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
@@ -3436,15 +3526,15 @@ async fn statement_lengths(admin: &ChClient, recorded: &str) -> LengthsRow {
 /// sides count the same rows.
 ///
 /// **It is a check and it changed nothing about what the fetch returns.**
-async fn stored_bytes_denominator(admin: &ChClient, db: &str, hex: &str) -> u64 {
+async fn stored_bytes_denominator(data: &ChClient, db: &str, hex: &str) -> u64 {
     let spans = ch_count_with(
-        admin,
+        data,
         &format!("SELECT sum(byteSize(*)) AS n FROM {db}.spans WHERE trace_id = unhex('{hex}')"),
         "final = 1",
     )
     .await;
     let resources = ch_count_with(
-        admin,
+        data,
         &format!(
             "SELECT sum(byteSize(*)) AS n FROM {db}.resources WHERE (service, resource_id) IN (\
                SELECT service, resource_id FROM {db}.spans WHERE trace_id = unhex('{hex}')\
@@ -3565,8 +3655,9 @@ async fn t_q3_the_fetch_statement_body_is_within_twice_the_stored_bytes() {
 
     // Assertion 2 — THE DISCRIMINATOR, and it does not depend on sizes at
     // all: a per-span resource shipping returns 40 and 40.
+    let data = ch_data(db.name()).await;
     assert_eq!(
-        statement_lengths(&admin, &recorded).await,
+        statement_lengths(&data, &recorded).await,
         LengthsRow {
             spans: 40,
             resources: 4
@@ -3576,8 +3667,8 @@ async fn t_q3_the_fetch_statement_body_is_within_twice_the_stored_bytes() {
 
     // Assertion 1 — the requirement's own bound, over the corrected
     // denominator.
-    let numerator = statement_body_bytes(&admin, &recorded).await;
-    let denominator = stored_bytes_denominator(&admin, db.name(), &hex32).await;
+    let numerator = statement_body_bytes(&data, &recorded).await;
+    let denominator = stored_bytes_denominator(&data, db.name(), &hex32).await;
     assert!(
         denominator > 0,
         "the denominator must be measured over a populated trace, got 0"
@@ -3593,7 +3684,7 @@ async fn t_q3_the_fetch_statement_body_is_within_twice_the_stored_bytes() {
     // the resource tuple must be more than 1.25x the span tuple, or the
     // ratio assertion above cannot see a tenfold duplication.
     let one_span = ch_count_with(
-        &admin,
+        &data,
         &format!(
             "SELECT sum(byteSize(*)) AS n FROM {db}.spans \
              WHERE trace_id = unhex('{hex32}') AND span_id = unhex('0101010101010101')",
@@ -3603,7 +3694,7 @@ async fn t_q3_the_fetch_statement_body_is_within_twice_the_stored_bytes() {
     )
     .await;
     let one_resource = ch_count_with(
-        &admin,
+        &data,
         &format!(
             "SELECT sum(byteSize(*)) AS n FROM {db}.resources WHERE service = 'svc-0'",
             db = db.name()
@@ -3644,9 +3735,7 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
     let _server = spawn_ready(port, &db);
     let admin = ch_admin().await;
     hold_the_fetch_tables(&admin, db.name()).await;
-    let data = ChClient::new(live_db::conn_config(db.name()))
-        .await
-        .expect("connect a data client");
+    let data = ch_data(db.name()).await;
 
     let tid = trace_id(0x0a);
     let hex32 = hex(&tid);
@@ -3714,7 +3803,7 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
 
     // (a) THE SUPPRESSION, and it is what makes the bound hold.
     assert_eq!(
-        statement_lengths(&admin, &first).await,
+        statement_lengths(&data, &first).await,
         LengthsRow {
             spans: 0,
             resources: 0
@@ -3768,7 +3857,7 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
         "(b3)(ii) four DISTINCT resource values across those forty groups"
     );
     assert_eq!(
-        statement_lengths(&admin, &second).await,
+        statement_lengths(&data, &second).await,
         LengthsRow {
             spans: 40,
             resources: 4
@@ -3782,8 +3871,8 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
     // certain, because (a) asserts a mechanism and (c) asserts the
     // requirement.
     let numerator =
-        statement_body_bytes(&admin, &first).await + statement_body_bytes(&admin, &second).await;
-    let denominator = stored_bytes_denominator(&admin, db.name(), &hex32).await;
+        statement_body_bytes(&data, &first).await + statement_body_bytes(&data, &second).await;
+    let denominator = stored_bytes_denominator(&data, db.name(), &hex32).await;
     assert!(
         denominator > 0,
         "the denominator must be measured over a populated trace, got 0"

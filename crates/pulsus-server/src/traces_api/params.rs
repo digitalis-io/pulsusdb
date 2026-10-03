@@ -59,12 +59,28 @@ pub(crate) fn parse_trace_id(raw: &str) -> Result<String, TraceIdError> {
 /// it would turn a harmless request into an error on a route that
 /// previously ignored these parameters altogether.
 ///
-/// STUB (issue #587): the window the fallback reads is the change.
 pub(crate) fn parse_fetch_window(
     query: Option<&str>,
 ) -> Result<Option<FetchWindow>, SearchParamError> {
-    let _ = query;
-    Ok(None)
+    let Some(raw) = query else {
+        return Ok(None);
+    };
+    let pairs = parse_pairs(raw);
+    let start = get(&pairs, "start").filter(|s| !s.is_empty());
+    let end = get(&pairs, "end").filter(|s| !s.is_empty());
+    let (Some(start), Some(end)) = (start, end) else {
+        return Ok(None);
+    };
+    // The same grammar as the search surface's — seconds, nanoseconds or
+    // RFC3339 — through the one parser, so the two endpoints cannot drift.
+    let start_ns = parse_timestamp_ns(start)
+        .ok_or_else(|| SearchParamError::InvalidTimestamp(start.to_string()))?;
+    let end_ns = parse_timestamp_ns(end)
+        .ok_or_else(|| SearchParamError::InvalidTimestamp(end.to_string()))?;
+    if end_ns <= start_ns {
+        return Ok(None);
+    }
+    Ok(Some(FetchWindow { start_ns, end_ns }))
 }
 
 /// Default `limit` when the param is absent (docs/api.md §4.2).
@@ -2054,6 +2070,79 @@ mod tests {
 
     fn pairs(raw: &str) -> Vec<(String, String)> {
         parse_pairs(raw)
+    }
+
+    /// Issue #587: the fetch routes' optional window.
+    ///
+    /// **Both bounds or neither**, because the window is read only by the
+    /// fallback and a half-open request has no window to answer over. An
+    /// empty or inverted one yields `None` rather than a refusal: the
+    /// indexed statement never reads the window, so the only thing a
+    /// window can do is ADD an answer, and a window that cannot contain a
+    /// span adds nothing.
+    #[test]
+    fn the_fetch_window_takes_both_bounds_or_neither() {
+        let ns = |s, e| {
+            Some(FetchWindow {
+                start_ns: s,
+                end_ns: e,
+            })
+        };
+        for (raw, want) in [
+            (None, None),
+            (Some(""), None),
+            (Some("limit=20"), None),
+            // one bound alone is the same as none
+            (Some("start=1699999999"), None),
+            (Some("end=1700000002"), None),
+            (Some("start=&end=1700000002"), None),
+            // seconds, the trace surface's own grammar
+            (
+                Some("start=1699999999&end=1700000002"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // nanoseconds, by magnitude
+            (
+                Some("start=1699999999000000000&end=1700000002000000000"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // RFC3339
+            (
+                Some("start=2023-11-14T22:13:19Z&end=2023-11-14T22:13:22Z"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // an empty window and an inverted one add nothing
+            (Some("start=1700000002&end=1700000002"), None),
+            (Some("start=1700000002&end=1699999999"), None),
+            // every other parameter is accepted and ignored
+            (
+                Some("limit=20&start=1699999999&end=1700000002&spss=3"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+        ] {
+            assert_eq!(
+                parse_fetch_window(raw).expect("a well-formed window"),
+                want,
+                "for {raw:?}"
+            );
+        }
+    }
+
+    /// A bound that is present and unparseable is a `400`, the same
+    /// refusal and the same message as the search surface's: accepting it
+    /// silently would answer over a window the caller did not ask for.
+    #[test]
+    fn an_unparseable_fetch_window_bound_is_refused() {
+        for raw in [
+            "start=yesterday&end=1700000002",
+            "start=1699999999&end=tomorrow",
+        ] {
+            let err = parse_fetch_window(Some(raw)).expect_err("a malformed bound is refused");
+            assert!(
+                matches!(err, SearchParamError::InvalidTimestamp(_)),
+                "for {raw}: got {err:?}"
+            );
+        }
     }
 
     /// Criterion 14. **The wording and the boundary are pinned together,

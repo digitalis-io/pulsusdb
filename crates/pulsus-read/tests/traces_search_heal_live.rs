@@ -189,6 +189,27 @@ fn now_ns() -> i64 {
 
 /// #139's L-T1 fixture, exactly: one span whose attr registration is
 /// poisoned on the first insert.
+/// One `count()`, for a durability probe on a table this suite writes
+/// directly.
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count(client: &ChClient, sql: &str) -> u64 {
+    use futures::StreamExt;
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("count failed: {e}\nSQL:\n{sql}"));
+    stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("no row for:\n{sql}"))
+        .unwrap_or_else(|e| panic!("decode count row: {e}"))
+        .n
+}
+
 fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
     ParsedTraces {
         spans: vec![SpanRecord {
@@ -374,20 +395,30 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     // #139 backfill exists to heal, now stated through the executor.
     assert_eq!(attrs.forwarded(), 0);
     assert_eq!(writer.metrics().attrs_backfill.healed_total, 0);
-    let mut committed_spans = Vec::new();
+    // **A direct count on the table this suite writes**, not a fetch
+    // (issue #587). The fixture drives the writer's `ParsedTraces` path,
+    // which writes the old span table and the attribute index and
+    // nothing else; the trace fetch now reads the span, per-trace and
+    // resource tables, so it would answer nothing here for a reason that
+    // is not this case's subject. What the case needs is "the span row
+    // committed", and that is the count below.
+    let mut committed = 0u64;
     for _ in 0..150 {
-        committed_spans = engine
-            .fetch_by_id(TRACE_ID_HEX, None)
-            .await
-            .expect("the fetch executes")
-            .spans;
-        if !committed_spans.is_empty() {
+        committed = count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM {db}.trace_spans \
+                 WHERE trace_id = unhex('{TRACE_ID_HEX}') \
+                   AND span_id = unhex('0a0a0a0a0a0a0a0a')"
+            ),
+        )
+        .await;
+        if committed > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(committed_spans.len(), 1, "the span committed");
-    assert_eq!(committed_spans[0].span_id, SPAN_ID);
+    assert_eq!(committed, 1, "the span committed");
     let pre_heal = engine
         .search(&plan)
         .await

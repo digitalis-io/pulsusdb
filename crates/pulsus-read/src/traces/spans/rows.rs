@@ -231,6 +231,20 @@ impl FetchedTrace {
     }
 }
 
+/// Reads the next element of a tuple, naming the element that is missing
+/// rather than reporting a bare length error.
+fn element<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(
+    seq: &mut A,
+    tuple: &'static str,
+    field: &'static str,
+) -> Result<T, A::Error> {
+    seq.next_element::<T>()?.ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "the {tuple} tuple ended before its `{field}` element"
+        ))
+    })
+}
+
 /// The element counts the four nested tuple types declare, named once so
 /// the deserializers, the serializers and the cases read the same numbers.
 pub const SPAN_TUPLE_ELEMENTS: usize = 25;
@@ -270,11 +284,19 @@ impl<'de> Visitor<'de> for EventVisitor {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // STUB (issue #587): the hand-written element walk is the change.
-        let _ = &mut seq;
-        Err(serde::de::Error::custom(
-            "the fetched-row deserializers are not implemented",
-        ))
+        const T: &str = "span-event";
+        Ok(FetchedEventTuple {
+            // `UInt64` since the write side stopped saturating it: a read
+            // at the old signed width would turn a value above the signed
+            // maximum into a negative one.
+            time_ns: element(&mut seq, T, "time_ns")?,
+            name: element(&mut seq, T, "name")?,
+            attrs: element(&mut seq, T, "attrs")?,
+            // The byte path: a plain byte vector would demand an array of
+            // integers and the fetch would be refused.
+            attrs_other: element::<_, ByteBuf>(&mut seq, T, "attrs_other")?,
+            dropped_attrs: element(&mut seq, T, "dropped_attrs")?,
+        })
     }
 }
 
@@ -312,11 +334,18 @@ impl<'de> Visitor<'de> for LinkVisitor {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // STUB (issue #587).
-        let _ = &mut seq;
-        Err(serde::de::Error::custom(
-            "the fetched-row deserializers are not implemented",
-        ))
+        const T: &str = "span-link";
+        Ok(FetchedLinkTuple {
+            // Both ids are `String` columns holding whatever bytes the
+            // sender sent, so both take the byte path.
+            trace_id: element::<_, ByteBuf>(&mut seq, T, "trace_id")?,
+            span_id: element::<_, ByteBuf>(&mut seq, T, "span_id")?,
+            trace_state: element(&mut seq, T, "trace_state")?,
+            flags: element(&mut seq, T, "flags")?,
+            attrs: element(&mut seq, T, "attrs")?,
+            attrs_other: element::<_, ByteBuf>(&mut seq, T, "attrs_other")?,
+            dropped_attrs: element(&mut seq, T, "dropped_attrs")?,
+        })
     }
 }
 
@@ -372,11 +401,37 @@ impl<'de> Visitor<'de> for SpanVisitor {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // STUB (issue #587).
-        let _ = &mut seq;
-        Err(serde::de::Error::custom(
-            "the fetched-row deserializers are not implemented",
-        ))
+        const T: &str = "span";
+        Ok(FetchedSpanTuple {
+            span_id: element(&mut seq, T, "span_id")?,
+            parent_span_id: element(&mut seq, T, "parent_span_id")?,
+            start_ns: element(&mut seq, T, "start_ns")?,
+            end_ns: element(&mut seq, T, "end_ns")?,
+            service: element(&mut seq, T, "service")?,
+            resource_id: element(&mut seq, T, "resource_id")?,
+            name: element(&mut seq, T, "name")?,
+            // The protocol's own signed values. A read at the old
+            // unsigned byte width would refuse the row, and a read at a
+            // narrower signed one would truncate silently.
+            kind: element(&mut seq, T, "kind")?,
+            status_code: element(&mut seq, T, "status_code")?,
+            status_message: element(&mut seq, T, "status_message")?,
+            trace_state: element(&mut seq, T, "trace_state")?,
+            flags: element(&mut seq, T, "flags")?,
+            scope_name: element(&mut seq, T, "scope_name")?,
+            scope_version: element(&mut seq, T, "scope_version")?,
+            scope_attrs: element(&mut seq, T, "scope_attrs")?,
+            attrs: element(&mut seq, T, "attrs")?,
+            attrs_other: element::<_, ByteBuf>(&mut seq, T, "attrs_other")?,
+            dropped_attrs: element(&mut seq, T, "dropped_attrs")?,
+            events: element(&mut seq, T, "events")?,
+            dropped_events: element(&mut seq, T, "dropped_events")?,
+            links: element(&mut seq, T, "links")?,
+            dropped_links: element(&mut seq, T, "dropped_links")?,
+            scope_schema_url: element(&mut seq, T, "scope_schema_url")?,
+            scope_dropped_attrs: element(&mut seq, T, "scope_dropped_attrs")?,
+            scope_attrs_other: element::<_, ByteBuf>(&mut seq, T, "scope_attrs_other")?,
+        })
     }
 }
 
@@ -413,11 +468,15 @@ impl<'de> Visitor<'de> for ResourceVisitor {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // STUB (issue #587).
-        let _ = &mut seq;
-        Err(serde::de::Error::custom(
-            "the fetched-row deserializers are not implemented",
-        ))
+        const T: &str = "resource";
+        Ok(FetchedResourceTuple {
+            resource_id: element(&mut seq, T, "resource_id")?,
+            attrs: element(&mut seq, T, "attrs")?,
+            attrs_other: element::<_, ByteBuf>(&mut seq, T, "attrs_other")?,
+            dropped_attrs: element(&mut seq, T, "dropped_attrs")?,
+            schema_url: element(&mut seq, T, "schema_url")?,
+            entity_refs: element::<_, ByteBuf>(&mut seq, T, "entity_refs")?,
+        })
     }
 }
 

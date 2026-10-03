@@ -120,10 +120,18 @@ impl TraceDispatch {
     /// The caller's settings with this statement's own `query_id` added
     /// when a prefix is set, and untouched when none is.
     ///
-    /// STUB (issue #587): the stamp itself is the change.
+    /// The counter is read with `fetch_add`, so two concurrent reads
+    /// through one engine get two ids; the suffix counts from 1, which is
+    /// what makes a request's first statement `<prefix>-1`.
     fn stamped(&self, settings: &QuerySettings) -> QuerySettings {
-        let _ = (&self.statement_prefix, &self.statement_seq);
-        settings.clone()
+        let Some(prefix) = &self.statement_prefix else {
+            return settings.clone();
+        };
+        let n = self
+            .statement_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        settings.clone().set("query_id", format!("{prefix}-{n}"))
     }
 }
 

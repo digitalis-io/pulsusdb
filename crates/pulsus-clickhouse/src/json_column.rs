@@ -49,6 +49,7 @@
 
 use std::fmt;
 
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, SerializeTuple};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -436,18 +437,363 @@ impl Serialize for TraceJson {
     }
 }
 
-/// **Refuses, always.** `pulsus_clickhouse::ChRow` requires
-/// `DeserializeOwned`, and nothing on this path reads a landing row back
-/// through the driver: the landing table is written and the five targets are
-/// read through their own column lists. An implementation that returned a
-/// value would be a decoder nothing exercises, which is worse than one that
-/// says so.
+/// The decoder (issue #587), and the whole of the column's read side.
+///
+/// **Every level reads exactly two elements**, so no level under-reads a
+/// declared tuple arity:
+///
+/// ```text
+/// TraceJson        deserialize_seq       -> LEB128 path count, then N entries
+/// TraceJsonEntry   deserialize_tuple(2)  -> (String path, TraceJsonValue)
+/// TraceJsonValue   deserialize_tuple(2)  -> (u8 tag, body-by-seed)
+///    tag 0x15 String   body = String
+///    tag 0x2d Bool     body = u8, 0 or 1
+///    tag 0x0a Int64    body = i64
+///    tag 0x0e Float64  body = f64
+///    tag 0x1e Array    body = deserialize_tuple(2) -> (u8 kind, elements-by-seed)
+///         kind 0x23 Nullable  -> (u8 elem tag, Vec<(u8 NOT_NULL, T)>)
+///         kind 0x2b Dynamic   -> (u8 max_types, Vec<TraceJsonValue>)
+///    any other tag     -> Err
+/// ```
+///
+/// The body is read through [`serde::de::DeserializeSeed`], which is what
+/// lets the tag decide the next read inside one `visit_seq`. **Nothing
+/// inside the column is validated by the driver**
+/// (`vendor/clickhouse/PATCHES.md` section 3 states that as the patch's
+/// limit), so this decoder owns every byte.
+///
+/// **The domain is the WRITER's range, not the column type's.** The tags
+/// above are exactly the set [`TraceJsonValue`] and [`TraceJsonScalar`]
+/// can produce. A `JSON` column can hold more and nothing in this
+/// workspace writes it, so **a tag outside the set is an error, not a
+/// default**: the message names the tag byte and the path.
+///
+/// **The order is the column's**, not sorted: reconstructing an OTLP key
+/// order is the response assembler's, and this returns what the column
+/// holds.
 impl<'de> Deserialize<'de> for TraceJson {
-    fn deserialize<D: Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(
-            "a JSON column is written by this encoder and never read back through it",
-        ))
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_seq(ColumnVisitor)
     }
+}
+
+struct ColumnVisitor;
+
+impl<'de> Visitor<'de> for ColumnVisitor {
+    type Value = TraceJson;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON column: a path count then one (path, tagged value) per path")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut entries = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(entry) = seq.next_element::<TraceJsonEntry>()? {
+            entries.push(entry);
+        }
+        Ok(TraceJson(entries))
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceJsonEntry {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(2, EntryVisitor)
+    }
+}
+
+struct EntryVisitor;
+
+impl<'de> Visitor<'de> for EntryVisitor {
+    type Value = TraceJsonEntry;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a stored path and its tagged value")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let path: String = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("a JSON column entry with no path"))?;
+        // The path is read FIRST so a bad value can name it: a `500` that
+        // says only "unknown tag" tells an operator nothing about which
+        // attribute to look at.
+        let value = seq
+            .next_element::<TraceJsonValue>()
+            .map_err(|e| serde::de::Error::custom(format!("json column path {path:?}: {e}")))?
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!("json column path {path:?} carries no value"))
+            })?;
+        Ok(TraceJsonEntry { path, value })
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceJsonValue {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(2, ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = TraceJsonValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a Dynamic type tag and its value")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let tag: u8 = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("a Dynamic value with no type tag"))?;
+        seq.next_element_seed(ValueBody { tag })?
+            .ok_or_else(|| serde::de::Error::custom("a Dynamic tag with no value after it"))
+    }
+}
+
+/// The seed the tag chooses: it decides which read comes next, inside the
+/// same `visit_seq`.
+struct ValueBody {
+    tag: u8,
+}
+
+impl<'de> DeserializeSeed<'de> for ValueBody {
+    type Value = TraceJsonValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        match self.tag {
+            TAG_STRING => Ok(TraceJsonValue::Scalar(TraceJsonScalar::Str(
+                String::deserialize(d)?,
+            ))),
+            TAG_BOOL => Ok(TraceJsonValue::Scalar(TraceJsonScalar::Bool(read_bool(
+                u8::deserialize(d)?,
+            )?))),
+            TAG_INT64 => Ok(TraceJsonValue::Scalar(TraceJsonScalar::Int(
+                i64::deserialize(d)?,
+            ))),
+            TAG_FLOAT64 => Ok(TraceJsonValue::Scalar(TraceJsonScalar::Double(
+                f64::deserialize(d)?,
+            ))),
+            TAG_ARRAY => d.deserialize_tuple(2, ArrayVisitor),
+            other => Err(unknown_tag(other)),
+        }
+    }
+}
+
+/// A scalar body of the tag's own type, for an `Array(Nullable(T))`'s
+/// declared element type.
+struct NullableElements {
+    elem_tag: u8,
+}
+
+impl<'de> DeserializeSeed<'de> for NullableElements {
+    type Value = TraceJsonValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        match self.elem_tag {
+            TAG_STRING => {
+                let v = Vec::<NotNullElement<String>>::deserialize(d)?;
+                // **An EMPTY `Array(Nullable(String))` is the empty-array
+                // arm**, not an empty string array. The encoder stores
+                // both as the same four bytes, because an empty array
+                // carries no element type on the wire, and the arm the
+                // captured frame was taken from is the empty one.
+                if v.is_empty() {
+                    return Ok(TraceJsonValue::EmptyArray);
+                }
+                Ok(TraceJsonValue::StrArray(
+                    v.into_iter().map(|e| e.0).collect(),
+                ))
+            }
+            TAG_INT64 => Ok(TraceJsonValue::IntArray(
+                Vec::<NotNullElement<i64>>::deserialize(d)?
+                    .into_iter()
+                    .map(|e| e.0)
+                    .collect(),
+            )),
+            TAG_FLOAT64 => Ok(TraceJsonValue::DoubleArray(
+                Vec::<NotNullElement<f64>>::deserialize(d)?
+                    .into_iter()
+                    .map(|e| e.0)
+                    .collect(),
+            )),
+            TAG_BOOL => {
+                let raw = Vec::<NotNullElement<u8>>::deserialize(d)?;
+                let mut out = Vec::with_capacity(raw.len());
+                for e in raw {
+                    out.push(read_bool(e.0)?);
+                }
+                Ok(TraceJsonValue::BoolArray(out))
+            }
+            other => Err(unknown_tag(other)),
+        }
+    }
+}
+
+/// The elements of an `Array(Dynamic)`: each carries its own tag, so each
+/// is a whole [`TraceJsonValue`] read.
+struct DynamicElements;
+
+impl<'de> DeserializeSeed<'de> for DynamicElements {
+    type Value = TraceJsonValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        let values = Vec::<TraceJsonValue>::deserialize(d)?;
+        let mut out = Vec::with_capacity(values.len());
+        for value in values {
+            match value {
+                TraceJsonValue::Scalar(s) => out.push(s),
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "a mixed array's element is not a scalar: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(TraceJsonValue::MixedArray(out))
+    }
+}
+
+struct ArrayVisitor;
+
+impl<'de> Visitor<'de> for ArrayVisitor {
+    type Value = TraceJsonValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array's element-type prefix and its elements")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let kind: u8 = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("an array with no element-type prefix"))?;
+        match kind {
+            TAG_NULLABLE => seq
+                .next_element_seed(NullableArray)?
+                .ok_or_else(|| serde::de::Error::custom("a nullable array with no elements")),
+            TAG_DYNAMIC => seq
+                .next_element_seed(DynamicArray)?
+                .ok_or_else(|| serde::de::Error::custom("a dynamic array with no elements")),
+            other => Err(unknown_tag(other)),
+        }
+    }
+}
+
+/// `Array(Nullable(T))`: the element type's own tag, then the elements.
+struct NullableArray;
+
+impl<'de> DeserializeSeed<'de> for NullableArray {
+    type Value = TraceJsonValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_tuple(2, NullableArrayVisitor)
+    }
+}
+
+struct NullableArrayVisitor;
+
+impl<'de> Visitor<'de> for NullableArrayVisitor {
+    type Value = TraceJsonValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a nullable array's element tag and its elements")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let elem_tag: u8 = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("a nullable array with no element tag"))?;
+        seq.next_element_seed(NullableElements { elem_tag })?
+            .ok_or_else(|| serde::de::Error::custom("a nullable array with no element sequence"))
+    }
+}
+
+/// `Array(Dynamic(max_types=N))`: the declared `max_types`, then the
+/// elements.
+struct DynamicArray;
+
+impl<'de> DeserializeSeed<'de> for DynamicArray {
+    type Value = TraceJsonValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_tuple(2, DynamicArrayVisitor)
+    }
+}
+
+struct DynamicArrayVisitor;
+
+impl<'de> Visitor<'de> for DynamicArrayVisitor {
+    type Value = TraceJsonValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a dynamic array's max_types and its elements")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        // `max_types` is read and discarded: it is the column's own
+        // declaration, not a value, and the encoder writes one constant.
+        let _max_types: u8 = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("a dynamic array with no max_types"))?;
+        seq.next_element_seed(DynamicElements)?
+            .ok_or_else(|| serde::de::Error::custom("a dynamic array with no element sequence"))
+    }
+}
+
+/// One element of an `Array(Nullable(T))` on the way back: the not-null
+/// marker, then the value with no tag of its own.
+///
+/// The mirror of the encoder's own element type, and a `NULL` element is
+/// refused rather than mapped to anything — this encoder writes none, so a
+/// null here means the column was written by something else.
+struct NotNullElement<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NotNullElement<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(2, NotNullElementVisitor(std::marker::PhantomData))
+    }
+}
+
+struct NotNullElementVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for NotNullElementVisitor<T> {
+    type Value = NotNullElement<T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a not-null marker and a value")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let marker: u8 = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("an array element with no null marker"))?;
+        if marker != NOT_NULL {
+            return Err(serde::de::Error::custom(format!(
+                "a NULL array element (marker {marker:#04x}); this encoder writes none"
+            )));
+        }
+        let value: T = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::custom("an array element with no value"))?;
+        Ok(NotNullElement(value))
+    }
+}
+
+/// A stored boolean is one byte and only `0` or `1` is a boolean.
+fn read_bool<E: serde::de::Error>(raw: u8) -> Result<bool, E> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(serde::de::Error::custom(format!(
+            "a Bool value that is neither 0 nor 1: {other:#04x}"
+        ))),
+    }
+}
+
+/// A type tag outside the writer's range. **An error, not a default** —
+/// the caller wraps it with the path.
+fn unknown_tag<E: serde::de::Error>(tag: u8) -> E {
+    serde::de::Error::custom(format!("unexpected JSON value type tag {tag:#04x}"))
 }
 
 impl fmt::Display for TraceJson {
@@ -516,8 +862,10 @@ pub fn escape_json_path(key: &str) -> String {
 /// `http.route`; unescaping it first produces `http.route` and a splitter
 /// then reports a two-level kvlist the sender never sent.
 pub fn unescape_json_path(segment: &str) -> String {
-    // STUB (issue #587): the real inverse is two ordered replacements.
-    segment.to_string()
+    if !segment.contains('%') {
+        return segment.to_string();
+    }
+    segment.replace("%2E", ".").replace("%25", "%")
 }
 
 /// The bytes LEB128 takes for `n`.
