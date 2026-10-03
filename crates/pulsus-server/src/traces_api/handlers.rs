@@ -25,7 +25,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use pulsus_read::TraceEngine;
+use pulsus_read::{FetchRoute, TraceEngine};
 
 use crate::app::AppState;
 use crate::chconfig;
@@ -194,6 +194,10 @@ fn report_missing_resources(state: &AppState, missing: u64) {
     crate::ops::record_fetch_missing_resources(missing);
 }
 
+/// Empty stub — this is the cases-first commit.
+#[allow(dead_code)]
+fn report_fetch_route(_route: FetchRoute) {}
+
 /// `GET /api/v2/traces/{traceId}` (issue #474) — the fourteenth compat
 /// alias. Same order of operations as [`trace_by_id_impl`] (pool, then id
 /// parse, then fetch) so error precedence matches the v1 alias exactly;
@@ -332,5 +336,149 @@ mod tests {
         let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "clickhouse pool not yet established");
+    }
+
+    /// A valid 32-char hex id, so every case below reaches past
+    /// `parse_trace_id`.
+    const VALID_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// The three fetch entry points, called with one id and one query
+    /// string. Returns the route's label beside its response so a failure
+    /// names which one.
+    async fn each_route(id: &str, query: Option<&str>) -> Vec<(&'static str, Response)> {
+        let q = query.map(str::to_string);
+        vec![
+            (
+                "v1",
+                trace_by_id(
+                    State(test_state()),
+                    Path(id.to_string()),
+                    RawQuery(q.clone()),
+                    HeaderMap::new(),
+                )
+                .await,
+            ),
+            (
+                "v1/json",
+                trace_by_id_json(
+                    State(test_state()),
+                    Path(id.to_string()),
+                    RawQuery(q.clone()),
+                    HeaderMap::new(),
+                )
+                .await,
+            ),
+            (
+                "v2",
+                trace_by_id_v2(
+                    State(test_state()),
+                    Path(id.to_string()),
+                    RawQuery(q),
+                    HeaderMap::new(),
+                )
+                .await,
+            ),
+        ]
+    }
+
+    /// Issue #587, the documented response-header contract (docs/api.md
+    /// §4.1: *"Every response from the fetch routes … carries
+    /// `X-Pulsus-Query-Id`"*). **Every** includes the errors, and they
+    /// are the cases the header is most use for: an operator chasing a
+    /// `500` or an empty `404` wants that request's own `query_log` rows,
+    /// and on a `400` or a `503` the prefix correctly names an empty set
+    /// rather than someone else's statements.
+    ///
+    /// Three error shapes are reachable with no pool and no server — a
+    /// malformed id, a malformed window and the unavailable pool — across
+    /// all three entry points, which is nine responses from one case.
+    #[tokio::test]
+    async fn every_fetch_error_response_carries_the_query_id_header() {
+        let cases: [(&str, &str, Option<&str>, StatusCode); 3] = [
+            ("malformed id", "nothex", None, StatusCode::BAD_REQUEST),
+            (
+                "malformed window",
+                VALID_ID,
+                Some("start=yesterday"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "pool unavailable",
+                VALID_ID,
+                None,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (shape, id, query, want_status) in cases {
+            for (route, res) in each_route(id, query).await {
+                let where_ = format!("{route} / {shape}");
+                assert_eq!(res.status(), want_status, "status for {where_}");
+                let got = res
+                    .headers()
+                    .get(QUERY_ID_HEADER)
+                    .unwrap_or_else(|| panic!("no {QUERY_ID_HEADER} on {where_}"))
+                    .to_str()
+                    .unwrap_or_else(|e| panic!("non-ascii header on {where_}: {e}"))
+                    .to_string();
+                assert_eq!(got.len(), 32, "prefix width on {where_}: {got:?}");
+                assert!(
+                    got.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "prefix is not 32 lowercase hex chars on {where_}: {got:?}"
+                );
+            }
+        }
+    }
+
+    /// A malformed bound is a `400` **at the route**, not just in the
+    /// parser — the route test the parser's own case cannot stand in for,
+    /// because the handler decides the order of validation against the
+    /// pool acquisition. A lone bound is included: it is the shape a
+    /// half-filled time control sends.
+    #[tokio::test]
+    async fn a_malformed_fetch_bound_is_a_400_on_every_fetch_route() {
+        for query in [
+            "start=yesterday",
+            "end=tomorrow",
+            "start=yesterday&end=1700000002",
+            "start=1699999999&end=tomorrow",
+            "start=yesterday&end=",
+        ] {
+            for (route, res) in each_route(VALID_ID, Some(query)).await {
+                let status = res.status();
+                let (_, body) = error_body(res).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{route} / {query:?}");
+                assert!(
+                    body.starts_with("invalid timestamp"),
+                    "{route} / {query:?}: body {body:?}"
+                );
+            }
+        }
+    }
+
+    /// §3.4's truncated-set counter, and the route flag that carries it
+    /// (§3.4a). One sub-case per `FetchRoute` arm, because a counter that
+    /// fires on every route reports nothing: the whole point is that a
+    /// trace occupying 4,096 or more buckets took the complete-predicate
+    /// route, and `statements == 2` cannot say so — the window fallback
+    /// gives 2 as well.
+    #[test]
+    fn only_the_truncated_set_route_increments_its_counter() {
+        for (route, want) in [
+            (FetchRoute::Indexed, 0u64),
+            (FetchRoute::TruncatedSet, 1u64),
+            (FetchRoute::Fallback, 0u64),
+        ] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || report_fetch_route(route));
+            let rendered = handle.render();
+            let got: u64 = rendered
+                .lines()
+                .find_map(|l| l.strip_prefix("pulsus_trace_fetch_truncated_set_total "))
+                .map(|v| v.trim().parse().expect("an integer counter value"))
+                .unwrap_or(0);
+            assert_eq!(got, want, "for {route:?}, rendered:\n{rendered}");
+        }
     }
 }

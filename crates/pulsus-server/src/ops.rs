@@ -155,6 +155,10 @@ pub(crate) fn record_fetch_missing_resources(missing: u64) {
     metrics::counter!("pulsus_trace_fetch_missing_resources_total").increment(missing);
 }
 
+/// Empty stub — this is the cases-first commit.
+#[allow(dead_code)]
+pub(crate) fn record_fetch_truncated_set() {}
+
 fn record_label_cache_metrics(cache: &LabelCache) {
     let snap = cache.metrics();
     metrics::gauge!("pulsus_label_cache_series_count").set(snap.series_count as f64);
@@ -1213,6 +1217,43 @@ mod tests {
             &text,
             r#"pulsus_ingest_queue_bytes{signal="traces"}"#,
             256.0,
+        );
+    }
+
+    /// Issue #587 §3.4: the trace fetch adds **two** counters to this
+    /// surface, and both are named and typed here so a rename or a
+    /// gauge-for-counter slip is a failing case rather than a dashboard
+    /// that silently stops drawing. Each is asserted at the value it was
+    /// given, not just for presence — a counter wired to the wrong
+    /// argument would still be present.
+    ///
+    /// Zero is a sub-case for the missing-resource counter on purpose: a
+    /// fetch with every resource row present must emit no sample at all,
+    /// because a flat zero series on every scrape is what makes the
+    /// non-zero one invisible.
+    #[test]
+    fn the_two_trace_fetch_counters_are_named_and_typed() {
+        let rendered = render_local(|| {
+            record_fetch_missing_resources(3);
+            record_fetch_truncated_set();
+        });
+        assert_sample(&rendered, "pulsus_trace_fetch_missing_resources_total", 3.0);
+        assert_type(
+            &rendered,
+            "pulsus_trace_fetch_missing_resources_total",
+            "counter",
+        );
+        assert_sample(&rendered, "pulsus_trace_fetch_truncated_set_total", 1.0);
+        assert_type(
+            &rendered,
+            "pulsus_trace_fetch_truncated_set_total",
+            "counter",
+        );
+
+        let quiet = render_local(|| record_fetch_missing_resources(0));
+        assert!(
+            !quiet.contains("pulsus_trace_fetch_missing_resources_total"),
+            "a zero missing-resource count emitted a series:\n{quiet}"
         );
     }
 

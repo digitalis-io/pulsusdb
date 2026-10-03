@@ -3866,6 +3866,21 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
          which is what `shipped once per resource` actually means"
     );
 
+    // (b4) §3.4's truncated-set counter, read off this server's own
+    // `/metrics` after the one fetch that took the route. It is the only
+    // signal an operator gets that a trace occupied 4,096 or more buckets
+    // and so paid for two statements — `statements == 2` cannot say so,
+    // because the window fallback gives 2 as well. Asserted at `1` rather
+    // than for presence: this spawn served exactly one fetch.
+    let scrape = get(port, "/metrics", "the truncated-set counter scrape");
+    let rendered = String::from_utf8_lossy(&scrape.body).into_owned();
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l == "pulsus_trace_fetch_truncated_set_total 1"),
+        "(b4) the truncated-set counter must report this fetch, /metrics body:\n{rendered}"
+    );
+
     // (c) the requirement, over the SUM of the two bodies and over THIS
     // fixture's own trace id. Taken even though (a) makes it near
     // certain, because (a) asserts a mechanism and (c) asserts the

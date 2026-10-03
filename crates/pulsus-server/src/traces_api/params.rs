@@ -2131,11 +2131,29 @@ mod tests {
     /// A bound that is present and unparseable is a `400`, the same
     /// refusal and the same message as the search surface's: accepting it
     /// silently would answer over a window the caller did not ask for.
+    ///
+    /// **A LONE malformed bound is refused too**, and that is the half
+    /// this case exists for. "Both bounds or neither" decides which
+    /// window to *answer over*; it was never a licence to stop *reading*
+    /// a bound the caller supplied. A lone `start=yesterday` discarded in
+    /// silence is the same wrong as a pair with one bad half — the caller
+    /// asked for a window and got an answer over a different one — and it
+    /// is the likelier shape, because a half-filled time control sends
+    /// one bound.
     #[test]
     fn an_unparseable_fetch_window_bound_is_refused() {
         for raw in [
             "start=yesterday&end=1700000002",
             "start=1699999999&end=tomorrow",
+            // lone, with no partner at all
+            "start=yesterday",
+            "end=tomorrow",
+            // lone, with an empty partner — the empty value is discarded
+            // as absent, so this is the lone case by a second route
+            "start=yesterday&end=",
+            "start=&end=tomorrow",
+            // the supplied bound is read whatever else the query carries
+            "limit=20&start=yesterday&spss=3",
         ] {
             let err = parse_fetch_window(Some(raw)).expect_err("a malformed bound is refused");
             assert!(

@@ -155,6 +155,28 @@ impl RawResponse {
     }
 }
 
+/// Issue #587: the 32-lowercase-hex statement-id prefix the fetch routes
+/// return, asserted off a response over loopback HTTP.
+///
+/// **It is asserted on the ERROR responses, not only the `200`.**
+/// docs/api.md §4.1 says every response from these routes carries it, and
+/// an operator chasing a `404` or a `500` through `system.query_log` needs
+/// that request's own prefix more than a successful caller does. A header
+/// that appears only when the request worked is one a test cannot rely on
+/// either.
+fn assert_query_id(res: &RawResponse, ctx: &str) {
+    let got = res
+        .headers
+        .get("x-pulsus-query-id")
+        .unwrap_or_else(|| panic!("{ctx}: no X-Pulsus-Query-Id, headers {:?}", res.headers));
+    assert_eq!(got.len(), 32, "{ctx}: prefix width, got {got:?}");
+    assert!(
+        got.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{ctx}: prefix is not 32 lowercase hex chars, got {got:?}"
+    );
+}
+
 /// Token-matches `accept` in the (comma-joined) `Vary` header — never a
 /// substring check, since `accept-encoding` (the compression layer's own
 /// `Vary` contribution) contains `accept` as a substring but is a distinct
@@ -895,6 +917,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         "{ctx}: {body:?}"
     );
     assert!(has_vary_accept(&res), "{ctx}: 406 must Vary: accept");
+    assert_query_id(&res, ctx);
 
     // -- Absent + malformed ids.
     let ctx = "GET absent trace";
@@ -902,6 +925,10 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let body = assert_error_body(&res, 404, ctx);
     assert!(body.contains("trace not found"), "{ctx}: {body:?}");
     assert!(has_vary_accept(&res), "{ctx}: 404 must Vary: accept");
+    // The not-found response, over HTTP: this is the one the hermetic
+    // handler case cannot reach, because a 404 needs a pool and a read
+    // that found nothing.
+    assert_query_id(&res, ctx);
 
     let ctx = "GET malformed trace id";
     let res = get(PORT, &fetch_path("zzzz"), &[], ctx);
@@ -911,6 +938,21 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         "{ctx}: {body:?}"
     );
     assert!(has_vary_accept(&res), "{ctx}: 400 must Vary: accept");
+    assert_query_id(&res, ctx);
+
+    // -- A malformed LONE request bound: the window is read on this route
+    // too, and a bound the caller supplied is parsed whether or not its
+    // partner arrived (docs/api.md §4.1).
+    let ctx = "GET with a malformed lone start";
+    let res = get(
+        PORT,
+        &format!("{}?start=yesterday", fetch_path(&a_hex)),
+        &[],
+        ctx,
+    );
+    let body = assert_error_body(&res, 400, ctx);
+    assert!(body.contains("invalid timestamp"), "{ctx}: {body:?}");
+    assert_query_id(&res, ctx);
 
     // -- Dedup: ingest the same span twice, fetch returns it once.
     let trace_b = [0xbb; 16];
