@@ -2930,3 +2930,287 @@ async fn drop_user(admin: &ChClient, user: &str) {
         .await
         .expect("drop the capped user");
 }
+
+// === Issue #587: the values #586's definitions could not hold ==============
+
+/// One request whose single `ScopeSpans` carries its own `schema_url` and
+/// whose scope carries its own dropped count, which
+/// [`request_with`] cannot express.
+fn request_with_scope_spans(
+    service: &str,
+    spans: Vec<Span>,
+    scope: Option<InstrumentationScope>,
+    scope_schema_url: &str,
+) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", str_value(service))],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope,
+                spans,
+                schema_url: scope_schema_url.to_string(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// **W-1 (issue #587 rows 1, 2 and 3).** A scope's schema url, its own
+/// dropped-attribute count and an attribute of its whose value no JSON path
+/// can hold are all stored.
+///
+/// Each is its own column and its own assertion. Without
+/// `#[serde(with = "serde_bytes")]` on `scope_attrs_other` the **insert**
+/// fails rather than the comparison — serde's default `Vec<u8>` path
+/// targets `Array(UInt8)` — so this case cannot be green with a sequence
+/// encoding either.
+#[tokio::test]
+async fn w1_the_scope_schema_url_dropped_count_and_unstorable_attribute_are_stored() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_w1")).await;
+
+    let r = try_land(
+        &client,
+        &request_with_scope_spans(
+            "checkout",
+            vec![span_with(0xb1, 0x11, Vec::new())],
+            Some(InstrumentationScope {
+                name: "io.otel.http".to_string(),
+                version: "1.4.2".to_string(),
+                attributes: vec![kv("scope.blob", bytes_value(&[0xde, 0xad, 0xbe, 0xef]))],
+                dropped_attributes_count: 11,
+            }),
+            "https://example.invalid/scope",
+        ),
+    )
+    .await;
+    assert!(r.is_ok(), "the landing insert returned {:?}", r.err());
+
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT concat(scope_schema_url, '|', toString(scope_dropped_attrs)) AS s FROM spans"
+        )
+        .await,
+        "https://example.invalid/scope|11",
+        "the scope's own schema url and dropped count"
+    );
+
+    // The scope's unstorable attribute, under its ORIGINAL OTLP key, in the
+    // same `KeyValueList` carrier the span's own `attrs_other` uses.
+    let carrier = blob(&client, "SELECT scope_attrs_other AS b FROM spans").await;
+    let decoded = KeyValueList::decode(carrier.as_slice()).expect("a KeyValueList");
+    assert_eq!(decoded.values.len(), 1, "one entry: {decoded:?}");
+    assert_eq!(decoded.values[0].key, "scope.blob");
+    assert_eq!(
+        decoded.values[0].value,
+        Some(bytes_value(&[0xde, 0xad, 0xbe, 0xef])),
+        "the bytes the sender sent"
+    );
+
+    // And the storable scope attributes are untouched beside it.
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM tag_names \
+             WHERE scope = 'instrumentation' AND key = 'scope.blob'"
+        )
+        .await,
+        1,
+        "a key whose value went to `attrs_other` is still catalogued"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **W-2 (issue #587 row 4, and half of row 7).** An event's and a link's
+/// own unstorable attribute are stored, and a link's ids are the bytes the
+/// sender sent whatever their length.
+///
+/// Both tuples gain an element, so a `serialize_tuple` left at its old
+/// arity sends a short tuple and the insert answers
+/// `Code: 32 … Attempt to read after eof`; and each new element has to
+/// reach `serialize_bytes` rather than serde's sequence path.
+#[tokio::test]
+async fn w2_each_event_and_link_carries_its_own_unstorable_attribute_and_the_ids_sent() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_w2")).await;
+
+    let start = now_ns();
+    let span = Span {
+        trace_id: vec![0xb2; 16],
+        span_id: vec![0x22; 8],
+        parent_span_id: Vec::new(),
+        trace_state: String::new(),
+        flags: 0,
+        name: "GET /api".to_string(),
+        kind: 2,
+        start_time_unix_nano: start as u64,
+        end_time_unix_nano: start as u64 + 1_000_000,
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        events: vec![span::Event {
+            time_unix_nano: start as u64 + 1,
+            name: "exception".to_string(),
+            attributes: vec![kv("event.blob", bytes_value(&[0x01, 0x02]))],
+            dropped_attributes_count: 7,
+        }],
+        dropped_events_count: 0,
+        // **Four bytes of trace id and three of span id**, which the
+        // reference copies with no length check and returns verbatim.
+        links: vec![span::Link {
+            trace_id: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            span_id: vec![0x01, 0x02, 0x03],
+            trace_state: String::new(),
+            attributes: vec![kv("link.blob", bytes_value(&[0x03, 0x04, 0x05]))],
+            dropped_attributes_count: 9,
+            flags: 0,
+        }],
+        dropped_links_count: 0,
+        status: None,
+    };
+
+    let r = try_land(&client, &request("checkout", vec![span])).await;
+    assert!(r.is_ok(), "the landing insert returned {:?}", r.err());
+
+    // The two ids, as the bytes sent.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT concat(hex(links[1].trace_id), '|', hex(links[1].span_id)) AS s FROM spans"
+        )
+        .await,
+        "AABBCCDD|010203",
+        "a link's ids are the bytes the sender put on the wire"
+    );
+
+    // Each element's own carrier, decoded as the `KeyValueList` it is.
+    for (what, sql, key, value) in [
+        (
+            "the event",
+            "SELECT events[1].attrs_other AS b FROM spans",
+            "event.blob",
+            vec![0x01u8, 0x02],
+        ),
+        (
+            "the link",
+            "SELECT links[1].attrs_other AS b FROM spans",
+            "link.blob",
+            vec![0x03u8, 0x04, 0x05],
+        ),
+    ] {
+        let decoded =
+            KeyValueList::decode(blob(&client, sql).await.as_slice()).expect("a KeyValueList");
+        assert_eq!(decoded.values.len(), 1, "{what}: one entry: {decoded:?}");
+        assert_eq!(decoded.values[0].key, key, "{what}");
+        assert_eq!(
+            decoded.values[0].value,
+            Some(bytes_value(&value)),
+            "{what}: the bytes the sender sent"
+        );
+    }
+
+    // The elements' other members are undisturbed by the new one.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT concat(toString(events[1].dropped_attrs), '|', \
+                           toString(links[1].dropped_attrs)) AS s FROM spans"
+        )
+        .await,
+        "7|9",
+        "each element's dropped count still reads back"
+    );
+
+    drop_db(&db).await;
+}
+
+/// **W-3 (issue #587 row 5, and §3.2's any-depth clause).** A kvlist with a
+/// leaf no JSON path can hold moves the **whole** attribute to
+/// `attrs_other`, under its own key, at **any** depth.
+///
+/// The unstorable leaf is a **grandchild**, so an implementation that
+/// checks its direct children and ignores a deeper verdict writes `k.a.ok`
+/// and `k.b` as paths and leaves only the grandchild out — which is why the
+/// **absence** of `k.b` is what discriminates depth-two propagation from
+/// depth-one.
+///
+/// The second, separate attribute keyed literally `k.a.deep` is what pins
+/// the carrier choice: under a design that put the leaf into
+/// `attrs_other` under its own dotted key the two would collide, and a
+/// reader could tell neither apart nor put the nested one back together.
+#[tokio::test]
+async fn w3_a_kvlist_with_an_unstorable_leaf_at_any_depth_moves_whole() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_w3")).await;
+
+    let nested = kvlist_value(vec![
+        (
+            "a",
+            kvlist_value(vec![
+                ("deep", bytes_value(&[0xfe, 0xed])),
+                ("ok", int_value(2)),
+            ]),
+        ),
+        ("b", int_value(1)),
+    ]);
+    let r = try_land(
+        &client,
+        &request(
+            "checkout",
+            vec![span_with(
+                0xb3,
+                0x33,
+                vec![kv("k", nested.clone()), kv("k.a.deep", str_value("flat"))],
+            )],
+        ),
+    )
+    .await;
+    assert!(r.is_ok(), "the landing insert returned {:?}", r.err());
+
+    // `attrs` holds the flat attribute's ESCAPED path and no path of the
+    // kvlist's — not the grandchild, not its sibling, not the uncle.
+    assert_eq!(
+        texts(
+            &client,
+            "SELECT arrayJoin(arraySort(JSONAllPaths(attrs))) AS s FROM spans"
+        )
+        .await,
+        vec!["k%2Ea%2Edeep".to_string()],
+        "the only stored path is the separate flat attribute's"
+    );
+
+    // `attrs_other` holds ONE entry, keyed `k`, whose value is the whole
+    // two-level kvlist the sender sent.
+    let decoded = KeyValueList::decode(
+        blob(&client, "SELECT attrs_other AS b FROM spans")
+            .await
+            .as_slice(),
+    )
+    .expect("a KeyValueList");
+    assert_eq!(decoded.values.len(), 1, "one entry: {decoded:?}");
+    assert_eq!(decoded.values[0].key, "k", "under the attribute's own key");
+    assert_eq!(
+        decoded.values[0].value,
+        Some(nested),
+        "the whole attribute, whole"
+    );
+
+    // The catalog lists the attribute's own key and the separate flat key,
+    // and no leaf of the kvlist.
+    assert_eq!(
+        texts(
+            &client,
+            "SELECT key AS s FROM tag_names WHERE scope = 'span' ORDER BY key"
+        )
+        .await,
+        vec!["k".to_string(), "k.a.deep".to_string()],
+        "two keys: the attribute's own and the separate flat one"
+    );
+
+    drop_db(&db).await;
+}

@@ -3339,6 +3339,9 @@ pub fn parse_landing(
                         attrs_other: encode_attrs_other(resource_attrs.other.clone()),
                         dropped_attrs: resource_dropped,
                         schema_url: resource_spans.schema_url.clone(),
+                        // ISSUE #587 STUB: row 8's carrier is not populated
+                        // yet.
+                        entity_refs: Vec::new(),
                     });
                 out.spans.push(landed);
             }
@@ -3442,9 +3445,15 @@ fn land_span(
         let landed = land_attrs(&event.attributes, TagScope::Event, None, stage);
         check_json_paths(&landed.json)?;
         events.push(LandingEvent {
-            time_ns: i64::try_from(event.time_unix_nano).unwrap_or(i64::MAX),
+            // ISSUE #587 STUB: the member is `u64` and the saturation is
+            // still here, so `W-12` is red on the value rather than on a
+            // type error.
+            time_ns: u64::try_from(i64::try_from(event.time_unix_nano).unwrap_or(i64::MAX))
+                .unwrap_or(0),
             name: event.name.clone(),
             attrs: landed.json,
+            // ISSUE #587 STUB: row 4's carrier is not populated yet.
+            attrs_other: Vec::new(),
             dropped_attrs: event.dropped_attributes_count,
         });
     }
@@ -3457,11 +3466,20 @@ fn land_span(
         let landed = land_attrs(&link.attributes, TagScope::Link, None, stage);
         check_json_paths(&landed.json)?;
         links.push(LandingLink {
-            trace_id: <[u8; 16]>::try_from(link.trace_id.as_slice()).unwrap_or([0u8; 16]),
-            span_id: <[u8; 8]>::try_from(link.span_id.as_slice()).unwrap_or([0u8; 8]),
+            // ISSUE #587 STUB: the members are byte buffers and the
+            // rewrite to all-zero bytes is still here, so `W-2` is red on
+            // the value rather than on a type error.
+            trace_id: <[u8; 16]>::try_from(link.trace_id.as_slice())
+                .unwrap_or([0u8; 16])
+                .to_vec(),
+            span_id: <[u8; 8]>::try_from(link.span_id.as_slice())
+                .unwrap_or([0u8; 8])
+                .to_vec(),
             trace_state: link.trace_state.clone(),
             flags: link.flags,
             attrs: landed.json,
+            // ISSUE #587 STUB: row 4's carrier is not populated yet.
+            attrs_other: Vec::new(),
             dropped_attrs: link.dropped_attributes_count,
         });
     }
@@ -3474,14 +3492,14 @@ fn land_span(
         duration_ns: resolve_duration_ns(span.start_time_unix_nano, span.end_time_unix_nano),
         resource_id,
         name: span.name.clone(),
-        // The OTLP span kind is `0..=5`; a value outside that is the
-        // sender's and is stored as it arrived, saturating rather than
-        // wrapping.
-        kind: u8::try_from(span.kind).unwrap_or(0),
+        // ISSUE #587 STUB: the fields are `i32` and the narrowing to a byte
+        // is still here, so `W-5` and `W-13` are red on the value rather
+        // than on a type error.
+        kind: i32::from(u8::try_from(span.kind).unwrap_or(0)),
         status_code: span
             .status
             .as_ref()
-            .map(|s| u8::try_from(s.code).unwrap_or(0))
+            .map(|s| i32::from(u8::try_from(s.code).unwrap_or(0)))
             .unwrap_or(0),
         status_message: span
             .status
@@ -3493,6 +3511,11 @@ fn land_span(
         scope_name: scope_name.to_string(),
         scope_version: scope_version.to_string(),
         scope_attrs: scope_attrs.json.clone(),
+        // ISSUE #587 STUB: rows 1, 2, 3 and 9 are not carried yet.
+        scope_schema_url: String::new(),
+        scope_dropped_attrs: 0,
+        scope_attrs_other: Vec::new(),
+        end_ns: 0,
         events,
         dropped_events: span.dropped_events_count,
         links,
@@ -3516,6 +3539,7 @@ fn reject_landing(out: &mut ParsedTraceLanding, message: String) {
 #[cfg(test)]
 mod landing_tests {
     use super::*;
+    use opentelemetry_proto::tonic::common::v1::EntityRef;
     use opentelemetry_proto::tonic::trace::v1::span;
 
     fn str_value(s: &str) -> AnyValue {
@@ -4229,6 +4253,127 @@ mod landing_tests {
         assert_eq!(
             parsed.resources[0].resource_id, parsed.spans[0].resource_id,
             "the span and its resource row carry one identity"
+        );
+    }
+
+    /// **W-10's hermetic half (issue #587 rows 8 and 13).** The identity
+    /// covers **all four** of its inputs, and it covers each one's
+    /// **value** rather than its presence.
+    ///
+    /// **Four inputs, and that is the whole set**, which is what makes this
+    /// exhaustive rather than illustrative: `Resource` has exactly three
+    /// fields in the generated protocol source — `attributes` (tag 1),
+    /// `dropped_attributes_count` (tag 2), `entity_refs` (tag 3) — and
+    /// `resource_identity` takes `ResourceSpans.schema_url` as its second
+    /// parameter. A fourth `Resource` field added upstream has to appear
+    /// here.
+    ///
+    /// **Seven sub-cases, and the two value pairs are the load-bearing
+    /// ones.** A section appended merely *because* the count is non-zero,
+    /// or *because* the vector is non-empty, passes `0` against `5` and
+    /// `empty` against `one` and **collides** on `5` against `6` and on two
+    /// different single-reference vectors — so those two pairs are what
+    /// force the field's own value into the buffer. The seventh pins that
+    /// no existing identity moved.
+    #[test]
+    fn the_resource_identity_covers_every_field_the_resource_carries() {
+        const SCHEMA: &str = "https://example.invalid/v1";
+        let attrs = || {
+            vec![
+                kv("service.name", str_value("checkout")),
+                kv("host.name", str_value("node-a")),
+            ]
+        };
+        let entity = |kind: &str| EntityRef {
+            schema_url: SCHEMA.to_string(),
+            r#type: kind.to_string(),
+            id_keys: vec!["host.name".to_string()],
+            description_keys: Vec::new(),
+        };
+        let id = |dropped: u32, refs: Vec<EntityRef>, schema_url: &str| {
+            resource_identity(
+                Some(&Resource {
+                    attributes: attrs(),
+                    dropped_attributes_count: dropped,
+                    entity_refs: refs,
+                }),
+                schema_url,
+            )
+        };
+        let base = || id(0, Vec::new(), SCHEMA);
+
+        // 1. `Resource.attributes` — the input that was already covered.
+        assert_ne!(
+            base(),
+            resource_identity(
+                Some(&Resource {
+                    attributes: vec![
+                        kv("service.name", str_value("checkout")),
+                        kv("host.name", str_value("node-b")),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                SCHEMA,
+            ),
+            "the attributes are in the hash"
+        );
+
+        // 2. `ResourceSpans.schema_url` — likewise.
+        assert_ne!(
+            base(),
+            id(0, Vec::new(), "https://example.invalid/v2"),
+            "the schema url is in the hash"
+        );
+
+        // 3. `Resource.dropped_attributes_count`, zero against non-zero.
+        assert_ne!(
+            base(),
+            id(5, Vec::new(), SCHEMA),
+            "a dropped count of 5 is not a dropped count of 0"
+        );
+
+        // 4. And **non-zero against non-zero**, which a presence-only
+        // section fails: the count's own value has to be in the buffer.
+        assert_ne!(
+            id(5, Vec::new(), SCHEMA),
+            id(6, Vec::new(), SCHEMA),
+            "a dropped count of 6 is not a dropped count of 5"
+        );
+
+        // 5. `Resource.entity_refs`, empty against one reference.
+        assert_ne!(
+            id(5, Vec::new(), SCHEMA),
+            id(5, vec![entity("host")], SCHEMA),
+            "an entity reference is not the absence of one"
+        );
+
+        // 6. And **one non-empty vector against another**, the same point.
+        assert_ne!(
+            id(5, vec![entity("host")], SCHEMA),
+            id(5, vec![entity("service")], SCHEMA),
+            "a `service` entity reference is not a `host` one"
+        );
+
+        // 7. **No existing identity moves.** A resource with an empty
+        // `entity_refs` and a zero dropped count hashes to exactly the
+        // value it hashed to before the two sections were added, which is
+        // why both are conditional and appended after the schema url. The
+        // literal was read off this function on `origin/main` at
+        // `619414e4`.
+        assert_eq!(
+            base(),
+            Fingerprint::from_raw(307_209_891_247_568_146_312_164_646_737_311_135_069),
+            "a resource with neither field set must keep the identity it \
+             had before issue #587: the two new sections are conditional"
+        );
+
+        // And one value twice is one resource, so none of the assertions
+        // above can pass on an unstable identity.
+        assert_eq!(base(), base());
+        assert_eq!(
+            id(6, vec![entity("service")], SCHEMA),
+            id(6, vec![entity("service")], SCHEMA),
         );
     }
 

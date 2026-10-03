@@ -3687,4 +3687,396 @@ mod tests {
              the ten: {row}"
         );
     }
+
+    /// The `(name, type)` pairs of a rendered `CREATE TABLE`, in
+    /// declaration order, with every `CODEC(...)` clause cut off: the codec
+    /// per column is `T-S5b`'s own assertion
+    /// (`crates/pulsus-schema/tests/live_traces_v2.rs`) and restating it
+    /// here would be two statements of one rule.
+    ///
+    /// **Split by line, not by comma.** Every column of these templates is
+    /// on a line of its own, and a split on commas cuts
+    /// `Array(Tuple(a X, b Y))` in the middle.
+    fn declared_columns(ddl: &str) -> Vec<(String, String)> {
+        let body = ddl
+            .split_once(" (\n")
+            .expect("a CREATE TABLE opens its column list with ` (`")
+            .1;
+        let body = &body[..body
+            .find("\n) ENGINE")
+            .expect("a CREATE TABLE closes its column list before ENGINE")];
+        body.split('\n')
+            .map(|line| {
+                let line = line.trim().trim_end_matches(',').trim();
+                let (name, rest) = line
+                    .split_once(char::is_whitespace)
+                    .unwrap_or_else(|| panic!("a column declaration is `name type`: {line}"));
+                let rest = match rest.find(" CODEC(") {
+                    Some(at) => &rest[..at],
+                    None => rest,
+                };
+                (
+                    name.to_string(),
+                    rest.split_whitespace().collect::<Vec<_>>().join(" "),
+                )
+            })
+            .collect()
+    }
+
+    /// A materialized view's output column names, in projection order: the
+    /// alias after each top-level `AS`, or the expression itself where it
+    /// has none.
+    ///
+    /// Whitespace is flattened first, because a template's `\n` makes the
+    /// `FROM` keyword start a line; the scan then stops at the first `FROM`
+    /// at paren depth zero, so `traces_mv`'s inner `SELECT … FROM …`
+    /// subquery is skipped.
+    fn mv_output_names(name: &str) -> Vec<String> {
+        let mv = MVS
+            .iter()
+            .find(|mv| mv.name == name)
+            .unwrap_or_else(|| panic!("MVS has no view named {name}"));
+        let rendered = render::render(
+            mv.tmpl,
+            &render::render_name(mv.name, &ctx()),
+            &ctx(),
+            false,
+        );
+        let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        let at = flat.find("SELECT ").expect("a view has a projection") + "SELECT ".len();
+        let tail = &flat[at..];
+        let mut depth = 0i32;
+        let mut end = tail.len();
+        for (i, b) in tail.bytes().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && tail[i..].starts_with(" FROM ") {
+                end = i;
+                break;
+            }
+        }
+        let list = &tail[..end];
+        let mut items: Vec<String> = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, b) in list.bytes().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    items.push(list[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(list[start..].to_string());
+        items
+            .iter()
+            .map(|item| {
+                let item = item.trim();
+                match item.rfind(" AS ") {
+                    Some(at) => item[at + " AS ".len()..].trim().to_string(),
+                    None => item.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// **W-7.** The amended `spans`, `traces` and `resources` declarations,
+    /// against a literal expected list in this file, and then every view's
+    /// projection against its own target's column order (issue #587).
+    ///
+    /// **Two assertions and the order matters.** (1) is the content check:
+    /// it is red until every column of the amended DDL exists at its stated
+    /// type, which is what makes the type widenings and the six new columns
+    /// visible here. (2) is a *drift* check and is green on the unamended
+    /// tree — each view's output names already equal its target's column
+    /// list — so it cannot be read as evidence that (1)'s columns exist. It
+    /// is what keeps a later column added to a target out of its view, or a
+    /// view's projection out of order, which the server does not refuse: a
+    /// view selecting fewer columns than its target is accepted.
+    #[test]
+    fn the_amended_trace_tables_declare_these_columns_and_their_views_match() {
+        let spans: Vec<(&str, &str)> = vec![
+            ("trace_id", "FixedString(16)"),
+            ("span_id", "FixedString(8)"),
+            ("parent_span_id", "FixedString(8)"),
+            ("start_ns", "Int64"),
+            ("duration_ns", "Int64"),
+            ("service", "LowCardinality(String)"),
+            ("resource_id", "UInt128"),
+            ("name", "LowCardinality(String)"),
+            ("kind", "Int32"),
+            ("status_code", "Int32"),
+            ("status_message", "String"),
+            ("trace_state", "String"),
+            ("flags", "UInt32"),
+            ("scope_name", "LowCardinality(String)"),
+            ("scope_version", "LowCardinality(String)"),
+            ("scope_attrs", "JSON"),
+            ("attrs", "JSON"),
+            ("attrs_other", "String"),
+            ("dropped_attrs", "UInt32"),
+            (
+                "events",
+                "Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, \
+                 attrs_other String, dropped_attrs UInt32))",
+            ),
+            ("dropped_events", "UInt32"),
+            (
+                "links",
+                "Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, \
+                 attrs JSON, attrs_other String, dropped_attrs UInt32))",
+            ),
+            ("dropped_links", "UInt32"),
+            ("scope_schema_url", "String"),
+            ("scope_dropped_attrs", "UInt32"),
+            ("scope_attrs_other", "String"),
+            ("end_ns", "UInt64"),
+        ];
+        let traces: Vec<(&str, &str)> = vec![
+            ("day", "Date"),
+            ("trace_id", "FixedString(16)"),
+            ("start_ns", "SimpleAggregateFunction(min, Int64)"),
+            ("end_ns", "SimpleAggregateFunction(max, Int64)"),
+            (
+                "root_service",
+                "SimpleAggregateFunction(max, LowCardinality(String))",
+            ),
+            (
+                "root_name",
+                "SimpleAggregateFunction(max, LowCardinality(String))",
+            ),
+            (
+                "services",
+                "SimpleAggregateFunction(groupUniqArrayArray, Array(String))",
+            ),
+            ("last_start_ns", "SimpleAggregateFunction(max, Int64)"),
+            (
+                "buckets",
+                "SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))",
+            ),
+        ];
+        let resources: Vec<(&str, &str)> = vec![
+            ("day", "Date"),
+            ("resource_id", "UInt128"),
+            ("service", "LowCardinality(String)"),
+            ("attrs", "JSON"),
+            ("attrs_other", "String"),
+            ("dropped_attrs", "UInt32"),
+            ("schema_url", "String"),
+            ("entity_refs", "String"),
+        ];
+
+        // (1) the content check.
+        for (id, table, want) in [
+            (66, "spans", &spans),
+            (67, "traces", &traces),
+            (68, "resources", &resources),
+        ] {
+            let got = declared_columns(&rendered_static(id));
+            let want: Vec<(String, String)> = want
+                .iter()
+                .map(|(n, t)| {
+                    (
+                        (*n).to_string(),
+                        t.split_whitespace().collect::<Vec<_>>().join(" "),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{table}'s declarations (migration {id})");
+        }
+        assert_eq!(spans.len(), 27, "spans declares 27 columns");
+        assert_eq!(traces.len(), 9, "traces declares 9 columns");
+        assert_eq!(resources.len(), 8, "resources declares 8 columns");
+
+        // The two aggregate declarations carry their codecs too, which the
+        // pairs above deliberately drop.
+        let traces_ddl = rendered_static(67);
+        for declaration in [
+            "last_start_ns  SimpleAggregateFunction(max, Int64)                         \
+             CODEC(Delta, ZSTD(1))",
+            "buckets        SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))  \
+             CODEC(ZSTD(1))",
+        ] {
+            assert!(
+                traces_ddl.contains(declaration),
+                "traces must declare `{declaration}`: {traces_ddl}"
+            );
+        }
+
+        // (2) the drift check: every view's output names equal its
+        // target's column list, in the target's own order.
+        for (view, id, table) in [
+            ("spans_mv", 66, "spans"),
+            ("resources_mv", 68, "resources"),
+            ("traces_mv", 67, "traces"),
+        ] {
+            let target: Vec<String> = declared_columns(&rendered_static(id))
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(
+                mv_output_names(view),
+                target,
+                "{view}'s projection must name {table}'s columns in {table}'s own order"
+            );
+        }
+    }
+
+    /// **W-9.** The four amended trace migrations are exactly
+    /// `{66, 67, 68, 71}`, each renders with every addition issue #587
+    /// makes, and the two routing wrappers at 72 and 73 render
+    /// byte-unchanged.
+    ///
+    /// **The set is derived by name over the base `Ddl::Static` records,
+    /// never by `family`.** `family: Some(Family::Traces)` is a larger set
+    /// than this one, and the wrappers at 72 and 73 carry the names `spans`
+    /// and `traces` as well — so a derivation keyed on the name alone reads
+    /// as six. The wrapper half is what stops that.
+    #[test]
+    fn the_amended_trace_migration_set_is_exactly_these_four() {
+        let amended = ["spans", "traces", "resources", "trace_landing"];
+        let ids: Vec<u32> = MIGRATIONS
+            .iter()
+            .filter(|m| amended.contains(&m.name) && matches!(m.ddl, Ddl::Static(_)))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![66, 67, 68, 71],
+            "the amended set is the four base trace tables this change edits"
+        );
+
+        // Every addition of §4, per table, in the rendered template.
+        for (id, fragments) in [
+            (
+                66u32,
+                vec![
+                    "kind            Int32",
+                    "status_code     Int32",
+                    "events          Array(Tuple(time_ns UInt64, name LowCardinality(String), \
+                     attrs JSON, attrs_other String, dropped_attrs UInt32))",
+                    "links           Array(Tuple(trace_id String, span_id String, \
+                     trace_state String, flags UInt32, attrs JSON, attrs_other String, \
+                     dropped_attrs UInt32))",
+                    "scope_schema_url    String",
+                    "scope_dropped_attrs UInt32",
+                    "scope_attrs_other   String",
+                    "end_ns              UInt64",
+                    "PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')",
+                ],
+            ),
+            (
+                67,
+                vec![
+                    "last_start_ns  SimpleAggregateFunction(max, Int64)",
+                    "buckets        SimpleAggregateFunction(groupUniqArrayArray(4096), \
+                     Array(Int64))",
+                ],
+            ),
+            (68, vec!["entity_refs    String"]),
+            (
+                71,
+                vec![
+                    "kind            Int32",
+                    "status_code     Int32",
+                    "events          Array(Tuple(time_ns UInt64, name LowCardinality(String), \
+                     attrs JSON, attrs_other String, dropped_attrs UInt32))",
+                    "links           Array(Tuple(trace_id String, span_id String, \
+                     trace_state String, flags UInt32, attrs JSON, attrs_other String, \
+                     dropped_attrs UInt32))",
+                    "scope_schema_url    String",
+                    "scope_dropped_attrs UInt32",
+                    "scope_attrs_other   String",
+                    "entity_refs         String",
+                    "end_ns              UInt64",
+                    "ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)",
+                ],
+            ),
+        ] {
+            let ddl = rendered_static(id);
+            for fragment in fragments {
+                assert!(
+                    ddl.contains(fragment),
+                    "migration {id} must render `{fragment}`:\n{ddl}"
+                );
+            }
+        }
+
+        // The wrappers copy their columns from the base at creation, so a
+        // fresh database follows the amended base for free and neither
+        // template changes. Asserted as literals so an edit to either one
+        // reddens here rather than silently enlarging the set above.
+        assert_eq!(
+            rendered_cluster_only(72),
+            "CREATE TABLE IF NOT EXISTS pulsus.spans_dist AS pulsus.spans\n\
+             ENGINE = Distributed('', pulsus, spans, cityHash64(trace_id))\n\
+             SETTINGS fsync_after_insert = 1, fsync_directories = 1;",
+        );
+        assert_eq!(
+            rendered_cluster_only(73),
+            "CREATE TABLE IF NOT EXISTS pulsus.traces_dist AS pulsus.traces\n\
+             ENGINE = Distributed('', pulsus, traces, cityHash64(trace_id))\n\
+             SETTINGS fsync_after_insert = 1, fsync_directories = 1;",
+        );
+    }
+
+    /// **W-9's view half.** `traces_mv` carries §3.5a's saturating
+    /// per-trace end, §4.1's explicit `'UTC'` and §4.2c's two new
+    /// aggregates; `spans_mv` and `resources_mv` carry the new columns.
+    #[test]
+    fn the_three_amended_trace_views_render_the_expressions_this_change_names() {
+        let rendered = |name: &str| {
+            let mv = MVS
+                .iter()
+                .find(|mv| mv.name == name)
+                .unwrap_or_else(|| panic!("MVS has no view named {name}"));
+            render::render(
+                mv.tmpl,
+                &render::render_name(mv.name, &ctx()),
+                &ctx(),
+                false,
+            )
+        };
+
+        let traces_mv = rendered("traces_mv");
+        for fragment in [
+            "toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day",
+            "max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), \
+             9223372036854775807))) AS e",
+            "max(start_ns) AS ls",
+            "groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk",
+            "ls AS last_start_ns",
+            "bk AS buckets",
+        ] {
+            assert!(
+                traces_mv.contains(fragment),
+                "traces_mv must render `{fragment}`:\n{traces_mv}"
+            );
+        }
+
+        let spans_mv = rendered("spans_mv");
+        for fragment in [
+            "scope_schema_url AS scope_schema_url",
+            "scope_dropped_attrs AS scope_dropped_attrs",
+            "scope_attrs_other AS scope_attrs_other",
+            "end_ns AS end_ns",
+        ] {
+            assert!(
+                spans_mv.contains(fragment),
+                "spans_mv must render `{fragment}`:\n{spans_mv}"
+            );
+        }
+
+        let resources_mv = rendered("resources_mv");
+        assert!(
+            resources_mv.contains("entity_refs AS entity_refs"),
+            "resources_mv must render the entity references:\n{resources_mv}"
+        );
+    }
 }
