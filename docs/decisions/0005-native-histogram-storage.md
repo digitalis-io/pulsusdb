@@ -93,4 +93,5 @@ this ADR governs storage only.
 - Downstream milestones build on this table: the engine value model, OTLP native
   ingest, and histogram PromQL functions/routing (A3/A4/A5) — A2 delivers the
   tables (`metric_hist_samples`, its `_dist` wrapper, and `metric_series.value_type`)
-  and nothing else.
+  and nothing else. The milestone names are the ones A2 used; A5's own
+  `value_type` routing is the superseded design marked in §(c) above.
