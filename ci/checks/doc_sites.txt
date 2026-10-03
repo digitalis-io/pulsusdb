@@ -4,24 +4,48 @@
 # text is still there, and a `rewrite` row says its text is gone.
 # base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
 rewrite docs/schemas.md:33-33
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587
+# The five references issue #587 adds to this row's column — #5, #63, #75,
+# #478 and #555 — are not follow-ups it invented. Each occurs the SAME
+# number of times in this file at the upstream revision as at the head:
+# 2, 1, 2, 3 and 5. The rewrite carried sentences that already cited them
+# (`finding #5, extended by issues #478 and #555`, the `kind` projection's
+# own #75, the read-bounded-generator residual's #63) into lines the rule
+# reads as added, while the protected base ranges it compares against are
+# different lines. Declaring them records that, and the presence rule above
+# keeps the declaration honest about the file.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555
 rewrite docs/schemas.md:1089-1089
 rewrite docs/architecture.md:378-378 refs=#560
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
-rewrite crates/pulsus-clickhouse/src/lib.rs:6-10
+# `refs=#587` is a NEW reference, not a carried one: the module declaration
+# this row protects gained a comment naming the issue that made it `pub`,
+# because `pulsus-read` and `pulsus-write` both reach the moved `JSON`
+# codec through it. #587 is this change's own issue, which is the category
+# #494 is hard-coded for in `doc_sites.sh`; it is declared here instead of
+# widening that exemption, because an exemption derived from `the current
+# issue` is one a contributor controls, and the column is the mechanism
+# this manifest already uses to record a decision a reader can follow.
+rewrite crates/pulsus-clickhouse/src/lib.rs:6-10 refs=#587
 rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
-rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587
+# #478 and #555 join this column for the same reason as `docs/schemas.md`'s:
+# both occur as often upstream as at the head (1 and 2), carried across by
+# issue #587's rewrite of the four-access-patterns paragraph rather than
+# introduced by it.
+rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587,#478,#555
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126
 leave crates/pulsus-schema/src/catalog.rs:195-195
 leave crates/pulsus-schema/src/catalog.rs:254-254
-rewrite crates/pulsus-write/src/writer/mod.rs:36-40 refs=#603,#139,#9
+# `#587` here is the other half of the same move, and also new: the comment
+# records where the `JSON` column's codec went. Same decision as
+# `crates/pulsus-clickhouse/src/lib.rs` above.
+rewrite crates/pulsus-write/src/writer/mod.rs:36-40 refs=#603,#139,#9,#587
 rewrite crates/pulsus-write/src/writer/mod.rs:566-568
 leave crates/pulsus-write/src/writer/backfill.rs:23-28
 leave crates/pulsus-write/src/protocols/otlp_logs.rs:111-113
