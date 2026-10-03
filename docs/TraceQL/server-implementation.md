@@ -35,14 +35,14 @@ local disks: the object-storage requirements were withdrawn by the owner on
 | OTLP | stored |
 |---|---|
 | `trace_id`, `span_id`, `parent_span_id` | `FixedString(16)`/`FixedString(8)`, raw bytes |
-| start and end | `start_ns`, `duration_ns = end − start` |
-| `name`, `kind`, `status.code`, `status.message` | columns |
-| `trace_state`, `flags`, the three dropped counts | columns |
+| start and end | `start_ns` **verbatim, zero included**; `end_ns` verbatim; `duration_ns = end − start`, clamped to `0` for an unset or inverted end and saturated at `i64::MAX` |
+| `name`, `kind`, `status.code`, `status.message` | columns. `kind` and `status.code` are stored as the protocol's own **signed 32-bit** values, not narrowed |
+| `trace_state`, `flags`, the four dropped counts | columns |
 | span attributes | `attrs`, one typed JSON path per key |
-| events, links | arrays of tuples, each with its own `attrs` |
-| scope name, version, attributes | `scope_name`, `scope_version`, `scope_attrs` |
-| resource attributes | a 128-bit `resource_id`, plus one row in `resources` |
-| the service name | the `spans.service` column **only** — it is removed from the resource's attributes and put back by the reader |
+| events, links | arrays of tuples, each with its own `attrs` **and its own `attrs_other`**; an event's time is stored **unsigned**, and a link's two ids are the bytes the sender sent, whatever their length |
+| scope name, version, attributes, schema url, dropped count | six columns: `scope_name`, `scope_version`, `scope_attrs`, `scope_attrs_other`, `scope_schema_url`, `scope_dropped_attrs` |
+| resource attributes and entity references | a 128-bit `resource_id` over **all three** `Resource` fields and the schema url, plus one row in `resources` carrying `entity_refs` |
+| the service name | the `spans.service` column, and removed from the resource's attributes **only when its value is a non-empty string** — the one arm that column carries losslessly. Every other arm stays in `resources.attrs` as the typed value it was, and is never a catalog entry either way |
 
 There is no payload blob: a fetch rebuilds the OTLP message from the columns.
 That is where today's 58.12 B/span of payload goes.
@@ -57,16 +57,22 @@ ClickHouse requires — two identical paths in one JSON value are refused).
 
 ### 2.2 Resources and catalogs
 
-`resource_id` is `pulsus_model::compose128` over the resource's encoded
-attributes and schema url — `cityHash64` in the high half, `xxHash64` with seed
+`resource_id` is `pulsus_model::compose128` over **four** inputs — the
+resource's encoded attributes, its schema url, its `dropped_attributes_count`
+and its `entity_refs` — `cityHash64` in the high half, `xxHash64` with seed
 0 in the low half, the composition issue #498 settled on for stream and series
 identity, for the same reason. Not a third hash primitive: with one
 composition, a change to either primitive moves every identity and one set of
-golden vectors catches it. The writer keeps no map of what it has
+golden vectors catches it. **`Resource` has exactly three fields and the
+schema url is the fourth input, so the four are all of them** — the two
+issue #587 added are appended **conditionally**, the entity references iff
+non-empty and the dropped count iff non-zero, so a resource carrying
+neither keeps the identity it had and the golden vectors do not churn. The writer keeps no map of what it has
 already written: a push lands the distinct `(resource_id, day)` and
 `(scope, key[, value, type])` tuples of its own spans, and each target
 collapses the repeats on its own key. On g1: 68 resource rows, 48 name rows, 304,070
-value rows, against 2,000,064 spans.
+value rows, against 2,000,064 spans — unchanged by issue #587, whose two new
+identity inputs are both at their proto3 default across that corpus.
 
 ### 2.3 Attributes: paths, types, and the binary encoding
 
@@ -106,14 +112,35 @@ them. So "a span is never stored without its index row" is not claimed here
 and `T-W6` does not assert it: the sibling counts are recorded, and asserting
 `spans` is empty would fail about a tenth of the time.
 
+**And the sender is told `200`.** The route's answer is the old path's: a
+failed landing view is counted and spooled and changes no status code
+(`crates/pulsus-write/src/writer/trace_landing.rs`'s own note on the block
+carrying no waiter), and a byte-identical retry inside the deduplication
+window is suppressed from any committed target
+(`crates/pulsus-write/src/writer/push_dedup.rs`'s claim-from-any-committed
+rule), so the gap persists. **What repairs it is a manual replay**:
+`replay_trace_window` re-drives the landing window through all five targets
+and converges, bounded by `PULSUS_TRACE_LANDING_RETENTION_HOURS`
+(`crates/pulsus-schema/src/replay.rs`). **Nothing invokes it.** No component
+detects an incomplete target, so an operator who does not already know a
+push was partial has nothing that tells them. **This paragraph is true
+until #602**, which deletes the old path and so moves the acknowledgement
+to this one; whoever writes #602 has to revisit it.
+
 ### 2.6 What the write path costs
 
 | | today | this design |
 |---|---:|---:|
 | rows written per span | 22.64 | 1.187 |
-| bytes on disk per span | 754.44 | 37.275 |
-| bytes per span on the insert hop (LZ4, measured on the same rows) | — | 57.58 |
-| bytes per span fetched by each further replica (measured) | 754 | **34.965** |
+| bytes on disk per span | 754.44 | 42.465 |
+| bytes per span on the insert hop (LZ4, measured at the pre-#587 row shape) | — | 57.58 |
+| bytes per span fetched by each further replica (measured at the pre-#587 row shape) | 754 | **34.965** |
+
+The first two rows are re-measured over the amended `spans` (issue #587). The
+last two are not: both need a second server — the LZ4 figure an alternative
+layout built by `measure/layouts.sql`, the replication figure two replicas —
+and they are left at the shape they were measured over rather than mixed with
+a later run. `T-W4` is what re-measures the replication figure.
 
 ## 3. The compiler
 
@@ -274,6 +301,9 @@ Per span, at replication factor 2, one shard:
   `system.part_log` (`measure/replication_bytes.sh`), against 34.923 stored —
   1.0012×, the excess being part metadata rather than a second copy of a column.
   Today's engine ships 754 B/span, because it writes 22.6 rows per span.
+  **Both figures are at the pre-#587 row shape**: the stored side is now 39.675
+  B/span compressed, and the fetched side needs two replicas, so `T-W4` is what
+  re-measures it.
 - On the read path what crosses is the answer: 546–4,926 bytes for a search,
   2,346–185,352 for a metrics range query, one row for a fetch. A clustered
   search returns twenty rows per shard to the coordinator, not spans.

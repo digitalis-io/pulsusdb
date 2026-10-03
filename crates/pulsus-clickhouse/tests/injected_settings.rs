@@ -87,6 +87,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "read_overflow_mode_leaf",
     "result_overflow_mode",
     "select_sequential_consistency",
+    "session_timezone",
     "set_overflow_mode",
     "skip_unavailable_shards",
     "sort_overflow_mode",

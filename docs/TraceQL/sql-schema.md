@@ -28,9 +28,11 @@ and no offload path here.
        attrs: a JSON column - one stored subcolumn per attribute key, typed
 
      resources    one row per DISTINCT resource per day; spans carry a 128-bit id
-       key: (service, resource_id)      service.name is NOT repeated inside attrs
+       key: (service, resource_id)      service.name is dropped from attrs ONLY
+                                        when its value is a non-empty string
 
-     traces       one row per (day, trace): extent, root, services   granule 1024
+     traces       one row per (day, trace): extent, last start, root, services,
+                  and the trace's own distinct 5-minute span buckets  granule 1024
        key: trace_id
 
      tag_names    one row per distinct (scope, key)          48 rows for g1
@@ -76,20 +78,20 @@ Measured after one merge per table (`system.parts`, `system.columns`):
 
 | table | rows | bytes on disk | bytes per span |
 |---|---:|---:|---:|
-| `spans` | 2,000,064 | 69,932,464 | 34.965 |
-| `traces` | 70,413 | 2,919,750 | 1.460 |
+| `spans` | 2,000,064 | 79,696,928 | 39.847 |
+| `traces` | 70,413 | 3,536,708 | 1.768 |
 | `tag_values` | 304,070 | 1,691,983 | 0.846 |
-| `resources` | 68 | 6,412 | 0.003 |
+| `resources` | 68 | 6,524 | 0.003 |
 | `tag_names` | 48 | 1,190 | 0.001 |
-| **total** | 2,374,663 | **74,551,799** | **37.275** |
+| **total** | 2,374,663 | **84,933,333** | **42.465** |
 
 These figures were measured with no `CODEC` clause on `resources`, `tag_names`,
-`tag_values` or `traces.day`; the shipped migrations give those fourteen columns
+`tag_values` or `traces.day`; the shipped migrations give those fifteen columns
 `CODEC(ZSTD(1))`, so the four non-span rows and the total price the measured
 schema rather than the shipped one. The `spans` rows and the ratio below are
 unchanged by that.
 
-Non-span tables are **6.605%** of the span table. Against today's six tables on
+Non-span tables are **6.570%** of the span table. Against today's six tables on
 the same bodies: 1,508,935,285 bytes, 754.44 per span (753.79 after a full
 merge). Against the reference's three active blocks: 209,324,594 bytes, 104.66
 per span.
@@ -98,16 +100,23 @@ The span table, column by column (compressed bytes per span):
 
 | column | B/span | column | B/span |
 |---|---:|---|---:|
-| `attrs` (5.45 values per span) | 10.870 | `name` | 0.937 |
-| `span_id` | 8.004 | `events` | 0.669 |
-| `parent_span_id` | 4.015 | `trace_id` | 0.596 |
-| `start_ns` | 3.674 | `service` | 0.430 |
-| `duration_ns` | 3.595 | `kind` | 0.252 |
-| `resource_id` | 1.495 | everything else | < 0.2 |
+| `attrs` (5.45 values per span) | 10.871 | `trace_id` | 0.596 |
+| `span_id` | 8.004 | `service` | 0.430 |
+| `end_ns` | 4.704 | `kind` | 0.412 |
+| `parent_span_id` | 4.015 | `scope_name` | 0.190 |
+| `start_ns` | 3.674 | `links` | 0.039 |
+| `duration_ns` | 3.595 | everything else | < 0.02 |
+| `resource_id` | 1.495 | | |
+| `name` | 0.937 | | |
+| `events` | 0.678 | | |
 
 `span_id` is 8 random bytes and does not compress; it is the largest irreducible
-cost, which is the sign the rest is near the floor. The table compresses
-**6.977×** (244.0 B/span uncompressed → 34.97); today's tables 4.53×.
+cost, which is the sign the rest is near the floor. **`end_ns` is the second
+largest addition issue #587 made** — absolute nanoseconds under
+`CODEC(Delta, ZSTD(1))`, where `duration_ns` holds a small difference under
+`T64` — and `kind` went from 0.252 to 0.412 when it widened from a byte to the
+protocol's own signed integer. The table compresses **6.405×** (254.1 B/span
+uncompressed → 39.68); today's tables 4.53×.
 
 ### 2.1 The model, so a reader can substitute their own workload
 
@@ -117,13 +126,13 @@ in retention.
 
 | dimension | expression | g1 |
 |---|---|---|
-| span row, fixed part | ids, times, name, kind, status, resource id ≈ 23 B/span | 23.2 |
+| span row, fixed part | ids, times (start **and** end), name, kind, status, resource id ≈ 28 B/span | 28.1 |
 | span attributes | ≈ `A` × 1.99 B — one typed subcolumn per key over a sorted run | 10.87 |
-| events and links | their own attributes at the same rate | 0.71 |
+| events and links | their own attributes at the same rate | 0.72 |
 | resources | 1.49 B/span for the id, plus `d` × `R` per day — **not** × spans | 1.49 + 0.003 |
-| per-trace index | ≈ 41.5 B per trace ⇒ 41.5/`k` per span | 1.46 |
+| per-trace index | ≈ 50.2 B per trace ⇒ 50.2/`k` per span | 1.77 |
 | tag catalogs | ≈ `V` × 5.6 B, and one row per distinct key | 0.85 |
-| **total** | ≈ 23.2 + 1.99·`A` + 41.5/`k` + 5.6·`V`/spans | **37.275** |
+| **total** | ≈ 28.1 + 1.99·`A` + 50.2/`k` + 5.6·`V`/spans | **42.465** |
 
 `A` moves the total; `V` is the one term that grows with cardinality rather than
 volume, and it is the price of the time-less value catalog `docs/api.md` §4.3
@@ -184,9 +193,11 @@ Measured against 26.3.29.7 by inserting each case:
 | `NaN`, `±Inf`, `1e400` | insert **fails** | written through RowBinary's **binary** JSON encoding, which carries a typed `Float64`; verified: a stored `+Inf` answers `> 500` with 1 |
 | empty object | the key disappears | goes to `attrs_other` |
 | bytes value, an array with no JSON rendering | not representable | `attrs_other`, a string holding the OTLP `AnyValue` for those keys only |
-| nested object | becomes real nested paths | kept, and distinct from the escaped dotted key |
+| nested object | becomes nested paths of its own | kept, and distinct from the escaped dotted key — **while every leaf at every depth is storable as a JSON path**; one leaf that is not sends the whole attribute to `attrs_other` under its own key (issue #587) |
 
-`attrs_other` is empty for every span in g1 and costs 676 bytes in total.
+`attrs_other` is empty for every span in g1 and costs 1,081 bytes in total,
+which is what a constant column costs on this corpus — the same figure as
+every other all-default column of the amended table.
 
 ## 4. Reads never double-count a retried span
 
@@ -928,7 +939,10 @@ for the `IN` subqueries exactly as the current reader does. Replication moves
 one compressed copy of each part to each further replica: measured **34.965
 bytes per span** fetched by the second replica (`measure/replication_bytes.sh`)
 against **34.923** stored — 1.0012×, the excess being part metadata rather than
-a second copy of any column.
+a second copy of any column. **Both figures are at the pre-#587 row shape**:
+the stored side is now **39.675** B/span compressed, re-measured over the
+amended `spans`, and the fetched side needs two replicas and so has not been
+re-measured — `T-W4` is what takes it.
 
 ## 8. The layouts that were measured, and why this one
 
@@ -936,7 +950,15 @@ All six alternatives are built by `measure/layouts.sql` from the same staging
 table, so only the layout differs, and `measure/run_all.sh` benchmarks each of
 them — and the shipped one — on the five shapes that discriminate
 (`results/layout-comparison.tsv`). Warm medians of five repetitions, one
-unmeasured first:
+unmeasured first.
+
+**Every B/span figure in this table is at the pre-#587 row shape**, the shipped
+one included: the comparison was run before the amended `spans` existed, and
+the shipped column's own figure is now 39.847 (§2). The **ordering** is what
+this section decides and the amendment moves every row by the same columns, so
+the decision stands; the figures are left as they were measured rather than
+mixed with a later run.
+
 
 | layout | B/span | fetch, 20 spans | fetch, 1,000 spans | service-scoped quantiles | instant by name | narrowed tag values |
 |---|---:|---:|---:|---:|---:|---:|

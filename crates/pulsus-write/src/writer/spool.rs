@@ -1078,19 +1078,28 @@ mod tests {
             scope_name: "io.otel.http".to_string(),
             scope_version: "1.4.2".to_string(),
             scope_attrs: json("otel%2Escope%2Ebuild", "release"),
+            // Every field issue #587 adds carries a non-default value, so
+            // the audit record's two encoders are compared over a row that
+            // actually holds them.
+            scope_schema_url: "https://example.invalid/scope".to_string(),
+            scope_dropped_attrs: 11,
+            scope_attrs_other: vec![0x0a, 0x02, 0x73, 0x6b],
+            end_ns: TS as u64 + 4_000_000,
             events: vec![LandingEvent {
-                time_ns: TS + 1_000_000,
+                time_ns: TS as u64 + 1_000_000,
                 name: "exception".to_string(),
                 attrs: json("exception%2Etype", "IOError"),
+                attrs_other: vec![0x0a, 0x03, 0x65, 0x76, 0x74],
                 dropped_attrs: 1,
             }],
             dropped_events: 3,
             links: vec![LandingLink {
-                trace_id: [0x11; 16],
-                span_id: [0x22; 8],
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
                 trace_state: "congo=t61rcWkgMzE".to_string(),
                 flags: 0x100,
                 attrs: json("link%2Ekind", "follows"),
+                attrs_other: vec![0x0a, 0x04, 0x6c, 0x69, 0x6e, 0x6b],
                 dropped_attrs: 4,
             }],
             dropped_links: 5,
@@ -1107,6 +1116,7 @@ mod tests {
             attrs_other: vec![0x0a, 0x01, 0x6b],
             dropped_attrs: 1,
             schema_url: "https://example.invalid/\"v1\"".to_string(),
+            entity_refs: vec![0x1a, 0x02, 0x12, 0x00],
         };
         let tag_name = LandingTagName {
             scope: TagScope::Event,

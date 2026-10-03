@@ -34,39 +34,56 @@
 //! asserts of the others — it names the current window, and it does not
 //! still claim the earlier one was the last.
 
-/// The window this change opened, named the same way in all four.
-const CURRENT_WINDOW: &str = "#498";
+/// The latest window, named in all four.
+const CURRENT_WINDOW: &str = "#587";
 
-/// The window that was the last one before it. A passage still calling
-/// this one "the last" is stale, whatever else it says.
+/// The window before it. **It is no longer the last one, and it is still
+/// named**: the policy now lists two, so a passage that names only one of
+/// them is a passage that has been half-edited.
+const PRIOR_WINDOW: &str = "#498";
+
+/// The window before THAT. A passage still calling this one "the last" is
+/// stale, whatever else it says.
 const SUPERSEDED_WINDOW: &str = "#54";
 
 /// The sentence fragment that carries the claim, in each artefact's own
-/// wording, and **how many times that passage names the current window**.
+/// wording, and **how many times that passage names each of the two
+/// windows the policy now lists**.
 ///
-/// The count is the point. Two of these passages name `#498` twice — the
-/// catalog's module doc in its statement and again in its attribution, the
-/// design record's note in its first sentence and again in its last — and
-/// a `contains` check passes when only one of the two is changed. Measured:
+/// The counts are the point. A `contains` check passes on a passage that
+/// has been half-edited, and both halves are reachable: the design record's
+/// note names `#498` in its first sentence and again in its last, and every
+/// passage names the latest window once beside it. Measured at issue #498:
 /// with the catalog's first occurrence alone rewritten, a presence test
-/// reports every file agreeing while the passage says two different things
-/// about which window is current. The cardinality is what makes each
-/// single-occurrence edit a failure.
-const POLICY_PASSAGES: &[(&str, &str, usize)] = &[
-    ("docs/schemas.md", "**Migration amendment policy:**", 1),
+/// reported every file agreeing while the passage said two different things
+/// about which window was current.
+///
+/// **Both columns are pinned, which is what the second window added.**
+/// Before issue #587 the policy named one window and this table pinned one
+/// count; a list of two needs both, or dropping either one from a passage
+/// is silent.
+const POLICY_PASSAGES: &[(&str, &str, usize, usize)] = &[
+    ("docs/schemas.md", "**Migration amendment policy:**", 1, 1),
     (
         "docs/architecture.md",
         "Migrations are idempotent, and append-only from the first tagged release onward",
+        1,
         1,
     ),
     (
         "crates/pulsus-schema/src/catalog.rs",
         "**Amendment policy:** migrations are append-only",
-        2,
+        1,
+        1,
     ),
     (
         "docs/traceql-schema-migration.md",
-        "> **Historical, 2026-09-17.** The window was reopened by a ruling on issue",
+        "> **Historical, 2026-09-17.** The window was reopened by a",
+        2,
+        // The design record names each window **twice** — in the sentence
+        // that reopens it and again in the sentence that says which is the
+        // latest occupant. That is the shape a `contains` check cannot see
+        // half of.
         2,
     ),
 ];
@@ -106,18 +123,20 @@ fn passage(rel: &str, opener: &str) -> String {
 #[test]
 fn the_four_amendment_policy_statements_name_one_window() {
     let mut wrong: Vec<String> = Vec::new();
-    for (rel, opener, expected) in POLICY_PASSAGES {
+    for (rel, opener, want_prior, want_current) in POLICY_PASSAGES {
         let p = passage(rel, opener);
-        let got = p.matches(CURRENT_WINDOW).count();
-        if got != *expected {
-            wrong.push(format!(
-                "{rel}: names {CURRENT_WINDOW} {got} time(s), expected {expected}"
-            ));
+        for (window, want) in [(PRIOR_WINDOW, *want_prior), (CURRENT_WINDOW, *want_current)] {
+            let got = p.matches(window).count();
+            if got != want {
+                wrong.push(format!(
+                    "{rel}: names {window} {got} time(s), expected {want}"
+                ));
+            }
         }
     }
     assert!(
         wrong.is_empty(),
-        "the amendment-policy passage must name the same window in all four places, everywhere \
+        "the amendment-policy passage must name the same windows in all four places, everywhere \
          it states one:\n  {}",
         wrong.join("\n  ")
     );
@@ -130,7 +149,7 @@ fn the_four_amendment_policy_statements_name_one_window() {
 fn no_amendment_policy_statement_still_calls_the_superseded_window_the_last_one() {
     let stale: Vec<&str> = POLICY_PASSAGES
         .iter()
-        .filter(|(rel, opener, _)| {
+        .filter(|(rel, opener, _, _)| {
             let p = passage(rel, opener);
             // The design record's dated note names the superseded window
             // deliberately, as the thing that was superseded, so what is
@@ -142,7 +161,7 @@ fn no_amendment_policy_statement_still_calls_the_superseded_window_the_last_one(
             let after = &p[at..];
             after.contains("was the last such") || after.contains("was the last window")
         })
-        .map(|(rel, _, _)| *rel)
+        .map(|(rel, _, _, _)| *rel)
         .collect();
     assert!(
         stale.is_empty(),

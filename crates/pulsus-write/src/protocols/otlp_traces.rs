@@ -57,6 +57,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::EntityRef;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
@@ -2651,6 +2652,18 @@ mod tests {
 /// reserved pair cannot be read as part of one.
 const IDENTITY_SCHEMA_URL_KEY: &[u8] = &[0xFF];
 
+/// The reserved key the identity buffer appends `Resource.entity_refs`
+/// under, **iff the field is non-empty** (issue #587 row 8).
+///
+/// [`IDENTITY_SCHEMA_URL_KEY`]'s device, one byte longer: no valid UTF-8
+/// key can spell it, so it collides with nothing a sender can send.
+const IDENTITY_ENTITY_REFS_KEY: &[u8] = &[0xFF, 0xFF];
+
+/// The reserved key the identity buffer appends
+/// `Resource.dropped_attributes_count` under, **iff the count is non-zero**
+/// (issue #587 row 13).
+const IDENTITY_DROPPED_COUNT_KEY: &[u8] = &[0xFF, 0xFF, 0xFF];
+
 /// The separator the identity buffer uses, which is
 /// `pulsus_model::build_stream_buffer`'s own.
 const IDENTITY_SEP: u8 = 0xFF;
@@ -2746,7 +2759,26 @@ fn identity_encode_value(value: Option<&AnyValue>, buf: &mut Vec<u8>) {
 /// **Pairs sorted by key, key-unique, `key ++ 0xFF ++ <encoded value> ++
 /// 0xFF`** — `pulsus_model::build_stream_buffer`'s layout, with
 /// [`identity_encode_value`] in place of the value's text — then the schema
-/// url under [`IDENTITY_SCHEMA_URL_KEY`].
+/// url under [`IDENTITY_SCHEMA_URL_KEY`], then **two conditional
+/// sections**: the entity references under [`IDENTITY_ENTITY_REFS_KEY`]
+/// when the field is non-empty, and the dropped count under
+/// [`IDENTITY_DROPPED_COUNT_KEY`] when it is non-zero (issue #587 rows 8
+/// and 13).
+///
+/// **The two sections carry the field's VALUE, not its presence.** A
+/// section appended merely *because* a field is set separates `0` from `5`
+/// and `empty` from `one reference`, and **collides** on `5` against `6`
+/// and on two different single-reference vectors — so the entity section
+/// carries the carrier bytes and the count section its own decimal text,
+/// which is self-delimiting against the trailing separator because a
+/// decimal digit is never `0xFF`.
+///
+/// **They are conditional and appended last, so no stored `resource_id`
+/// moves.** `entity_refs` is a proto3 `repeated` field, so an empty one and
+/// an absent one are the same value and must hash the same; a `uint32` has
+/// no presence either, so `0` and absent are one value — and `0` with no
+/// references is what every resource landed before this change carried, so
+/// the two conditions are what keep the golden vectors from churning.
 ///
 /// The encoded value starts with a type tag, which is an ASCII letter, and
 /// is self-delimiting from there; a key holds no `0xFF` because it is valid
@@ -2792,6 +2824,20 @@ fn resource_identity_buffer(resource: Option<&Resource>, schema_url: &str) -> Ve
     buf.push(IDENTITY_SEP);
     buf.extend_from_slice(schema_url.as_bytes());
     buf.push(IDENTITY_SEP);
+    if let Some(resource) = resource {
+        if !resource.entity_refs.is_empty() {
+            buf.extend_from_slice(IDENTITY_ENTITY_REFS_KEY);
+            buf.push(IDENTITY_SEP);
+            buf.extend_from_slice(&encode_entity_refs(&resource.entity_refs));
+            buf.push(IDENTITY_SEP);
+        }
+        if resource.dropped_attributes_count != 0 {
+            buf.extend_from_slice(IDENTITY_DROPPED_COUNT_KEY);
+            buf.push(IDENTITY_SEP);
+            buf.extend_from_slice(resource.dropped_attributes_count.to_string().as_bytes());
+            buf.push(IDENTITY_SEP);
+        }
+    }
     buf
 }
 
@@ -2866,13 +2912,24 @@ fn land_value(key: &str, value: Option<&AnyValue>) -> LandedValue {
             LandedValue::One(TraceJsonValue::Scalar(TraceJsonScalar::Double(*d)))
         }
         Value::ArrayValue(array) => land_array(array),
+        // **One unstorable leaf at ANY depth moves the WHOLE attribute**
+        // (issue #587 row 5). The alternative — writing the storable
+        // leaves as paths and the unstorable one nowhere — loses that leaf
+        // silently, and putting it in `attrs_other` under its own dotted
+        // key is indistinguishable from a top-level attribute literally
+        // spelled that way and splits one nested attribute across two
+        // carriers. So the attribute goes to exactly one carrier, whole,
+        // under exactly one key.
+        //
+        // The cost is that the attribute's other leaves lose their
+        // queryability, which is already what `attrs_other` means and
+        // already what a top-level bytes value gets.
         Value::KvlistValue(kvlist) => {
             if kvlist.values.is_empty() {
                 return LandedValue::Other;
             }
             let mut leaves = Vec::new();
-            collect_leaves(key, key, kvlist, &mut leaves);
-            if leaves.is_empty() {
+            if !collect_leaves(key, key, kvlist, &mut leaves) || leaves.is_empty() {
                 LandedValue::Other
             } else {
                 LandedValue::Leaves(leaves)
@@ -2970,22 +3027,33 @@ fn land_array(array: &ArrayValue) -> LandedValue {
     LandedValue::One(TraceJsonValue::MixedArray(scalars))
 }
 
-/// Walks a kvlist into `(escaped path, original dotted key, value)` leaves.
+/// Walks a kvlist into `(escaped path, original dotted key, value)` leaves,
+/// answering **whether every leaf it reached was storable as a JSON path**.
 ///
 /// **A nested object is dotted leaf paths and nothing else** — the engine
 /// stores no value at a parent path, measured: for
 /// `CAST('{"k":{"a":{"b":1}}}' AS JSON)`, `dynamicType(attrs.`k`)` answers
 /// `None` while `JSONAllPathsWithTypes(attrs)` answers `{'k.a.b':'Int64'}`.
-/// A leaf whose own value cannot be stored (a bytes value, an empty kvlist)
-/// is simply not a leaf: the composite key is listed in `tag_names` and no
-/// value is listed for it, which is the disagreement `docs/api.md` §4.3's
-/// two halves carry for a composite key.
+///
+/// **`false` means the whole attribute belongs in `attrs_other`** (issue
+/// #587 row 5), and the recursion propagates it, so a **grandchild**'s
+/// verdict reaches the top-level attribute: an implementation that checked
+/// its direct children only would write the deeper leaf's siblings as
+/// paths and lose the leaf itself. `W-3`'s fixture puts the unstorable leaf
+/// at depth two for exactly that reason.
+///
+/// **A profiling string reference is still `true`.** That arm lands
+/// NOWHERE by the protocol's own instruction — a non-profiling receiver
+/// processes the value as absent — so it is not an unstorable value to be
+/// carried elsewhere, and treating it as one would move an attribute whose
+/// every value-carrying leaf is storable.
 fn collect_leaves(
     escaped_prefix: &str,
     original_prefix: &str,
     kvlist: &KeyValueList,
     out: &mut Vec<(String, String, TraceJsonValue)>,
-) {
+) -> bool {
+    let mut all_storable = true;
     for entry in &kvlist.values {
         let escaped = format!(
             "{escaped_prefix}.{}",
@@ -2994,18 +3062,22 @@ fn collect_leaves(
         let original = format!("{original_prefix}.{}", entry.key);
         match entry.value.as_ref().and_then(|v| v.value.as_ref()) {
             Some(Value::KvlistValue(nested)) if !nested.values.is_empty() => {
-                collect_leaves(&escaped, &original, nested, out);
+                all_storable &= collect_leaves(&escaped, &original, nested, out);
             }
             _ => match land_value(&entry.key, entry.value.as_ref()) {
                 LandedValue::One(value) => out.push((escaped, original, value)),
-                // A leaf whose value goes to `attrs_other`, a leaf that is
-                // itself an empty kvlist, and a leaf of the profiling arm all
-                // store no path. Inside a kvlist that arm already landed
-                // nowhere before issue #586: only `One` is kept here.
-                LandedValue::Leaves(_) | LandedValue::Other | LandedValue::Absent => {}
+                // A leaf whose value no JSON path can hold — a bytes
+                // value, an empty kvlist, an array with a bytes or kvlist
+                // element, an `AnyValue` with no arm set. The whole
+                // attribute moves.
+                LandedValue::Leaves(_) | LandedValue::Other => all_storable = false,
+                // The profiling arm, which lands nowhere by instruction
+                // and is not a loss.
+                LandedValue::Absent => {}
             },
         }
     }
+    all_storable
 }
 
 /// One attribute scope's landed attributes: the JSON column, the keys and
@@ -3052,6 +3124,22 @@ impl TagStage {
 /// under; `stage` is the holding set for the part of the push these
 /// attributes belong to, merged into the accepted sets only once a span
 /// under them lands.
+///
+/// **`skip_key` is TWO decisions, not one** (issue #587 row 6). The caller
+/// passes `service.name` because `spans.service` already carries it — but
+/// `spans.service` carries it losslessly for exactly one `AnyValue` arm, a
+/// non-empty `StringValue`. For every other arm `any_value_to_string`
+/// flattens the value to text and the typed value is gone, so:
+///
+/// - the **catalog** skip is unconditional at every arm —
+///   `service.name` is a column and not a catalog entry, which
+///   `sql-schema.md` §4.3's tag contract requires;
+/// - the **`attrs`** skip applies only to a non-empty `StringValue`, so an
+///   empty string stays as an empty-string path and an integer stays as an
+///   integer path.
+///
+/// The value is stored once either way, in one place or the other, never
+/// both.
 fn land_attrs(
     attrs: &[KeyValue],
     scope: TagScope,
@@ -3073,6 +3161,26 @@ fn land_attrs(
             continue;
         }
         if Some(kv.key.as_str()) == skip_key {
+            // The catalog skip, unconditional: no `tag_names` row and no
+            // `tag_values` row for this key, at any arm.
+            if value_is_non_empty_string(kv.value.as_ref()) {
+                // And the `attrs` skip, for the one arm the column
+                // carries losslessly.
+                continue;
+            }
+            match land_value(&kv.key, kv.value.as_ref()) {
+                LandedValue::One(value) => entries.push(TraceJsonEntry {
+                    path: crate::writer::trace_json::escape_json_path(&kv.key),
+                    value,
+                }),
+                LandedValue::Leaves(leaves) => {
+                    for (path, _original, value) in leaves {
+                        entries.push(TraceJsonEntry { path, value });
+                    }
+                }
+                LandedValue::Other => other.push(kv.clone()),
+                LandedValue::Absent => {}
+            }
             continue;
         }
         // **The classifying runs BEFORE the name is listed** (issue #586),
@@ -3120,6 +3228,15 @@ fn land_attrs(
         json: TraceJson::from_entries(entries),
         other,
     }
+}
+
+/// `true` for the one `AnyValue` arm `spans.service` carries losslessly: a
+/// `StringValue` that is not empty (issue #587 row 6).
+fn value_is_non_empty_string(value: Option<&AnyValue>) -> bool {
+    matches!(
+        value.and_then(|v| v.value.as_ref()),
+        Some(Value::StringValue(s)) if !s.is_empty()
+    )
 }
 
 /// Records the kind-3 rows one landed value produces: one for a scalar and
@@ -3183,6 +3300,33 @@ fn encode_attrs_other(attrs: Vec<KeyValue>) -> Vec<u8> {
     KeyValueList { values: attrs }.encode_to_vec()
 }
 
+/// The carrier `resources.entity_refs` holds (issue #587 row 8), or the
+/// empty vector when the resource carries none.
+///
+/// **An `opentelemetry.proto.resource.v1.Resource` with only field 3
+/// populated**, which is [`encode_attrs_other`]'s shape one message up: an
+/// OTLP message in its own right used as a carrier, with empty meaning zero
+/// bytes. So each `EntityRef` keeps **its own protocol tag** — the key byte
+/// `0x1a`, field 3 wire type 2 — and the bytes are a valid, self-describing OTLP fragment
+/// a generic protobuf tool decodes correctly, where a private wrapper would
+/// renumber the field and nothing in the vendored tree would generate the
+/// type.
+///
+/// **Fields 1 and 2 come back at their proto3 defaults and are NOT the
+/// resource's** — an empty attribute vector and `0`. That is the one cost
+/// of reusing `Resource`, and `W-6` asserts it rather than leaving a
+/// careless reader to assume otherwise.
+fn encode_entity_refs(entity_refs: &[EntityRef]) -> Vec<u8> {
+    if entity_refs.is_empty() {
+        return Vec::new();
+    }
+    Resource {
+        entity_refs: entity_refs.to_vec(),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 /// Refuses a value whose stored path count exceeds
 /// `format_binary_max_object_size`.
 ///
@@ -3212,7 +3356,12 @@ fn check_json_paths(json: &TraceJson) -> Result<(), LogsIngestError> {
 /// `Ok`.
 pub fn parse_landing(
     req: &ExportTraceServiceRequest,
-    now_ns: i64,
+    // **Not consulted since issue #587 row 10.** A zero
+    // `start_time_unix_nano` is stored as `0` rather than replaced with
+    // the receipt time, so this walk needs no clock at all. The parameter
+    // stays because the handler runs both decodes over the same bytes with
+    // the same arguments, and `parse` does still take one.
+    _now_ns: i64,
 ) -> Result<ParsedTraceLanding, LogsIngestError> {
     crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
 
@@ -3269,6 +3418,12 @@ pub fn parse_landing(
             let scope = scope_spans.scope.as_ref();
             let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
             let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
+            // **The scope's OWN schema url**, not the resource's (issue
+            // #587 row 1): `ScopeSpans` carries one and `ResourceSpans`
+            // carries another, and the one this loop is inside is this
+            // one. And the scope's own dropped count (row 2).
+            let scope_schema_url = scope_spans.schema_url.clone();
+            let scope_dropped_attrs = scope.map(|s| s.dropped_attributes_count).unwrap_or(0);
             let mut scope_stage = TagStage::default();
             let scope_attrs = match scope {
                 Some(scope) => {
@@ -3295,11 +3450,12 @@ pub fn parse_landing(
                     &mut out,
                     &mut expanded_bytes,
                     span,
-                    now_ns,
                     resource_id,
                     &service,
                     &scope_name,
                     &scope_version,
+                    &scope_schema_url,
+                    scope_dropped_attrs,
                     &scope_attrs,
                     &mut span_stage,
                 )?
@@ -3339,6 +3495,9 @@ pub fn parse_landing(
                         attrs_other: encode_attrs_other(resource_attrs.other.clone()),
                         dropped_attrs: resource_dropped,
                         schema_url: resource_spans.schema_url.clone(),
+                        entity_refs: resource
+                            .map(|r| encode_entity_refs(&r.entity_refs))
+                            .unwrap_or_default(),
                     });
                 out.spans.push(landed);
             }
@@ -3361,11 +3520,12 @@ fn land_span(
     out: &mut ParsedTraceLanding,
     expanded_bytes: &mut usize,
     span: &Span,
-    now_ns: i64,
     resource_id: Fingerprint,
     service: &str,
     scope_name: &str,
     scope_version: &str,
+    scope_schema_url: &str,
+    scope_dropped_attrs: u32,
     scope_attrs: &LandedAttrs,
     stage: &mut TagStage,
 ) -> Result<Option<LandingSpan>, LogsIngestError> {
@@ -3409,22 +3569,31 @@ fn land_span(
             }
         }
     };
-    let start_ns = if span.start_time_unix_nano == 0 {
-        now_ns
-    } else {
-        match i64::try_from(span.start_time_unix_nano) {
-            Ok(ns) => ns,
-            Err(_) => {
-                reject_landing(
-                    out,
-                    format!(
-                        "span {:?}: start_time_unix_nano {} is not representable",
-                        diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                        span.start_time_unix_nano
-                    ),
-                );
-                return Ok(None);
-            }
+    // **A zero start is the sender's own value and is stored as it
+    // arrived** (issue #587 row 10). Substituting the receipt time did not
+    // merely change a timestamp: it moved the span into a different day
+    // partition and a different five-minute bucket, so a window query over
+    // the sender's own time range did not find it. 1970-01-01T00:00:00Z is
+    // inside the admitted UTC-day domain, so the span lands where the
+    // sender said it belongs.
+    //
+    // **The OLD path's substitution stays**, in `parse`'s span loop, and
+    // `parse_zero_start_time_falls_back_to_now_ns` is what pins it. The two
+    // paths then disagree for a zero start, which is allowed: no
+    // equivalence between the old tables and the new ones is claimed,
+    // required or tested.
+    let start_ns = match i64::try_from(span.start_time_unix_nano) {
+        Ok(ns) => ns,
+        Err(_) => {
+            reject_landing(
+                out,
+                format!(
+                    "span {:?}: start_time_unix_nano {} is not representable",
+                    diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                    span.start_time_unix_nano
+                ),
+            );
+            return Ok(None);
         }
     };
 
@@ -3442,9 +3611,14 @@ fn land_span(
         let landed = land_attrs(&event.attributes, TagScope::Event, None, stage);
         check_json_paths(&landed.json)?;
         events.push(LandingEvent {
-            time_ns: i64::try_from(event.time_unix_nano).unwrap_or(i64::MAX),
+            // Verbatim: no `try_from`, no clamp, no rejection (issue #587
+            // row 11). The reference stores an unsigned offset from the
+            // span start and reads it back by unsigned addition, so any
+            // unsigned 64-bit event time round-trips there.
+            time_ns: event.time_unix_nano,
             name: event.name.clone(),
             attrs: landed.json,
+            attrs_other: encode_attrs_other(landed.other),
             dropped_attrs: event.dropped_attributes_count,
         });
     }
@@ -3457,11 +3631,17 @@ fn land_span(
         let landed = land_attrs(&link.attributes, TagScope::Link, None, stage);
         check_json_paths(&landed.json)?;
         links.push(LandingLink {
-            trace_id: <[u8; 16]>::try_from(link.trace_id.as_slice()).unwrap_or([0u8; 16]),
-            span_id: <[u8; 8]>::try_from(link.span_id.as_slice()).unwrap_or([0u8; 8]),
+            // **The bytes the sender put on the wire, with no length
+            // check** (issue #587 row 7), which is what this module's own
+            // note on a link's ids already says the response renders. The
+            // span's OWN ids stay rejected at the wrong length — that is
+            // #586's shipped behaviour and a rejection rather than a loss.
+            trace_id: link.trace_id.clone(),
+            span_id: link.span_id.clone(),
             trace_state: link.trace_state.clone(),
             flags: link.flags,
             attrs: landed.json,
+            attrs_other: encode_attrs_other(landed.other),
             dropped_attrs: link.dropped_attributes_count,
         });
     }
@@ -3474,15 +3654,14 @@ fn land_span(
         duration_ns: resolve_duration_ns(span.start_time_unix_nano, span.end_time_unix_nano),
         resource_id,
         name: span.name.clone(),
-        // The OTLP span kind is `0..=5`; a value outside that is the
-        // sender's and is stored as it arrived, saturating rather than
-        // wrapping.
-        kind: u8::try_from(span.kind).unwrap_or(0),
-        status_code: span
-            .status
-            .as_ref()
-            .map(|s| u8::try_from(s.code).unwrap_or(0))
-            .unwrap_or(0),
+        // **The protocol's own signed values, verbatim** (issue #587 rows
+        // 7 and 12). The reference stores a signed integer kind and a
+        // signed integer status code and returns both as they arrived, so
+        // narrowing or rejecting either would be a divergence introduced
+        // here. The outer `unwrap_or(0)` is the absent-`Status` arm, which
+        // the reference collapses to `0` identically.
+        kind: span.kind,
+        status_code: span.status.as_ref().map(|s| s.code).unwrap_or(0),
         status_message: span
             .status
             .as_ref()
@@ -3493,6 +3672,15 @@ fn land_span(
         scope_name: scope_name.to_string(),
         scope_version: scope_version.to_string(),
         scope_attrs: scope_attrs.json.clone(),
+        scope_schema_url: scope_schema_url.to_string(),
+        scope_dropped_attrs,
+        scope_attrs_other: encode_attrs_other(scope_attrs.other.clone()),
+        // **The sender's end, verbatim**: no `try_from`, no clamp, no
+        // rejection (issue #587 row 9). `duration_ns` above keeps
+        // `resolve_duration_ns`'s clamped value — `0` for an unset or
+        // inverted end, `i64::MAX` for an unrepresentable difference — and
+        // the exact end is here.
+        end_ns: span.end_time_unix_nano,
         events,
         dropped_events: span.dropped_events_count,
         links,
@@ -4229,6 +4417,127 @@ mod landing_tests {
         assert_eq!(
             parsed.resources[0].resource_id, parsed.spans[0].resource_id,
             "the span and its resource row carry one identity"
+        );
+    }
+
+    /// **W-10's hermetic half (issue #587 rows 8 and 13).** The identity
+    /// covers **all four** of its inputs, and it covers each one's
+    /// **value** rather than its presence.
+    ///
+    /// **Four inputs, and that is the whole set**, which is what makes this
+    /// exhaustive rather than illustrative: `Resource` has exactly three
+    /// fields in the generated protocol source — `attributes` (tag 1),
+    /// `dropped_attributes_count` (tag 2), `entity_refs` (tag 3) — and
+    /// `resource_identity` takes `ResourceSpans.schema_url` as its second
+    /// parameter. A fourth `Resource` field added upstream has to appear
+    /// here.
+    ///
+    /// **Seven sub-cases, and the two value pairs are the load-bearing
+    /// ones.** A section appended merely *because* the count is non-zero,
+    /// or *because* the vector is non-empty, passes `0` against `5` and
+    /// `empty` against `one` and **collides** on `5` against `6` and on two
+    /// different single-reference vectors — so those two pairs are what
+    /// force the field's own value into the buffer. The seventh pins that
+    /// no existing identity moved.
+    #[test]
+    fn the_resource_identity_covers_every_field_the_resource_carries() {
+        const SCHEMA: &str = "https://example.invalid/v1";
+        let attrs = || {
+            vec![
+                kv("service.name", str_value("checkout")),
+                kv("host.name", str_value("node-a")),
+            ]
+        };
+        let entity = |kind: &str| EntityRef {
+            schema_url: SCHEMA.to_string(),
+            r#type: kind.to_string(),
+            id_keys: vec!["host.name".to_string()],
+            description_keys: Vec::new(),
+        };
+        let id = |dropped: u32, refs: Vec<EntityRef>, schema_url: &str| {
+            resource_identity(
+                Some(&Resource {
+                    attributes: attrs(),
+                    dropped_attributes_count: dropped,
+                    entity_refs: refs,
+                }),
+                schema_url,
+            )
+        };
+        let base = || id(0, Vec::new(), SCHEMA);
+
+        // 1. `Resource.attributes` — the input that was already covered.
+        assert_ne!(
+            base(),
+            resource_identity(
+                Some(&Resource {
+                    attributes: vec![
+                        kv("service.name", str_value("checkout")),
+                        kv("host.name", str_value("node-b")),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                SCHEMA,
+            ),
+            "the attributes are in the hash"
+        );
+
+        // 2. `ResourceSpans.schema_url` — likewise.
+        assert_ne!(
+            base(),
+            id(0, Vec::new(), "https://example.invalid/v2"),
+            "the schema url is in the hash"
+        );
+
+        // 3. `Resource.dropped_attributes_count`, zero against non-zero.
+        assert_ne!(
+            base(),
+            id(5, Vec::new(), SCHEMA),
+            "a dropped count of 5 is not a dropped count of 0"
+        );
+
+        // 4. And **non-zero against non-zero**, which a presence-only
+        // section fails: the count's own value has to be in the buffer.
+        assert_ne!(
+            id(5, Vec::new(), SCHEMA),
+            id(6, Vec::new(), SCHEMA),
+            "a dropped count of 6 is not a dropped count of 5"
+        );
+
+        // 5. `Resource.entity_refs`, empty against one reference.
+        assert_ne!(
+            id(5, Vec::new(), SCHEMA),
+            id(5, vec![entity("host")], SCHEMA),
+            "an entity reference is not the absence of one"
+        );
+
+        // 6. And **one non-empty vector against another**, the same point.
+        assert_ne!(
+            id(5, vec![entity("host")], SCHEMA),
+            id(5, vec![entity("service")], SCHEMA),
+            "a `service` entity reference is not a `host` one"
+        );
+
+        // 7. **No existing identity moves.** A resource with an empty
+        // `entity_refs` and a zero dropped count hashes to exactly the
+        // value it hashed to before the two sections were added, which is
+        // why both are conditional and appended after the schema url. The
+        // literal was read off this function on `origin/main` at
+        // `619414e4`.
+        assert_eq!(
+            base(),
+            Fingerprint::from_raw(307_209_891_247_568_146_312_164_646_737_311_135_069),
+            "a resource with neither field set must keep the identity it \
+             had before issue #587: the two new sections are conditional"
+        );
+
+        // And one value twice is one resource, so none of the assertions
+        // above can pass on an unstable identity.
+        assert_eq!(base(), base());
+        assert_eq!(
+            id(6, vec![entity("service")], SCHEMA),
+            id(6, vec![entity("service")], SCHEMA),
         );
     }
 

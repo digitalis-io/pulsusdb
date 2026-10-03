@@ -216,18 +216,51 @@ fn now_unix_millis() -> i64 {
 ///
 /// Written as literal SQL so this suite stays inside `pulsus-schema`'s own
 /// dependency set: it does not depend on `pulsus-write`.
+///
+/// **`W-15` (issue #587): every field the amended table added or widened
+/// carries a non-default value here**, because a compressed default column
+/// is nearly free and a populated one is not — so the existing per-row
+/// ceiling has never been measured against the amended row shape, and a
+/// fixture that left any of them at a default would pass the ceiling while
+/// representative rows exceeded it. That includes the **widened integers**
+/// and not only the new byte fields: a `kind` outside `0..=5`, a
+/// `status_code` outside `0..=255`, a non-zero `end_ns`, a non-zero
+/// `scope_dropped_attrs` and a non-zero event time are what price four
+/// bytes rather than one.
+///
+/// **`traces.buckets` is not here, and must not be**: it is a column on
+/// `traces`, which `T-S3` prices, not on `trace_landing`.
 fn landing_span_block_sql(db: &str, received_ms: i64, base_ns: i64, count: u64) -> String {
     format!(
         "INSERT INTO {db}.trace_landing \
          (received_ms, row_kind, trace_id, span_id, parent_span_id, start_ns, duration_ns, \
-          resource_id, name, kind, status_code, service, attrs, scope_attrs) \
+          resource_id, name, kind, status_code, service, attrs, scope_attrs, \
+          scope_schema_url, scope_dropped_attrs, scope_attrs_other, end_ns, entity_refs, \
+          events, links) \
          SELECT {received_ms}, 0, \
           reinterpretAsFixedString(toUInt128(0x1000 + number)), \
           reinterpretAsFixedString(toUInt64(0x2000 + number)), \
-          toFixedString('', 8), {base_ns} + number * 1000000, 1000000, 1, 'GET /api', 2, 0, \
+          toFixedString('', 8), {base_ns} + number * 1000000, 1000000, 1, 'GET /api', 300, 300, \
           'checkout', \
           CAST('{{\"http%2Erequest%2Emethod\":\"GET\",\"http%2Eresponse%2Estatus_code\":200}}' AS JSON), \
-          CAST('{{}}' AS JSON) \
+          CAST('{{}}' AS JSON), \
+          'https://opentelemetry.invalid/schemas/1.21.0', \
+          1 + number % 7, \
+          concat('scope.blob.', leftPad(toString(number), 20, '0')), \
+          toUInt64({base_ns} + number * 1000000 + 1000000), \
+          concat('entity.refs.', leftPad(toString(number), 28, '0')), \
+          [( \
+            toUInt64({base_ns} + number * 1000000 + 500000), 'exception', \
+            CAST('{{\"exception%2Etype\":\"IOError\"}}' AS JSON), \
+            concat('event.blob.', leftPad(toString(number), 20, '0')), 1 \
+          )], \
+          [( \
+            concat('lnk', leftPad(toString(number), 17, '0')), \
+            concat('s', leftPad(toString(number), 7, '0')), \
+            'congo=t61rcWkgMzE', 256, \
+            CAST('{{\"link%2Ekind\":\"follows\"}}' AS JSON), \
+            concat('link.blob.', leftPad(toString(number), 20, '0')), 2 \
+          )] \
          FROM numbers({count})"
     )
 }
@@ -409,9 +442,47 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
     let got = columns(&client, db, "traces").await;
+    // In NAME order, which is `columns`' own `ORDER BY`.
     let want: Vec<(String, String)> = [
+        // Issue #587: the stored span-bucket set part 2's span read is a
+        // point read over.
+        //
+        // **The cap is applied in three places, and which ones depends on
+        // the engine** — measured on 26.3.29.7, one request each:
+        //
+        //   CAST(range(5000) AS SimpleAggregateFunction(
+        //        groupUniqArrayArray(4096), Array(Int64)))        -> 5000
+        //   INSERT of a 5,000-element array into a column of that
+        //        type on a plain MergeTree                        -> 5000
+        //   the same INSERT on an AggregatingMergeTree            -> 4096
+        //
+        // So the TYPE caps nothing and the FUNCTION does, and this table
+        // is an `AggregatingMergeTree`, so the function named here is
+        // applied when the part is written and again when two rows of one
+        // key merge. Measured on the same engine: a 10-element array
+        // carrying each value twice stores as **five** distinct here and
+        // as **ten** on a plain `MergeTree`.
+        //
+        // `traces_mv` applies `groupUniqArray(4096)(...)` per push beside
+        // it. **Both govern a single push's stored array; only the one
+        // named here governs a MERGE, and only the one named here decides
+        // which function is applied at all** — so a view that emitted
+        // `groupArray` would still store a deduplicated, capped set.
+        // **This case is therefore the only one that can see the wrong
+        // declared function**: `W-17`
+        // (`crates/pulsus-write/tests/trace_landing.rs`) reads the stored
+        // set back through a deduplicating aggregate and cannot.
+        (
+            "buckets",
+            "SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))",
+        ),
         ("day", "Date"),
         ("end_ns", "SimpleAggregateFunction(max, Int64)"),
+        // Issue #587: the per-trace LATEST start, which part 2 bounds the
+        // resource-day range with. `max`, not `min`: `start_ns` above is
+        // the minimum and this is the maximum, and a view that wrote `min`
+        // here would narrow that bound silently.
+        ("last_start_ns", "SimpleAggregateFunction(max, Int64)"),
         (
             "root_name",
             "SimpleAggregateFunction(max, LowCardinality(String))",
@@ -430,7 +501,7 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     .iter()
     .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
     .collect();
-    assert_eq!(got, want, "the per-trace table's seven declarations");
+    assert_eq!(got, want, "the per-trace table's nine declarations");
 
     drop_database(&client, db).await;
 }
@@ -460,9 +531,10 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        43,
-        "the five target tables' own column count (23 + 7 + 7 + 2 + 4), so \
-         the codec check below has a non-empty domain"
+        50,
+        "the five target tables' own column count (27 + 9 + 8 + 2 + 4), so \
+         the codec check below has a non-empty domain. Issue #587 added \
+         four columns to `spans`, two to `traces` and one to `resources`"
     );
     let bare = names(
         &client,
@@ -491,7 +563,7 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 43] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 50] = [
     ("resources", "day", "CODEC(ZSTD(1))"),
     ("resources", "resource_id", "CODEC(ZSTD(1))"),
     ("resources", "service", "CODEC(ZSTD(1))"),
@@ -499,6 +571,7 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 43] = [
     ("resources", "attrs_other", "CODEC(ZSTD(1))"),
     ("resources", "dropped_attrs", "CODEC(ZSTD(1))"),
     ("resources", "schema_url", "CODEC(ZSTD(1))"),
+    ("resources", "entity_refs", "CODEC(ZSTD(1))"),
     ("spans", "trace_id", "CODEC(ZSTD(1))"),
     ("spans", "span_id", "CODEC(ZSTD(1))"),
     ("spans", "parent_span_id", "CODEC(ZSTD(1))"),
@@ -522,6 +595,10 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 43] = [
     ("spans", "dropped_events", "CODEC(ZSTD(1))"),
     ("spans", "links", "CODEC(ZSTD(1))"),
     ("spans", "dropped_links", "CODEC(ZSTD(1))"),
+    ("spans", "scope_schema_url", "CODEC(ZSTD(1))"),
+    ("spans", "scope_dropped_attrs", "CODEC(ZSTD(1))"),
+    ("spans", "scope_attrs_other", "CODEC(ZSTD(1))"),
+    ("spans", "end_ns", "CODEC(Delta(8), ZSTD(1))"),
     ("tag_names", "scope", "CODEC(ZSTD(1))"),
     ("tag_names", "key", "CODEC(ZSTD(1))"),
     ("tag_values", "scope", "CODEC(ZSTD(1))"),
@@ -535,6 +612,8 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 43] = [
     ("traces", "root_service", "CODEC(ZSTD(1))"),
     ("traces", "root_name", "CODEC(ZSTD(1))"),
     ("traces", "services", "CODEC(ZSTD(1))"),
+    ("traces", "last_start_ns", "CODEC(Delta(8), ZSTD(1))"),
+    ("traces", "buckets", "CODEC(ZSTD(1))"),
 ];
 
 #[tokio::test]
@@ -894,7 +973,7 @@ async fn the_attribute_columns_are_exactly_these() {
              AND table IN ('trace_landing', 'spans', 'resources', 'tag_names', 'tag_values', \
                            'traces') \
              AND (position(type, 'JSON') > 0 \
-                  OR name IN ('attrs_other', 'value', 'tag_value'))\
+                  OR name IN ('attrs_other', 'scope_attrs_other', 'value', 'tag_value'))\
          ) ORDER BY name"
     );
     let got: BTreeSet<String> = names(&client, &sql).await.into_iter().collect();
@@ -906,12 +985,19 @@ async fn the_attribute_columns_are_exactly_these() {
         "spans.events",
         "spans.links",
         "spans.scope_attrs",
+        // Issue #587 row 3: the scope's own keys whose values no JSON path
+        // can hold. `resources.entity_refs` and
+        // `trace_landing.entity_refs` are deliberately NOT in this set: an
+        // `EntityRef` carries attribute **keys** that must exist in the
+        // resource's attributes, not attribute values.
+        "spans.scope_attrs_other",
         "tag_values.value",
         "trace_landing.attrs",
         "trace_landing.attrs_other",
         "trace_landing.events",
         "trace_landing.links",
         "trace_landing.scope_attrs",
+        "trace_landing.scope_attrs_other",
         "trace_landing.tag_value",
     ]
     .iter()
@@ -961,6 +1047,11 @@ async fn the_landed_storage_is_priced() {
     )
     .await;
     let per_span = bytes / 100;
+    // **Recorded, because issue #587 populated every added and widened
+    // field and the figure had never been measured against that row
+    // shape.** The ceiling is unchanged; if a later row shape exceeds it
+    // that is a finding for the owner, not a licence to raise it.
+    eprintln!("the landing table holds {per_span} B/row over 100 populated rows (recorded)");
     assert!(
         per_span < 200,
         "the landing table holds {per_span} B/span, over the 200 B/span ceiling \

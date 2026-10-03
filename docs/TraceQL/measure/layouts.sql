@@ -2,6 +2,13 @@
 -- and the alternatives docs/TraceQL/sql-schema.md 5.4 reports. Each is built
 -- from the same staging table, so only the layout differs. Run with
 -- json_type_escape_dots_in_keys = 1 after schema.sql has created tqd_g1.spans.
+--
+-- Each `AS tqd_g1.spans` copies that table's columns at creation, so these
+-- follow schema.sql's shape for free; `l_lz4`'s codec `ALTER` names the
+-- types and has to be kept in step with it. Their `PARTITION BY` is left
+-- bare deliberately: these are measurement-only tables and the shipped
+-- partition's explicit `'UTC'` (issue #587) is not a property of an
+-- alternative layout.
 
 -- A. the shipped layout's sort key with the service first (the alternative that
 --    prunes a service-scoped read but costs a trace fetch more granules)
@@ -48,9 +55,10 @@ ALTER TABLE tqd_g1.l_lz4 MODIFY COLUMN trace_id FixedString(16) CODEC(LZ4), MODI
     MODIFY COLUMN parent_span_id FixedString(8) CODEC(LZ4), MODIFY COLUMN start_ns Int64 CODEC(LZ4),
     MODIFY COLUMN duration_ns Int64 CODEC(LZ4), MODIFY COLUMN service LowCardinality(String) CODEC(LZ4),
     MODIFY COLUMN resource_id UInt128 CODEC(LZ4), MODIFY COLUMN name LowCardinality(String) CODEC(LZ4),
-    MODIFY COLUMN kind UInt8 CODEC(LZ4), MODIFY COLUMN status_code UInt8 CODEC(LZ4),
-    MODIFY COLUMN attrs JSON CODEC(LZ4), MODIFY COLUMN events Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(LZ4),
-    MODIFY COLUMN links Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(LZ4);
+    MODIFY COLUMN kind Int32 CODEC(LZ4), MODIFY COLUMN status_code Int32 CODEC(LZ4),
+    MODIFY COLUMN attrs JSON CODEC(LZ4), MODIFY COLUMN events Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(LZ4),
+    MODIFY COLUMN links Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(LZ4),
+    MODIFY COLUMN end_ns UInt64 CODEC(LZ4);
 INSERT INTO tqd_g1.l_lz4 SELECT * FROM tqd_g1.spans;
 
 -- E and F. the shipped sort key at two smaller granules, which is the knee the

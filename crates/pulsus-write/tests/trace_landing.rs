@@ -1891,3 +1891,1300 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
         .expect("drop the test database");
     std::fs::remove_dir_all(&root).ok();
 }
+
+// === Issue #587: the stored shape, read back off a live server ============
+//
+// **Live, unlike every case above.** What these assert is what the five
+// target tables HOLD, and the values issue #587 adds are produced by the
+// writer and by the three materialized views together — only a server runs
+// a view, so a mock inserter cannot carry any of them. Each case is gated
+// behind `PULSUS_TEST_CLICKHOUSE=1`, like
+// `no_landing_insert_reaches_the_asynchronous_queue` above.
+//
+// **None of these fetches through a route.** Part 1 of issue #587 changes no
+// API response: every route still answers from `trace_spans` and
+// `trace_attrs_idx`. So every assertion is on what the tables hold.
+
+use futures::StreamExt as _;
+use opentelemetry_proto::tonic::common::v1::EntityRef;
+use opentelemetry_proto::tonic::trace::v1::{Status, span};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, Row};
+use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct NumRow {
+    n: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct StrRow {
+    s: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct BlobRow {
+    #[serde(with = "serde_bytes")]
+    b: Vec<u8>,
+}
+
+macro_rules! skip_unless_live {
+    () => {
+        if !pulsus_testkit::live_clickhouse_enabled() {
+            eprintln!(
+                "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+                 (see crates/pulsus-write/tests/trace_rows_v2.rs for setup)"
+            );
+            return;
+        }
+    };
+}
+
+fn live_config() -> ChConnConfig {
+    ChConnConfig {
+        server: std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(19123),
+        database: std::env::var("PULSUS_TEST_CH_DATABASE")
+            .unwrap_or_else(|_| "default".to_string()),
+        proto: ChProto::Http,
+        pool_size: 4,
+        query_timeout: Duration::from_secs(120),
+        ..ChConnConfig::default()
+    }
+}
+
+/// A fresh database with the whole schema in it, **with merges stopped on
+/// the six write-path tables**, and a client bound to it.
+///
+/// **The merges are stopped because every fixture below is at a fixed past
+/// instant, and `spans`, `traces`, `resources` and `trace_spans` all carry
+/// a delete TTL of `retention_days = 7`.** Measured on this engine: a part
+/// holding one span at `start_ns = 1` and one at `1700000000000000000` is
+/// reported with `rows = 0` within two seconds of the insert, because
+/// `ttl_only_drop_parts = 1` drops a wholly-expired part as a background
+/// merge. The 1970-01-01 partition `W-11` and `W-17` assert the label of is
+/// exactly such a part.
+///
+/// **Stopping merges weakens no assertion here.** `FINAL` is a read-time
+/// collapse and is unaffected, so the two cases that read through it still
+/// read what a merged table would give; and `W-17` aggregates with
+/// `groupUniqArrayArray` in every assertion, which gives the union whether
+/// the day rows are merged or not. What it removes is the part drop, which
+/// would leave every one of these cases reading an empty table.
+///
+/// **`db` is already composed by `pulsus_testkit::test_db` at the call
+/// site**, so the per-checkout prefix reaches every name: two checkouts
+/// sharing one ClickHouse would otherwise both use it and drop each
+/// other's data, which `every_live_test_database_name_comes_from_the_helper`
+/// refuses.
+async fn live_db(db: String) -> (ChClient, String) {
+    let admin = ChClient::new(live_config()).await.expect("connect");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the test database");
+    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    run_init(&admin, &ctx).await.expect("run_init");
+    for table in [
+        "spans",
+        "traces",
+        "resources",
+        "trace_landing",
+        "trace_spans",
+    ] {
+        admin
+            .execute(
+                &format!("SYSTEM STOP MERGES {db}.{table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stop merges on {db}.{table}: {e}"));
+    }
+    let client = ChClient::new(ChConnConfig {
+        database: db.clone(),
+        ..live_config()
+    })
+    .await
+    .expect("connect to the test database");
+    (client, db)
+}
+
+async fn drop_live_db(db: &str) {
+    let admin = ChClient::new(live_config()).await.expect("connect");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the test database");
+}
+
+/// The settings every landing insert below carries — the writer's own
+/// constructor, so a case's insert is pinned the way a push's is.
+///
+/// **The deduplication token is minted per call from a counter**, not from
+/// the clock: two pushes of one trace inside the window are two blocks, and
+/// a repeated token would have the second one suppressed, which is exactly
+/// the state `W-17` exists to read across.
+fn live_landing_settings() -> QuerySettings {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    QuerySettings::trace_landing_insert(&format!("it587-{}-{n}", unique()), 1_048_576)
+}
+
+fn landing_rows(parsed: &ParsedTraceLanding, received_ms: i64) -> Vec<TraceLandingRow> {
+    let mut rows: Vec<TraceLandingRow> = Vec::with_capacity(parsed.total_rows() as usize);
+    rows.extend(
+        parsed
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        parsed
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| TraceLandingRow::resource(received_ms, r)),
+    );
+    rows.extend(
+        parsed
+            .tag_names
+            .iter()
+            .cloned()
+            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+    );
+    rows.extend(
+        parsed
+            .tag_values
+            .iter()
+            .cloned()
+            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+    );
+    rows
+}
+
+/// The wall clock in milliseconds, for `received_ms` alone: the landing
+/// table's own TTL is six hours over that column, so a fixture's chosen
+/// span instants must not reach it.
+fn wall_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a representable instant")
+}
+
+/// Decodes `req` with the landing decoder at the receipt clock `now_ns` and
+/// inserts every row it produces into `trace_landing` through the
+/// production client, in **one** block — one push is one insert.
+async fn land_live(
+    client: &ChClient,
+    req: &ExportTraceServiceRequest,
+    now_ns: i64,
+    settings: &QuerySettings,
+) -> ParsedTraceLanding {
+    let parsed = pulsus_write::parse_trace_landing(req, now_ns).expect("the landing decode");
+    client
+        .insert_block_with(LANDING, &landing_rows(&parsed, wall_ms()), settings)
+        .await
+        .expect("the landing insert");
+    parsed
+}
+
+async fn live_count(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<NumRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("count failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").n
+}
+
+async fn live_scalar(client: &ChClient, sql: &str) -> String {
+    let mut stream = client
+        .query_stream::<StrRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("scalar failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").s
+}
+
+async fn live_texts(client: &ChClient, sql: &str) -> Vec<String> {
+    let mut stream = client
+        .query_stream::<StrRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("text query failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").s);
+    }
+    out
+}
+
+async fn live_blob(client: &ChClient, sql: &str) -> Vec<u8> {
+    let mut stream = client
+        .query_stream::<BlobRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("blob query failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").b
+}
+
+/// A fixed instant well inside the admitted UTC-day domain and on a
+/// different UTC day from the epoch: 2023-11-14, which
+/// `intDiv(start_ns, 300000000000)` puts in bucket 5,666,666.
+const FIXED_NS: i64 = 1_700_000_000_000_000_000;
+
+fn any_kv(key: &str, value: Value) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value: Some(value) }),
+        key_strindex: 0,
+    }
+}
+
+/// One `ResourceSpans` carrying the resource given, with no scope.
+fn resource_spans_of(resource: Resource, spans: Vec<Span>) -> ResourceSpans {
+    ResourceSpans {
+        resource: Some(resource),
+        scope_spans: vec![ScopeSpans {
+            scope: None,
+            spans,
+            schema_url: String::new(),
+        }],
+        schema_url: String::new(),
+    }
+}
+
+/// **W-4 (issue #587 row 6).** A `service.name` that is present-but-empty,
+/// or not a string, round-trips: it stays in `resources.attrs` as the typed
+/// value it was, and it is still **never** a catalog entry.
+///
+/// §3.3's one `continue` becomes two decisions. The `attrs` skip applies
+/// only to a non-empty `StringValue` — the one arm `spans.service` carries
+/// losslessly — and the catalog skip stays **unconditional** at every arm,
+/// which `sql-schema.md` §4.3's tag contract and
+/// `otlp_traces.rs`'s own assertion that `service.name` is *"a column, not
+/// a catalog entry"* both require.
+///
+/// **Three values are three resource identities**, so this push stores
+/// three `resources` rows: `service.name` is in the identity buffer and the
+/// buffer is type-tagged.
+#[tokio::test]
+async fn w4_a_service_name_that_is_not_a_non_empty_string_round_trips() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w4")).await;
+
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![
+            resource_spans_of(
+                Resource {
+                    attributes: vec![any_kv(
+                        "service.name",
+                        Value::StringValue("checkout".to_string()),
+                    )],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                },
+                vec![span_at(0xc4, 0x01, FIXED_NS, Vec::new())],
+            ),
+            resource_spans_of(
+                Resource {
+                    attributes: vec![any_kv("service.name", Value::StringValue(String::new()))],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                },
+                vec![span_at(0xc4, 0x02, FIXED_NS, Vec::new())],
+            ),
+            resource_spans_of(
+                Resource {
+                    attributes: vec![any_kv("service.name", Value::IntValue(7))],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                },
+                vec![span_at(0xc4, 0x03, FIXED_NS, Vec::new())],
+            ),
+        ],
+    };
+    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+
+    // Three identities, three rows — §7.0c's derivation, not the fixture's
+    // own count.
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        3,
+        "three `service.name` values are three resource identities"
+    );
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT uniqExact(resource_id) AS n FROM resources FINAL"
+        )
+        .await,
+        3,
+        "and three distinct identities"
+    );
+
+    // The span column carries the text rendering in every case.
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT toString(service) AS s FROM spans FINAL ORDER BY service"
+        )
+        .await,
+        vec![String::new(), "7".to_string(), "checkout".to_string()],
+        "`spans.service` renders every arm"
+    );
+
+    // And the stored attributes keep the value for every arm BUT a
+    // non-empty string: `None` is what `dynamicType` answers for a path the
+    // JSON column does not hold.
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT concat(toString(service), '|', \
+                           dynamicType(attrs.`service%2Ename`)) AS s \
+             FROM resources FINAL ORDER BY service"
+        )
+        .await,
+        vec![
+            "|String".to_string(),
+            "7|Int64".to_string(),
+            "checkout|None".to_string()
+        ],
+        "the empty string stays as a String path, the integer as an Int64 \
+         path, and only the non-empty string is dropped"
+    );
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT toString(length(assumeNotNull(attrs.`service%2Ename`.:String))) AS s \
+             FROM resources FINAL WHERE service = ''"
+        )
+        .await,
+        "0",
+        "the empty-string arm is PRESENT and empty, not absent"
+    );
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT toString(assumeNotNull(attrs.`service%2Ename`.:Int64)) AS s \
+             FROM resources FINAL WHERE service = '7'"
+        )
+        .await,
+        "7",
+        "the integer arm keeps its integer value"
+    );
+
+    // The catalog skip is unconditional: no arm produces a tag row.
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT count() AS n FROM tag_names \
+             WHERE scope = 'resource' AND key = 'service.name'"
+        )
+        .await,
+        0,
+        "`service.name` is a column, not a catalog entry, at every arm"
+    );
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT count() AS n FROM tag_values \
+             WHERE scope = 'resource' AND key = 'service.name'"
+        )
+        .await,
+        0,
+        "and it has no catalog value either"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// **W-5 (issue #587 row 7).** A span `kind` outside a byte and a link id
+/// of the wrong length are stored as the sender sent them, and **no
+/// rejection is introduced**.
+///
+/// The reference stores a signed integer kind and copies a link's ids with
+/// no length check, and returns both verbatim, so narrowing or rejecting
+/// either would be a divergence introduced here. `kind = 7` is the control
+/// — a byte stores it either way — and `-1` and `300` are what
+/// discriminate.
+///
+/// **The rejection half is asserted on the landing decode's own count, not
+/// on the route's response body.** §3.4 establishes that the route's
+/// `rejected` figure stays `parse`'s own, so a rejection added in
+/// `parse_landing` would not reach the body at all — the body cannot see
+/// the thing this half exists to rule out, and `ParsedTraceLanding` can.
+#[tokio::test]
+async fn w5_a_kind_outside_a_byte_and_an_off_length_link_id_are_stored_as_sent() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w5")).await;
+
+    let mut spans = Vec::new();
+    for (id, kind) in [(0x01u8, -1i32), (0x02, 300), (0x03, 7)] {
+        spans.push(Span {
+            kind,
+            ..span_at(0xc5, id, FIXED_NS, Vec::new())
+        });
+    }
+    spans.push(Span {
+        links: vec![span::Link {
+            trace_id: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            span_id: vec![0x01, 0x02, 0x03],
+            trace_state: String::new(),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+        }],
+        ..span_at(0xc5, 0x04, FIXED_NS, Vec::new())
+    });
+
+    let parsed = land_live(
+        &client,
+        &request_with_resource_spans(spans),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+
+    assert_eq!(
+        parsed.rejected, 0,
+        "no span is rejected: the fix is a wider column, not a refusal"
+    );
+    assert_eq!(parsed.rejected_message, None, "and no rejection message");
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        4,
+        "all four spans landed"
+    );
+
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT concat(hex(span_id), '|', toString(kind)) AS s \
+             FROM spans FINAL ORDER BY span_id"
+        )
+        .await,
+        vec![
+            "0101010101010101|-1".to_string(),
+            "0202020202020202|300".to_string(),
+            "0303030303030303|7".to_string(),
+            "0404040404040404|2".to_string(),
+        ],
+        "the protocol's own signed kind, stored as it arrived"
+    );
+
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT concat(hex(links[1].trace_id), '|', hex(links[1].span_id)) AS s \
+             FROM spans FINAL WHERE span_id = unhex('0404040404040404')"
+        )
+        .await,
+        "AABBCCDD|010203",
+        "a link's ids are the bytes the sender put on the wire"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// One request whose single resource carries `service.name = "checkout"`
+/// and the spans given.
+fn request_with_resource_spans(spans: Vec<Span>) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![resource_spans_of(
+            Resource {
+                attributes: vec![any_kv(
+                    "service.name",
+                    Value::StringValue("checkout".to_string()),
+                )],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            },
+            spans,
+        )],
+    }
+}
+
+/// **W-6 (issue #587 row 8).** `Resource.entity_refs` is stored, in the
+/// carrier §3.6 names, and it is part of the resource's identity.
+///
+/// Three halves, each its own failure: a dropped column loses the field; a
+/// different carrier — a private wrapper, or concatenated bare messages —
+/// fails the `Resource::decode` and the `0x1a` key-byte assertion; and an
+/// identity that ignores the field collapses two resources differing only
+/// in it into one row. The zero-bytes assertion is what pins the empty case
+/// against an empty-message encoding, which would move every existing
+/// `resource_id`.
+#[tokio::test]
+async fn w6_the_entity_references_are_stored_in_their_own_carrier_and_in_the_identity() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w6")).await;
+
+    let entity = |kind: &str| EntityRef {
+        schema_url: "https://example.invalid/v1".to_string(),
+        r#type: kind.to_string(),
+        id_keys: vec!["host.name".to_string()],
+        description_keys: Vec::new(),
+    };
+    let attrs = || {
+        vec![
+            any_kv("service.name", Value::StringValue("checkout".to_string())),
+            any_kv("host.name", Value::StringValue("node-a".to_string())),
+        ]
+    };
+    let two = vec![entity("host"), entity("service")];
+
+    // Three resources that differ in NOTHING but `entity_refs`.
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![
+            resource_spans_of(
+                Resource {
+                    attributes: attrs(),
+                    dropped_attributes_count: 0,
+                    entity_refs: two.clone(),
+                },
+                vec![span_at(0xc6, 0x01, FIXED_NS, Vec::new())],
+            ),
+            resource_spans_of(
+                Resource {
+                    attributes: attrs(),
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![entity("host")],
+                },
+                vec![span_at(0xc6, 0x02, FIXED_NS, Vec::new())],
+            ),
+            resource_spans_of(
+                Resource {
+                    attributes: attrs(),
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                },
+                vec![span_at(0xc6, 0x03, FIXED_NS, Vec::new())],
+            ),
+        ],
+    };
+    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        3,
+        "two resources differing only in `entity_refs` are two rows"
+    );
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT uniqExact(resource_id) AS n FROM resources FINAL"
+        )
+        .await,
+        3,
+        "and the identity is what separates them"
+    );
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT count() AS n FROM resources FINAL WHERE length(entity_refs) = 0"
+        )
+        .await,
+        1,
+        "an empty `entity_refs` stores ZERO bytes, not an empty message"
+    );
+
+    // The carrier, decoded as what §3.6 says it is.
+    let carrier = live_blob(
+        &client,
+        "SELECT entity_refs AS b FROM resources FINAL \
+         ORDER BY length(entity_refs) DESC LIMIT 1",
+    )
+    .await;
+    assert_eq!(
+        carrier.first(),
+        Some(&0x1au8),
+        "field 3, wire type 2 — `(3 << 3) | 2` — is the first key byte: {carrier:?}"
+    );
+    let decoded = Resource::decode(carrier.as_slice()).expect("a Resource");
+    assert_eq!(decoded.entity_refs, two, "the references the sender sent");
+    assert!(
+        decoded.attributes.is_empty(),
+        "fields 1 and 2 come back at their proto3 defaults and are NOT the \
+         resource's: {decoded:?}"
+    );
+    assert_eq!(decoded.dropped_attributes_count, 0, "likewise field 2");
+
+    drop_live_db(&db).await;
+}
+
+/// **W-8 (issue #587 row 9, and §3.5a).** A span's own end is stored
+/// verbatim — zero, inverted and the unsigned maximum alike — while
+/// `duration_ns` keeps its clamped value, and the per-trace end **saturates
+/// rather than wrapping**.
+///
+/// Four spans, each its own trace (§7.0f), so no trace of this fixture
+/// occupies two partitions and every per-trace assertion is over one span.
+/// The `traces.end_ns` assertion for (d) is the **correct** value and not
+/// the wrap: `max(start_ns + duration_ns)` over `Int64` operands wraps at
+/// `1 + i64::MAX` to `-9223372036854775808`, which excluded the longest
+/// trace the protocol can express from `{ trace:duration > 1s }`. The (c)
+/// assertion is the other half: the clamp must change **nothing** that does
+/// not overflow, so an implementation that saturates early reddens there.
+#[tokio::test]
+async fn w8_a_spans_own_end_is_verbatim_and_the_per_trace_end_saturates() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w8")).await;
+
+    let start = u64::try_from(FIXED_NS).expect("a post-epoch fixture");
+    let spans = vec![
+        // (a) an unset end.
+        Span {
+            trace_id: vec![0xa8; 16],
+            end_time_unix_nano: 0,
+            ..span_at(0xa8, 0x01, FIXED_NS, Vec::new())
+        },
+        // (b) an end before the start.
+        Span {
+            trace_id: vec![0xb8; 16],
+            end_time_unix_nano: start - 1_000_000_000,
+            ..span_at(0xb8, 0x02, FIXED_NS, Vec::new())
+        },
+        // (c) an ordinary end.
+        Span {
+            trace_id: vec![0xc8; 16],
+            end_time_unix_nano: start + 500_000_000,
+            ..span_at(0xc8, 0x03, FIXED_NS, Vec::new())
+        },
+        // (d) the largest end the protocol can express, against the
+        // smallest start it can: the accepted maximum, which
+        // `parse_saturates_an_i64_overflowing_duration_to_max` pins as
+        // saturating on the duration.
+        Span {
+            trace_id: vec![0xd8; 16],
+            start_time_unix_nano: 1,
+            end_time_unix_nano: u64::MAX,
+            ..span_at(0xd8, 0x04, FIXED_NS, Vec::new())
+        },
+    ];
+    land_live(
+        &client,
+        &request_with_resource_spans(spans),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT concat(hex(span_id), '|', toString(end_ns), '|', toString(duration_ns)) AS s \
+             FROM spans FINAL ORDER BY span_id"
+        )
+        .await,
+        vec![
+            format!("0101010101010101|0|0"),
+            format!("0202020202020202|{}|0", start - 1_000_000_000),
+            format!("0303030303030303|{}|500000000", start + 500_000_000),
+            "0404040404040404|18446744073709551615|9223372036854775807".to_string(),
+        ],
+        "every end is the sender's own, and `duration_ns` keeps its clamp"
+    );
+
+    // The per-trace aggregate: (d) saturates, (c) is untouched.
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT concat(toString(max(end_ns)), '|', toString(max(last_start_ns))) AS s \
+             FROM traces FINAL WHERE trace_id = unhex('D8D8D8D8D8D8D8D8D8D8D8D8D8D8D8D8')"
+        )
+        .await,
+        "9223372036854775807|1",
+        "the per-trace end saturates at `i64::MAX` instead of wrapping \
+         negative, and the per-trace last start is the span's own"
+    );
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT toString(max(end_ns)) AS s FROM traces FINAL \
+             WHERE trace_id = unhex('C8C8C8C8C8C8C8C8C8C8C8C8C8C8C8C8')"
+        )
+        .await,
+        (start + 500_000_000).to_string(),
+        "and the clamp changes nothing that does not overflow"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// **W-10's live half (issue #587 rows 8 and 13).** Five resources that
+/// differ only in their dropped count and their entity references are
+/// **five** stored rows, each carrying its own values.
+///
+/// The state is §7.0a's derivation and not the fixture's own count: all five
+/// share byte-identical attributes and schema url, all five spans are in one
+/// push on one UTC day, and `resources` is keyed `(resource_id, day)` — so
+/// five distinct identities on one day are five rows.
+///
+/// **On the unamended tree this returns one row** carrying the first landed
+/// resource's values, because the identity separates none of the five.
+/// `1` against `5` is the discriminator; the hermetic half, in
+/// `otlp_traces.rs`, is what makes the input set exhaustive.
+#[tokio::test]
+async fn w10_five_resources_differing_only_in_two_fields_are_five_rows() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w10")).await;
+
+    let entity = |kind: &str| EntityRef {
+        schema_url: "https://example.invalid/v1".to_string(),
+        r#type: kind.to_string(),
+        id_keys: vec!["host.name".to_string()],
+        description_keys: Vec::new(),
+    };
+    let attrs = || {
+        vec![
+            any_kv("service.name", Value::StringValue("checkout".to_string())),
+            any_kv("host.name", Value::StringValue("node-a".to_string())),
+        ]
+    };
+    let five: Vec<(u8, u32, Vec<EntityRef>)> = vec![
+        (0x01, 0, Vec::new()),
+        (0x02, 5, Vec::new()),
+        (0x03, 6, Vec::new()),
+        (0x04, 5, vec![entity("host")]),
+        (0x05, 5, vec![entity("service")]),
+    ];
+    let req = ExportTraceServiceRequest {
+        resource_spans: five
+            .iter()
+            .map(|(id, dropped, refs)| {
+                resource_spans_of(
+                    Resource {
+                        attributes: attrs(),
+                        dropped_attributes_count: *dropped,
+                        entity_refs: refs.clone(),
+                    },
+                    vec![span_at(0xca, *id, FIXED_NS, Vec::new())],
+                )
+            })
+            .collect(),
+    };
+    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
+        5,
+        "five identities on one day are five rows"
+    );
+    assert_eq!(
+        live_count(
+            &client,
+            "SELECT uniqExact(resource_id) AS n FROM resources FINAL"
+        )
+        .await,
+        5,
+        "five DISTINCT identities"
+    );
+    assert_eq!(
+        live_count(&client, "SELECT uniqExact(day) AS n FROM resources FINAL").await,
+        1,
+        "on one UTC day, so the five rows are five identities and not five days"
+    );
+
+    // Each row carries its own count and its own references.
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT concat(toString(dropped_attrs), '|', toString(length(entity_refs) > 0)) AS s \
+             FROM resources FINAL ORDER BY dropped_attrs, length(entity_refs)"
+        )
+        .await,
+        vec![
+            "0|0".to_string(),
+            "5|0".to_string(),
+            "5|1".to_string(),
+            "5|1".to_string(),
+            "6|0".to_string(),
+        ],
+        "every row carries the count and the references it was sent with"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// **W-11 (issue #587 row 10, §4.1 and §0.1d).** A span whose
+/// `start_time_unix_nano` is zero is stored **as zero** — the sender's own
+/// instant, in the sender's own partition — while the old path keeps its
+/// receipt-time substitution.
+///
+/// **The case runs under two session timezones and asserts the same values
+/// in both**, which is the only way the partition half can hold anything:
+/// under UTC a bare `toDate(fromUnixTimestamp64Nano(0))` already answers
+/// `1970-01-01`, so an unamended expression passes a UTC-only run. Under
+/// `Pacific/Honolulu` the bare form answers `2149-06-06` — a pre-epoch
+/// local instant underflowing the 16-bit `Date` domain — and `traces`'
+/// delete TTL reads `day`, so the trace would outlive its retention by 126
+/// years.
+///
+/// **The two `resources` counts mean two different things and the case says
+/// which.** The raw count is the fixture's state: one resource referenced
+/// by spans on two UTC days is two rows, keyed `(resource_id, day)`. The
+/// finalised count is the identity: `day` is outside `resources`' sort key
+/// and `do_not_merge_across_partitions_select_final` is `0` by default, so
+/// `FINAL` collapses the two partitions into one row.
+///
+/// **And the `max`-against-`min` pair is here and nowhere else.** `W-8`'s
+/// asserted trace has one span, so `max(start_ns)` and `min(start_ns)`
+/// agree and an implementer who wrote `min` passed it. This trace has two
+/// spans whose starts are `0` and a 2023 instant, so the two operators give
+/// different answers and the case names which it means.
+#[tokio::test]
+async fn w11_a_zero_start_is_stored_as_zero_in_a_utc_dated_partition() {
+    skip_unless_live!();
+
+    for (leg, session, name) in [
+        (
+            "utc",
+            None,
+            pulsus_testkit::test_db("pulsus_trace_landing_it_w11_utc"),
+        ),
+        (
+            "honolulu",
+            Some("Pacific/Honolulu"),
+            pulsus_testkit::test_db("pulsus_trace_landing_it_w11_honolulu"),
+        ),
+    ] {
+        let (client, db) = live_db(name).await;
+
+        // The receipt clock, set far from zero, so a substitution is
+        // visible as a value and not merely as a different partition.
+        let receipt_ns = FIXED_NS + 86_400_000_000_000;
+        let spans = vec![
+            Span {
+                start_time_unix_nano: 0,
+                end_time_unix_nano: 0,
+                ..span_at(0xcb, 0x01, FIXED_NS, Vec::new())
+            },
+            span_at(0xcb, 0x02, FIXED_NS, Vec::new()),
+        ];
+        let req = request_with_resource_spans(spans);
+
+        let mut settings = live_landing_settings();
+        if let Some(zone) = session {
+            settings = settings.set("session_timezone", zone);
+        }
+        land_live(&client, &req, receipt_ns, &settings).await;
+
+        // The old path, beside it: its own substitution is KEPT, which is
+        // §3.8's deliberate asymmetry.
+        let old = pulsus_write::parse_traces(&req, receipt_ns).expect("the old path's decode");
+        let old_rows: Vec<TraceSpanRow> = old.spans.iter().map(TraceSpanRow::from).collect();
+        client
+            .insert_block_with(SPANS, &old_rows, &QuerySettings::new())
+            .await
+            .expect("the old path's insert");
+
+        assert_eq!(
+            live_scalar(
+                &client,
+                "SELECT toString(start_ns) AS s FROM spans FINAL \
+                 WHERE span_id = unhex('0101010101010101')"
+            )
+            .await,
+            "0",
+            "{leg}: a zero start is the sender's own value and is stored as it arrived"
+        );
+
+        // The partition LABEL, which is what the explicit zone decides.
+        assert_eq!(
+            live_texts(
+                &client,
+                &format!(
+                    "SELECT partition AS s FROM system.parts \
+                     WHERE database = '{db}' AND table = 'spans' AND active \
+                     ORDER BY partition"
+                )
+            )
+            .await,
+            vec!["1970-01-01".to_string(), "2023-11-14".to_string()],
+            "{leg}: the zero-start span's part is dated by the UTC day the \
+             sender named, whatever the session's own zone"
+        );
+        assert_eq!(
+            live_scalar(&client, "SELECT toString(any(day)) AS s FROM traces FINAL").await,
+            "1970-01-01",
+            "{leg}: the per-trace row is filed under the block's MINIMUM \
+             start day, and `traces`' delete TTL reads that column"
+        );
+
+        // One resource, two UTC days: two rows raw, one identity finalised.
+        assert_eq!(
+            live_count(&client, "SELECT count() AS n FROM resources").await,
+            2,
+            "{leg}: one resource referenced by spans on two UTC days is two \
+             rows, keyed `(resource_id, day)`"
+        );
+        assert_eq!(
+            live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
+            1,
+            "{leg}: and one identity, because `day` is outside the sort key"
+        );
+        assert_eq!(
+            live_count(&client, "SELECT count() AS n FROM traces FINAL").await,
+            1,
+            "{leg}: one trace"
+        );
+
+        // `max` against `min`, named.
+        assert_eq!(
+            live_scalar(
+                &client,
+                "SELECT concat(toString(min(start_ns)), '|', toString(max(last_start_ns))) AS s \
+                 FROM traces FINAL"
+            )
+            .await,
+            format!("0|{FIXED_NS}"),
+            "{leg}: the per-trace start is the EARLIEST of the trace's spans \
+             and `last_start_ns` the LATEST — `min` in the view's `s` and \
+             `max` in its `ls`, which a one-span trace cannot tell apart"
+        );
+
+        // The ordinary span is unaffected.
+        assert_eq!(
+            live_scalar(
+                &client,
+                "SELECT toString(start_ns) AS s FROM spans FINAL \
+                 WHERE span_id = unhex('0202020202020202')"
+            )
+            .await,
+            FIXED_NS.to_string(),
+            "{leg}: the ordinary span is untouched"
+        );
+
+        // And the OLD path keeps its substitution — §3.8's asymmetry. No
+        // equivalence between the two stores is claimed, required or
+        // tested; this asserts the old table's own expected value.
+        assert_eq!(
+            live_scalar(
+                &client,
+                "SELECT toString(timestamp_ns) AS s FROM trace_spans \
+                 WHERE span_id = unhex('0101010101010101')"
+            )
+            .await,
+            receipt_ns.to_string(),
+            "{leg}: the OLD path still substitutes the receipt time, and this \
+             change deletes only the landing path's substitution"
+        );
+
+        drop_live_db(&db).await;
+    }
+}
+
+/// **W-12 (issue #587 row 11).** An event time above `i64::MAX` is stored
+/// unsaturated.
+///
+/// The ordinary event is the control — an `Int64` member stores it either
+/// way — and the maximum one discriminates. The column's own type is the
+/// failure point before the comparison is ever reached: an `Int64` tuple
+/// member refuses the `u64` on insert.
+#[tokio::test]
+async fn w12_an_event_time_above_the_signed_maximum_is_stored_unsaturated() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w12")).await;
+
+    let span = Span {
+        events: vec![
+            span::Event {
+                time_unix_nano: u64::MAX,
+                name: "first".to_string(),
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+            },
+            span::Event {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                name: "second".to_string(),
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+            },
+        ],
+        ..span_at(0xcc, 0x01, FIXED_NS, Vec::new())
+    };
+    land_live(
+        &client,
+        &request_with_resource_spans(vec![span]),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+
+    assert_eq!(
+        live_scalar(
+            &client,
+            "SELECT concat(toString(events[1].time_ns), '|', \
+                           toString(events[2].time_ns)) AS s FROM spans FINAL"
+        )
+        .await,
+        "18446744073709551615|1700000000000000000",
+        "the protocol's own unsigned event time, stored as it arrived"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// **W-13 (issue #587 row 12).** A `status.code` outside a byte is stored
+/// as the protocol's own signed value.
+///
+/// `2` and the absent-`Status` `0` are the controls; `300` and `-1`
+/// discriminate. Narrowing to a byte turns both into `0`, which is
+/// `STATUS_CODE_UNSET` — so an out-of-range code came back as "unset"
+/// rather than as the unknown code it is, with nothing in a response to say
+/// so.
+///
+/// The absent-status row asserts §3.0a's exemption rather than assuming it:
+/// an absent `Status` and `code = 0` both store `0`, and the reference does
+/// the same.
+#[tokio::test]
+async fn w13_a_status_code_outside_a_byte_is_stored_as_the_signed_value_sent() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w13")).await;
+
+    let mut spans = Vec::new();
+    for (id, code) in [(0x01u8, 300i32), (0x02, -1), (0x03, 2)] {
+        spans.push(Span {
+            status: Some(Status {
+                message: String::new(),
+                code,
+            }),
+            ..span_at(0xcd, id, FIXED_NS, Vec::new())
+        });
+    }
+    spans.push(Span {
+        status: None,
+        ..span_at(0xcd, 0x04, FIXED_NS, Vec::new())
+    });
+    land_live(
+        &client,
+        &request_with_resource_spans(spans),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT concat(hex(span_id), '|', toString(status_code)) AS s \
+             FROM spans FINAL ORDER BY span_id"
+        )
+        .await,
+        vec![
+            "0101010101010101|300".to_string(),
+            "0202020202020202|-1".to_string(),
+            "0303030303030303|2".to_string(),
+            "0404040404040404|0".to_string(),
+        ],
+        "the protocol's own signed status code, stored as it arrived"
+    );
+
+    drop_live_db(&db).await;
+}
+
+/// **W-17 (issue #587 §4.2).** `traces.buckets` is the trace's **distinct**
+/// span buckets, asserted against the spans it is supposed to describe.
+///
+/// **Three pushes and a repeated bucket**, because one push would not test
+/// the union across day rows and a push without a repeat would not test the
+/// deduplication. §7.0d derives the state: pushes 2 and 3 file under the
+/// same day as each other and push 1 under `1970-01-01`, so `traces` holds
+/// two rows and the column's value is the union across both.
+///
+/// **Every assertion aggregates, and correct code fails one that does
+/// not.** Measured: reading `arraySort(buckets)` over two day rows returns
+/// **two rows**, `[0, 5666666]` and `[5666666, 5666667]`, while
+/// `arraySort(groupUniqArrayArray(buckets))` returns the union. The
+/// aggregate is also what makes these assertions independent of the merge
+/// state: unmerged there are rows to union, merged there is one row already
+/// unioned, and `groupUniqArrayArray` gives the same set either way.
+///
+/// **This column is the only stored value either half of issue #587's read
+/// correctness depends on that is invisible in the statement text**: a
+/// wrong divisor leaves the fetch returning fewer spans, silently, with
+/// the SQL still correct. **Assertion (b) is what sees a wrong divisor**,
+/// and that is checked by doing it — with `600000000000` the stored set
+/// is `[0, 2833333]` against the spans' `[0, 5666666, 5666667]`.
+///
+/// **What (b) cannot see is the view's aggregate NAME**, and nothing here
+/// can, because `traces` is an `AggregatingMergeTree`: the engine applies
+/// the column's own declared `groupUniqArrayArray(4096)` when it writes
+/// the part, whatever the view emitted. Measured on 26.3.29.7, a
+/// 10-element array carrying each value twice inserted into a column of
+/// that type:
+///
+/// ```text
+///   on an AggregatingMergeTree  ->  [0,1,2,3,4]
+///   on a plain MergeTree        ->  [0,0,1,1,2,2,3,3,4,4]
+/// ```
+///
+/// So `groupArray` for `groupUniqArray` in the view leaves every assertion
+/// here green — checked by doing that too. The declaration is what the
+/// stored value answers to, and
+/// `the_per_trace_aggregate_columns_carry_the_functions_this_design_names`
+/// (`crates/pulsus-schema/tests/live_traces_v2.rs`) reads it back off the
+/// server.
+#[tokio::test]
+async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w17")).await;
+
+    let trace = "CBCBCBCBCBCBCBCBCBCBCBCBCBCBCBCB";
+    // Push 1: bucket 0 and bucket 5,666,666.
+    land_live(
+        &client,
+        &request_with_resource_spans(vec![
+            Span {
+                start_time_unix_nano: 0,
+                end_time_unix_nano: 0,
+                ..span_at(0xcb, 0x01, FIXED_NS, Vec::new())
+            },
+            span_at(0xcb, 0x02, FIXED_NS, Vec::new()),
+        ]),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+    // Push 2: bucket 5,666,666 **again**, from a different span.
+    land_live(
+        &client,
+        &request_with_resource_spans(vec![span_at(0xcb, 0x03, FIXED_NS, Vec::new())]),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+    // Push 3: the next bucket, 5,666,667.
+    land_live(
+        &client,
+        &request_with_resource_spans(vec![span_at(
+            0xcb,
+            0x04,
+            FIXED_NS + 300_000_000_000,
+            Vec::new(),
+        )]),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+
+    // §7.0d's derived state, asserted rather than assumed - **as the
+    // number of DAY partitions the trace occupies, not as a raw row
+    // count.** Pushes 2 and 3 file under one day and push 1 under
+    // `1970-01-01`, so the trace's rows span two partitions; whether the
+    // two same-day rows are one row or two is a merge this test does not
+    // control, and a row count would pin that.
+    assert_eq!(
+        live_count(
+            &client,
+            &format!("SELECT uniqExact(day) AS n FROM traces WHERE trace_id = unhex('{trace}')")
+        )
+        .await,
+        2,
+        "three pushes whose minima fall on two days put the trace's rows in \
+         two day partitions, so the union below has to cross them"
+    );
+
+    // (a) the literal control, so a reader can see the expected set.
+    let stored = live_scalar(
+        &client,
+        &format!(
+            "SELECT toString(arraySort(groupUniqArrayArray(buckets))) AS s \
+             FROM traces FINAL WHERE trace_id = unhex('{trace}')"
+        ),
+    )
+    .await;
+    assert_eq!(
+        stored, "[0,5666666,5666667]",
+        "the stored bucket set, unioned across the trace's day rows"
+    );
+
+    // (b) the same value against the spans themselves, read in this test
+    // rather than restated.
+    let from_spans = live_scalar(
+        &client,
+        &format!(
+            "SELECT toString(arraySort(groupUniqArray(intDiv(start_ns, 300000000000)))) AS s \
+             FROM spans FINAL WHERE trace_id = unhex('{trace}')"
+        ),
+    )
+    .await;
+    assert_eq!(
+        stored, from_spans,
+        "the stored set must be the distinct buckets of the trace's own spans"
+    );
+
+    // (c) the repeated bucket is one element, not two.
+    assert_eq!(
+        live_scalar(
+            &client,
+            &format!(
+                "SELECT toString(length(groupUniqArrayArray(buckets))) AS s \
+                 FROM traces FINAL WHERE trace_id = unhex('{trace}')"
+            )
+        )
+        .await,
+        "3",
+        "four spans over three distinct buckets are three elements"
+    );
+
+    // (d) the boundary: a push of 4,097 distinct buckets stores 4,096.
+    //
+    // **It sees the cap holding, and it cannot say WHICH expression held
+    // it.** Two do: the view's `groupUniqArray(4096)` per push and the
+    // column's declared `groupUniqArrayArray(4096)`, which an
+    // `AggregatingMergeTree` applies when it writes the part — measured,
+    // a 5,000-element array into a column of that type stores 5,000 on a
+    // plain `MergeTree` and 4,096 on this one. Checked by removing each in
+    // turn: this assertion stays green either way, because one push needs
+    // only one of them. What it holds is the guarantee part 2's truncation
+    // branch is written against — a stored row of exactly 4,096 elements
+    // may be truncated and one shorter is complete — and the declaration
+    // itself is read back off the server by
+    // `the_per_trace_aggregate_columns_carry_the_functions_this_design_names`
+    // (`crates/pulsus-schema/tests/live_traces_v2.rs`).
+    let wide = "DBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDB";
+    let spans: Vec<Span> = (0..4097u32)
+        .map(|i| Span {
+            trace_id: vec![0xdb; 16],
+            span_id: i.to_be_bytes().repeat(2),
+            start_time_unix_nano: u64::from(i) * 300_000_000_000,
+            end_time_unix_nano: u64::from(i) * 300_000_000_000 + 1_000_000,
+            ..span_at(0xdb, 0x00, FIXED_NS, Vec::new())
+        })
+        .collect();
+    land_live(
+        &client,
+        &request_with_resource_spans(spans),
+        FIXED_NS,
+        &live_landing_settings(),
+    )
+    .await;
+    assert_eq!(
+        live_texts(
+            &client,
+            &format!(
+                "SELECT toString(length(buckets)) AS s FROM traces \
+                 WHERE trace_id = unhex('{wide}')"
+            )
+        )
+        .await,
+        vec!["4096".to_string()],
+        "one push of 4,097 distinct buckets stores ONE row capped at 4,096"
+    );
+
+    drop_live_db(&db).await;
+}

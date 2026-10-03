@@ -40,7 +40,11 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "spans",
         "spans_mv",
-        Some("toDate(fromUnixTimestamp64Nano(start_ns))"),
+        // **Byte-identical to `spans`' own `PARTITION BY`**, the explicit
+        // `'UTC'` included (issue #587): a replay that enumerated its
+        // target partitions under a different zone would name partitions
+        // the table does not have.
+        Some("toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')"),
     ),
     ("traces", "traces_mv", Some("day")),
     ("resources", "resources_mv", Some("day")),

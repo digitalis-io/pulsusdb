@@ -304,20 +304,32 @@ use crate::writer::trace_json::TraceJson;
 /// One span event, as the `events` column's element tuple stores it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandingEvent {
-    pub time_ns: i64,
+    /// The protocol's own `fixed64`, unsaturated: an event time above
+    /// `i64::MAX` round-trips, which the reference's unsigned offset does
+    /// too (issue #587 row 11).
+    pub time_ns: u64,
     pub name: String,
     pub attrs: TraceJson,
+    /// This event's own keys whose values no JSON path can hold, in
+    /// [`LandingSpan::attrs_other`]'s carrier (issue #587 row 4).
+    pub attrs_other: Vec<u8>,
     pub dropped_attrs: u32,
 }
 
 /// One span link, as the `links` column's element tuple stores it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandingLink {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
+    /// The bytes the sender put on the wire, whatever their length: a link
+    /// points at a span in another system and is never length-validated
+    /// here (issue #587 row 7).
+    pub trace_id: Vec<u8>,
+    pub span_id: Vec<u8>,
     pub trace_state: String,
     pub flags: u32,
     pub attrs: TraceJson,
+    /// This link's own keys whose values no JSON path can hold, in
+    /// [`LandingSpan::attrs_other`]'s carrier (issue #587 row 4).
+    pub attrs_other: Vec<u8>,
     pub dropped_attrs: u32,
 }
 
@@ -335,14 +347,31 @@ pub struct LandingSpan {
     /// kind-1 row the push lands for it.
     pub resource_id: Fingerprint,
     pub name: String,
-    pub kind: u8,
-    pub status_code: u8,
+    /// The protocol's own signed value, stored as it arrived: the reference
+    /// stores a signed integer kind and returns it verbatim (issue #587
+    /// row 7).
+    pub kind: i32,
+    /// The protocol's own signed value, stored as it arrived (issue #587
+    /// row 12). Narrowing it to a byte turns an out-of-range code into
+    /// `STATUS_CODE_UNSET`, which is silent in a response.
+    pub status_code: i32,
     pub status_message: String,
     pub trace_state: String,
     pub flags: u32,
     pub scope_name: String,
     pub scope_version: String,
     pub scope_attrs: TraceJson,
+    /// `ScopeSpans.schema_url` (issue #587 row 1).
+    pub scope_schema_url: String,
+    /// `InstrumentationScope.dropped_attributes_count` (issue #587 row 2).
+    pub scope_dropped_attrs: u32,
+    /// The scope's own keys whose values no JSON path can hold, in
+    /// [`Self::attrs_other`]'s carrier (issue #587 row 3).
+    pub scope_attrs_other: Vec<u8>,
+    /// The sender's `end_time_unix_nano`, verbatim — no clamp, no
+    /// substitution, no rejection. `duration_ns` above keeps its clamped
+    /// value (issue #587 row 9).
+    pub end_ns: u64,
     pub events: Vec<LandingEvent>,
     pub dropped_events: u32,
     pub links: Vec<LandingLink>,
@@ -379,6 +408,10 @@ pub struct LandingResource {
     pub attrs_other: Vec<u8>,
     pub dropped_attrs: u32,
     pub schema_url: String,
+    /// `Resource.entity_refs`, as an
+    /// `opentelemetry.proto.resource.v1.Resource` with only field 3
+    /// populated — zero bytes when there are none (issue #587 row 8).
+    pub entity_refs: Vec<u8>,
 }
 
 /// The five attribute scopes the tag catalogs discriminate on, which are the

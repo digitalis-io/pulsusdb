@@ -187,6 +187,28 @@ python3 "$HERE/catalogue.py" "$CH" tqd_cat "$CORPUS_TQL" "$WORK/cat/spans.jsonl"
 echo "== the counted claims the documents make, against the tree"
 python3 "$HERE/claims_check.py"
 
+# W-16(b), issue #587. The ratio below and the byte totals are measured over
+# whatever shape `schema.sql` built, and a missing column there fails NOTHING
+# until it prices the wrong table: the figures come out, they look plausible,
+# and they describe a `spans` that is not the one the catalogue ships. So the
+# shape is asserted before the figures are taken.
+echo "== the amended span shape the storage figures are measured over"
+want=$'end_ns\tUInt64\nscope_attrs_other\tString\nstatus_code\tInt32'
+got=$(q "SELECT name, type FROM system.columns
+         WHERE database='tqd_g1' AND table='spans'
+           AND name IN ('end_ns','scope_attrs_other','status_code')
+         ORDER BY name FORMAT TSV")
+if [ "$got" != "$want" ]; then
+  echo "   STOP: tqd_g1.spans is not the amended shape. wanted:" >&2
+  printf '%s\n' "$want" >&2
+  echo "   got:" >&2
+  printf '%s\n' "$got" >&2
+  echo "   schema.sql has to carry issue #587's columns, or every figure below" >&2
+  echo "   prices a different table from the one the catalogue ships." >&2
+  exit 1
+fi
+echo "   ok: $(printf '%s' "$got" | tr '\n' ' ')"
+
 echo "== storage totals, compression, rows per span"
 q "SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, round(sum(bytes_on_disk)/$SPANS, 3) AS b_per_span
    FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values')

@@ -2742,19 +2742,29 @@ mod tests {
 /// order is the column's declared order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceEventTuple {
-    pub time_ns: i64,
+    /// The protocol's own `fixed64`, unsaturated (issue #587 row 11).
+    pub time_ns: u64,
     pub name: String,
     pub attrs: TraceJson,
+    /// A binary protobuf blob in a `String` element, written through
+    /// `serde_bytes::Bytes` below for the reason
+    /// [`TraceLandingRow::attrs_other`] gives (issue #587 row 4).
+    pub attrs_other: Vec<u8>,
     pub dropped_attrs: u32,
 }
 
 impl Serialize for TraceEventTuple {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
-        let mut t = s.serialize_tuple(4)?;
+        let mut t = s.serialize_tuple(5)?;
         t.serialize_element(&self.time_ns)?;
         t.serialize_element(self.name.as_str())?;
         t.serialize_element(&self.attrs)?;
+        // **`Bytes`, not the `Vec<u8>` itself.** This impl calls element
+        // serialization by hand, so a field attribute would not be
+        // consulted; serde's default path would target `Array(UInt8)` and
+        // fail the insert.
+        t.serialize_element(serde_bytes::Bytes::new(&self.attrs_other))?;
         t.serialize_element(&self.dropped_attrs)?;
         t.end()
     }
@@ -2774,23 +2784,30 @@ impl<'de> Deserialize<'de> for TraceEventTuple {
 /// [`TraceEventTuple`] for why this is a tuple.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceLinkTuple {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
+    /// The bytes the sender sent, whatever their length (issue #587
+    /// row 7). As `String` elements they are length-prefixed rather than
+    /// raw fixed-width bytes, so both go through `serde_bytes::Bytes`
+    /// below.
+    pub trace_id: Vec<u8>,
+    pub span_id: Vec<u8>,
     pub trace_state: String,
     pub flags: u32,
     pub attrs: TraceJson,
+    /// See [`TraceEventTuple::attrs_other`] (issue #587 row 4).
+    pub attrs_other: Vec<u8>,
     pub dropped_attrs: u32,
 }
 
 impl Serialize for TraceLinkTuple {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
-        let mut t = s.serialize_tuple(6)?;
-        t.serialize_element(&self.trace_id)?;
-        t.serialize_element(&self.span_id)?;
+        let mut t = s.serialize_tuple(7)?;
+        t.serialize_element(serde_bytes::Bytes::new(&self.trace_id))?;
+        t.serialize_element(serde_bytes::Bytes::new(&self.span_id))?;
         t.serialize_element(self.trace_state.as_str())?;
         t.serialize_element(&self.flags)?;
         t.serialize_element(&self.attrs)?;
+        t.serialize_element(serde_bytes::Bytes::new(&self.attrs_other))?;
         t.serialize_element(&self.dropped_attrs)?;
         t.end()
     }
@@ -2807,8 +2824,8 @@ impl<'de> Deserialize<'de> for TraceLinkTuple {
 /// One `trace_landing` row: the union of the four landed event shapes'
 /// columns, discriminated by `row_kind`.
 ///
-/// **Thirty-one fields, and `event_id` is not one of them.** The table has
-/// thirty-two columns; the writer leaves the landed event's own identity out
+/// **Thirty-six fields, and `event_id` is not one of them.** The table has
+/// thirty-seven columns; the writer leaves the landed event's own identity out
 /// of the insert so the server fills it from `DEFAULT generateUUIDv7()`.
 /// It is not the retry mechanism: that is the `insert_deduplication_token`
 /// the writer mints per sealed block.
@@ -2835,8 +2852,10 @@ pub struct TraceLandingRow {
     pub duration_ns: i64,
     pub resource_id: Fingerprint,
     pub name: String,
-    pub kind: u8,
-    pub status_code: u8,
+    /// The protocol's own signed values, stored as they arrived (issue
+    /// #587 rows 7 and 12).
+    pub kind: i32,
+    pub status_code: i32,
     pub status_message: String,
     pub trace_state: String,
     pub flags: u32,
@@ -2863,6 +2882,23 @@ pub struct TraceLandingRow {
     pub tag_key: String,
     pub tag_value: String,
     pub tag_type: String,
+    /// `ScopeSpans.schema_url` (issue #587 row 1).
+    pub scope_schema_url: String,
+    /// `InstrumentationScope.dropped_attributes_count` (issue #587 row 2).
+    pub scope_dropped_attrs: u32,
+    /// The scope's own keys whose values no JSON path can hold, in
+    /// [`Self::attrs_other`]'s carrier and through the same
+    /// `serde_bytes` route (issue #587 row 3).
+    #[serde(with = "serde_bytes")]
+    pub scope_attrs_other: Vec<u8>,
+    /// The sender's `end_time_unix_nano`, verbatim (issue #587 row 9).
+    /// `duration_ns` above keeps its clamped value.
+    pub end_ns: u64,
+    /// `Resource.entity_refs`, on the kind-1 row: an
+    /// `opentelemetry.proto.resource.v1.Resource` with only field 3
+    /// populated, zero bytes when there are none (issue #587 row 8).
+    #[serde(with = "serde_bytes")]
+    pub entity_refs: Vec<u8>,
 }
 
 /// One traces landing row's own inline footprint, in the shape the WRITER
@@ -2930,6 +2966,11 @@ impl TraceLandingRow {
             tag_key: String::new(),
             tag_value: String::new(),
             tag_type: String::new(),
+            scope_schema_url: String::new(),
+            scope_dropped_attrs: 0,
+            scope_attrs_other: Vec::new(),
+            end_ns: 0,
+            entity_refs: Vec::new(),
         }
     }
 
@@ -2956,6 +2997,10 @@ impl TraceLandingRow {
             scope_name: span.scope_name,
             scope_version: span.scope_version,
             scope_attrs: span.scope_attrs,
+            scope_schema_url: span.scope_schema_url,
+            scope_dropped_attrs: span.scope_dropped_attrs,
+            scope_attrs_other: span.scope_attrs_other,
+            end_ns: span.end_ns,
             events: span
                 .events
                 .into_iter()
@@ -2963,6 +3008,7 @@ impl TraceLandingRow {
                     time_ns: e.time_ns,
                     name: e.name,
                     attrs: e.attrs,
+                    attrs_other: e.attrs_other,
                     dropped_attrs: e.dropped_attrs,
                 })
                 .collect(),
@@ -2976,6 +3022,7 @@ impl TraceLandingRow {
                     trace_state: l.trace_state,
                     flags: l.flags,
                     attrs: l.attrs,
+                    attrs_other: l.attrs_other,
                     dropped_attrs: l.dropped_attrs,
                 })
                 .collect(),
@@ -2998,6 +3045,7 @@ impl TraceLandingRow {
             dropped_attrs: resource.dropped_attrs,
             day: resource.day,
             schema_url: resource.schema_url,
+            entity_refs: resource.entity_refs,
             ..Self::of_kind(received_ms, Self::KIND_RESOURCE)
         }
     }
@@ -3038,19 +3086,37 @@ impl TraceLandingRow {
             + span.trace_state.len()
             + span.scope_name.len()
             + span.scope_version.len()
-            + span.attrs_other.len();
+            + span.scope_schema_url.len()
+            + span.attrs_other.len()
+            + span.scope_attrs_other.len();
         let events = span.events.capacity() as u64 * std::mem::size_of::<TraceEventTuple>() as u64
             + span
                 .events
                 .iter()
-                .map(|e| e.name.len() as u64 + e.attrs.encoded_len() + e.attrs.allocated_bytes())
+                .map(|e| {
+                    e.name.len() as u64
+                        + e.attrs_other.len() as u64
+                        + e.attrs.encoded_len()
+                        + e.attrs.allocated_bytes()
+                })
                 .sum::<u64>();
+        // **The two link ids are heap terms now.** As `[u8; 16]`/`[u8; 8]`
+        // they were inline in the tuple and already priced by the
+        // `capacity() * size_of::<TraceLinkTuple>()` header term above; as
+        // byte buffers they are owned allocations and that term no longer
+        // covers them, so leaving them out would REMOVE bytes from the
+        // charge rather than merely fail to add them (issue #587 §6.3).
         let links = span.links.capacity() as u64 * std::mem::size_of::<TraceLinkTuple>() as u64
             + span
                 .links
                 .iter()
                 .map(|l| {
-                    l.trace_state.len() as u64 + l.attrs.encoded_len() + l.attrs.allocated_bytes()
+                    l.trace_state.len() as u64
+                        + l.attrs_other.len() as u64
+                        + l.trace_id.len() as u64
+                        + l.span_id.len() as u64
+                        + l.attrs.encoded_len()
+                        + l.attrs.allocated_bytes()
                 })
                 .sum::<u64>();
         text as u64
@@ -3064,7 +3130,10 @@ impl TraceLandingRow {
 
     /// The bytes one kind-1 row's own owned content prices.
     pub fn est_resource_bytes(resource: &LandingResource) -> u64 {
-        (resource.service.len() + resource.schema_url.len() + resource.attrs_other.len()) as u64
+        (resource.service.len()
+            + resource.schema_url.len()
+            + resource.attrs_other.len()
+            + resource.entity_refs.len()) as u64
             + resource.attrs.encoded_len()
             + resource.attrs.allocated_bytes()
     }
@@ -3117,6 +3186,10 @@ impl SpoolEncode for TraceLandingRow {
                 "links": self.links.len() as u64,
                 "dropped_links": self.dropped_links,
                 "service": self.service,
+                "scope_schema_url": self.scope_schema_url,
+                "scope_dropped_attrs": self.scope_dropped_attrs,
+                "scope_attrs_other_bytes": self.scope_attrs_other.len() as u64,
+                "end_ns": self.end_ns,
             }),
             Self::KIND_RESOURCE => serde_json::json!({
                 "row_kind": self.row_kind,
@@ -3128,6 +3201,7 @@ impl SpoolEncode for TraceLandingRow {
                 "dropped_attrs": self.dropped_attrs,
                 "day": self.day,
                 "schema_url": self.schema_url,
+                "entity_refs_bytes": self.entity_refs.len() as u64,
             }),
             Self::KIND_TAG_NAME => serde_json::json!({
                 "row_kind": self.row_kind,
@@ -3176,6 +3250,7 @@ impl SpoolEncode for TraceLandingRow {
                 o.field("dropped_events", &self.dropped_events).await?;
                 o.field("dropped_links", &self.dropped_links).await?;
                 o.field("duration_ns", &self.duration_ns).await?;
+                o.field("end_ns", &self.end_ns).await?;
                 o.field("events", &(self.events.len() as u64)).await?;
                 o.field("flags", &self.flags).await?;
                 o.field("kind", &self.kind).await?;
@@ -3188,7 +3263,16 @@ impl SpoolEncode for TraceLandingRow {
                 o.field("row_kind", &self.row_kind).await?;
                 o.str_field("scope_attrs", &self.scope_attrs.to_string())
                     .await?;
+                o.field(
+                    "scope_attrs_other_bytes",
+                    &(self.scope_attrs_other.len() as u64),
+                )
+                .await?;
+                o.field("scope_dropped_attrs", &self.scope_dropped_attrs)
+                    .await?;
                 o.str_field("scope_name", &self.scope_name).await?;
+                o.str_field("scope_schema_url", &self.scope_schema_url)
+                    .await?;
                 o.str_field("scope_version", &self.scope_version).await?;
                 o.str_field("service", &self.service).await?;
                 o.str_field("span_id", &hex_lower(&self.span_id)).await?;
@@ -3204,6 +3288,8 @@ impl SpoolEncode for TraceLandingRow {
                     .await?;
                 o.field("day", &self.day).await?;
                 o.field("dropped_attrs", &self.dropped_attrs).await?;
+                o.field("entity_refs_bytes", &(self.entity_refs.len() as u64))
+                    .await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("resource_id", &self.resource_id).await?;
                 o.field("row_kind", &self.row_kind).await?;
@@ -3263,19 +3349,30 @@ mod trace_landing_tests {
             scope_name: "io.otel.http".to_string(),
             scope_version: "1.4.2".to_string(),
             scope_attrs: json("build", 1),
+            // **Every field issue #587 adds is EMPTY here**, because this
+            // is `W-14`'s baseline: each of its sub-cases sets exactly one
+            // of them and asserts the charge grew by that field's own
+            // bytes, which only holds against a baseline that carries none
+            // of them.
+            scope_schema_url: String::new(),
+            scope_dropped_attrs: 0,
+            scope_attrs_other: Vec::new(),
+            end_ns: TS as u64 + 4_000_000,
             events: vec![LandingEvent {
-                time_ns: TS + 1,
+                time_ns: TS as u64 + 1,
                 name: "exception".to_string(),
                 attrs: json("type", 2),
+                attrs_other: Vec::new(),
                 dropped_attrs: 1,
             }],
             dropped_events: 3,
             links: vec![LandingLink {
-                trace_id: [0x11; 16],
-                span_id: [0x22; 8],
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
                 trace_state: "congo=1".to_string(),
                 flags: 0x100,
                 attrs: json("kind", 3),
+                attrs_other: Vec::new(),
                 dropped_attrs: 4,
             }],
             dropped_links: 5,
@@ -3295,11 +3392,14 @@ mod trace_landing_tests {
             attrs_other: vec![4, 5],
             dropped_attrs: 1,
             schema_url: "https://example.invalid/v1".to_string(),
+            // Empty, for `span_fixture`'s reason: `W-14`'s resource
+            // sub-case varies exactly this field from here.
+            entity_refs: Vec::new(),
         }
     }
 
     /// **The insert omits `event_id`, so the server fills it.** The table has
-    /// thirty-two columns and the row type declares the other thirty-one;
+    /// thirty-seven columns and the row type declares the other thirty-six;
     /// the landed event's own identity comes from the column's
     /// `DEFAULT generateUUIDv7()`.
     ///
@@ -3310,8 +3410,8 @@ mod trace_landing_tests {
         let names = <TraceLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
         assert_eq!(
             names.len(),
-            31,
-            "the table has 32 columns and the row type declares the other 31: {names:?}"
+            36,
+            "the table has 37 columns and the row type declares the other 36: {names:?}"
         );
         assert!(
             !names.contains(&"event_id"),
@@ -3321,6 +3421,19 @@ mod trace_landing_tests {
         // the first column is the one the DDL declares after `event_id`.
         assert_eq!(names[0], "received_ms");
         assert_eq!(names[1], "row_kind");
+        // And the five issue #587 appended, in the table's own order, which
+        // is what makes the positional encoding land them in the right
+        // columns.
+        assert_eq!(
+            &names[31..],
+            &[
+                "scope_schema_url",
+                "scope_dropped_attrs",
+                "scope_attrs_other",
+                "end_ns",
+                "entity_refs",
+            ]
+        );
     }
 
     /// **Every landing column is the value its kind was built from**, and
@@ -3387,8 +3500,14 @@ mod trace_landing_tests {
         assert_eq!(span.events[0].dropped_attrs, want.events[0].dropped_attrs);
         assert_eq!(span.dropped_events, want.dropped_events);
         assert_eq!(span.links.len(), 1);
-        assert_eq!(span.links[0].trace_id, want.links[0].trace_id);
-        assert_eq!(span.links[0].span_id, want.links[0].span_id);
+        assert_eq!(
+            span.links[0].trace_id.as_slice(),
+            want.links[0].trace_id.as_slice()
+        );
+        assert_eq!(
+            span.links[0].span_id.as_slice(),
+            want.links[0].span_id.as_slice()
+        );
         assert_eq!(span.links[0].trace_state, want.links[0].trace_state);
         assert_eq!(span.links[0].flags, want.links[0].flags);
         assert_eq!(span.links[0].attrs, want.links[0].attrs);
@@ -3495,9 +3614,10 @@ mod trace_landing_tests {
         let mut more_events = span_fixture();
         for i in 0..200 {
             more_events.events.push(LandingEvent {
-                time_ns: TS + i,
+                time_ns: TS as u64 + i as u64,
                 name: format!("event-{i}-with-a-name-long-enough-to-notice"),
                 attrs: json("k", i),
+                attrs_other: Vec::new(),
                 dropped_attrs: 0,
             });
         }
@@ -3512,11 +3632,12 @@ mod trace_landing_tests {
         let mut more_links = span_fixture();
         for i in 0..50 {
             more_links.links.push(LandingLink {
-                trace_id: [0x11; 16],
-                span_id: [0x22; 8],
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
                 trace_state: format!("congo=link-{i}-with-a-long-enough-state"),
                 flags: 0,
                 attrs: json("k", i),
+                attrs_other: Vec::new(),
                 dropped_attrs: 0,
             });
         }
@@ -3530,6 +3651,155 @@ mod trace_landing_tests {
             with_links >= base + link_text,
             "the charge ({with_links}) must cover the {link_text} bytes of \
              link trace states it holds, over the one-link charge ({base})"
+        );
+    }
+
+    /// `W-14`'s baseline: [`span_fixture`] grown to the element counts the
+    /// sub-cases use, with **every** byte field issue #587 adds — and the
+    /// two widened link ids — left empty.
+    ///
+    /// **The element counts are in the baseline, not in the variation.**
+    /// `est_span_bytes` prices the two vectors by
+    /// `capacity() * size_of::<Tuple>()` as well as by their elements' own
+    /// bytes, so a sub-case that *pushes* elements grows the header term
+    /// too — and for the link sub-cases that term is larger than the bytes
+    /// being asserted, so the assertion would pass with the per-field term
+    /// missing. Varying one field across a fixed element count makes the
+    /// header terms cancel exactly, and the difference is then the field's
+    /// own bytes and nothing else.
+    fn charge_baseline() -> LandingSpan {
+        let mut span = span_fixture();
+        span.events = (0..200)
+            .map(|i| LandingEvent {
+                time_ns: TS as u64 + i,
+                name: "exception".to_string(),
+                attrs: json("type", 2),
+                attrs_other: Vec::new(),
+                dropped_attrs: 1,
+            })
+            .collect();
+        span.links = (0..50)
+            .map(|i| LandingLink {
+                trace_id: Vec::new(),
+                span_id: Vec::new(),
+                trace_state: format!("congo={i}"),
+                flags: 0x100,
+                attrs: json("kind", 3),
+                attrs_other: Vec::new(),
+                dropped_attrs: 4,
+            })
+            .collect();
+        span
+    }
+
+    /// **W-14.** The queue charge grows by every heap field issue #587
+    /// adds, **one field at a time** (§6.3).
+    ///
+    /// Six sub-cases, each cloning [`charge_baseline`] and setting exactly
+    /// one field. **A fixture that populates several at once lets one
+    /// field's bytes pay for another's missing term**, which is the shape
+    /// that hides exactly the defect this case exists for: a threshold of
+    /// `base + field_bytes` over a fixture carrying two new fields is met
+    /// by either one of them alone.
+    ///
+    /// The queue's charge is taken **before** the rows are materialized
+    /// (`writer/trace_landing.rs`'s reserve-before-materialize rule), so an
+    /// under-charge is not merely inaccurate — `PULSUS_INGEST_QUEUE_BYTES`
+    /// stops bounding what the writer holds.
+    #[test]
+    fn the_span_charge_grows_with_each_new_heap_field_on_its_own() {
+        let baseline = charge_baseline();
+        let base = TraceLandingRow::est_span_bytes(&baseline);
+
+        // 1. every event's own `attrs_other`.
+        let mut varied = baseline.clone();
+        for event in &mut varied.events {
+            event.attrs_other = vec![0x7a; 96];
+        }
+        let want = 200 * 96;
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + want,
+            "the charge ({got}) must cover the {want} bytes of event \
+             `attrs_other` it holds, over the baseline's ({base})"
+        );
+
+        // 2. every link's own `attrs_other`.
+        let mut varied = baseline.clone();
+        for link in &mut varied.links {
+            link.attrs_other = vec![0x7a; 96];
+        }
+        let want = 50 * 96;
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + want,
+            "the charge ({got}) must cover the {want} bytes of link \
+             `attrs_other` it holds, over the baseline's ({base})"
+        );
+
+        // 3. every link's `trace_id`, then 4. every link's `span_id` —
+        // **separately**, because as `[u8; 16]`/`[u8; 8]` both were priced
+        // by the `size_of::<TraceLinkTuple>()` header term, so widening
+        // them to byte buffers with no new term *removes* bytes from the
+        // charge rather than merely failing to add them.
+        let mut varied = baseline.clone();
+        for link in &mut varied.links {
+            link.trace_id = vec![0x11; 32];
+        }
+        let want = 50 * 32;
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + want,
+            "the charge ({got}) must cover the {want} bytes of link \
+             `trace_id` it holds, over the baseline's ({base})"
+        );
+
+        let mut varied = baseline.clone();
+        for link in &mut varied.links {
+            link.span_id = vec![0x22; 24];
+        }
+        let want = 50 * 24;
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + want,
+            "the charge ({got}) must cover the {want} bytes of link \
+             `span_id` it holds, over the baseline's ({base})"
+        );
+
+        // 5. the scope's schema url, then 6. the scope's `attrs_other` —
+        // separately, for the same reason.
+        let mut varied = baseline.clone();
+        varied.scope_schema_url = "s".repeat(256);
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + 256,
+            "the charge ({got}) must cover the 256 bytes of \
+             `scope_schema_url` it holds, over the baseline's ({base})"
+        );
+
+        let mut varied = baseline.clone();
+        varied.scope_attrs_other = vec![0x7a; 256];
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + 256,
+            "the charge ({got}) must cover the 256 bytes of \
+             `scope_attrs_other` it holds, over the baseline's ({base})"
+        );
+    }
+
+    /// **W-14's resource half.** `est_resource_bytes` grows by the
+    /// entity-reference carrier the kind-1 row holds (§6.3).
+    #[test]
+    fn the_resource_charge_grows_with_the_entity_references_it_holds() {
+        let baseline = resource_fixture();
+        let base = TraceLandingRow::est_resource_bytes(&baseline);
+        let mut varied = resource_fixture();
+        varied.entity_refs = vec![0x1a; 512];
+        let got = TraceLandingRow::est_resource_bytes(&varied);
+        assert!(
+            got >= base + 512,
+            "the charge ({got}) must cover the 512 bytes of `entity_refs` \
+             it holds, over the baseline's ({base})"
         );
     }
 }
