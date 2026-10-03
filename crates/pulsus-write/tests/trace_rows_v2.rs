@@ -1423,7 +1423,15 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
 #[tokio::test]
 async fn two_events_and_two_links_in_one_span_all_land() {
     skip_unless_live!();
-    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_w2")).await;
+    // Its own database. It shared `pulsus_trace_rows_it_w2` with
+    // `w2_each_event_and_link_carries_its_own_unstorable_attribute_and_the_ids_sent`
+    // below, and `fresh_db` opens with `DROP DATABASE IF EXISTS` — so
+    // whichever of the two threads started second dropped the other's
+    // schema mid-insert and that one failed with `Code: 60 ... Unknown
+    // table expression identifier '<db>.trace_landing'`. Measured in
+    // `schema-it`: green on one run and red on the two after it, same
+    // revision of this file, which is what a race looks like.
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_events_links")).await;
 
     let start = now_ns();
     let span = Span {
@@ -1902,7 +1910,7 @@ async fn t_w3_one_span_id_with_two_kinds_is_two_rows() {
 #[tokio::test]
 async fn t_w5_a_thousand_spans_of_one_resource_land_one_resource_row() {
     skip_unless_live!();
-    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w5")).await;
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_t_w5")).await;
 
     let t0 = (now_ns() / 86_400_000_000_000) * 86_400_000_000_000 + 3_600_000_000_000;
     let trace = trace_id_of(0xe0);
@@ -2016,7 +2024,7 @@ async fn a_second_push_re_emits_the_same_resource_and_catalog_rows() {
 #[tokio::test]
 async fn t_w6_a_throwing_view_fails_the_insert_and_its_target_holds_nothing() {
     skip_unless_live!();
-    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_landing_it_w6")).await;
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_t_w6")).await;
 
     // Point `traces_mv` at a table whose `trace_id` cannot take the
     // projection's `FixedString(16)`.
