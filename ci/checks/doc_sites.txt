@@ -4,7 +4,7 @@
 # text is still there, and a `rewrite` row says its text is gone.
 # base 4ebb3e48c8acf9d74c1b3797bbe821c763e6f614
 rewrite docs/schemas.md:33-33
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587
 rewrite docs/schemas.md:1089-1089
 rewrite docs/architecture.md:378-378 refs=#560
 rewrite docs/116.md:64-64
@@ -15,7 +15,7 @@ rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
-rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584
+rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126

@@ -210,7 +210,11 @@ ALTER TABLE {{db}}.metric_landing{{on_cluster}} MODIFY SETTING non_replicated_de
   long that is. `pulsusdb rebuild-metrics` replays a window of the landing table through
   the same projection the view applies, read out of the view's own rendered statement
   (`pulsus_schema::mv_projection`) so the two cannot drift. It is a command run by hand
-  and it has no tests (§9 D15).
+  and it has no tests (§9 D15). **Traces have the same thing**:
+  `replay_trace_window`, bounded by `PULSUS_TRACE_LANDING_RETENTION_HOURS`,
+  replays a window of `trace_landing` through all five of its views'
+  projections — also run by hand, also untested, and **nothing detects that
+  it is needed** (`docs/TraceQL/server-implementation.md` §2.5).
 
 ---
 

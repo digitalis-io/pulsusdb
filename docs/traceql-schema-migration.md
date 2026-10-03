@@ -2480,6 +2480,10 @@ keep.** That is not a detail; it removes most of the work.
 > append-only migrations and needed no amendment, which is why it took none. What has
 > moved is the surrounding statement of policy: the inventory is **four** places, this
 > passage included, and the window's latest occupant is issue #498 rather than issue #54.
+> **Reopened again, 2026-10-03, by issue #587**: the trace tables of issue #586 could not
+> hold what OTLP sends, so migrations 66, 67, 68 and 71 were amended in place — six new
+> columns, five widened declarations and two identity inputs. The condition is the same one
+> and the latest occupant is now issue #587. The analysis below is still unchanged.
 
 **Amending migration 16 and 18 in place is not currently permitted.** Three places say
 the migration catalogue is append-only and that the window for in-place amendment closed:

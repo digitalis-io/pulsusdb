@@ -952,8 +952,8 @@ at exit 0 (§11.1), so the quotation above cannot drift without that gate redden
 **This narrows a rule §2.4 already carried and did not bound.** The lattice says `a || b` becomes
 `sql_a OR sql_b` in one statement. That is right **when both sides read the same source**, and wrong
 when they do not: `resource.service.name` is a physical column of `trace_spans`
-(`crates/pulsus-schema/src/catalog.rs:359`, ordered by `(trace_id, timestamp_ns)`) while
-`span.http.method` is a row of `trace_attrs_idx` (`catalog.rs:383`, ordered by
+(`crates/pulsus-schema/src/catalog.rs:362`, ordered by `(trace_id, timestamp_ns)`) while
+`span.http.method` is a row of `trace_attrs_idx` (`catalog.rs:386`, ordered by
 `(key, val, scope, timestamp_ns, trace_id, span_id)`). A disjunction over one of each is reachable,
 not theoretical.
 
@@ -2511,8 +2511,8 @@ event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.nam
 | 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
 | 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
 
-The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:3206` asserts
-`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:3147` the
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:3229` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:3170` the
 same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
 schema we run**, and that ambiguity is why the statements are printed rather than described.
 
@@ -2745,7 +2745,7 @@ lines above them, and neither number was wrong about what it measured.
 `min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
 trap §9.2 records against itself). That is the whole `key = 'a'` (or `'c'`) partition, once per
 read, and it equals the phase-1 generator's own read. `trace_id` is the fifth column of `ORDER BY
-(key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:383`), so a batch's
+(key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:386`), so a batch's
 `trace_id IN (32 ids)` prunes nothing inside it.
 
 **And §9.2's cheap fix does not apply.** §9.2 records that narrowing the *membership* read's
@@ -2795,7 +2795,7 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 drops any of them answers differently from the evaluator.
 
 - **Compare `val_num`, not `val`, and gate on `isNotNull(val_num)`.** The `f64` rounding happens at
-  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:759`) is
+  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:760`) is
   `val.parse::<f64>().filter(is_finite)` — so both sides of the comparison already read the rounded
   number and there is no unrounded side to disagree with. But the `val` String still holds the
   original text:
@@ -3131,7 +3131,7 @@ memory at production volume, and whether 80,658,368 rows per generator statement
 
 **What it is.** An **additional** `trace_attrs_idx`-shaped table ordered `(trace_id, span_id, key)`,
 alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
-(`crates/pulsus-schema/src/catalog.rs:383`) — **not instead of it**.
+(`crates/pulsus-schema/src/catalog.rs:386`) — **not instead of it**.
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
 existing key-ordered `trace_attrs_idx` — which is **1,128,726,045** bytes on four builds of the
@@ -4131,7 +4131,7 @@ Its three prerequisites, each with what a taker must read first:
 2. **The presence-count discriminator.** A bare `anyIf` maps "the span carries the key with an empty
    value" and "the span carries no such row" onto the same output row. `val_type` cannot tell them
    apart: migration 39 added it with `DEFAULT ''` and pre-existing rows read back `''`
-   (`crates/pulsus-schema/src/catalog.rs:814`), and `StoredType::from_stored` maps `''` to `Unknown`
+   (`crates/pulsus-schema/src/catalog.rs:817`), and `StoredType::from_stored` maps `''` to `Unknown`
    (`crates/pulsus-read/src/traces/search_eval.rs:183`). The merged statement must carry
    `countIf(key = … AND scope = …) > 0` as its own column, which is what a3 does.
 

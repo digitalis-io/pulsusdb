@@ -1160,17 +1160,17 @@ CREATE TABLE trace_landing (
     duration_ns     Int64  CODEC(T64, ZSTD(1)),
     resource_id     UInt128  CODEC(ZSTD(1)),
     name            LowCardinality(String)  CODEC(ZSTD(1)),
-    kind            UInt8  CODEC(ZSTD(1)),
-    status_code     UInt8  CODEC(ZSTD(1)),
+    kind            Int32  CODEC(ZSTD(1)),
+    status_code     Int32  CODEC(ZSTD(1)),
     status_message  String  CODEC(ZSTD(1)),
     trace_state     String  CODEC(ZSTD(1)),
     flags           UInt32  CODEC(ZSTD(1)),
     scope_name      LowCardinality(String)  CODEC(ZSTD(1)),
     scope_version   LowCardinality(String)  CODEC(ZSTD(1)),
     scope_attrs     JSON  CODEC(ZSTD(1)),
-    events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),
+    events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),
     dropped_events  UInt32  CODEC(ZSTD(1)),
-    links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),
+    links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),
     dropped_links   UInt32  CODEC(ZSTD(1)),
     service         LowCardinality(String)  CODEC(ZSTD(1)),
     attrs           JSON  CODEC(ZSTD(1)),
@@ -1181,7 +1181,12 @@ CREATE TABLE trace_landing (
     tag_scope       LowCardinality(String)  CODEC(ZSTD(1)),
     tag_key         String  CODEC(ZSTD(1)),
     tag_value       String  CODEC(ZSTD(1)),
-    tag_type        LowCardinality(String)  CODEC(ZSTD(1))
+    tag_type        LowCardinality(String)  CODEC(ZSTD(1)),
+    scope_schema_url    String               CODEC(ZSTD(1)),
+    scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
+    scope_attrs_other   String               CODEC(ZSTD(1)),
+    end_ns              UInt64               CODEC(Delta, ZSTD(1)),
+    entity_refs         String               CODEC(ZSTD(1))
 ) ENGINE = MergeTree
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
@@ -1196,8 +1201,8 @@ CREATE TABLE spans (
     service         LowCardinality(String)   CODEC(ZSTD(1)),
     resource_id     UInt128                  CODEC(ZSTD(1)),
     name            LowCardinality(String)   CODEC(ZSTD(1)),
-    kind            UInt8                    CODEC(ZSTD(1)),
-    status_code     UInt8                    CODEC(ZSTD(1)),
+    kind            Int32                    CODEC(ZSTD(1)),
+    status_code     Int32                    CODEC(ZSTD(1)),
     status_message  String                   CODEC(ZSTD(1)),
     trace_state     String                   CODEC(ZSTD(1)),
     flags           UInt32                   CODEC(ZSTD(1)),
@@ -1207,12 +1212,16 @@ CREATE TABLE spans (
     attrs           JSON                     CODEC(ZSTD(1)),
     attrs_other     String                   CODEC(ZSTD(1)),
     dropped_attrs   UInt32                   CODEC(ZSTD(1)),
-    events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
     dropped_events  UInt32                   CODEC(ZSTD(1)),
-    links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
-    dropped_links   UInt32                   CODEC(ZSTD(1))
+    links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    dropped_links   UInt32                   CODEC(ZSTD(1)),
+    scope_schema_url    String               CODEC(ZSTD(1)),
+    scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
+    scope_attrs_other   String               CODEC(ZSTD(1)),
+    end_ns              UInt64               CODEC(Delta, ZSTD(1))
 ) ENGINE = ReplacingMergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))
+PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
 
@@ -1223,7 +1232,9 @@ CREATE TABLE traces (
     end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
     root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
     root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
-    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1))
+    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1)),
+    last_start_ns SimpleAggregateFunction(max, Int64)                         CODEC(Delta, ZSTD(1)),
+    buckets       SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))  CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
 ORDER BY trace_id
@@ -1236,7 +1247,8 @@ CREATE TABLE resources (
     attrs          JSON                    CODEC(ZSTD(1)),
     attrs_other    String                  CODEC(ZSTD(1)),
     dropped_attrs  UInt32                  CODEC(ZSTD(1)),
-    schema_url     String                  CODEC(ZSTD(1))
+    schema_url     String                  CODEC(ZSTD(1)),
+    entity_refs    String                  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
 PARTITION BY day
 ORDER BY (service, resource_id);
@@ -1264,21 +1276,29 @@ SELECT trace_id AS trace_id, span_id AS span_id, parent_span_id AS parent_span_i
        scope_name AS scope_name, scope_version AS scope_version,
        scope_attrs AS scope_attrs, attrs AS attrs, attrs_other AS attrs_other,
        dropped_attrs AS dropped_attrs, events AS events, dropped_events AS dropped_events,
-       links AS links, dropped_links AS dropped_links
+       links AS links, dropped_links AS dropped_links,
+       scope_schema_url AS scope_schema_url,
+       scope_dropped_attrs AS scope_dropped_attrs,
+       scope_attrs_other AS scope_attrs_other, end_ns AS end_ns
 FROM trace_landing WHERE row_kind = 0;
 
 CREATE MATERIALIZED VIEW resources_mv TO resources AS
 SELECT day AS day, resource_id AS resource_id, service AS service, attrs AS attrs,
-       attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url
+       attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url,
+       entity_refs AS entity_refs
 FROM trace_landing WHERE row_kind = 1;
 
 CREATE MATERIALIZED VIEW traces_mv TO traces AS
-SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns,
-       rs AS root_service, rn AS root_name, sv AS services
-FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e,
+SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, s AS start_ns, e AS end_ns,
+       rs AS root_service, rn AS root_name, sv AS services,
+       ls AS last_start_ns, bk AS buckets
+FROM (SELECT trace_id, min(start_ns) AS s,
+             max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
              maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,
              maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,
-             groupUniqArray(toString(service)) AS sv
+             groupUniqArray(toString(service)) AS sv,
+             max(start_ns) AS ls,
+             groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
       FROM trace_landing WHERE row_kind = 0
       GROUP BY trace_id);
 
@@ -1430,7 +1450,7 @@ CREATE TABLE mv_checksums (
 ORDER BY mv_name;
 ```
 
-**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration is permitted only while the condition that allows it holds — no tagged release, no persistent deployments, databases created fresh; the `fingerprint` widening to `UInt128` (issue #498, migrations 4, 5, 6, 7, 8, 9, 23 and 29) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
+**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration is permitted only while the condition that allows it holds — no tagged release, no persistent deployments, databases created fresh. Two amendment windows have been taken while that condition held: the `fingerprint` widening to `UInt128` (issue #498, migrations 4, 5, 6, 7, 8, 9, 23 and 29) and the trace tables' widening (issue #587, migrations 66, 67, 68 and 71 — six new columns, five widened declarations and two identity inputs, because #586's definitions could not hold what OTLP sends). A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
 
 ---
 

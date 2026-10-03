@@ -16,10 +16,13 @@
 //! **Amendment policy:** migrations are append-only from the first tagged
 //! release onward. In-place amendment of an already-listed migration is
 //! permitted only while the condition that allows it holds — no tagged
-//! release, no persistent deployments, databases created fresh — and issue
+//! release, no persistent deployments, databases created fresh — and two
+//! amendment windows have been taken while that condition held: issue
 //! #498's widening of the `fingerprint` column to `UInt128` in migrations
-//! 4, 5, 6, 7, 8, 9, 23 and 29 was the last such amendment window
-//! (task-manager ruling on #498). Developers with a local schema created
+//! 4, 5, 6, 7, 8, 9, 23 and 29, and issue #587's widening of the trace
+//! tables in migrations 66, 67, 68 and 71 — six new columns, five widened
+//! declarations and two identity inputs, because #586's definitions could
+//! not hold what OTLP sends. Developers with a local schema created
 //! before that amendment must drop and re-reconcile it — the checksum
 //! drift guard ([`MigrationScope::Checksum`]) correctly refuses to touch
 //! the stale tables.
@@ -1474,8 +1477,8 @@ pub const MIGRATIONS: &[Migration] = &[
                  service         LowCardinality(String)   CODEC(ZSTD(1)),\n\
                  resource_id     UInt128                  CODEC(ZSTD(1)),\n\
                  name            LowCardinality(String)   CODEC(ZSTD(1)),\n\
-                 kind            UInt8                    CODEC(ZSTD(1)),\n\
-                 status_code     UInt8                    CODEC(ZSTD(1)),\n\
+                 kind            Int32                    CODEC(ZSTD(1)),\n\
+                 status_code     Int32                    CODEC(ZSTD(1)),\n\
                  status_message  String                   CODEC(ZSTD(1)),\n\
                  trace_state     String                   CODEC(ZSTD(1)),\n\
                  flags           UInt32                   CODEC(ZSTD(1)),\n\
@@ -1485,12 +1488,16 @@ pub const MIGRATIONS: &[Migration] = &[
                  attrs           JSON                     CODEC(ZSTD(1)),\n\
                  attrs_other     String                   CODEC(ZSTD(1)),\n\
                  dropped_attrs   UInt32                   CODEC(ZSTD(1)),\n\
-                 events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
+                 events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
                  dropped_events  UInt32                   CODEC(ZSTD(1)),\n\
-                 links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
-                 dropped_links   UInt32                   CODEC(ZSTD(1))\n\
+                 links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),\n\
+                 dropped_links   UInt32                   CODEC(ZSTD(1)),\n\
+                 scope_schema_url    String               CODEC(ZSTD(1)),\n\
+                 scope_dropped_attrs UInt32               CODEC(ZSTD(1)),\n\
+                 scope_attrs_other   String               CODEC(ZSTD(1)),\n\
+                 end_ns              UInt64               CODEC(Delta, ZSTD(1))\n\
              ) ENGINE = ReplacingMergeTree\n\
-             PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))\n\
+             PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')\n\
              ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)\n\
              SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;",
         ),
@@ -1509,7 +1516,9 @@ pub const MIGRATIONS: &[Migration] = &[
                  end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),\n\
                  root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),\n\
                  root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),\n\
-                 services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1))\n\
+                 services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1)),\n\
+                 last_start_ns  SimpleAggregateFunction(max, Int64)                         CODEC(Delta, ZSTD(1)),\n\
+                 buckets        SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))  CODEC(ZSTD(1))\n\
              ) ENGINE = AggregatingMergeTree\n\
              PARTITION BY day\n\
              ORDER BY trace_id\n\
@@ -1530,7 +1539,8 @@ pub const MIGRATIONS: &[Migration] = &[
                  attrs          JSON                    CODEC(ZSTD(1)),\n\
                  attrs_other    String                  CODEC(ZSTD(1)),\n\
                  dropped_attrs  UInt32                  CODEC(ZSTD(1)),\n\
-                 schema_url     String                  CODEC(ZSTD(1))\n\
+                 schema_url     String                  CODEC(ZSTD(1)),\n\
+                 entity_refs    String                  CODEC(ZSTD(1))\n\
              ) ENGINE = ReplacingMergeTree\n\
              PARTITION BY day\n\
              ORDER BY (service, resource_id);",
@@ -1627,17 +1637,17 @@ pub const MIGRATIONS: &[Migration] = &[
                  duration_ns     Int64  CODEC(T64, ZSTD(1)),\n\
                  resource_id     UInt128  CODEC(ZSTD(1)),\n\
                  name            LowCardinality(String)  CODEC(ZSTD(1)),\n\
-                 kind            UInt8  CODEC(ZSTD(1)),\n\
-                 status_code     UInt8  CODEC(ZSTD(1)),\n\
+                 kind            Int32  CODEC(ZSTD(1)),\n\
+                 status_code     Int32  CODEC(ZSTD(1)),\n\
                  status_message  String  CODEC(ZSTD(1)),\n\
                  trace_state     String  CODEC(ZSTD(1)),\n\
                  flags           UInt32  CODEC(ZSTD(1)),\n\
                  scope_name      LowCardinality(String)  CODEC(ZSTD(1)),\n\
                  scope_version   LowCardinality(String)  CODEC(ZSTD(1)),\n\
                  scope_attrs     JSON  CODEC(ZSTD(1)),\n\
-                 events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
+                 events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
                  dropped_events  UInt32  CODEC(ZSTD(1)),\n\
-                 links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
+                 links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),\n\
                  dropped_links   UInt32  CODEC(ZSTD(1)),\n\
                  service         LowCardinality(String)  CODEC(ZSTD(1)),\n\
                  attrs           JSON  CODEC(ZSTD(1)),\n\
@@ -1648,7 +1658,12 @@ pub const MIGRATIONS: &[Migration] = &[
                  tag_scope       LowCardinality(String)  CODEC(ZSTD(1)),\n\
                  tag_key         String  CODEC(ZSTD(1)),\n\
                  tag_value       String  CODEC(ZSTD(1)),\n\
-                 tag_type        LowCardinality(String)  CODEC(ZSTD(1))\n\
+                 tag_type        LowCardinality(String)  CODEC(ZSTD(1)),\n\
+                 scope_schema_url    String               CODEC(ZSTD(1)),\n\
+                 scope_dropped_attrs UInt32               CODEC(ZSTD(1)),\n\
+                 scope_attrs_other   String               CODEC(ZSTD(1)),\n\
+                 end_ns              UInt64               CODEC(Delta, ZSTD(1)),\n\
+                 entity_refs         String               CODEC(ZSTD(1))\n\
              ) ENGINE = MergeTree\n\
              PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))\n\
              ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)\n\
@@ -1933,14 +1948,18 @@ pub const MVS: &[MvDef] = &[
                       scope_name AS scope_name, scope_version AS scope_version,\n\
                       scope_attrs AS scope_attrs, attrs AS attrs, attrs_other AS attrs_other,\n\
                       dropped_attrs AS dropped_attrs, events AS events, dropped_events AS dropped_events,\n\
-                      links AS links, dropped_links AS dropped_links\n\
+                      links AS links, dropped_links AS dropped_links,\n\
+                      scope_schema_url AS scope_schema_url,\n\
+                      scope_dropped_attrs AS scope_dropped_attrs,\n\
+                      scope_attrs_other AS scope_attrs_other, end_ns AS end_ns\n\
                FROM {{db}}.trace_landing WHERE row_kind = 0;",
     },
     MvDef {
         name: "resources_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.resources_mv{{on_cluster}} TO {{db}}.resources AS\n\
                SELECT day AS day, resource_id AS resource_id, service AS service, attrs AS attrs,\n\
-                      attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url\n\
+                      attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url,\n\
+                      entity_refs AS entity_refs\n\
                FROM {{db}}.trace_landing WHERE row_kind = 1;",
     },
     // `measure/schema.sql`'s own projection, with `WHERE row_kind = 0` added
@@ -1962,12 +1981,16 @@ pub const MVS: &[MvDef] = &[
     MvDef {
         name: "traces_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}} AS\n\
-               SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns,\n\
-                      rs AS root_service, rn AS root_name, sv AS services\n\
-               FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e,\n\
+               SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, s AS start_ns, e AS end_ns,\n\
+                      rs AS root_service, rn AS root_name, sv AS services,\n\
+                      ls AS last_start_ns, bk AS buckets\n\
+               FROM (SELECT trace_id, min(start_ns) AS s,\n\
+                            max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,\n\
                             maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,\n\
                             maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,\n\
-                            groupUniqArray(toString(service)) AS sv\n\
+                            groupUniqArray(toString(service)) AS sv,\n\
+                            max(start_ns) AS ls,\n\
+                            groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk\n\
                      FROM {{db}}.trace_landing WHERE row_kind = 0\n\
                      GROUP BY trace_id);",
     },

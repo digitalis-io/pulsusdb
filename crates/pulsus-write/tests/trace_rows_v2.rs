@@ -1355,7 +1355,7 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
         scalar(
             &client,
             "SELECT concat(\
-                toString(events[1].2), '|', toString(events[1].4), '|', \
+                toString(events[1].2), '|', toString(events[1].5), '|', \
                 toString(events[1].3.`exception%2Etype`), '|', \
                 dynamicType(events[1].3.`exception%2Etype`)\
              ) AS s FROM spans"
@@ -1369,7 +1369,7 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
             &client,
             "SELECT concat(\
                 hex(links[1].1), '|', hex(links[1].2), '|', links[1].3, '|', \
-                toString(links[1].4), '|', toString(links[1].6), '|', \
+                toString(links[1].4), '|', toString(links[1].7), '|', \
                 toString(links[1].5.`link%2Ekind`), '|', \
                 dynamicType(links[1].5.`link%2Ekind`)\
              ) AS s FROM spans"
@@ -1386,7 +1386,7 @@ async fn t_w7_a_span_with_every_field_reads_back_equal() {
     assert_eq!(
         scalar(
             &client,
-            "SELECT toString(events[1].1 = toInt64(start_ns + 1000000)) AS s FROM spans"
+            "SELECT toString(events[1].1 = toUInt64(start_ns + 1000000)) AS s FROM spans"
         )
         .await,
         "1",
@@ -1484,7 +1484,7 @@ async fn two_events_and_two_links_in_one_span_all_land() {
             "SELECT concat(\
                 toString(length(events)), '|', \
                 toString(events[1].2), '|', toString(events[2].2), '|', \
-                toString(events[1].4), '|', toString(events[2].4), '|', \
+                toString(events[1].5), '|', toString(events[2].5), '|', \
                 toString(events[1].3.`e`), '|', toString(events[2].3.`e`)\
              ) AS s FROM spans"
         )
@@ -1499,7 +1499,7 @@ async fn two_events_and_two_links_in_one_span_all_land() {
                 toString(length(links)), '|', \
                 hex(links[1].1), '|', hex(links[2].1), '|', \
                 links[1].3, '|', links[2].3, '|', \
-                toString(links[1].6), '|', toString(links[2].6), '|', \
+                toString(links[1].7), '|', toString(links[2].7), '|', \
                 toString(links[1].5.`l`), '|', toString(links[2].5.`l`)\
              ) AS s FROM spans"
         )
@@ -1516,7 +1516,7 @@ async fn two_events_and_two_links_in_one_span_all_land() {
     drop_db(&db).await;
 }
 
-/// **The insert omits `event_id`, so the server fills it.** Thirty-one
+/// **The insert omits `event_id`, so the server fills it.** Thirty-six
 /// columns in the insert's column list and `event_id` is not one of them;
 /// live, every landed row's own identity is non-zero and distinct.
 #[tokio::test]
@@ -1527,8 +1527,8 @@ async fn the_insert_omits_event_id_so_the_server_fills_it() {
     let names = <TraceLandingRow as clickhouse::Row>::COLUMN_NAMES;
     assert_eq!(
         names.len(),
-        31,
-        "the table has 32 columns and the row type declares the other 31: {names:?}"
+        36,
+        "the table has 37 columns and the row type declares the other 36: {names:?}"
     );
     assert!(
         !names.contains(&"event_id"),

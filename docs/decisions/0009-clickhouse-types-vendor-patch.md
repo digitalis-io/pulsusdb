@@ -10,13 +10,19 @@ Spawned: no issue. The two upstream reports are not filed — see "What this doe
 
 The approved trace schema declares two columns whose tuple elements are
 **named** (`crates/pulsus-schema/src/catalog.rs`: migration 71's
-`trace_landing` at `:1638` and `:1640`, the `spans` record at `:1488` and
-`:1490`):
+`trace_landing` at `:1648` and `:1650`, the `spans` record at `:1491` and
+`:1493`):
 
 ```text
-events  Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32))
-links   Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32))
+events  Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32))
+links   Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32))
 ```
+
+**Issue #587 widened both tuples** — each element gained its own
+`attrs_other`, the event time became unsigned and the two link ids became
+byte buffers. **The decision below is unaffected**: it is about the
+vendored type parser reading a named tuple at all, and a wider named tuple
+is the same decision.
 
 Every insert into `trace_landing` failed before a byte left the client:
 

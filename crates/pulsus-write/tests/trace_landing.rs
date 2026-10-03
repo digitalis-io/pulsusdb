@@ -3014,11 +3014,30 @@ async fn w13_a_status_code_outside_a_byte_is_stored_as_the_signed_value_sent() {
 /// unioned, and `groupUniqArrayArray` gives the same set either way.
 ///
 /// **This column is the only stored value either half of issue #587's read
-/// correctness depends on that is invisible in the statement text** — a
-/// wrong divisor, `groupArray` for `groupUniqArray`, or an expression
-/// derived rather than copied from `spans`' own sorting key all leave the
-/// fetch returning fewer spans, silently, with the SQL still correct.
-/// Assertion (b) is the one that sees it.
+/// correctness depends on that is invisible in the statement text**: a
+/// wrong divisor leaves the fetch returning fewer spans, silently, with
+/// the SQL still correct. **Assertion (b) is what sees a wrong divisor**,
+/// and that is checked by doing it — with `600000000000` the stored set
+/// is `[0, 2833333]` against the spans' `[0, 5666666, 5666667]`.
+///
+/// **What (b) cannot see is the view's aggregate NAME**, and nothing here
+/// can, because `traces` is an `AggregatingMergeTree`: the engine applies
+/// the column's own declared `groupUniqArrayArray(4096)` when it writes
+/// the part, whatever the view emitted. Measured on 26.3.29.7, a
+/// 10-element array carrying each value twice inserted into a column of
+/// that type:
+///
+/// ```text
+///   on an AggregatingMergeTree  ->  [0,1,2,3,4]
+///   on a plain MergeTree        ->  [0,0,1,1,2,2,3,3,4,4]
+/// ```
+///
+/// So `groupArray` for `groupUniqArray` in the view leaves every assertion
+/// here green — checked by doing that too. The declaration is what the
+/// stored value answers to, and
+/// `the_per_trace_aggregate_columns_carry_the_functions_this_design_names`
+/// (`crates/pulsus-schema/tests/live_traces_v2.rs`) reads it back off the
+/// server.
 #[tokio::test]
 async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
     skip_unless_live!();
@@ -3122,10 +3141,21 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
         "four spans over three distinct buckets are three elements"
     );
 
-    // (d) the boundary. **The only assertion in either half of issue #587
-    // that can see a missing `(4096)` in the view's own aggregate**: with
-    // the bare `groupUniqArray` the stored length is 4,097 and every
-    // assertion above still passes, because they use three buckets.
+    // (d) the boundary: a push of 4,097 distinct buckets stores 4,096.
+    //
+    // **It sees the cap holding, and it cannot say WHICH expression held
+    // it.** Two do: the view's `groupUniqArray(4096)` per push and the
+    // column's declared `groupUniqArrayArray(4096)`, which an
+    // `AggregatingMergeTree` applies when it writes the part — measured,
+    // a 5,000-element array into a column of that type stores 5,000 on a
+    // plain `MergeTree` and 4,096 on this one. Checked by removing each in
+    // turn: this assertion stays green either way, because one push needs
+    // only one of them. What it holds is the guarantee part 2's truncation
+    // branch is written against — a stored row of exactly 4,096 elements
+    // may be truncated and one shorter is complete — and the declaration
+    // itself is read back off the server by
+    // `the_per_trace_aggregate_columns_carry_the_functions_this_design_names`
+    // (`crates/pulsus-schema/tests/live_traces_v2.rs`).
     let wide = "DBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDB";
     let spans: Vec<Span> = (0..4097u32)
         .map(|i| Span {

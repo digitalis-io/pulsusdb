@@ -27,9 +27,9 @@ docs/query-lowering.md	ast.rs:977	crates/pulsus-logql/src/ast.rs	977		prose	Bina
 docs/query-lowering.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr	SpansetExpr
 docs/query-lowering.md	ast.rs:992	crates/pulsus-logql/src/ast.rs	992		prose	VariantsExpr	Variants
 docs/query-lowering.md	ast.rs:994	crates/pulsus-traceql/src/ast.rs	994		prose	Aggregate	Aggregate
-docs/query-lowering.md	catalog.rs:3147	crates/pulsus-schema/src/catalog.rs	3147		line	trace_edges_mv	.expect("trace_edges_mv present");
-docs/query-lowering.md	catalog.rs:3206	crates/pulsus-schema/src/catalog.rs	3206		line	status_message	!static_tmpl(16).contains("status_message"),
-docs/query-lowering.md	catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
+docs/query-lowering.md	catalog.rs:3170	crates/pulsus-schema/src/catalog.rs	3170		line	trace_edges_mv	.expect("trace_edges_mv present");
+docs/query-lowering.md	catalog.rs:3229	crates/pulsus-schema/src/catalog.rs	3229		line	status_message	!static_tmpl(16).contains("status_message"),
+docs/query-lowering.md	catalog.rs:386	crates/pulsus-schema/src/catalog.rs	386		line	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
 docs/query-lowering.md	compile/fold.rs:245	crates/pulsus-read/src/compile/fold.rs	245		prose	set_provenance	set_provenance
 docs/query-lowering.md	compile/fold.rs:626	crates/pulsus-read/src/compile/fold.rs	626		line	Relation	pub struct Relation<L: Lang + ?Sized> {
 docs/query-lowering.md	compile/plan.rs:897	crates/pulsus-read/src/compile/plan.rs	897		prose	name_not_resolvable	NameNotResolvable
@@ -87,9 +87,9 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:448	crates/pulsus-read/src/traces/search_sql.rs	448		line	hydration_sql	pub fn hydration_sql(
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:545-555	crates/pulsus-read/src/traces/search_sql.rs	545	555	line	membership	/// gated rather than asserted. /// /// **`SELECT DISTINCT` over one more column can return more rows.** A span /// carr
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:71	crates/pulsus-read/src/traces/search_sql.rs	71		line	byte_cap_expr	pub(crate) fn byte_cap_expr(col: &str) -> String {
-docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:359	crates/pulsus-schema/src/catalog.rs	359		prose	timestamp_ns	(trace_id, timestamp_ns)
-docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		line	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
-docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:814	crates/pulsus-schema/src/catalog.rs	814		line	id	id: 39,
+docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:362	crates/pulsus-schema/src/catalog.rs	362		prose	timestamp_ns	(trace_id, timestamp_ns)
+docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:386	crates/pulsus-schema/src/catalog.rs	386		line	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
+docs/query-lowering.md	crates/pulsus-schema/src/catalog.rs:817	crates/pulsus-schema/src/catalog.rs	817		line	id	id: 39,
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-157	crates/pulsus-server/src/logs_api/error.rs	147	157	line	X_CONTENT_TYPE_OPTIONS	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-212	crates/pulsus-server/src/logs_api/error.rs	147	212	line	ClientHTTPStatusAndError	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:212	crates/pulsus-server/src/logs_api/error.rs	212		line	PipelineInvalid	| ReadError::PipelineInvalid { .. }
@@ -99,7 +99,7 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:759	crates/pulsus-write/src/protocols/otlp_traces.rs	759		prose	numeric_val_num	numeric_val_num
+docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:760	crates/pulsus-write/src/protocols/otlp_traces.rs	760		prose	numeric_val_num	numeric_val_num
 docs/query-lowering.md	exec.rs:2983-2989	crates/pulsus-read/src/traces/exec.rs	2983	2989	prose	TRACE_SEARCH_MAX_BLOCK_ROWS	read_overflow_mode
 docs/query-lowering.md	exec.rs:3023	crates/pulsus-read/src/traces/exec.rs	3023		prose	generator_settings	generator_settings
 docs/query-lowering.md	exec.rs:808	crates/pulsus-read/src/traces/exec.rs	808		prose	map_trace_generator_error	map_trace_generator_error
@@ -188,17 +188,17 @@ docs/query-to-sql.md	ast.rs:2301	crates/pulsus-logql/src/ast.rs	2301		prose	LogR
 docs/query-to-sql.md	ast.rs:939	crates/pulsus-logql/src/ast.rs	939		prose	MetricExpr	MetricExpr
 docs/query-to-sql.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr	SpansetExpr
 docs/query-to-sql.md	canonical_labels.rs:131-163	crates/pulsus-read/src/canonical_labels.rs	131	163	line	parse_canonical_labels_into	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
-docs/query-to-sql.md	catalog.rs:245-258	crates/pulsus-schema/src/catalog.rs	245	258	prose	fromUnixTimestamp64Nano	log_samples
-docs/query-to-sql.md	catalog.rs:341-385	crates/pulsus-schema/src/catalog.rs	341	385	prose	fromUnixTimestamp64Nano	trace_attrs_idx
-docs/query-to-sql.md	catalog.rs:344	crates/pulsus-schema/src/catalog.rs	344		line	FixedString	parent_id FixedString(8),\n\
-docs/query-to-sql.md	catalog.rs:353	crates/pulsus-schema/src/catalog.rs	353		prose	idx_duration	idx_duration
-docs/query-to-sql.md	catalog.rs:371-385	crates/pulsus-schema/src/catalog.rs	371	385	line	fromUnixTimestamp64Nano	"CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}} (\n\ date Date,\n\ key LowCardinality(String),\n\ val S
-docs/query-to-sql.md	catalog.rs:377	crates/pulsus-schema/src/catalog.rs	377		line	timestamp_ns	timestamp_ns Int64,\n\
-docs/query-to-sql.md	catalog.rs:380	crates/pulsus-schema/src/catalog.rs	380		prose	duration_ns	duration
-docs/query-to-sql.md	catalog.rs:382-383	crates/pulsus-schema/src/catalog.rs	382	383	line	timestamp_ns	PARTITION BY date\n\ ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
-docs/query-to-sql.md	catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		prose	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
-docs/query-to-sql.md	catalog.rs:442	crates/pulsus-schema/src/catalog.rs	442		prose	structured_metadata	structured_metadata
-docs/query-to-sql.md	catalog.rs:986-992	crates/pulsus-schema/src/catalog.rs	986	992	prose	status_message	(service, timestamp_ns)
+docs/query-to-sql.md	catalog.rs:248-261	crates/pulsus-schema/src/catalog.rs	248	261	prose	fromUnixTimestamp64Nano	log_samples
+docs/query-to-sql.md	catalog.rs:344-388	crates/pulsus-schema/src/catalog.rs	344	388	prose	fromUnixTimestamp64Nano	trace_attrs_idx
+docs/query-to-sql.md	catalog.rs:347	crates/pulsus-schema/src/catalog.rs	347		line	FixedString	parent_id FixedString(8),\n\
+docs/query-to-sql.md	catalog.rs:356	crates/pulsus-schema/src/catalog.rs	356		prose	idx_duration	idx_duration
+docs/query-to-sql.md	catalog.rs:374-388	crates/pulsus-schema/src/catalog.rs	374	388	line	fromUnixTimestamp64Nano	"CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}} (\n\ date Date,\n\ key LowCardinality(String),\n\ val S
+docs/query-to-sql.md	catalog.rs:380	crates/pulsus-schema/src/catalog.rs	380		line	timestamp_ns	timestamp_ns Int64,\n\
+docs/query-to-sql.md	catalog.rs:383	crates/pulsus-schema/src/catalog.rs	383		prose	duration_ns	duration
+docs/query-to-sql.md	catalog.rs:385-386	crates/pulsus-schema/src/catalog.rs	385	386	line	timestamp_ns	PARTITION BY date\n\ ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
+docs/query-to-sql.md	catalog.rs:386	crates/pulsus-schema/src/catalog.rs	386		prose	timestamp_ns	ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
+docs/query-to-sql.md	catalog.rs:445	crates/pulsus-schema/src/catalog.rs	445		prose	structured_metadata	structured_metadata
+docs/query-to-sql.md	catalog.rs:989-995	crates/pulsus-schema/src/catalog.rs	989	995	prose	status_message	(service, timestamp_ns)
 docs/query-to-sql.md	client_agg.rs:2169	crates/pulsus-read/src/logql/client_agg.rs	2169		line	VectorAggSpec	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
 docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	minor	if (major, minor) < (26, 3) {
 docs/query-to-sql.md	controller.rs:76	crates/pulsus-schema/src/controller.rs	76		line	server_version	pub async fn server_version(client: &ChClient) -> Result<String, SchemaError> {
@@ -229,7 +229,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
-docs/query-to-sql.md	crates/pulsus-schema/src/catalog.rs:245-258	crates/pulsus-schema/src/catalog.rs	245	258	prose	fromUnixTimestamp64Nano	log_samples
+docs/query-to-sql.md	crates/pulsus-schema/src/catalog.rs:248-261	crates/pulsus-schema/src/catalog.rs	248	261	prose	fromUnixTimestamp64Nano	log_samples
 docs/query-to-sql.md	crates/pulsus-schema/src/controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	minor	if (major, minor) < (26, 3) {
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,

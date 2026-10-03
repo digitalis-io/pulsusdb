@@ -445,10 +445,33 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     // In NAME order, which is `columns`' own `ORDER BY`.
     let want: Vec<(String, String)> = [
         // Issue #587: the stored span-bucket set part 2's span read is a
-        // point read over. **The cap is in this declaration's own function
-        // and in the view's `groupUniqArray(4096)`, and in neither
-        // declaration on insert** — a 5,000-element array cast to this
-        // type stays 5,000, measured.
+        // point read over.
+        //
+        // **The cap is applied in three places, and which ones depends on
+        // the engine** — measured on 26.3.29.7, one request each:
+        //
+        //   CAST(range(5000) AS SimpleAggregateFunction(
+        //        groupUniqArrayArray(4096), Array(Int64)))        -> 5000
+        //   INSERT of a 5,000-element array into a column of that
+        //        type on a plain MergeTree                        -> 5000
+        //   the same INSERT on an AggregatingMergeTree            -> 4096
+        //
+        // So the TYPE caps nothing and the FUNCTION does, and this table
+        // is an `AggregatingMergeTree`, so the function named here is
+        // applied when the part is written and again when two rows of one
+        // key merge. Measured on the same engine: a 10-element array
+        // carrying each value twice stores as **five** distinct here and
+        // as **ten** on a plain `MergeTree`.
+        //
+        // `traces_mv` applies `groupUniqArray(4096)(...)` per push beside
+        // it. **Both govern a single push's stored array; only the one
+        // named here governs a MERGE, and only the one named here decides
+        // which function is applied at all** — so a view that emitted
+        // `groupArray` would still store a deduplicated, capped set.
+        // **This case is therefore the only one that can see the wrong
+        // declared function**: `W-17`
+        // (`crates/pulsus-write/tests/trace_landing.rs`) reads the stored
+        // set back through a deduplicating aggregate and cannot.
         (
             "buckets",
             "SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))",
@@ -1024,6 +1047,11 @@ async fn the_landed_storage_is_priced() {
     )
     .await;
     let per_span = bytes / 100;
+    // **Recorded, because issue #587 populated every added and widened
+    // field and the figure had never been measured against that row
+    // shape.** The ceiling is unchanged; if a later row shape exceeds it
+    // that is a finding for the owner, not a licence to raise it.
+    eprintln!("the landing table holds {per_span} B/row over 100 populated rows (recorded)");
     assert!(
         per_span < 200,
         "the landing table holds {per_span} B/span, over the 200 B/span ceiling \

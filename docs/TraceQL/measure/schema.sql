@@ -21,8 +21,8 @@ CREATE TABLE tqd_g1.spans (
     service         LowCardinality(String)   CODEC(ZSTD(1)),
     resource_id     UInt128                  CODEC(ZSTD(1)),
     name            LowCardinality(String)   CODEC(ZSTD(1)),
-    kind            UInt8                    CODEC(ZSTD(1)),
-    status_code     UInt8                    CODEC(ZSTD(1)),
+    kind            Int32                    CODEC(ZSTD(1)),
+    status_code     Int32                    CODEC(ZSTD(1)),
     status_message  String                   CODEC(ZSTD(1)),
     trace_state     String                   CODEC(ZSTD(1)),
     flags           UInt32                   CODEC(ZSTD(1)),
@@ -32,12 +32,16 @@ CREATE TABLE tqd_g1.spans (
     attrs           JSON                     CODEC(ZSTD(1)),
     attrs_other     String                   CODEC(ZSTD(1)),
     dropped_attrs   UInt32                   CODEC(ZSTD(1)),
-    events          Array(Tuple(time_ns Int64, name LowCardinality(String), attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
     dropped_events  UInt32                   CODEC(ZSTD(1)),
-    links           Array(Tuple(trace_id FixedString(16), span_id FixedString(8), trace_state String, flags UInt32, attrs JSON, dropped_attrs UInt32)) CODEC(ZSTD(1)),
-    dropped_links   UInt32                   CODEC(ZSTD(1))
+    links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
+    dropped_links   UInt32                   CODEC(ZSTD(1)),
+    scope_schema_url    String               CODEC(ZSTD(1)),
+    scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
+    scope_attrs_other   String               CODEC(ZSTD(1)),
+    end_ns              UInt64               CODEC(Delta, ZSTD(1))
 ) ENGINE = ReplacingMergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns))
+PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
 
@@ -50,7 +54,8 @@ CREATE TABLE tqd_g1.resources (
     attrs          JSON,
     attrs_other    String,
     dropped_attrs  UInt32,
-    schema_url     String
+    schema_url     String,
+    entity_refs    String
 ) ENGINE = ReplacingMergeTree
 PARTITION BY day
 ORDER BY (service, resource_id);
@@ -62,19 +67,25 @@ CREATE TABLE tqd_g1.traces (
     end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
     root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
     root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
-    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1))
+    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1)),
+    last_start_ns SimpleAggregateFunction(max, Int64)                         CODEC(Delta, ZSTD(1)),
+    buckets       SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64)) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
 ORDER BY trace_id
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
 
 CREATE MATERIALIZED VIEW tqd_g1.traces_mv TO tqd_g1.traces AS
-SELECT toDate(fromUnixTimestamp64Nano(s)) AS day, trace_id, s AS start_ns, e AS end_ns,
-       rs AS root_service, rn AS root_name, sv AS services
-FROM (SELECT trace_id, min(start_ns) AS s, max(start_ns + duration_ns) AS e,
+SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, s AS start_ns, e AS end_ns,
+       rs AS root_service, rn AS root_name, sv AS services,
+       ls AS last_start_ns, bk AS buckets
+FROM (SELECT trace_id, min(start_ns) AS s,
+             max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
              maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,
              maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,
-             groupUniqArray(toString(service)) AS sv
+             groupUniqArray(toString(service)) AS sv,
+             max(start_ns) AS ls,
+             groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
       FROM tqd_g1.spans
       GROUP BY trace_id);
 
@@ -97,17 +108,17 @@ CREATE TABLE tqd_g1.tag_values (
 ) ENGINE = ReplacingMergeTree
 ORDER BY (scope, key, value, val_type);
 
-INSERT INTO tqd_g1.spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, service, resource_id, name, kind, status_code, status_message, scope_name, scope_version, scope_attrs, attrs, events, links)
+INSERT INTO tqd_g1.spans (trace_id, span_id, parent_span_id, start_ns, end_ns, duration_ns, service, resource_id, name, kind, status_code, status_message, scope_name, scope_version, scope_attrs, attrs, events, links)
 SELECT unhex(trace_id), unhex(span_id), if(parent_span_id = '', toFixedString('', 8), unhex(parent_span_id)),
-       start_ns, end_ns - start_ns, service, reinterpretAsUInt128(sipHash128(resource)), name, kind, status_code, status_message, scope_name, scope_version,
+       start_ns, end_ns, end_ns - start_ns, service, reinterpretAsUInt128(sipHash128(resource)), name, kind, status_code, status_message, scope_name, scope_version,
        CAST(tqd_kv2json(scope_attrs) AS JSON),
        CAST(tqd_kv2json(attrs) AS JSON),
-       arrayMap(e -> (JSONExtract(e, 1, 'Int64'), JSONExtractString(e, 2), CAST(tqd_kv2json(JSONExtractRaw(e, 3)) AS JSON), 0), JSONExtractArrayRaw(events)),
-       arrayMap(l -> (unhex(JSONExtractString(l, 1)), unhex(JSONExtractString(l, 2)), '', 0, CAST(tqd_kv2json(JSONExtractRaw(l, 3)) AS JSON), 0), JSONExtractArrayRaw(links))
+       arrayMap(e -> (JSONExtract(e, 1, 'UInt64'), JSONExtractString(e, 2), CAST(tqd_kv2json(JSONExtractRaw(e, 3)) AS JSON), '', 0), JSONExtractArrayRaw(events)),
+       arrayMap(l -> (unhex(JSONExtractString(l, 1)), unhex(JSONExtractString(l, 2)), '', 0, CAST(tqd_kv2json(JSONExtractRaw(l, 3)) AS JSON), '', 0), JSONExtractArrayRaw(links))
 FROM tqd_g1.raw;
 
 INSERT INTO tqd_g1.resources (day, resource_id, service, attrs)
-SELECT DISTINCT toDate(fromUnixTimestamp64Nano(start_ns)), reinterpretAsUInt128(sipHash128(resource)), service,
+SELECT DISTINCT toDate(fromUnixTimestamp64Nano(start_ns), 'UTC'), reinterpretAsUInt128(sipHash128(resource)), service,
        CAST(tqd_kv2json_skip(resource, 'service.name') AS JSON)
 FROM tqd_g1.raw;
 

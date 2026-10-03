@@ -1,32 +1,36 @@
 table	rows	bytes	b_per_span
-resources	68	6412	0.003
-spans	2000064	69932464	34.965
+resources	68	6524	0.003
+spans	2000064	79696928	39.847
 tag_names	48	1190	0.001
 tag_values	304070	1691983	0.846
-traces	70413	2919750	1.46
+traces	70413	3536708	1.768
 total_bytes	bytes_per_span	index_overhead_pct	compression	total_rows	rows_per_span
-74551799	37.2747067093853	6.605422912025523	6.976800056262141	2374663	1.1872935066077885
+84933333	42.46530761015647	6.5703975440559015	6.405392850077192	2374663	1.1872935066077885
 name	bytes	b_per_span
-attrs	21739822	10.87
-span_id	16009060	8.004
-parent_span_id	8030815	4.015
-start_ns	7348575	3.674
-duration_ns	7189438	3.595
-resource_id	2989842	1.495
-name	1874833	0.937
-events	1338847	0.669
-trace_id	1192195	0.596
-service	859629	0.43
-kind	504965	0.252
-scope_name	379099	0.19
-links	76322	0.038
-status_message	23184	0.012
-status_code	19515	0.01
-scope_attrs	12711	0.006
-scope_version	6421	0.003
-trace_state	1247	0.001
-flags	1247	0.001
-attrs_other	1247	0.001
-dropped_attrs	1247	0.001
-dropped_events	1247	0.001
-dropped_links	1247	0.001
+attrs	21742404	10.871
+span_id	16009064	8.004
+end_ns	9409048	4.704
+parent_span_id	8029431	4.015
+start_ns	7348634	3.674
+duration_ns	7189380	3.595
+resource_id	2989207	1.495
+name	1874410	0.937
+events	1356851	0.678
+trace_id	1192006	0.596
+service	859590	0.43
+kind	823990	0.412
+scope_name	379242	0.19
+links	77417	0.039
+status_message	22915	0.011
+status_code	19249	0.01
+scope_attrs	12794	0.006
+scope_version	7188	0.004
+trace_state	1081	0.001
+flags	1081	0.001
+attrs_other	1081	0.001
+dropped_attrs	1081	0.001
+dropped_events	1081	0.001
+dropped_links	1081	0.001
+scope_schema_url	1081	0.001
+scope_dropped_attrs	1081	0.001
+scope_attrs_other	1081	0.001
