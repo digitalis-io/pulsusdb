@@ -1,9 +1,11 @@
 # M4: Traces read-path shard-locality evidence (2-shard cluster)
 
-> **SUPERSEDED IN PART by issue #587, at three places in this file: the
+> **SUPERSEDED IN PART by issue #587, at four places in this file: the
 > trace-by-ID row of the summary above, the "§4.2 trace-by-ID point read"
-> in the shard-locality criterion below, and the caveat in §Caveats that
-> records the fetch handler not injecting the §7 settings.**
+> in the shard-locality criterion below, the `trace_by_id` half of the
+> "hit one shard" bullet under Evidence — with the `pruned_reason`
+> derivation it cites, in this report's raw JSON — and the caveat in
+> §Caveats that records the fetch handler not injecting the §7 settings.**
 >
 > Two things moved and they moved in opposite directions. **The statement
 > this file measured no longer exists**: the fetch reads the TraceQL

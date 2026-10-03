@@ -2438,10 +2438,21 @@ jobs:
         run: cargo test -p pulsus-clickhouse --test live_spreading
 
       # Issue #57 AC4: per-stage per-shard shard-locality verdicts for the
-      # two-phase TraceQL search + trace-by-ID, against a client-computed
+      # two-phase TraceQL search, against a client-computed
       # cityHash64(trace_id) % total_weight roster (hard errors on any
       # fan-out violation). Recorded evidence: docs/benchmarks/
       # m4-traces-read-path.md + data/traces-read-cluster-ci.json.
+      #
+      # The trace-by-ID stage is the one exception, and it still runs: it
+      # is captured and its coordinator-row check is verdicted, but its
+      # shard roster is not. Since issue #587 the fetch reads the TraceQL
+      # design's own tables through a predicate the Distributed engine
+      # does not prune on, and whether a prune would confine it is
+      # unmeasured by owner decision of 2026-10-02 — the same thing
+      # docs/schemas.md's section 7 fan-out row says. The exemption names
+      # that one stage, and xtask's own
+      # exactly_one_stage_is_exempt_from_the_roster_verdict fails if a
+      # second one ever appears.
       - name: Traces read-path fan-out evidence (bench traces-read)
         run: |
           cargo run -p xtask -- bench traces-read \

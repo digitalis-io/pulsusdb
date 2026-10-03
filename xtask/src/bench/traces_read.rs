@@ -4,11 +4,12 @@
 //!
 //! Follows the issue #16 evidence model exactly (see
 //! `queries.rs`'s module docs): every stage the two-phase TraceQL search
-//! executes — plus the trace-by-ID point read — runs the **product
+//! executes — plus the trace-by-ID fetch — runs the **product
 //! planner's own generated SQL** (`pulsus_read::traces`), tagged with a
 //! unique `query_id` under the docs/schemas.md §7 clustered-reader
-//! settings, and is then verdicted against a **client-computed expected
-//! shard roster**: `cityHash64(trace_id) % total_weight` over the
+//! settings, and — every stage but the one named below — is then
+//! verdicted against a **client-computed expected shard roster**:
+//! `cityHash64(trace_id) % total_weight` over the
 //! cumulative-weight slot map from `system.clusters` (the exact selection
 //! the Distributed engine performs — the sharding key here is
 //! `cityHash64(trace_id)`, so the client carries its own CityHash64
@@ -26,6 +27,19 @@
 //! `expected-pruned` evidence entries carrying the
 //! `cityHash64 % total_weight` derivation so a reviewer can verify the
 //! pruning by hand.
+//!
+//! **One stage has no roster verdict, and it is named rather than
+//! described** (issue #587): `trace_by_id`. It is still captured and its
+//! coordinator-row check is still a hard error; what is not claimed is
+//! its shard set. The fetch reads the TraceQL design's own tables through
+//! a predicate the Distributed engine does not prune on, and whether a
+//! prune would confine it is **unmeasured by owner decision of
+//! 2026-10-02** — which is what `docs/schemas.md` §7's fan-out row says
+//! of the same read. [`Roster::Unmeasured`] carries the one stage name it
+//! was written for and [`capture_stage`] refuses it anywhere else, so the
+//! exemption cannot travel; and
+//! `exactly_one_stage_is_exempt_from_the_roster_verdict` counts the
+//! exemptions in use, so a second one cannot appear quietly.
 //!
 //! Scenario-local evidence structs only — the shared [`super::query_log::
 //! QueryLogTotals`] shape is untouched (the frozen-artifact rule).
@@ -108,8 +122,10 @@ fn hex32(id: &[u8; 16]) -> String {
 pub struct TraceShardEvidence {
     pub shard_num: u32,
     /// `"coordinator-local"` (`is_initial_query = 1`), `"remote"`
-    /// (`is_initial_query = 0`), or `"expected-pruned"` (derivedly
-    /// excluded by `optimize_skip_unused_shards`).
+    /// (`is_initial_query = 0`), `"expected-pruned"` (derivedly excluded
+    /// by `optimize_skip_unused_shards`), or `"unmeasured"` — a shard that
+    /// did no work on a stage whose roster is not claimed, where calling
+    /// it pruned would assert the thing that stage does not assert.
     pub role: String,
     pub read_rows: u64,
     pub read_bytes: u64,
@@ -126,7 +142,15 @@ pub struct TraceStageEvidence {
     pub sql: String,
     pub wall_ms: f64,
     pub returned_rows: u64,
+    /// The shards verdicted against, or — when `unmeasured_reason` is
+    /// present — simply the ones that participated.
     pub expected_shards: Vec<u32>,
+    /// Present only for a stage whose roster is deliberately not claimed
+    /// (issue #587): why, and whose decision it is. Its presence is what
+    /// tells a reader that `expected_shards` on this stage is a record of
+    /// what happened rather than a verdict it passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmeasured_reason: Option<String>,
     pub shards: Vec<TraceShardEvidence>,
 }
 
@@ -163,7 +187,6 @@ enum Roster {
     /// way to reach this arm except by writing a stage's name into it, and
     /// `exactly_one_stage_is_exempt_from_the_roster_verdict` counts the
     /// arms in use, so a second exemption reddens rather than passing.
-    #[allow(dead_code)]
     Unmeasured {
         /// The one stage this exemption is written for.
         stage: &'static str,
@@ -182,7 +205,7 @@ impl Roster {
     /// compared against a client-computed shard set; only
     /// [`Roster::Unmeasured`] answers `Some`, and only for the one stage
     /// written inside it.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn exempt_stage(&self) -> Option<&'static str> {
         match self {
             Roster::Full | Roster::TraceIds(_) => None,
@@ -300,7 +323,25 @@ fn evidence_stages(
             // span, per-trace and resource tables. `resources` is read
             // from the local replica and is never `_dist`-suffixed.
             sql: indexed_fetch_sql("traces_dist", "spans_dist", "resources", &hex32(&target)),
-            roster: Roster::TraceIds(vec![target]),
+            // **This stage's roster is not verdicted, and it is the only
+            // one.** `Roster::TraceIds` here asserted that
+            // `optimize_skip_unused_shards` confines the fetch to the
+            // trace's owning shard — true of the statement this harness
+            // first measured, which read `trace_spans_dist` under a plain
+            // `trace_id` equality. The fetch's indexed statement reaches
+            // `spans_dist` through `(intDiv(start_ns, …), trace_id) IN
+            // (…)`, which the Distributed engine does not prune on, and
+            // it observed `{1, 2}` where the derivation expected `{1}`.
+            roster: Roster::Unmeasured {
+                stage: "trace_by_id",
+                decision: "unmeasured, by owner decision of 2026-10-02: whether a shard \
+                           prune reduces the fetch's statements to the trace's owning shard \
+                           is not measured, and no roster is claimed for this stage. \
+                           docs/schemas.md's §7 fan-out row reads the same and carries no \
+                           count. The answer is correct either way — the shards that do not \
+                           hold the trace return nothing; what is unmeasured is the work, \
+                           not the result.",
+            },
             decoder: Decoder::IndexedFetch,
         },
         StageSpec {
@@ -477,29 +518,43 @@ async fn capture_stage(
     flush_logs_before_shard_read(client, cluster).await?;
     let by_shard = read_shard_rows(client, cluster, topology, query_id).await?;
 
-    let expected: BTreeSet<u32> = match &spec.roster {
-        // Issue #587, the cases-first commit: no stage carries this arm
-        // yet, so nothing reaches it.
-        Roster::Unmeasured { .. } => unreachable!("no stage is exempt yet"),
-        Roster::Full => topology.all_shards(),
-        Roster::TraceIds(ids) => ids
-            .iter()
-            .map(|id| topology.shard_for_key_value(city_hash_64_16(id)))
-            .collect(),
+    // `None` for the one stage whose roster is not claimed — issue #587.
+    // Every other arm yields a set and is verdicted below.
+    let expected: Option<BTreeSet<u32>> = match &spec.roster {
+        Roster::Full => Some(topology.all_shards()),
+        Roster::TraceIds(ids) => Some(
+            ids.iter()
+                .map(|id| topology.shard_for_key_value(city_hash_64_16(id)))
+                .collect(),
+        ),
+        Roster::Unmeasured { stage, .. } => {
+            // The exemption names ONE stage, and this is where that is
+            // enforced: copying the line onto a second stage fails here
+            // rather than quietly exempting it too.
+            anyhow::ensure!(
+                *stage == spec.stage,
+                "the roster exemption written for stage {stage:?} is attached to stage \
+                 {:?} — an exemption names one stage and does not travel",
+                spec.stage
+            );
+            None
+        }
     };
     let observed: BTreeSet<u32> = by_shard
         .iter()
         .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
         .map(|(shard, _)| *shard)
         .collect();
-    anyhow::ensure!(
-        observed == expected,
-        "stage {:?} (query_id={query_id}): observed participating shards {observed:?} != \
-         expected {expected:?} — missing shards are lost system.query_log rows, unexpected \
-         shards are pruning/sharding violations; SQL:\n{}",
-        spec.stage,
-        spec.sql
-    );
+    if let Some(expected) = &expected {
+        anyhow::ensure!(
+            observed == *expected,
+            "stage {:?} (query_id={query_id}): observed participating shards {observed:?} != \
+             expected {expected:?} — missing shards are lost system.query_log rows, unexpected \
+             shards are pruning/sharding violations; SQL:\n{}",
+            spec.stage,
+            spec.sql
+        );
+    }
     let coordinator_rows = by_shard
         .values()
         .filter(|row| row.is_initial_query == 1)
@@ -511,10 +566,14 @@ async fn capture_stage(
         spec.stage
     );
 
+    // With no expectation to compare against, the participating set IS
+    // what was observed: the record says what happened and claims nothing
+    // about what should have.
+    let participating = expected.as_ref().unwrap_or(&observed);
     let mut shards = Vec::new();
     for shard_num in topology.all_shards() {
         match by_shard.get(&shard_num) {
-            Some(row) if expected.contains(&shard_num) => shards.push(TraceShardEvidence {
+            Some(row) if participating.contains(&shard_num) => shards.push(TraceShardEvidence {
                 shard_num,
                 role: if row.is_initial_query == 1 {
                     "coordinator-local".to_string()
@@ -530,7 +589,9 @@ async fn capture_stage(
             }),
             _ => {
                 let reason = match &spec.roster {
-                    Roster::Unmeasured { .. } => unreachable!("no stage is exempt yet"),
+                    // NOT `expected-pruned`: naming a prune here would
+                    // assert the very thing this stage does not claim.
+                    Roster::Unmeasured { decision, .. } => (*decision).to_string(),
                     Roster::Full => anyhow::bail!(
                         "stage {:?}: shard {shard_num} missing from a Full-roster stage \
                          (unreachable after the observed == expected verdict)",
@@ -540,7 +601,10 @@ async fn capture_stage(
                 };
                 shards.push(TraceShardEvidence {
                     shard_num,
-                    role: "expected-pruned".to_string(),
+                    role: match &spec.roster {
+                        Roster::Unmeasured { .. } => "unmeasured".to_string(),
+                        _ => "expected-pruned".to_string(),
+                    },
                     read_rows: 0,
                     read_bytes: 0,
                     selected_marks: 0,
@@ -557,7 +621,11 @@ async fn capture_stage(
         sql: spec.sql,
         wall_ms,
         returned_rows,
-        expected_shards: expected.into_iter().collect(),
+        expected_shards: participating.iter().copied().collect(),
+        unmeasured_reason: match &spec.roster {
+            Roster::Unmeasured { decision, .. } => Some((*decision).to_string()),
+            _ => None,
+        },
         shards,
     })
 }

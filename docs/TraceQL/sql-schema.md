@@ -995,7 +995,7 @@ outlive the 7-day span retention").
 
 | table | sharding key | why |
 |---|---|---|
-| `spans`, `traces` | `cityHash64(trace_id)` | a trace is whole on one shard, so per-trace grouping, the structural climb and the fetch are shard-local |
+| `spans`, `traces` | `cityHash64(trace_id)` | a trace is whole on one shard, so per-trace grouping and the structural climb complete shard-locally and the fetch needs no cross-shard assembly. **Not a claim that only that shard is contacted**: whether a prune confines the fetch's statements is unmeasured by owner decision of 2026-10-02 (`docs/schemas.md` §7) |
 | `resources`, `tag_names`, `tag_values` | replicated to every shard | tiny, and read by every shard's join or dropdown |
 
 A search's first pass aggregates per shard and the coordinator merges twenty
