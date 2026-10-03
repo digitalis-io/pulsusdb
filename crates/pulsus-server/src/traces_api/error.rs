@@ -797,14 +797,29 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    /// The error a real `KeyValueList` decode produces for a carrier whose
+    /// declared field length runs past the end of the buffer — taken from
+    /// `prost` rather than constructed, so the rendered message cannot
+    /// drift from what a stored carrier actually produces.
+    fn undecodable_carrier_error() -> prost::DecodeError {
+        use opentelemetry_proto::tonic::common::v1::KeyValueList;
+        use prost::Message;
+        KeyValueList::decode([0x0au8, 0x7f, 0x01].as_slice())
+            .expect_err("a field length past the end of the buffer must not decode")
+    }
+
     #[tokio::test]
-    async fn assemble_unsupported_payload_type_maps_to_500_naming_the_count() {
-        let err = ApiError::Assemble(AssembleError::UnsupportedPayloadType { count: 3 });
+    async fn assemble_decode_maps_to_500_naming_the_column_and_the_subject() {
+        let err = ApiError::Assemble(AssembleError::Decode {
+            column: "attrs_other",
+            subject: "span 1111111111111111".to_string(),
+            source: undecodable_carrier_error(),
+        });
         let (status, body) = rendered(err).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
-            body.contains("3"),
-            "message must name the count, got {body}"
+            body.contains("attrs_other") && body.contains("1111111111111111"),
+            "message must name the column and the subject, got {body}"
         );
     }
 
@@ -1057,9 +1072,13 @@ mod tests {
             ),
             (
                 "Assemble",
-                ApiError::Assemble(AssembleError::UnsupportedPayloadType { count: 3 }),
+                ApiError::Assemble(AssembleError::Decode {
+                    column: "attrs_other",
+                    subject: "span 1111111111111111".to_string(),
+                    source: undecodable_carrier_error(),
+                }),
                 StatusCode::INTERNAL_SERVER_ERROR,
-                r#"unsupported payload_type on 3 span(s)"#,
+                r#"the stored attrs_other for span 1111111111111111 failed to decode: failed to decode Protobuf message: KeyValueList.values: buffer underflow"#,
                 None,
             ),
             (

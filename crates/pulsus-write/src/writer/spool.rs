@@ -1049,7 +1049,7 @@ mod tests {
             LandingTagValue, TagScope,
         };
         use crate::writer::rows::TraceLandingRow;
-        use crate::writer::trace_json::{
+        use pulsus_clickhouse::json_column::{
             TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue,
         };
 

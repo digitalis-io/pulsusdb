@@ -1,6 +1,6 @@
 //! `/api/traces/v1` parameter parsing: the trace-fetch hex id
 //! (docs/api.md §4.1: "16 or 32 chars, left-padded" — the injection
-//! boundary for `point_read_sql`'s `unhex('...')` literal: only
+//! boundary for the fetch statements' `unhex('...')` literals: only
 //! `[0-9a-f]{32}` output ever leaves [`parse_trace_id`]) and the issue
 //! #57 search params (docs/api.md §4.2: `q`/legacy params, `start`/`end`
 //! unix seconds, `limit`, `spss`). The `(key, value)` pair core mirrors
@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+use pulsus_read::FetchWindow;
 use pulsus_read::traces::tags_sql::ATTR_SCOPES;
 
 use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
@@ -40,6 +41,30 @@ pub(crate) fn parse_trace_id(raw: &str) -> Result<String, TraceIdError> {
     } else {
         Ok(lowered)
     }
+}
+
+/// The fetch routes' optional request window (issue #587).
+///
+/// **Both bounds or neither.** The window is read only by the fallback,
+/// which answers a trace the per-trace table has not indexed; a half-open
+/// request has no window to answer over, so one bound alone is the same as
+/// none. Either bound present but unparseable is a `400`, the same
+/// grammar and the same refusal as the search surface's — accepting a
+/// malformed timestamp silently would answer over a window the caller did
+/// not ask for.
+///
+/// **An empty or inverted window yields `None`.** The indexed statement
+/// never reads the window, so the only thing a window can do is ADD an
+/// answer; a window that cannot contain a span adds nothing, and refusing
+/// it would turn a harmless request into an error on a route that
+/// previously ignored these parameters altogether.
+///
+/// STUB (issue #587): the window the fallback reads is the change.
+pub(crate) fn parse_fetch_window(
+    query: Option<&str>,
+) -> Result<Option<FetchWindow>, SearchParamError> {
+    let _ = query;
+    Ok(None)
 }
 
 /// Default `limit` when the param is absent (docs/api.md §4.2).

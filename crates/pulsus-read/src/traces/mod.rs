@@ -20,7 +20,9 @@
 //! #478 `q`-to-terms lowering), [`window_sql`] (the issue #525 shared
 //! time-window bound conventions — the one place a window's row bound
 //! and its day-partition bound are rendered from, so the two cannot
-//! disagree), [`sql`]/[`rows`]
+//! disagree), [`spans`] (the issue #587 trace fetch on the span,
+//! per-trace and resource tables — three pure SQL builders and their
+//! row shapes), [`sql`]/[`rows`]
 //! (point-read builder + `ChClient` result-row shapes), `dispatch` (the
 //! private issue #509 choke point that owns the `ChClient` and is the
 //! only place a `?` in query text is doubled), and [`exec`]
@@ -52,6 +54,7 @@ pub mod search_sql;
 // call from here is an `E0603`. The exemption list is PromQL only, and
 // that one is permanent by design.
 
+pub mod spans;
 pub mod sql;
 pub mod tag_narrow;
 pub mod tags_sql;
@@ -79,3 +82,8 @@ pub use search_eval::{
     non_finite_double_spelling, wire_arm,
 };
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, WireKey, plan_search};
+pub use spans::rows::{
+    FallbackFetchRow, FetchRoute, FetchWindow, FetchedEventTuple, FetchedLinkTuple,
+    FetchedResource, FetchedResourceTuple, FetchedSpan, FetchedSpanTuple, FetchedTrace,
+    IndexedFetchRow, WideFetchRow,
+};

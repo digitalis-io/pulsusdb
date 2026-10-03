@@ -1875,6 +1875,35 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             "INSERT INTO {run_db}.trace_tag_catalog (scope, key, val) \
              SELECT 'span', 'http.status_code', concat('v', toString(number)) FROM numbers(64)"
         ),
+        // Issue #587: the fetch moved to the span, per-trace and resource
+        // tables, so this fixture has to seed those too — otherwise the
+        // fetch below returns nothing and the assertion goes red for the
+        // wrong reason. All three of the per-trace fields the statements
+        // read are supplied: the bucket set (which is what makes the key
+        // read find the spans) and the two extent bounds (which are what
+        // makes the resource-day bound include the resource's day).
+        format!(
+            "INSERT INTO {run_db}.spans \
+             (trace_id, span_id, parent_span_id, start_ns, end_ns, service, resource_id, \
+              name, kind, status_code) \
+             SELECT unhex('{trace_hex}'), \
+                    reinterpretAsFixedString(toUInt64(number + 1)), \
+                    toFixedString('', 8), {ts_ns} + number, \
+                    toUInt64({ts_ns} + number + 1000000), 'checkout', 1, 'op', 2, 0 \
+             FROM numbers(64)"
+        ),
+        format!(
+            "INSERT INTO {run_db}.traces \
+             (day, trace_id, start_ns, last_start_ns, buckets) VALUES \
+             (toDate(fromUnixTimestamp64Nano({ts_ns}), 'UTC'), unhex('{trace_hex}'), \
+              {ts_ns}, {ts_ns} + 63, [intDiv({ts_ns}, 300000000000), \
+              intDiv({ts_ns} + 63, 300000000000)])"
+        ),
+        format!(
+            "INSERT INTO {run_db}.resources \
+             (day, resource_id, service, attrs, schema_url) VALUES \
+             (toDate(fromUnixTimestamp64Nano({ts_ns}), 'UTC'), 1, 'checkout', '{{}}', '')"
+        ),
     ] {
         seed.execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
             .await
@@ -1894,6 +1923,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         edges_table: "trace_edges".to_string(),
         recent_table: "trace_recent".to_string(),
         errors_table: "trace_error_spans".to_string(),
+        spans_v2_table: "spans".to_string(),
+        traces_table: "traces".to_string(),
+        resources_table: "resources".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,
@@ -1937,9 +1969,15 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         "the search fixture must return rows, or the phase-2 reads never dispatch"
     );
 
-    // 2. Trace-by-id — the §4.2 point read, the third settings root.
-    let spans = engine.fetch_by_id(trace_hex).await.expect("point read");
-    assert!(!spans.is_empty(), "the point-read fixture must return rows");
+    // 2. Trace-by-id — the fetch's own settings root (issue #587).
+    let fetched = engine
+        .fetch_by_id(trace_hex, None)
+        .await
+        .expect("the fetch executes");
+    assert!(
+        !fetched.spans.is_empty(),
+        "the fetch fixture must return rows, or the fetch's reads never dispatch"
+    );
 
     // 3 + 4. Catalog discovery — `catalog_settings`, the root that
     //        produced the measured 500.

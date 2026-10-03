@@ -96,17 +96,28 @@ pub(super) fn encode_json(trace: &AssembledTrace) -> Result<Vec<u8>, serde_json:
 mod tests {
     use super::*;
 
-    use super::super::assemble::fixture474;
-    use pulsus_read::StoredSpan;
+    use super::super::assemble::{fixture, fixture474};
 
+    /// The issue #474 T1 probe as the fetch now reads it: one span row
+    /// whose columns carry exactly what the probe sent, and one resource
+    /// row with no attributes at all.
+    ///
+    /// **Every field the probe left absent is absent here too** — no
+    /// service name, no scope name or version, no status, no attributes —
+    /// which is what makes the rendered resource, scope and status the
+    /// present-but-empty messages `T1_MATERIALIZED_HEX` carries.
     fn t1_trace() -> AssembledTrace {
-        AssembledTrace::from_stored(vec![StoredSpan {
-            span_id: [0xbb, 0, 0, 0, 0, 0, 0, 0x01],
-            payload_type: 1,
-            kind: 0,
-            payload: fixture474::from_hex(fixture474::T1_STORED_HEX),
-        }])
-        .expect("assemble the T1 probe")
+        let mut span = fixture::span_row(fixture474::T1_SPAN_ID, fixture474::T1_START_NS);
+        span.end_ns = fixture474::T1_END_NS;
+        span.name = fixture474::T1_NAME.to_string();
+        span.kind = fixture474::T1_KIND;
+        span.service = String::new();
+        span.scope_name = String::new();
+        AssembledTrace::from_fetched(
+            &fixture474::T1_TRACE_ID,
+            fixture::fetched(vec![span], vec![fixture::resource_row(1)]),
+        )
+        .expect("rebuild the T1 probe")
     }
 
     /// Issue #474 AC-8a: the absent-trace envelope is the reference's four

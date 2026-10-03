@@ -1,5 +1,12 @@
-//! The `JSON` column's own RowBinary form, written by this crate rather
-//! than by the driver (issue #585).
+//! The `JSON` column's own RowBinary form, written and read by this crate
+//! rather than by the driver (issues #585 and #587).
+//!
+//! **One home for both directions.** The encoder is the write path's
+//! (issue #585); the decoder is the trace fetch's (issue #587). They share
+//! the tag constants, the eleven captured frames below and the path escape
+//! with its inverse, so the module lives in the crate both `pulsus-write`
+//! and `pulsus-read` already depend on. The format's own record is
+//! `vendor/clickhouse/PATCHES.md` section 3.
 //!
 //! **Why the binary form and not text.** Text JSON refuses a non-finite
 //! double on this engine — four attempts, each
@@ -460,6 +467,14 @@ impl fmt::Display for TraceJson {
     }
 }
 
+/// What a `JSON` column decodes to on the read side.
+///
+/// The same type and the same wire form as the encoder's, under the name
+/// the fetch's row types read it by: one column, the paths it holds, each
+/// with its value. **One owning type for both directions** — a second type
+/// over one wire form is two places for the format to drift.
+pub type JsonColumn = TraceJson;
+
 /// An OTLP attribute key as the stored JSON path: `%` becomes `%25`, then
 /// `.` becomes `%2E`.
 ///
@@ -486,6 +501,23 @@ pub fn escape_json_path(key: &str) -> String {
         }
     }
     out
+}
+
+/// The inverse of [`escape_json_path`]: `%2E` becomes `.`, then `%25`
+/// becomes `%`.
+///
+/// **The order matters, and it is the mirror of the escape's.** Undoing the
+/// dot first means a stored path of `a%252Eb` becomes `a%2Eb` — the key the
+/// sender actually spelled — where undoing the percent first would make it
+/// `a.b`, which is a different key.
+///
+/// **Split the stored path on `.` BEFORE calling this, never after.** A
+/// stored `http%2Eroute` is one segment spelling the dotted key
+/// `http.route`; unescaping it first produces `http.route` and a splitter
+/// then reports a two-level kvlist the sender never sent.
+pub fn unescape_json_path(segment: &str) -> String {
+    // STUB (issue #587): the real inverse is two ordered replacements.
+    segment.to_string()
 }
 
 /// The bytes LEB128 takes for `n`.
@@ -682,6 +714,334 @@ mod tests {
                 "{label}: no `NaN` or `Inf` text may reach the wire: {got}"
             );
         }
+    }
+
+    /// The bytes of a lowercase hex frame — the inverse of [`hex`], for a
+    /// case whose input is one of the captured frames.
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "odd-length hex frame");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex frame"))
+            .collect()
+    }
+
+    /// One `JSON` column's value, decoded from the column's own bytes
+    /// through the same RowBinary deserializer the fetch uses, with no
+    /// column metadata — the exact mirror of [`encode`]
+    /// (`vendor/clickhouse/PATCHES.md` section 3's test-support exports).
+    ///
+    /// Returns the driver's error rather than panicking, because
+    /// [`a_dynamic_tag_outside_the_writers_range_is_an_error_naming_it`]
+    /// is about the error.
+    fn decode(bytes: &[u8]) -> Result<TraceJson, clickhouse::error::Error> {
+        let mut cursor = bytes;
+        clickhouse::_priv::deserialize_row_unvalidated::<OneJsonColumn>(&mut cursor)
+            .map(|row| row.attrs)
+    }
+
+    /// One representative value per [`TraceJsonValue`] arm.
+    ///
+    /// The `match` below is **exhaustive over the enum and that is the
+    /// point**: a new arm does not compile until it is handled here, and
+    /// the count assertion then fails until it is given a representative.
+    fn every_value_arm() -> Vec<TraceJsonValue> {
+        let arms = vec![
+            TraceJsonValue::Scalar(TraceJsonScalar::Int(1)),
+            TraceJsonValue::StrArray(vec!["a".to_string(), "b".to_string()]),
+            TraceJsonValue::IntArray(vec![1, -2]),
+            TraceJsonValue::DoubleArray(vec![1.5, 2.5]),
+            TraceJsonValue::BoolArray(vec![true, false]),
+            TraceJsonValue::MixedArray(vec![
+                TraceJsonScalar::Str("a".to_string()),
+                TraceJsonScalar::Int(1),
+            ]),
+            TraceJsonValue::EmptyArray,
+        ];
+        for arm in &arms {
+            match arm {
+                TraceJsonValue::Scalar(_)
+                | TraceJsonValue::StrArray(_)
+                | TraceJsonValue::IntArray(_)
+                | TraceJsonValue::DoubleArray(_)
+                | TraceJsonValue::BoolArray(_)
+                | TraceJsonValue::MixedArray(_)
+                | TraceJsonValue::EmptyArray => {}
+            }
+        }
+        assert_eq!(arms.len(), 7, "one representative per TraceJsonValue arm");
+        arms
+    }
+
+    /// One representative per [`TraceJsonScalar`] arm, on the same rule as
+    /// [`every_value_arm`].
+    fn every_scalar_arm() -> Vec<TraceJsonScalar> {
+        let arms = vec![
+            TraceJsonScalar::Str("s".to_string()),
+            TraceJsonScalar::Bool(true),
+            TraceJsonScalar::Int(-7),
+            TraceJsonScalar::Double(1.5),
+        ];
+        for arm in &arms {
+            match arm {
+                TraceJsonScalar::Str(_)
+                | TraceJsonScalar::Bool(_)
+                | TraceJsonScalar::Int(_)
+                | TraceJsonScalar::Double(_) => {}
+            }
+        }
+        assert_eq!(arms.len(), 4, "one representative per TraceJsonScalar arm");
+        arms
+    }
+
+    /// `F-1`: **the eleven captured frames decode to the values they were
+    /// captured from.** The same eleven rows
+    /// `every_value_kind_encodes_the_bytes_the_server_emits` compares in the
+    /// other direction, read off this module's own header, with the same
+    /// `cases.len() == 11` guard before anything is compared — so a row
+    /// deleted from the table cannot shrink the case into a green run.
+    ///
+    /// **The empty-array arm is where the two directions are not a
+    /// bijection, and the decode rule is stated rather than implied.** The
+    /// encoder stores both `EmptyArray` and an empty `StrArray` as
+    /// `1e 23 15 00` — `Array(Nullable(String))` with no element — because
+    /// an empty array carries no element type on the wire. The decoder
+    /// therefore reads a zero-length nullable array back as `EmptyArray`,
+    /// which is the arm the eleventh frame was captured from.
+    #[test]
+    fn every_captured_frame_decodes_to_the_value_it_was_captured_from() {
+        let cases: Vec<(&str, &str, TraceJson)> = vec![
+            (
+                r#"{"a":1}"#,
+                "0101610a0100000000000000",
+                one("a", TraceJsonValue::Scalar(TraceJsonScalar::Int(1))),
+            ),
+            (
+                r#"{"k":"s"}"#,
+                "01016b150173",
+                one(
+                    "k",
+                    TraceJsonValue::Scalar(TraceJsonScalar::Str("s".to_string())),
+                ),
+            ),
+            (
+                r#"{"k":true}"#,
+                "01016b2d01",
+                one("k", TraceJsonValue::Scalar(TraceJsonScalar::Bool(true))),
+            ),
+            (
+                r#"{"k":1.5}"#,
+                "01016b0e000000000000f83f",
+                one("k", TraceJsonValue::Scalar(TraceJsonScalar::Double(1.5))),
+            ),
+            (
+                r#"{"k":["a","b"]}"#,
+                "01016b1e231502000161000162",
+                one(
+                    "k",
+                    TraceJsonValue::StrArray(vec!["a".to_string(), "b".to_string()]),
+                ),
+            ),
+            (
+                r#"{"k":[1,2]}"#,
+                "01016b1e230a02000100000000000000000200000000000000",
+                one("k", TraceJsonValue::IntArray(vec![1, 2])),
+            ),
+            (
+                r#"{"k":[1.5,2.5]}"#,
+                "01016b1e230e0200000000000000f83f000000000000000440",
+                one("k", TraceJsonValue::DoubleArray(vec![1.5, 2.5])),
+            ),
+            (
+                r#"{"k":[true]}"#,
+                "01016b1e232d010001",
+                one("k", TraceJsonValue::BoolArray(vec![true])),
+            ),
+            (
+                r#"{"k":["a",1]}"#,
+                "01016b1e2b20021501610a0100000000000000",
+                one(
+                    "k",
+                    TraceJsonValue::MixedArray(vec![
+                        TraceJsonScalar::Str("a".to_string()),
+                        TraceJsonScalar::Int(1),
+                    ]),
+                ),
+            ),
+            (
+                r#"{"k":[]}"#,
+                "01016b1e231500",
+                one("k", TraceJsonValue::EmptyArray),
+            ),
+            (r#"{"k":{}}"#, "00", TraceJson::empty()),
+        ];
+
+        assert_eq!(cases.len(), 11, "one sub-case per captured frame");
+        let mut wrong: Vec<String> = Vec::new();
+        for (label, frame, want) in &cases {
+            match decode(&unhex(frame)) {
+                Ok(got) if &got == want => {}
+                Ok(got) => wrong.push(format!("{label}: wanted {want:?}, got {got:?}")),
+                Err(e) => wrong.push(format!("{label}: decode failed: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// `F-1`, second half: **every arm of both value enums survives a round
+    /// trip through the column's own bytes.** The arms are enumerated by
+    /// [`every_value_arm`] and [`every_scalar_arm`], whose `match`es are
+    /// exhaustive, so a new arm does not compile until it is listed.
+    #[test]
+    fn every_value_and_scalar_arm_round_trips_through_the_column() {
+        for arm in every_value_arm() {
+            let value = one("k", arm.clone());
+            let got =
+                decode(&encode(&value)).unwrap_or_else(|e| panic!("decode {arm:?} back: {e}"));
+            assert_eq!(got, value, "{arm:?} must survive encode then decode");
+        }
+        for scalar in every_scalar_arm() {
+            let value = one("k", TraceJsonValue::Scalar(scalar.clone()));
+            let got =
+                decode(&encode(&value)).unwrap_or_else(|e| panic!("decode {scalar:?} back: {e}"));
+            assert_eq!(got, value, "{scalar:?} must survive encode then decode");
+        }
+    }
+
+    /// The three non-finite doubles round-trip as the **same** non-finite
+    /// value, which is the whole reason the binary form exists: text JSON
+    /// refuses all three on this engine.
+    ///
+    /// `NaN != NaN`, so that arm is compared on the bit pattern.
+    #[test]
+    fn a_non_finite_double_round_trips_as_itself() {
+        for (label, value) in [
+            ("+Inf", f64::INFINITY),
+            ("-Inf", f64::NEG_INFINITY),
+            ("NaN", f64::NAN),
+        ] {
+            let stored = one("k", TraceJsonValue::Scalar(TraceJsonScalar::Double(value)));
+            let got = decode(&encode(&stored)).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let TraceJsonValue::Scalar(TraceJsonScalar::Double(back)) = got.entries()[0].value
+            else {
+                panic!(
+                    "{label}: wanted a Double scalar, got {:?}",
+                    got.entries()[0]
+                );
+            };
+            assert_eq!(
+                back.to_bits(),
+                value.to_bits(),
+                "{label}: the bit pattern must survive"
+            );
+        }
+    }
+
+    /// `F-2`: **`unescape_json_path` is `escape_json_path`'s inverse**, over
+    /// the seven keys that exercise each rule, plus the asymmetry case that
+    /// is the whole reason the two replacements are ordered.
+    #[test]
+    fn the_path_unescape_inverts_the_escape_and_the_order_is_what_makes_it_so() {
+        for key in ["http.route", "a.b", "a%2Eb", "a%25b", "%", ".", ""] {
+            assert_eq!(
+                unescape_json_path(&escape_json_path(key)),
+                key,
+                "unescape(escape({key:?})) must be {key:?}"
+            );
+        }
+        // The asymmetry, spelled out: the key literally spelled `a%2Eb`
+        // stores `a%252Eb`, and undoing the dot BEFORE the percent is what
+        // gives the key back. Undoing the percent first gives `a.b` — a
+        // different key, and one the escape maps to a different path.
+        assert_eq!(escape_json_path("a%2Eb"), "a%252Eb");
+        assert_eq!(unescape_json_path("a%252Eb"), "a%2Eb");
+        let percent_first = "a%252Eb".replace("%25", "%").replace("%2E", ".");
+        assert_eq!(
+            percent_first, "a.b",
+            "the swapped order is what this ordering exists to avoid"
+        );
+        assert_ne!(
+            unescape_json_path("a%252Eb"),
+            percent_first,
+            "the two orders must not agree, or the order would not matter"
+        );
+    }
+
+    /// `F-12`: **a `Dynamic` type tag outside the writer's range is an
+    /// error naming the tag byte and the path**, not a default and not a
+    /// null.
+    ///
+    /// The frame is the one-path `{"k": <tag 0x11>}` shape — `01 016b 11`
+    /// — where `0x11` is not one of the six tags `land_value` and
+    /// `land_array` can produce. `docs/api.md` §4.1's `500` row is where
+    /// this surfaces to a caller.
+    #[test]
+    fn a_dynamic_tag_outside_the_writers_range_is_an_error_naming_it() {
+        let frame = unhex("01016b11");
+        let err = decode(&frame).expect_err("an unknown Dynamic tag must not decode");
+        let message = err.to_string();
+        assert!(
+            message.contains("0x11"),
+            "the message must name the tag byte, got {message:?}"
+        );
+        assert!(
+            message.contains('k'),
+            "the message must name the path, got {message:?}"
+        );
+    }
+
+    /// `F-13`: a repeated path keeps the **first** value — the write side's
+    /// own rule — **and the survivor round-trips through the column.**
+    /// `a_repeated_path_keeps_the_first_value` is the first half on its
+    /// own; this is the half that says the decoder sees what was stored.
+    #[test]
+    fn a_repeated_path_keeps_the_first_value_and_the_survivor_round_trips() {
+        let value = TraceJson::from_entries(vec![
+            entry(
+                "k",
+                TraceJsonValue::Scalar(TraceJsonScalar::Str("first".to_string())),
+            ),
+            entry(
+                "k",
+                TraceJsonValue::Scalar(TraceJsonScalar::Str("second".to_string())),
+            ),
+        ]);
+        assert_eq!(value.len(), 1);
+        let got = decode(&encode(&value)).expect("decode the survivor");
+        assert_eq!(got.len(), 1, "one path in, one path out");
+        assert_eq!(got, value);
+        assert_eq!(
+            got.entries()[0].value,
+            TraceJsonValue::Scalar(TraceJsonScalar::Str("first".to_string()))
+        );
+    }
+
+    /// The multi-path nested frame decodes to the three leaf paths it was
+    /// built from, in the stored order — and **the decoder does not sort**:
+    /// reconstructing the OTLP key order is the response assembler's, and
+    /// this module returns what the column holds.
+    #[test]
+    fn a_nested_frame_decodes_to_its_leaf_paths_in_stored_order() {
+        let value = TraceJson::from_entries(vec![
+            entry(
+                &escape_json_path("a.b"),
+                TraceJsonValue::Scalar(TraceJsonScalar::Int(1)),
+            ),
+            entry(
+                "c",
+                TraceJsonValue::Scalar(TraceJsonScalar::Str("s".to_string())),
+            ),
+            entry("d.e", TraceJsonValue::Scalar(TraceJsonScalar::Bool(true))),
+        ]);
+        let got = decode(&encode(&value)).expect("decode the nested frame");
+        assert_eq!(
+            got.entries()
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a%2Eb", "c", "d.e"]
+        );
+        assert_eq!(got, value);
     }
 
     /// Escaping `%` before `.` is what keeps a key literally spelled

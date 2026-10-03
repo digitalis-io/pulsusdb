@@ -94,6 +94,8 @@ use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsP
 use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
+use super::spans::rows::{FetchRoute, FetchWindow, FetchedTrace};
+
 use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow,
     HydrationProbeRow, HydrationProbeValueRow, HydrationRow, MetricAggGroupInstantRow,
@@ -101,8 +103,7 @@ use super::rows::{
     MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
     MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
-    NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
-    TagValueRow, TraceCtxRow,
+    NumValueRow, RootRow, SpanNameRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
@@ -380,6 +381,23 @@ pub struct TraceReadConfig {
     /// `trace_error_spans{_dist}` — the `{ status = error }` generator's
     /// source (issue #560). Same rule.
     pub errors_table: String,
+    /// `spans{_dist}` — the trace fetch's span table (issue #587).
+    ///
+    /// **A third name beside [`Self::spans_table`], not a repurposing of
+    /// it.** `spans_table` still means `trace_spans` to the search,
+    /// metrics, tag and graph reads, which this part does not move. Same
+    /// `_dist` rule: the table co-shards on `cityHash64(trace_id)`.
+    pub spans_v2_table: String,
+    /// `traces{_dist}` — the per-trace table the indexed fetch reads its
+    /// bucket set and its extent from (issue #587). Same `_dist` rule.
+    pub traces_table: String,
+    /// `resources` — the fetch's resource table (issue #587).
+    ///
+    /// **Never `_dist`-suffixed**: the table is `Replication::Global`, one
+    /// cluster-wide replica set read from the local replica, the same
+    /// carve-out the tag catalog has. A `_dist` wrapper here would fan a
+    /// read out to every shard for rows every shard already holds.
+    pub resources_table: String,
     /// `reader.traceql_max_candidates` — per-generator top-K depth and
     /// the merged consumption ceiling.
     pub max_candidates: u64,
@@ -858,6 +876,18 @@ impl TraceEngine {
             dispatch: super::dispatch::TraceDispatch::new(client),
             config,
         }
+    }
+
+    /// Stamps every statement this engine issues with
+    /// `<prefix>-<n>`, `n` counting from 1 in issue order (issue #587).
+    ///
+    /// The server mints one prefix per fetch request and returns it in a
+    /// response header, so a caller reads the prefix rather than
+    /// recomputing it; a test then reads the statements the request
+    /// issued out of the engine's own `query_log` rows.
+    pub fn with_statement_prefix(mut self, prefix: &str) -> Self {
+        self.dispatch = self.dispatch.with_statement_prefix(prefix);
+        self
     }
 
     /// The planning context this engine's configuration implies —
@@ -1819,50 +1849,45 @@ impl TraceEngine {
         Ok(ServiceGraph { edges, truncated })
     }
 
-    /// Streams the §4.2 point read for one trace. `hex32` must already be
-    /// validated as exactly 32 lowercase hex chars (the server's
-    /// `parse_trace_id` is the one validation point) — injection-safe
-    /// because only `[0-9a-f]` can then reach the `unhex('...')` literal.
-    /// An empty `Vec` means the trace is absent (the handler maps that to
-    /// `404`); duplicate `span_id`s from at-least-once ingest are returned
-    /// as stored — dedup is the assembler's read-time concern.
+    /// Fetches one trace from the span, per-trace and resource tables
+    /// (issue #587).
     ///
-    /// **Issue #509: no longer exempt from the query-text guard — it
-    /// PASSES it.** `point_read_sql` is a fixed template plus 32
-    /// caller-validated hex chars, SQL well under 1 KiB by construction
-    /// with no unbounded-width component (pinned by
-    /// `point_read_sql_stays_under_4kib_by_construction` in this
-    /// module's tests), so the guard `traces::dispatch` now applies to
-    /// every read on this path can never fire here. Issue #35's
-    /// exemption was a statement about where the check ran, not about
-    /// this query being unable to survive it.
-    pub async fn fetch_by_id(&self, hex32: &str) -> Result<Vec<StoredSpan>, ReadError> {
-        let sql = super::sql::point_read_sql(&self.config.spans_table, hex32);
-        let mut spans = Vec::new();
-        // Scoped stream: the pooled-connection lease is dropped when this
-        // binding leaves scope at the end of the function, after full
-        // consumption.
-        //
-        // Issue #398: this read sent a bare `QuerySettings::new()` — no
-        // budget of any kind — and mapped both `ChError` seams with
-        // `ReadError::Clickhouse` DIRECTLY, bypassing
-        // [`map_trace_read_error`] entirely. It now carries
-        // [`catalog_settings`] (the point read is a primary-key-prefix
-        // lookup on the Traces family, the same read-budget class as the
-        // catalog scans) and routes both seams through the shared mapper,
-        // so a memory breach here is a `422`, not a `500`.
-        let settings = catalog_settings(&self.config);
-        let mut stream = self
-            .dispatch
-            .query_stream::<StoredSpanRow, _>(&sql, &settings, |e| {
-                map_trace_read_error(e, &self.config)
-            })
-            .await?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
-            spans.push(StoredSpan::from(row));
-        }
-        Ok(spans)
+    /// `hex32` must already be validated as exactly 32 lowercase hex chars
+    /// (the server's `parse_trace_id` is the one validation point) —
+    /// injection-safe because only `[0-9a-f]` can then reach the
+    /// `unhex('...')` literal. An empty `spans` means no statement found
+    /// the trace; duplicate `(span_id, kind)` pairs that survive
+    /// `final = 1` are returned as stored, because dedup across replicas
+    /// is the assembler's read-time concern.
+    ///
+    /// `window` is the request's own `start`/`end` when it supplied them.
+    /// **The indexed statement never reads it** — its bounds come from the
+    /// per-trace row — so the window only ever ADDS an answer, which is
+    /// what keeps the documented property that ignoring `start`/`end`
+    /// returns a superset and never a wrong answer. With no window a trace
+    /// the per-trace table has not indexed answers empty rather than
+    /// taking a `trace_id`-only predicate over every partition in
+    /// retention.
+    ///
+    /// **Issue #509: this read is not exempt from the query-text guard —
+    /// it PASSES it.** All three statements are fixed templates plus 32
+    /// caller-validated hex chars and at most three nanosecond literals,
+    /// so the text is bounded by construction (pinned by
+    /// `both_fetch_statements_stay_under_the_query_text_cap` in this
+    /// module's tests) and the guard `traces::dispatch` applies to every
+    /// read on this path can never fire here.
+    pub async fn fetch_by_id(
+        &self,
+        hex32: &str,
+        window: Option<FetchWindow>,
+    ) -> Result<FetchedTrace, ReadError> {
+        // STUB (issue #587): the fetch's own three statements are the
+        // change.
+        let _ = (
+            fetch_settings(&self.config),
+            fetch_route_and_second(&self.config, hex32, 0, 0, false, window),
+        );
+        Ok(FetchedTrace::empty_at_one_statement())
     }
 
     /// Streams the §4.3 tag-names read (issue #58): distinct
@@ -3059,6 +3084,86 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("max_bytes_before_external_group_by", 0u64)
 }
 
+/// The trace fetch's Layer-1 settings (issue #587): a **third root**
+/// beside [`search_settings`] and [`catalog_settings`], not a change to
+/// either.
+///
+/// [`catalog_settings`]'s budget set, **plus `final = 1`**, **plus**
+/// `QuerySettings::clustered_reader` as the base when clustered.
+/// `catalog_settings` deliberately carries no clustered-reader block
+/// because the catalogs are `Replication::Global`; the fetch reads two
+/// `PerShard` tables, so it needs one.
+///
+/// **`final = 1` is a setting, not SQL text**, and it is what makes a
+/// retried span single on a read taken before the next merge. It applies
+/// to the span table (collapsing a repeat of the
+/// `(bucket, trace_id, start_ns, span_id, kind)` key), to the resource
+/// table (collapsing a repeat of `(service, resource_id)` inside a day)
+/// and to the per-trace table. On the per-trace table it changes nothing
+/// the statements act on: `index_rows` is read only as `!= 0`, and
+/// `min`/`max` are idempotent under aggregation, so they return the same
+/// value whether the trace's day rows have been collapsed or not.
+///
+/// **`distributed_product_mode` is deliberately not set, and there is
+/// nothing left for it to act on.** It exists to rewrite an
+/// `IN (SELECT … FROM <t>_dist)` to the local shard, and neither statement
+/// here contains a subquery over a `Distributed` table: the tuple `IN`s
+/// read `arrayJoin(bk)` and `arrayJoin(sp.2)`, and neither reads a table
+/// at all. A setting with no subject is not set.
+///
+/// **`load_balancing` is deliberately not set either.** A replica
+/// preference puts two reads on one *host*, which is not one *position*,
+/// so it closes none of the visibility states it was once proposed for.
+fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
+    // STUB (issue #587): the entry set is the change.
+    let _ = config;
+    QuerySettings::new()
+}
+
+/// What §2.4's branch decides: which route answers, and the second
+/// statement's text when there is one.
+///
+/// **Pure, and that is deliberate** — the branch is three conditions over
+/// statement 1's answer and the request's window, so it is testable
+/// without a database and [`TraceEngine::fetch_by_id`] is its one caller.
+/// `statements` is `1` when the second element is `None` and `2` when it
+/// is `Some`, which is the whole of the count the measurement record
+/// publishes.
+///
+/// The order of the conditions is load-bearing. **The truncation branch is
+/// tested first** because the suppression conjunct makes statement 1's
+/// array empty on that route, and an empty array would otherwise fall
+/// through to the window fallback and answer from a window the caller may
+/// not have supplied. It needs no `index_rows` guard: with no per-trace
+/// row the bucket set defaults to the empty array and its length is `0`,
+/// so the test is false for an absent trace by construction.
+///
+/// **Both halves of the second condition are load-bearing.**
+/// `index_rows != 0` is needed because the state where the per-trace table
+/// holds a row and the span table holds nothing is reachable — a partial
+/// view fan-out, or a stale extent — and with a window the fallback
+/// answers it. A non-empty span array is needed because statement 1
+/// answers one row whatever `index_rows` turns out to be.
+fn fetch_route_and_second(
+    config: &TraceReadConfig,
+    hex32: &str,
+    index_rows: u64,
+    bucket_count: u32,
+    spans_non_empty: bool,
+    window: Option<FetchWindow>,
+) -> (FetchRoute, Option<String>) {
+    // STUB (issue #587): the branch is the change.
+    let _ = (
+        config,
+        hex32,
+        index_rows,
+        bucket_count,
+        spans_non_empty,
+        window,
+    );
+    (FetchRoute::Indexed, None)
+}
+
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
 /// delta 3): the full search budget set ([`search_settings`]) plus the
 /// IN-set limits (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191
@@ -4221,6 +4326,8 @@ mod wire_literal {
 mod tests {
     use super::*;
 
+    use crate::traces::spans::fetch::BUCKET_SET_CAP;
+
     /// Issue #398: a distinctive, non-default
     /// `reader.traceql_read_max_memory_bytes` for these tests —
     /// deliberately unequal to `generator_max_memory_bytes` above, so the
@@ -4326,6 +4433,9 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
+            spans_v2_table: "spans".to_string(),
+            traces_table: "traces".to_string(),
+            resources_table: "resources".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,
@@ -4348,6 +4458,9 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
+            spans_v2_table: "spans".to_string(),
+            traces_table: "traces".to_string(),
+            resources_table: "resources".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
             event_set_max_values: 1_000_000,
@@ -4357,6 +4470,164 @@ mod tests {
             distributed: false,
             skip_unavailable_shards: false,
         }
+    }
+
+    /// `F-17`: **`fetch_settings`' entry set, exactly**, through
+    /// `QuerySettings::entries` in insertion order.
+    ///
+    /// An exact list is what makes an accidental addition fail. Two
+    /// absences are asserted as well as the twelve entries, each for its
+    /// own reason: `distributed_product_mode`, because neither statement
+    /// contains a subquery over a `Distributed` table for it to act on;
+    /// and `load_balancing`, because a replica preference puts two reads
+    /// on one host, which is not one position, so it closes none of the
+    /// visibility states it was proposed for.
+    #[test]
+    fn fetch_settings_carries_exactly_the_clustered_budget_set_and_final() {
+        let clustered = TraceReadConfig {
+            distributed: true,
+            skip_unavailable_shards: true,
+            ..cfg()
+        };
+        let got: Vec<(String, String)> = fetch_settings(&clustered)
+            .entries()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let want: Vec<(String, String)> = [
+            ("optimize_skip_unused_shards", "1"),
+            ("optimize_distributed_group_by_sharding_key", "1"),
+            ("distributed_aggregation_memory_efficient", "1"),
+            ("prefer_localhost_replica", "1"),
+            ("skip_unavailable_shards", "1"),
+            ("max_rows_to_read", "1000"),
+            ("max_bytes_to_read", "53687091200"),
+            ("read_overflow_mode", "throw"),
+            ("max_query_size", "8388608"),
+            ("max_memory_usage", "8589934592"),
+            ("max_bytes_before_external_group_by", "0"),
+            ("final", "1"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        assert_eq!(got, want, "the fetch's entry set, exactly and in order");
+
+        let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !keys.contains(&"distributed_product_mode"),
+            "the setting has no subquery over a Distributed table to act on"
+        );
+        assert!(
+            !keys.contains(&"load_balancing"),
+            "a replica preference closes none of the visibility states"
+        );
+
+        // Unclustered: the same budgets and `final`, with no
+        // clustered-reader block at all.
+        let local: Vec<String> = fetch_settings(&cfg())
+            .entries()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert_eq!(
+            local,
+            vec![
+                "max_rows_to_read",
+                "max_bytes_to_read",
+                "read_overflow_mode",
+                "max_query_size",
+                "max_memory_usage",
+                "max_bytes_before_external_group_by",
+                "final",
+            ]
+        );
+    }
+
+    /// `F-19`: **the route flag, one sub-case per arm, with the second
+    /// statement each arm renders.**
+    ///
+    /// `statements` is `1` when the branch returns no second statement and
+    /// `2` when it returns one, so the count is derived here rather than
+    /// asserted separately.
+    ///
+    /// **The second and third sub-cases are the load-bearing pair**: both
+    /// give `statements == 2`, which is why the count cannot carry the
+    /// signal and the enum exists.
+    ///
+    /// The second sub-case's text assertion says the **wide builder ran**
+    /// and that it carries its own bounds — not that its text is correct.
+    /// Both sides of a comparison against that builder's own output would
+    /// come from the same function, so it would hold for any text the
+    /// function produces; the byte-freeze case in
+    /// [`crate::traces::spans::fetch`] is what holds the content.
+    #[test]
+    fn the_route_flag_names_which_statement_answered() {
+        const HEX: &str = "aa000000000000000000000000000001";
+        let config = cfg();
+        let window = Some(FetchWindow {
+            start_ns: 1_699_999_999_000_000_000,
+            end_ns: 1_700_000_002_000_000_000,
+        });
+
+        // (a) an indexed answer: a complete bucket set and a non-empty
+        // span array, so one statement answers.
+        let (route, second) = fetch_route_and_second(&config, HEX, 1, 0, true, None);
+        assert_eq!(route, FetchRoute::Indexed);
+        assert!(second.is_none(), "the indexed route issues one statement");
+
+        // (b) a bucket set that may have truncated. `4097` and not
+        // `4096`: the value an uncapped union of a truncated row with one
+        // further bucket produces, so this sub-case also pins that the
+        // test is `>=` and not `==`.
+        let (route, second) = fetch_route_and_second(&config, HEX, 1, 4097, false, None);
+        assert_eq!(route, FetchRoute::TruncatedSet);
+        let wide = second.expect("the truncated-set route issues a second statement");
+        assert!(
+            wide.contains("min(start_ns)"),
+            "the wide builder ran and reads its own bounds:\n{wide}"
+        );
+
+        // (c) no index row, no spans, and a window: the fallback answers,
+        // also at two statements.
+        let (route, second) = fetch_route_and_second(&config, HEX, 0, 0, false, window);
+        assert_eq!(route, FetchRoute::Fallback);
+        let fallback = second.expect("the fallback route issues a second statement");
+        assert!(
+            fallback.contains("start_ns >= 1699999999000000000"),
+            "the fallback renders the request's own window, which statement 1 never \
+             renders in any form:\n{fallback}"
+        );
+
+        // (d) no index row, no spans and NO window: one statement, and the
+        // answer is empty rather than a trace_id-only predicate over every
+        // partition in retention.
+        let (route, second) = fetch_route_and_second(&config, HEX, 0, 0, false, None);
+        assert_eq!(route, FetchRoute::Indexed);
+        assert!(
+            second.is_none(),
+            "with no window the fetch answers empty at one statement"
+        );
+
+        // (e) an index row with an EMPTY span array and a window: the
+        // state where the per-trace table holds a row and the span table
+        // holds nothing. Both halves of the second condition are
+        // load-bearing and this is the half that is not `index_rows`.
+        let (route, second) = fetch_route_and_second(&config, HEX, 1, 0, false, window);
+        assert_eq!(route, FetchRoute::Fallback);
+        assert!(second.is_some());
+
+        // (f) the truncation branch is tested FIRST, and it needs no
+        // `index_rows` guard: with no per-trace row the bucket set is
+        // empty and its length is 0, so the test is false for an absent
+        // trace by construction. With a window supplied, an empty
+        // statement-1 array on the truncated route must NOT fall through
+        // to the fallback.
+        let (route, _) = fetch_route_and_second(&config, HEX, 1, 4096, false, window);
+        assert_eq!(
+            route,
+            FetchRoute::TruncatedSet,
+            "an empty array on the truncated route must not reach the window fallback"
+        );
+        assert_eq!(BUCKET_SET_CAP, 4096, "the cap the branch tests against");
     }
 
     #[test]
@@ -5796,22 +6067,63 @@ mod tests {
 
     // --- Issue #35: full-shape parse bound (traces) ---
 
-    /// The point-read template plus 32 hex chars stays well under any
-    /// plausible query-text cap, let alone
-    /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`]. Issue #35 used this
-    /// to justify EXEMPTING `fetch_by_id` from
+    /// Each of the fetch's three templates plus 32 hex chars and its own
+    /// bounds stays well under any plausible query-text cap, let alone
+    /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`]. Issue #35 used the
+    /// equivalent of this to justify EXEMPTING `fetch_by_id` from
     /// [`crate::querytext::ensure_query_text_fits`]; since issue #509 the
-    /// point read passes that guard like every other read on this path,
-    /// and this test is what says the guard can never fire on it.
+    /// fetch passes that guard like every other read on this path, and
+    /// this test is what says the guard can never fire on it.
+    ///
+    /// **More load-bearing than before, not less** (issue #587): these
+    /// three statements are the longest text this path renders, where the
+    /// old point read was the shortest.
     #[test]
-    fn point_read_sql_stays_under_4kib_by_construction() {
-        let sql =
-            crate::traces::sql::point_read_sql("trace_spans", "4bf92f3577b34da6a3ce929d0e0e4736");
-        assert!(
-            sql.len() < 4096,
-            "point-read SQL is {} bytes, expected < 4 KiB",
-            sql.len()
-        );
+    fn both_fetch_statements_stay_under_the_query_text_cap() {
+        const HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let window = FetchWindow {
+            start_ns: 1_699_999_999_000_000_000,
+            end_ns: 1_700_000_002_000_000_000,
+        };
+        for (label, sql) in [
+            (
+                "indexed",
+                crate::traces::spans::fetch::indexed_fetch_sql(
+                    "traces_dist",
+                    "spans_dist",
+                    "resources",
+                    HEX,
+                ),
+            ),
+            (
+                "wide",
+                crate::traces::spans::fetch::wide_fetch_sql(
+                    "traces_dist",
+                    "spans_dist",
+                    "resources",
+                    HEX,
+                ),
+            ),
+            (
+                "fallback",
+                crate::traces::spans::fetch::fallback_fetch_sql(
+                    "spans_dist",
+                    "resources",
+                    HEX,
+                    window,
+                ),
+            ),
+        ] {
+            assert!(
+                sql.len() < 4096,
+                "the {label} statement is {} bytes, expected < 4 KiB",
+                sql.len()
+            );
+            assert!(
+                crate::querytext::ensure_query_text_fits(&sql).is_ok(),
+                "the {label} statement must pass the query-text guard"
+            );
+        }
     }
 
     /// The batch hydration read at the `BATCH_TRACES` batch size — the

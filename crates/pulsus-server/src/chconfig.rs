@@ -416,6 +416,16 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         // `trace_spans` on `cityHash64(trace_id)` — the same rule.
         recent_table: format!("trace_recent{dist}"),
         errors_table: format!("trace_error_spans{dist}"),
+        // Issue #587: the fetch's three tables. `spans` and `traces`
+        // co-shard with the landing table on `cityHash64(trace_id)`, so
+        // they take the same `_dist` rule as every other routed trace
+        // table. `resources` does NOT: it is `Replication::Global`, one
+        // cluster-wide replica set read from the local replica, the same
+        // carve-out the tag catalog has — a `_dist` wrapper would fan a
+        // read out to every shard for rows every shard already holds.
+        spans_v2_table: format!("spans{dist}"),
+        traces_table: format!("traces{dist}"),
+        resources_table: "resources".to_string(),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
         event_set_max_values: config.reader.traceql_event_set_max_values,

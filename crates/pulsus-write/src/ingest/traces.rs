@@ -299,7 +299,7 @@ mod tests {
 
 use pulsus_model::Fingerprint;
 
-use crate::writer::trace_json::TraceJson;
+use pulsus_clickhouse::json_column::TraceJson;
 
 /// One span event, as the `events` column's element tuple stores it.
 #[derive(Debug, Clone, PartialEq)]

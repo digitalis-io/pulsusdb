@@ -1,18 +1,28 @@
 //! The two `/api/traces/v1/trace/{traceId}` handlers (docs/api.md §4.1):
-//! acquire the pool → parse the hex trace id (`params.rs`) → point-read
-//! via `TraceEngine` (`pulsus-read`, empty ⇒ 404) → assemble the OTLP
-//! `TracesData` (`assemble.rs`) → negotiate the representation
-//! (`negotiate.rs`; the `/json` route forces JSON before `Accept` is ever
-//! consulted) → encode. Thin by design — SQL/execution stays in
-//! `pulsus-read`, OTLP assembly in `assemble.rs`.
+//! acquire the pool → parse the hex trace id and the optional request
+//! window (`params.rs`) → fetch via `TraceEngine` (`pulsus-read`, empty ⇒
+//! 404) → rebuild the OTLP `TracesData` from the fetched columns
+//! (`assemble.rs`) → negotiate the representation (`negotiate.rs`; the
+//! `/json` route forces JSON before `Accept` is ever consulted) → encode.
+//! Thin by design — SQL/execution stays in `pulsus-read`, OTLP assembly in
+//! `assemble.rs`.
+//!
+//! **Two things each handler owns since issue #587.** It mints one
+//! statement-id prefix per request and returns it in an
+//! `X-Pulsus-Query-Id` response header, so a caller — and a test — reads
+//! the prefix of the statement ids the request issued rather than
+//! recomputing it. And it reports the one degraded state a fetch can
+//! detect from its own inputs: a span whose `resource_id` has no row in
+//! the resource array, which is a `200` going out without the sender's
+//! resource attributes.
 //!
 //! [`trace_by_id_v2`] (issue #474) serves the `/api/v2/traces/{traceId}`
 //! compat alias through the same steps, wrapping the result in
 //! `fetch_v2.rs`'s envelope and answering `200` with an empty trace where
 //! the v1 handlers answer `404`.
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Path, RawQuery, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_read::TraceEngine;
@@ -53,9 +63,10 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
 pub(crate) async fn trace_by_id(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = match trace_by_id_impl(state, &trace_id, Some(&headers)).await {
+    let mut res = match trace_by_id_impl(state, &trace_id, query.as_deref(), Some(&headers)).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     };
@@ -69,9 +80,10 @@ pub(crate) async fn trace_by_id(
 pub(crate) async fn trace_by_id_json(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
+    RawQuery(query): RawQuery,
     _headers: HeaderMap,
 ) -> Response {
-    match trace_by_id_impl(state, &trace_id, None).await {
+    match trace_by_id_impl(state, &trace_id, query.as_deref(), None).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -83,15 +95,21 @@ pub(crate) async fn trace_by_id_json(
 async fn trace_by_id_impl(
     state: AppState,
     raw_trace_id: &str,
+    raw_query: Option<&str>,
     negotiate_headers: Option<&HeaderMap>,
 ) -> Result<Response, ApiError> {
-    let engine = engine_for(&state).await?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
-    let spans = engine.fetch_by_id(&hex32).await?;
-    if spans.is_empty() {
+    let window = params::parse_fetch_window(raw_query)?;
+    let stmt_prefix = new_statement_prefix();
+    let engine = engine_for(&state)
+        .await?
+        .with_statement_prefix(&stmt_prefix);
+    let fetched = engine.fetch_by_id(&hex32, window).await?;
+    if fetched.spans.is_empty() {
         return Err(ApiError::NotFound);
     }
-    let data = AssembledTrace::from_stored(spans)?;
+    let data = AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?;
+    report_missing_resources(&state, data.missing_resources());
     let wants = match negotiate_headers {
         None => Wants::Json,
         // `negotiate_from_headers` combines every repeated `Accept` field
@@ -109,7 +127,71 @@ async fn trace_by_id_impl(
         // `application/x-protobuf` — docs/api.md §4.1.
         Wants::Protobuf => ("application/protobuf", assemble::encode_protobuf(&data)),
     };
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response())
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (QUERY_ID_HEADER, stmt_prefix),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// The response header carrying a request's statement-id prefix: the
+/// statements the request issued are `<prefix>-1`, `<prefix>-2`, … in
+/// issue order.
+pub(super) const QUERY_ID_HEADER: HeaderName = HeaderName::from_static("x-pulsus-query-id");
+
+/// One prefix per request: **32 hex chars** of operating-system
+/// randomness, so it is a legal `query_id` and two concurrent requests
+/// cannot be given one.
+///
+/// **`getrandom` rather than `uuid`**, for the reason the workspace's own
+/// entry gives: one opaque string per request is the same shape the write
+/// path's token mint already declines `uuid` for, and `getrandom` adds no
+/// crate to this binary's graph. A failure to read randomness falls back
+/// to the monotonic clock plus a process-local counter, which is still
+/// unique within a process and is the only thing left when the kernel's
+/// own source is unavailable.
+fn new_statement_prefix() -> String {
+    match (getrandom::u64(), getrandom::u64()) {
+        (Ok(hi), Ok(lo)) => format!("{hi:016x}{lo:016x}"),
+        _ => {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            format!("{nanos:016x}{n:016x}")
+        }
+    }
+}
+
+/// The validated 32-char hex id as the 16 bytes every rebuilt span's
+/// `trace_id` carries. `parse_trace_id` is the one validation point, so
+/// this cannot fail for anything it admits.
+fn trace_id_bytes(hex32: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex32[i * 2..i * 2 + 2], 16)
+            .expect("parse_trace_id admits only hex digits");
+    }
+    out
+}
+
+/// Reports the spans whose resource row was missing, through the metric
+/// facade the server already holds.
+///
+/// **It makes no answer correct.** It exists so a `200` going out without
+/// the sender's resource attributes is visible rather than silent: the
+/// reader knows which `resource_id`s its spans reference and which came
+/// back, which is the one degraded state a fetch can detect from its own
+/// inputs.
+fn report_missing_resources(state: &AppState, missing: u64) {
+    let _ = state;
+    crate::ops::record_fetch_missing_resources(missing);
 }
 
 /// `GET /api/v2/traces/{traceId}` (issue #474) — the fourteenth compat
@@ -122,15 +204,19 @@ async fn trace_by_id_impl(
 /// made a trace outside the queried time range render as a raw HTTP error
 /// string instead of a sentence about the range.
 ///
-/// Query parameters are accepted and ignored, exactly as the v1 fetch
-/// route ignores them: our point read has no time bound, so ignoring
-/// `start`/`end` returns a superset, never a wrong answer.
+/// `start`/`end` are read, and only for the fallback (issue #587). The
+/// indexed statement never reads the window, so the property that made
+/// ignoring them safe is preserved: the window only ever ADDS an answer —
+/// it answers a trace the per-trace table has not indexed, and it can
+/// never narrow one the indexed statement found. Every other query
+/// parameter is still accepted and ignored.
 pub(crate) async fn trace_by_id_v2(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = match trace_by_id_v2_impl(state, &trace_id, &headers).await {
+    let mut res = match trace_by_id_v2_impl(state, &trace_id, query.as_deref(), &headers).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     };
@@ -142,18 +228,24 @@ pub(crate) async fn trace_by_id_v2(
 async fn trace_by_id_v2_impl(
     state: AppState,
     raw_trace_id: &str,
+    raw_query: Option<&str>,
     negotiate_headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let engine = engine_for(&state).await?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
-    let spans = engine.fetch_by_id(&hex32).await?;
+    let window = params::parse_fetch_window(raw_query)?;
+    let stmt_prefix = new_statement_prefix();
+    let engine = engine_for(&state)
+        .await?
+        .with_statement_prefix(&stmt_prefix);
+    let fetched = engine.fetch_by_id(&hex32, window).await?;
     // The empty case is the whole reason this route exists: a present,
     // empty trace, not a 404.
-    let trace = if spans.is_empty() {
+    let trace = if fetched.spans.is_empty() {
         AssembledTrace::empty()
     } else {
-        AssembledTrace::from_stored(spans)?
+        AssembledTrace::from_fetched(&trace_id_bytes(&hex32), fetched)?
     };
+    report_missing_resources(&state, trace.missing_resources());
     let wants = negotiate::negotiate_from_headers(negotiate_headers)?;
     let (content_type, body) = match wants {
         Wants::Json => (
@@ -162,7 +254,15 @@ async fn trace_by_id_v2_impl(
         ),
         Wants::Protobuf => ("application/protobuf", fetch_v2::encode_protobuf(&trace)),
     };
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response())
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (QUERY_ID_HEADER, stmt_prefix),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -204,6 +304,7 @@ mod tests {
         let res = trace_by_id(
             State(test_state()),
             Path("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            RawQuery(None),
             HeaderMap::new(),
         )
         .await;
@@ -223,6 +324,7 @@ mod tests {
         let res = trace_by_id_json(
             State(test_state()),
             Path("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            RawQuery(None),
             HeaderMap::new(),
         )
         .await;

@@ -245,6 +245,9 @@ fn engine_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         recent_table: "trace_recent".to_string(),
         errors_table: "trace_error_spans".to_string(),
+        spans_v2_table: "spans".to_string(),
+        traces_table: "traces".to_string(),
+        resources_table: "resources".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,
@@ -374,9 +377,10 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     let mut committed_spans = Vec::new();
     for _ in 0..150 {
         committed_spans = engine
-            .fetch_by_id(TRACE_ID_HEX)
+            .fetch_by_id(TRACE_ID_HEX, None)
             .await
-            .expect("point read executes");
+            .expect("the fetch executes")
+            .spans;
         if !committed_spans.is_empty() {
             break;
         }

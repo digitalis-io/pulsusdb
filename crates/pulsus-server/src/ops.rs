@@ -133,6 +133,28 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// exporter's own running total). `misses_total` carries one `reason`
 /// label per [`pulsus_read::FallbackReason`] variant, matching Prometheus's
 /// labelled-counter idiom rather than five separate metric names.
+/// The trace fetch's missing-resource counter (issue #587).
+///
+/// Incremented once per span whose `resource_id` had no row in the
+/// resource array the fetch returned — a `200` going out without the
+/// sender's resource attributes, which is reachable on a cluster whose
+/// resource replica is behind and after a partial view fan-out.
+///
+/// **It makes no answer correct**, and it is deliberately the only one of
+/// the degraded read states this surface reports: the others are not
+/// detectable from a fetch's own inputs, because there is no expected span
+/// count to compare against.
+///
+/// A counter rather than a gauge, and absolute rather than a snapshot
+/// read at render time: the quantity is an event count over the process's
+/// life, which is what the `metrics` facade's `counter!` means.
+pub(crate) fn record_fetch_missing_resources(missing: u64) {
+    if missing == 0 {
+        return;
+    }
+    metrics::counter!("pulsus_trace_fetch_missing_resources_total").increment(missing);
+}
+
 fn record_label_cache_metrics(cache: &LabelCache) {
     let snap = cache.metrics();
     metrics::gauge!("pulsus_label_cache_series_count").set(snap.series_count as f64);

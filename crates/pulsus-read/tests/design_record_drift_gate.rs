@@ -1845,31 +1845,39 @@ enum ReviewedVerdict {
 // ONE new case entered, `plan.rs:3319` at occurrence 3, read against both
 // candidate files and recorded with its reasoning below. For the counts,
 // read the assertion at the end of this file's fallback test.
+//
+// Issue #587: the three TraceQL-executor cases below moved their
+// coordinates and nothing else. The fetch's additions to
+// `traces/exec.rs` shifted every line below the trace read config, so
+// `exec.rs:2983-2989` is now `:3008-3014`, `exec.rs:3023` is now
+// `:3048`, and `exec.rs:808` is now `:826`. Each still cites the same
+// expression it cited before — the verdicts are unchanged and the
+// reasoning below is the same sentence.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 4] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:3023",
+        "exec.rs:3048",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3023",
+        "exec.rs:3048",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:2983-2989",
+        "exec.rs:3008-3014",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:808",
+        "exec.rs:826",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",
