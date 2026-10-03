@@ -48,11 +48,35 @@ use crate::logql::exec::escape_query_placeholders;
 /// that holds one of these — has none either.
 pub(super) struct TraceDispatch {
     client: ChClient,
+    /// Issue #587: when set, every statement this dispatcher issues
+    /// carries `query_id = "<prefix>-<n>"` with `n` counting from 1 in
+    /// issue order.
+    ///
+    /// **Here and nowhere else, for the same reason the `?`-doubling is
+    /// here**: a statement added to the fetch tomorrow cannot miss the
+    /// stamp, because `exec.rs` cannot reach the client another way. A
+    /// per-call-site stamp is a rule kept by n call sites and broken by
+    /// the n+1st.
+    statement_prefix: Option<String>,
+    /// The counter the stamp's suffix comes from. Shared, so two
+    /// concurrent reads through one engine cannot be given one id.
+    statement_seq: std::sync::atomic::AtomicU32,
 }
 
 impl TraceDispatch {
     pub(super) fn new(client: ChClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            statement_prefix: None,
+            statement_seq: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Stamps every statement this dispatcher issues with
+    /// `<prefix>-<n>`, counting from 1.
+    pub(super) fn with_statement_prefix(mut self, prefix: &str) -> Self {
+        self.statement_prefix = Some(prefix.to_string());
+        self
     }
 
     /// Executes one already-rendered SQL statement and returns its row
@@ -86,10 +110,28 @@ impl TraceDispatch {
     {
         let sql = escape_query_placeholders(sql);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let settings = self.stamped(settings);
         self.client
-            .query_stream::<R>(&sql, settings)
+            .query_stream::<R>(&sql, &settings)
             .await
             .map_err(map_err)
+    }
+
+    /// The caller's settings with this statement's own `query_id` added
+    /// when a prefix is set, and untouched when none is.
+    ///
+    /// The counter is read with `fetch_add`, so two concurrent reads
+    /// through one engine get two ids; the suffix counts from 1, which is
+    /// what makes a request's first statement `<prefix>-1`.
+    fn stamped(&self, settings: &QuerySettings) -> QuerySettings {
+        let Some(prefix) = &self.statement_prefix else {
+            return settings.clone();
+        };
+        let n = self
+            .statement_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        settings.clone().set("query_id", format!("{prefix}-{n}"))
     }
 }
 

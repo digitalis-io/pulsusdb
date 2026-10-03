@@ -1422,7 +1422,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
      ungrouped **aggregation** or **quantile** over an empty window we emit
      one series whose zero `value` is protojson-omitted, where the reference
      emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
-     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1337-1349`, "an empty
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1747-1760`, "an empty
      aggregate window is a 0-valued sample"), and the reference drops a
      series with no samples
      (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
@@ -3745,3 +3745,87 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Where it is pinned.** `a_push_spanning_more_than_a_hundred_dates_is_refused` in
   `crates/pulsus-write/tests/trace_landing.rs`, once per trace transport, over both
   sides of the boundary and over both write paths' stores.
+
+### `traces-fetch-attribute-order-not-preserved` (issue #587) — **a fetched span's attributes come back ascending by key, not in the order the sender wrote them**
+
+- **What:** `GET /api/traces/v1/trace/{traceId}`, `GET /api/traces/v1/trace/{traceId}/json`,
+  their three compat aliases (`/api/traces/{traceId}`, `/api/traces/{traceId}/json`,
+  `/tempo/api/traces/{traceId}`) and `GET /api/v2/traces/{traceId}` return attributes
+  **ascending by key** in **all five scopes** — a span's, a resource's, an instrumentation
+  scope's, an event's and a link's. The order the sender put them on the wire is not
+  stored and is not reproduced, in any of the five. A duplicate key inside one scope keeps
+  its first value and the rest are not stored, which is the rule `docs/api.md` §4.2 already
+  states. Everything else about the response is unchanged: the same spans, the same
+  values, the same types and the same canonical span order. **Two byte comparisons are
+  distinguished here, because running them together is how this bullet goes wrong**: the
+  bytes equal **the sender's own encoding** only for a trace whose senders wrote every
+  scope's attributes in ascending key order, and they equal **the reference's encoding**
+  only where the reference's reconstruction order happens to be ascending too — which the
+  bullet below says it is not. **The sender's order is irrelevant to the second
+  comparison**, and `docs/api.md` §4.1 withdraws the byte claim against the reference
+  rather than conditioning it.
+
+- **What the reference does:** returns attributes in the order its own columnar reader
+  produces them, which is the order of its dedicated and generic attribute columns rather
+  than the sender's wire order. It preserves no sender order either; the two orders simply
+  need not agree.
+
+- **Why we do not match it.** A span's attributes are stored as one ClickHouse `JSON`
+  column, one typed subcolumn per key, which is what makes a filter on one key a single
+  subcolumn read and what brings the span table to its measured bytes per span. A column
+  of subcolumns has no element ordinal to carry a sender's order, and storing one would be
+  a second copy of every key. OTLP's `KeyValue` list is a map — the data model gives order
+  no meaning — so nothing is lost that the model admits exists. The reader sorts rather
+  than emitting the column's own order, because what a merge does to a part's path order
+  is not a question this tree can answer, and trusting it would make `docs/api.md` §4.1's
+  byte-determinism sentence false the first time a merge changed one.
+
+- **Consumer impact.** It needs a consumer that reads a span's attributes positionally
+  rather than by key. No OTLP consumer does: the generated bindings expose a repeated
+  `KeyValue` and every reader looks a key up. The one observable effect is on a byte
+  comparison of two fetch responses for data pushed with the keys in different orders —
+  which now compare equal, where before they compared unequal.
+
+- **Where it is pinned.** `a_reordered_attribute_key_passes_and_a_changed_value_fails` and
+  `t_w7_a_span_with_every_field_round_trips_as_an_otlp_value` in
+  `crates/pulsus-server/tests/traces_api_v2_live.rs` — the second asserts the returned
+  sequence of all five scopes positionally; the byte-frozen reference comparison that must
+  stay byte-equal through the change is
+  `crates/pulsus-server/tests/trace_nullable_wire_differential.rs`.
+
+### `traces-fetch-returns-resource-entity-references` (issue #587) — **a fetched resource carries the entity references the sender sent, where the reference omits them**
+
+- **What:** the same seven routes return `ResourceSpans.resource.entityRefs` as the sender
+  sent it. Two resources differing only in their entity references are two stored
+  resources with two identities, not one.
+
+- **What the reference does:** drops them. A scan of its storage layer and query package
+  for the field name at the pinned version returns nothing — the field has no column in
+  its schema and no arm in its proto-to-row or row-to-proto conversion, so a sender that
+  sends entity references gets a resource back without them.
+
+- **Why we do not match it.** `Resource.entity_refs` is field 3 of the message
+  (`vendor/opentelemetry-proto/src/proto/tonic/opentelemetry.proto.resource.v1.rs:25`),
+  and the trace path's own fidelity claim is that everything OTLP carries is stored
+  (`docs/TraceQL/server-implementation.md` §2). The old payload path round-tripped them,
+  so dropping them would have been a regression introduced by moving the fetch to columns,
+  and matching the reference here would mean matching it in losing data a sender sent. The
+  field is marked `[Development]` in the proto, which is why no sender in this
+  repository's fixtures populates it and why the cost is one almost-always-empty column on
+  the smallest table in the design.
+
+- **Consumer impact.** It needs a sender that populates the field, a development-stage
+  feature no instrumentation library emits by default. The one observable effect is on a
+  byte comparison against the reference for such a trace: **a trace that carries entity
+  references returns a field the reference does not return at all**, so the two responses
+  differ in content and not only in layout. **No byte-equality claim is made here, in
+  either direction.** `docs/api.md` §4.1's reference-byte sentence is **withdrawn** by the
+  same change rather than qualified: attribute reconstruction alone can change the bytes
+  of a trace with **no** entity references, so *"it holds whenever entity references are
+  absent"* would be false. **The entity-reference difference is the only thing this entry
+  claims**; the ordering difference is `traces-fetch-attribute-order-not-preserved`'s.
+
+- **Where it is pinned.** `W-6` in `crates/pulsus-write/tests/trace_landing.rs` for the
+  column and the identity — the write part's case — and
+  `t_w7_a_span_with_every_field_round_trips_as_an_otlp_value` in
+  `crates/pulsus-server/tests/traces_api_v2_live.rs` for the fetched value.

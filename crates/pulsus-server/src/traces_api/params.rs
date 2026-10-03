@@ -1,6 +1,6 @@
 //! `/api/traces/v1` parameter parsing: the trace-fetch hex id
 //! (docs/api.md §4.1: "16 or 32 chars, left-padded" — the injection
-//! boundary for `point_read_sql`'s `unhex('...')` literal: only
+//! boundary for the fetch statements' `unhex('...')` literals: only
 //! `[0-9a-f]{32}` output ever leaves [`parse_trace_id`]) and the issue
 //! #57 search params (docs/api.md §4.2: `q`/legacy params, `start`/`end`
 //! unix seconds, `limit`, `spss`). The `(key, value)` pair core mirrors
@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+use pulsus_read::FetchWindow;
 use pulsus_read::traces::tags_sql::ATTR_SCOPES;
 
 use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
@@ -40,6 +41,68 @@ pub(crate) fn parse_trace_id(raw: &str) -> Result<String, TraceIdError> {
     } else {
         Ok(lowered)
     }
+}
+
+/// The fetch routes' optional request window (issue #587).
+///
+/// **Every supplied bound is read before anything is decided.** A bound
+/// present and unparseable is a `400` — the same grammar and the same
+/// refusal as the search surface's — and that holds for a bound arriving
+/// ALONE as much as for one half of a pair. Accepting a malformed
+/// timestamp silently would answer over a window the caller did not ask
+/// for, and the lone form is the likelier one: a half-filled time control
+/// sends `start` with no `end`. The code review of 2026-10-03 found the
+/// reverse order here, with "both or neither" applied first, so a lone
+/// `?start=yesterday` was never parsed at all.
+///
+/// **Both bounds or neither, once both are known good.** The window is
+/// read only by the fallback, which answers a trace the per-trace table
+/// has not indexed; a half-open request has no window to answer over, so
+/// one *valid* bound alone is the same as none. That rule chooses the
+/// window to answer over; it was never a rule about which bounds to read.
+///
+/// **An empty or inverted window yields `None`.** The indexed statement
+/// never reads the window, so the only thing a window can do is ADD an
+/// answer; a window that cannot contain a span adds nothing, and refusing
+/// it would turn a harmless request into an error on a route that
+/// previously ignored these parameters altogether.
+pub(crate) fn parse_fetch_window(
+    query: Option<&str>,
+) -> Result<Option<FetchWindow>, SearchParamError> {
+    let Some(raw) = query else {
+        return Ok(None);
+    };
+    let pairs = parse_pairs(raw);
+    // Both parses happen before the both-or-neither test, so neither
+    // bound's validity depends on the other's presence.
+    let start_ns = parse_supplied_bound(&pairs, "start")?;
+    let end_ns = parse_supplied_bound(&pairs, "end")?;
+    let (Some(start_ns), Some(end_ns)) = (start_ns, end_ns) else {
+        return Ok(None);
+    };
+    if end_ns <= start_ns {
+        return Ok(None);
+    }
+    Ok(Some(FetchWindow { start_ns, end_ns }))
+}
+
+/// One fetch-window bound: `None` when the caller did not supply it (or
+/// supplied it empty, which this surface has always read as absent), the
+/// parsed nanosecond instant when they did, and a `400` when they
+/// supplied something this grammar cannot read.
+///
+/// The same grammar as the search surface's — seconds, nanoseconds or
+/// RFC3339 — through the one parser, so the two endpoints cannot drift.
+fn parse_supplied_bound(
+    pairs: &[(String, String)],
+    name: &str,
+) -> Result<Option<i64>, SearchParamError> {
+    let Some(raw) = get(pairs, name).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    parse_timestamp_ns(raw)
+        .map(Some)
+        .ok_or_else(|| SearchParamError::InvalidTimestamp(raw.to_string()))
 }
 
 /// Default `limit` when the param is absent (docs/api.md §4.2).
@@ -2029,6 +2092,97 @@ mod tests {
 
     fn pairs(raw: &str) -> Vec<(String, String)> {
         parse_pairs(raw)
+    }
+
+    /// Issue #587: the fetch routes' optional window.
+    ///
+    /// **Both bounds or neither**, because the window is read only by the
+    /// fallback and a half-open request has no window to answer over. An
+    /// empty or inverted one yields `None` rather than a refusal: the
+    /// indexed statement never reads the window, so the only thing a
+    /// window can do is ADD an answer, and a window that cannot contain a
+    /// span adds nothing.
+    #[test]
+    fn the_fetch_window_takes_both_bounds_or_neither() {
+        let ns = |s, e| {
+            Some(FetchWindow {
+                start_ns: s,
+                end_ns: e,
+            })
+        };
+        for (raw, want) in [
+            (None, None),
+            (Some(""), None),
+            (Some("limit=20"), None),
+            // one bound alone is the same as none
+            (Some("start=1699999999"), None),
+            (Some("end=1700000002"), None),
+            (Some("start=&end=1700000002"), None),
+            // seconds, the trace surface's own grammar
+            (
+                Some("start=1699999999&end=1700000002"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // nanoseconds, by magnitude
+            (
+                Some("start=1699999999000000000&end=1700000002000000000"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // RFC3339
+            (
+                Some("start=2023-11-14T22:13:19Z&end=2023-11-14T22:13:22Z"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+            // an empty window and an inverted one add nothing
+            (Some("start=1700000002&end=1700000002"), None),
+            (Some("start=1700000002&end=1699999999"), None),
+            // every other parameter is accepted and ignored
+            (
+                Some("limit=20&start=1699999999&end=1700000002&spss=3"),
+                ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
+            ),
+        ] {
+            assert_eq!(
+                parse_fetch_window(raw).expect("a well-formed window"),
+                want,
+                "for {raw:?}"
+            );
+        }
+    }
+
+    /// A bound that is present and unparseable is a `400`, the same
+    /// refusal and the same message as the search surface's: accepting it
+    /// silently would answer over a window the caller did not ask for.
+    ///
+    /// **A LONE malformed bound is refused too**, and that is the half
+    /// this case exists for. "Both bounds or neither" decides which
+    /// window to *answer over*; it was never a licence to stop *reading*
+    /// a bound the caller supplied. A lone `start=yesterday` discarded in
+    /// silence is the same wrong as a pair with one bad half — the caller
+    /// asked for a window and got an answer over a different one — and it
+    /// is the likelier shape, because a half-filled time control sends
+    /// one bound.
+    #[test]
+    fn an_unparseable_fetch_window_bound_is_refused() {
+        for raw in [
+            "start=yesterday&end=1700000002",
+            "start=1699999999&end=tomorrow",
+            // lone, with no partner at all
+            "start=yesterday",
+            "end=tomorrow",
+            // lone, with an empty partner — the empty value is discarded
+            // as absent, so this is the lone case by a second route
+            "start=yesterday&end=",
+            "start=&end=tomorrow",
+            // the supplied bound is read whatever else the query carries
+            "limit=20&start=yesterday&spss=3",
+        ] {
+            let err = parse_fetch_window(Some(raw)).expect_err("a malformed bound is refused");
+            assert!(
+                matches!(err, SearchParamError::InvalidTimestamp(_)),
+                "for {raw}: got {err:?}"
+            );
+        }
     }
 
     /// Criterion 14. **The wording and the boundary are pinned together,

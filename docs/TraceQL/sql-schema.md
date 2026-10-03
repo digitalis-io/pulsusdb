@@ -414,33 +414,99 @@ rule the compiler applies and the statement bound.
 ### 5.4 Trace by id
 
 ```sql
-WITH (SELECT (min(start_ns), max(end_ns)) FROM traces WHERE trace_id = unhex('…')) AS ext
-SELECT groupArray((span_id, parent_span_id, start_ns, duration_ns, service, resource_id, name,
-                   kind, status_code, status_message, trace_state, flags, scope_name,
-                   scope_version, scope_attrs, attrs, attrs_other, dropped_attrs, events,
-                   dropped_events, links, dropped_links)) AS spans,
-       (SELECT groupArray((resource_id, attrs, attrs_other, dropped_attrs, schema_url))
-        FROM resources WHERE … resource_id IN (the trace's resources)) AS resources
-FROM spans
-WHERE (intDiv(start_ns, 300000000000), trace_id) IN
-      (SELECT (k, unhex('…')) FROM (SELECT arrayJoin(range(intDiv(ext.1, 300000000000),
-                                                            intDiv(ext.2, 300000000000) + 1)) AS k))
+WITH (SELECT (count(), min(start_ns), max(last_start_ns),
+              groupUniqArrayArray(4096)(buckets))
+      FROM traces
+      WHERE trace_id = toFixedString(unhex('…'), 16)) AS ext,
+     ifNull(ext.1, 0)  AS idx_rows,
+     ifNull(ext.2, 0)  AS ext_lo,
+     ifNull(ext.3, 0)  AS ext_hi,
+     ifNull(ext.4, []) AS bk,
+     (SELECT (groupArray((span_id, parent_span_id, start_ns, end_ns, service,
+                          resource_id, name, kind, status_code, status_message,
+                          trace_state, flags, scope_name, scope_version, scope_attrs,
+                          attrs, attrs_other, dropped_attrs, events, dropped_events,
+                          links, dropped_links,
+                          scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
+              groupUniqArray((service, resource_id)))
+      FROM spans
+      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            (SELECT (k, toFixedString(unhex('…'), 16))
+             FROM (SELECT arrayJoin(bk) AS k))
+        AND length(bk) < 4096) AS sp
+SELECT idx_rows               AS index_rows,
+       toUInt32(length(bk))   AS bucket_count,
+       sp.1                   AS spans,
+       (SELECT groupArray((resource_id, attrs, attrs_other, dropped_attrs,
+                           schema_url, entity_refs))
+        FROM (SELECT resource_id,
+                     any(attrs) AS attrs, any(attrs_other) AS attrs_other,
+                     any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
+                     any(entity_refs) AS entity_refs
+              FROM resources
+              WHERE day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')
+                AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
+              GROUP BY resource_id)) AS resources
 ```
 
 One statement, one row: the spans and the distinct resources they point at, so a
 resource crosses the wire once rather than once per span.
 
-| | rows read | returned | warm | cold | the reference (interleaved p50) |
-|---|---:|---:|---:|---:|---:|
-| 20-span trace | 5,190 | 11,699 | **32 ms** | 168 | 53 ms |
-| 1,000-span trace | 9,286 | 335,128 | **40 ms** | 130 | 102 ms |
+**Seven properties of it, each stated because each replaced something.**
 
-The reference column is the interleaved p50 of 21 repetitions
-(`measure/fetch_compare.py`, `results/g1-fetch-compare.tsv`), where this design
-was 35 and 42 ms against 53 and 102. Interleaving is what makes the comparison
-mean anything: the reference's fetch time moves between sessions — 53 and 102 ms
-in this run, 61 and 112 in the one before, 66 and 121 before that — while this
-design stayed inside 30–43 ms in every session.
+1. **Each table is read ONCE.** R7 forbids a read path reading a column twice
+   in one statement, and the span read is a **scalar** carrying the span array
+   **and** the distinct `(service, resource_id)` pairs of the very same rows —
+   so the resource subquery filters on a materialised array and reads no span.
+2. **The key set is READ from `traces.buckets`, never computed.** `arrayJoin(bk)`
+   is the buckets the trace actually occupies, measured at 1.0003 per trace
+   (§2), where deriving `range(first, last + 1)` from the extent enumerates
+   every bucket between them: for a trace with one unset-timestamp span and one
+   ordinary one that is 5,666,667 keys and 45,333,344 bytes of intermediate, for
+   an answer of two keys and 16 bytes.
+3. **The extent comes from `start_ns` extrema, never from an end.** A span's
+   bucket is a function of its start alone, and `max(end_ns)` for a trace whose
+   sender sent the protocol's maximum end derives thirty million buckets.
+4. **`toUInt32(length(bk))`, not the bare `length`**, which returns `UInt64`:
+   the value's domain is `0..=4096` and the cast is what keeps the reported type
+   and the reader's row type from drifting apart.
+5. **`groupUniqArrayArray(4096)` caps the OUTER union**, because a trace
+   straddling midnight has several per-trace rows and each is capped per row:
+   measured, a truncated row unioned with one further bucket is `4097`.
+6. **`AND length(bk) < 4096` empties this statement's span array on the
+   complete-predicate route**, so the two bodies carry one copy of the trace
+   between them. It avoids a duplicate and returns nothing less: delete the
+   conjunct and the response is byte-identical.
+7. **The resource day bound carries an explicit `'UTC'`.** `resources.day` is
+   written by the writer, in Rust, with no timezone in the computation, so a
+   bare conversion selects the wrong partition for a trace near a day boundary
+   and returns spans whose resources carry no attributes.
+
+**The complete-predicate statement**, issued only when `bucket_count >= 4096`,
+reads its own bounds off `traces` and carries **no bucket condition at all** —
+an incomplete key set excludes rows, and a wrong answer is worse than a slow
+one. Its partition clause is byte identical to the span table's own
+`PARTITION BY` expression, or the prune is lost.
+
+**The figures this section carried are withdrawn, not re-measured** (issue
+#587). The statement's shape and its projection both changed — one span read
+instead of two, a read key set instead of a derived one, 25 span columns instead
+of 22 and 6 resource columns instead of 5 — so the rows-read, returned-bytes and
+latency figures measured against the previous shape are properties of a
+statement that no longer exists. `measure/run_all.sh` re-measures them against
+the regenerated `sql/b01_trace_by_id_20.sql` and `sql/b02_trace_by_id_1000.sql`,
+and this section states no figure until it has.
+
+**What transfers and what does not, stated rather than left.** The previous
+read-row counts are an **upper bound** on this statement's and nothing more: it
+reads the span table once where the previous shape read it twice, so it reads no
+more and probably fewer — argued from the shape, not measured. The returned-byte
+and latency figures transfer in neither direction. The reference comparison
+(`measure/fetch_compare.py`, `results/g1-fetch-compare.tsv`) reads the
+regenerated statement file, so it re-measures with no code change of its own;
+what it recorded about the reference's own variance between sessions — 53 and
+102 ms in one run, 61 and 112 in the one before, 66 and 121 before that — is a
+property of the reference and is unaffected.
 
 ### 5.5 Tags, and the contract they must keep
 
@@ -819,7 +885,7 @@ In SQL the promotion needs no iteration. After the forest walk, every remaining
 span's parent is also remaining, so the spans that can reach a span X are
 exactly X's own parent chain; X is promoted when X is the smallest
 `(start_ns, span_id)` on that chain, which is one more bounded climb. The walk's
-bound is `MAX_SPANS_PER_TRACE` (10,000, `crates/pulsus-read/src/traces/exec.rs:125`),
+bound is `MAX_SPANS_PER_TRACE` (10,000, `crates/pulsus-read/src/traces/exec.rs:130`),
 deeper than ClickHouse's default recursive-CTE depth, so the statement carries
 `max_recursive_cte_evaluation_depth`. Any span the two passes still do not
 number is counted in `unnumbered`, a column of the one row the statement
@@ -929,7 +995,7 @@ outlive the 7-day span retention").
 
 | table | sharding key | why |
 |---|---|---|
-| `spans`, `traces` | `cityHash64(trace_id)` | a trace is whole on one shard, so per-trace grouping, the structural climb and the fetch are shard-local |
+| `spans`, `traces` | `cityHash64(trace_id)` | a trace is whole on one shard, so per-trace grouping and the structural climb complete shard-locally and the fetch needs no cross-shard assembly. **Not a claim that only that shard is contacted**: whether a prune confines the fetch's statements is unmeasured by owner decision of 2026-10-02 (`docs/schemas.md` §7) |
 | `resources`, `tag_names`, `tag_values` | replicated to every shard | tiny, and read by every shard's join or dropdown |
 
 A search's first pass aggregates per shard and the coordinator merges twenty

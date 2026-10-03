@@ -4,11 +4,12 @@
 //!
 //! Follows the issue #16 evidence model exactly (see
 //! `queries.rs`'s module docs): every stage the two-phase TraceQL search
-//! executes — plus the trace-by-ID point read — runs the **product
+//! executes — plus the trace-by-ID fetch — runs the **product
 //! planner's own generated SQL** (`pulsus_read::traces`), tagged with a
 //! unique `query_id` under the docs/schemas.md §7 clustered-reader
-//! settings, and is then verdicted against a **client-computed expected
-//! shard roster**: `cityHash64(trace_id) % total_weight` over the
+//! settings, and — every stage but the one named below — is then
+//! verdicted against a **client-computed expected shard roster**:
+//! `cityHash64(trace_id) % total_weight` over the
 //! cumulative-weight slot map from `system.clusters` (the exact selection
 //! the Distributed engine performs — the sharding key here is
 //! `cityHash64(trace_id)`, so the client carries its own CityHash64
@@ -27,6 +28,19 @@
 //! `cityHash64 % total_weight` derivation so a reviewer can verify the
 //! pruning by hand.
 //!
+//! **One stage has no roster verdict, and it is named rather than
+//! described** (issue #587): `trace_by_id`. It is still captured and its
+//! coordinator-row check is still a hard error; what is not claimed is
+//! its shard set. The fetch reads the TraceQL design's own tables through
+//! a predicate the Distributed engine does not prune on, and whether a
+//! prune would confine it is **unmeasured by owner decision of
+//! 2026-10-02** — which is what `docs/schemas.md` §7's fan-out row says
+//! of the same read. [`Roster::Unmeasured`] carries the one stage name it
+//! was written for and [`capture_stage`] refuses it anywhere else, so the
+//! exemption cannot travel; and
+//! `exactly_one_stage_is_exempt_from_the_roster_verdict` counts the
+//! exemptions in use, so a second one cannot appear quietly.
+//!
 //! Scenario-local evidence structs only — the shared [`super::query_log::
 //! QueryLogTotals`] shape is untouched (the frozen-artifact rule).
 //!
@@ -44,10 +58,11 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::rows::{
-    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, TypedStrValueRow,
+    CandidateRow, HydrationRow, MembershipRow, RootRow, TypedStrValueRow,
 };
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
-use pulsus_read::traces::sql::point_read_sql;
+use pulsus_read::traces::spans::fetch::indexed_fetch_sql;
+use pulsus_read::traces::spans::rows::IndexedFetchRow;
 use pulsus_read::{SearchPlan, SpanFilterCtx, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -107,8 +122,10 @@ fn hex32(id: &[u8; 16]) -> String {
 pub struct TraceShardEvidence {
     pub shard_num: u32,
     /// `"coordinator-local"` (`is_initial_query = 1`), `"remote"`
-    /// (`is_initial_query = 0`), or `"expected-pruned"` (derivedly
-    /// excluded by `optimize_skip_unused_shards`).
+    /// (`is_initial_query = 0`), `"expected-pruned"` (derivedly excluded
+    /// by `optimize_skip_unused_shards`), or `"unmeasured"` — a shard that
+    /// did no work on a stage whose roster is not claimed, where calling
+    /// it pruned would assert the thing that stage does not assert.
     pub role: String,
     pub read_rows: u64,
     pub read_bytes: u64,
@@ -125,7 +142,15 @@ pub struct TraceStageEvidence {
     pub sql: String,
     pub wall_ms: f64,
     pub returned_rows: u64,
+    /// The shards verdicted against, or — when `unmeasured_reason` is
+    /// present — simply the ones that participated.
     pub expected_shards: Vec<u32>,
+    /// Present only for a stage whose roster is deliberately not claimed
+    /// (issue #587): why, and whose decision it is. Its presence is what
+    /// tells a reader that `expected_shards` on this stage is a record of
+    /// what happened rather than a verdict it passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmeasured_reason: Option<String>,
     pub shards: Vec<TraceShardEvidence>,
 }
 
@@ -152,6 +177,41 @@ enum Roster {
     /// `trace_id`-keyed reads — exactly the shards owning one of these
     /// ids under `cityHash64(trace_id) % total_weight`.
     TraceIds(Vec<[u8; 16]>),
+    /// **No roster is claimed for ONE named stage.** Not a category and
+    /// not a property of the SQL: the `stage` field is the single stage
+    /// name this exemption was written for, and [`capture_stage`] refuses
+    /// it if it is attached to any other stage — so copying the line onto
+    /// a second stage is a hard error rather than a silent inheritance.
+    ///
+    /// A stage added later gets a verdicted roster by default. There is no
+    /// way to reach this arm except by writing a stage's name into it, and
+    /// `exactly_one_stage_is_exempt_from_the_roster_verdict` counts the
+    /// arms in use, so a second exemption reddens rather than passing.
+    Unmeasured {
+        /// The one stage this exemption is written for.
+        stage: &'static str,
+        /// Why there is no roster to verdict, and whose decision that is.
+        /// It travels in the data so it cannot be left behind in a commit
+        /// message, and it is asserted non-empty by the case above.
+        decision: &'static str,
+    },
+}
+
+impl Roster {
+    /// The stage name an exemption is written for, or `None` for a roster
+    /// that is verdicted.
+    ///
+    /// **The default is "checked".** Every arm that answers `None` here is
+    /// compared against a client-computed shard set; only
+    /// [`Roster::Unmeasured`] answers `Some`, and only for the one stage
+    /// written inside it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn exempt_stage(&self) -> Option<&'static str> {
+        match self {
+            Roster::Full | Roster::TraceIds(_) => None,
+            Roster::Unmeasured { stage, .. } => Some(stage),
+        }
+    }
 }
 
 struct StageSpec {
@@ -178,7 +238,7 @@ struct StageSpec {
 /// to the SQL without a second list to keep in step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decoder {
-    StoredSpan,
+    IndexedFetch,
     Candidate,
     Hydration,
     /// The membership read with NO fused value — two columns.
@@ -193,7 +253,7 @@ impl Decoder {
     #[cfg_attr(not(test), allow(dead_code))]
     fn columns(self) -> &'static [&'static str] {
         match self {
-            Decoder::StoredSpan => StoredSpanRow::COLUMN_NAMES,
+            Decoder::IndexedFetch => IndexedFetchRow::COLUMN_NAMES,
             Decoder::Candidate => CandidateRow::COLUMN_NAMES,
             Decoder::Hydration => HydrationRow::COLUMN_NAMES,
             Decoder::Membership => MembershipRow::COLUMN_NAMES,
@@ -259,9 +319,30 @@ fn evidence_stages(
     vec![
         StageSpec {
             stage: "trace_by_id",
-            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
-            roster: Roster::TraceIds(vec![target]),
-            decoder: Decoder::StoredSpan,
+            // Issue #587: the fetch's own indexed statement, over the
+            // span, per-trace and resource tables. `resources` is read
+            // from the local replica and is never `_dist`-suffixed.
+            sql: indexed_fetch_sql("traces_dist", "spans_dist", "resources", &hex32(&target)),
+            // **This stage's roster is not verdicted, and it is the only
+            // one.** `Roster::TraceIds` here asserted that
+            // `optimize_skip_unused_shards` confines the fetch to the
+            // trace's owning shard — true of the statement this harness
+            // first measured, which read `trace_spans_dist` under a plain
+            // `trace_id` equality. The fetch's indexed statement reaches
+            // `spans_dist` through `(intDiv(start_ns, …), trace_id) IN
+            // (…)`, which the Distributed engine does not prune on, and
+            // it observed `{1, 2}` where the derivation expected `{1}`.
+            roster: Roster::Unmeasured {
+                stage: "trace_by_id",
+                decision: "unmeasured, by owner decision of 2026-10-02: whether a shard \
+                           prune reduces the fetch's statements to the trace's owning shard \
+                           is not measured, and no roster is claimed for this stage. \
+                           docs/schemas.md's §7 fan-out row reads the same and carries no \
+                           count. The answer is correct either way — the shards that do not \
+                           hold the trace return nothing; what is unmeasured is the work, \
+                           not the result.",
+            },
+            decoder: Decoder::IndexedFetch,
         },
         StageSpec {
             stage: "phase1_generator_service",
@@ -437,26 +518,43 @@ async fn capture_stage(
     flush_logs_before_shard_read(client, cluster).await?;
     let by_shard = read_shard_rows(client, cluster, topology, query_id).await?;
 
-    let expected: BTreeSet<u32> = match &spec.roster {
-        Roster::Full => topology.all_shards(),
-        Roster::TraceIds(ids) => ids
-            .iter()
-            .map(|id| topology.shard_for_key_value(city_hash_64_16(id)))
-            .collect(),
+    // `None` for the one stage whose roster is not claimed — issue #587.
+    // Every other arm yields a set and is verdicted below.
+    let expected: Option<BTreeSet<u32>> = match &spec.roster {
+        Roster::Full => Some(topology.all_shards()),
+        Roster::TraceIds(ids) => Some(
+            ids.iter()
+                .map(|id| topology.shard_for_key_value(city_hash_64_16(id)))
+                .collect(),
+        ),
+        Roster::Unmeasured { stage, .. } => {
+            // The exemption names ONE stage, and this is where that is
+            // enforced: copying the line onto a second stage fails here
+            // rather than quietly exempting it too.
+            anyhow::ensure!(
+                *stage == spec.stage,
+                "the roster exemption written for stage {stage:?} is attached to stage \
+                 {:?} — an exemption names one stage and does not travel",
+                spec.stage
+            );
+            None
+        }
     };
     let observed: BTreeSet<u32> = by_shard
         .iter()
         .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
         .map(|(shard, _)| *shard)
         .collect();
-    anyhow::ensure!(
-        observed == expected,
-        "stage {:?} (query_id={query_id}): observed participating shards {observed:?} != \
-         expected {expected:?} — missing shards are lost system.query_log rows, unexpected \
-         shards are pruning/sharding violations; SQL:\n{}",
-        spec.stage,
-        spec.sql
-    );
+    if let Some(expected) = &expected {
+        anyhow::ensure!(
+            observed == *expected,
+            "stage {:?} (query_id={query_id}): observed participating shards {observed:?} != \
+             expected {expected:?} — missing shards are lost system.query_log rows, unexpected \
+             shards are pruning/sharding violations; SQL:\n{}",
+            spec.stage,
+            spec.sql
+        );
+    }
     let coordinator_rows = by_shard
         .values()
         .filter(|row| row.is_initial_query == 1)
@@ -468,10 +566,14 @@ async fn capture_stage(
         spec.stage
     );
 
+    // With no expectation to compare against, the participating set IS
+    // what was observed: the record says what happened and claims nothing
+    // about what should have.
+    let participating = expected.as_ref().unwrap_or(&observed);
     let mut shards = Vec::new();
     for shard_num in topology.all_shards() {
         match by_shard.get(&shard_num) {
-            Some(row) if expected.contains(&shard_num) => shards.push(TraceShardEvidence {
+            Some(row) if participating.contains(&shard_num) => shards.push(TraceShardEvidence {
                 shard_num,
                 role: if row.is_initial_query == 1 {
                     "coordinator-local".to_string()
@@ -487,6 +589,9 @@ async fn capture_stage(
             }),
             _ => {
                 let reason = match &spec.roster {
+                    // NOT `expected-pruned`: naming a prune here would
+                    // assert the very thing this stage does not claim.
+                    Roster::Unmeasured { decision, .. } => (*decision).to_string(),
                     Roster::Full => anyhow::bail!(
                         "stage {:?}: shard {shard_num} missing from a Full-roster stage \
                          (unreachable after the observed == expected verdict)",
@@ -496,7 +601,10 @@ async fn capture_stage(
                 };
                 shards.push(TraceShardEvidence {
                     shard_num,
-                    role: "expected-pruned".to_string(),
+                    role: match &spec.roster {
+                        Roster::Unmeasured { .. } => "unmeasured".to_string(),
+                        _ => "expected-pruned".to_string(),
+                    },
                     read_rows: 0,
                     read_bytes: 0,
                     selected_marks: 0,
@@ -513,7 +621,11 @@ async fn capture_stage(
         sql: spec.sql,
         wall_ms,
         returned_rows,
-        expected_shards: expected.into_iter().collect(),
+        expected_shards: participating.iter().copied().collect(),
+        unmeasured_reason: match &spec.roster {
+            Roster::Unmeasured { decision, .. } => Some((*decision).to_string()),
+            _ => None,
+        },
         shards,
     })
 }
@@ -802,7 +914,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         // membership read came to be built four-column and decoded
         // three-column.
         let returned_rows = match spec.decoder {
-            Decoder::StoredSpan => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
+            Decoder::IndexedFetch => {
+                drain::<IndexedFetchRow>(&client, &spec.sql, &settings).await?
+            }
             Decoder::Candidate => drain::<CandidateRow>(&client, &spec.sql, &settings).await?,
             Decoder::Hydration => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
             Decoder::Membership => drain::<MembershipRow>(&client, &spec.sql, &settings).await?,
@@ -863,6 +977,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             edges_table: "trace_edges_dist".to_string(),
             recent_table: "trace_recent_dist".to_string(),
             errors_table: "trace_error_spans_dist".to_string(),
+            spans_v2_table: "spans".to_string(),
+            traces_table: "traces".to_string(),
+            resources_table: "resources".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,
@@ -1018,7 +1135,38 @@ mod tests {
         let batch = [trace_id_of(1), trace_id_of(2)];
         let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
         assert_eq!(stages.len(), 6, "every stage must be checked");
+        // Issue #587: the fetch stage is EXEMPT from this reader, and the
+        // exemption is stated here rather than left as a silent skip.
+        //
+        // This reader accepts a narrow grammar over a statement that opens
+        // with `SELECT`. The fetch's indexed statement opens with `WITH`
+        // and binds four scalars before its projection — a `[]` default,
+        // a tuple member access, a zone literal and two nested scalar
+        // subqueries — none of which is in the closed alphabet, and
+        // widening the alphabet to admit them would make the reader accept
+        // very nearly anything, which is the one thing it exists not to do.
+        //
+        // **What holds the property for that stage instead**, so this is a
+        // carve-out and not a hole: the statement's projection aliases are
+        // byte-frozen by `all_three_builders_are_byte_frozen`, and the row
+        // type's own `COLUMN_NAMES` are asserted against those four
+        // literals by `each_row_types_column_names_are_its_statements_aliases`
+        // — both in `pulsus-read`. Two cases over one pair of facts, where
+        // every other stage has this one.
+        const EXEMPT_STAGES: [&str; 1] = ["trace_by_id"];
+        let mut checked = 0;
         for spec in &stages {
+            if EXEMPT_STAGES.contains(&spec.stage) {
+                assert!(
+                    spec.sql.starts_with("WITH "),
+                    "stage {:?} is exempt because its statement opens with a WITH prelude; \
+                     a statement that no longer does belongs back under the reader.\nSQL:\n{}",
+                    spec.stage,
+                    spec.sql
+                );
+                continue;
+            }
+            checked += 1;
             assert_eq!(
                 projection_names(&spec.sql),
                 spec.decoder.columns(),
@@ -1028,6 +1176,11 @@ mod tests {
                 spec.sql
             );
         }
+        assert_eq!(
+            checked,
+            stages.len() - EXEMPT_STAGES.len(),
+            "every stage is either checked or named in the exemption"
+        );
         // The membership stage takes the FUSED arm for this query, which
         // is the arm issue #510 widened. Pinned so a planner change that
         // silently stopped fusing would not turn this test into a check
@@ -1101,7 +1254,7 @@ mod tests {
     ///
     /// **Why the names are read from SQL at all.** None of the five
     /// builders holds its output names as a list: `hydration_sql`,
-    /// `root_sql` and `point_read_sql` write the projection inline in a
+    /// `root_sql` and the fetch's builders write the projection inline in a
     /// `format!`, `membership_sql` builds a projection String first and
     /// interpolates it, and `generator_sql` opens with a
     /// `String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n")`.
@@ -1324,6 +1477,103 @@ mod tests {
                 }
             }
             other => panic!("expected an expression, found {other:?}, in:\n{sql}"),
+        }
+    }
+
+    /// Issue #587: **exactly one stage may skip the roster verdict, and
+    /// the case is a count rather than a lookup.**
+    ///
+    /// The verdict is the gate — a clustered deployment is the normal one,
+    /// and which node does the work is the whole point of this harness. So
+    /// the risk in exempting a stage is not the stage exempted, it is the
+    /// exemption widening afterwards. Three things are asserted, and the
+    /// first is the load-bearing one:
+    ///
+    /// * **how many** stages are exempt, derived from the specs in the
+    ///   assertion itself. A second exemption appearing later reddens here
+    ///   rather than passing silently, which is what a lookup for one
+    ///   known name would have done.
+    /// * **which** stage, by name — and that the name written inside the
+    ///   exemption is the stage it is attached to, so the line cannot be
+    ///   moved to another stage by copying it.
+    /// * **that the rest are verdicted**, by naming the complement
+    ///   explicitly. A stage added later is in neither list and reddens.
+    ///
+    /// The reason is asserted too, because an exemption whose reason has
+    /// been emptied is an exemption nobody can audit: it must name the
+    /// decision's date and the document row it mirrors.
+    ///
+    /// *RED when:* a second stage is exempted; the exemption moves to a
+    /// different stage; the one exempt stage goes back to a verdicted
+    /// roster while the documents still say the prune is unmeasured; or a
+    /// stage is added or removed without this partition being re-derived.
+    #[test]
+    fn exactly_one_stage_is_exempt_from_the_roster_verdict() {
+        let base = 1_700_000_000_000_000_000i64;
+        let now = base + WINDOW_NS;
+        let (plan, attr_plan) = evidence_plans(base, now).expect("the evidence queries plan");
+        let batch = [trace_id_of(1), trace_id_of(2)];
+        let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
+
+        // (a) the COUNT, derived here and not written beside a list.
+        let exempt: Vec<(&'static str, &'static str)> = stages
+            .iter()
+            .filter_map(|s| s.roster.exempt_stage().map(|named| (s.stage, named)))
+            .collect();
+        assert_eq!(
+            exempt.len(),
+            1,
+            "exactly one stage may skip the roster verdict; exempt now: {exempt:?}"
+        );
+
+        // (b) WHICH stage — and that the exemption names the stage it is
+        // attached to. The pair is compared, so an exemption written for
+        // `trace_by_id` and pasted onto another stage fails here as well
+        // as in `capture_stage`.
+        assert_eq!(
+            exempt[0],
+            ("trace_by_id", "trace_by_id"),
+            "the one exemption is the trace fetch's, and it names its own stage"
+        );
+
+        // (c) the COMPLEMENT, named, so an added stage is in neither list.
+        let verdicted: Vec<&'static str> = stages
+            .iter()
+            .filter(|s| s.roster.exempt_stage().is_none())
+            .map(|s| s.stage)
+            .collect();
+        assert_eq!(
+            verdicted,
+            vec![
+                "phase1_generator_service",
+                "phase1_generator_attr",
+                "phase2_hydration",
+                "phase2_membership",
+                "root_hydration",
+            ],
+            "every stage but the fetch is verdicted against a computed shard set"
+        );
+        assert_eq!(
+            verdicted.len() + exempt.len(),
+            stages.len(),
+            "the two lists must partition the stages"
+        );
+
+        // The reason travels in the data. It names the decision's date and
+        // the document row it mirrors, so the two carriers cannot drift
+        // apart again — which is how this exemption came to be needed.
+        let Some(Roster::Unmeasured { decision, .. }) = stages
+            .iter()
+            .find(|s| s.stage == "trace_by_id")
+            .map(|s| &s.roster)
+        else {
+            panic!("the fetch stage must carry the Unmeasured roster");
+        };
+        for needle in ["2026-10-02", "docs/schemas.md"] {
+            assert!(
+                decision.contains(needle),
+                "the exemption's reason must name {needle:?}; it reads: {decision}"
+            );
         }
     }
 

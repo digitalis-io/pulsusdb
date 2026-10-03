@@ -415,6 +415,15 @@ door. It serializes one row with no column metadata and so no validation, it
 is called from no production path, and the validating serializer the client
 uses is untouched.
 
+`_priv::deserialize_row_unvalidated` is its mirror, added when the read side
+of this column gained a decoder: `deserialize_row` is `pub(crate)` too, so a
+hermetic case could assert the bytes a value produces and had no way to
+assert the value a frame produces. The same three properties — no column
+metadata, no production caller, the validating deserializer untouched — and
+the same gate location: the eleven frames are decoded back in
+`crates/pulsus-clickhouse/src/json_column.rs`'s own cases, against the same
+literals the encoding loop compares.
+
 ### Gates
 
 Neither the vendored crate's own `#[test]`s nor a new CI step for them exist —

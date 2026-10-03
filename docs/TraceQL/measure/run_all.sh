@@ -230,11 +230,25 @@ echo "== what max_dynamic_paths defaults to, measured at the boundary"
 "$HERE/json_paths_default.sh" "$CH" > "$R/json-paths-default.tsv"
 
 echo "== R6 denominators: returned bytes against the trace's stored bytes"
+# Issue #587: the denominator counts the trace's SPAN rows **plus the distinct
+# resource rows the statement returns**, because the statement returns both. A
+# denominator over the span rows alone measures a narrower quantity than the
+# thing it bounds, and for a one-span trace whose resource is larger than its
+# span a CORRECT statement exceeds the published ceiling. The predicate is the
+# full (service, resource_id) sort key, so the IN prunes on the resource table's
+# primary key exactly as the statement's own predicate does, and `final = 1` is
+# on both reads so each counts the finalised identity rather than its day rows.
+# **The numerator does not move**: it is the statement's own body, which is what
+# R6 bounds; only the denominator was measuring the wrong set.
 { printf 'trace\treturned_bytes\tstored_uncompressed_bytes\tratio\n'
   for pair in "50FB0CD99260AC2A15D0A6F208126742:b01_trace_by_id_20" "9E0AE95131B5BEDBEEA2C9EB5234F1EC:b02_trace_by_id_1000"; do
     tid=${pair%%:*}; shape=${pair##*:}
     ret=$(curl --fail-with-body -sS "$CH/?default_format=RowBinary&final=1" --data-binary @"$HERE/sql/$shape.sql" | wc -c)
-    den=$(q "SELECT sum(byteSize(*)) FROM tqd_g1.spans WHERE trace_id = unhex('$tid') SETTINGS final = 1 FORMAT TSV")
+    den_s=$(q "SELECT sum(byteSize(*)) FROM tqd_g1.spans WHERE trace_id = unhex('$tid') SETTINGS final = 1 FORMAT TSV")
+    den_r=$(q "SELECT sum(byteSize(*)) FROM tqd_g1.resources WHERE (service, resource_id) IN (
+                 SELECT service, resource_id FROM tqd_g1.spans WHERE trace_id = unhex('$tid')
+               ) SETTINGS final = 1 FORMAT TSV")
+    den=$(( den_s + den_r ))
     printf '%s\t%s\t%s\t%s\n' "$tid" "$ret" "$den" "$(python3 -c "print(round($ret/$den, 3))")"
   done; } > "$R/r6-denominators.tsv"
 

@@ -248,24 +248,49 @@ LIMIT 1001
 """)
 
 # ---- trace by id: ONE row, the spans and the trace's resources ----
+# Issue #587: the span table is read ONCE, as a scalar carrying the span array
+# AND the distinct (service, resource_id) pairs of the very same rows — R7
+# forbids a read path reading a column twice in one statement, and the previous
+# shape read it twice. The key set is READ from traces.buckets rather than
+# derived from the extent: deriving range(first, last + 1) enumerates every
+# bucket between the trace's first and last span, which for a trace with one
+# unset-timestamp span is 5,666,667 keys for an answer of two. The extent that
+# survives bounds the resource day only, and it comes from last_start_ns and
+# never from an end.
 def by_id(name, tid):
-    open(f'{OUT}/{name}.sql', 'w').write(f"""WITH (SELECT (min(start_ns), max(end_ns))
-      FROM {DB}.traces WHERE trace_id = toFixedString(unhex('{tid}'), 16)) AS ext
-SELECT groupArray((span_id, parent_span_id, start_ns, duration_ns, service, resource_id, name, kind,
-                   status_code, status_message, trace_state, flags, scope_name, scope_version, scope_attrs,
-                   attrs, attrs_other, dropped_attrs, events, dropped_events, links, dropped_links)) AS spans,
-       (SELECT groupArray((resource_id, attrs, attrs_other, dropped_attrs, schema_url))
-        FROM (SELECT resource_id, any(attrs) AS attrs, any(attrs_other) AS attrs_other,
-                     any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url
+    open(f'{OUT}/{name}.sql', 'w').write(f"""WITH (SELECT (count(), min(start_ns), max(last_start_ns),
+              groupUniqArrayArray(4096)(buckets))
+      FROM {DB}.traces
+      WHERE trace_id = toFixedString(unhex('{tid}'), 16)) AS ext,
+     ifNull(ext.1, 0)  AS idx_rows,
+     ifNull(ext.2, 0)  AS ext_lo,
+     ifNull(ext.3, 0)  AS ext_hi,
+     ifNull(ext.4, []) AS bk,
+     (SELECT (groupArray((span_id, parent_span_id, start_ns, end_ns, service,
+                          resource_id, name, kind, status_code, status_message,
+                          trace_state, flags, scope_name, scope_version, scope_attrs,
+                          attrs, attrs_other, dropped_attrs, events, dropped_events,
+                          links, dropped_links,
+                          scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
+              groupUniqArray((service, resource_id)))
+      FROM {DB}.spans
+      WHERE (intDiv(start_ns, {B}), trace_id) IN
+            (SELECT (k, toFixedString(unhex('{tid}'), 16))
+             FROM (SELECT arrayJoin(bk) AS k))
+        AND length(bk) < 4096) AS sp
+SELECT idx_rows               AS index_rows,
+       toUInt32(length(bk))   AS bucket_count,
+       sp.1                   AS spans,
+       (SELECT groupArray((resource_id, attrs, attrs_other, dropped_attrs,
+                           schema_url, entity_refs))
+        FROM (SELECT resource_id,
+                     any(attrs) AS attrs, any(attrs_other) AS attrs_other,
+                     any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
+                     any(entity_refs) AS entity_refs
               FROM {DB}.resources
-              WHERE day >= toDate(fromUnixTimestamp64Nano(ext.1)) AND day <= toDate(fromUnixTimestamp64Nano(ext.2))
-                AND resource_id IN (SELECT DISTINCT resource_id FROM {DB}.spans
-                                    WHERE (intDiv(start_ns, {B}), trace_id) IN
-                                          (SELECT (k, toFixedString(unhex('{tid}'), 16)) FROM (SELECT arrayJoin(range(intDiv(ext.1, {B}), intDiv(ext.2, {B}) + 1)) AS k)))
+              WHERE day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')
+                AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
               GROUP BY resource_id)) AS resources
-FROM {DB}.spans
-WHERE (intDiv(start_ns, {B}), trace_id) IN
-      (SELECT (k, toFixedString(unhex('{tid}'), 16)) FROM (SELECT arrayJoin(range(intDiv(ext.1, {B}), intDiv(ext.2, {B}) + 1)) AS k))
 """)
 by_id('b01_trace_by_id_20', '50FB0CD99260AC2A15D0A6F208126742')
 by_id('b02_trace_by_id_1000', '9E0AE95131B5BEDBEEA2C9EB5234F1EC')

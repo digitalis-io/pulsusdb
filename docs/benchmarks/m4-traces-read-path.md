@@ -1,5 +1,26 @@
 # M4: Traces read-path shard-locality evidence (2-shard cluster)
 
+> **SUPERSEDED IN PART by issue #587, at four places in this file: the
+> trace-by-ID row of the summary above, the "§4.2 trace-by-ID point read"
+> in the shard-locality criterion below, the `trace_by_id` half of the
+> "hit one shard" bullet under Evidence — with the `pruned_reason`
+> derivation it cites, in this report's raw JSON — and the caveat in
+> §Caveats that records the fetch handler not injecting the §7 settings.**
+>
+> Two things moved and they moved in opposite directions. **The statement
+> this file measured no longer exists**: the fetch reads the TraceQL
+> design's own span, per-trace and resource tables through the three
+> statements `docs/TraceQL/sql-schema.md` §5.4 holds, so the trace-by-ID
+> row's confinement verdict is about a read the server no longer issues.
+> **And the caveat is closed**: the fetch now injects the §7
+> clustered-reader settings through its own settings root. What replaces
+> the verdict is **nothing** — whether the shard prune reduces the new
+> statements to the owning shard is unmeasured by owner decision of
+> 2026-10-02, and `docs/schemas.md` §7's fan-out row says so rather than
+> carrying a count. Everything else in this file — the method, the
+> coordinator-inclusive capture, the roster derivation and every search
+> row — stands.
+
 > **This report establishes Tier-1 evidence for the traces rows of
 > `docs/schemas.md` §7** — trace-by-ID single-shard confinement and
 > shard-local two-phase TraceQL search — on the 2-shard

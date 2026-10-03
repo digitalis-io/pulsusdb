@@ -40,8 +40,6 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "charge_explain charges sql+note+overhead before the to_string/format"),
     ("exec.rs", "collect_rows_charged", "Vec::new", 1,
      "the row vec fills only through the per-row cost closure charge (charged as it streams)"),
-    ("exec.rs", "fetch_by_id", "Vec::new", 1,
-     "trace-by-ID point read - deliberately outside the search budget (issue #55 scope; no SearchPlan/ByteBudget on this path)"),
     ("exec.rs", "list_tag_names", "Vec::new", 1,
      "tag-names catalog read (issue #58) - outside the search budget by design (no SearchPlan/ByteBudget on this path); hard-bounded by the SQL LIMIT to TAG_NAMES_MAX + 1 short catalog rows"),
     ("exec.rs", "stream_tag_values", "Vec::new", 1,

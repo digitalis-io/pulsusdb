@@ -727,6 +727,24 @@ pub mod _priv {
         crate::rowbinary::serialize_row_binary(&mut buffer, row)?;
         Ok(buffer)
     }
+
+    /// Deserializes one row from `RowBinary` with **no** column metadata and
+    /// so no schema validation — the exact mirror of
+    /// [`serialize_row_unvalidated`], for a test that asserts what a known
+    /// frame decodes to.
+    ///
+    /// Added by this vendored copy, and the reason is in `PATCHES.md` §3:
+    /// the crate's own `deserialize_row` is `pub(crate)`, so a hermetic case
+    /// on a `JSON` column's own wire form could assert the bytes a value
+    /// produces and had no way to assert the value a frame produces. **It is
+    /// not a change to the driver's behaviour**: no production path calls
+    /// it, and the validating deserializer the client uses is untouched.
+    pub fn deserialize_row_unvalidated<'data, R>(input: &mut &'data [u8]) -> super::Result<R>
+    where
+        R: crate::Row + serde::Deserialize<'data>,
+    {
+        crate::rowbinary::deserialize_row::<R>(input, None)
+    }
 }
 
 #[cfg(test)]

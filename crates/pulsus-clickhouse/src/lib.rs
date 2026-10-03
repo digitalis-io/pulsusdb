@@ -14,6 +14,10 @@
 mod client;
 mod config;
 mod error;
+// Issue #587: `pub`, because `pulsus-read` and `pulsus-write` both name
+// `pulsus_clickhouse::json_column::…` — the `JSON` column's own RowBinary
+// codec, one home for the write side's encoder and the read side's decoder.
+pub mod json_column;
 mod pool;
 mod settings;
 mod tls;

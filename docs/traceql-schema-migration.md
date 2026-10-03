@@ -456,7 +456,7 @@ because the table it reads has no time column.
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:1834-1875`):
+(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2039-2070`):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -491,7 +491,7 @@ no instrument beside it, and a second pair at 20,000,000 spans whose corpus is
 withdrawn (§5); both are replaced by the table above. It cannot be answered off
 the catalog, because
 `trace_tag_catalog_mv` reads `trace_attrs_idx`, which has no `service` column
-(`crates/pulsus-schema/src/catalog.rs:965-969`, `crates/pulsus-schema/src/catalog.rs:365-388`).
+(`crates/pulsus-schema/src/catalog.rs:966-970`, `crates/pulsus-schema/src/catalog.rs:365-388`).
 
 ### 2.5 Three ways a failed write leaves the two tables disagreeing
 
@@ -615,7 +615,7 @@ GROUP BY date, key, val, scope, val_type, val_num, bucket, trace_id;
 Nothing in that view is untried. An `ARRAY JOIN` inside a materialized view is
 what `log_streams_idx_mv` does (`crates/pulsus-schema/src/catalog.rs:934-942`). A `GROUP BY` inside one,
 feeding `SimpleAggregateFunction` columns of an `AggregatingMergeTree`, is what
-`log_metrics_*_mv` does into `log_metrics_*` (`crates/pulsus-schema/src/catalog.rs:945-953`, table at
+`log_metrics_*_mv` does into `log_metrics_*` (`crates/pulsus-schema/src/catalog.rs:946-954`, table at
 `crates/pulsus-schema/src/catalog.rs:266-281`). And the two **together in one view** — `ARRAY JOIN` over
 `trace_spans`'s arrays plus a `GROUP BY` — was built and run for the tag catalog,
 where it produced the same rows as the two-table build. Re-run on corpus C1 with
@@ -1193,7 +1193,7 @@ WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 ```
 
-Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:117`). **Today that is two
+Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:125`). **Today that is two
 statements per batch** — one to fetch the spans, one to ask the index which of
 them carry the attribute:
 
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3080-3100`, used at `crates/pulsus-read/src/traces/exec.rs:2172-2200`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3080-3100`, used at `crates/pulsus-read/src/traces/exec.rs:2268-2296`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -2988,7 +2988,7 @@ Every column, type, codec, sort key, partition key, projection column list and
 materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256, 266-281, 335-407,
 648-936, 934-1000`); every statement and its `SELECT` list (`crates/pulsus-read/src/traces/search_sql.rs:231,
 230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:89, 118, 253, 282`;
-`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:117`,
+`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:125`,
 `crates/pulsus-config/src/model.rs:569-571`); which aggregates push down and what they read
 (`crates/pulsus-read/src/traces/compile.rs:439-489, 560-562`); the write path's failure modes
 (`crates/pulsus-write/src/writer/trace.rs:9-19, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442`;
@@ -3160,11 +3160,11 @@ from its source; the pointer is not reproduced here.
 
 | what | value | where |
 |---|---|---|
-| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:117` |
+| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:125` |
 | candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:569` |
 | scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:570` |
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:571` |
-| spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:122` |
+| spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:130` |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:130, 135` |
 | storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:695` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
 | shard key | `cityHash64(trace_id)` | `crates/pulsus-schema/src/render.rs:55-57` |

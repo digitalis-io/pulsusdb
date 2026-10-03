@@ -16,6 +16,10 @@ mod render;
 mod replay;
 mod rotation;
 
+// Issue #587: `table_column_names` is the one public door onto the
+// catalogue's declared column lists — the trace fetch's projection case
+// derives its expected list from it rather than restating one.
+pub use catalog::table_column_names;
 pub use controller::{
     DEDUP_WINDOW_SECONDS, NameCatalogue, REQUIRED_SERVER_NAMES, SchemaParams, absent_server_names,
     apply_ttl, check_version, guard_skip_ddl_in_init, missing_server_names, mv_projection,

@@ -10,6 +10,13 @@ name = "pulsusdb"
 path = "src/main.rs"
 
 [dependencies]
+# Issue #587: the fetch routes' statement-id prefix — 32 hex chars per
+# request, read from the operating system's own source. The workspace entry
+# says why this crate and not `rand`, and why not `uuid`: the one opaque
+# string per request is the same shape `writer::landing`'s token mint
+# already declines `uuid` for, and `getrandom` adds no crate to this
+# binary's graph.
+getrandom.workspace = true
 # `ws` (issue #74): the `/api/logs/v1/tail` live-tail WebSocket
 # (`axum::extract::ws`) — a feature flag on the existing dependency, not a
 # new one.
@@ -78,6 +85,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Issue #587: TEST-ONLY — the fetch's byte-valued attribute carriers are
+# read as `serde_bytes::ByteBuf`, and `assemble.rs`'s own fixtures build
+# them. No production path in this crate names the crate.
+serde_bytes.workspace = true
 # Issue #320: the shared live-gate guard for the environment-gated
 # suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
 # exit 0, so a CI wiring regression was silent.

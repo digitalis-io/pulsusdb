@@ -98,6 +98,24 @@
 
 use super::search_sql::date_literal;
 
+/// The resource table's `day` partition bound, from two nanosecond
+/// EXPRESSIONS — a window's own literals, or the bound names a statement
+/// that reads its own extent uses (issue #587).
+///
+/// **One owning text, and the explicit `'UTC'` is load-bearing.**
+/// `resources.day` is written by the writer, in Rust, with no timezone in
+/// the computation at all, so the bound has to say `'UTC'` to match it
+/// whatever any DDL does. Measured: for `1700000000000000000` the bare
+/// form returns `2023-11-15` in a non-UTC session and the explicit form
+/// `2023-11-14`, and a trace near a day boundary would then select the
+/// wrong partition and return spans whose resources carry no attributes.
+pub fn resources_day_bound(lo: &str, hi: &str) -> String {
+    format!(
+        "day >= toDate(fromUnixTimestamp64Nano({lo}), 'UTC') \
+         AND day <= toDate(fromUnixTimestamp64Nano({hi}), 'UTC')"
+    )
+}
+
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// The recency table's bucket width in nanoseconds (issue #560). THE
@@ -197,13 +215,56 @@ impl WindowSql {
     /// The row-level bound on `timestamp_ns`, operators chosen by the
     /// convention.
     pub fn time_clause(self) -> String {
+        self.time_clause_on("timestamp_ns")
+    }
+
+    /// [`WindowSql::time_clause`] over a named column, because the trace
+    /// fetch's span table calls the same quantity `start_ns` (issue #587).
+    ///
+    /// **Factored, not duplicated.** A second rendering of the row bound
+    /// is a second place the convention's operators can be written down,
+    /// which is the defect this module exists to remove.
+    pub fn time_clause_on(self, column: &str) -> String {
         let (lo, hi) = match self.bounds {
             WindowBounds::StartOpenEndClosed => (">", "<="),
             WindowBounds::StartClosedEndOpen => (">=", "<"),
         };
         format!(
-            "timestamp_ns {lo} {} AND timestamp_ns {hi} {}",
+            "{column} {lo} {} AND {column} {hi} {}",
             self.start_ns, self.end_ns
+        )
+    }
+
+    /// The span table's row bound (issue #587) — [`time_clause_on`] over
+    /// `start_ns`.
+    ///
+    /// [`time_clause_on`]: WindowSql::time_clause_on
+    pub fn span_time_clause(self) -> String {
+        self.time_clause_on("start_ns")
+    }
+
+    /// The resource table's `day` partition bound (issue #587), from this
+    /// window's own two nanoseconds. [`resources_day_bound`] is the text.
+    pub fn resources_day_clause(self) -> String {
+        resources_day_bound(
+            &self.first_included_ns().to_string(),
+            &self.last_included_ns().to_string(),
+        )
+    }
+
+    /// The span table's leading sort-key bound (issue #587).
+    ///
+    /// **Both sides are divided server-side**, so the reader never
+    /// reproduces `intDiv`'s rounding: `intDiv` truncates toward zero
+    /// where this module's own `div_euclid` floors, and the two disagree
+    /// below the epoch. Handing the engine the nanoseconds and letting it
+    /// divide removes the question rather than answering it.
+    pub fn span_bucket_clause(self) -> String {
+        format!(
+            "intDiv(start_ns, {bucket}) BETWEEN intDiv({}, {bucket}) AND intDiv({}, {bucket})",
+            self.first_included_ns(),
+            self.last_included_ns(),
+            bucket = RECENT_BUCKET_NS
         )
     }
 
@@ -226,10 +287,17 @@ impl WindowSql {
     /// here so the asymmetry reads as a decision rather than an
     /// oversight.
     pub fn date_clause(self) -> String {
+        self.date_clause_on("date")
+    }
+
+    /// [`WindowSql::date_clause`] over a named column (issue #587), the
+    /// same factoring as [`WindowSql::time_clause_on`] and for the same
+    /// reason.
+    pub fn date_clause_on(self, column: &str) -> String {
         let start_days = self.start_ns.div_euclid(NS_PER_DAY);
         let end_days = self.last_included_ns().div_euclid(NS_PER_DAY);
         format!(
-            "date >= {} AND date <= {}",
+            "{column} >= {} AND {column} <= {}",
             date_literal(start_days),
             date_literal(end_days)
         )
@@ -374,6 +442,86 @@ mod tests {
         assert_eq!(
             WindowSql::start_open_end_closed(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause(),
             "date >= toDate('1969-12-30') AND date <= toDate('1969-12-31')"
+        );
+    }
+
+    /// `F-5`: **the span table's three renderings all derive from the
+    /// same last-included nanosecond**, and the resource bound carries its
+    /// explicit zone.
+    ///
+    /// The window used is the one input that can discriminate: it ends
+    /// exactly at a UTC midnight, which is also exactly a five-minute
+    /// bucket boundary. Under the `[start, end)` convention the last
+    /// included nanosecond is the one before it, so the three clauses must
+    /// render the **previous** day, the **previous** bucket and
+    /// `start_ns < <midnight>` together. A clause given `end_ns` instead
+    /// moves one of the three and not the others.
+    #[test]
+    fn the_three_span_renderings_share_one_last_included_nanosecond() {
+        let w = WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
+        assert_eq!(w.last_included_ns(), MIDNIGHT_NS - 1);
+
+        assert_eq!(
+            w.span_time_clause(),
+            format!("start_ns >= {PREV_MIDNIGHT_NS} AND start_ns < {MIDNIGHT_NS}"),
+            "the row bound names the span table's own column and keeps the \
+             convention's operators"
+        );
+        assert_eq!(
+            w.resources_day_clause(),
+            format!(
+                "day >= toDate(fromUnixTimestamp64Nano({PREV_MIDNIGHT_NS}), 'UTC') \
+                 AND day <= toDate(fromUnixTimestamp64Nano({}), 'UTC')",
+                MIDNIGHT_NS - 1
+            ),
+            "the resource day bound's upper argument is the last INCLUDED nanosecond"
+        );
+        assert_eq!(
+            w.resources_day_clause().matches(", 'UTC')").count(),
+            2,
+            "both conversions carry the zone explicitly"
+        );
+        assert_eq!(
+            w.span_bucket_clause(),
+            format!(
+                "intDiv(start_ns, 300000000000) BETWEEN intDiv({PREV_MIDNIGHT_NS}, 300000000000) \
+                 AND intDiv({}, 300000000000)",
+                MIDNIGHT_NS - 1
+            ),
+            "both sides of the bucket bound are divided server-side"
+        );
+
+        // The discriminator: the same window under the INCLUSIVE
+        // convention includes the midnight nanosecond, so all three
+        // clauses move together. A clause that took `end_ns` regardless
+        // would render the inclusive form under both conventions.
+        let inclusive = WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
+        assert_ne!(w.span_time_clause(), inclusive.span_time_clause());
+        assert_ne!(w.resources_day_clause(), inclusive.resources_day_clause());
+        assert_ne!(w.span_bucket_clause(), inclusive.span_bucket_clause());
+    }
+
+    /// The row bound factored on a column name renders the same text for
+    /// the old column as it did before the factoring — the refactor's own
+    /// guard, so the search path's committed SQL cannot move underneath
+    /// it.
+    #[test]
+    fn the_factored_row_and_day_bounds_still_render_the_original_columns() {
+        let w = WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
+        assert_eq!(w.time_clause(), w.time_clause_on("timestamp_ns"));
+        assert_eq!(w.date_clause(), w.date_clause_on("date"));
+        assert!(w.time_clause().starts_with("timestamp_ns >= "));
+        assert!(w.date_clause().starts_with("date >= toDate('"));
+    }
+
+    /// The resource-day bound's one owning text, called with bound NAMES
+    /// — the form the two statements that read their own extent use.
+    #[test]
+    fn the_resource_day_bound_takes_expressions_as_well_as_literals() {
+        assert_eq!(
+            resources_day_bound("ext_lo", "ext_hi"),
+            "day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') \
+             AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')"
         );
     }
 }

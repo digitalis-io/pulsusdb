@@ -72,7 +72,7 @@ use crate::ingest::traces::{
     AttrRecord, AttrValueType, LandingEvent, LandingLink, LandingResource, LandingSpan,
     LandingTagName, LandingTagValue, ParsedTraceLanding, ParsedTraces, SpanRecord, TagScope,
 };
-use crate::writer::trace_json::{TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
+use pulsus_clickhouse::json_column::{TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
 
 /// The `scope` discriminator value for a resource attribute row.
 const SCOPE_RESOURCE: &str = "resource";
@@ -3057,7 +3057,7 @@ fn collect_leaves(
     for entry in &kvlist.values {
         let escaped = format!(
             "{escaped_prefix}.{}",
-            crate::writer::trace_json::escape_json_path(&entry.key)
+            pulsus_clickhouse::json_column::escape_json_path(&entry.key)
         );
         let original = format!("{original_prefix}.{}", entry.key);
         match entry.value.as_ref().and_then(|v| v.value.as_ref()) {
@@ -3170,7 +3170,7 @@ fn land_attrs(
             }
             match land_value(&kv.key, kv.value.as_ref()) {
                 LandedValue::One(value) => entries.push(TraceJsonEntry {
-                    path: crate::writer::trace_json::escape_json_path(&kv.key),
+                    path: pulsus_clickhouse::json_column::escape_json_path(&kv.key),
                     value,
                 }),
                 LandedValue::Leaves(leaves) => {
@@ -3202,7 +3202,7 @@ fn land_attrs(
             LandedValue::One(value) => {
                 record_values(scope, &kv.key, &value, values);
                 entries.push(TraceJsonEntry {
-                    path: crate::writer::trace_json::escape_json_path(&kv.key),
+                    path: pulsus_clickhouse::json_column::escape_json_path(&kv.key),
                     value,
                 });
             }

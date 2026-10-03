@@ -58,7 +58,6 @@ pub(crate) mod rows;
 mod spool;
 mod table;
 mod trace;
-pub(crate) mod trace_json;
 mod trace_landing;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,7 +90,11 @@ pub use rows::{
 pub use spool::SPOOL_CHUNK_BYTES;
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};
-pub use trace_json::{
+// Issue #587: the `JSON` column's codec moved to
+// `pulsus_clickhouse::json_column` — one home for the encoder this crate
+// writes with and the decoder the fetch reads with. The public surface is
+// unchanged; this re-export is what keeps it so.
+pub use pulsus_clickhouse::json_column::{
     TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, escape_json_path,
 };
 pub use trace_landing::TRACE_LANDING_DAY_LIMIT;

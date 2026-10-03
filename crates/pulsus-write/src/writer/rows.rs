@@ -16,7 +16,7 @@ use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::backfill::BackfillRow;
 use crate::writer::registration::StreamKey;
 use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
-use crate::writer::trace_json::TraceJson;
+use pulsus_clickhouse::json_column::TraceJson;
 
 /// One `log_samples` row (docs/schemas.md §3.1). `structured_metadata` is a
 /// canonical sorted-key JSON String (issue #97), the LAST field so the
@@ -3321,7 +3321,7 @@ impl SpoolEncode for TraceLandingRow {
 mod trace_landing_tests {
     use super::*;
     use crate::ingest::traces::{LandingEvent, LandingLink, TagScope};
-    use crate::writer::trace_json::{TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
+    use pulsus_clickhouse::json_column::{TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
 
     const TS: i64 = 1_700_000_000_000_000_000;
 

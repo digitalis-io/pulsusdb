@@ -933,11 +933,12 @@ pub const MIGRATIONS: &[Migration] = &[
     //
     // Id 16's frozen CREATE declares `service_time` as `SELECT *`, so every
     // span's `payload` is stored a SECOND time inside the projection and
-    // re-compressed on every merge. Nothing reads it there: the only
-    // statement that selects `payload` is the trace-by-id point read
-    // (`crates/pulsus-read/src/traces/sql.rs:22`), which filters on
-    // `trace_id` — the BASE table's first sort key — so the optimizer never
-    // reaches the projection for it.
+    // re-compressed on every merge. Nothing on the read path reads it
+    // there, and since issue #587 nothing on the read path reads `payload`
+    // at all: the trace fetch projects the span, per-trace and resource
+    // tables' own columns. The two write-path round-trip suites that still
+    // decode it filter on `trace_id` — the BASE table's first sort key —
+    // so the optimizer never reaches the projection for them either.
     //
     // Ids 44-46 replace `service_time` with the same key order over the 14
     // non-payload columns; ids 47/48 add `name_time`, the same 14 sorted by
@@ -2008,6 +2009,72 @@ pub const MVS: &[MvDef] = &[
     },
 ];
 
+/// The column names one catalogued table declares, in the order its
+/// `CREATE TABLE` template declares them.
+///
+/// Issue #587: the trace fetch's three statements project an explicit
+/// subset of `spans`' and `resources`' columns, and the case that holds
+/// them (`F-14`) compares each projection against **this** list minus the
+/// columns it names as omitted — so a column added to either table shows up
+/// in the derived list and the case fails until the new column is either
+/// projected or named as an omission. Reading the catalogue is what makes
+/// that mechanical; a second hand-written list in the read crate would
+/// drift silently.
+///
+/// `None` for a name this catalogue does not carry, or for one whose DDL is
+/// generated rather than literal ([`Ddl::Dist`]). The parse is deliberately
+/// narrow: the text between the first `(` and the matching `)` of the
+/// template, split on top-level commas, each entry's first whitespace-free
+/// token. It is exact for every `Ddl::Static` table in this file and is not
+/// a general SQL parser.
+pub fn table_column_names(table: &str) -> Option<Vec<&'static str>> {
+    let tmpl = MIGRATIONS
+        .iter()
+        .find(|m| m.name == table)
+        .and_then(|m| match m.ddl {
+            Ddl::Static(t) | Ddl::StaticClusterOnly(t) => Some(t),
+            Ddl::Dist => None,
+        })?;
+    let open = tmpl.find('(')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, c) in tmpl[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &tmpl[open + 1..close?];
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let cut = |slice: &'static str, names: &mut Vec<&'static str>| {
+        if let Some(name) = slice.split_whitespace().next() {
+            names.push(name);
+        }
+    };
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                cut(&body[start..i], &mut names);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    cut(&body[start..], &mut names);
+    Some(names)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2054,8 +2121,8 @@ mod tests {
     /// `docs/schemas.md` §4.1 prints the six base-table ones verbatim.
     ///
     /// This is what this repository means by binding documented SQL — the
-    /// `point_read_sql_is_byte_exact_to_schemas_md_4_2` convention
-    /// (`crates/pulsus-read/src/traces/sql.rs`), strengthened from a
+    /// `all_three_builders_are_byte_frozen` convention
+    /// (`crates/pulsus-read/src/traces/spans/fetch.rs`), strengthened from a
     /// human-maintained literal to a read of the document itself.
     ///
     /// What it does NOT do, said rather than left: it does not bind the
@@ -4100,6 +4167,82 @@ mod tests {
         assert!(
             resources_mv.contains("entity_refs AS entity_refs"),
             "resources_mv must render the entity references:\n{resources_mv}"
+        );
+    }
+
+    /// Issue #587: the declared-column accessor the trace fetch's
+    /// projection case derives its expected list from.
+    ///
+    /// Asserted on the two tables that case reads, in full and in order —
+    /// the point of the accessor is the ORDER as well as the set, because a
+    /// RowBinary projection is positional. The nested `Array(Tuple(...))`
+    /// and `SimpleAggregateFunction(...)` declarations are what the
+    /// top-level comma split has to see past, so both tables are a check on
+    /// the parse and not only on the names.
+    #[test]
+    fn the_declared_column_accessor_reads_each_tables_own_order() {
+        assert_eq!(
+            table_column_names("spans").expect("spans is catalogued"),
+            vec![
+                "trace_id",
+                "span_id",
+                "parent_span_id",
+                "start_ns",
+                "duration_ns",
+                "service",
+                "resource_id",
+                "name",
+                "kind",
+                "status_code",
+                "status_message",
+                "trace_state",
+                "flags",
+                "scope_name",
+                "scope_version",
+                "scope_attrs",
+                "attrs",
+                "attrs_other",
+                "dropped_attrs",
+                "events",
+                "dropped_events",
+                "links",
+                "dropped_links",
+                "scope_schema_url",
+                "scope_dropped_attrs",
+                "scope_attrs_other",
+                "end_ns",
+            ]
+        );
+        assert_eq!(
+            table_column_names("resources").expect("resources is catalogued"),
+            vec![
+                "day",
+                "resource_id",
+                "service",
+                "attrs",
+                "attrs_other",
+                "dropped_attrs",
+                "schema_url",
+                "entity_refs",
+            ]
+        );
+        assert_eq!(
+            table_column_names("traces").expect("traces is catalogued"),
+            vec![
+                "day",
+                "trace_id",
+                "start_ns",
+                "end_ns",
+                "root_service",
+                "root_name",
+                "services",
+                "last_start_ns",
+                "buckets",
+            ]
+        );
+        assert!(
+            table_column_names("not_a_table_in_this_catalogue").is_none(),
+            "an unknown name has no column list"
         );
     }
 }
