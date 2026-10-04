@@ -267,11 +267,7 @@ fn is_ident_byte(b: u8) -> bool {
 /// column, asserted at compile time by
 /// [`finder_tests::every_composer_spelling_starts_with_an_identifier_byte`].
 fn inside_a_string_literal(stripped: &str, blanked: &str, at: usize) -> bool {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = (stripped, blanked, at);
-    false
+    stripped.as_bytes()[at] != blanked.as_bytes()[at]
 }
 
 /// The byte span of the balanced parenthesised argument list that starts
@@ -284,11 +280,28 @@ fn inside_a_string_literal(stripped: &str, blanked: &str, at: usize) -> bool {
 /// and not for this one (where does the span end, so which literal is the
 /// first one in it).
 fn arg_list_span(bytes: &[u8], open: usize) -> (usize, usize) {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = bytes;
-    (open, open)
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        if i > open
+            && let Some(next) = skip_literal_or_comment(bytes, i)
+        {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (open, i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (open, bytes.len())
 }
 
 /// The first plain string literal in `stripped[lo..hi]`, as
@@ -300,10 +313,24 @@ fn arg_list_span(bytes: &[u8], open: usize) -> (usize, usize) {
 /// tree is worse than a refusal. No composer call in the tree is written
 /// that way; rule 1 keeps it so.
 fn first_string_literal(stripped: &str, lo: usize, hi: usize) -> Option<(usize, &str)> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = (stripped, lo, hi);
+    let bytes = stripped.as_bytes();
+    let mut i = lo;
+    while i < hi {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // `r"`, `r#"`, `b"`, `br#"`: the prefix bytes sit immediately
+        // before the quote.
+        if i > lo && matches!(bytes[i - 1], b'r' | b'#' | b'b') {
+            return None;
+        }
+        let end = skip_quoted(bytes, i + 1);
+        if end > hi || end == i + 1 {
+            return None;
+        }
+        return Some((i + 1, &stripped[i + 1..end - 1]));
+    }
     None
 }
 
@@ -311,11 +338,11 @@ fn first_string_literal(stripped: &str, lo: usize, hi: usize) -> Option<(usize, 
 /// `[A-Za-z_][A-Za-z0-9_]*`. A fixed name that is not one means the
 /// literal this scan picked is not the name.
 fn is_identifier(s: &str) -> bool {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = s;
-    false
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(is_ident_byte)
 }
 
 // ---------------------------------------------------------------------
@@ -325,22 +352,117 @@ fn is_identifier(s: &str) -> bool {
 /// Scans one source file. `Err` carries every rule-1 and rule-2
 /// violation found in it, each already prefixed with `file:line`.
 fn scan_source(rel: &str, src: &str) -> Result<FileScan, Vec<String>> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = (rel, src);
-    Ok(FileScan::default())
+    // `.0`: comments blanked, string/char literals intact — the view the
+    // call sites are read from. `.1` additionally blanks literals, and is
+    // only ever consulted through [`inside_a_string_literal`].
+    let (stripped, blanked) = preprocess_views(src);
+    let bytes = stripped.as_bytes();
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut out = FileScan::default();
+
+    // Rule 1: every composer call's argument is readable.
+    for composer in COMPOSER_CALLS {
+        let mut i = 0usize;
+        while let Some(rel_at) = stripped[i..].find(composer) {
+            let at = i + rel_at;
+            i = at + composer.len();
+            // A longer identifier ending in the same text is not a call.
+            if at > 0 && is_ident_byte(bytes[at - 1]) {
+                continue;
+            }
+            let line = line_of(&stripped, at);
+            if inside_a_string_literal(&stripped, &blanked, at) {
+                out.quoted.push(line);
+                continue;
+            }
+            let (lo, hi) = arg_list_span(bytes, at + composer.len() - 1);
+            let Some((_, contents)) = first_string_literal(&stripped, lo, hi) else {
+                errors.push(format!(
+                    "{rel}:{line}: `{composer}…)` is given no readable name — its argument list \
+                     is `{}`. The uniqueness guard compares the literal written at the call \
+                     site, so a name assembled elsewhere, or spelled as a raw or byte string, \
+                     is one it can never compare against another suite's. Write the name as a \
+                     plain string literal here.",
+                    stripped[lo..hi].trim(),
+                ));
+                continue;
+            };
+            let stem = contents.split('{').next().unwrap_or(contents);
+            if !is_identifier(stem) {
+                errors.push(format!(
+                    "{rel}:{line}: `{composer}\"{contents}\"…)` does not begin with an \
+                     identifier, so `{stem}` is not the name this call composes and the literal \
+                     the guard picked is the wrong one. A test object name is \
+                     `[A-Za-z_][A-Za-z0-9_]*`, which is also all \
+                     `pulsus_testkit::test_db` accepts at run time."
+                ));
+                continue;
+            }
+            out.names.push(Name {
+                spelling: contents.to_string(),
+                kind: if contents.contains('{') {
+                    Kind::Composed
+                } else {
+                    Kind::Fixed
+                },
+                file: rel.to_string(),
+                line,
+                composer: (*composer).to_string(),
+            });
+        }
+    }
+
+    // Rule 2, inside the tree: every composer call is qualified.
+    for item in COMPOSER_ITEMS {
+        let mut i = 0usize;
+        while let Some(rel_at) = stripped[i..].find(item) {
+            let at = i + rel_at;
+            i = at + item.len();
+            if at > 0 && is_ident_byte(bytes[at - 1]) {
+                continue;
+            }
+            if inside_a_string_literal(&stripped, &blanked, at) {
+                continue;
+            }
+            if stripped[..at].ends_with(COMPOSER_QUALIFIER) {
+                continue;
+            }
+            errors.push(format!(
+                "{rel}:{}: `{item}` is called without its `{COMPOSER_QUALIFIER}` qualifier. The \
+                 uniqueness guard finds composer calls by their qualified spelling, so this \
+                 name is never compared against any other suite's and the two can collide \
+                 silently. Write `{COMPOSER_QUALIFIER}{item}…)`.",
+                line_of(&stripped, at),
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors)
+    }
 }
 
 /// Every `.rs` file under `root/crates/*/tests`, sorted. The scanned
 /// tree, shared by the whole-tree scan and by the outside-the-tree rule
 /// so the two cannot disagree about where the boundary is.
 fn domain_files(root: &Path) -> BTreeSet<PathBuf> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = root;
-    BTreeSet::new()
+    let mut crate_dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    crate_dirs.sort();
+    let mut out = BTreeSet::new();
+    for dir in crate_dirs {
+        out.extend(rs_files_under(&dir.join("tests")));
+    }
+    out
 }
 
 /// `path` relative to `root`, with forward slashes.
@@ -354,30 +476,135 @@ fn relative(root: &Path, path: &Path) -> String {
 /// Walks the scanned tree. Returns the inventory, or every rule-1 and
 /// rule-2 violation across it.
 fn scan_tree(root: &Path) -> Result<Inventory, Vec<String>> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = root;
-    Ok(Inventory::default())
+    let mut inv = Inventory::default();
+    let mut errors = Vec::new();
+    for file in domain_files(root) {
+        let rel = relative(root, &file);
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        inv.files_scanned += 1;
+        match scan_source(&rel, &src) {
+            Ok(scan) => {
+                inv.names.extend(scan.names);
+                inv.quoted
+                    .extend(scan.quoted.into_iter().map(|line| (rel.clone(), line)));
+            }
+            Err(mut e) => errors.append(&mut e),
+        }
+    }
+    if errors.is_empty() {
+        Ok(inv)
+    } else {
+        Err(errors)
+    }
 }
 
 /// All five floors, over an already-scanned tree. Every floor is
 /// evaluated; the error carries one entry per breach, in [`Floor`] order.
 fn check_floors(inv: &Inventory) -> Result<(), Vec<(Floor, String)>> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = inv;
-    Err(Vec::new())
+    let mut breaches = Vec::new();
+    if inv.files_scanned < MIN_FILES_SCANNED {
+        breaches.push((
+            Floor::FilesScanned,
+            format!(
+                "scanned only {} test source files (floor {MIN_FILES_SCANNED}) — the walk found \
+                 almost nothing, so a green result here would mean nothing was checked.",
+                inv.files_scanned
+            ),
+        ));
+    }
+    if inv.names.len() < MIN_CREATING_CALLS {
+        breaches.push((
+            Floor::CreatingCalls,
+            format!(
+                "found only {} creating calls (floor {MIN_CREATING_CALLS}) — either the live \
+                 suites were deleted or a composer is being spelled a way this scan does not \
+                 match, in which case the names it composes are never compared.",
+                inv.names.len()
+            ),
+        ));
+    }
+    let files: BTreeSet<&str> = inv.names.iter().map(|n| n.file.as_str()).collect();
+    if files.len() < MIN_CALLING_FILES {
+        breaches.push((
+            Floor::CallingFiles,
+            format!(
+                "only {} files compose a test object name (floor {MIN_CALLING_FILES}) — the scan \
+                 is matching one file's shape and missing the rest.",
+                files.len()
+            ),
+        ));
+    }
+    let composed = inv
+        .names
+        .iter()
+        .filter(|n| n.kind == Kind::Composed)
+        .count();
+    if composed < MIN_COMPOSED_NAMES {
+        breaches.push((
+            Floor::ComposedNames,
+            format!(
+                "only {composed} names are composed at run time (floor \
+                 {MIN_COMPOSED_NAMES}) — the class this guard states it covers as templates and \
+                 excludes as renderings has gone, so that note now describes nothing.",
+            ),
+        ));
+    }
+    if inv.quoted.len() < MIN_QUOTED_LOOKALIKES {
+        breaches.push((
+            Floor::QuotedLookalikes,
+            format!(
+                "found only {} composer call(s) that are quoted text rather than calls (floor \
+                 {MIN_QUOTED_LOOKALIKES}) — the one thing this guard has to get right is telling \
+                 those apart, and the tree no longer contains an instance for it to get right.",
+                inv.quoted.len()
+            ),
+        ));
+    }
+    if breaches.is_empty() {
+        Ok(())
+    } else {
+        Err(breaches)
+    }
 }
 
 /// Rule 3: every spelling is composed at exactly one call site.
 fn check_uniqueness(inv: &Inventory) -> Result<(), String> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = inv;
-    Ok(())
+    let mut grouped: BTreeMap<&str, Vec<&Name>> = BTreeMap::new();
+    for name in &inv.names {
+        grouped
+            .entry(name.spelling.as_str())
+            .or_default()
+            .push(name);
+    }
+    let dupes: Vec<(&&str, &Vec<&Name>)> = grouped.iter().filter(|(_, v)| v.len() > 1).collect();
+    if dupes.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "{} test object name(s) are composed at more than one call site. Every live test opens \
+         with `DROP DATABASE IF EXISTS`, so run in parallel — which is how CI and `cargo \
+         nextest` run them, each test in its own process — whichever of these starts second \
+         destroys the other's schema while it is still inserting, and the failure it reports is \
+         a table it created itself coming back unknown:\n",
+        dupes.len()
+    );
+    for (spelling, sites) in &dupes {
+        msg.push_str(&format!("  {spelling}:\n"));
+        for n in sites.iter() {
+            msg.push_str(&format!(
+                "    {}:{} {}…) {:?}\n",
+                n.file, n.line, n.composer, n.kind
+            ));
+        }
+    }
+    msg.push_str(
+        "Give each site its own name, and name it for the file it lives in: two of the three \
+         collisions in issue #616 carried another file's prefix, which is how the copied \
+         literal read as correct.",
+    );
+    Err(msg)
 }
 
 // ---------------------------------------------------------------------
@@ -423,21 +650,60 @@ fn every_test_database_name_is_composed_at_exactly_one_call_site() {
 /// in `.rs` files under `root`, excluding the scanned tree and
 /// [`COMPOSER_CRATE`]. `vendor`, `target` and `.git` are not walked.
 fn composer_sites_outside_the_tree(root: &Path) -> (usize, Vec<String>) {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = root;
-    (0, Vec::new())
+    let domain = domain_files(root);
+    let mut all = Vec::new();
+    walk_outside(root, &mut all);
+    all.sort();
+    let mut files = 0usize;
+    let mut sites = Vec::new();
+    for file in all {
+        if domain.contains(&file) {
+            continue;
+        }
+        let rel = relative(root, &file);
+        if rel.starts_with(COMPOSER_CRATE) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        files += 1;
+        let (stripped, blanked) = preprocess_views(&src);
+        let import = format!("use {COMPOSER_QUALIFIER}");
+        for needle in COMPOSER_CALLS.iter().copied().chain([import.as_str()]) {
+            let mut i = 0usize;
+            while let Some(rel_at) = stripped[i..].find(needle) {
+                let at = i + rel_at;
+                i = at + needle.len();
+                if inside_a_string_literal(&stripped, &blanked, at) {
+                    continue;
+                }
+                sites.push(format!("{rel}:{} `{needle}`", line_of(&stripped, at)));
+            }
+        }
+    }
+    (files, sites)
 }
 
 /// [`rs_files_under`] with `target`, `vendor` and `.git` left unwalked:
 /// a build directory holds generated sources and `vendor` holds other
 /// people's crates, neither of which can call this project's composer.
 fn walk_outside(dir: &Path, out: &mut Vec<PathBuf>) {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = (dir, out);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            if matches!(name.to_str(), Some("target" | "vendor" | ".git")) {
+                continue;
+            }
+            walk_outside(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// The entries in [`COMPOSER_CRATE`]'s `[dependencies]` table.
@@ -447,11 +713,21 @@ fn walk_outside(dir: &Path, out: &mut Vec<PathBuf>) {
 /// composes a string and can reach no server. Add a dependency and the
 /// exemption has to be argued again.
 fn testkit_dependencies(root: &Path) -> Vec<String> {
-    // Issue #616, tests-first commit: stub. The implementation
-    // lands in the next commit; every test above must fail on an
-    // assertion here, not on a compile error.
-    let _ = root;
-    Vec::new()
+    let manifest = root.join(COMPOSER_CRATE).join("Cargo.toml");
+    let src = std::fs::read_to_string(&manifest).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in src.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == "[dependencies]";
+            continue;
+        }
+        if inside && !line.is_empty() && !line.starts_with('#') {
+            out.push(line.to_string());
+        }
+    }
+    out
 }
 
 /// The scan's domain is the whole of the composer's reach: no `.rs` file
