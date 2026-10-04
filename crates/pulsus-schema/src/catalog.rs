@@ -517,14 +517,14 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
-    // --- metric_series per-series value-type routing signal (M7-A2, #113) ---
-    // Additive ALTERs (the id 21/22 `structured_metadata` precedent), never a
-    // mutation of id 4's frozen `metric_series` CREATE. `value_type`: 0 =
-    // float, 1 = histogram; pre-M7 rows read back 0 (float) — no data
-    // migration. This is the per-series float/histogram/mixed routing signal:
-    // A4 writes it (LRU key gains `value_type`), A5 reads it (the type-mask
-    // co-load) — A2 only adds the column. An ALTER carries no `ENGINE =`
-    // clause, so it passes through `render` unchanged in cluster mode.
+    // --- metric_series per-series value-type discriminator (M7-A2, #113) ---
+    // Additive ALTERs (the id 21/22 `structured_metadata` precedent), never a mutation
+    // of id 4's frozen `metric_series` CREATE. `value_type`: 0 = float, 1 = histogram;
+    // pre-M7 rows read back 0 (float) — no data migration. A4 writes it; the read path
+    // does NOT consult it for routing and dual-reads both sample tables, and the rule
+    // and its reason are `docs/schemas.md` §2.4 (the type-mask co-load this comment
+    // once named was deleted in #112's plan v5). A2 only adds the column. An ALTER
+    // carries no `ENGINE =` clause, so `render` passes it unchanged in cluster mode.
     Migration {
         id: 25,
         name: "metric_series",
@@ -2959,11 +2959,11 @@ mod tests {
         ));
     }
 
-    /// Issue #113: the `value_type` routing signal is added to `metric_series`
-    /// via an additive `ADD COLUMN IF NOT EXISTS` (id 25) — never a mutation
-    /// of id 4's frozen CREATE — as `UInt8 DEFAULT 0` (0 = float; pre-M7 rows
-    /// read back 0, no data migration). An ALTER carries no `ENGINE =` clause,
-    /// so it passes through `render` unchanged even in cluster mode.
+    /// Issue #113: the `value_type` discriminator is added to `metric_series` via an
+    /// additive `ADD COLUMN IF NOT EXISTS` (id 25) — never a mutation of id 4's frozen
+    /// CREATE — as `UInt8 DEFAULT 0` (0 = float; pre-M7 rows read back 0, no data
+    /// migration). The read path does not consult it for routing (`docs/schemas.md`
+    /// §2.4). An ALTER has no `ENGINE =` clause, so cluster rendering leaves it alone.
     #[test]
     fn metric_series_value_type_base_alter_is_additive_uint8_default_zero() {
         let ddl = rendered_static(25);

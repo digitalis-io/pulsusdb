@@ -66,6 +66,15 @@ upgraded deployments converge byte-identically and pre-M7 rows read back `0`
 with no data migration. This is the per-series routing signal telling the read
 path which sample table(s) to touch for a fingerprint.
 
+> **Superseded by A1's plan v5 (#112), 2026-07-18 — the sentence above and the
+> paragraph below.** `value_type` is not a routing signal and the read path does
+> not consult it. The type-mask-plus-probe mechanism was A1's plans v2 and v3;
+> review failed it twice, and plan v5 deleted it and passed with no findings:
+> "A1's read path must not consult `value_type` for routing … The column remains
+> inert to the read path in M7." The rule in force, and the reason for it, is
+> [docs/schemas.md §2.4](../schemas.md)'s writer-contract paragraph. Both
+> passages are kept as the record of what was proposed.
+
 The read path uses `value_type` as a **snapshot type-mask plus a bounded
 live-tail probe** to stay correct when a series changes or mixes types near the
 query edge — the mechanism is designed in [A1 (#112)](https://github.com/digitalis-io/pulsusdb/issues/112);
@@ -84,4 +93,5 @@ this ADR governs storage only.
 - Downstream milestones build on this table: the engine value model, OTLP native
   ingest, and histogram PromQL functions/routing (A3/A4/A5) — A2 delivers the
   tables (`metric_hist_samples`, its `_dist` wrapper, and `metric_series.value_type`)
-  and nothing else.
+  and nothing else. The milestone names are the ones A2 used; A5's own
+  `value_type` routing is the superseded design marked in §(c) above.
