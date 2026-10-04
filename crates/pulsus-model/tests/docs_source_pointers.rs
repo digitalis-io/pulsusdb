@@ -3,8 +3,8 @@
 //!
 //! A design document here cites source by line number — "see
 //! `exec.rs:125`". When the source moves the citation goes stale, and a
-//! stale citation is read as current. An earlier check covered three
-//! documents out of the eleven that carry pointers, and on those three it
+//! stale citation is read as current. An earlier check covered three of
+//! the twenty documents that carry pointers, and on those three it
 //! compared the cited line against a snapshot of itself: a pointer moved
 //! to a wrong line, with the snapshot regenerated, passed.
 //!
@@ -19,8 +19,10 @@
 //! and the source does not. Regenerating a dataset cannot make a wrong
 //! pointer right, because no dataset here holds the cited line's text.
 //!
-//! **Five written forms are read**, not one. The fifth — a comma list —
-//! was found while writing this and is not in the issue's table.
+//! **Five written forms are read**, not one: a qualified path, a bare
+//! basename, a continuation, a comma list, and a Markdown link followed
+//! by `(line N)`. See [`Form`]. The comma list was found while writing
+//! this and is not in the issue's table.
 //!
 //! # The rule, in full
 //!
@@ -57,10 +59,21 @@
 //! of that class are frozen in [`FOREIGN_TSV`] so that a mistyped path to
 //! one of our own files cannot hide in it.
 //!
+//! A pointer with `@ <version>` after it. That marks a line in another
+//! crate or in the reference at a stated version, and the version is not
+//! what this tree holds.
+//!
 //! A pointer that anchors on a name which is also somewhere else in the
 //! file. The name is a word the document prints, not a proof, and a short
 //! common word can land anywhere. The census below counts how many
 //! pointers anchor on a name shorter than eight characters.
+//!
+//! One bare basename meaning two different files in one document. Both
+//! occurrences are read and each is checked against the file its own
+//! sentence picks, which is right where a document cites
+//! `metrics/exec.rs` in one section and `traces/exec.rs` in another —
+//! `docs/query-lowering.md` does — and which cannot distinguish that
+//! from a mistake.
 //!
 //! # The census, and how to re-take it
 //!
@@ -69,33 +82,36 @@
 //!     the_census_of_source_pointers
 //! ```
 //!
-//! On `23770e3d`, before any repair:
+//! Two readings, both from that command. The left column is `23770e3d`
+//! with the documents as they were; the right is the same tree with the
+//! coordinates repaired.
 //!
 //! ```text
-//! documents scanned                                     45
-//! documents carrying at least one pointer               20
-//!   qualified path   `crates/pulsus-read/src/x.rs:12`   862
-//!   bare filename    `x.rs:12`                          635
-//!   continuation     `:12` and `x.rs:12,34`             430
-//!   linked path      [`sym`](../crates/.../x.rs) (12)    13
-//!   pointers written                                   1,940
-//!   distinct (document, pointer) keys                  1,516
-//! anchored                                               412
-//!   by the range printing the name                       360
-//!   by the range lying in the name's definition           52
-//! FAILS                                                   32
-//!   names a symbol defined elsewhere                      32
-//!   beyond the end of the file                              0
-//! cannot be checked by this rule                       1,072
-//!   not in this repository                               419
-//!   pinned to another version, `@ v3.0.2`                224
-//!   ambiguous basename                                    68
-//!   no name the target file holds                        361
+//!                                                     before   after
+//! documents scanned                                       45      45
+//! documents carrying at least one pointer                 20      20
+//!   qualified path   `crates/pulsus-read/src/x.rs:12`     862     862
+//!   bare filename    `x.rs:12`                            635     635
+//!   continuation     `:12` and `x.rs:12,34`               430     430
+//!   linked path      [`sym`](../crates/.../x.rs) (12)      13      13
+//!   pointers written                                   1,940   1,940
+//! anchored                                                501     544
+//!   the range prints the name                             436     481
+//!   the range is inside the name's definition              65      63
+//! FAILS                                                    25       0
+//!   names a symbol defined elsewhere                       25       0
+//!   beyond the end of the file                              0       0
+//! cannot be checked by this rule                        1,414   1,396
+//!   not in this repository                                488     488
+//!   pinned to another version, `@ v3.0.2`                 234     234
+//!   ambiguous basename                                    167     167
+//!   no name the target file holds                         525     507
+//! anchored on a name shorter than eight characters        119     127
 //! ```
 //!
-//! The forms are counted per written pointer and the verdicts per key: a
-//! token written twice in one document names one target both times, so a
-//! key gets the better of its occurrences' verdicts. See [`rank`].
+//! The forms and the verdicts are counted per written pointer. The frozen
+//! dataset is keyed by `(document, pointer)` and holds only the keys where
+//! no occurrence anchors and none fails — 1,082 before, 1,075 after.
 //!
 //! The issue counted 961 over eleven documents; three earlier sweeps of
 //! one change answered 3, then 27, then more. Every one of those numbers
@@ -113,6 +129,15 @@ const FOREIGN_TSV: &str = "crates/pulsus-model/tests/docs_source_pointers_foreig
 /// seeing a form is the failure this issue is about, so the floor is
 /// stated per form below as well.
 const POINTERS_FLOOR: usize = 1_700;
+
+/// How far from a pointer a name can be and still be read as that
+/// pointer's subject, in characters of the paragraph.
+///
+/// Without a cap, a name anywhere in a paragraph reaches the one pointer
+/// nearest to it however far that is, and six correct pointers were
+/// convicted on a name two or three lines away. Eighty characters is
+/// about a line of this repository's prose.
+const NAME_REACH: usize = 80;
 
 fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -195,16 +220,19 @@ struct Pointer {
     /// The document wrote `@ <version>` after it, so the line is in
     /// another tree at a stated version. See [`pinned_after`].
     pinned: bool,
-    /// The names of the nearest backticked token to the pointer that is
-    /// not itself a pointer. **Only these can make a pointer FAIL.**
+    /// The names of the backticked token nearest to this pointer, where
+    /// this pointer is also the nearest pointer to that token. **Only
+    /// these can make a pointer FAIL.**
     ///
-    /// Using every name on the line convicted a correct pointer the
-    /// first time this was run: one table row in
-    /// `docs/TraceQL/functional-requirements.md` carries four pointers
-    /// and six backticked names, and `intrinsics.rs:61-63`, which points
-    /// exactly at the function the row says produces a list, was
-    /// convicted on `KEYWORD_TYPE` — a name belonging to a different
-    /// pointer on the same row.
+    /// Both halves were learnt by running the check and reading what it
+    /// convicted. Using every name on the line convicted
+    /// `intrinsics.rs:61-63` in a `docs/TraceQL/functional-requirements.md`
+    /// row that carries four pointers and six names, on `KEYWORD_TYPE` —
+    /// a name belonging to a different pointer. Using the nearest name
+    /// alone then convicted `trace.rs:9-19` in
+    /// `docs/traceql-schema-migration.md`, which points at the module
+    /// doc it means, on `admit_batch` — the name of the pointer after it,
+    /// and nearer to that one. A name belongs to one pointer.
     near: BTreeSet<String>,
     /// Names the enclosing paragraph prints, or the table row for a
     /// pointer in a table. A table is one paragraph and a wide table
@@ -287,36 +315,6 @@ fn backticked(line: &str) -> Vec<String> {
     backticked_at(line).into_iter().map(|(_, _, t)| t).collect()
 }
 
-/// The names of the nearest backticked token to `at` that is not itself
-/// a pointer and that prints at least one name.
-///
-/// Nearest in either direction, **measured to the token's near edge**: a
-/// document writes both "`X` is built at `plan.rs:12`" and "at
-/// `plan.rs:12`, `X` is built". Measuring to the opening backtick
-/// instead made the token AFTER the pointer win in
-/// `` `compile_filter_predicate` (line 202) → `render_expr` (378) →
-/// `lower_leaf` (530) ``, where each number belongs to the name
-/// immediately before it, so `(378)` was convicted on `lower_leaf`.
-fn nearest_names(line: &str, at: usize) -> BTreeSet<String> {
-    let mut toks: Vec<(usize, BTreeSet<String>)> = backticked_at(line)
-        .into_iter()
-        .map(|(open, close, t)| {
-            let d = if close < at {
-                at - close
-            } else {
-                open.abs_diff(at)
-            };
-            (d, names_of(&t))
-        })
-        .filter(|(_, ns)| !ns.is_empty())
-        .collect();
-    toks.sort_by_key(|(d, _)| *d);
-    toks.into_iter()
-        .next()
-        .map(|(_, ns)| ns)
-        .unwrap_or_default()
-}
-
 /// Is this a file path a document would write? The last segment must end
 /// in a dot and one to eight letters.
 ///
@@ -375,32 +373,26 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
     let mut out = Vec::new();
     // The last file named on an earlier line.
     let mut running: Option<String> = None;
+    // The current paragraph's pointers and name tokens, at offsets that
+    // run across the paragraph, and where the current line starts in it.
+    let mut drafts: Vec<((usize, usize), Pointer)> = Vec::new();
+    let mut tokens: Vec<((usize, usize), BTreeSet<String>)> = Vec::new();
+    let mut base = 0usize;
+    let mut this_para = usize::MAX;
     for (idx, line) in lines.iter().enumerate() {
         let doc_line = idx as u32 + 1;
+        if para_of[idx] != this_para {
+            settle(&mut drafts, &tokens, &mut out);
+            tokens.clear();
+            base = 0;
+            this_para = para_of[idx];
+        }
         // A table row is its own context; see [`Pointer::wide`].
         let mut wide: BTreeSet<String> =
             backticked(line).iter().flat_map(|t| names_of(t)).collect();
         if !line.trim_start().starts_with('|') && para_of[idx] != usize::MAX {
             wide.extend(names_of_para[para_of[idx]].iter().cloned());
         }
-        let mut push =
-            |form, path_text: &str, first, last, pinned, at: usize, extra: &BTreeSet<String>| {
-                let mut near = nearest_names(line, at);
-                near.extend(extra.iter().cloned());
-                let mut wide = wide.clone();
-                wide.extend(extra.iter().cloned());
-                out.push(Pointer {
-                    doc: doc.to_string(),
-                    doc_line,
-                    form,
-                    path_text: path_text.to_string(),
-                    first,
-                    last,
-                    pinned,
-                    near,
-                    wide,
-                });
-            };
 
         // Every file this line names, by offset, so a continuation can
         // take the nearest one before it.
@@ -430,74 +422,176 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
             }
         };
 
-        // Forms A, B and the comma list.
+        // Pass one: where the pointers are, and what each is.
+        // `(span in the line, form, file, first, last, pinned, extra names)`
+        type Found = (
+            (usize, usize),
+            Form,
+            String,
+            u32,
+            u32,
+            bool,
+            BTreeSet<String>,
+        );
+        let mut found: Vec<Found> = Vec::new();
         for w in &written {
             let form = if w.path.contains('/') {
                 Form::Qualified
             } else {
                 Form::Bare
             };
-            push(
+            found.push((
+                (w.at, w.end),
                 form,
-                &w.path,
+                w.path.clone(),
                 w.first,
                 w.last,
                 w.pinned,
-                w.at,
-                &BTreeSet::new(),
-            );
-            for n in &w.also {
-                push(
+                BTreeSet::new(),
+            ));
+            // A comma list's further numbers each sit at their own place.
+            for (n, at) in &w.also {
+                found.push((
+                    (*at, *at),
                     Form::Continuation,
-                    &w.path,
+                    w.path.clone(),
                     *n,
                     *n,
                     w.pinned,
-                    w.at,
-                    &BTreeSet::new(),
-                );
+                    BTreeSet::new(),
+                ));
             }
         }
-
         // Form D: a file named in the text, then `(line N)` or `(N)`.
-        for (at, first, last) in parenthesised(line) {
+        for (at, end, first, last) in parenthesised(line) {
             if let Some((path, extra)) = antecedent(at) {
-                push(Form::Linked, &path, first, last, false, at, &extra);
+                found.push(((at, end), Form::Linked, path, first, last, false, extra));
             }
+        }
+        // Form C.
+        for (at, end, first, last, pinned) in continuations(line) {
+            let (path, _) = antecedent(at).unwrap_or_default();
+            found.push((
+                (at, end),
+                Form::Continuation,
+                path,
+                first,
+                last,
+                pinned,
+                BTreeSet::new(),
+            ));
         }
 
-        // Form C.
-        for (at, first, last, pinned) in continuations(line) {
-            match antecedent(at) {
-                Some((path, _)) => push(
-                    Form::Continuation,
-                    &path,
-                    first,
-                    last,
-                    pinned,
-                    at,
-                    &BTreeSet::new(),
-                ),
-                // A continuation nothing can attribute. Counted and
-                // frozen under its own reason rather than dropped — a
-                // dropped pointer is a pointer no check can ever see.
-                None => push(
-                    Form::Continuation,
-                    "",
-                    first,
-                    last,
-                    pinned,
-                    at,
-                    &BTreeSet::new(),
-                ),
+        // The pointers and the name tokens of this line, carried at
+        // offsets that run across the whole paragraph. Ownership is
+        // settled per paragraph, not per line: a sentence that wraps puts
+        // the name on one line and its pointer on the next, and
+        // `docs/traceql-schema-migration.md` does exactly that —
+        // "`admit_batch` at" ends one line and the pointer it belongs to
+        // begins the next, so a line-scoped rule gave `admit_batch` to
+        // the pointer before it and convicted a correct one.
+        for f in found {
+            drafts.push((
+                (base + f.0.0, base + f.0.1),
+                Pointer {
+                    doc: doc.to_string(),
+                    doc_line,
+                    form: f.1,
+                    path_text: f.2,
+                    first: f.3,
+                    last: f.4,
+                    pinned: f.5,
+                    near: f.6.clone(),
+                    wide: {
+                        let mut w = wide.clone();
+                        w.extend(f.6.iter().cloned());
+                        w
+                    },
+                },
+            ));
+        }
+        for (open, close, tok) in backticked_at(line) {
+            let ns: BTreeSet<String> = names_of(&tok)
+                .into_iter()
+                .filter(|n| convictable(n))
+                .collect();
+            if !ns.is_empty() {
+                tokens.push(((base + open, base + close), ns));
             }
         }
+        base += line.len() + 1;
 
         if let Some((_, p, _)) = named.last() {
             running = Some(p.clone());
         }
     }
+    settle(&mut drafts, &tokens, &mut out);
     out
+}
+
+/// Gives each name token to the pointer it is nearest to, and each
+/// pointer the nearest name it owns.
+fn settle(
+    drafts: &mut Vec<((usize, usize), Pointer)>,
+    tokens: &[((usize, usize), BTreeSet<String>)],
+    out: &mut Vec<Pointer>,
+) {
+    let spans: Vec<(usize, usize)> = drafts.iter().map(|(sp, _)| *sp).collect();
+    let mut owned: Vec<Option<(usize, BTreeSet<String>)>> = vec![None; drafts.len()];
+    for (tok_span, ns) in tokens {
+        // **A name owns the nearest pointer that FOLLOWS it.** These
+        // documents write the name first and the coordinate after it —
+        // "`PlannedAggregate` was built at `search_plan.rs:2119`",
+        // "`compile_filter_predicate` (line 209)". Letting a name own a
+        // pointer before it convicted `trace.rs:9-19` in
+        // `docs/traceql-schema-migration.md` §12 on `admit_batch`, which
+        // belongs to the `` `:344-586` `` after it across a line break.
+        let Some((i, d)) = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, sp)| sp.0 >= tok_span.1)
+            .map(|(i, sp)| (i, gap(*tok_span, *sp)))
+            .min_by_key(|(_, d)| *d)
+        else {
+            continue;
+        };
+        if d > NAME_REACH {
+            continue;
+        }
+        match &owned[i] {
+            Some((had, _)) if *had <= d => {}
+            _ => owned[i] = Some((d, ns.clone())),
+        }
+    }
+    for (i, (_, mut p)) in drafts.drain(..).enumerate() {
+        let mut near = owned[i].clone().map(|(_, ns)| ns).unwrap_or_default();
+        near.extend(p.near.iter().cloned());
+        p.near = near;
+        out.push(p);
+    }
+}
+
+/// Can this name convict a pointer?
+///
+/// Not if it is an SQL keyword the prose prints in capitals. `` `LIMIT …
+/// BY` `` reads as the name `LIMIT`, which is also a `const` in
+/// `search_plan.rs`, and it convicted the correct pointer beside it. A
+/// capitalised name with an underscore is a Rust constant —
+/// `MAX_EXPANDED_BYTES` anchors a pointer in
+/// `docs/TraceQL/functional-requirements.md` — so the rule is narrow:
+/// all upper case AND no underscore.
+fn convictable(name: &str) -> bool {
+    name.contains('_') || !name.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// The gap between two spans in a paragraph, zero if they touch or
+/// overlap.
+fn gap(a: (usize, usize), b: (usize, usize)) -> usize {
+    if a.1 < b.0 {
+        b.0 - a.1
+    } else {
+        a.0.saturating_sub(b.1)
+    }
 }
 
 /// Every token on a line that is a bare file path, with its offset.
@@ -580,8 +674,10 @@ struct Written {
     path: String,
     first: u32,
     last: u32,
-    /// The further lines of a comma list.
-    also: Vec<u32>,
+    /// Byte offset just past the pointer's last digit.
+    end: usize,
+    /// The further lines of a comma list, each with its own offset.
+    also: Vec<(u32, usize)>,
     pinned: bool,
 }
 
@@ -624,11 +720,13 @@ fn written_out(line: &str) -> Vec<Written> {
             if more.is_empty() {
                 break;
             }
+            let at = j + 1;
             j += 1 + m;
-            also.push(more.parse().expect("digits"));
+            also.push((more.parse().expect("digits"), at));
         }
         out.push(Written {
             at: start,
+            end: j,
             path: path.to_string(),
             first: first.parse().expect("digits"),
             last: last.parse().expect("digits"),
@@ -677,7 +775,7 @@ fn markdown_links(line: &str) -> Vec<Link> {
 ///
 /// The bare spelling is how `` `compile_filter_predicate` (line 202) →
 /// `render_expr` (378) `` writes its second and third pointers.
-fn parenthesised(line: &str) -> Vec<(usize, u32, u32)> {
+fn parenthesised(line: &str) -> Vec<(usize, usize, u32, u32)> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -712,6 +810,7 @@ fn parenthesised(line: &str) -> Vec<(usize, u32, u32)> {
         }
         out.push((
             open,
+            j,
             first.parse().expect("digits"),
             last.parse().expect("digits"),
         ));
@@ -724,7 +823,7 @@ fn parenthesised(line: &str) -> Vec<(usize, u32, u32)> {
 ///
 /// The backticks are part of the form: a bare `:825` in prose is an
 /// ordinary colon before a number.
-fn continuations(line: &str) -> Vec<(usize, u32, u32, bool)> {
+fn continuations(line: &str) -> Vec<(usize, usize, u32, u32, bool)> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -747,6 +846,7 @@ fn continuations(line: &str) -> Vec<(usize, u32, u32, bool)> {
         if bytes.get(j) == Some(&b'`') {
             out.push((
                 open,
+                j,
                 first.parse().expect("digits"),
                 last.parse().expect("digits"),
                 pinned_after(line, j),
@@ -1103,24 +1203,16 @@ struct Reading {
     /// the keys where **no** occurrence anchors and none fails. These are
     /// the pointers the rule has no answer for.
     frozen: BTreeMap<(String, String), (&'static str, Pointer)>,
-    /// One token anchoring in two different files: the key is then not a
-    /// target, and both datasets are keyed on it.
-    split: Vec<String>,
 }
 
 fn reading() -> Reading {
     let (docs, occurrences) = all_pointers();
-    let mut anchored_paths: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut answered: BTreeSet<(String, String)> = BTreeSet::new();
     let mut fails = Vec::new();
     let mut frozen: BTreeMap<(String, String), (&'static str, Pointer)> = BTreeMap::new();
     for (p, v) in &occurrences {
         match v {
-            Verdict::Anchored { path, .. } => {
-                anchored_paths
-                    .entry(p.key())
-                    .or_default()
-                    .insert(path.clone());
+            Verdict::Anchored { .. } => {
                 answered.insert(p.key());
             }
             Verdict::BeyondEndOfFile { .. } | Verdict::DefinedElsewhere { .. } => {
@@ -1139,17 +1231,11 @@ fn reading() -> Reading {
         }
     }
     frozen.retain(|k, _| !answered.contains(k));
-    let split: Vec<String> = anchored_paths
-        .iter()
-        .filter(|(_, paths)| paths.len() > 1)
-        .map(|((doc, token), paths)| format!("{doc} cites {token}, which anchors in {paths:?}"))
-        .collect();
     Reading {
         docs,
         occurrences,
         fails,
         frozen,
-        split,
     }
 }
 
@@ -1238,7 +1324,7 @@ fn frozen_foreign() -> BTreeSet<String> {
 #[test]
 fn every_source_pointer_in_the_documents_points_at_what_it_names() {
     let r = reading();
-    let mut problems: Vec<String> = r.split;
+    let mut problems: Vec<String> = Vec::new();
     for (p, v) in &r.fails {
         match v {
             Verdict::BeyondEndOfFile { path, lines } => problems.push(format!(

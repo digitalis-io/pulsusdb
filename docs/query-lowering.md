@@ -59,14 +59,14 @@ five call sites across three files: `plan.rs:1710`, `plan.rs:1732`, `plan.rs:377
 `pipeline.rs:1117`, `exec.rs:2809`.
 
 TraceQL computes the same thing a fourth time and shares none of it:
-[`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2327) walks a boolean tree
+[`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2737) walks a boolean tree
 choosing candidate generators, and
-[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1083) walks the pipeline.
+[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1928) walks the pipeline.
 
 The core replaces TraceQL's hand-written walks; LogQL's walks stay in LogQL's compiler by the decision above.
 
 **And the cost of not having it was measurable.** TraceQL's spanset aggregate had no SQL path at
-all when this record was written: `PlannedAggregate` was built at `search_plan.rs:1487` and read at
+all when this record was written: `PlannedAggregate` was built at `search_plan.rs:2119` and read at
 exactly one place, `search_eval.rs:2439`. Every matching span was therefore transported and then
 discarded. (Issue #492 part 4 gave `min(duration)`, `max(duration)` and `count()` over a
 single attribute-equality selector a `HAVING` in the generator statement; every other aggregate
@@ -301,7 +301,7 @@ spanset's spans, i.e. the matched set, not the trace's spans — and `aggregateC
 `len(ss.Spans)` (`pkg/traceql/ast_execute.go:243-280` @ grafana/tempo v3.0.2,
 `0c4b926d09234186de39833e9c7ecb5b7614c8b9`). A span whose aggregated value is nil is skipped, and
 a spanset with no non-nil value is dropped rather than emitted as zero — which is what our
-`aggregate_value` (`search_eval.rs:1856`) returning `None` already does.
+`aggregate_value` (`search_eval.rs:2222`) returning `None` already does.
 
 ### 2.3 Shape composition, and the open column set
 
@@ -970,8 +970,8 @@ core builds carries either today.
 
 **The same decision in LogQL belongs to LogQL's compiler, not to this cut.** LogQL keeps its own
 compiler, separate from the core (owner decision, #507). Its page loop is
-`StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:83`, set at `:1655` from
-`has_unpushed_dropping_stage`, `:1673`); when it is set the read is one statement per page through
+`StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:83`, set at `:1658` from
+`has_unpushed_dropping_stage`, `:1688`); when it is set the read is one statement per page through
 `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:851`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. Whether a compiled LogQL filter
 lets the request's limit into the statement is decided in `plan.rs`; §2.7.7's `Fidelity` does not
@@ -1172,7 +1172,7 @@ blocking behaviour the reader has to infer.
 #### Payload validation runs BEFORE the fold, and the rejection governs
 
 **A disposition in the table below is only ever reached by a payload the shipped planner accepts.**
-`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1117`) refuses several payloads of
+`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1928`) refuses several payloads of
 `Aggregate`, `By` and `Select` with `PlanError`, which
 `crates/pulsus-server/src/traces_api/error.rs:304` maps to **`400`** with
 `Content-Type: text/plain; charset=utf-8` (`:270-277`). Without this rule the design would be a
@@ -1201,8 +1201,8 @@ cannot be reached by any request:
 | `Aggregate` | a non-finite numeric threshold (`:1046`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
 | `By` | a composite key expression (`:1125`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
 | `By` | a span-event / span-link intrinsic key (`:1435`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
-| `Select` | a nested-set intrinsic (`:1277`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
-| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:1322`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Select` | a nested-set intrinsic (`:2181`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
+| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2226`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
 | `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
@@ -1286,8 +1286,8 @@ See §5, which covers both languages.
 ### 3.3 Group 2 — could be lowered, has not been
 
 [`metrics_sql`](../crates/pulsus-read/src/traces/metrics_sql.rs) already compiles a `{...}` filter
-body to SQL — `compile_filter_predicate` (line 202) → `render_expr` (378) → `lower_leaf` (530),
-with attribute leaves lowered by `LeafSink::attr_leaf` (354), which since issue
+body to SQL — `compile_filter_predicate` (line 209) → `render_expr` (385) → `lower_leaf` (537),
+with attribute leaves lowered by `LeafSink::attr_leaf` (361), which since issue
 [#559](https://github.com/digitalis-io/pulsusdb/issues/559) calls the SAME
 `filter::probe_column` the search route's span-row slots are built by. **The search path does not
 call `metrics_sql` itself.**
@@ -1471,7 +1471,7 @@ nobody later reads them as unfinished work.
 | **structural relations** `>` `>>` `<` `<<` `~` and their `!`/`&` forms | the relation holds between two spans of one trace and is evaluated over the **hydrated** span set — window-bounded and truncated at `MAX_SPANS_PER_TRACE` = 10,000 (`exec.rs:124`). The answer is a function of our own batching, so a SQL form would have to reproduce a limit that only the client-side query defines |
 | **the nested-set numbering** `nestedSetLeft`, `nestedSetRight`, and `nestedSetParent` outside the root sentinel | a modified-preorder numbering computed per trace at query time from the `parent_id` forest; no stored column carries it. The root sentinel **is** expressible and is already lowered (`metrics_sql.rs:562`) |
 | **trace-level intrinsics** `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | resolved from a co-load that is deliberately trace-wide with **no time predicate**, because the true root may predate the window. A window-bounded statement cannot read those rows at all. Already refused on the metrics path for this reason (`lower_leaf`, `metrics_sql.rs:546`) |
-| **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:423`) |
+| **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:529`) |
 | **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
 
 **Cross-attribute comparison is deliberately not in this table.** `{ .a = .b }` compares two rows
@@ -5541,16 +5541,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | of those, citing a bare basename | 519 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
-| `(document, token)` pairs the rule resolves | 365 |
-| occurrences those resolved pairs cover | 495 |
-| `(document, token)` pairs it cannot resolve | 108 |
-| occurrences those frozen pairs cover | 198 |
-| resolved rows anchored on a token the citing prose prints | 165 |
-| resolved rows anchored on a snapshot of the cited line | 200 |
+| `(document, token)` pairs the rule resolves | 362 |
+| occurrences those resolved pairs cover | 492 |
+| `(document, token)` pairs it cannot resolve | 110 |
+| occurrences those frozen pairs cover | 201 |
+| resolved rows anchored on a token the citing prose prints | 174 |
+| resolved rows anchored on a snapshot of the cited line | 188 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 99 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 101 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 7 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
@@ -5565,7 +5565,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 693 citation occurrences the five artefacts make, 519 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 365 `(document, token)` pairs covering 495 occurrences, and cannot resolve 108 covering 198. Of the resolved rows, 165 are anchored on a token the citing prose prints and 200 on a snapshot of the cited line.
+Of the 693 citation occurrences the five artefacts make, 519 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 492 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

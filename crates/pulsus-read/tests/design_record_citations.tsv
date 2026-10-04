@@ -43,7 +43,6 @@ docs/query-lowering.md	crates/pulsus-read/src/compile/plan.rs:550	crates/pulsus-
 docs/query-lowering.md	crates/pulsus-read/src/logql/error.rs:805-806	crates/pulsus-read/src/logql/error.rs	805	806	line	PipelineInvalid	#[error("{reason}")] PipelineInvalid { reason: String },
 docs/query-lowering.md	crates/pulsus-read/src/logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1658	crates/pulsus-read/src/logql/plan.rs	1658		line	has_unpushed_dropping_stage	let fetch_until_limit = has_unpushed_dropping_stage(&log_expr.pipeline);
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1673	crates/pulsus-read/src/logql/plan.rs	1673		line	result_limit	result_limit,
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1688	crates/pulsus-read/src/logql/plan.rs	1688		prose	has_unpushed_dropping_stage	has_unpushed_dropping_stage
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1722	crates/pulsus-read/src/logql/plan.rs	1722		prose	metric_pipeline_construct	metric_pipeline_construct
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:174	crates/pulsus-read/src/logql/plan.rs	174		line	re2_pattern_to_rust	let translated = pulsus_promql::re2_pattern_to_rust(regex);
@@ -78,7 +77,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:639	crates/p
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:651	crates/pulsus-read/src/traces/metrics_sql.rs	651		line	to_string	.to_string(),
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:183	crates/pulsus-read/src/traces/search_eval.rs	183		line	from_stored	pub fn from_stored(s: &str) -> Self {
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:2436	crates/pulsus-read/src/traces/search_eval.rs	2436		line	ProjectionValue	ProjectionValue::SelectValue { field_idx } => env
-docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
+docs/query-lowering.md	crates/pulsus-read/src/traces/search_plan.rs:1928	crates/pulsus-read/src/traces/search_plan.rs	1928		prose	plan_pipeline	plan_pipeline
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:448	crates/pulsus-read/src/traces/search_sql.rs	448		line	hydration_sql	pub fn hydration_sql(
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:545-555	crates/pulsus-read/src/traces/search_sql.rs	545	555	line	membership	/// gated rather than asserted. /// /// **`SELECT DISTINCT` over one more column can return more rows.** A span /// carr
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:71	crates/pulsus-read/src/traces/search_sql.rs	71		line	byte_cap_expr	pub(crate) fn byte_cap_expr(col: &str) -> String {
@@ -98,7 +97,7 @@ docs/query-lowering.md	exec.rs:830	crates/pulsus-read/src/traces/exec.rs	830		pr
 docs/query-lowering.md	filter.rs:100	crates/pulsus-read/src/traces/filter.rs	100		prose	AttrKeyScan	AttrKeyScan
 docs/query-lowering.md	filter.rs:107	crates/pulsus-read/src/traces/filter.rs	107		prose	TimeRange	TimeRange
 docs/query-lowering.md	filter.rs:2695	crates/pulsus-read/src/traces/filter.rs	2695		prose	spans_generator_for	spans_generator_for
-docs/query-lowering.md	filter.rs:423	crates/pulsus-read/src/traces/filter.rs	423		line	negation	/// Unary negation.
+docs/query-lowering.md	filter.rs:529	crates/pulsus-read/src/traces/filter.rs	529		prose	BoolTruth	BoolTruth
 docs/query-lowering.md	logql/compile.rs:314-317	crates/pulsus-read/src/logql/compile.rs	314	317	line	residual_effect	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	metrics_plan.rs:666	crates/pulsus-read/src/traces/metrics_plan.rs	666		line	metrics_compare_exemplar_range_sql	metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
 docs/query-lowering.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	mistaken	/// be mistaken for the other.
@@ -136,7 +135,7 @@ docs/query-lowering.md	post_agg.rs:3008-3011	crates/pulsus-read/src/logql/post_a
 docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs	3307		prose	merge_matrix_collisions	merge_matrix_collisions
 docs/query-lowering.md	predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	documentation	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
 docs/query-lowering.md	predicate.rs:93	crates/pulsus-read/src/logql/predicate.rs	93		line	REMOVAL	//! **So a fence is only worth what its REMOVAL TEST is worth**, and the
-docs/query-lowering.md	search_eval.rs:1856	crates/pulsus-read/src/traces/search_eval.rs	1856		line	terminates	/// ancestor), the `reached` set terminates every cycle, and an
+docs/query-lowering.md	search_eval.rs:2222	crates/pulsus-read/src/traces/search_eval.rs	2222		prose	aggregate_value	aggregate_value
 docs/query-lowering.md	search_eval.rs:2439	crates/pulsus-read/src/traces/search_eval.rs	2439		line	field_idx	.get(*field_idx)
 docs/query-lowering.md	search_eval.rs:2483	crates/pulsus-read/src/traces/search_eval.rs	2483		line	physical	/// target. Only the physical sources can fill that target, so a typed
 docs/query-lowering.md	search_plan.rs:1017-1074	crates/pulsus-read/src/traces/search_plan.rs	1017	1074	line	child_count_sql_for	/// Whether the plan issues the per-batch trace-level context co-load /// (issue #184 — `traceDuration`/`rootName`/`root
@@ -147,18 +146,18 @@ docs/query-lowering.md	search_plan.rs:1189	crates/pulsus-read/src/traces/search_
 docs/query-lowering.md	search_plan.rs:1194	crates/pulsus-read/src/traces/search_plan.rs	1194		line	ProbeColumn	slots: Vec<ProbeColumn>,
 docs/query-lowering.md	search_plan.rs:1212	crates/pulsus-read/src/traces/search_plan.rs	1212		line	extend	slots.extend(aggs);
 docs/query-lowering.md	search_plan.rs:1262	crates/pulsus-read/src/traces/search_plan.rs	1262		line	AttrFieldRef	fn field_slot(field: &AttrFieldRef, alias_stem: &str, want: SlotValue) -> ProbeColumn {
-docs/query-lowering.md	search_plan.rs:1277	crates/pulsus-read/src/traces/search_plan.rs	1277		line	condition	// the same walk the unscoped condition makes, so a value and
-docs/query-lowering.md	search_plan.rs:1322	crates/pulsus-read/src/traces/search_plan.rs	1322		line	String	) -> (String, String, String) {
 docs/query-lowering.md	search_plan.rs:1430	crates/pulsus-read/src/traces/search_plan.rs	1430		line	PhysicalPredicate	PhysicalPredicate::Status { op, code } => PhysicalEval::Status {
 docs/query-lowering.md	search_plan.rs:1435	crates/pulsus-read/src/traces/search_plan.rs	1435		line	op	op: *op,
-docs/query-lowering.md	search_plan.rs:1487	crates/pulsus-read/src/traces/search_plan.rs	1487		line	TraceCtxPred	TraceCtxPred::RootName { op, value } => {
 docs/query-lowering.md	search_plan.rs:1632-1633	crates/pulsus-read/src/traces/search_plan.rs	1632	1633	prose	select_attrs	select_attrs
 docs/query-lowering.md	search_plan.rs:1886	crates/pulsus-read/src/traces/search_plan.rs	1886		line	continues	/// which continues `filter::collect`'s `&&` fold across the pipe so
 docs/query-lowering.md	search_plan.rs:1893	crates/pulsus-read/src/traces/search_plan.rs	1893		line	through	/// `{...}` filter plans its leaves through exactly the same
+docs/query-lowering.md	search_plan.rs:2119	crates/pulsus-read/src/traces/search_plan.rs	2119		prose	PlannedAggregate	PlannedAggregate
 docs/query-lowering.md	search_plan.rs:2130	crates/pulsus-read/src/traces/search_plan.rs	2130		prose	PipelineStage	Metric
 docs/query-lowering.md	search_plan.rs:2137	crates/pulsus-read/src/traces/search_plan.rs	2137		prose	MetricSecondStage	MetricSecondStage
 docs/query-lowering.md	search_plan.rs:214-215	crates/pulsus-read/src/traces/search_plan.rs	214	215	line	Neq	Eq, Neq,
 docs/query-lowering.md	search_plan.rs:2143	crates/pulsus-read/src/traces/search_plan.rs	2143		prose	PipelineStage	Compare { .. }
+docs/query-lowering.md	search_plan.rs:2181	crates/pulsus-read/src/traces/search_plan.rs	2181		line	to_string	"select() of a nested-set intrinsic is not supported".to_string(),
+docs/query-lowering.md	search_plan.rs:2226	crates/pulsus-read/src/traces/search_plan.rs	2226		line	to_string	"select() of this intrinsic is not supported".to_string(),
 docs/query-lowering.md	search_plan.rs:3141	crates/pulsus-read/src/traces/search_plan.rs	3141		line	candidates	// Cross-spanset `{A} op {B}` candidates are the superset union of
 docs/query-lowering.md	search_plan.rs:954	crates/pulsus-read/src/traces/search_plan.rs	954		line	count	.count()
 docs/query-lowering.md	search_response.rs:504	crates/pulsus-server/src/traces_api/search_response.rs	504		line	group_json	// one-entry list and is served by `group_json` above, so the
@@ -209,7 +208,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3119	crates/pulsus-read/src/traces/exec.rs	3119		prose	generator_settings	generator_settings
-docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
+docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1928	crates/pulsus-read/src/traces/search_plan.rs	1928		prose	plan_pipeline	plan_pipeline
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	crates/pulsus-schema/src/checks.rs	29		line	minor	if (major, minor) < (26, 3) {
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/src/checks.rs	76		line	format	let sql = format!(
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -230,8 +229,8 @@ docs/query-to-sql.md	escape.rs:93	crates/pulsus-read/src/logql/escape.rs	93		lin
 docs/query-to-sql.md	escape.rs:93-105	crates/pulsus-read/src/logql/escape.rs	93	105	line	ch_like_contains	pub fn ch_like_contains(needle: &str) -> String { let mut pattern = String::with_capacity(needle.len() + 2); pattern.pus
 docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		prose	push_str	\\%
 docs/query-to-sql.md	filter.rs:1220	crates/pulsus-read/src/traces/filter.rs	1220		prose	AttrScope	AttrScope::Unscoped => None
+docs/query-to-sql.md	filter.rs:1455-1457	crates/pulsus-read/src/traces/filter.rs	1455	1457	line	ch_string	if let Some(scope) = probe.scope { parts.push(format!("scope = {}", escape::ch_string(scope))); }
 docs/query-to-sql.md	filter.rs:81-84	crates/pulsus-read/src/traces/filter.rs	81	84	prose	UnsupportedField	unsupported field:
-docs/query-to-sql.md	filter.rs:860	crates/pulsus-read/src/traces/filter.rs	860		line	comparison	// (a raw comparison silently dropped any over-cap message
 docs/query-to-sql.md	filter.rs:978	crates/pulsus-read/src/traces/filter.rs	978		prose	to_string	ValuePred::KeyExists
 docs/query-to-sql.md	labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	merge_labels_with_structured_metadata	structured_metadata
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted	render_labels_json_sorted
@@ -243,7 +242,7 @@ docs/query-to-sql.md	logql/pipeline.rs:1266	crates/pulsus-read/src/logql/pipelin
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	MAX_CLIENT_AGG_BUCKETS	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
 docs/query-to-sql.md	metrics_plan.rs:398	crates/pulsus-read/src/traces/metrics_plan.rs	398		line	plan_trace_metrics	pub fn plan_trace_metrics(
-docs/query-to-sql.md	metrics_plan.rs:968	crates/pulsus-read/src/traces/metrics_plan.rs	968		line	MetricSecondStage	PipelineStage::MetricSecondStage(second),
+docs/query-to-sql.md	metrics_plan.rs:964	crates/pulsus-read/src/traces/metrics_plan.rs	964		prose	pipeline	reduce
 docs/query-to-sql.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	mistaken	/// be mistaken for the other.
 docs/query-to-sql.md	metrics_sql.rs:116	crates/pulsus-read/src/traces/metrics_sql.rs	116		line	trace_attrs_idx	/// The `trace_attrs_idx` daily-partition pruning clause for the
 docs/query-to-sql.md	metrics_sql.rs:357	crates/pulsus-read/src/traces/metrics_sql.rs	357		line	attribute	/// Renders one attribute leaf's span-row test and records its
@@ -287,9 +286,9 @@ docs/query-to-sql.md	plan.rs:365	crates/pulsus-read/src/logql/plan.rs	365		prose
 docs/query-to-sql.md	plan.rs:3763	crates/pulsus-read/src/logql/plan.rs	3763		prose	compile_line_filters	compile_line_filters
 docs/query-to-sql.md	plan.rs:3763-3781	crates/pulsus-read/src/logql/plan.rs	3763	3781	prose	is_pushable_line_filter	_ => {}
 docs/query-to-sql.md	plan.rs:3797	crates/pulsus-read/src/logql/plan.rs	3797		prose	is_pushable_line_filter	is_pushable_line_filter
-docs/query-to-sql.md	post_agg.rs:1041	crates/pulsus-read/src/logql/post_agg.rs	1041		line	VectorAggOp	if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
+docs/query-to-sql.md	post_agg.rs:1042	crates/pulsus-read/src/logql/post_agg.rs	1042		prose	select_k_range	select_k_range
 docs/query-to-sql.md	post_agg.rs:1064-1079	crates/pulsus-read/src/logql/post_agg.rs	1064	1079	line	or_default	let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new(); for s in series { groups .entry(group_key(&
-docs/query-to-sql.md	post_agg.rs:1109	crates/pulsus-read/src/logql/post_agg.rs	1109		line	VectorAggOp	if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
+docs/query-to-sql.md	post_agg.rs:1110	crates/pulsus-read/src/logql/post_agg.rs	1110		prose	select_k_instant	select_k_instant
 docs/query-to-sql.md	post_agg.rs:807	crates/pulsus-read/src/logql/post_agg.rs	807		prose	select_k_range	select_k_range
 docs/query-to-sql.md	post_agg.rs:858	crates/pulsus-read/src/logql/post_agg.rs	858		prose	select_k_instant	select_k_instant
 docs/query-to-sql.md	post_agg.rs:983	crates/pulsus-read/src/logql/post_agg.rs	983		prose	approx_topk_instant	approx_topk_instant
@@ -308,22 +307,20 @@ docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limit
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1053	crates/pulsus-read/src/logql/plan.rs	1053		line	QueryParams	pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	pulsus-server/src/logs_api/mod.rs:55-59	crates/pulsus-server/src/logs_api/mod.rs	55	59	line	mount_log_query_routes	fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> { router .route( &format!("{prefix
+docs/query-to-sql.md	search_eval.rs:1223	crates/pulsus-read/src/traces/search_eval.rs	1223		prose	expression	expression
 docs/query-to-sql.md	search_eval.rs:2439	crates/pulsus-read/src/traces/search_eval.rs	2439		line	field_idx	.get(*field_idx)
 docs/query-to-sql.md	search_eval.rs:3127	crates/pulsus-read/src/traces/search_eval.rs	3127		line	SpansetStage	SpansetStage::Aggregate(agg) => {
-docs/query-to-sql.md	search_eval.rs:895	crates/pulsus-read/src/traces/search_eval.rs	895		line	keeping	/// happens in the compare (keeping it out of the per-span hot loop).
 docs/query-to-sql.md	search_plan.rs:1091-1092	crates/pulsus-read/src/traces/search_plan.rs	1091	1092	line	spanset	/// /// Derived from the stored spanset rather than from a second stored
 docs/query-to-sql.md	search_plan.rs:1262	crates/pulsus-read/src/traces/search_plan.rs	1262		line	AttrFieldRef	fn field_slot(field: &AttrFieldRef, alias_stem: &str, want: SlotValue) -> ProbeColumn {
 docs/query-to-sql.md	search_plan.rs:1394-1395	crates/pulsus-read/src/traces/search_plan.rs	1394	1395	line	RegexCompileError	// Issue #291: through the shared compile budget; the message // prefix is unchanged, and `RegexCompileError::Display` r
 docs/query-to-sql.md	search_plan.rs:1469-1471	crates/pulsus-read/src/traces/search_plan.rs	1469	1471	line	TraceCtxEval	trace_ctx: &mut bool, child_count: &mut bool, ) -> Result<TraceCtxEval, PlanError> {
 docs/query-to-sql.md	search_plan.rs:1481-1484	crates/pulsus-read/src/traces/search_plan.rs	1481	1484	line	TraceDurationNs	*trace_ctx = true; TraceCtxEval::TraceDurationNs { op: *op, nanos: *nanos,
 docs/query-to-sql.md	search_plan.rs:1487	crates/pulsus-read/src/traces/search_plan.rs	1487		line	TraceCtxPred	TraceCtxPred::RootName { op, value } => {
-docs/query-to-sql.md	search_plan.rs:1551	crates/pulsus-read/src/traces/search_plan.rs	1551		line	items	items.push(item.clone());
-docs/query-to-sql.md	search_plan.rs:1596-1597	crates/pulsus-read/src/traces/search_plan.rs	1596	1597	line	PlannedOperand	CompareOperand::Service => PlannedOperand::Service, CompareOperand::Duration => PlannedOperand::Duration,
 docs/query-to-sql.md	search_plan.rs:1709-1710	crates/pulsus-read/src/traces/search_plan.rs	1709	1710	line	reproduces	/// bound the other way round: that function refuses to push unless the /// exact integer is one this `f64` reproduces e
 docs/query-to-sql.md	search_plan.rs:2119	crates/pulsus-read/src/traces/search_plan.rs	2119		line	PlannedAggregate	post_stages.push(SpansetStage::Aggregate(PlannedAggregate {
 docs/query-to-sql.md	search_plan.rs:2130	crates/pulsus-read/src/traces/search_plan.rs	2130		line	PipelineStage	PipelineStage::Metric(stage) => {
-docs/query-to-sql.md	search_plan.rs:2131	crates/pulsus-read/src/traces/search_plan.rs	2131		line	TypeMismatch	return Err(PlanError::TypeMismatch(format!(
-docs/query-to-sql.md	search_plan.rs:2137	crates/pulsus-read/src/traces/search_plan.rs	2137		line	MetricSecondStage	PipelineStage::MetricSecondStage(stage) => {
+docs/query-to-sql.md	search_plan.rs:2181	crates/pulsus-read/src/traces/search_plan.rs	2181		line	to_string	"select() of a nested-set intrinsic is not supported".to_string(),
+docs/query-to-sql.md	search_plan.rs:2226	crates/pulsus-read/src/traces/search_plan.rs	2226		line	to_string	"select() of this intrinsic is not supported".to_string(),
 docs/query-to-sql.md	search_sql.rs:109-111	crates/pulsus-read/src/traces/search_sql.rs	109	111	line	start_closed_end_open	fn bounds(w: TimeWindow) -> WindowSql { WindowSql::start_closed_end_open(w.start_ns, w.end_ns) }
 docs/query-to-sql.md	search_sql.rs:121	crates/pulsus-read/src/traces/search_sql.rs	121		line	time_clause	fn time_clause(w: TimeWindow) -> String {
 docs/query-to-sql.md	search_sql.rs:170	crates/pulsus-read/src/traces/search_sql.rs	170		line	for	for b in id {

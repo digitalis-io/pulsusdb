@@ -366,7 +366,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:163-178`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:608-619`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
   build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:942` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:163-178`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:608-619`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The
@@ -3777,7 +3777,7 @@ a divergence at a public surface, found while implementing the cap.
   exist.
   **Correction to an earlier reading:
   `/tail` is NOT such a carrier** — `/api/logs/v1/tail` is a GET
-  WebSocket upgrade (`logs_api/mod.rs:100,119`), so on the wire it sits
+  WebSocket upgrade (`logs_api/mod.rs:156,184`), so on the wire it sits
   under the same 65,534-byte ceiling; its cap enforcement is pinned at
   the params seam (`parse_tail_params`, `tail.rs`), not over a socket.
   The other GET-only routes — `/stats`, `/volume`, `/patterns`,
@@ -4268,8 +4268,8 @@ unexplained.
   version of this correction got wrong by writing "line filter" flat.
   `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's
   discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
-  line filter (`pipeline.rs:986-996`) before it reaches `compile_regex` at
-  `:1013`; a pushable filter's regex is validated on the SQL-rendering
+  line filter (`pipeline.rs:1115-1120`) before it reaches `compile_regex` at
+  `:1138`; a pushable filter's regex is validated on the SQL-rendering
   path instead (`logql/escape.rs`'s `_checked` renderers), and a discarded
   prefix renders no SQL. Put the filter after a `line_format` and
   `seen_line_format` clears the pushdown, so the filter IS compiled and
@@ -4634,7 +4634,7 @@ often than they agree about it.
   route can store invalid UTF-8.** Every one materialises a line body and
   a label value into a Rust `String` — `LogRow.body: String`,
   `StreamRow.labels: LabelSet`
-  (`crates/pulsus-write/src/protocols/otlp_logs.rs:37-55`) — through prost
+  (`crates/pulsus-write/src/protocols/otlp_logs.rs:102-110`) — through prost
   or `serde_json`, both of which require valid UTF-8 and fail the push
   otherwise. So no line and no label value in this store could match the
   reference's 0xFF byte, and the five positions where it serves the

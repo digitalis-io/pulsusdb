@@ -170,7 +170,6 @@ docs/benchmarks/logs-differential-ledger.md	crates/pulsus-schema/src/catalog.rs:
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/logs_api/error.rs:160	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/serve.rs:225	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/serve.rs:237	no_name_the_target_file_holds
-docs/benchmarks/logs-differential-ledger.md	crates/pulsus-write/src/protocols/otlp_logs.rs:37-55	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	de.rs:1102	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	de.rs:1375	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	de.rs:63	pinned_to_another_version
@@ -218,8 +217,6 @@ docs/benchmarks/logs-differential-ledger.md	logql/exec.rs:2290	no_name_the_targe
 docs/benchmarks/logs-differential-ledger.md	logql/exec.rs:2576	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	logql/exec.rs:612	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	logql/exec.rs:906	no_name_the_target_file_holds
-docs/benchmarks/logs-differential-ledger.md	logs_api/mod.rs:100	no_name_the_target_file_holds
-docs/benchmarks/logs-differential-ledger.md	logs_api/mod.rs:119	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	marshal.go:60	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	model/labels/labels_common.go:57-80	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	modules/frontend/combiner/trace_by_id.go:99	not_in_this_repository
@@ -237,7 +234,6 @@ docs/benchmarks/logs-differential-ledger.md	parser.go:521	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	parser.go:594-599	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	parser.rs:90-92	ambiguous_basename
 docs/benchmarks/logs-differential-ledger.md	patterns.rs:51	ambiguous_basename
-docs/benchmarks/logs-differential-ledger.md	pipeline.rs:1013	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	pkg/chunkenc/unordered.go:140-148	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/distributor/distributor.go:124	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/distributor/distributor.go:1370-1387	pinned_to_another_version
@@ -622,6 +618,7 @@ docs/query-lowering.md	crates/pulsus-clickhouse/src/lib.rs:3	no_name_the_target_
 docs/query-lowering.md	crates/pulsus-config/src/model.rs:689	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-config/src/model.rs:693	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:131-163	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1655	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/predicate.rs:257	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/predicate.rs:295	no_name_the_target_file_holds
@@ -864,7 +861,8 @@ docs/query-to-sql.md	search_plan.rs:1487	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1709-1710	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:2119	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:2130	no_name_the_target_file_holds
-docs/query-to-sql.md	search_plan.rs:2131	no_name_the_target_file_holds
+docs/query-to-sql.md	search_plan.rs:2136	no_name_the_target_file_holds
+docs/query-to-sql.md	search_plan.rs:2142	no_name_the_target_file_holds
 docs/query-to-sql.md	search_sql.rs:109-111	no_name_the_target_file_holds
 docs/query-to-sql.md	search_sql.rs:121	no_name_the_target_file_holds
 docs/query-to-sql.md	search_sql.rs:170	no_name_the_target_file_holds
@@ -969,10 +967,9 @@ docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/exec.rs:2268-2296
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/filter.rs:89-103	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_eval.rs:1213-1216	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_eval.rs:3656	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_eval.rs:3702	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:1077	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:1083	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:2308-2352	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:2314-2358	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:3072-3092	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:3080-3100	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_plan.rs:661	no_name_the_target_file_holds
@@ -986,9 +983,9 @@ docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:286
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:286-312	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:301-323	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:325	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:357-383	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:366-380	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:437-451	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:397	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:556-579	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/sql.rs:16-26	not_in_this_repository
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/tags_sql.rs:118	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/tags_sql.rs:253	no_name_the_target_file_holds
@@ -1044,7 +1041,6 @@ docs/traceql-schema-migration.md	crates/pulsus-write/src/protocols/otlp_traces.r
 docs/traceql-schema-migration.md	crates/pulsus-write/src/protocols/otlp_traces.rs:657	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/protocols/otlp_traces.rs:697	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/protocols/otlp_traces.rs:712-714	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-write/src/protocols/otlp_traces.rs:752-754	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/backfill.rs:189-201	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/backfill.rs:214-220	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/backfill.rs:78-90	no_name_the_target_file_holds
@@ -1056,6 +1052,7 @@ docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:137-185
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:151-199	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:172	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:186	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:220-304	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/src/writer/trace.rs:234-318	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/tests/trace_ingest_roundtrip.rs:281	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-write/tests/trace_ingest_roundtrip.rs:291	no_name_the_target_file_holds
