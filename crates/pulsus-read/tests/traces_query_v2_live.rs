@@ -156,9 +156,14 @@ const SPANS_TABLE: &str = "spans";
 // reading
 // ---------------------------------------------------------------------
 
+/// The membership statement's one column. It is aliased `id` and NOT
+/// `span_id`: a select-list alias shadows the column of the same name for
+/// the whole statement, so `AS span_id` would make every `span:id`
+/// predicate compare the hex of the hex text. `span_membership_sql`'s own
+/// doc carries the measurement.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct IdRow {
-    span_id: String,
+    id: String,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -174,16 +179,21 @@ fn read_settings() -> QuerySettings {
     QuerySettings::new().set("final", 1)
 }
 
+/// The driver's own `?` placeholder is doubled before the text is sent, as
+/// every other live suite in this crate does: an anchored regex carries
+/// `(?:` and a single `?` is a bind argument the statement has none of.
+/// The RENDERED text is untouched — `T-C4` freezes that, and the doubling
+/// is the transport's concern rather than the compiler's.
 async fn ids_of(client: &ChClient, sql: &str) -> Vec<String> {
     let mut stream = client
-        .query_stream::<IdRow>(sql, &read_settings())
+        .query_stream::<IdRow>(&sql.replace('?', "??"), &read_settings())
         .await
         .unwrap_or_else(|e| panic!("the membership read failed: {e}\nSQL:\n{sql}"));
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         out.push(
             row.unwrap_or_else(|e| panic!("decode failed: {e}\nSQL:\n{sql}"))
-                .span_id,
+                .id,
         );
     }
     out
@@ -226,8 +236,8 @@ async fn answer(client: &ChClient, w: WindowSql, query: &str) -> Vec<String> {
 /// asserting a statement shape.
 async fn raw_answer(client: &ChClient, w: WindowSql, predicate: &str) -> Vec<String> {
     let sql = format!(
-        "SELECT lower(hex(span_id)) AS span_id FROM {SPANS_TABLE} WHERE {} AND ({predicate}) \
-         ORDER BY span_id",
+        "SELECT lower(hex(span_id)) AS id FROM {SPANS_TABLE} WHERE {} AND ({predicate}) \
+         ORDER BY id",
         w.span_time_clause()
     );
     ids_of(client, &sql).await
@@ -823,7 +833,9 @@ const CASES_61: &[Case] = &[
     Case {
         name: "T-A1",
         query: r#"{ span.http.response.status_code != 200 }"#,
-        expect: &["0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009"],
+        expect: &[
+            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
+        ],
     },
     Case {
         name: "T-A2a (F4)",
@@ -843,7 +855,9 @@ const CASES_61: &[Case] = &[
     Case {
         name: "T-A2d",
         query: r#"{ span.http.response.status_code != 500 }"#,
-        expect: &["0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"],
+        expect: &[
+            "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009",
+        ],
     },
     Case {
         name: "F6",
@@ -883,7 +897,9 @@ const CASES_61: &[Case] = &[
     Case {
         name: "T-A18",
         query: r#"{ span.app.tags = nil }"#,
-        expect: &["0001", "0002", "0004", "0005", "0006", "0007", "0008", "0009"],
+        expect: &[
+            "0001", "0002", "0004", "0005", "0006", "0007", "0008", "0009",
+        ],
     },
     Case {
         name: "T-A18b",
@@ -973,7 +989,9 @@ const CASES_61: &[Case] = &[
     Case {
         name: "LOL2",
         query: r#"{ 200 != span.http.response.status_code }"#,
-        expect: &["0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009"],
+        expect: &[
+            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
+        ],
     },
     Case {
         name: "RE1",
@@ -1084,7 +1102,7 @@ async fn the_predicate_compiler_answers_the_worked_fixture() {
          final = 1); nothing below can be read as a predicate result until this holds"
     );
 
-    let wrong = run_cases(&client, w, CASES_61, |s| id61(s)).await;
+    let wrong = run_cases(&client, w, CASES_61, id61).await;
     drop_db(&db).await;
     assert!(
         wrong.is_empty(),
@@ -1226,7 +1244,12 @@ async fn the_predicate_compiler_answers_the_id_boolean_and_integer_fixture() {
     let db = pulsus_testkit::test_db("pulsus_read_it_t588_fixturet");
     let client = fresh_db(&db).await;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    land(&client, &fixture_t_body(base_ns), &format!("t588-t-{}", now_ns())).await;
+    land(
+        &client,
+        &fixture_t_body(base_ns),
+        &format!("t588-t-{}", now_ns()),
+    )
+    .await;
     let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
 
     let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
@@ -1236,7 +1259,7 @@ async fn the_predicate_compiler_answers_the_id_boolean_and_integer_fixture() {
          result until this holds"
     );
 
-    let mut wrong = run_cases(&client, w, CASES_T, |s| idt(s)).await;
+    let mut wrong = run_cases(&client, w, CASES_T, idt).await;
     wrong.extend(uc6_cells(&client, w).await);
     drop_db(&db).await;
     assert!(
@@ -1266,7 +1289,10 @@ const UC6_COLUMNS: [(&str, &str, &str); 3] = [
 /// Every cell's two answers: the one the rule gives (the raw literal) and
 /// the one the rendering it forbids gives (the lowercased literal). All
 /// twelve differ, which is what makes none of them decoration.
-fn uc6_expected(field: &str, op: ComparisonOp) -> (&'static [&'static str], &'static [&'static str]) {
+fn uc6_expected(
+    field: &str,
+    op: ComparisonOp,
+) -> (&'static [&'static str], &'static [&'static str]) {
     const A123: &[&str] = &["a1", "a2", "a3"];
     const A1234: &[&str] = &["a1", "a2", "a3", "a4"];
     const A567: &[&str] = &["a5", "a6", "a7"];

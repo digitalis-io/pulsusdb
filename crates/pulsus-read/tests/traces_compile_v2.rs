@@ -371,7 +371,10 @@ fn op_is_ordered(op: ComparisonOp) -> bool {
 /// here is how an earlier draft of this case used `>` twice and `<` not at
 /// all.
 fn ordered_ops() -> Vec<ComparisonOp> {
-    ALL_OPS.into_iter().filter(|op| op_is_ordered(*op)).collect()
+    ALL_OPS
+        .into_iter()
+        .filter(|op| op_is_ordered(*op))
+        .collect()
 }
 
 #[test]
@@ -381,8 +384,10 @@ fn the_four_ordered_operators_are_a_complement() {
             assert_ne!(a, b, "ALL_OPS lists an operator twice");
         }
     }
-    let not_ordered: Vec<ComparisonOp> =
-        ALL_OPS.into_iter().filter(|op| !op_is_ordered(*op)).collect();
+    let not_ordered: Vec<ComparisonOp> = ALL_OPS
+        .into_iter()
+        .filter(|op| !op_is_ordered(*op))
+        .collect();
     assert_eq!(
         not_ordered,
         vec![
@@ -518,13 +523,12 @@ fn t_c3_the_span_tables_three_window_clauses() {
 /// live suite ran.
 #[test]
 fn t_c4_the_membership_statement_is_frozen_whole() {
-    let predicate = compile_span_predicate(&filter_body(
-        r#"{ span.http.response.status_code != 200 }"#,
-    ))
-    .expect("T-A1 compiles");
+    let predicate =
+        compile_span_predicate(&filter_body(r#"{ span.http.response.status_code != 200 }"#))
+            .expect("T-A1 compiles");
     assert_eq!(
         span_membership_sql("spans", t_b1_window(), &predicate),
-        "SELECT lower(hex(span_id)) AS span_id\n\
+        "SELECT lower(hex(span_id)) AS id\n\
          FROM spans\n\
          WHERE start_ns >= 1790094846486853636 AND start_ns < 1790094846486853637\n\
          \x20 AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790094846486853636, 300000000000) \
@@ -533,7 +537,7 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
          toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')\n\
          \x20 AND (NOT (coalesce(attrs.`http%2Eresponse%2Estatus_code`.:Int64 = 200, false) OR \
          coalesce(attrs.`http%2Eresponse%2Estatus_code`.:Float64 = 200, false)))\n\
-         ORDER BY span_id"
+         ORDER BY id"
     );
 }
 
@@ -649,7 +653,10 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
 #[test]
 fn t_c6_the_fixed_refusals_keep_their_messages() {
     for (query, message) in [
-        (r#"{ duration > 100 }"#, "duration requires a duration literal"),
+        (
+            r#"{ duration > 100 }"#,
+            "duration requires a duration literal",
+        ),
         (
             r#"{ duration =~ "x" }"#,
             "duration requires a duration literal",
@@ -712,7 +719,10 @@ fn t_c6b_the_carved_out_fields_refuse_every_ordered_comparison() {
             }
         }
     }
-    assert_eq!(seen, CARVED_OUT.len() * ordered_ops().len() * operands.len());
+    assert_eq!(
+        seen,
+        CARVED_OUT.len() * ordered_ops().len() * operands.len()
+    );
 }
 
 // ---------------------------------------------------------------------
