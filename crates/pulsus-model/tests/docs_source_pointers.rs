@@ -195,8 +195,16 @@ struct Pointer {
     /// The document wrote `@ <version>` after it, so the line is in
     /// another tree at a stated version. See [`pinned_after`].
     pinned: bool,
-    /// Names the pointer's own document line prints. Only these can make
-    /// a pointer FAIL; a name from further away is too weak to convict.
+    /// The names of the nearest backticked token to the pointer that is
+    /// not itself a pointer. **Only these can make a pointer FAIL.**
+    ///
+    /// Using every name on the line convicted a correct pointer the
+    /// first time this was run: one table row in
+    /// `docs/TraceQL/functional-requirements.md` carries four pointers
+    /// and six backticked names, and `intrinsics.rs:61-63`, which points
+    /// exactly at the function the row says produces a list, was
+    /// convicted on `KEYWORD_TYPE` — a name belonging to a different
+    /// pointer on the same row.
     near: BTreeSet<String>,
     /// Names the enclosing paragraph prints, or the table row for a
     /// pointer in a table. A table is one paragraph and a wide table
@@ -254,22 +262,59 @@ fn names_of(tok: &str) -> BTreeSet<String> {
     out
 }
 
-/// The backticked tokens on one line.
-fn backticked(line: &str) -> Vec<String> {
+/// The backticked tokens on one line, each with the offsets of its
+/// opening and closing backtick.
+fn backticked_at(line: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
-    let mut rest = line;
-    while let Some((_, tail)) = rest.split_once('`') {
-        match tail.split_once('`') {
-            Some((inner, after)) => {
-                if (2..=160).contains(&inner.chars().count()) {
-                    out.push(inner.to_string());
-                }
-                rest = after;
-            }
-            None => break,
+    let mut at = 0usize;
+    while let Some(rel) = line[at..].find('`') {
+        let open = at + rel;
+        let Some(rel2) = line[open + 1..].find('`') else {
+            break;
+        };
+        let close = open + 1 + rel2;
+        let inner = &line[open + 1..close];
+        if (2..=160).contains(&inner.chars().count()) {
+            out.push((open, close, inner.to_string()));
         }
+        at = close + 1;
     }
     out
+}
+
+/// The backticked tokens on one line.
+fn backticked(line: &str) -> Vec<String> {
+    backticked_at(line).into_iter().map(|(_, _, t)| t).collect()
+}
+
+/// The names of the nearest backticked token to `at` that is not itself
+/// a pointer and that prints at least one name.
+///
+/// Nearest in either direction, **measured to the token's near edge**: a
+/// document writes both "`X` is built at `plan.rs:12`" and "at
+/// `plan.rs:12`, `X` is built". Measuring to the opening backtick
+/// instead made the token AFTER the pointer win in
+/// `` `compile_filter_predicate` (line 202) → `render_expr` (378) →
+/// `lower_leaf` (530) ``, where each number belongs to the name
+/// immediately before it, so `(378)` was convicted on `lower_leaf`.
+fn nearest_names(line: &str, at: usize) -> BTreeSet<String> {
+    let mut toks: Vec<(usize, BTreeSet<String>)> = backticked_at(line)
+        .into_iter()
+        .map(|(open, close, t)| {
+            let d = if close < at {
+                at - close
+            } else {
+                open.abs_diff(at)
+            };
+            (d, names_of(&t))
+        })
+        .filter(|(_, ns)| !ns.is_empty())
+        .collect();
+    toks.sort_by_key(|(d, _)| *d);
+    toks.into_iter()
+        .next()
+        .map(|(_, ns)| ns)
+        .unwrap_or_default()
 }
 
 /// Is this a file path a document would write? The last segment must end
@@ -332,29 +377,30 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
     let mut running: Option<String> = None;
     for (idx, line) in lines.iter().enumerate() {
         let doc_line = idx as u32 + 1;
-        let near: BTreeSet<String> = backticked(line).iter().flat_map(|t| names_of(t)).collect();
         // A table row is its own context; see [`Pointer::wide`].
-        let mut wide = near.clone();
+        let mut wide: BTreeSet<String> =
+            backticked(line).iter().flat_map(|t| names_of(t)).collect();
         if !line.trim_start().starts_with('|') && para_of[idx] != usize::MAX {
             wide.extend(names_of_para[para_of[idx]].iter().cloned());
         }
-        let mut push = |form, path_text: &str, first, last, pinned, extra: &BTreeSet<String>| {
-            let mut near = near.clone();
-            near.extend(extra.iter().cloned());
-            let mut wide = wide.clone();
-            wide.extend(extra.iter().cloned());
-            out.push(Pointer {
-                doc: doc.to_string(),
-                doc_line,
-                form,
-                path_text: path_text.to_string(),
-                first,
-                last,
-                pinned,
-                near,
-                wide,
-            });
-        };
+        let mut push =
+            |form, path_text: &str, first, last, pinned, at: usize, extra: &BTreeSet<String>| {
+                let mut near = nearest_names(line, at);
+                near.extend(extra.iter().cloned());
+                let mut wide = wide.clone();
+                wide.extend(extra.iter().cloned());
+                out.push(Pointer {
+                    doc: doc.to_string(),
+                    doc_line,
+                    form,
+                    path_text: path_text.to_string(),
+                    first,
+                    last,
+                    pinned,
+                    near,
+                    wide,
+                });
+            };
 
         // Every file this line names, by offset, so a continuation can
         // take the nearest one before it.
@@ -391,7 +437,15 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
             } else {
                 Form::Bare
             };
-            push(form, &w.path, w.first, w.last, w.pinned, &BTreeSet::new());
+            push(
+                form,
+                &w.path,
+                w.first,
+                w.last,
+                w.pinned,
+                w.at,
+                &BTreeSet::new(),
+            );
             for n in &w.also {
                 push(
                     Form::Continuation,
@@ -399,6 +453,7 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
                     *n,
                     *n,
                     w.pinned,
+                    w.at,
                     &BTreeSet::new(),
                 );
             }
@@ -407,7 +462,7 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
         // Form D: a file named in the text, then `(line N)` or `(N)`.
         for (at, first, last) in parenthesised(line) {
             if let Some((path, extra)) = antecedent(at) {
-                push(Form::Linked, &path, first, last, false, &extra);
+                push(Form::Linked, &path, first, last, false, at, &extra);
             }
         }
 
@@ -420,6 +475,7 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
                     first,
                     last,
                     pinned,
+                    at,
                     &BTreeSet::new(),
                 ),
                 // A continuation nothing can attribute. Counted and
@@ -431,6 +487,7 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
                     first,
                     last,
                     pinned,
+                    at,
                     &BTreeSet::new(),
                 ),
             }
@@ -1013,55 +1070,99 @@ fn all_pointers() -> (Vec<String>, Vec<(Pointer, Verdict)>) {
     (docs, out)
 }
 
-/// How a verdict ranks when one `(document, token)` is written in two
-/// places with different text around it.
-///
-/// **A key gets its best verdict, not its first.** A token names one
-/// target wherever the document writes it, so a sentence that prints the
-/// symbol settles the pointer for the sentence that does not — and the
-/// datasets are keyed by token, so without this one occurrence froze the
-/// token and another contradicted the row.
-fn rank(v: &Verdict) -> u8 {
+/// How a frozen reason ranks when one `(document, token)` is written in
+/// two places that fall into two different unanchored classes. Lower is
+/// more specific, and the dataset records one reason per key.
+fn frozen_rank(v: &Verdict) -> u8 {
     match v {
-        Verdict::Anchored { .. } => 0,
-        Verdict::BeyondEndOfFile { .. } => 1,
-        Verdict::DefinedElsewhere { .. } => 2,
-        Verdict::PinnedToAnotherVersion => 3,
-        Verdict::NotInThisRepository => 4,
-        Verdict::AmbiguousBasename => 5,
-        Verdict::NoNameTheTargetFileHolds => 6,
-        Verdict::ContinuationWithNoAntecedent => 7,
+        Verdict::PinnedToAnotherVersion => 0,
+        Verdict::NotInThisRepository => 1,
+        Verdict::ContinuationWithNoAntecedent => 2,
+        Verdict::AmbiguousBasename => 3,
+        Verdict::NoNameTheTargetFileHolds => 4,
+        Verdict::Anchored { .. }
+        | Verdict::BeyondEndOfFile { .. }
+        | Verdict::DefinedElsewhere { .. } => u8::MAX,
     }
 }
 
-/// One `(document, token)` key, its verdict, and the occurrence that
-/// produced it.
-fn by_key() -> (Vec<String>, Vec<(Pointer, Verdict)>, Vec<String>) {
-    let (docs, pointers) = all_pointers();
-    let mut best: BTreeMap<(String, String), (Pointer, Verdict)> = BTreeMap::new();
+/// What one pass over the documents found.
+struct Reading {
+    docs: Vec<String>,
+    /// Every pointer as written, in document order.
+    occurrences: Vec<(Pointer, Verdict)>,
+    /// The occurrences that fail. **Per occurrence, not per key.** One
+    /// token can be right where one sentence writes it and wrong where
+    /// another does: `logs-differential-ledger.md` cites
+    /// `logql/sql.rs:163-178` twice, and the citation beside
+    /// `cardinality` lands on a line that happens to print that word
+    /// while the citation beside `sql::detected_labels` is 445 lines off.
+    /// Keeping the verdict per key hid the second one behind the first.
+    fails: Vec<(Pointer, Verdict)>,
+    /// `(document, token) -> (reason, a representative occurrence)` for
+    /// the keys where **no** occurrence anchors and none fails. These are
+    /// the pointers the rule has no answer for.
+    frozen: BTreeMap<(String, String), (&'static str, Pointer)>,
+    /// One token anchoring in two different files: the key is then not a
+    /// target, and both datasets are keyed on it.
+    split: Vec<String>,
+}
+
+fn reading() -> Reading {
+    let (docs, occurrences) = all_pointers();
     let mut anchored_paths: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    for (p, v) in &pointers {
-        if let Verdict::Anchored { path, .. } = v {
-            anchored_paths
-                .entry(p.key())
-                .or_default()
-                .insert(path.clone());
-        }
-        match best.get(&p.key()) {
-            Some((_, had)) if rank(had) <= rank(v) => {}
-            _ => {
-                best.insert(p.key(), (p.clone(), v.clone()));
+    let mut answered: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut fails = Vec::new();
+    let mut frozen: BTreeMap<(String, String), (&'static str, Pointer)> = BTreeMap::new();
+    for (p, v) in &occurrences {
+        match v {
+            Verdict::Anchored { path, .. } => {
+                anchored_paths
+                    .entry(p.key())
+                    .or_default()
+                    .insert(path.clone());
+                answered.insert(p.key());
+            }
+            Verdict::BeyondEndOfFile { .. } | Verdict::DefinedElsewhere { .. } => {
+                answered.insert(p.key());
+                fails.push((p.clone(), v.clone()));
+            }
+            other => {
+                let reason = other.reason().expect("a frozen verdict has a reason");
+                match frozen.get(&p.key()) {
+                    Some((had, _)) if rank_of(had) <= frozen_rank(other) => {}
+                    _ => {
+                        frozen.insert(p.key(), (reason, p.clone()));
+                    }
+                }
             }
         }
     }
-    // One token anchoring in two different files would mean the key is
-    // not a target, and every row of both datasets is keyed on it.
+    frozen.retain(|k, _| !answered.contains(k));
     let split: Vec<String> = anchored_paths
         .iter()
         .filter(|(_, paths)| paths.len() > 1)
         .map(|((doc, token), paths)| format!("{doc} cites {token}, which anchors in {paths:?}"))
         .collect();
-    (docs, best.into_values().collect(), split)
+    Reading {
+        docs,
+        occurrences,
+        fails,
+        frozen,
+        split,
+    }
+}
+
+/// The rank of a reason word, so the two spellings cannot drift.
+fn rank_of(reason: &str) -> u8 {
+    match reason {
+        "pinned_to_another_version" => frozen_rank(&Verdict::PinnedToAnotherVersion),
+        "not_in_this_repository" => frozen_rank(&Verdict::NotInThisRepository),
+        "continuation_with_no_antecedent" => frozen_rank(&Verdict::ContinuationWithNoAntecedent),
+        "ambiguous_basename" => frozen_rank(&Verdict::AmbiguousBasename),
+        "no_name_the_target_file_holds" => frozen_rank(&Verdict::NoNameTheTargetFileHolds),
+        other => panic!("no rank for the reason {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1136,9 +1237,9 @@ fn frozen_foreign() -> BTreeSet<String> {
 /// name its own line prints is defined elsewhere in that file.
 #[test]
 fn every_source_pointer_in_the_documents_points_at_what_it_names() {
-    let (_, pointers, split) = by_key();
-    let mut problems: Vec<String> = split;
-    for (p, v) in &pointers {
+    let r = reading();
+    let mut problems: Vec<String> = r.split;
+    for (p, v) in &r.fails {
         match v {
             Verdict::BeyondEndOfFile { path, lines } => problems.push(format!(
                 "{}:{} cites {} ({}), and {path} has {lines} lines",
@@ -1157,7 +1258,7 @@ fn every_source_pointer_in_the_documents_points_at_what_it_names() {
                 p.form.word(),
                 names.join(" and "),
             )),
-            _ => {}
+            other => unreachable!("{other:?} is not a failure"),
         }
     }
     assert!(
@@ -1176,21 +1277,12 @@ fn every_source_pointer_in_the_documents_points_at_what_it_names() {
 /// which is what stops the hole closing unnoticed and staying enumerated.
 #[test]
 fn the_frozen_datasets_partition_the_pointers() {
-    let (_, pointers, _) = by_key();
-    let frozen = frozen_unanchored();
+    let r = reading();
+    let recorded = frozen_unanchored();
     let mut problems: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for (p, v) in &pointers {
-        let key = p.key();
-        seen.insert(key.clone());
-        match (v.reason(), frozen.get(&key)) {
-            (None, None) => {}
-            (None, Some(had)) => problems.push(format!(
-                "{UNANCHORED_TSV} freezes {} / {} as {had}, and the rule now has an answer for \
-                 it. Take the row out",
-                key.0, key.1
-            )),
-            (Some(want), None) => problems.push(format!(
+    for (key, (want, p)) in &r.frozen {
+        match recorded.get(key) {
+            None => problems.push(format!(
                 "{}:{} cites {} ({}), which this rule cannot check ({want}), and no row of \
                  {UNANCHORED_TSV} says so",
                 p.doc,
@@ -1198,17 +1290,18 @@ fn the_frozen_datasets_partition_the_pointers() {
                 p.token(),
                 p.form.word()
             )),
-            (Some(want), Some(had)) if had != want => problems.push(format!(
+            Some(had) if had != want => problems.push(format!(
                 "{UNANCHORED_TSV} gives {} / {} the reason {had:?}; it is now {want:?}",
                 key.0, key.1
             )),
-            (Some(_), Some(_)) => {}
+            Some(_) => {}
         }
     }
-    for key in frozen.keys() {
-        if !seen.contains(key) {
+    for key in recorded.keys() {
+        if !r.frozen.contains_key(key) {
             problems.push(format!(
-                "{UNANCHORED_TSV} names {} / {}, which {} no longer cites",
+                "{UNANCHORED_TSV} freezes {} / {}, which the rule now has an answer for, or \
+                 which {} no longer cites. Take the row out",
                 key.0, key.1, key.0
             ));
         }
@@ -1230,8 +1323,8 @@ fn the_frozen_datasets_partition_the_pointers() {
 /// once.
 #[test]
 fn every_file_name_this_repository_does_not_hold_is_named() {
-    let (_, pointers, _) = by_key();
-    let seen: BTreeSet<String> = pointers
+    let seen: BTreeSet<String> = reading()
+        .occurrences
         .iter()
         .filter(|(_, v)| *v == Verdict::NotInThisRepository)
         .map(|(p, _)| p.path_text.clone())
@@ -1319,15 +1412,15 @@ fn every_extension_the_reader_knows_is_used() {
 #[test]
 #[ignore = "prints a census; asserts nothing"]
 fn the_census_of_source_pointers() {
-    let (docs, pointers) = all_pointers();
-    let (_, keys, _) = by_key();
+    let r = reading();
+    let (docs, pointers) = (&r.docs, &r.occurrences);
     let mut by_form: BTreeMap<&str, usize> = BTreeMap::new();
     let mut by_verdict: BTreeMap<&str, usize> = BTreeMap::new();
     let mut short_anchor = 0usize;
-    for (p, _) in &pointers {
+    for (p, _) in pointers {
         *by_form.entry(p.form.word()).or_default() += 1;
     }
-    for (_, v) in &keys {
+    for (_, v) in pointers {
         *by_verdict
             .entry(match v {
                 Verdict::Anchored {
@@ -1350,7 +1443,7 @@ fn the_census_of_source_pointers() {
         }
     }
     let mut carrying: BTreeMap<&String, usize> = BTreeMap::new();
-    for (p, _) in &pointers {
+    for (p, _) in pointers {
         *carrying.entry(&p.doc).or_default() += 1;
     }
     println!("documents scanned: {}", docs.len());
@@ -1365,7 +1458,16 @@ fn the_census_of_source_pointers() {
         println!("  form {k}: {n}");
     }
     println!("total pointers: {}", pointers.len());
-    println!("distinct (document, pointer) keys: {}", keys.len());
+    println!(
+        "distinct (document, pointer) keys: {}",
+        pointers
+            .iter()
+            .map(|(p, _)| p.key())
+            .collect::<BTreeSet<_>>()
+            .len()
+    );
+    println!("failing occurrences: {}", r.fails.len());
+    println!("frozen keys: {}", r.frozen.len());
     for (k, n) in &by_verdict {
         println!("  {k}: {n}");
     }
@@ -1387,19 +1489,15 @@ fn the_census_of_source_pointers() {
 #[test]
 #[ignore = "writes the two frozen datasets"]
 fn regenerate_the_frozen_datasets() {
-    let (_, pointers, _) = by_key();
-    let mut rows: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut foreign: BTreeSet<String> = BTreeSet::new();
-    for (p, v) in &pointers {
-        if let Some(reason) = v.reason() {
-            rows.insert(p.key(), reason.to_string());
-        }
-        if *v == Verdict::NotInThisRepository {
-            foreign.insert(p.path_text.clone());
-        }
-    }
+    let r = reading();
+    let foreign: BTreeSet<String> = r
+        .occurrences
+        .iter()
+        .filter(|(_, v)| *v == Verdict::NotInThisRepository)
+        .map(|(p, _)| p.path_text.clone())
+        .collect();
     let mut out = String::from("doc\ttoken\treason\n");
-    for ((doc, token), reason) in &rows {
+    for ((doc, token), (reason, _)) in &r.frozen {
         out.push_str(&format!("{doc}\t{token}\t{reason}\n"));
     }
     std::fs::write(repo_root().join(UNANCHORED_TSV), out).expect("write the unanchored dataset");

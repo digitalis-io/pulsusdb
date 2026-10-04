@@ -20,8 +20,10 @@ docs/TraceQL/functional-requirements.md	crates/pulsus-read/src/traces/search_pla
 docs/TraceQL/functional-requirements.md	crates/pulsus-read/src/traces/search_sql.rs:124	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-schema/src/catalog.rs:394-404	not_in_this_repository
 docs/TraceQL/functional-requirements.md	crates/pulsus-schema/src/catalog.rs:862-870	not_in_this_repository
+docs/TraceQL/functional-requirements.md	crates/pulsus-server/src/traces_api/intrinsics.rs:61-63	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-server/src/traces_api/params.rs:224-234	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-write/src/protocols/otlp_traces.rs:484-495	no_name_the_target_file_holds
+docs/TraceQL/functional-requirements.md	crates/pulsus-write/src/protocols/otlp_traces.rs:948	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	deploy/e2e/compose.single.yaml:158	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	pkg/api/http.go:69-86	pinned_to_another_version
 docs/TraceQL/functional-requirements.md	pkg/traceql/engine_metrics_compare.go:98-110	pinned_to_another_version
@@ -394,6 +396,7 @@ docs/benchmarks/logs-differential-ledger.md	pkg/validation/limits.go:60-61	pinne
 docs/benchmarks/logs-differential-ledger.md	pkg/validation/validate.go:15	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/validation/validate.go:58-69	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	plan.rs:2641	ambiguous_basename
+docs/benchmarks/logs-differential-ledger.md	post_agg.rs:1122-1135	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	push.go:571-582	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	querier.go:757	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	querier.go:799	not_in_this_repository
@@ -647,6 +650,7 @@ docs/query-lowering.md	exec.rs:2809	ambiguous_basename
 docs/query-lowering.md	exec.rs:709	ambiguous_basename
 docs/query-lowering.md	labels.rs:318	ambiguous_basename
 docs/query-lowering.md	labels.rs:328	ambiguous_basename
+docs/query-lowering.md	logql/compile.rs:314-317	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:111	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:562	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:951	no_name_the_target_file_holds
@@ -852,6 +856,7 @@ docs/query-to-sql.md	schema/schema.sql:471	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:2439	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:3127	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1091-1092	no_name_the_target_file_holds
+docs/query-to-sql.md	search_plan.rs:1262	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1394-1395	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1469-1471	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1481-1484	no_name_the_target_file_holds
@@ -983,6 +988,7 @@ docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:301
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:325	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:357-383	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:366-380	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/search_sql.rs:437-451	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/sql.rs:16-26	not_in_this_repository
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/tags_sql.rs:118	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/tags_sql.rs:253	no_name_the_target_file_holds
