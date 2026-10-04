@@ -92,8 +92,8 @@
 //!
 //! What that leaves open, stated rather than implied:
 //!
-//! * A rendering that happens to equal a fixed name elsewhere. Ruling
-//!   this out textually means treating the template's stem as a prefix and
+//! * A rendering that happens to equal a fixed name elsewhere. Excluding
+//!   this textually means treating the template's stem as a prefix and
 //!   refusing every fixed name under it. On `main` that convicts 32 safe
 //!   pairs — 21 of a template against a fixed name, 11 of a template
 //!   against another template — because `pulsus_read_it_qlg_{}`
@@ -915,7 +915,7 @@ fn f() {
 fn fixture() {
     let quoted = r#"let db = pulsus_testkit::test_db("pulsus_read_it_s1_single");"#;
 }
-async fn real() {
+async fn creating_call() {
     let db = &pulsus_testkit::test_db("pulsus_read_it_s1_single");
 }
 "##;
@@ -1047,8 +1047,8 @@ async fn real() {
     }
 
     // -----------------------------------------------------------------
-    // The floors, one at a time. Each fixture is a one-field mutation of
-    // the control, so it proves something about the field it mutates.
+    // The floors, one at a time. Each fixture changes exactly one field
+    // of the control, so it proves something about the field it changes.
     // -----------------------------------------------------------------
 
     /// An inventory that clears all five floors.
@@ -1086,8 +1086,8 @@ async fn real() {
     fn the_control_inventory_clears_every_floor() {
         assert!(
             check_floors(&passing_inventory()).is_ok(),
-            "the per-floor fixtures are one-field mutations of this; if it does not pass, they \
-             prove nothing about the field they mutate"
+            "each per-floor fixture changes exactly one field of this; if it does not pass, \
+             they prove nothing about the field they change"
         );
     }
 
