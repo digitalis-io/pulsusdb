@@ -243,6 +243,11 @@ impl WindowSql {
         self.time_clause_on("start_ns")
     }
 
+    /// The span table's daily-partition bound (issue #588) — STUB.
+    pub fn span_day_clause(self) -> String {
+        "true".to_string()
+    }
+
     /// The resource table's `day` partition bound (issue #587), from this
     /// window's own two nanoseconds. [`resources_day_bound`] is the text.
     pub fn resources_day_clause(self) -> String {
