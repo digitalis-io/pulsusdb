@@ -174,11 +174,18 @@ pulsusdb:
 # creates none and a serving pod whose database does not exist stays
 # unready and logs the command to run.
 #
-# The script **drops the configured database and builds it fresh**. On an
-# install that is what you want. On an upgrade it would discard everything
-# collected, so disable it after the first install unless a schema change
-# calls for a rebuild — there are no migrations, and a schema change costs
-# a drop and a rebuild.
+# The script **drops the configured database and builds it fresh**, and the
+# Job's name carries a digest of the schema parameters, so:
+#
+#   * an install runs it once;
+#   * an upgrade that changes a schema parameter renders a new Job, which
+#     runs again and **discards what the database holds**. That is the cost
+#     this design states: there are no migrations, and a schema change costs
+#     a drop and a rebuild;
+#   * an upgrade that changes anything else leaves it alone.
+#
+# `templates/init-job.yaml` says which parameters have that property and why
+# the name is built this way.
 initJob:
   enabled: true
   resources:

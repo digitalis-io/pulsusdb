@@ -468,7 +468,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pulsusdb-init
+  name: pulsusdb-init-7bfbdd69
   labels:
     helm.sh/chart: pulsusdb-0.1.0
     app.kubernetes.io/name: pulsusdb

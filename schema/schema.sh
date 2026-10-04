@@ -224,6 +224,47 @@ if [ "$major" -lt 26 ] || { [ "$major" -eq 26 ] && [ "$minor" -lt 3 ]; }; then
     exit 1
 fi
 
+# **And wait for the CLUSTER to be whole**, when there is one. Every
+# statement below carries `ON CLUSTER`, and distributed DDL waits for each
+# host to acknowledge: with a shard still starting it returns "There are N
+# unfinished hosts" after `distributed_ddl_task_timeout` and the whole run
+# fails. The chart installs this Job alongside every shard's StatefulSet, so
+# that is the normal first-install race, not an edge case.
+#
+# `clusterAllReplicas` connects to every replica itself, and
+# `skip_unavailable_shards = 1` makes it answer with the number that did
+# rather than refusing — so the server's own view is the readiness test.
+if [ "$mode" = cluster ]; then
+    want_hosts=$(ask "SELECT count() FROM system.clusters \
+                      WHERE cluster = '$cluster' FORMAT TSVRaw")
+    case "$want_hosts" in
+        '' | *[!0-9]*)
+            echo "schema.sh: cluster '$cluster' is not defined on $server:$port" >&2
+            exit 1
+            ;;
+        0)
+            echo "schema.sh: cluster '$cluster' is not defined on $server:$port" >&2
+            exit 1
+            ;;
+    esac
+    whole=0
+    for _ in $(seq 1 "$wait_seconds"); do
+        live=$(ask "SELECT count() FROM clusterAllReplicas('$cluster', system.one) \
+                    SETTINGS skip_unavailable_shards = 1 FORMAT TSVRaw" 2>/dev/null || echo 0)
+        if [ "$live" = "$want_hosts" ]; then
+            whole=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$whole" = 0 ]; then
+        echo "schema.sh: only $live of $want_hosts hosts in cluster '$cluster' answered \
+within ${wait_seconds}s; ON CLUSTER DDL would fail on the rest" >&2
+        exit 1
+    fi
+    echo "schema.sh: all $want_hosts hosts in cluster '$cluster' answered"
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
