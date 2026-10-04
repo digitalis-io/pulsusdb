@@ -148,6 +148,25 @@ pub const SCHEMA_RETENTION_DAYS: u32 = 36_500;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two to the
 /// same text.
 pub async fn build_schema(db: &str) {
+    build_schema_with_retention(db, SCHEMA_RETENTION_DAYS).await;
+}
+
+/// [`build_schema`] at a stated retention.
+///
+/// **`api_conformance` needs the default seven days**, and the reason is
+/// uncomfortable but it is the behaviour that suite has always had: its route
+/// assertions push fixtures stamped 2023-11-14 through the ingest routes and
+/// then assert that `/api/traces/v1/search` returns an EMPTY array. What makes
+/// that true is the delete-TTL dropping the part as already expired. At a
+/// hundred years the fixtures survive and the assertion fails on rows the
+/// suite itself wrote.
+///
+/// That fragility pre-dates the schema moving out of the binary — the server
+/// used to build the schema from its own `PULSUS_RETENTION_DAYS`, which that
+/// suite leaves at the default — and it is recorded here rather than changed,
+/// because tightening the assertion is a claim about the route and not about
+/// where the DDL lives.
+pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
     let client = ChClient::new(conn_config("default"))
         .await
         .unwrap_or_else(|e| panic!("connect bootstrap client to build {db}: {e}"));
@@ -166,7 +185,7 @@ pub async fn build_schema(db: &str) {
     }
 
     let params = pulsus_schema::RenderCtx {
-        retention_days: SCHEMA_RETENTION_DAYS,
+        retention_days,
         ..pulsus_schema::RenderCtx::for_tests(db)
     };
     pulsus_schema_testkit::run_init(&client, &params)
@@ -193,13 +212,19 @@ pub async fn fresh_db(db: &str) {
 /// spawn with no schema is a sixty-second `/ready` timeout, and there is one
 /// spawn helper per suite but several drops.
 pub fn build_schema_blocking(db: &str) {
+    build_schema_blocking_with_retention(db, SCHEMA_RETENTION_DAYS);
+}
+
+/// [`build_schema_blocking`] at a stated retention. See
+/// [`build_schema_with_retention`] for the one suite that needs the default.
+pub fn build_schema_blocking_with_retention(db: &str, retention_days: u32) {
     let name = db.to_string();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build a current-thread runtime")
-            .block_on(build_schema(&name));
+            .block_on(build_schema_with_retention(&name, retention_days));
     })
     .join()
     .expect("the schema-build thread");
