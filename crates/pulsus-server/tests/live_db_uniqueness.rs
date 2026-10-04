@@ -166,7 +166,8 @@ const MIN_QUOTED_LOOKALIKES: usize = 1;
 
 /// Floors for [`the_composer_is_reachable_only_from_the_scanned_test_tree`],
 /// which walks the whole repository rather than the test tree: 278 files
-/// in the tree and 311 outside it.
+/// in the tree and 310 outside it, the latter counted after `target`,
+/// `vendor`, `.git` and [`COMPOSER_CRATE`] are left unwalked.
 const MIN_FILES_OUTSIDE: usize = 250;
 
 /// The composer's own crate, the one place a composer call composes a
@@ -877,8 +878,11 @@ static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_s
     }
 
     /// The second known-harmless shape, and the one that reads exactly
-    /// like a call: `live_db_naming.rs:709` sits inside an `r#"…"#` block
-    /// that is fed to a source scanner as text. It composes nothing.
+    /// like a call: the composer call in
+    /// `live_db_naming.rs`'s `the_helper_call_is_the_one_accepted_way_to_name_a_test_database`
+    /// sits inside an `r#"…"#` block fed to a source scanner as text, and
+    /// composes nothing. Named by its test rather than by line number,
+    /// which has already moved once in this change.
     #[test]
     fn a_composer_call_inside_a_string_literal_is_text_and_not_a_call() {
         let src = r##"
