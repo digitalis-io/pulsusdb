@@ -192,6 +192,23 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         return Err(err);
     }
 
+    // **And the collector, which is not behind that gate.** The first
+    // scenario pushes OTLP into it, and `pulsusdb` being ready says nothing
+    // about whether it is listening: the collector starts after `pulsusdb`
+    // starts, while `/ready` answers as soon as `pulsusdb` has connected.
+    // The schema is built by a one-shot service now rather than by the
+    // serving process, which took seconds off the time `/ready` needs and
+    // left the first push arriving before the collector's HTTP server was
+    // up — `Connection reset by peer` on `/v1/logs`, measured.
+    println!(
+        "pulsus-e2e: polling {} for the collector",
+        opts.collector_url
+    );
+    if let Err(err) = wait_listening(&http, &opts.collector_url, READY_POLL_TIMEOUT).await {
+        dump_logs(&compose, opts.variant);
+        return Err(err);
+    }
+
     let ctx = Ctx {
         http,
         base_url: opts.base_url.clone(),
@@ -253,6 +270,31 @@ pub async fn wait_ready(http: &reqwest::Client, base_url: &str, timeout: Duratio
         let now = tokio::time::Instant::now();
         if now >= deadline {
             bail!("{url} did not become ready within {timeout:?}");
+        }
+        tokio::time::sleep(READY_POLL_INTERVAL.min(deadline - now)).await;
+    }
+}
+
+/// Polls `url` until it ANSWERS, whatever it answers.
+///
+/// [`wait_ready`]'s sibling for a service with no readiness endpoint: the
+/// collector's OTLP receiver answers `405` to a `GET`, and a status is proof
+/// the listener is up, which is the whole question here. Same per-attempt
+/// timeout discipline, for the same reason.
+pub async fn wait_listening(http: &reqwest::Client, url: &str, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("{url} was not listening within {timeout:?}");
+        }
+        let attempt_budget = (deadline - now).min(READY_REQUEST_TIMEOUT);
+        if let Ok(Ok(_)) = tokio::time::timeout(attempt_budget, http.get(url).send()).await {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("{url} was not listening within {timeout:?}");
         }
         tokio::time::sleep(READY_POLL_INTERVAL.min(deadline - now)).await;
     }
