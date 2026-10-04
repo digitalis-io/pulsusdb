@@ -3,8 +3,8 @@ Feature: PulsusDB pods stay running-but-unready during a ClickHouse outage, neve
   I want a prolonged ClickHouse outage to degrade readiness only, never trigger a restart storm
   So that the probe contract (issue #38 plan amendment §1 — liveness/startupProbe are always
   plain TCP, only readiness ever depends on /ready) holds against a real kubelet, not just
-  rendered YAML. Also proves reconcile-retry: once ClickHouse comes back, the same pod
-  (never restarted) self-reconciles and becomes Ready again on its own
+  rendered YAML. Also proves retry: once ClickHouse comes back, the same pod (never
+  restarted) reconnects and becomes Ready again on its own
   (issue #38 task-manager final ruling #3 — required scenarios)
 
   Scenario: A pod survives a prolonged ClickHouse outage unready, then self-heals when ClickHouse returns
@@ -20,9 +20,12 @@ Feature: PulsusDB pods stay running-but-unready during a ClickHouse outage, neve
   # Round-2 code-review test gap #5, tightened by round-3 disposition for
   # determinism: the scenario above proves resilience to an outage a pod
   # discovers *after* it was already healthy. This scenario instead
-  # exercises the pod's very first reconcile attempt —
+  # exercises the pod's very first startup attempt —
   # crates/pulsus-server/src/serve.rs's ensure_schema_then_connect retry
   # loop starting cold, before ClickHouse has ever been reachable at all.
+  # The schema Job is waiting through the same outage (schema/schema.sh
+  # polls for five minutes by default), so the schema lands when ClickHouse
+  # does and the pod has something to serve from.
   # ClickHouse is scaled to zero (and confirmed absent) *before* the
   # pulsusdb pod is ever created — not raced against `--wait=false` — by
   # installing with `pulsusdb.replicaCount=0` first (so no pulsusdb pod

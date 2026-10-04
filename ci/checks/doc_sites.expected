@@ -1,8 +1,6 @@
 crates/pulsus-clickhouse/src/client.rs:156-164
 crates/pulsus-clickhouse/src/lib.rs:6-10
 crates/pulsus-read/src/logql/plan.rs:5573-5581
-crates/pulsus-schema/src/catalog.rs:195-195
-crates/pulsus-schema/src/catalog.rs:254-254
 crates/pulsus-server/tests/fingerprint_collision_live.rs:676-682
 crates/pulsus-server/tests/fingerprint_collision_live.rs:909-909
 crates/pulsus-server/tests/logs_api_live.rs:1404-1404
@@ -26,4 +24,5 @@ docs/decisions/0006-log-pattern-extraction.md:52-62
 docs/schemas.md:1089-1089
 docs/schemas.md:174-174
 docs/schemas.md:33-33
+docs/schemas.md:691-692
 docs/traceql-schema-migration.md:2289-2289

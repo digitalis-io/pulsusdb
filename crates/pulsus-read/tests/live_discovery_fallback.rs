@@ -39,7 +39,8 @@ use pulsus_read::{
     DataWindow, DiscoveryFilter, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
     MetricsConfig, MetricsEngine,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when

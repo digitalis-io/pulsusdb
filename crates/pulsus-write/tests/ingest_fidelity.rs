@@ -107,7 +107,8 @@ use tower::ServiceExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Date, LabelSet, log_label_name};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 use pulsus_write::{LogWriter, WriterTables};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a

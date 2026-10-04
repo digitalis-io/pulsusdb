@@ -22,6 +22,19 @@ services:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s
 
+  # The schema. The binary creates none, so this one-shot service builds it
+  # before the server starts: it drops the database and applies
+  # `schema/schema.sql` fresh. Set `PULSUS_CLUSTER` here too for a sharded
+  # ClickHouse.
+  schema:
+    image: ghcr.io/digitalis-io/pulsusdb:latest
+    entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+    environment:
+      CLICKHOUSE_SERVER: clickhouse
+      PULSUS_RETENTION_DAYS: "7"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+
   pulsusdb:
     image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
@@ -30,6 +43,7 @@ services:
     ports: [ "3100:3100" ]
     depends_on:
       clickhouse: { condition: service_healthy }
+      schema: { condition: service_completed_successfully }
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest

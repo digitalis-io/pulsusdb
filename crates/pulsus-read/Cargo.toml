@@ -76,6 +76,7 @@ tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 tracing.workspace = true
 
 [dev-dependencies]
+pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
 # Issue #320: the shared live-gate guard for the environment-gated
 # suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
 # exit 0, so a CI wiring regression was silent.

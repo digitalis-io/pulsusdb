@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
-use pulsus_schema::{Family, RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 const CLUSTER_NAME: &str = "pulsus_test_cluster";
 // Each test uses its own dedicated database (mirroring live_schema.rs's
@@ -38,8 +39,8 @@ const CLUSTER_NAME: &str = "pulsus_test_cluster";
 // sidestep the race entirely rather than papering over it with a retry.
 static TEST_DB_DIST: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dist");
-static TEST_DB_BOOKKEEPING: pulsus_testkit::TestDb =
-    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_bookkeeping");
+static TEST_DB_CATALOG: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_catalog");
 static TEST_DB_SPAN_ARRAYS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_span_arrays");
 // Issue #560: the two derived trace tables, clustered.
@@ -198,7 +199,7 @@ struct LogSampleRow {
 /// on *every* shard (not just the one the client is connected to), a write
 /// through a `_dist` table is readable back through `_dist`, and every
 /// `_dist` table in a family carries the byte-identical
-/// `Family::sharding_expr()` string live in `system.tables`.
+/// family sharding expression live in `system.tables`.
 #[tokio::test]
 async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_sharding() {
     skip_unless_live!();
@@ -235,20 +236,28 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     let names2 = table_names(&shard2, &TEST_DB_DIST).await;
     assert_eq!(names1, names2, "DDL must land identically on every shard");
 
+    // The sharding expression every wrapper in a family must carry
+    // (docs/schemas.md §7): one fingerprint maps to one shard, so a series'
+    // rollups land where its samples do. Written out here rather than read
+    // from a renderer, so this side of the assertion is independent of
+    // `schema/schema.sql`.
+    const METRICS_KEY: &str = "cityHash64(metric_name, fingerprint)";
+    const LOGS_KEY: &str = "cityHash64(fingerprint)";
+    const TRACES_KEY: &str = "cityHash64(trace_id)";
     let dist_tables = [
-        ("metric_series_dist", Family::Metrics),
-        ("metric_samples_dist", Family::Metrics),
-        ("log_streams_dist", Family::Logs),
-        ("log_streams_idx_dist", Family::Logs),
-        ("log_samples_dist", Family::Logs),
-        ("log_metrics_5s_dist", Family::Logs),
-        ("trace_spans_dist", Family::Traces),
-        ("trace_attrs_idx_dist", Family::Traces),
+        ("metric_series_dist", METRICS_KEY),
+        ("metric_samples_dist", METRICS_KEY),
+        ("log_streams_dist", LOGS_KEY),
+        ("log_streams_idx_dist", LOGS_KEY),
+        ("log_samples_dist", LOGS_KEY),
+        ("log_metrics_5s_dist", LOGS_KEY),
+        ("trace_spans_dist", TRACES_KEY),
+        ("trace_attrs_idx_dist", TRACES_KEY),
         // Service-graph edge ledger (M7-E1, issue #173): co-shards with the
         // rest of the Traces family on `cityHash64(trace_id)`.
-        ("trace_edges_dist", Family::Traces),
+        ("trace_edges_dist", TRACES_KEY),
     ];
-    for (table, family) in dist_tables {
+    for (table, sharding_expr) in dist_tables {
         assert!(
             names1.contains(&table.to_string()),
             "missing {table} on shard1"
@@ -260,9 +269,8 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
             "{table}'s CREATE statement must be identical on every shard"
         );
         assert!(
-            ddl1.contains(family.sharding_expr()),
-            "{table} must carry its family's sharding expression {:?}, got: {ddl1}",
-            family.sharding_expr()
+            ddl1.contains(sharding_expr),
+            "{table} must carry its family's sharding expression {sharding_expr:?}, got: {ddl1}"
         );
     }
 
@@ -278,7 +286,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         v
     };
     for ddl in &metrics_exprs {
-        assert!(ddl.contains(Family::Metrics.sharding_expr()));
+        assert!(ddl.contains(METRICS_KEY));
     }
 
     let logs_dist = [
@@ -289,7 +297,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     ];
     for t in logs_dist {
         let ddl = create_table_query(&shard1, &TEST_DB_DIST, t).await;
-        assert!(ddl.contains(Family::Logs.sharding_expr()));
+        assert!(ddl.contains(LOGS_KEY));
     }
 
     let traces_dist = [
@@ -299,7 +307,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     ];
     for t in traces_dist {
         let ddl = create_table_query(&shard1, &TEST_DB_DIST, t).await;
-        assert!(ddl.contains(Family::Traces.sharding_expr()));
+        assert!(ddl.contains(TRACES_KEY));
     }
 
     // trace_tag_catalog is a Global catalog table (issue #53 adjudication):
@@ -410,20 +418,6 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-struct MigrationRow {
-    id: u32,
-    checksum: String,
-    applied_at: u32,
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-struct MvChecksumRow {
-    mv_name: String,
-    checksum: String,
-    updated_at: u32,
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricMetadataRow {
     metric_name: String,
     metric_type: String,
@@ -517,14 +511,20 @@ where
     last
 }
 
-/// Issue #5 fix plan F2: `schema_migrations`, `mv_checksums`, and
-/// `metric_metadata` join ONE shard-less, cluster-wide replica set
+/// The catalog tables join ONE shard-less, cluster-wide replica set
 /// (`/clickhouse/tables/all/<db>.<table>`) rather than each shard's own
-/// per-shard replica set — so bookkeeping/catalog rows written while
-/// connected to shard1 must read back identically from shard2 directly
-/// (never through `_dist`; these tables carry no `_dist` wrapper).
+/// per-shard replica set — so a catalog row written while connected to
+/// shard1 must read back identically from shard2 directly (never through
+/// `_dist`; these tables carry no `_dist` wrapper).
+///
+/// **This is also what tells a correct replication path from the silently
+/// broken one.** A path whose `{shard}` macro was substituted away reaches
+/// the same validation point as a correct one on a single node, and only a
+/// keeper-backed cluster shows the difference: here `metric_metadata` and
+/// `trace_tag_catalog` must share a replica set while every per-shard table
+/// must not.
 #[tokio::test]
-async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
+async fn the_catalog_tables_are_identical_on_every_shard() {
     skip_unless_live!();
     let shard1 = ChClient::new(shard1_config())
         .await
@@ -538,87 +538,29 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     // of the Atomic database engine's default deferred drop.
     shard1
         .execute(
-            &format!(
-                "DROP DATABASE IF EXISTS {TEST_DB_BOOKKEEPING} ON CLUSTER '{CLUSTER_NAME}' SYNC"
-            ),
+            &format!("DROP DATABASE IF EXISTS {TEST_DB_CATALOG} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await
         .expect("drop test database on cluster");
 
-    let ctx = cluster_ctx(&TEST_DB_BOOKKEEPING);
+    let ctx = cluster_ctx(&TEST_DB_CATALOG);
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
-
-    let (migrations1, migrations2) = poll_until_matching(|| async {
-        (
-            bookkeeping_rows::<MigrationRow>(
-                &shard1,
-                &TEST_DB_BOOKKEEPING,
-                "schema_migrations",
-                "id",
-            )
-            .await,
-            bookkeeping_rows::<MigrationRow>(
-                &shard2,
-                &TEST_DB_BOOKKEEPING,
-                "schema_migrations",
-                "id",
-            )
-            .await,
-        )
-    })
-    .await;
-    assert!(
-        !migrations1.is_empty(),
-        "schema_migrations must have rows after run_init"
-    );
-    assert_eq!(
-        migrations1, migrations2,
-        "schema_migrations rows must be identical on every shard"
-    );
-
-    let (mvs1, mvs2) = poll_until_matching(|| async {
-        (
-            bookkeeping_rows::<MvChecksumRow>(
-                &shard1,
-                &TEST_DB_BOOKKEEPING,
-                "mv_checksums",
-                "mv_name",
-            )
-            .await,
-            bookkeeping_rows::<MvChecksumRow>(
-                &shard2,
-                &TEST_DB_BOOKKEEPING,
-                "mv_checksums",
-                "mv_name",
-            )
-            .await,
-        )
-    })
-    .await;
-    assert!(
-        !mvs1.is_empty(),
-        "mv_checksums must have rows after run_init"
-    );
-    assert_eq!(
-        mvs1, mvs2,
-        "mv_checksums rows must be identical on every shard"
-    );
 
     // metric_metadata has no M0 writer, so it is legitimately empty — the
     // invariant under test is that both shards agree (both empty counts as
     // "identical"), not that it is populated.
     let metadata1 = bookkeeping_rows::<MetricMetadataRow>(
         &shard1,
-        &TEST_DB_BOOKKEEPING,
+        &TEST_DB_CATALOG,
         "metric_metadata",
         "metric_name",
     )
     .await;
     let metadata2 = bookkeeping_rows::<MetricMetadataRow>(
         &shard2,
-        &TEST_DB_BOOKKEEPING,
+        &TEST_DB_CATALOG,
         "metric_metadata",
         "metric_name",
     )
@@ -637,7 +579,7 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     shard1
         .execute(
             &format!(
-                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog \
+                "INSERT INTO {TEST_DB_CATALOG}.trace_tag_catalog \
                      (scope, key, val, val_type) \
                  VALUES ('span', 'http.status_code', '500', 'int')"
             ),
@@ -650,14 +592,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
         (
             bookkeeping_rows::<TraceTagRow>(
                 &shard1,
-                &TEST_DB_BOOKKEEPING,
+                &TEST_DB_CATALOG,
                 "trace_tag_catalog",
                 "scope, key, val, val_type",
             )
             .await,
             bookkeeping_rows::<TraceTagRow>(
                 &shard2,
-                &TEST_DB_BOOKKEEPING,
+                &TEST_DB_CATALOG,
                 "trace_tag_catalog",
                 "scope, key, val, val_type",
             )
@@ -752,18 +694,21 @@ async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
         }
     }
 
-    // The constraint lives on the BASE table only: a Distributed table
-    // refuses `ADD_CONSTRAINT`, and does not need one.
+    // The base table carries the constraint, and so does the wrapper: it is
+    // created `AS {{db}}.trace_spans`, which copies the whole declaration.
+    // That is new — the wrapper used to predate the `ALTER` that added the
+    // constraint, and a Distributed table refuses `ADD CONSTRAINT`, so the
+    // old build order left it without one. It costs nothing: the base
+    // enforces the same check on the same rows, and the round-trip below is
+    // what shows a valid span still lands through the wrapper.
     let base_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans").await;
     let dist_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans_dist").await;
-    assert!(
-        base_ddl.contains("attr_arrays_aligned"),
-        "the base table must carry the constraint: {base_ddl}"
-    );
-    assert!(
-        !dist_ddl.contains("CONSTRAINT"),
-        "the wrapper must carry no constraint: {dist_ddl}"
-    );
+    for (label, ddl) in [("the base table", &base_ddl), ("the wrapper", &dist_ddl)] {
+        assert!(
+            ddl.contains("attr_arrays_aligned"),
+            "{label} must carry the constraint: {ddl}"
+        );
+    }
 
     let now_ns = i64::try_from(
         std::time::SystemTime::now()
@@ -991,8 +936,11 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         .expect("connect shard2");
     require_two_shard_topology(&shard1, &shard2).await;
 
+    // Dropped and built ONCE at the configured window: a second build over
+    // an existing table adopts it, so the window would stay at the default
+    // and this case would assert the default against itself.
     let db = &TEST_DB_DEDUP_WINDOWS;
-    fresh_cluster_db(&shard1, db).await;
+    drop_cluster_db(&shard1, db).await;
     let mut ctx = cluster_ctx(db);
     ctx.metrics_dedup_window = 5_000;
     ctx.log_dedup_window = 5_000;
@@ -1075,9 +1023,9 @@ async fn the_clustered_form() {
         for base in ["spans", "traces"] {
             let got = engine_full_on(shard, db, &format!("{base}_dist")).await;
             let want = format!(
-                "Distributed('{CLUSTER_NAME}', '{db}', '{base}', {}) \
-                 SETTINGS fsync_after_insert = 1, fsync_directories = 1",
-                Family::Traces.sharding_expr()
+                "Distributed('{CLUSTER_NAME}', '{db}', '{base}', \
+                 cityHash64(trace_id)) \
+                 SETTINGS fsync_after_insert = 1, fsync_directories = 1"
             );
             assert_eq!(
                 got,
@@ -1139,14 +1087,25 @@ async fn exec_on(client: &ChClient, sql: &str) {
 }
 
 async fn fresh_cluster_db(shard1: &ChClient, db: &str) {
+    drop_cluster_db(shard1, db).await;
+    run_init(shard1, &cluster_ctx(db))
+        .await
+        .expect("run_init (clustered)");
+}
+
+/// Drops `db` on every shard, without building anything.
+///
+/// **A case that wants a non-default parameter has to build only once.**
+/// Every `CREATE` carries `IF NOT EXISTS` and nothing mutates a table in
+/// place any more, so a second build over an existing one adopts it and the
+/// parameter never lands. `SYNC` forces the physical cleanup, Keeper replica
+/// znodes included, rather than the Atomic engine's deferred drop.
+async fn drop_cluster_db(shard1: &ChClient, db: &str) {
     exec_on(
         shard1,
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
-    run_init(shard1, &cluster_ctx(db))
-        .await
-        .expect("run_init (clustered)");
 }
 
 /// Every one of `tables` exists in `db` on both shards; the missing ones

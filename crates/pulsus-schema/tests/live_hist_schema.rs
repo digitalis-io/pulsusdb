@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -173,7 +174,7 @@ const HIST_SELECT_COLS: &str = "metric_name, fingerprint, unix_milli, schema, ze
 
 /// Issue #113 (AC): `run_init` on a fresh database creates
 /// `metric_hist_samples` and adds `metric_series.value_type UInt8`; a second
-/// run is a no-op (no `MigrationDrift` on ids 23–26); and the frozen
+/// run is a no-op; and the frozen
 /// `metric_samples`/`metric_series` base CREATEs are untouched (the float read
 /// path stays byte-frozen).
 #[tokio::test]
@@ -216,7 +217,7 @@ async fn native_histogram_migrations_apply_and_are_idempotent() {
         "metric_samples value column stays Float64 (float path byte-frozen)"
     );
 
-    // Second run: idempotent, no MigrationDrift on ids 23–26.
+    // Second run: idempotent.
     run_init(&client, &ctx)
         .await
         .expect("run_init (second run — ids 23–26 must not drift)");

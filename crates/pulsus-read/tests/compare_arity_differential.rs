@@ -71,7 +71,8 @@ use std::time::{Duration, Instant};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{MetricLabelValue, TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 const SEC: i64 = 1_000_000_000;
 const MS: i64 = 1_000_000;

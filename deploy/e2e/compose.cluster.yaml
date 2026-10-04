@@ -26,6 +26,26 @@
 # a follow-up.
 
 services:
+  # The schema. The binary creates none, so this one-shot service builds the
+  # clustered variant — `Replicated*` engines, `ON CLUSTER`, the `_dist`
+  # wrappers — before the server starts.
+  schema:
+    build:
+      context: ${PULSUS_E2E_ROOT}
+    image: pulsusdb:e2e
+    entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+    networks:
+      pulsus-schema-it:
+        # .11/.12 are the shards, .20 to .22 this file's other services; a
+        # collision resets the colliding service's connections rather than
+        # failing to start, which cost one run.
+        ipv4_address: 172.28.0.23
+    environment:
+      CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
+      PULSUS_CLUSTER: pulsus_test_cluster
+      PULSUS_RETENTION_DAYS: "7"
+    depends_on: [ ch-shard1, ch-shard2 ]
+
   pulsusdb:
     build:
       context: ${PULSUS_E2E_ROOT}
@@ -50,8 +70,13 @@ services:
     # Plain start-order form, not `condition: service_healthy` — the
     # harness polls `/ready` itself rather than trusting compose's health
     # condition, whose semantics (and, on older Podman, reliability) differ
-    # across implementations (architect plan edge case).
-    depends_on: [ ch-shard1, ch-shard2 ]
+    # across implementations (architect plan edge case). The schema is the
+    # one exception: the binary creates none, so the server has nothing to
+    # serve from until `schema.sh` has finished.
+    depends_on:
+      ch-shard1: { condition: service_started }
+      ch-shard2: { condition: service_started }
+      schema: { condition: service_completed_successfully }
     ports: [ "3100:3100" ]
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3100/ready"]

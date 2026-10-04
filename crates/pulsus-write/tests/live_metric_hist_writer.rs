@@ -46,7 +46,8 @@ use pulsus_model::{
     DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, STALE_NAN_BITS, Span,
     metric_fingerprint,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::protocols::otlp_metrics;
 use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::{

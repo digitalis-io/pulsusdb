@@ -40,7 +40,8 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 use pulsus_write::ingest::http::traces;
 use pulsus_write::{TraceWriter, TraceWriterTables};
 

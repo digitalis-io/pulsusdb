@@ -27,7 +27,8 @@ use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_config::WriterConfig;
 use pulsus_model::{CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, HistogramColumns};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::protocols::remote_write::{
     BucketSpan, Histogram, HistogramCount, Label, TimeSeries, WriteRequest,
 };

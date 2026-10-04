@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// The six tables on the trace write path: the landing table and the five
 /// the views maintain.

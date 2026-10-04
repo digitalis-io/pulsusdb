@@ -165,14 +165,14 @@ and for the one performance cliff it introduces.
 | Feature | Notes | Milestone |
 |---------|-------|-----------|
 | Single-binary modes | `all` / `writer` / `reader` / `init` | M0 |
-| Schema controller | idempotent DDL, append-only migrations, TTL rotation, MV checksum lifecycle | M0 |
+| Schema | one `schema/schema.sql`, applied by `schema/schema.sh`; two variants, single-node and clustered; drop and recreate, no migrations | M0 |
 | Health & introspection | `/ready`, `/metrics`, `/config`, `/buildinfo` | M0 |
 | Basic auth | `PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` | M0 |
 | Compatibility endpoint flag | `PULSUS_COMPAT_ENDPOINTS` (default off) | M1 |
 | Inbound TLS | native TLS termination on the listener | M7 |
 | Label cache | bounded active-series window, JOIN fallback | M2 |
 | Downsampling | insert-triggered in-database MVs (real-time tiers), one-shot backfill, checksum-gated MV recreation, `PULSUS_TIER_POLICY` exact/fast routing | M3 |
-| Clustered ClickHouse | Replicated engines; Distributed tables over every per-shard table but the three ingest landing tables — `log_landing`, `metric_landing` and `trace_landing` — which are written under their bare names so one push stays one block, and none over the cluster-wide catalogue and bookkeeping tables ([schemas.md §7](schemas.md) lists all ten); shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
+| Clustered ClickHouse | Replicated engines; Distributed tables over every per-shard table but the three ingest landing tables — `log_landing`, `metric_landing` and `trace_landing` — which are written under their bare names so one push stays one block, and none over the cluster-wide catalogue tables ([schemas.md §7](schemas.md) lists all eight); shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
 | Cross-cluster reads | distributed-suffix read targeting | M7 |
 | Recording rules (ruler) | LogQL + PromQL kinds, CRUD API, write-back | M7 |
 | Alerting rules | stored/validated from M7 API; evaluation + notification delivery | post-1.0 |
@@ -186,7 +186,7 @@ Every signal milestone gates on an end-to-end pipeline: **OTel Collector → Pul
 
 | Milestone | Deliverable | Definition of done |
 |-----------|-------------|--------------------|
-| **M0 — Foundation** | workspace, config loader, ClickHouse client + pool (benchmarked choice), schema controller with logs+metrics DDL, health endpoints, CI, compose-based dev env (podman compose or docker compose, incl. OTel Collector) | `pulsusdb --mode init` creates a correct schema on a fresh ClickHouse; e2e harness skeleton green |
+| **M0 — Foundation** | workspace, config loader, ClickHouse client + pool (benchmarked choice), the logs+metrics DDL, health endpoints, CI, compose-based dev env (podman compose or docker compose, incl. OTel Collector) | `schema/schema.sh` creates a correct schema on a fresh ClickHouse; e2e harness skeleton green |
 | **M1 — Logs proof** | OTLP logs ingest, LogQL proof subset, `/api/logs/v1/{query_range,query,labels,series}`, one flag-gated compat query path | collector logs pipeline queryable end-to-end; `EXPLAIN indexes = 1` shows primary-index + skip-index use; benchmarked against captured real-world slow queries with `system.query_log` evidence (read_rows, read_bytes, marks); multi-shard behavior measured, not assumed |
 | **M2 — Metrics proof** | OTLP metrics + remote write, time-aware label cache, PromQL proof subset, Prometheus API surface | differential test vs Prometheus: 100% value match on the M2 subset over 10k series fed through the collector; label-resolution correctness tests incl. historical windows; **three-path label-resolution benchmark started on the 5M-series scale corpus** (cache matcher + refresh cost / SQL fallback across metric cardinalities / prototype inverted index) |
 | **M3 — Downsampling** | tier tables, insert-triggered MVs, one-shot backfill, tier router + `PULSUS_TIER_POLICY`, `@` modifier | tier accuracy suite green (misaligned windows, single-reset counters, duplicate/late data) with documented error bounds; `exact` policy bit-identical to Prometheus on raw segments; insert-throughput impact of tier MVs measured; **label-resolution decision gate closed with benchmark evidence** — ship `metric_series_idx` and/or incremental cache refresh only if the data demands it |

@@ -1,11 +1,19 @@
-//! DDL rendering: explicit `{{token}}` string substitution (never a
-//! template-engine dependency — docs/schemas.md's DDL is byte-authoritative
-//! and the parameter set is small and fixed) plus a structural engine-swap
-//! pass for clustered deployments. Double-brace tokens never collide with
-//! ClickHouse's own single-brace `{shard}`/`{replica}` macros, which must
-//! survive verbatim into `Replicated*` engine arguments.
+//! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
+//! replacement, sixteen names and nothing else.
+//!
+//! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
+//! macros are single-brace and must survive verbatim into `Replicated*`
+//! engine arguments; a substitution expression that matched a single brace
+//! pair would eat them, and the server accepts the result without complaint
+//! — every shard then joins one replica set. Double-brace tokens cannot
+//! match them.
 
 use std::time::Duration;
+
+/// Config-derived rendering context, and the parameter the test toolkit's
+/// `run_init` takes. The same struct doubles as both so there is exactly one
+/// config-shaped struct in this crate rather than two kept in sync by hand.
+pub type SchemaParams = RenderCtx;
 
 /// The config-derived context every DDL block renders against. Re-exported
 /// from `pulsus-schema` as `SchemaParams` — the same struct doubles as the
@@ -81,53 +89,6 @@ impl RenderCtx {
     }
 }
 
-/// Table families that must shard byte-identically (docs/schemas.md §7):
-/// every raw/series/index/tier table in a family carries the exact same
-/// `Distributed(...)` sharding expression, or a series' rollups silently
-/// land on a different shard than its samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    Metrics,
-    Logs,
-    Traces,
-}
-
-impl Family {
-    /// The single source of truth for a family's sharding expression
-    /// (docs/schemas.md §7). Every `_dist` wrapper in a family renders this
-    /// exact string — never a per-table copy.
-    ///
-    /// **The logs key hashes the column rather than being the column**
-    /// (issue #498). A `Distributed` sharding key must evaluate to an
-    /// integer type ClickHouse accepts, and `UInt128` is not one: with
-    /// `fingerprint` now 128 bits, the bare column creates without
-    /// complaint and then refuses every insert. Measured on ClickHouse
-    /// 26.3.29.7 against a two-shard fixture:
-    ///
-    /// ```text
-    ///   Distributed(..., fingerprint)              CREATE ok
-    ///                                              INSERT Code: 53,
-    ///                                                "Sharding key expression does not
-    ///                                                 evaluate to an integer type"
-    ///                                              SELECT count() = 0
-    ///   Distributed(..., cityHash64(fingerprint))  CREATE ok, INSERT ok,
-    ///                                              SELECT returns the row with the
-    ///                                                128-bit value intact
-    /// ```
-    ///
-    /// The co-sharding property the family needs is unchanged: one
-    /// fingerprint still maps to one shard, and it now maps through both
-    /// 64-bit halves rather than through the low one. `cityHash64` is the
-    /// same function the other two families' keys already use.
-    pub const fn sharding_expr(self) -> &'static str {
-        match self {
-            Family::Metrics => "cityHash64(metric_name, fingerprint)",
-            Family::Logs => "cityHash64(fingerprint)",
-            Family::Traces => "cityHash64(trace_id)",
-        }
-    }
-}
-
 /// Renders the human-readable rollup-resolution suffix used in
 /// `log_metrics_<res>` (docs/schemas.md §3.1), e.g. `5s`, `500ms`, `2m`.
 /// Whole units are preferred over sub-units so the default (`5s`) matches
@@ -151,31 +112,31 @@ pub fn rollup_suffix(d: Duration) -> String {
     format!("{nanos}ns")
 }
 
-/// Applies every `{{token}}` substitution defined by [`RenderCtx`]. Never
-/// touches ClickHouse's own single-brace `{shard}`/`{replica}` macros — they
-/// are simply absent from double-brace matching.
+/// Applies every `{{token}}` substitution the file uses. Never touches
+/// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
+/// simply absent from double-brace matching.
+///
+/// `schema.sh` carries the same list as sixteen `sed` expressions;
+/// `the_script_renders_exactly_what_this_crate_renders` holds the two
+/// together.
 pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
-    substitute_tokens_with(tmpl, ctx, &ctx.retention_days.to_string())
-}
-
-/// Same as [`substitute_tokens`], but `{{retention_days}}` is substituted
-/// with `retention_repr` rather than `ctx.retention_days` — the seam
-/// [`identity_ddl`] uses to exclude the mutable retention value from
-/// migration identity (issue #5 fix plan F1) while every other token still
-/// renders normally.
-fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> String {
     let on_cluster = match &ctx.cluster {
         Some(name) => format!(" ON CLUSTER '{}'", escape_literal(name)),
         None => String::new(),
     };
     let cluster_name = ctx.cluster.clone().unwrap_or_default();
     let log_rollup_ns = ctx.log_rollup.as_nanos().to_string();
+    let storage_policy = match &ctx.storage_policy {
+        Some(policy) => format!(", storage_policy = '{}'", escape_literal(policy)),
+        None => String::new(),
+    };
 
     tmpl.replace("{{db}}", &ctx.db)
         .replace("{{on_cluster}}", &on_cluster)
         .replace("{{cluster}}", &cluster_name)
         .replace("{{dist_suffix}}", &ctx.dist_suffix)
-        .replace("{{retention_days}}", retention_repr)
+        .replace("{{route_suffix}}", route_suffix(ctx))
+        .replace("{{retention_days}}", &ctx.retention_days.to_string())
         .replace("{{log_rollup_suffix}}", &rollup_suffix(ctx.log_rollup))
         .replace("{{log_rollup_ns}}", &log_rollup_ns)
         .replace(
@@ -183,46 +144,27 @@ fn substitute_tokens_with(tmpl: &str, ctx: &RenderCtx, retention_repr: &str) -> 
             &ctx.metrics_landing_retention_hours.to_string(),
         )
         .replace(
-            "{{metrics_dedup_window}}",
-            &ctx.metrics_dedup_window.to_string(),
-        )
-        .replace(
             "{{log_landing_retention_hours}}",
             &ctx.log_landing_retention_hours.to_string(),
         )
-        .replace("{{log_dedup_window}}", &ctx.log_dedup_window.to_string())
         .replace(
             "{{trace_landing_retention_hours}}",
             &ctx.trace_landing_retention_hours.to_string(),
         )
         .replace(
+            "{{metrics_dedup_window}}",
+            &ctx.metrics_dedup_window.to_string(),
+        )
+        .replace("{{log_dedup_window}}", &ctx.log_dedup_window.to_string())
+        .replace(
             "{{trace_dedup_window}}",
             &ctx.trace_dedup_window.to_string(),
         )
-        .replace("{{route_suffix}}", route_suffix(ctx))
-        .replace("{{dedup_window_setting}}", dedup_window_setting(ctx))
         .replace(
             "{{dedup_window_seconds}}",
-            &crate::controller::DEDUP_WINDOW_SECONDS.to_string(),
+            &crate::checks::DEDUP_WINDOW_SECONDS.to_string(),
         )
-}
-
-/// The `MergeTree` setting that carries the block-deduplication window on the
-/// engine this deployment renders (issue #603).
-///
-/// **The name is rendered from the same thing that renders the engine.**
-/// `non_replicated_deduplication_window` applies to a non-replicated
-/// `MergeTree` table only, and a clustered deployment — the production shape —
-/// renders every write-path table `Replicated*`, where the setting in force is
-/// the replicated engines' own. Sending the non-replicated name there left the
-/// deployment's configured window with nothing to change. Deriving both from
-/// `ctx.cluster` is what stops either name reaching a table that does not
-/// carry it.
-fn dedup_window_setting(ctx: &RenderCtx) -> &'static str {
-    match ctx.cluster {
-        Some(_) => "replicated_deduplication_window",
-        None => "non_replicated_deduplication_window",
-    }
+        .replace("{{storage_policy}}", &storage_policy)
 }
 
 /// The suffix a materialized view's `TO` clause carries when its target is
@@ -254,146 +196,10 @@ fn escape_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Renders a table/view *name* template (may contain `{{log_rollup_suffix}}`
-/// but never `{{on_cluster}}`) against `ctx`. Used both to compute the
-/// fully-resolved name for bookkeeping/zoo-path purposes and as an input to
-/// [`render`].
+/// Renders a table/view *name* template (may contain
+/// `{{log_rollup_suffix}}`, never `{{on_cluster}}`).
 pub fn render_name(name_tmpl: &str, ctx: &RenderCtx) -> String {
     substitute_tokens(name_tmpl, ctx)
-}
-
-/// Renders one DDL template end to end: token substitution, then (clustered
-/// mode only) the `MergeTree`-family → `Replicated*` engine swap, then
-/// (always) storage-policy `SETTINGS` injection. `global` selects the zoo
-/// path scope for the clustered engine swap (issue #5 fix plan F2): `true`
-/// for the shard-less, cluster-wide bookkeeping/catalog replica set
-/// (`Migration.replication == Replication::Global`), `false` for the normal
-/// per-shard data tables. Ignored outside clustered mode and by statements
-/// with no `ENGINE = ` clause (views, `CREATE DATABASE`).
-pub fn render(tmpl: &str, resolved_table_name: &str, ctx: &RenderCtx, global: bool) -> String {
-    let mut s = substitute_tokens(tmpl, ctx);
-    if ctx.cluster.is_some() {
-        s = swap_engine(&s, resolved_table_name, ctx, global);
-    }
-    inject_storage_policy(&s, ctx.storage_policy.as_deref())
-}
-
-/// Renders DDL for **migration-identity** purposes only: checksummed by
-/// `apply_migration`, never executed. Mutable operational config —
-/// `{{retention_days}}` (replaced with a fixed sentinel, never the real
-/// value) and `storage_policy` (`inject_storage_policy` is skipped entirely)
-/// — is excluded from the identity, so changing `PULSUS_RETENTION_DAYS` or
-/// `PULSUS_STORAGE_POLICY` after first init does not trip `MigrationDrift`
-/// (issue #5 fix plan F1). Everything else — db, cluster clause, engine
-/// family + `Replicated` swap (incl. `global`'s zoo-path scope), sharding
-/// expressions, columns/CODECs/order/partition — is identity-bearing, so a
-/// genuine structural/template change still drifts hard.
-pub fn identity_ddl(
-    tmpl: &str,
-    resolved_table_name: &str,
-    ctx: &RenderCtx,
-    global: bool,
-) -> String {
-    let mut s = substitute_tokens_with(tmpl, ctx, RETENTION_IDENTITY_SENTINEL);
-    if ctx.cluster.is_some() {
-        s = swap_engine(&s, resolved_table_name, ctx, global);
-    }
-    s
-}
-
-/// Placeholder substituted for `{{retention_days}}` in [`identity_ddl`].
-/// Deliberately not a valid ClickHouse numeral (identity DDL is checksummed
-/// only, never executed) so it can never be mistaken for — or collide
-/// with — a real rendered retention value.
-const RETENTION_IDENTITY_SENTINEL: &str = "__PULSUS_IDENTITY_RETENTION_DAYS__";
-
-/// The explicit zoo path convention (task-manager resolution #2,
-/// docs/schemas.md §7): `/clickhouse/tables/{shard}/<db>.<table>` +
-/// `{replica}` for per-shard replica sets, or
-/// `/clickhouse/tables/all/<db>.<table>` for the shard-less, cluster-wide
-/// replica set that catalog/bookkeeping tables join (`global = true`, issue
-/// #5 fix plan F2; docs/schemas.md §7 — requires `{replica}` macros unique
-/// across the whole cluster, not merely per shard). `{shard}`/`{replica}`
-/// are ClickHouse server macros, left verbatim; `<db>` is already-rendered
-/// (never a `{{db}}` token, so a second substitution pass can't
-/// double-render it).
-fn zoo_path(db: &str, table: &str, global: bool) -> String {
-    let shard_slot = if global { "all" } else { "{shard}" };
-    format!("'/clickhouse/tables/{shard_slot}/{db}.{table}', '{{replica}}'")
-}
-
-/// Swaps a rendered CREATE statement's base engine for its `Replicated*`
-/// counterpart, in place, textually locating the `ENGINE = <Name>[(...)]`
-/// clause. Unknown/view-less engines (anything not matched below) are left
-/// untouched — DDL statements with no `ENGINE = ` clause (`CREATE DATABASE`,
-/// `CREATE MATERIALIZED VIEW ... TO ...`) simply pass through unchanged.
-fn swap_engine(ddl: &str, table: &str, ctx: &RenderCtx, global: bool) -> String {
-    const MARKER: &str = "ENGINE = ";
-    let Some(pos) = ddl.find(MARKER) else {
-        return ddl.to_string();
-    };
-    let after = &ddl[pos + MARKER.len()..];
-    let name_end = after.find(['(', '\n', ' ', ';']).unwrap_or(after.len());
-    let engine_name = &after[..name_end];
-    let rest = &after[name_end..];
-
-    let (args, tail) = if let Some(body) = rest.strip_prefix('(') {
-        match body.find(')') {
-            Some(close) => (Some(&body[..close]), &body[close + 1..]),
-            None => (None, rest), // malformed; leave untouched below
-        }
-    } else {
-        (None, rest)
-    };
-
-    let zoo = zoo_path(&ctx.db, table, global);
-    let new_engine = match engine_name {
-        "MergeTree" => format!("ReplicatedMergeTree({zoo})"),
-        "ReplacingMergeTree" => match args.map(str::trim).filter(|a| !a.is_empty()) {
-            Some(version_col) => format!("ReplicatedReplacingMergeTree({zoo}, {version_col})"),
-            None => format!("ReplicatedReplacingMergeTree({zoo})"),
-        },
-        "AggregatingMergeTree" => format!("ReplicatedAggregatingMergeTree({zoo})"),
-        _ => return ddl.to_string(), // not a MergeTree-family engine (or malformed args above)
-    };
-
-    format!("{}{}{}{}", &ddl[..pos], MARKER, new_engine, tail)
-}
-
-/// Appends (or extends an existing) `storage_policy` table SETTING, only for
-/// statements that carry a `MergeTree`-family `ENGINE = ` clause (covers
-/// both plain and `Replicated*` forms, since the latter still contains the
-/// substring `MergeTree`). Views, `CREATE DATABASE`, and `Distributed`
-/// wrappers (`Distributed` does not accept `storage_policy`) are left
-/// unchanged.
-fn inject_storage_policy(ddl: &str, storage_policy: Option<&str>) -> String {
-    let Some(policy) = storage_policy else {
-        return ddl.to_string();
-    };
-    if !ddl.contains("MergeTree") {
-        return ddl.to_string();
-    }
-    let setting = format!("storage_policy = '{}'", escape_literal(policy));
-    if let Some(pos) = ddl.rfind("SETTINGS ") {
-        let split = pos + "SETTINGS ".len();
-        format!("{}{}, {}", &ddl[..split], setting, &ddl[split..])
-    } else {
-        let trimmed = ddl.trim_end();
-        let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
-        format!("{body}\nSETTINGS {setting};\n")
-    }
-}
-
-/// Renders the `_dist` `Distributed` wrapper template for `table` in
-/// `family` (docs/schemas.md §7). Every family table's wrapper is built from
-/// this one function, so [`Family::sharding_expr`] is the single source of
-/// truth invariant holds structurally, not by convention.
-pub fn dist_ddl_template(table: &str, family: Family) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {{{{db}}}}.{table}{{{{dist_suffix}}}}{{{{on_cluster}}}} AS {{{{db}}}}.{table}\n\
-         ENGINE = Distributed('{{{{cluster}}}}', {{{{db}}}}, {table}, {expr});\n",
-        expr = family.sharding_expr(),
-    )
 }
 
 #[cfg(test)]
@@ -427,35 +233,6 @@ mod tests {
         assert!(!out.contains("{{"));
     }
 
-    /// **T27.** The deduplication-window setting name follows the engine.
-    ///
-    /// `non_replicated_deduplication_window` applies to a non-replicated
-    /// `MergeTree` table only, and a clustered deployment — the production
-    /// shape — renders every write-path table `Replicated*`. Rendering the
-    /// name from `ctx.cluster`, the same field that renders the engine, is
-    /// what stops either name reaching a table that does not carry it.
-    #[test]
-    fn the_dedup_window_setting_follows_the_engine() {
-        const TMPL: &str =
-            "ALTER TABLE {{db}}.t{{on_cluster}} MODIFY SETTING {{dedup_window_setting}} = 1;";
-
-        let single = ctx();
-        assert_eq!(
-            substitute_tokens(TMPL, &single),
-            "ALTER TABLE pulsus.t MODIFY SETTING non_replicated_deduplication_window = 1;"
-        );
-
-        let clustered = RenderCtx {
-            cluster: Some("c".to_string()),
-            ..ctx()
-        };
-        assert_eq!(
-            substitute_tokens(TMPL, &clustered),
-            "ALTER TABLE pulsus.t ON CLUSTER 'c' MODIFY SETTING \
-             replicated_deduplication_window = 1;"
-        );
-    }
-
     /// The seconds window renders the one constant that carries it, so the
     /// relation a case asserts and the statement text a deployment receives
     /// cannot disagree.
@@ -463,7 +240,7 @@ mod tests {
     fn the_seconds_window_token_renders_the_constant() {
         assert_eq!(
             substitute_tokens("SETTING x = {{dedup_window_seconds}};", &ctx()),
-            format!("SETTING x = {};", crate::controller::DEDUP_WINDOW_SECONDS)
+            format!("SETTING x = {};", crate::checks::DEDUP_WINDOW_SECONDS)
         );
     }
 
@@ -552,178 +329,5 @@ mod tests {
     #[test]
     fn rollup_suffix_falls_back_to_nanos_for_sub_millisecond() {
         assert_eq!(rollup_suffix(Duration::from_nanos(123)), "123ns");
-    }
-
-    #[test]
-    fn swap_engine_rewrites_plain_mergetree_with_zoo_path() {
-        let tmpl = "CREATE TABLE {{db}}.metric_samples{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x;";
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let out = render(tmpl, "metric_samples", &c, false);
-        assert!(out.contains(
-            "ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.metric_samples', '{replica}')"
-        ));
-        assert!(out.contains("ORDER BY x;"));
-        assert!(out.contains("ON CLUSTER 'prod'"));
-    }
-
-    #[test]
-    fn swap_engine_uses_the_shard_less_all_zoo_path_when_global() {
-        let tmpl = "CREATE TABLE {{db}}.schema_migrations{{on_cluster}} (x UInt8) ENGINE = ReplacingMergeTree(x)\nORDER BY x;";
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let out = render(tmpl, "schema_migrations", &c, true);
-        assert!(out.contains(
-            "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.schema_migrations', '{replica}', x)"
-        ));
-        assert!(!out.contains("{shard}"));
-    }
-
-    #[test]
-    fn swap_engine_rewrites_replacing_mergetree_with_version_column() {
-        let tmpl = "CREATE TABLE {{db}}.log_streams{{on_cluster}} (x UInt8) ENGINE = ReplacingMergeTree(updated_ns)\nORDER BY x;";
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let out = render(tmpl, "log_streams", &c, false);
-        assert!(out.contains(
-            "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.log_streams', '{replica}', updated_ns)"
-        ));
-    }
-
-    #[test]
-    fn swap_engine_rewrites_bare_replacing_mergetree_without_version_column() {
-        let tmpl = "CREATE TABLE {{db}}.log_streams_idx{{on_cluster}} (x UInt8) ENGINE = ReplacingMergeTree\nORDER BY x;";
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let out = render(tmpl, "log_streams_idx", &c, false);
-        assert!(out.contains(
-            "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.log_streams_idx', '{replica}')"
-        ));
-        assert!(!out.contains("ReplicatedReplacingMergeTree(...,"));
-    }
-
-    #[test]
-    fn swap_engine_rewrites_aggregating_mergetree() {
-        let tmpl = "CREATE TABLE {{db}}.log_metrics_5s{{on_cluster}} (x UInt8) ENGINE = AggregatingMergeTree\nORDER BY x;";
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let out = render(tmpl, "log_metrics_5s", &c, false);
-        assert!(out.contains(
-            "ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/pulsus.log_metrics_5s', '{replica}')"
-        ));
-    }
-
-    #[test]
-    fn engine_is_not_swapped_in_single_node_mode() {
-        let tmpl = "CREATE TABLE {{db}}.metric_samples{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x;";
-        let out = render(tmpl, "metric_samples", &ctx(), false);
-        assert!(out.contains("ENGINE = MergeTree"));
-        assert!(!out.contains("Replicated"));
-    }
-
-    #[test]
-    fn storage_policy_appends_to_an_existing_settings_clause() {
-        let mut c = ctx();
-        c.storage_policy = Some("hot_cold".to_string());
-        let tmpl = "CREATE TABLE {{db}}.metric_samples{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x\nSETTINGS ttl_only_drop_parts = 1;";
-        let out = render(tmpl, "metric_samples", &c, false);
-        assert!(out.contains("SETTINGS storage_policy = 'hot_cold', ttl_only_drop_parts = 1;"));
-    }
-
-    #[test]
-    fn storage_policy_adds_a_new_settings_clause_when_absent() {
-        let mut c = ctx();
-        c.storage_policy = Some("hot_cold".to_string());
-        let tmpl = "CREATE TABLE {{db}}.metric_series{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x;";
-        let out = render(tmpl, "metric_series", &c, false);
-        assert!(out.contains("SETTINGS storage_policy = 'hot_cold';"));
-    }
-
-    #[test]
-    fn storage_policy_is_not_injected_into_non_mergetree_statements() {
-        let mut c = ctx();
-        c.storage_policy = Some("hot_cold".to_string());
-        let out = render(
-            "CREATE DATABASE IF NOT EXISTS {{db}}{{on_cluster}};",
-            "",
-            &c,
-            false,
-        );
-        assert!(!out.contains("storage_policy"));
-    }
-
-    #[test]
-    fn identity_ddl_excludes_retention_days_from_the_checksum_surface() {
-        let tmpl = "CREATE TABLE {{db}}.metric_samples{{on_cluster}} (x UInt8) ENGINE = MergeTree\n\
-                    ORDER BY x\nTTL x + INTERVAL {{retention_days}} DAY DELETE;";
-        let mut c7 = ctx();
-        c7.retention_days = 7;
-        let mut c30 = ctx();
-        c30.retention_days = 30;
-        let identity7 = identity_ddl(tmpl, "metric_samples", &c7, false);
-        let identity30 = identity_ddl(tmpl, "metric_samples", &c30, false);
-        assert_eq!(
-            identity7, identity30,
-            "changing retention_days must not change migration identity"
-        );
-        assert!(!identity7.contains('7'));
-        assert!(!identity7.contains("30"));
-    }
-
-    #[test]
-    fn identity_ddl_excludes_storage_policy_from_the_checksum_surface() {
-        let tmpl = "CREATE TABLE {{db}}.metric_series{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x;";
-        let mut plain = ctx();
-        let mut policied = ctx();
-        policied.storage_policy = Some("hot_cold".to_string());
-        plain.storage_policy = None;
-        let identity_plain = identity_ddl(tmpl, "metric_series", &plain, false);
-        let identity_policied = identity_ddl(tmpl, "metric_series", &policied, false);
-        assert_eq!(
-            identity_plain, identity_policied,
-            "changing storage_policy must not change migration identity"
-        );
-        assert!(!identity_policied.contains("storage_policy"));
-    }
-
-    #[test]
-    fn identity_ddl_still_reflects_structural_changes() {
-        let mut c = ctx();
-        c.cluster = Some("prod".to_string());
-        let tmpl_a =
-            "CREATE TABLE {{db}}.x{{on_cluster}} (x UInt8) ENGINE = MergeTree\nORDER BY x;";
-        let tmpl_b = "CREATE TABLE {{db}}.x{{on_cluster}} (x UInt8, y UInt8) ENGINE = MergeTree\nORDER BY x;";
-        assert_ne!(
-            identity_ddl(tmpl_a, "x", &c, false),
-            identity_ddl(tmpl_b, "x", &c, false),
-            "a genuine column change must still change migration identity"
-        );
-    }
-
-    #[test]
-    fn dist_ddl_template_uses_the_family_sharding_expr() {
-        let tmpl = dist_ddl_template("metric_samples", Family::Metrics);
-        let out = render(&tmpl, "metric_samples", &ctx(), false);
-        assert!(out.contains("cityHash64(metric_name, fingerprint)"));
-        assert!(out.contains("pulsus.metric_samples_dist"));
-        assert!(out.contains("Distributed('', pulsus, metric_samples,"));
-    }
-
-    #[test]
-    fn dist_ddl_template_uses_the_traces_family_sharding_expr() {
-        let tmpl = dist_ddl_template("trace_spans", Family::Traces);
-        let out = render(&tmpl, "trace_spans", &ctx(), false);
-        assert!(out.contains("pulsus.trace_spans_dist"));
-        assert!(out.contains("Distributed('', pulsus, trace_spans, cityHash64(trace_id))"));
-    }
-
-    #[test]
-    fn family_sharding_expressions_are_distinct_and_stable() {
-        assert_eq!(
-            Family::Metrics.sharding_expr(),
-            "cityHash64(metric_name, fingerprint)"
-        );
-        assert_eq!(Family::Logs.sharding_expr(), "cityHash64(fingerprint)");
-        assert_eq!(Family::Traces.sharding_expr(), "cityHash64(trace_id)");
     }
 }

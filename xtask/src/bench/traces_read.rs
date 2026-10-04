@@ -64,7 +64,8 @@ use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::traces::spans::fetch::indexed_fetch_sql;
 use pulsus_read::traces::spans::rows::IndexedFetchRow;
 use pulsus_read::{SearchPlan, SpanFilterCtx, TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 use super::queries::{ClusterTopology, load_cluster_topology};
 use super::query_log::{flush_logs_before_shard_read, tagged_settings};

@@ -252,7 +252,6 @@ data:
       traceql_max_candidates: 100000
       traceql_tag_lookback: 24h
     retention_days: 7
-    rotation_interval: 1h
     ruler:
       enabled: false
       max_result_bytes: 10MiB
@@ -478,7 +477,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 209456ed79b7c6541d3550c8835b4e81f7d2aaaa6077850cd93c7448a74951e6
+        checksum/config: b02f808d1eef320f7ad5c187d32ab4aaf61d6dacda9904988efa5b74aeda67c8
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       serviceAccountName: pulsusdb
@@ -1139,6 +1138,100 @@ spec:
         resources:
           requests:
             storage: 20Gi
+---
+# Source: pulsusdb/templates/init-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pulsusdb-init-35dbea8e
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: init
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: init
+      annotations:
+        checksum/config: b02f808d1eef320f7ad5c187d32ab4aaf61d6dacda9904988efa5b74aeda67c8
+        checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+    spec:
+      restartPolicy: Never
+      serviceAccountName: pulsusdb
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        -
+          name: pulsusdb
+          image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+          env:
+            - name: CLICKHOUSE_AUTH_PASSWORD_ONLY
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            - name: CLICKHOUSE_AUTH
+              value: "default:$(CLICKHOUSE_AUTH_PASSWORD_ONLY)"
+            - name: CLICKHOUSE_SERVER
+              value: "pulsusdb-clickhouse-shard-0"
+            - name: CLICKHOUSE_HTTP_PORT
+              value: "8123"
+            - name: CLICKHOUSE_DB
+              value: "pulsus"
+            - name: PULSUS_CLUSTER
+              value: "pulsus_cluster"
+            - name: PULSUS_DIST_SUFFIX
+              value: "_dist"
+            - name: PULSUS_LOG_ROLLUP_RESOLUTION
+              value: "5s"
+            - name: PULSUS_RETENTION_DAYS
+              value: "7"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulsusdb
+              readOnly: true
+            - name: spool
+              mountPath: /var/lib/pulsusdb
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-config
+        - name: spool
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
 ---
 # Source: pulsusdb/templates/tests/test-ready.yaml
 apiVersion: v1

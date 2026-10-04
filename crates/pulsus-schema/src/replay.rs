@@ -21,8 +21,8 @@
 
 use pulsus_clickhouse::{ChClient, ChError, Idempotency, QuerySettings};
 
-use crate::controller::mv_projection;
 use crate::render::{self, RenderCtx};
+use crate::sql::mv_projection;
 
 /// The five targets, each with the materialized view that maintains it and
 /// the expression its partitions are keyed on **as the view's own projection

@@ -49,7 +49,8 @@ use pulsus_model::Fingerprint;
 use pulsus_read::logql::rows as logql_rows;
 use pulsus_read::metrics::exec as metrics_exec;
 use pulsus_read::metrics::{rows as metrics_rows, sample_rows};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::writer::{
     LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricSampleRow,
     MetricSeriesRow,

@@ -220,10 +220,10 @@ jobs:
           if-no-files-found: ignore
 
 
-  # Issue #5: every DDL block in docs/schemas.md must be rendered and
-  # executed against a fresh ClickHouse in CI. Single-node 26.3 leg (live
-  # migration/MV tests, the `--mode init` create-then-no-op acceptance
-  # criterion) plus a negative leg proving the < 26.3 version refusal.
+  # Issue #5: every DDL block in docs/schemas.md must be applied to a fresh
+  # ClickHouse in CI. Single-node 26.3 leg (the live schema suites, plus
+  # `schema/schema.sh` building the whole schema twice identically) and a
+  # negative leg proving the script's < 26.3 version refusal.
   # Uses the runner's own docker (task-manager resolution #3 on issue #5);
   # local development uses podman against the same runtime-neutral fixtures.
 
@@ -1736,7 +1736,7 @@ jobs:
       # database (`DROP DATABASE IF EXISTS` + a unique `pulsus_*_it_*` name)
       # or, for live_cityhash/live_intdiv/live_clickhouse, read-only queries
       # against the bare image's pre-created `default` database — none of
-      # them touch the `pulsus` database `--mode init` uses below.
+      # them touch the `pulsus` database `schema/schema.sh` builds below.
       - name: Live ClickHouse client suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -2270,19 +2270,43 @@ jobs:
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
 
-      - name: "--mode init: first run creates every table/MV"
+      # The schema is `schema/schema.sql` and `schema/schema.sh` applies it.
+      # The binary creates none, so this is the step that proves a fresh
+      # ClickHouse ends up with the whole schema.
+      #
+      # The script drops the database and builds it fresh every run, so
+      # running it twice and comparing the catalogue byte for byte is a
+      # determinism check rather than an idempotency one.
+      #
+      # The file's own shape — no single-brace token, no stray semicolon,
+      # every replication path naming its own table, the script and the
+      # crate rendering the same text — is held by
+      # `crates/pulsus-schema/tests/schema_file.rs`, which the `ci` job runs.
+      - name: "schema.sh: builds the whole schema, single-node, twice identically"
         env:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "19123"
           CLICKHOUSE_DB: pulsus
-        run: ./target/debug/pulsusdb --mode init
-
-      - name: "--mode init: second run is a no-op (acceptance criterion)"
-        env:
-          CLICKHOUSE_SERVER: localhost
-          CLICKHOUSE_HTTP_PORT: "19123"
-          CLICKHOUSE_DB: pulsus
-        run: ./target/debug/pulsusdb --mode init
+        run: |
+          catalogue() {
+            curl -sS --fail-with-body 'http://localhost:19123/' --data-binary \
+              "SELECT name, create_table_query FROM system.tables \
+               WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
+          }
+          schema/schema.sh
+          catalogue > /tmp/schema-first.tsv
+          objects=$(wc -l < /tmp/schema-first.tsv)
+          if [ "$objects" -ne 41 ]; then
+            echo "::error::expected 41 objects in the single-node schema, got $objects"
+            cut -f1 /tmp/schema-first.tsv
+            exit 1
+          fi
+          schema/schema.sh
+          catalogue > /tmp/schema-second.tsv
+          if ! diff -u /tmp/schema-first.tsv /tmp/schema-second.tsv; then
+            echo "::error::a second run of schema.sh produced a different schema"
+            exit 1
+          fi
 
       - name: Stop ClickHouse 26.3
         if: always()
@@ -2298,14 +2322,14 @@ jobs:
             sleep 1
           done
 
-      - name: "--mode init refuses ClickHouse < 26.3 with a clear error"
+      - name: "schema.sh refuses ClickHouse < 26.3 with a clear error"
         env:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "19124"
           CLICKHOUSE_DB: pulsus
         run: |
           set +e
-          output=$(./target/debug/pulsusdb --mode init 2>&1)
+          output=$(schema/schema.sh 2>&1)
           status=$?
           set -e
           echo "$output"
@@ -2372,6 +2396,65 @@ jobs:
           echo "::error::cluster did not become healthy in time"
           docker ps -a
           exit 1
+
+      # The clustered half of `schema/schema.sh`, created rather than
+      # rendered. **This is the only leg that can tell a correct replication
+      # path from the silently broken one**: a path whose `{shard}` macro was
+      # substituted away reaches the same validation point as a correct one
+      # on a single node, and the difference only shows against a keeper —
+      # every shard joins one replica set. So the check is not "the DDL
+      # applied" but what the macros resolved to, read back from
+      # `system.replicas` per shard.
+      - name: "schema.sh: builds the clustered schema on both shards"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "18123"
+          CLICKHOUSE_DB: pulsus
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: |
+          ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }
+          schema/schema.sh
+
+          catalogue() {
+            ask "$1" "SELECT name, create_table_query FROM system.tables \
+                      WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
+          }
+          catalogue 18123 > /tmp/cluster-shard1.tsv
+          catalogue 28123 > /tmp/cluster-shard2.tsv
+          objects=$(wc -l < /tmp/cluster-shard1.tsv)
+          if [ "$objects" -ne 56 ]; then
+            echo "::error::expected 56 objects in the clustered schema, got $objects"
+            cut -f1 /tmp/cluster-shard1.tsv
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard2.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on both shards"
+            exit 1
+          fi
+
+          # Per-shard replica sets must be per shard: `{shard}` resolved to
+          # this node's own macro, so shard1's paths say /1/ and shard2's say
+          # /2/, and each holds one replica. The five cluster-wide tables take
+          # /all/ and hold two. A substituted-away macro collapses the first
+          # group onto one path with two replicas, which this catches.
+          paths() {
+            ask "$1" "SELECT countIf(zookeeper_path LIKE '/clickhouse/tables/$2/%'), \
+                             countIf(zookeeper_path LIKE '/clickhouse/tables/all/%'), \
+                             countIf(total_replicas = 1), countIf(total_replicas = 2) \
+                      FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
+          }
+          want=$(printf '18\t5\t18\t5')
+          for pair in "18123 1" "28123 2"; do
+            set -- $pair
+            got=$(paths "$1" "$2")
+            echo "shard on $1: per-shard/all/one-replica/two-replica = $got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::shard on $1 resolved its replication paths as '$got', expected '$want'"
+              ask "$1" "SELECT table, zookeeper_path, total_replicas FROM system.replicas \
+                        WHERE database = 'pulsus' ORDER BY table FORMAT TSV"
+              exit 1
+            fi
+          done
 
       - name: Live cluster tests (_dist write/read-back, sharding identity)
         env:

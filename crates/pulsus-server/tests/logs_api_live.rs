@@ -278,6 +278,10 @@ impl Drop for ChildGuard {
 /// schema reconcile (same startup path `live_server.rs` proves). Blocks
 /// until `/ready` is `200` (60s deadline).
 fn spawn_ready_server_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    // The binary creates no schema: without this the process logs "database
+    // does not exist: build it with `schema/schema.sh`" and `/ready` never
+    // reaches 200. Idempotent, so repeated spawns cost one no-op render.
+    live_db::build_schema_blocking(db);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")

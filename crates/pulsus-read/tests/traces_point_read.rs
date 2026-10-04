@@ -40,7 +40,8 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_read::traces::spans::fetch::{BUCKET_NS, BUCKET_SET_CAP};
 use pulsus_read::traces::spans::rows::{FetchRoute, FetchWindow};
 use pulsus_read::{TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when

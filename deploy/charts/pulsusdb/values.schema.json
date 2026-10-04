@@ -371,7 +371,6 @@
         "skip_ddl": { "type": "boolean" },
         "retention_days": { "type": "integer", "minimum": 1 },
         "storage_policy": { "type": ["string", "null"] },
-        "rotation_interval": { "$ref": "#/definitions/humanDuration" },
         "log_rollup_resolution": { "$ref": "#/definitions/humanDuration" },
         "cluster": { "type": ["string", "null"] },
         "dist_suffix": { "type": "string" },

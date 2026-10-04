@@ -187,6 +187,10 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     let db = pulsus_testkit::test_db("pulsus_prom_api_live_it");
     let port: u16 = 31_173;
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(&db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -381,6 +385,10 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
     let db = &pulsus_testkit::test_db("pulsus_prom_api_fanout_it");
     let port: u16 = 31_174;
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -502,6 +510,10 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
 
     let db = &pulsus_testkit::test_db("pulsus_prom_api_scan_budget_it");
     let port: u16 = 31_175;
+
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
@@ -686,6 +698,10 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
     let db = db.as_str();
     let port: u16 = 31_149;
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -856,6 +872,10 @@ async fn prom_api_query_surface_bundle_issue_471() {
 
     let db = pulsus_testkit::test_db("pulsus_prom_471_it");
     let port: u16 = 31_300;
+
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(&db);
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
@@ -1352,6 +1372,10 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     let db = db.as_str();
     let port: u16 = 31_303;
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -1831,6 +1855,10 @@ fn urlencode_query(s: &str) -> String {
 /// Spawns a server against `db` on `port` with `extra_env`, waits for
 /// `/ready`.
 fn spawn_prom_server(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")

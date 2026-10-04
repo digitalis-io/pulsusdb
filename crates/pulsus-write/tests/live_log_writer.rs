@@ -25,7 +25,8 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
 use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::writer::{LogWriter, WriterTables};
 use pulsus_write::{LogRow, LogSink, ParsedLogs, PushHeaders, StreamRow};
 

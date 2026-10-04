@@ -64,7 +64,8 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_logql::parse;
 use pulsus_read::logql::{Direction, QueryParams, QuerySpec};
 use pulsus_read::{EngineConfig, LogQlEngine};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 use super::{BenchArgs, parse_http_url};
 

@@ -1789,6 +1789,7 @@ dependencies = [
  "pulsus-promql",
  "pulsus-re2",
  "pulsus-schema",
+ "pulsus-schema-testkit",
  "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
@@ -1814,12 +1815,21 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "pulsus-clickhouse",
+ "pulsus-schema-testkit",
  "pulsus-testkit",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "pulsus-schema-testkit"
+version = "0.0.0"
+dependencies = [
+ "pulsus-clickhouse",
+ "pulsus-schema",
 ]
 
 [[package]]
@@ -1845,6 +1855,7 @@ dependencies = [
  "pulsus-promql",
  "pulsus-read",
  "pulsus-schema",
+ "pulsus-schema-testkit",
  "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
@@ -1898,6 +1909,7 @@ dependencies = [
  "pulsus-config",
  "pulsus-model",
  "pulsus-schema",
+ "pulsus-schema-testkit",
  "pulsus-testkit",
  "serde",
  "serde_bytes",
@@ -3323,6 +3335,7 @@ dependencies = [
  "pulsus-re2",
  "pulsus-read",
  "pulsus-schema",
+ "pulsus-schema-testkit",
  "pulsus-traceql",
  "rand 0.8.6",
  "rustls",

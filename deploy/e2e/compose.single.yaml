@@ -41,6 +41,24 @@ services:
       pulsus-e2e-single:
         ipv4_address: 172.29.0.10
 
+  # Overrides the base file's `schema` service: the locally built image, and
+  # the `clickhouse` service's static ipv4_address rather than its DNS name
+  # (the same discipline every other service on this network follows).
+  schema:
+    build:
+      context: ${PULSUS_E2E_ROOT}
+    image: pulsusdb:e2e
+    entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+    environment:
+      CLICKHOUSE_SERVER: "172.29.0.10"
+    networks:
+      pulsus-e2e-single:
+        # .10 to .16 are taken by this file's other services; a collision
+        # resets the colliding service's connections rather than failing to
+        # start, which cost one run.
+        ipv4_address: 172.29.0.17
+    depends_on: [ clickhouse ]
+
   pulsusdb:
     build:
       context: ${PULSUS_E2E_ROOT}
@@ -68,8 +86,12 @@ services:
     # `condition: service_healthy` — the harness polls `/ready` itself
     # rather than trusting compose's health condition, whose semantics
     # (and, on older Podman, reliability) differ across implementations
-    # (architect plan edge case).
-    depends_on: [ clickhouse ]
+    # (architect plan edge case). The schema is the one exception: the
+    # binary creates none, so the server has nothing to serve from until
+    # `schema.sh` has finished.
+    depends_on:
+      clickhouse: { condition: service_started }
+      schema: { condition: service_completed_successfully }
     ports: [ "3100:3100" ]
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3100/ready"]

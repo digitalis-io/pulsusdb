@@ -13,7 +13,7 @@ use pulsus_config::{Config, parse};
 
 /// Copied verbatim from docs/configuration.md §9.
 const GOLDEN_YAML: &str = r#"
-mode: all                        # all | writer | reader | init
+mode: all                        # all | writer | reader
 host: 0.0.0.0
 port: 3100
 log_level: info                  # error | warn | info | debug | trace
@@ -27,7 +27,6 @@ tls_key: null                    # PEM private key path; one-sided => startup er
 skip_ddl: false
 retention_days: 7
 storage_policy: null
-rotation_interval: 1h
 log_rollup_resolution: 5s
 metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication

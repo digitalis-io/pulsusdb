@@ -11,10 +11,7 @@ use pulsus_config::{Config, Mode};
 use crate::app::AppState;
 use crate::subsystems::{reader_router, ruler_router, writer_router};
 
-/// A mountable subsystem (docs/architecture.md §1). `init` never reaches
-/// this router at all — `main.rs` dispatches `Mode::Init` to
-/// `schema_init::run` and exits before `serve::run` (and therefore
-/// `build_router`) is ever called, so there is no `Subsystem` variant for it.
+/// A mountable subsystem (docs/architecture.md §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Subsystem {
     Writer,
@@ -26,7 +23,6 @@ pub(crate) enum Subsystem {
 /// - `all`    → Writer + Reader (+ Ruler iff `cfg.ruler.enabled`)
 /// - `writer` → Writer only
 /// - `reader` → Reader only
-/// - `init`   → none (unreachable in practice, see [`Subsystem`]'s docs)
 pub(crate) fn mounted(cfg: &Config) -> BTreeSet<Subsystem> {
     let mut set = BTreeSet::new();
     match cfg.mode {
@@ -43,7 +39,6 @@ pub(crate) fn mounted(cfg: &Config) -> BTreeSet<Subsystem> {
         Mode::Reader => {
             set.insert(Subsystem::Reader);
         }
-        Mode::Init => {}
     }
     set
 }
@@ -110,11 +105,5 @@ mod tests {
     fn reader_mode_mounts_only_reader() {
         let cfg = cfg_with_mode(Mode::Reader);
         assert_eq!(mounted(&cfg), BTreeSet::from([Subsystem::Reader]));
-    }
-
-    #[test]
-    fn init_mode_mounts_nothing() {
-        let cfg = cfg_with_mode(Mode::Init);
-        assert_eq!(mounted(&cfg), BTreeSet::new());
     }
 }

@@ -1,37 +1,26 @@
-//! DDL templates, migrations, TTL rotation, and materialized view lifecycle.
-//! See docs/architecture.md §3 and docs/schemas.md (the byte-authoritative
-//! DDL this crate renders and executes).
+//! What the binary needs from the schema, which is no longer how to create
+//! it.
 //!
-//! The public surface takes an already-connected `pulsus_clickhouse::ChClient`
-//! plus [`SchemaParams`] (a plain, `Config`-derived struct) — this crate has
-//! no dependency on `pulsus-config` or on how the connection was built
-//! (task-manager resolution #4, issue #5: that mapping lives once in
-//! `pulsus-server`).
+//! The DDL lives in `schema/schema.sql` and `schema/schema.sh` applies it
+//! (docs/schemas.md §6). This crate reads that file for the two things a
+//! serving process asks at run time — a view's own projection and a table's
+//! declared column list — checks the server version and the setting and
+//! function names this build sends, and replays a landing window.
+//!
+//! Nothing here sends DDL. A test builds a schema through
+//! `pulsus-schema-testkit`, which renders the same file.
 
-mod bookkeeping;
-mod catalog;
-mod controller;
+mod checks;
 mod error;
 mod render;
 mod replay;
-mod rotation;
+mod sql;
 
-// Issue #587: `table_column_names` is the one public door onto the
-// catalogue's declared column lists — the trace fetch's projection case
-// derives its expected list from it rather than restating one.
-pub use catalog::table_column_names;
-pub use controller::{
-    DEDUP_WINDOW_SECONDS, NameCatalogue, REQUIRED_SERVER_NAMES, SchemaParams, absent_server_names,
-    apply_ttl, check_version, guard_skip_ddl_in_init, missing_server_names, mv_projection,
-    reconcile, required_names_sql, run_init, server_version,
+pub use checks::{
+    DEDUP_WINDOW_SECONDS, NameCatalogue, REQUIRED_SERVER_NAMES, absent_server_names, check_version,
+    database_exists, missing_server_names, required_names_sql, server_version,
 };
 pub use error::SchemaError;
-pub use render::{Family, RenderCtx, rollup_suffix};
+pub use render::{RenderCtx, SchemaParams, render_name, rollup_suffix};
 pub use replay::{ReplayReport, replay_trace_window};
-pub use rotation::spawn_rotation;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {}
-}
+pub use sql::{SCHEMA_SQL, mv_projection, rendered, rendered_statements, table_column_names};

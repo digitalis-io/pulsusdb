@@ -222,6 +222,12 @@ def k8s_apps_v1(kind_cluster: str) -> k8s_client.AppsV1Api:
     return k8s_client.AppsV1Api()
 
 
+@pytest.fixture(scope="session")
+def k8s_batch_v1(kind_cluster: str) -> k8s_client.BatchV1Api:
+    k8s_config.load_kube_config(config_file=os.environ["KUBECONFIG"])
+    return k8s_client.BatchV1Api()
+
+
 class HelmRelease:
     """A thin handle bundling a release's name/namespace with the `helm`
     subprocess wrapper every step module needs, plus a base
@@ -361,6 +367,52 @@ def wait_for_condition(predicate, *, timeout: int = DEFAULT_TIMEOUT, interval: f
     raise TimeoutError(f"timed out waiting for: {description}{detail}")
 
 
+def jobs_complete(k8s_batch_v1, namespace: str) -> bool:
+    """Every Job in the namespace has at least one successful completion.
+    `False` when there are no Jobs, so a release that should have one and
+    does not is a failure rather than a pass."""
+    jobs = k8s_batch_v1.list_namespaced_job(namespace).items
+    if not jobs:
+        return False
+    return all((job.status.succeeded or 0) >= 1 for job in jobs)
+
+
+def dump_namespace(k8s_core_v1, namespace: str) -> None:
+    """Prints every Pod's phase, conditions and container state, plus the
+    logs of any Pod that is not Ready.
+
+    **A readiness timeout said only that it timed out.** The schema Job is
+    part of the install now, so "pods not Ready" can mean the Job has not
+    finished, has failed, or is waiting for ClickHouse — three different
+    answers that the message alone cannot tell apart, and two separate runs
+    were spent guessing which.
+    """
+    print(f"--- namespace {namespace}: pods ---", flush=True)
+    for pod in k8s_core_v1.list_namespaced_pod(namespace).items:
+        conditions = {c.type: c.status for c in (pod.status.conditions or [])}
+        states = []
+        for cs in pod.status.container_statuses or []:
+            state = cs.state
+            where = "running" if state.running else "waiting" if state.waiting else "terminated"
+            reason = getattr(state.waiting or state.terminated or state.running, "reason", None)
+            states.append(f"{cs.name}={where}({reason}) restarts={cs.restart_count}")
+        print(
+            f"  {pod.metadata.name} phase={pod.status.phase} "
+            f"ready={conditions.get('Ready')} {' '.join(states)}",
+            flush=True,
+        )
+        if pod.status.phase in ("Running", "Succeeded") and conditions.get("Ready") == "True":
+            continue
+        for cs in pod.status.container_statuses or []:
+            try:
+                log = k8s_core_v1.read_namespaced_pod_log(
+                    pod.metadata.name, namespace, container=cs.name, tail_lines=40
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                log = f"<could not read logs: {exc}>"
+            print(f"  --- {pod.metadata.name}/{cs.name} ---\n{log}", flush=True)
+
+
 def _pods_ready(k8s_core_v1, namespace: str, label_selector: str | None = None) -> bool:
     pods = k8s_core_v1.list_namespaced_pod(namespace, label_selector=label_selector or "").items
     if not pods:
@@ -370,6 +422,20 @@ def _pods_ready(k8s_core_v1, namespace: str, label_selector: str | None = None) 
         # they are not part of the release's steady-state workload and are
         # only run on-demand via `helm test`.
         if (pod.metadata.annotations or {}).get("helm.sh/hook") == "test":
+            continue
+        # A Pod that has FINISHED is excluded for the same reason, and it is
+        # load-bearing now: the schema Job runs `schema/schema.sh` and exits,
+        # and a Pod in phase Succeeded or Failed carries Ready=False forever.
+        #
+        # `Failed` as much as `Succeeded`: a Job attempt that fails leaves its
+        # Pod behind, the next attempt succeeds, and the release is correct —
+        # measured on a 3-shard install whose first attempt met a 500 and
+        # whose second applied all 75 statements. Reading the failed Pod's
+        # readiness made the install time out with every workload Ready.
+        #
+        # **Whether a Job succeeded is a separate question**, asked by
+        # [`jobs_complete`] rather than inferred from a Pod's condition.
+        if pod.status.phase in ("Succeeded", "Failed"):
             continue
         conditions = {c.type: c.status for c in (pod.status.conditions or [])}
         if conditions.get("Ready") != "True":
@@ -430,14 +496,22 @@ def _install_default(helm_release: HelmRelease):
 
 
 @given("a running pulsusdb release installed with default values", target_fixture="running_release")
-def _running_release(helm_release: HelmRelease, k8s_core_v1):
+def _running_release(helm_release: HelmRelease, k8s_core_v1, k8s_batch_v1):
     result = helm_release.install()
     assert result.returncode == 0, result.stderr
-    wait_for_condition(
-        lambda: _pods_ready(k8s_core_v1, helm_release.namespace),
-        timeout=DEFAULT_TIMEOUT,
-        description=f"initial install Ready in namespace {helm_release.namespace}",
-    )
+    try:
+        wait_for_condition(
+            lambda: _pods_ready(k8s_core_v1, helm_release.namespace)
+            and jobs_complete(k8s_batch_v1, helm_release.namespace),
+            timeout=DEFAULT_TIMEOUT,
+            description=(
+                f"initial install Ready and its schema Job complete in "
+                f"namespace {helm_release.namespace}"
+            ),
+        )
+    except TimeoutError:
+        dump_namespace(k8s_core_v1, helm_release.namespace)
+        raise
     return helm_release
 
 
@@ -449,12 +523,20 @@ def _install_with_extra(helm_release: HelmRelease, extra: str):
 
 
 @then(parsers.parse("every pod in the release reaches Ready within the timeout budget"))
-def _pods_reach_ready(helm_release: HelmRelease, k8s_core_v1):
-    wait_for_condition(
-        lambda: _pods_ready(k8s_core_v1, helm_release.namespace),
-        timeout=DEFAULT_TIMEOUT,
-        description=f"all pods Ready in namespace {helm_release.namespace}",
-    )
+def _pods_reach_ready(helm_release: HelmRelease, k8s_core_v1, k8s_batch_v1):
+    try:
+        wait_for_condition(
+            lambda: _pods_ready(k8s_core_v1, helm_release.namespace)
+            and jobs_complete(k8s_batch_v1, helm_release.namespace),
+            timeout=DEFAULT_TIMEOUT,
+            description=(
+                f"all pods Ready and the schema Job complete in namespace "
+                f"{helm_release.namespace}"
+            ),
+        )
+    except TimeoutError:
+        dump_namespace(k8s_core_v1, helm_release.namespace)
+        raise
 
 
 @then("the bundled helm test hook exits successfully")

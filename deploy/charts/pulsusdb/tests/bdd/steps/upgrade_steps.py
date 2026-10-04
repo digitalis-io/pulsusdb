@@ -1,13 +1,16 @@
 """Binds `helm_upgrade.feature` — AC #7 plus the required "upgrade-time
 schema gating" scenario (architect round-3 code-review disposition,
-task-manager final ruling #3): there is no install-path init Job (round-2
-amendment §1), so what actually gates a rollout is the ConfigMap's
+task-manager final ruling #3): what gates a rollout is the ConfigMap's
 `checksum/config` pod annotation changing (triggering the roll at all —
 Deployments never watch a mounted ConfigMap for in-place updates on their
 own) and readiness (gating traffic during/after it). This asserts both:
 the annotation actually changed, and replacement pods were observed
 transitioning through NotReady before Ready — i.e. the kubelet, not a
 hook, is what's doing the gating.
+
+The schema is built by the release's schema Job, not by a replacement pod.
+A pod reads a database somebody else built and stays unready while one is
+absent.
 """
 
 from __future__ import annotations
@@ -34,7 +37,15 @@ def _pulsusdb_pod_checksum_config(k8s_core_v1, namespace: str) -> str:
     pods = k8s_core_v1.list_namespaced_pod(
         namespace, label_selector="app.kubernetes.io/component=all"
     ).items
-    assert pods, f"expected an all-mode pulsusdb pod in {namespace}"
+    # **A pod being deleted is not the pod template.** `helm upgrade --wait`
+    # returns once the replacement is Ready, and the one it replaced can
+    # still be in the list, terminating, carrying the PREVIOUS checksum. It
+    # was `pods[0]` once: the rollout now completes faster, because a
+    # replacement no longer builds a schema before it can be ready, so the
+    # old pod is more often still there — and this read came back with the
+    # before value and the comparison below failed against itself.
+    pods = [p for p in pods if p.metadata.deletion_timestamp is None]
+    assert pods, f"expected a live all-mode pulsusdb pod in {namespace}"
     annotations = pods[0].metadata.annotations or {}
     checksum = annotations.get("checksum/config")
     assert checksum, f"expected a checksum/config annotation on {pods[0].metadata.name}, found none"
@@ -82,14 +93,18 @@ def _replacement_pods_gated_by_readiness(helm_release: HelmRelease, k8s_core_v1)
     # has already blocked until every pod was Ready — so the only thing
     # left to assert is that the *current* pods are, in fact, Ready now
     # (proving the roll actually completed rather than helm timing out
-    # silently before this step ran), and each has self-reconciled — the
-    # same `serve.rs` "readiness gates on pool_slot published only after
-    # ensure_schema_then_connect succeeds" contract `helm_clickhouse_
-    # resilience.feature` exercises directly for the ClickHouse-down case.
+    # silently before this step ran) — the same `serve.rs` "readiness gates
+    # on pool_slot published only after ensure_schema_then_connect succeeds"
+    # contract `helm_clickhouse_resilience.feature` exercises directly for
+    # the ClickHouse-down case.
     pods = k8s_core_v1.list_namespaced_pod(helm_release.namespace).items
     assert pods, "expected at least one pod after upgrade"
     for pod in pods:
         if (pod.metadata.annotations or {}).get("helm.sh/hook") == "test":
+            continue
+        # The schema Job's Pod has finished and carries Ready=False forever;
+        # `conftest._pods_ready` skips it for the same reason.
+        if pod.status.phase == "Succeeded":
             continue
         conditions = {c.type: c.status for c in (pod.status.conditions or [])}
         assert conditions.get("Ready") == "True", f"{pod.metadata.name} not Ready after upgrade"

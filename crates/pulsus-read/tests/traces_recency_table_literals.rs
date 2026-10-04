@@ -3,7 +3,7 @@
 //! sentences in the documents that describe those tables.
 //!
 //! ```text
-//!   crates/pulsus-schema/src/catalog.rs        (text, read here)
+//!   schema/schema.sql                          (text, read here)
 //!     trace_recent_mv        intDiv(timestamp_ns, 300000000000)   <-+
 //!     trace_error_spans_mv   WHERE status_code = 2                <-|-+
 //!                                                                   | |
@@ -12,9 +12,9 @@
 //!     { status != error } renders `status_code != 2`  ----------------+
 //! ```
 //!
-//! `pulsus-read` has no production dependency on `pulsus-schema`, and
-//! `pulsus-schema`'s catalog module is private, so the view templates are
-//! read as source text. Reading a file needs no dependency edge.
+//! `pulsus-read` has no production dependency on `pulsus-schema`, so the
+//! view statements are read as file text. Reading a file needs no
+//! dependency edge.
 //!
 //! The reader's error code is taken from `{ status != error }` rather
 //! than `{ status = error }`, because after issue #560 the second renders
@@ -25,7 +25,7 @@ use pulsus_read::traces::compile_span_filter;
 use pulsus_read::traces::window_sql::RECENT_BUCKET_NS;
 use pulsus_traceql::{SpansetExpr, SpansetFilter, parse};
 
-const CATALOG: &str = "crates/pulsus-schema/src/catalog.rs";
+const CATALOG: &str = "schema/schema.sql";
 const SCHEMAS_MD: &str = "docs/schemas.md";
 const ARCHITECTURE_MD: &str = "docs/architecture.md";
 
@@ -48,14 +48,14 @@ fn first_filter(query: &str) -> SpansetFilter {
     }
 }
 
-/// The source text of the `MvDef` whose `name:` is `name`: from that
-/// field to the next `MvDef {` (or the end of the file). `None` when no
-/// such definition exists.
+/// The statement that creates the view called `name`: from its `CREATE
+/// MATERIALIZED VIEW` line to the semicolon that ends it. `None` when the
+/// file carries no such view.
 fn mv_def_text<'a>(catalog: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("name: \"{name}\"");
+    let needle = format!("CREATE MATERIALIZED VIEW {{{{db}}}}.{name}{{{{on_cluster}}}}");
     let start = catalog.find(&needle)?;
     let rest = &catalog[start..];
-    let end = rest.find("MvDef {").unwrap_or(rest.len());
+    let end = rest.find(";\n").map(|i| i + 1).unwrap_or(rest.len());
     Some(&rest[..end])
 }
 
@@ -143,10 +143,10 @@ fn a_recency_bucket_never_straddles_a_utc_day() {
 /// this case for the wording rather than for the claim.
 ///
 /// The full set has one owning passage —
-/// `the_trace_sharding_key_passages_name_every_routed_trace_table` in
-/// `crates/pulsus-schema/src/catalog.rs`, which derives it from the
-/// migrations rather than retyping it. What is left here is #560's own two
-/// names and the reason they are in that bullet.
+/// `the_trace_sharding_key_passage_names_every_routed_trace_table` in
+/// `crates/pulsus-schema/tests/schema_file.rs`, which derives it from
+/// `schema/schema.sql` rather than retyping it. What is left here is
+/// #560's own two names and the reason they are in that bullet.
 #[test]
 fn the_architecture_sharding_bullet_names_both_new_tables() {
     let doc = read(ARCHITECTURE_MD);

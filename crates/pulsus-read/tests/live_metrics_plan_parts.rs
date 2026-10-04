@@ -64,7 +64,8 @@ use pulsus_promql::parser::parse;
 use pulsus_read::{
     LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()

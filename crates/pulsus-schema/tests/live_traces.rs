@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_schema::{RenderCtx, SchemaParams, apply_ttl, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// Corpus size for both EXPLAIN gates — ≥100k per the binding 24.8 finding
 /// on issue #53 (projection selection is data-dependent below that scale).
@@ -150,25 +151,6 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .await
         .unwrap_or_else(|e| panic!("count query failed: {e}\nSQL:\n{sql}"));
     stream.next().await.expect("one row").expect("decode").n
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct DigestRow {
-    digest: String,
-}
-
-/// The single `digest` column of a one-row query.
-async fn scalar_digest(client: &ChClient, sql: &str) -> String {
-    let mut stream = client
-        .query_stream::<DigestRow>(sql, &QuerySettings::new())
-        .await
-        .unwrap_or_else(|e| panic!("digest query failed: {e}\nSQL:\n{sql}"));
-    stream
-        .next()
-        .await
-        .expect("one row")
-        .expect("decode DigestRow")
-        .digest
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -346,8 +328,8 @@ async fn seed_attrs_corpus(client: &ChClient, db: &str, base_ns: i64) {
 }
 
 /// AC2 (issue #53): `run_init` on a fresh database creates every trace
-/// object, a second run adds/removes nothing (in particular no
-/// `MigrationDrift`), inserted spans + attrs round-trip, and the MV
+/// object, a second run adds and removes nothing, inserted spans + attrs
+/// round-trip, and the MV
 /// populates `trace_tag_catalog` with the deduplicated `(key, val)` set.
 #[tokio::test]
 async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv() {
@@ -833,157 +815,15 @@ async fn a_span_name_search_selects_the_name_time_projection_and_prunes() {
     drop_database(&client, db).await;
 }
 
-/// Issue #555 criterion 4: the trace-by-ID point read returns the same
-/// rows and the same payload bytes before and after migrations 44-48.
-///
-/// **The "before" state has to be built by hand.** Every other test in this
-/// file calls `run_init`, which applies all five at once, so after it there
-/// is no pre-44 state left to digest. This test therefore writes the pre-44
-/// `trace_spans` itself — id 16's frozen `CREATE` plus the columns ids 31,
-/// 35 and 37 add and the `span_name_day` projection of ids 42/43 — seeds
-/// it, digests it, calls `run_init`, and digests it again.
-///
-/// **`run_init` does more than apply 44-48 to this database, and none of it
-/// touches what is asserted.** Only the trace-table statements are no-ops
-/// against what this test built: ids 1-43 also create eighteen further
-/// objects (`schema_migrations`, `mv_checksums`, the metric and log tables,
-/// `trace_attrs_idx`, `trace_tag_catalog`, `trace_edges` and the four
-/// materialized views), and `apply_ttl`
-/// (`crates/pulsus-schema/src/controller.rs:493`) rewrites this table's TTL
-/// to the saturating form, which the plain interval below is not. The
-/// digest is over the point read's rows; the TTL and the other objects do
-/// not appear in it.
-///
-/// **Two digests compared alone can pass having read nothing.** Over zero
-/// rows `groupArray` gives `[]`, `arrayStringConcat` gives `''`, and the
-/// digest is `SHA256('')` =
-/// `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` on
-/// both sides. The exact seeded count is what catches a mis-typed trace id,
-/// a seed that did not land, or a filter that stopped matching.
-///
-/// **The row order is total.** Two legal rows can share a `span_id`, so
-/// ordering the rows themselves is not a total order and the two sides
-/// could be joined differently on data that did not change. The per-row
-/// digests are sorted instead, which is a total order on any multiset.
-///
-/// The function is spelled `SHA256`: `sha256` is
-/// `Code: 46 … Function with name 'sha256' does not exist` on 26.3.
-#[tokio::test]
-async fn trace_by_id_returns_the_same_rows_and_payload_bytes_across_the_projection_migrations() {
-    skip_unless_live!();
-    let client = ChClient::new(test_config()).await.expect("connect");
-    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_point_read_parity");
-    drop_database(&client, db).await;
-    client
-        .execute(
-            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create db");
-
-    // The pre-44 trace_spans: id 16's CREATE, the columns ids 31/35/37 add,
-    // and ids 42/43's aggregate projection. `service_time` is `SELECT *` —
-    // the payload copy this change removes.
-    client
-        .execute(
-            &format!(
-                "CREATE TABLE {db}.trace_spans (\
-                     trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8), \
-                     name LowCardinality(String), service LowCardinality(String), \
-                     timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), \
-                     duration_ns Int64 CODEC(T64, ZSTD(1)), status_code Int8, kind Int8, \
-                     payload_type Int8, payload String CODEC(ZSTD(3)), \
-                     shared UInt8 DEFAULT 0, status_message String DEFAULT '', \
-                     scope_name LowCardinality(String) DEFAULT '', \
-                     scope_version LowCardinality(String) DEFAULT '', \
-                     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4, \
-                     PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)), \
-                     PROJECTION span_name_day (\
-                         SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() \
-                         GROUP BY d, name) \
-                 ) ENGINE = MergeTree \
-                 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns)) \
-                 ORDER BY (trace_id, timestamp_ns) \
-                 TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE \
-                 SETTINGS ttl_only_drop_parts = 1"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create the pre-44 trace_spans");
-
-    seed_spans_corpus(&client, db, now_ns() - CORPUS_SPAN_NS).await;
-
-    // Ten seeded trace ids, written with the seeder's own id expression.
-    // One span per trace and no hash collision in this corpus, so ten ids
-    // are ten spans — a fact about a deterministic corpus, and the count
-    // assertion prints both numbers if a seeder change ever breaks it.
-    const EXPECTED_SPANS: u64 = 10;
-    const TEN_SEEDED_IDS: &str =
-        "trace_id IN (SELECT toFixedString(hex(cityHash64(number)), 16) FROM numbers(10))";
-    let count_sql = format!("SELECT count() AS n FROM {db}.trace_spans WHERE {TEN_SEEDED_IDS}");
-    // Every column the point read returns
-    // (`crates/pulsus-read/src/traces/sql.rs:22`), one digest per row, the
-    // per-row digests SORTED so the comparison has a total order.
-    let digest_sql = format!(
-        "SELECT lower(hex(SHA256(arrayStringConcat(arraySort(groupArray(row_digest)), '\\n')))) \
-             AS digest \
-         FROM ( \
-           SELECT lower(hex(SHA256(concat( \
-                    hex(trace_id), '|', hex(span_id), '|', hex(parent_id), '|', \
-                    toString(payload_type), '|', toString(kind), '|', lower(hex(SHA256(payload))) \
-                  )))) AS row_digest \
-           FROM {db}.trace_spans \
-           WHERE {TEN_SEEDED_IDS} \
-         )"
-    );
-
-    let before_count = count(&client, &count_sql).await;
-    let before_digest = scalar_digest(&client, &digest_sql).await;
-
-    let ctx = test_ctx(db);
-    run_init(&client, &ctx).await.expect("run_init");
-
-    let after_count = count(&client, &count_sql).await;
-    let after_digest = scalar_digest(&client, &digest_sql).await;
-
-    assert_eq!(
-        before_count, EXPECTED_SPANS,
-        "the pre-migration read must return the ten seeded spans, or the digest below compares \
-         two empty sets and passes having read nothing"
-    );
-    assert_eq!(
-        after_count, EXPECTED_SPANS,
-        "the post-migration read must return the same ten spans"
-    );
-    assert_eq!(
-        after_digest, before_digest,
-        "migrations 44-48 move no span row and no payload byte: the point read's digest over the \
-         ten seeded traces must be identical before and after"
-    );
-
-    // The projections did change, or the parity above would be about
-    // nothing: `service_time` is now the 14 named columns and `name_time`
-    // exists.
-    let payload_columns = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM system.projection_parts_columns \
-             WHERE database = '{db}' AND table = 'trace_spans' AND active AND column = 'payload'"
-        ),
-    )
-    .await;
-    assert_eq!(
-        payload_columns, 0,
-        "run_init must have narrowed service_time — otherwise this test compares a table with \
-         itself"
-    );
-
-    drop_database(&client, db).await;
-}
+// Issue #555 criterion 4 — "the trace-by-ID point read returns the same
+// rows and the same payload bytes before and after migrations 44-48" — was
+// a case here, and is deleted with the numbered migrations it was about.
+// It built a pre-#555 `trace_spans` by hand and asserted that `run_init`
+// narrowed the `service_time` projection in place. Nothing narrows a
+// projection in place any more: the projections are declared in the table's
+// own `CREATE`, an existing table is adopted unchanged
+// (`an_existing_landing_table_is_adopted_by_a_rerun`), and a projection
+// change is a rebuild.
 
 /// AC3b (issue #53 plan v2 delta 3, re-proven under issue #54's amended
 /// scoped DDL): within ONE dense `(key, val, scope)` prefix spanning many
@@ -1066,13 +906,12 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
     );
 }
 
-/// Plan v2 delta 1 (issue #53): a `PULSUS_RETENTION_DAYS` change re-init
-/// must succeed (retention is excluded from migration identity — no
-/// `MigrationDrift`) and must propagate the new TTL to BOTH retained trace
-/// tables via `apply_ttl` (`trace_tag_catalog` is a bounded catalog and
-/// carries no TTL).
+/// `PULSUS_RETENTION_DAYS` reaches every retained trace table's delete-TTL
+/// (`trace_tag_catalog` is a bounded catalog and carries no TTL), and a
+/// changed value reaches it after a rebuild: the TTL is declared in the
+/// `CREATE`, so a retention change is a rebuild rather than an `ALTER`.
 #[tokio::test]
-async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables() {
+async fn the_configured_retention_reaches_every_retained_trace_tables_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_retention");
@@ -1084,22 +923,24 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
         .await
         .expect("run_init (retention_days=7)");
     // `trace_edges` (issue #173) joins the retained-trace-table TTL set
-    // (`apply_ttl`, appended last) with the same saturating nano-scale form.
+    // with the same saturating nano-scale form.
     for table in ["trace_spans", "trace_attrs_idx", "trace_edges"] {
         let ddl = create_table_query(&client, db, table).await;
-        // `apply_ttl` (issue #131) supersedes the CREATE-time TTL with the
-        // saturating expression; ClickHouse normalizes the rendered
-        // `{{retention_days}} * 86400` product by wrapping it in parens.
+        // The saturating expression (issue #131); ClickHouse normalizes the
+        // rendered `{{retention_days}} * 86400` product by wrapping it in
+        // parens.
         assert!(
             ddl.contains("least(intDiv(timestamp_ns, 1000000000) + (7 * 86400), 4294967295)"),
             "{table}'s initial TTL must reflect retention_days=7: {ddl}"
         );
     }
 
+    // A changed retention is a rebuild: drop and build again.
+    drop_database(&client, db).await;
     ctx.retention_days = 30;
     run_init(&client, &ctx)
         .await
-        .expect("re-init after a PULSUS_RETENTION_DAYS change must succeed, not MigrationDrift");
+        .expect("a rebuild at the new PULSUS_RETENTION_DAYS must succeed");
 
     for table in ["trace_spans", "trace_attrs_idx", "trace_edges"] {
         let ddl = create_table_query(&client, db, table).await;
@@ -1122,7 +963,7 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
 /// the last whole second of the last fully u32-representable UTC day.
 const BOUNDARY_TS_NS: i64 = 49_710 * 86_400_000_000_000 - 1;
 
-/// The saturating trace TTL expression `apply_ttl` renders (issue #131,
+/// The saturating trace TTL expression the file declares (issue #131,
 /// Resolution C), as a SELECT-able snippet over a literal `ts`.
 fn new_ttl_expr(ts_ns: i64, retention_days: u32) -> String {
     format!(
@@ -1137,7 +978,7 @@ fn new_ttl_expr(ts_ns: i64, retention_days: u32) -> String {
 ///     `toDateTime(fromUnixTimestamp64Nano(ts)) + INTERVAL n DAY` form;
 /// (b) at the boundary timestamp it clamps exactly to
 ///     `toDateTime(4294967295)` (2106-02-07T06:28:15Z);
-/// (d) `apply_ttl` with `retention_days = u32::MAX` is accepted by the
+/// (d) a build at `retention_days = u32::MAX` is accepted by the
 ///     server (the rendered arithmetic stays Int64 — max operand sum
 ///     ≈ 3.71e14, no overflow, no type-coercion surprise) and the
 ///     expression clamps an admitted present-day timestamp exactly to
@@ -1179,14 +1020,15 @@ async fn trace_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bounda
         "boundary ts + 7d must clamp exactly to toDateTime(4294967295)"
     );
 
-    // (d) Extreme retention: the rendered ALTER is accepted at
-    // retention_days = u32::MAX, and the expression clamps an admitted
-    // present-day ts exactly to the u32::MAX instant. Also pin the
-    // arithmetic type: the un-clamped sum stays Int64 on the server.
+    // (d) Extreme retention: a build at retention_days = u32::MAX is
+    // accepted, and the expression clamps an admitted present-day ts exactly
+    // to the u32::MAX instant. Also pin the arithmetic type: the un-clamped
+    // sum stays Int64 on the server.
+    drop_database(&client, db).await;
     ctx.retention_days = u32::MAX;
-    apply_ttl(&client, &ctx)
+    run_init(&client, &ctx)
         .await
-        .expect("apply_ttl at retention_days = u32::MAX must be accepted");
+        .expect("a build at retention_days = u32::MAX must be accepted");
     for table in ["trace_spans", "trace_attrs_idx"] {
         let ddl = create_table_query(&client, db, table).await;
         assert!(
@@ -1224,11 +1066,11 @@ async fn trace_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bounda
 
 /// Issue #131 AC10c (survival, non-vacuous): a `trace_spans` row at the
 /// boundary timestamp survives `MATERIALIZE TTL` + `OPTIMIZE ... FINAL`
-/// under the saturating expression `apply_ttl` installed (retention 7),
+/// under the saturating expression the file declares (retention 7),
 /// then DROPS once the pre-#131 wrapping expression is re-installed — its
 /// wrapped expiry is ~1970-01-07, so the part reads as long-expired
 /// (`ttl_only_drop_parts = 1`). The second phase is the pre-fix behavior
-/// pinned in-test: on pre-#131 `apply_ttl` text the first phase fails.
+/// pinned in-test: on the pre-#131 expression the first phase fails.
 #[tokio::test]
 async fn boundary_span_survives_saturating_ttl_and_drops_under_the_wrapping_ttl() {
     skip_unless_live!();
@@ -1405,8 +1247,8 @@ async fn insert_span(
 }
 
 /// Issue #173 AC1/AC2/AC5/AC6: `run_init` creates `trace_edges` +
-/// `trace_edges_mv` idempotently (reconcile twice, no `MigrationDrift`),
-/// `mv_checksums` records the MV, SQL-inserted client/server pairs
+/// `trace_edges_mv` idempotently (run twice),
+/// the MV exists, SQL-inserted client/server pairs
 /// materialize completed edges through the MV, within-type pairing rejects a
 /// cross-kind decoy, and a byte-identical re-insert leaves the read's
 /// `calls` unchanged (replay idempotence via read-time dedup).
@@ -1421,7 +1263,7 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
     run_init(&client, &ctx).await.expect("run_init (first run)");
     run_init(&client, &ctx)
         .await
-        .expect("run_init (second run must be a no-op, never MigrationDrift)");
+        .expect("run_init (second run must be a no-op)");
 
     let names = table_names(&client, db).await;
     for t in ["trace_edges", "trace_edges_mv"] {
@@ -1443,13 +1285,14 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
     .await;
     assert_eq!(has_shared, 1, "migration 31 must add trace_spans.shared");
 
-    // `mv_checksums` records the edge MV.
-    let mv_present = count(
-        &client,
-        &format!("SELECT count() AS n FROM {db}.mv_checksums WHERE mv_name = 'trace_edges_mv'"),
-    )
-    .await;
-    assert_eq!(mv_present, 1, "mv_checksums must record trace_edges_mv");
+    // The edge MV exists.
+    assert!(
+        table_names(&client, db)
+            .await
+            .iter()
+            .any(|n| n == "trace_edges_mv"),
+        "trace_edges_mv must exist after run_init"
+    );
 
     let base = now_ns();
     // RPC pair: checkout(client, kind 3) -> payments(server, kind 2).
@@ -1595,7 +1438,7 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
 /// Issue #184 (M7-TQ5): migration 35 adds `trace_spans.status_message
 /// String DEFAULT ''` — `run_init` on a fresh database lands the column
 /// (reconcile applies the additive ALTER after the frozen id-16 CREATE), a
-/// second run is a no-op (idempotent, no `MigrationDrift`), pre-existing
+/// second run is a no-op (idempotent), pre-existing
 /// rows read back `''`, and a freshly inserted `status_message` value
 /// round-trips.
 #[tokio::test]
@@ -1803,7 +1646,7 @@ async fn migration_status_message_add_column_survives_a_populated_projection_tab
 /// Issue #192: migration 37 adds `trace_spans.scope_name`/`scope_version`
 /// `LowCardinality(String) DEFAULT ''` — `run_init` on a fresh database
 /// lands both columns (reconcile applies the additive ALTER after the frozen
-/// id-16 CREATE), a second run is a no-op (idempotent, no `MigrationDrift`),
+/// id-16 CREATE), a second run is a no-op (idempotent),
 /// pre-existing rows read back `''`, and freshly inserted values round-trip.
 #[tokio::test]
 async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
@@ -2441,15 +2284,9 @@ async fn engine_full(client: &ChClient, db: &str, table: &str) -> Option<String>
 }
 
 /// Issue #560 criterion 7: after `run_init` the two tables and their two
-/// views exist; a second `run_init` is a no-op leaving one bookkeeping row
-/// per new migration; both TTLs render the saturating form.
-///
-/// **The bookkeeping ids on a single node.** Migrations 61 and 63 are the
-/// `_dist` wrappers (`Ddl::Dist`), which a single node skips entirely —
-/// never attempted, never recorded (`controller.rs`, `is_cluster_only`) —
-/// so this suite, which runs single-node, holds rows for 60 and 62 and
-/// none for 61 and 63. The wrappers are asserted on the cluster leg
-/// (`live_cluster.rs`).
+/// views exist; a second `run_init` is a no-op; both TTLs render the
+/// saturating form; and neither table's routing wrapper is created, because
+/// a single node renders no `_dist` object at all.
 #[tokio::test]
 async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
     skip_unless_live!();
@@ -2459,7 +2296,6 @@ async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
     let ctx = test_ctx(db);
 
     run_init(&client, &ctx).await.expect("run_init");
-    apply_ttl(&client, &ctx).await.expect("apply_ttl");
     let second = run_init(&client, &ctx).await;
 
     let mut failures: Vec<String> = Vec::new();
@@ -2477,15 +2313,13 @@ async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
     if let Err(e) = &second {
         failures.push(format!("the second run_init failed: {e}"));
     }
-    for (id, expected) in [(60u32, 1u64), (61, 0), (62, 1), (63, 0)] {
-        let n = count(
-            &client,
-            &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = {id}"),
-        )
-        .await;
-        if n != expected {
+    // The two routing wrappers are clustered-only: single-node renders no
+    // `_dist` object at all, and the wrappers are asserted on the cluster
+    // leg (`live_cluster.rs`).
+    for object in ["trace_recent_dist", "trace_error_spans_dist"] {
+        if names.iter().any(|n| n == object) {
             failures.push(format!(
-                "schema_migrations holds {n} rows for id {id}, expected {expected}"
+                "{db}.{object} exists: a routing wrapper must not be created single-node"
             ));
         }
     }

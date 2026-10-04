@@ -20,9 +20,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_schema::{
-    Family, RenderCtx, SchemaParams, apply_ttl, check_version, reconcile, run_init,
-};
+use pulsus_schema::{RenderCtx, SchemaParams, check_version};
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -80,24 +79,6 @@ async fn table_names(client: &ChClient, db: &str) -> Vec<String> {
         out.push(row.expect("decode NameRow").name);
     }
     out
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct MvChecksumRow {
-    mv_name: String,
-    checksum: String,
-    updated_at: u32,
-}
-
-async fn mv_checksum(client: &ChClient, db: &str, mv_name: &str) -> Option<String> {
-    let sql = format!(
-        "SELECT mv_name, checksum, updated_at FROM {db}.mv_checksums FINAL WHERE mv_name = '{mv_name}'"
-    );
-    let mut stream = client
-        .query_stream::<MvChecksumRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("query mv_checksums");
-    stream.next().await.map(|r| r.expect("decode row").checksum)
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -210,8 +191,6 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     run_init(&client, &ctx).await.expect("run_init (first run)");
 
     let expected_base_tables = [
-        "schema_migrations",
-        "mv_checksums",
         "metric_metadata",
         "metric_series",
         "metric_samples",
@@ -230,9 +209,8 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
         );
     }
 
-    // Second run: idempotent, no error (in particular, no MigrationDrift —
-    // rendering the same params against the same catalog must reproduce
-    // identical checksums).
+    // Second run: idempotent, no error — every `CREATE TABLE` carries `IF
+    // NOT EXISTS` and every view is dropped before it is created.
     run_init(&client, &ctx)
         .await
         .expect("run_init (second run, no-op)");
@@ -440,7 +418,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
         "the modern row round-trips its structured metadata verbatim"
     );
 
-    // AC-2: a second run_init no-ops ids 21/22 — no MigrationDrift.
+    // AC-2: a second run_init is a no-op.
     run_init(&client, &ctx)
         .await
         .expect("run_init (second run, no-op — ids 21/22 must not drift)");
@@ -448,26 +426,21 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
     drop_database(&client, db).await;
 }
 
-/// MV crash-safety (issue #5 plan amendment 1): the view being physically
-/// absent from `system.tables` — even though `mv_checksums` still records
-/// the current-looking checksum from before the simulated crash — must
-/// still trigger a recreate. This simulates a crash between the `DROP VIEW`
-/// and `CREATE MATERIALIZED VIEW` steps.
+/// A view dropped out from under an existing schema comes back on the next
+/// run. The file carries `DROP VIEW IF EXISTS` before every `CREATE
+/// MATERIALIZED VIEW`, so a run always restates every view's definition —
+/// which is also why a second run cannot fail on one.
 #[tokio::test]
-async fn reconcile_recreates_a_materialized_view_missing_from_system_tables() {
+async fn a_second_run_recreates_a_view_that_was_dropped() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_mv_absent");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
-    reconcile(&client, &ctx).await.expect("initial reconcile");
-    let checksum_before = mv_checksum(&client, db, "log_streams_idx_mv")
-        .await
-        .expect("checksum recorded after initial reconcile");
+    run_init(&client, &ctx).await.expect("initial run");
+    let before = create_table_query(&client, db, "log_streams_idx_mv").await;
 
-    // Simulate "crashed after DROP VIEW, before CREATE": the checksum row
-    // still says current, but the object itself is gone.
     client
         .execute(
             &format!("DROP VIEW IF EXISTS {db}.log_streams_idx_mv"),
@@ -475,101 +448,33 @@ async fn reconcile_recreates_a_materialized_view_missing_from_system_tables() {
             Idempotency::Idempotent,
         )
         .await
-        .expect("simulate crash: drop the view out from under mv_checksums");
+        .expect("drop the view out from under the schema");
     assert!(
         !table_names(&client, db)
             .await
             .contains(&"log_streams_idx_mv".to_string())
     );
 
-    reconcile(&client, &ctx)
+    run_init(&client, &ctx)
         .await
-        .expect("reconcile must self-heal");
+        .expect("the next run heals it");
 
     assert!(
         table_names(&client, db)
             .await
             .contains(&"log_streams_idx_mv".to_string()),
-        "reconcile must recreate a view missing from system.tables even when mv_checksums looked current"
+        "a view missing from system.tables must be recreated"
     );
-    let checksum_after = mv_checksum(&client, db, "log_streams_idx_mv")
-        .await
-        .expect("checksum recorded after self-heal");
     assert_eq!(
-        checksum_before, checksum_after,
-        "the rendered template did not change, so the healed checksum must match"
+        before,
+        create_table_query(&client, db, "log_streams_idx_mv").await,
+        "the recreated view's definition must be byte-identical"
     );
 }
 
-/// MV crash-safety (issue #5 plan amendment 1): a `mv_checksums` row that
-/// no longer matches the current rendered checksum — simulating a crash
-/// between `CREATE MATERIALIZED VIEW` and the checksum upsert (or an
-/// external corruption) — must still trigger a recreate even though the
-/// view object itself is present and correct.
-#[tokio::test]
-async fn reconcile_recreates_a_materialized_view_whose_checksum_row_is_stale() {
-    skip_unless_live!();
-    let client = ChClient::new(test_config()).await.expect("connect");
-    let db = &pulsus_testkit::test_db("pulsus_schema_it_mv_stale_checksum");
-    drop_database(&client, db).await;
-    let ctx = test_ctx(db);
-
-    reconcile(&client, &ctx).await.expect("initial reconcile");
-
-    // Simulate "crashed after CREATE, before the checksum upsert" by
-    // directly corrupting the recorded checksum — the view itself is left
-    // untouched (present and correct), only the bookkeeping is stale. Raw
-    // `execute` (not `insert_block`, which cannot take a `db.table`
-    // qualified name — see `src/bookkeeping.rs`'s module doc) against the
-    // `default`-bound `client`, matching how the controller itself writes
-    // bookkeeping rows.
-    let now = u32::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs(),
-    )
-    .expect("timestamp fits u32");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.mv_checksums (mv_name, checksum, updated_at) \
-                 VALUES ('log_streams_idx_mv', '0000000000000000', {now})"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("simulate crash: corrupt the recorded checksum");
-    assert_eq!(
-        mv_checksum(&client, db, "log_streams_idx_mv")
-            .await
-            .as_deref(),
-        Some("0000000000000000")
-    );
-
-    reconcile(&client, &ctx)
-        .await
-        .expect("reconcile must self-heal");
-
-    assert!(
-        table_names(&client, db)
-            .await
-            .contains(&"log_streams_idx_mv".to_string()),
-        "the view must still exist after a checksum-mismatch-triggered recreate"
-    );
-    let healed = mv_checksum(&client, db, "log_streams_idx_mv")
-        .await
-        .expect("checksum recorded after self-heal");
-    assert_ne!(
-        healed, "0000000000000000",
-        "reconcile must overwrite the stale/bogus checksum with the current rendered one"
-    );
-}
-
-/// Pure version-gate refusal, proven against a real 24.8 server's actual
+/// Pure version-gate refusal, proven against a real server's actual
 /// `SELECT version()` string (parsing/comparison logic itself is unit
-/// tested without a container in `src/controller.rs`).
+/// tested without a container in `src/checks.rs`).
 #[tokio::test]
 async fn check_version_accepts_the_live_test_servers_reported_version() {
     skip_unless_live!();
@@ -587,37 +492,16 @@ struct VersionRow {
     v: String,
 }
 
-/// `docs/schemas.md §7` invariant, live: every `_dist` table in a family
-/// carries the byte-identical sharding expression. The single-shard live
-/// server here still exercises the clustered rendering path end to end
-/// (`ON CLUSTER` against a one-node "cluster" is a ClickHouse no-op when no
-/// `remote_servers` cluster of that name is configured would fail — so this
-/// test only asserts the rendering, not execution; live execution against a
-/// real multi-shard cluster is `tests/live_cluster.rs`, CI-side).
-#[test]
-fn family_sharding_expr_is_the_single_source_of_truth() {
-    // Hermetic, but it lives in a gated binary: without this the guard
-    // would be per-suite-entry, and `--test <suite> <this test>` would
-    // still exit 0 in a live CI job with the gate missing (issue #320).
-    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
-    assert_eq!(
-        Family::Metrics.sharding_expr(),
-        "cityHash64(metric_name, fingerprint)"
-    );
-    assert_eq!(Family::Logs.sharding_expr(), "cityHash64(fingerprint)");
-}
-
-/// Issue #5 fix plan F1: `PULSUS_RETENTION_DAYS` is mutable operational
-/// config, excluded from migration identity — a re-init after it changes
-/// must succeed (not `MigrationDrift`) and must actually update the TTL
-/// (`apply_ttl`'s job, run every `run_init`). Issue #137 re-points the TTL
-/// asserts at the saturating expression `apply_ttl` now renders for the
-/// metric/log tables, and extends coverage to `metric_hist_samples` — the
-/// hist assert fails on pre-#137 main, where the table is absent from
-/// `apply_ttl` and its TTL stays CREATE-static (the retention-propagation
-/// gap #137 closes).
+/// `PULSUS_RETENTION_DAYS` reaches every retained table's delete-TTL, in
+/// the saturating `least(..., 4294967295)` form (issues #131/#137/#187),
+/// and a changed value reaches it after a rebuild.
+///
+/// **A retention change is a rebuild**, not an `ALTER`: the TTL is declared
+/// in the `CREATE`, so `schema/schema.sh` drops the database and builds it
+/// again. That is what this does — the old separate `apply_ttl` pass, and
+/// the background task that reapplied it, are gone.
 #[tokio::test]
-async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
+async fn the_configured_retention_reaches_every_retained_tables_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_retention_change");
@@ -628,10 +512,10 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     run_init(&client, &ctx)
         .await
         .expect("run_init (retention_days=7)");
-    // `apply_ttl` (issues #131/#137) supersedes the CREATE-time TTL with the
-    // saturating expression; ClickHouse normalizes the rendered
-    // `{{retention_days}} * 86400` product by wrapping it in parens
-    // (live_traces.rs pins the same 24.8 normalization for the ns form).
+    // The saturating expression (issues #131/#137) is declared in the
+    // `CREATE`; ClickHouse normalizes the rendered `{{retention_days}} *
+    // 86400` product by wrapping it in parens (live_traces.rs pins the same
+    // normalization for the ns form).
     let before_metric = create_table_query(&client, db, "metric_samples").await;
     assert!(
         before_metric.contains("least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295)"),
@@ -640,28 +524,27 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     let before_hist = create_table_query(&client, db, "metric_hist_samples").await;
     assert!(
         before_hist.contains("least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295)"),
-        "metric_hist_samples' initial TTL must be the runtime saturating form (fails on \
-         pre-#137 main, where the table is absent from apply_ttl): {before_hist}"
+        "metric_hist_samples' initial TTL must be the saturating form: {before_hist}"
     );
     let before_log = create_table_query(&client, db, "log_samples").await;
     assert!(
         before_log.contains("least(intDiv(timestamp_ns, 1000000000) + (7 * 86400), 4294967295)"),
         "log_samples' initial TTL must reflect retention_days=7: {before_log}"
     );
-    // Issue #187: `log_patterns` (nanosecond `bucket_ns`) must carry the runtime
-    // saturating form too — fails on pre-#187 main, where the table is absent
-    // from apply_ttl and keeps its CREATE-time INTERVAL TTL.
+    // Issue #187: `log_patterns` (nanosecond `bucket_ns`) carries the
+    // saturating form too, not the wrap-prone INTERVAL one.
     let before_patterns = create_table_query(&client, db, "log_patterns").await;
     assert!(
         before_patterns.contains("least(intDiv(bucket_ns, 1000000000) + (7 * 86400), 4294967295)"),
-        "log_patterns' initial TTL must be the runtime saturating form (fails on pre-#187 main, \
-         where the table is absent from apply_ttl): {before_patterns}"
+        "log_patterns' initial TTL must be the saturating form: {before_patterns}"
     );
 
+    // A changed retention is a rebuild: drop and build again.
+    drop_database(&client, db).await;
     ctx.retention_days = 30;
     run_init(&client, &ctx)
         .await
-        .expect("re-init after a PULSUS_RETENTION_DAYS change must succeed, not MigrationDrift");
+        .expect("a rebuild at the new PULSUS_RETENTION_DAYS must succeed");
 
     for table in [
         "metric_samples",
@@ -685,13 +568,12 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     }
 }
 
-/// Issue #5 fix plan F1: `PULSUS_LOG_ROLLUP_RESOLUTION` is config-derived
-/// into the rollup table/MV *name* (`MigrationScope::ConfigName`) — a
-/// re-init after it changes must succeed, create the new-named objects, and
-/// leave the old ones (and their data) in place rather than dropping them.
-/// The orphan-warning selection logic itself is unit-tested in
-/// `src/controller.rs` (`orphaned_rollup_siblings`); this test proves the
-/// live functional outcome (new created, old retained, no drift/error).
+/// `PULSUS_LOG_ROLLUP_RESOLUTION` is config-derived into the rollup
+/// table/MV *name* — a re-init after it changes must succeed, create the
+/// new-named objects, and leave the old ones (and their data) in place
+/// rather than dropping them.
+/// This test proves the live functional outcome: the new objects are
+/// created and the old ones are left alone.
 #[tokio::test]
 async fn run_init_after_log_rollup_resolution_change_creates_new_table_and_retains_old() {
     skip_unless_live!();
@@ -707,9 +589,9 @@ async fn run_init_after_log_rollup_resolution_change_creates_new_table_and_retai
     assert!(names_before.contains(&"log_metrics_5s_mv".to_string()));
 
     ctx.log_rollup = Duration::from_secs(10);
-    run_init(&client, &ctx).await.expect(
-        "re-init after a PULSUS_LOG_ROLLUP_RESOLUTION change must succeed, not MigrationDrift",
-    );
+    run_init(&client, &ctx)
+        .await
+        .expect("re-init after a PULSUS_LOG_ROLLUP_RESOLUTION change must succeed");
 
     let names_after = table_names(&client, db).await;
     assert!(
@@ -741,7 +623,7 @@ const BOUNDARY_TS_MS: i64 = 49_710 * 86_400_000 - 1;
 /// for it.
 const DAY_50_000_MS: i64 = 50_000 * 86_400_000;
 
-/// The saturating metric TTL expression `apply_ttl` renders (issue #137,
+/// The saturating metric TTL expression the file declares (issue #137,
 /// the millisecond sibling of #131's trace form), as a SELECT-able snippet
 /// over a literal `ts`.
 fn new_ms_ttl_expr(ts_ms: i64, retention_days: u32) -> String {
@@ -756,11 +638,11 @@ fn new_ms_ttl_expr(ts_ms: i64, retention_days: u32) -> String {
 ///     `toDateTime(fromUnixTimestamp64Milli(ts)) + INTERVAL n DAY` form;
 /// (b) at the last admitted millisecond it clamps exactly to
 ///     `toDateTime(4294967295)` (2106-02-07T06:28:15Z);
-/// (d) `apply_ttl` with `retention_days = u32::MAX` is accepted by the
-///     server, both millisecond tables' DDL carries the extreme retention
-///     product, the expression clamps an admitted present-day timestamp
-///     exactly to `toDateTime(4294967295)`, and the un-clamped seconds
-///     arithmetic stays Int64.
+/// (d) a build at `retention_days = u32::MAX` is accepted by the server,
+///     both millisecond tables' DDL carries the extreme retention product,
+///     the expression clamps an admitted present-day timestamp exactly to
+///     `toDateTime(4294967295)`, and the un-clamped seconds arithmetic
+///     stays Int64.
 #[tokio::test]
 async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_boundary() {
     skip_unless_live!();
@@ -798,15 +680,15 @@ async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bound
         "last-admitted ms + 7d must clamp exactly to toDateTime(4294967295)"
     );
 
-    // (d) Extreme retention: the rendered ALTER is accepted at
-    // retention_days = u32::MAX on both millisecond tables, and the
-    // expression clamps an admitted present-day ts exactly to the u32::MAX
-    // instant. Also pin the arithmetic type: the un-clamped sum stays Int64
-    // on the server.
+    // (d) Extreme retention: a build at retention_days = u32::MAX is
+    // accepted on both millisecond tables, and the expression clamps an
+    // admitted present-day ts exactly to the u32::MAX instant. Also pin the
+    // arithmetic type: the un-clamped sum stays Int64 on the server.
+    drop_database(&client, db).await;
     ctx.retention_days = u32::MAX;
-    apply_ttl(&client, &ctx)
+    run_init(&client, &ctx)
         .await
-        .expect("apply_ttl at retention_days = u32::MAX must be accepted");
+        .expect("a build at retention_days = u32::MAX must be accepted");
     for table in ["metric_samples", "metric_hist_samples"] {
         let ddl = create_table_query(&client, db, table).await;
         assert!(
@@ -853,23 +735,21 @@ async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bound
 /// `metric_hist_samples` — inside `(2106-02-07, 2149-06-06]`, deliberately
 /// bypassing ingest to model pre-existing/non-ingest rows (post-#137
 /// ingest rejects the range) — survive `MATERIALIZE TTL` +
-/// `OPTIMIZE ... FINAL` under the saturating expression `apply_ttl`
-/// installed (retention 7): their expiry clamps to
+/// `OPTIMIZE ... FINAL` under the saturating expression the file declares
+/// (retention 7): their expiry clamps to
 /// `toDateTime(4294967295)` = 2106-02-07T06:28:15Z, the horizon, not an
 /// already-past instant. The same millisecond-table rows DROP once the
 /// pre-#137 wrapping expression is re-installed — the wrapped expiry is
 /// ~1970-10, so the part reads as long-expired (`ttl_only_drop_parts = 1`).
-/// The second phase pins the pre-fix defect in-test: on pre-#137
-/// `apply_ttl` text the first phase fails on all three tables
-/// (`metric_hist_samples` included: pre-#137 it kept its wrap-prone
-/// CREATE-time TTL, being absent from the runtime ALTER list).
+/// The second phase pins the pre-fix defect in-test: on the pre-#137
+/// expression the first phase fails on all three tables.
 #[tokio::test]
 async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_ttl_boundary_2106");
     drop_database(&client, db).await;
-    let ctx = test_ctx(db); // retention_days = 7; run_init applies the new TTL
+    let ctx = test_ctx(db); // retention_days = 7
     run_init(&client, &ctx).await.expect("run_init");
 
     client
@@ -946,10 +826,8 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
     }
 
     // Re-install the pre-#137 wrapping expression verbatim on both
-    // millisecond tables (for `metric_hist_samples` it is the CREATE-time
-    // TTL the table kept pre-#137, being absent from `apply_ttl`): the same
-    // rows' expiry wraps past u32::MAX to ~1970-10 and the parts are
-    // dropped.
+    // millisecond tables: the same rows' expiry wraps past u32::MAX to
+    // ~1970-10 and the parts are dropped.
     for table in ["metric_samples", "metric_hist_samples"] {
         client
             .execute(
@@ -1093,49 +971,22 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
     }
     drop(stream);
 
-    // The kinds `run_init` may issue, and nothing else. `MATERIALIZE TTL`
-    // comes from the delete-TTL on the sample tables; the four
-    // `PROJECTION` commands come from the span projections — three
-    // materialise and one drop, which is why the allowed list carries two
-    // projection prefixes. A command outside this list is a schema change
-    // nobody reviewed, whatever it says about columns.
-    const ALLOWED_PREFIXES: &[&str] = &[
-        "(MATERIALIZE TTL)",
-        "(MATERIALIZE PROJECTION ",
-        "(DROP PROJECTION IF EXISTS ",
-    ];
-    let unexpected: Vec<&String> = commands
-        .iter()
-        .filter(|c| !ALLOWED_PREFIXES.iter().any(|p| c.starts_with(p)))
-        .collect();
+    // **A fresh build issues no mutation at all.** Every TTL and every
+    // projection is declared in its table's own `CREATE`, so there is no
+    // `MODIFY TTL` to materialise and no `ADD PROJECTION` to fill in. The
+    // nineteen this used to assert — fifteen `MATERIALIZE TTL` and four
+    // `PROJECTION` commands — were the numbered migrations' own cost: each
+    // `ALTER` queued a background mutation on a table that had just been
+    // created empty.
+    //
+    // Pinned at zero rather than dropped, because a mutation appearing here
+    // means a statement in `schema/schema.sql` mutates a table instead of
+    // declaring it, which is the shape the file exists to avoid.
     assert!(
-        unexpected.is_empty(),
-        "a fresh database issued a mutation outside the reviewed set: {unexpected:?}\n\
-         all commands: {commands:?}"
-    );
-
-    // And the cardinality, so a NEW mutation of an allowed kind is a
-    // decision somebody makes rather than a line nobody reads. The split
-    // measured on this base is fifteen `MATERIALIZE TTL` and four
-    // `PROJECTION` commands — issue #560 added two `MATERIALIZE TTL`, one
-    // each for the `MODIFY TTL` on `trace_recent` and `trace_error_spans`;
-    // issue #603 added one for each landing table's own `MODIFY TTL`,
-    // `metric_landing`'s and then `log_landing`'s; and issues #584 to #586
-    // added **four**, one each for `spans`, `traces`, `resources` and
-    // `trace_landing`, which are the four tables on the trace write path
-    // that carry a delete-TTL. The two tag catalogs carry none, because
-    // `docs/api.md` §4.3 requires catalog entries to outlive span
-    // retention, so they add no mutation here either.
-    let ttl = commands
-        .iter()
-        .filter(|c| *c == "(MATERIALIZE TTL)")
-        .count();
-    let projection = commands.len() - ttl;
-    assert_eq!(
-        (commands.len(), ttl, projection),
-        (19, 15, 4),
-        "the mutations a fresh database issues moved; read each one before repinning: \
-         {commands:?}"
+        commands.is_empty(),
+        "a fresh build issued {} mutation(s); every TTL and projection belongs \
+         in its table's own CREATE: {commands:?}",
+        commands.len()
     );
 
     drop_database(&client, db).await;
@@ -1320,26 +1171,22 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
         .await
         .expect("create metric_landing directly, as a lost response would have left it");
 
+    let before = create_table_query(&client, db, "metric_landing").await;
     run_init(&client, &test_ctx(db))
         .await
         .expect("a re-run adopts the existing table rather than failing");
-    let recorded = count(
-        &client,
-        &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = 64"),
-    )
-    .await;
     assert_eq!(
-        recorded, 1,
-        "the migration is recorded once the re-run adopts the table"
+        before,
+        create_table_query(&client, db, "metric_landing").await,
+        "the existing table is adopted, not recreated"
     );
 
     drop_database(&client, db).await;
 }
 
-/// The landing table's delete-TTL is the configured hours, applied by
-/// `apply_ttl` rather than by the CREATE — so a statement that renders but is
-/// never run leaves the installed TTL what the CREATE gave, which is none at
-/// all. A second init at a different value replaces it.
+/// The landing table's delete-TTL is the configured hours. The value is
+/// declared in the `CREATE`, so a change to it is a rebuild rather than an
+/// `ALTER` — which is what this does.
 #[tokio::test]
 async fn run_init_installs_the_landing_ttl_at_the_configured_hours() {
     skip_unless_live!();
@@ -1356,8 +1203,9 @@ async fn run_init_installs_the_landing_ttl_at_the_configured_hours() {
         "the installed TTL must be the configured 1 hour: {create}"
     );
 
+    drop_database(&client, db).await;
     ctx.metrics_landing_retention_hours = 168;
-    run_init(&client, &ctx).await.expect("re-init at 168 hours");
+    run_init(&client, &ctx).await.expect("rebuild at 168 hours");
     let create = create_table_query(&client, db, "metric_landing").await;
     assert!(
         create.contains("least(intDiv(received_ms, 1000) + (168 * 3600), 4294967295)"),
@@ -1426,11 +1274,11 @@ const LOG_LANDING_COLUMNS: &[(&str, &str, &str)] = &[
 /// **T44.** A fresh `run_init` creates `log_landing` with exactly the declared
 /// columns, in order, with the declared types and codecs, `event_id` defaulted
 /// by the server's own time-ordered UUID function, and the engine, partition,
-/// sorting key and fixed settings the design pins. **All five `log_*_mv` views
-/// exist beside it, and each has a `mv_checksums` row.**
+/// sorting key and fixed settings the design pins. **All five `log_*_mv`
+/// views exist beside it.**
 ///
-/// It fails on an absent migration or `MvDef`, and on a view whose `TO` target
-/// does not exist yet — which the server refuses at `CREATE`.
+/// It fails on an absent statement, and on a view whose `TO` target does not
+/// exist yet — which the server refuses at `CREATE`.
 #[tokio::test]
 async fn log_landing_and_its_views_exist_after_init() {
     skip_unless_live!();
@@ -1489,20 +1337,6 @@ async fn log_landing_and_its_views_exist_after_init() {
             "{view} must exist after run_init: {names:?}"
         );
     }
-    let checksummed = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM {db}.mv_checksums WHERE mv_name IN ({})",
-            LOG_VIEWS
-                .iter()
-                .map(|v| format!("'{v}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    )
-    .await;
-    assert_eq!(checksummed, 5, "one checksum row per logs view");
-
     drop_database(&client, db).await;
 }
 
@@ -1510,9 +1344,9 @@ async fn log_landing_and_its_views_exist_after_init() {
 /// committed and its response was lost: an existing `log_landing` is adopted,
 /// `run_init` returns `Ok`, and the migration is recorded.
 ///
-/// **Running `run_init` twice would construct nothing**: the first run both
-/// creates the table and records the migration, so the second is a no-op and
-/// could not fail on the defect this names. The `CREATE` is issued directly
+/// **Running `run_init` twice would construct nothing**: the first run
+/// creates the table, so the second is a no-op and could not fail on the
+/// defect this names. The `CREATE` is issued directly
 /// instead — the state a committed creation whose response was lost leaves —
 /// and written out here rather than read from the catalogue, so the case is a
 /// claim about the shipped statement's text and not a tautology over whatever
@@ -1558,26 +1392,22 @@ async fn an_existing_log_landing_table_is_adopted_by_a_rerun() {
         .await
         .expect("create log_landing directly, as a lost response would have left it");
 
+    let before = create_table_query(&client, db, "log_landing").await;
     run_init(&client, &test_ctx(db))
         .await
         .expect("a re-run adopts the existing table rather than failing");
-    let recorded = count(
-        &client,
-        &format!("SELECT count() AS n FROM {db}.schema_migrations WHERE id = 65"),
-    )
-    .await;
     assert_eq!(
-        recorded, 1,
-        "the migration is recorded once the re-run adopts the table"
+        before,
+        create_table_query(&client, db, "log_landing").await,
+        "the existing table is adopted, not recreated"
     );
 
     drop_database(&client, db).await;
 }
 
-/// **T46.** The logs landing table's delete-TTL is the configured hours,
-/// applied by `apply_ttl` rather than by the CREATE — so a statement that
-/// renders but is never run leaves the installed TTL what the CREATE gave,
-/// which is none at all. A second init at a different value replaces it.
+/// **T46.** The logs landing table's delete-TTL is the configured hours.
+/// The value is declared in the `CREATE`, so a change to it is a rebuild
+/// rather than an `ALTER`.
 ///
 /// **The server parenthesises the multiplication** when it renders the
 /// expression back, so the unparenthesised form the statement is written in
@@ -1598,8 +1428,9 @@ async fn run_init_installs_the_log_landing_ttl_at_the_configured_hours() {
         "the installed TTL must be the configured 24 hours: {create}"
     );
 
+    drop_database(&client, db).await;
     ctx.log_landing_retention_hours = 168;
-    run_init(&client, &ctx).await.expect("re-init at 168 hours");
+    run_init(&client, &ctx).await.expect("rebuild at 168 hours");
     let create = create_table_query(&client, db, "log_landing").await;
     assert!(
         create.contains("least(intDiv(received_ms, 1000) + (168 * 3600), 4294967295)"),

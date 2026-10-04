@@ -44,7 +44,8 @@ use pulsus_read::traces::tags_sql::{
     DaySpan, attr_values_narrowed_sql, span_name_values_sql, tag_names_sql, tag_values_sql,
 };
 use pulsus_read::{TAG_NAMES_MAX, TAG_VALUES_MAX, TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when

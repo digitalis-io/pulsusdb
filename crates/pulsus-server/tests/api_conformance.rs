@@ -53,6 +53,8 @@
 //! (`logql/exec.rs::exceeding_the_stream_cap_maps_to_stream_cap_not_scan_budget_bytes`),
 //! since it has no config knob to reach cheaply.
 
+#[path = "support/live_db.rs"]
+mod live_db;
 #[path = "support/manifest.rs"]
 mod manifest;
 
@@ -339,6 +341,15 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    // The binary creates no schema: without this the process logs "database
+    // does not exist: build it with `schema/schema.sh`" and `/ready` never
+    // reaches 200. Idempotent, so repeated spawns cost one no-op render.
+    //
+    // **The DEFAULT retention, unlike every other suite here**, because this
+    // one's "empty DB must return an empty traces array" assertions rest on
+    // the delete-TTL dropping its own 2023-stamped fixtures.
+    // `live_db::build_schema_with_retention` says what that means.
+    live_db::build_schema_blocking_with_retention(db, 7);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")

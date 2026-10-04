@@ -85,7 +85,6 @@ pulsusdb:
     skip_ddl: false
     retention_days: 7
     storage_policy: null
-    rotation_interval: 1h
     log_rollup_resolution: 5s
     # -- ClickHouse cluster name (enables `ON CLUSTER` DDL, `Replicated*`
     # engines, `_dist` tables). `null` here: auto-set to
@@ -170,21 +169,34 @@ pulsusdb:
       size: 5Gi
       storageClass: ""
 
-# -- Disabled-by-default operator-convenience `--mode init` Job (issue #38
-# plan round-2 amendment §1): NOT wired into install/upgrade. Every
-# serving pod already self-reconciles its own schema before it can serve
-# (`crates/pulsus-server/src/serve.rs`'s `ensure_schema_then_connect` runs
-# strictly before the pool is published; `/ready` is 503 until it
-# succeeds) and `run_init`/reconcile is idempotent, so N replicas each
-# self-reconciling is safe by contract — this Job exists only for
-# operators who want first-boot DDL serialized ahead of a very large
-# split/cluster fleet's first rollout. Normally unnecessary.
+# -- The Job that builds the schema, by running `schema/schema.sh` from the
+# image. **On by default, because nothing else creates schema**: the binary
+# creates none and a serving pod whose database does not exist stays
+# unready and logs the command to run.
+#
+# The script **drops the configured database and builds it fresh**, and the
+# Job's name carries a digest of the schema parameters, so:
+#
+#   * an install runs it once;
+#   * an upgrade that changes a schema parameter renders a new Job, which
+#     runs again and **discards what the database holds**. That is the cost
+#     this design states: there are no migrations, and a schema change costs
+#     a drop and a rebuild;
+#   * an upgrade that changes anything else leaves it alone.
+#
+# `templates/init-job.yaml` says which parameters have that property and why
+# the name is built this way.
 initJob:
-  enabled: false
+  enabled: true
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
-  backoffLimit: 3
+  # -- Attempts the schema Job gets. Generous, because its first attempt can
+  # legitimately find the cluster incomplete: a sharded install creates every
+  # shard's StatefulSet alongside this Job, and `ON CLUSTER` DDL needs all of
+  # them. The script waits `PULSUS_SCHEMA_WAIT_SECONDS` (300 by default) for
+  # that on its own, and these attempts are what follows if it still was not.
+  backoffLimit: 10
 
 clickhouse:
   # -- false => external/production ClickHouse: point

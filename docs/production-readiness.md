@@ -51,9 +51,9 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 
 | Item | Evidence (test / CI step / doc § / code ref) | Status |
 | --- | --- | --- |
-| TTL statements rendered from `retention_days` (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/src/controller.rs::apply_ttl_all_statements_render_the_saturating_datetime_expression` | ✅ |
-| TTL applied at startup and on the rotation timer | `crates/pulsus-server/src/serve.rs` · `crates/pulsus-schema/src/controller.rs` | ✅ |
-| Retention/rotation/storage-policy config surface | `retention_days`/`rotation_interval`/`storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3` | ✅ |
+| TTL declared from `retention_days` (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
+| TTL applied when the schema is built | `schema/schema.sql` · `schema/schema.sh` · `crates/pulsus-schema/tests/schema_file.rs` | ✅ |
+| Retention/storage-policy config surface | `retention_days`/`storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3` | ✅ |
 | Live schema TTL gates (logs/metrics + traces) | `ci.yml: "Live schema tests (single-node, migrations + MVs + crash/retry)"` · `ci.yml: "Live traces schema tests (tables + MV + EXPLAIN gates)"` · `architecture.md §3.6` | ✅ |
 
 ## 4. Backpressure & admission control

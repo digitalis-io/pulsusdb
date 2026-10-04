@@ -30,7 +30,8 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::TimeBounds;
 use pulsus_read::{EngineConfig, LogQlEngine};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 const CLUSTER_NAME: &str = "pulsus_test_cluster";
 

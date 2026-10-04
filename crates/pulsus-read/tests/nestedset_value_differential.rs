@@ -101,7 +101,8 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 // ---------------------------------------------------------------------------
 // Gating + ClickHouse setup

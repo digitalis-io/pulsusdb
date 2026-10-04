@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use pulsus_config::Mode;
 
 mod app;
 mod azdetect;
@@ -21,7 +20,6 @@ mod modes;
 mod ops;
 mod prom_api;
 mod rebuild;
-mod schema_init;
 mod serve;
 mod subsystems;
 mod tls;
@@ -181,9 +179,6 @@ async fn main() -> ExitCode {
             match cli.command {
                 Some(Command::RebuildMetrics(args)) => rebuild::run(&config, args).await,
                 Some(Command::RebuildTraces(args)) => rebuild::run_traces(&config, args).await,
-                None if config.mode == Mode::Init => {
-                    schema_init::run(&config, pulsus_schema::REQUIRED_SERVER_NAMES).await
-                }
                 None => serve::run(config).await,
             }
         }

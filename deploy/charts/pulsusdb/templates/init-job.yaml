@@ -1,19 +1,44 @@
 {{/*
-Disabled-by-default operator-convenience Job (`initJob.enabled`, issue #38
-plan round-2 amendment §1 — read `values.yaml`'s `initJob` comment for the
-full rationale). NOT a Helm hook and NOT wired into install/upgrade
-ordering: every serving pod already self-reconciles its own schema before
-it can serve, so this Job is redundant on the default path. It exists only
-for operators who want `--mode init` DDL serialized once, ahead of a very
-large split/cluster fleet's first rollout, instead of letting every
-replica's first self-reconcile race (safely — `run_init`/reconcile is
-idempotent — but redundantly at scale).
+The Job that builds the schema (`initJob.enabled`, on by default).
+
+**It is the only thing that creates schema.** The binary creates none, and
+a serving pod whose database does not exist stays unready and says so. So
+this is not an operator convenience any more: without it, or without the
+script run by hand, nothing serves.
+
+**`schema/schema.sh` drops the database and builds it fresh.** The serving
+pods carry no ordering against it and need none — a pod that starts first
+stays unready and retries until the schema is there.
+
+**The name carries a digest of the schema parameters, and that is what makes
+an upgrade work at all.** A Job's `spec.template` is immutable, so a release
+whose Job is a plain resource cannot be upgraded once any value inside that
+template changes: `helm upgrade` tries to patch it and the API server
+refuses with `field is immutable` — measured, on the behavioural suite's
+retention-days upgrade.
+
+With the digest in the name, an upgrade that changes a schema parameter
+renders a DIFFERENT Job, so Helm creates it and removes the old one instead
+of patching. An upgrade that changes nothing the schema reads renders the
+same name and nothing happens.
+
+That means **a schema-parameter change rebuilds the database and discards
+what it holds.** That is the cost this design states: there are no
+migrations, and a schema change costs a drop and a rebuild. The parameters
+with that property are the ones `pulsusdb.schemaEnv` renders.
+
+A Helm hook would be the other shape and does not work here: `pre-install`
+runs before the release's own ClickHouse exists, and `post-install` runs
+after `--wait` has already given up waiting for pods that cannot be ready
+without a schema.
 */}}
 {{- if .Values.initJob.enabled }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "pulsusdb.componentFullname" (dict "root" . "suffix" "-init") }}
+  name: {{ printf "%s-%s"
+      (include "pulsusdb.componentFullname" (dict "root" . "suffix" "-init"))
+      (include "pulsusdb.schemaEnv" . | sha256sum | trunc 8) }}
   labels:
     {{- include "pulsusdb.componentLabels" (dict "root" . "component" "init") | nindent 4 }}
 spec:

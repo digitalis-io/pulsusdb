@@ -173,11 +173,6 @@ const ROWS: &[Row] = &[
         check: |c| c.storage_policy.as_deref() == Some("row-policy"),
     },
     Row {
-        var: "PULSUS_ROTATION_INTERVAL",
-        value: "3h",
-        check: |c| c.rotation_interval.0 == Duration::from_secs(3 * 3_600),
-    },
-    Row {
         var: "PULSUS_LOG_ROLLUP_RESOLUTION",
         value: "15s",
         check: |c| c.log_rollup_resolution.0 == Duration::from_secs(15),
@@ -543,8 +538,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        97,
-        "docs/configuration.md §§1-8 document exactly 97 variables"
+        96,
+        "docs/configuration.md §§1-8 document exactly 96 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

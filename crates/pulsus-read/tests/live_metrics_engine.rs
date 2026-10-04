@@ -36,7 +36,8 @@ use pulsus_read::{
     LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
     QueryResult, ReadError,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 fn stage<'a>(explain: &'a PlanExplain, name: &str) -> &'a ExplainStage {
     explain
