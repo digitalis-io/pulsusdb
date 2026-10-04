@@ -88,7 +88,7 @@ sealed newtype with no `Display` (`pulsus_model::Fingerprint`), and the literal 
 the only type whose `Display` converts a fingerprint value into text — searched over every tracked
 Rust file — so writing a fingerprint straight into SQL is a compile error. Two `Display` impls
 further down the read path do emit fingerprint SQL, `SqlExpr` and `Pred` in
-`crates/pulsus-read/src/compile/fold.rs:83,532`; both write out a string the mint rendered earlier.
+`crates/pulsus-read/src/compile/fold.rs:83,535`; both write out a string the mint rendered earlier.
 
 - **Metrics:** the buffer is the label set serialized as `key \xff value \xff ...` with keys sorted
   and `__name__` excluded (the metric name is a first-class column). This keeps fingerprints stable

@@ -242,7 +242,7 @@ undercounts: the `span_name_day` aggregate row was left out of the first, and
 the edge row out of the second.
 
 `val_num` is `val.parse::<f64>()` when the result is finite, else NULL
-(`crates/pulsus-write/src/protocols/otlp_traces.rs:752-754`). It is set from the **text**, whatever OTLP type the
+(`crates/pulsus-write/src/protocols/otlp_traces.rs:760-762`). It is set from the **text**, whatever OTLP type the
 sender declared, which is why the string `"500"` under a different key would also
 carry `val_num = 500`.
 
@@ -496,7 +496,7 @@ the catalog, because
 ### 2.5 Three ways a failed write leaves the two tables disagreeing
 
 The writer sends two `INSERT`s on two independent flush generations
-(`crates/pulsus-write/src/writer/trace.rs:9-19`, and `admit_batch` at `:220-304` appends to two separate
+(`crates/pulsus-write/src/writer/trace.rs:9-19`, and `admit_batch` at `:344-586` appends to two separate
 buffers drained by two separate tasks). A reader can therefore see a span without
 its attribute rows during the settle window. That window is temporary and the
 module documents it. These three are not temporary:
@@ -1208,7 +1208,7 @@ WHERE trace_id IN (…32 ids…)
 ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 
--- today, statement 2 of 2   (crates/pulsus-read/src/traces/search_sql.rs:357-383)
+-- today, statement 2 of 2   (crates/pulsus-read/src/traces/search_sql.rs:556-579)
 SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v, val_type AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
@@ -1337,7 +1337,7 @@ returns **0** — no span in C1 repeats a key — and both forms return the same
 positive.** `crates/pulsus-read/src/traces/search_plan.rs:667` carries
 `probe_predicates: Vec<String>`, documented as "Each probe's pre-escaped **positive**
 predicate", built by `membership_predicate`
-(`crates/pulsus-read/src/traces/search_plan.rs:1083`) against the column names `key`,
+(`crates/pulsus-read/src/traces/search_plan.rs:1111`) against the column names `key`,
 `scope`, `val`, `val_num`. What changes is where the string is spent: the
 `key`/`scope` conjuncts become the locate, and the value conjunct becomes the test on
 the located element. Splitting it that way is what the planner must render — the
@@ -1400,9 +1400,9 @@ negation belongs in the SQL.
 
 | builder | after | why |
 |---|---|---|
-| `membership_sql` (`crates/pulsus-read/src/traces/search_sql.rs:357`) | **deleted** — becomes `probe0` above | the result is one `UInt8` per span row |
+| `membership_sql` (`crates/pulsus-read/src/traces/search_sql.rs:556`) | **deleted** — becomes `probe0` above | the result is one `UInt8` per span row |
 | `attr_values_sql` (`:325`) | **deleted** — becomes two columns per read field | it is SCALAR: one value per (span, key). `arrayFirstIndex(…) AS i0`, then `attr_num[i0]` / `<byte-capped> attr_val[i0]` and `attr_type[i0]` from the SAME element. One capped string per field per row, which is the row shape the hydration read already has |
-| `event_set_sql` (`:397`) | **retargeted to `trace_spans` with an `ARRAY JOIN`**, still its own statement | it is MULTI-VALUED, and its own doc comment (`crates/pulsus-read/src/traces/search_sql.rs:437-451`, issue #351) records why a row-per-value shape replaced an aggregate one: "An ARRAY column is an unbounded number of capped strings in ONE row … phase-2 reads carry no `max_memory_usage`". Projecting `arrayFilter(…)` as a column would put that shape back. `ARRAY JOIN` over the span row reproduces the row-per-value read exactly, on the granules the batch already selects |
+| `event_set_sql` (`:628`) | **retargeted to `trace_spans` with an `ARRAY JOIN`**, still its own statement | it is MULTI-VALUED, and its own doc comment (`crates/pulsus-read/src/traces/search_sql.rs:608-613`, issue #351) records why a row-per-value shape replaced an aggregate one: "An ARRAY column is an unbounded number of capped strings in ONE row … phase-2 reads carry no `max_memory_usage`". Projecting `arrayFilter(…)` as a column would put that shape back. `ARRAY JOIN` over the span row reproduces the row-per-value read exactly, on the granules the batch already selects |
 
 `root_sql`, `trace_ctx_sql` and `child_count_sql` (`:428, 468, 492`) read `trace_spans`
 by `trace_id IN` and are untouched.
@@ -1577,11 +1577,11 @@ same table, the same 32 ids, three repetitions each, zero spread:
 
 **Which of the two production sends is not a choice made at the call site**, and that
 is why the wrong explanation survived a round: the builder takes `with_value` as an
-argument (`crates/pulsus-read/src/traces/search_sql.rs:357`), but the caller passes
+argument (`crates/pulsus-read/src/traces/search_sql.rs:556`), but the caller passes
 `self.probe_values[probe_idx]`
 (`crates/pulsus-read/src/traces/search_plan.rs:894-902`), and that vector is filled at
 plan time by `projection_value`
-(`crates/pulsus-read/src/traces/search_plan.rs:2314-2358`), which sets it **true** for
+(`crates/pulsus-read/src/traces/search_plan.rs:2593-2664`), which sets it **true** for
 exactly four predicate classes — `Regex`, `Num`, `KeyExists`, `NumExpr` — because those
 are the ones whose matched value the response needs and cannot take from the query's own
 literal. Q1's probe is `val_num >= 500`, a `Num`, so production sends the **with-value**
@@ -2210,7 +2210,7 @@ numeric attribute values compared bitwise equal between the two layouts —
 `reinterpretAsUInt64`.
 
 **The 2⁵³ boundary is exactly where it is today.** `val.parse::<f64>()`
-(`crates/pulsus-write/src/protocols/otlp_traces.rs:752-754`) already rounds `9007199254740993` to
+(`crates/pulsus-write/src/protocols/otlp_traces.rs:760-762`) already rounds `9007199254740993` to
 `9007199254740992` before anything is stored, and the new layout parses the same
 text with the same function into the same `Float64`. This design neither improves
 nor worsens that, **and that is why there are five arrays and not six**: adding
@@ -2228,7 +2228,7 @@ storage. If that answer should change, it should change on its own.
 | an event or link intrinsic | `event:name`, `link:spanID` | its own scope, one row per span | same tuple, trace grain | as the first row |
 | the tag dropdown's rows | any key ever ingested | every tuple ever seen | tuples seen in the retention window | **changed, deliberately** — a value last seen 400 days ago stops appearing. That is what every other endpoint already does |
 | **a span that carries the probed key twice** | `span.n = "7"` then `span.n = "5"`, filter `{ span.n = 5 }` | the membership row for the second entry exists, so the span **matches** — and `select(span.n)` then renders whichever entry `any()` reached | the span resolves to `7`, so it does **not** match, and `select(span.n)` renders `7` | **changed, deliberately.** Today's two answers contradict each other; the new pair agrees. §4 Q1's fixture moves on three rows, of two kinds — this one, and the next — and the third row is this kind under a negation. One ledger row covers filter, negation and read |
-| **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3660` pins today's union behaviour and moves with it |
+| **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3702` pins today's union behaviour and moves with it |
 
 **Where the two candidate generators first disagree**, as a case rather than a
 description:
@@ -2860,7 +2860,7 @@ The MV list and `TTL_STMTS` change either way:
    `trace_attrs_idx.timestamp_ns` at 80 B/span. That saving does not survive
    here: the column it applies to is on a table this design deletes.)
 2. **The read path changes with the schema, in the same commit.** Two SQL
-   builders are deleted (`crates/pulsus-read/src/traces/search_sql.rs:357, 325`) and one is retargeted
+   builders are deleted (`crates/pulsus-read/src/traces/search_sql.rs:556, 325`) and one is retargeted
    (`:397` — §4 Q1 says why it cannot become a column); the hydration builder gains **one
    resolved-element predicate column per attribute leaf** and a value column pair per read
    field; and the tag builders gain a `date` and a `service` clause. A schema that ships
@@ -3540,7 +3540,7 @@ because the script that produced it matched three file extensions and dropped fi
 golden `.sql` files and three document lines. The second said 108 and 9 because it did
 not resolve a **shorthand** citation — a path given once and then continued with a bare
 `` `:N` ``, as in "`crates/pulsus-write/src/writer/trace.rs:9-19`, and `admit_batch` at
-`` `:220-304` ``" and "`crates/pulsus-schema/src/controller.rs`'s `check_version`, called
+`` `:344-586` ``" and "`crates/pulsus-schema/src/controller.rs`'s `check_version`, called
 at `` `:89` ``". Six such shorthands appear in the body; resolving them adds
 `crates/pulsus-write/src/writer/trace.rs:234-318` and
 `crates/pulsus-schema/src/controller.rs:89` to the quoted set at the time. That second
