@@ -139,6 +139,10 @@ fn http_get_status(port: u16, path: &str) -> Option<u16> {
 }
 
 fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    // The binary creates no schema: without this the process logs "database
+    // does not exist: build it with `schema/schema.sh`" and `/ready` never
+    // reaches 200. Idempotent, so repeated spawns cost one no-op render.
+    live_db::build_schema_blocking(db);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")
@@ -539,15 +543,10 @@ fn engine_for_db(client: ChClient) -> LogQlEngine {
     )
 }
 
+/// The binary has no init mode: `schema/schema.sql` is the schema and
+/// `schema/schema.sh` applies it. The toolkit renders the same file.
 fn init_schema(db: &str) {
-    let status = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
-        .env("CLICKHOUSE_SERVER", ch_host())
-        .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
-        .env("CLICKHOUSE_DB", db)
-        .args(["--mode", "init"])
-        .status()
-        .expect("run --mode init");
-    assert!(status.success(), "--mode init must succeed");
+    live_db::build_schema_blocking(db);
 }
 
 /// A body whose `(fingerprint, cityHash64(body))` sorts strictly

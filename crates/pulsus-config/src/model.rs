@@ -53,7 +53,6 @@ pub struct Config {
     pub skip_ddl: bool,
     pub retention_days: u32,
     pub storage_policy: Option<String>,
-    pub rotation_interval: HumanDuration,
     pub log_rollup_resolution: HumanDuration,
     /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
     /// landing table's delete-TTL, in hours. It is the replay window — the
@@ -164,7 +163,6 @@ impl Default for Config {
             skip_ddl: false,
             retention_days: 7,
             storage_policy: None,
-            rotation_interval: HumanDuration(Duration::from_secs(3_600)),
             log_rollup_resolution: HumanDuration(Duration::from_secs(5)),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
@@ -774,14 +772,13 @@ pub enum Mode {
     All,
     Writer,
     Reader,
-    Init,
 }
 
 impl std::str::FromStr for Mode {
     type Err = String;
 
     /// On failure, returns just the valid-value list (e.g. `"one of: all,
-    /// writer, reader, init"`) — callers wrap this with the offending
+    /// writer, reader"`) — callers wrap this with the offending
     /// input and their own error context (`ConfigError::Env` /
     /// `ConfigError::Value`), so the "expected" clause is stated once.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -789,8 +786,7 @@ impl std::str::FromStr for Mode {
             "all" => Ok(Mode::All),
             "writer" => Ok(Mode::Writer),
             "reader" => Ok(Mode::Reader),
-            "init" => Ok(Mode::Init),
-            _ => Err("one of: all, writer, reader, init".to_string()),
+            _ => Err("one of: all, writer, reader".to_string()),
         }
     }
 }
@@ -1133,7 +1129,7 @@ mod tests {
     #[test]
     fn mode_from_str_rejects_unknown_values_with_the_valid_set() {
         let err = "bogus".parse::<Mode>().unwrap_err();
-        assert!(err.contains("all, writer, reader, init"), "{err}");
+        assert!(err.contains("all, writer, reader"), "{err}");
     }
 
     #[test]

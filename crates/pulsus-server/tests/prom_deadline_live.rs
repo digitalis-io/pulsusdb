@@ -312,6 +312,10 @@ async fn prom_request_deadline_answers_503_with_the_error_envelope() {
     let workdir = std::env::temp_dir().join(format!("pulsus-deadline-live-{}", std::process::id()));
     std::fs::create_dir_all(&workdir).expect("create the child's working directory");
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(&db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .current_dir(&workdir)
         .env("PULSUS_HOST", "127.0.0.1")

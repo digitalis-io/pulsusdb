@@ -18,6 +18,9 @@
 //! holding the generated cert — no HTTP-client or async dependency, the
 //! same bare-GET idiom `live_server.rs` uses, just wrapped in TLS.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -136,6 +139,11 @@ fn tls_listener_serves_ready_and_config_and_rejects_plaintext() {
     let key_path = write_temp_pem("key", &certified.key_pair.serialize_pem());
     let client = client_config(certified.cert.der());
 
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    let db = pulsus_testkit::test_db("pulsus_tls_live_it");
+    live_db::build_schema_blocking(&db);
+
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -149,10 +157,7 @@ fn tls_listener_serves_ready_and_config_and_rejects_plaintext() {
             "CLICKHOUSE_HTTP_PORT",
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
-        .env(
-            "CLICKHOUSE_DB",
-            pulsus_testkit::test_db("pulsus_tls_live_it"),
-        )
+        .env("CLICKHOUSE_DB", &db)
         .spawn()
         .expect("spawn pulsusdb");
     let _guard = ChildGuard(child);

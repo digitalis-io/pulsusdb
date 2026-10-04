@@ -31,7 +31,8 @@ use pulsus_read::{
     DataWindow, ExplainStage, LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig,
     MetricsEngine, PlanExplain, QueryResult,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 const CLUSTER_NAME: &str = "pulsus_test_cluster";
 

@@ -32,7 +32,8 @@ use pulsus_read::metrics::sql::{historical_resolution_query, historical_series_s
 use pulsus_read::{
     DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp, Resolution, SeriesResolver,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when

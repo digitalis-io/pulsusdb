@@ -42,7 +42,6 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_SKIP_DDL",
     "PULSUS_RETENTION_DAYS",
     "PULSUS_STORAGE_POLICY",
-    "PULSUS_ROTATION_INTERVAL",
     "PULSUS_LOG_ROLLUP_RESOLUTION",
     "PULSUS_METRICS_LANDING_RETENTION_HOURS",
     "PULSUS_METRICS_DEDUP_WINDOW",
@@ -283,9 +282,6 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_STORAGE_POLICY") {
         cfg.storage_policy = Some(v);
     }
-    if let Some(v) = read("PULSUS_ROTATION_INTERVAL") {
-        cfg.rotation_interval = parse_dur("PULSUS_ROTATION_INTERVAL", &v)?;
-    }
     if let Some(v) = read("PULSUS_LOG_ROLLUP_RESOLUTION") {
         cfg.log_rollup_resolution = parse_dur("PULSUS_LOG_ROLLUP_RESOLUTION", &v)?;
     }
@@ -520,8 +516,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            97,
-            "docs/configuration.md §§1-8 document exactly 97 variables"
+            96,
+            "docs/configuration.md §§1-8 document exactly 96 variables"
         );
     }
 

@@ -45,7 +45,8 @@ use pulsus_read::traces::exec::{TRACE_MAX_RESULT_BYTES, TRACE_READ_BYTES_BUDGET}
 use pulsus_read::traces::rows::{CandidateRow, HydrationRow, MembershipRow, RootRow};
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::{SearchPlan, SpanFilterCtx, TRACE_SEARCH_MAX_BLOCK_ROWS};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 use super::query_log::{flush_logs, tagged_settings};
 use super::{BenchArgs, parse_http_url};

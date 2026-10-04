@@ -85,6 +85,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
 # Issue #587: TEST-ONLY — the fetch's byte-valued attribute carriers are
 # read as `serde_bytes::ByteBuf`, and `assemble.rs`'s own fixtures build
 # them. No production path in this crate names the crate.

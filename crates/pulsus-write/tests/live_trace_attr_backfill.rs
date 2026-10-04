@@ -36,7 +36,8 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
 use pulsus_config::WriterConfig;
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
 use pulsus_write::{
     AttrRecord, AttrValueType, ParsedTraceLanding, ParsedTraces, PushHeaders, SpanRecord,

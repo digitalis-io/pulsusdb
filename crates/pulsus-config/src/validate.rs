@@ -1078,7 +1078,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
     positive_duration("reader.tail_catchup_slice", cfg.reader.tail_catchup_slice)?;
-    positive_duration("rotation_interval", cfg.rotation_interval)?;
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
     positive_bytes("ruler.max_result_bytes", cfg.ruler.max_result_bytes)?;

@@ -1,12 +1,12 @@
-//! `SchemaError` taxonomy for the schema controller.
+//! `SchemaError` taxonomy for the server checks and the trace replay.
 
 use thiserror::Error;
 
 use pulsus_clickhouse::ChError;
 
-/// Errors from `pulsus-schema`. Every variant carries enough context that
-/// `pulsus-server` can map it to a distinct process exit code and print an
-/// actionable message.
+/// Errors from `pulsus-schema`. Every variant carries enough context for
+/// `pulsus-server` to print an actionable message before it refuses to
+/// start.
 #[derive(Debug, Error)]
 pub enum SchemaError {
     /// Propagated from `pulsus-clickhouse` (connection, timeout, server, ...).
@@ -26,27 +26,6 @@ pub enum SchemaError {
     /// The server's reported version string could not be parsed at all.
     #[error("could not parse ClickHouse version string {0:?}")]
     Version(String),
-
-    /// A previously-applied migration's id now renders to a different
-    /// checksum than the one recorded in `schema_migrations` — the shipped
-    /// template (or a config value it renders from) changed after it was
-    /// already applied. Migrations are append-only and immutable; this is a
-    /// hard error, never a silent re-apply (docs/schemas.md §6).
-    #[error(
-        "migration {id} drifted: the rendered DDL no longer matches the checksum recorded in \
-         schema_migrations — migrations are immutable, ship the change as a new migration id"
-    )]
-    MigrationDrift { id: u32 },
-
-    /// `--mode init` was requested together with `PULSUS_SKIP_DDL=1`: a
-    /// contradictory intent (init exists to run DDL; skip exists to avoid
-    /// it during normal startup). Refused rather than silently ignoring one
-    /// of the two flags.
-    #[error(
-        "--mode init refuses to run with PULSUS_SKIP_DDL=1 (contradictory: init's purpose is to \
-         apply DDL; unset PULSUS_SKIP_DDL or use a different mode)"
-    )]
-    SkipDdlInInit,
 }
 
 #[cfg(test)]
@@ -60,19 +39,6 @@ mod tests {
         };
         assert!(err.to_string().contains("24.8.14.39"));
         assert!(err.to_string().contains("26.3"));
-    }
-
-    #[test]
-    fn migration_drift_message_names_the_id() {
-        let err = SchemaError::MigrationDrift { id: 5 };
-        assert!(err.to_string().contains('5'));
-    }
-
-    #[test]
-    fn skip_ddl_in_init_message_names_both_flags() {
-        let err = SchemaError::SkipDdlInInit;
-        assert!(err.to_string().contains("init"));
-        assert!(err.to_string().contains("PULSUS_SKIP_DDL"));
     }
 
     #[test]

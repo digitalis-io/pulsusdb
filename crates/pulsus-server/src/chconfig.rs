@@ -107,6 +107,9 @@ pub(crate) enum NameCheckError {
     Connect(ChError),
     Statement(SchemaError),
     Missing(Vec<&'static str>),
+    /// The configured database does not exist. `schema/schema.sh` builds
+    /// it; this process does not.
+    SchemaAbsent(String),
 }
 
 /// Reads back every setting and function name this build sends that was not
@@ -143,9 +146,35 @@ pub(crate) async fn check_server_names(
     }
 }
 
-/// Maps `Config` to the schema controller's rendering/reconcile parameters
-/// (`pulsus_schema::run_init`/`reconcile`'s `SchemaParams`). Used by both
-/// `--mode init` and the serving reconnect loop's schema-reconcile step.
+/// Whether the configured database exists.
+///
+/// **The binary does not create schema.** `schema/schema.sh` does, and a
+/// serving process that found nothing to serve from used to create it
+/// itself; now it refuses and says which command builds it. Without this
+/// the refusal is ClickHouse's `UNKNOWN_DATABASE` from the pool connect,
+/// which names the database but not what to run.
+///
+/// Reads the catalogue over a bootstrap client of its own, for
+/// [`check_server_names`]' reason: the target database may not exist.
+pub(crate) async fn check_schema_present(config: &Config) -> Result<(), NameCheckError> {
+    let client = ChClient::new(bootstrap_conn_config_from(config))
+        .await
+        .map_err(NameCheckError::Connect)?;
+    let db = &config.clickhouse.database;
+    let present = pulsus_schema::database_exists(&client, db)
+        .await
+        .map_err(NameCheckError::Statement)?;
+    drop(client);
+    if !present {
+        return Err(NameCheckError::SchemaAbsent(db.clone()));
+    }
+    Ok(())
+}
+
+/// Maps `Config` to the rendering parameters `schema/schema.sql`'s tokens
+/// are substituted from — the same values `schema/schema.sh` reads from the
+/// environment. Used by the serving startup's schema-presence check, the
+/// rebuild commands and the trace replay.
 pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
     RenderCtx {
         db: config.clickhouse.database.clone(),

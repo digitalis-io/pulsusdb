@@ -65,7 +65,8 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 #[derive(Parser, Debug, Clone)]
 pub struct BenchArgs {

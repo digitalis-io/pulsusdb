@@ -40,7 +40,8 @@ use pulsus_config::WriterConfig;
 use pulsus_read::logql::error::{ReadError, TooBroadReason};
 use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
 use pulsus_write::{
     AttrRecord, AttrValueType, ParsedTraceLanding, ParsedTraces, PushHeaders, SpanRecord,

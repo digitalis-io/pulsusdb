@@ -79,7 +79,8 @@ use prost::Message as _;
 use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 use pulsus_write::{ParsedTraceLanding, TraceLandingRow, parse_trace_landing, resource_identity};
 
 /// An instant inside the span retention window. `ttl_only_drop_parts = 1`

@@ -72,7 +72,8 @@ use pulsus_read::{
     HistOrFloat, LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine,
     QueryResult,
 };
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()

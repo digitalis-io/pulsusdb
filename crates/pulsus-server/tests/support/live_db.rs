@@ -123,6 +123,88 @@ async fn try_drop_db(db: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The retention the schema these suites build carries, in days: a hundred
+/// years.
+///
+/// **Their fixtures are fixed instants in the past.** At the default seven
+/// days the delete-TTL drops the part before the first query runs — measured
+/// while writing this: `template_timezone_live`'s 2023-11-14 line landed in
+/// `log_samples` and was gone one part later. The suites that cared already
+/// passed `PULSUS_RETENTION_DAYS=36500` to the server, which used to create
+/// the schema; the schema is built here now, so the value belongs here.
+///
+/// The server's own `PULSUS_RETENTION_DAYS` is untouched by this and still
+/// drives the read-side query-window clamp, which is a different thing.
+pub const SCHEMA_RETENTION_DAYS: u32 = 36_500;
+
+/// Builds the schema in `db`, as `schema/schema.sh` would.
+///
+/// **The binary creates none**, so a suite that spawns the server must do
+/// this first or `/ready` never reaches 200 — the process logs "database
+/// does not exist: build it with `schema/schema.sh`" and retries. The
+/// in-process renderer is used rather than the script for the reason
+/// `pulsus-schema-testkit`'s own documentation gives: a subprocess per call
+/// site costs about 0.8 s, and `pulsus-schema`'s
+/// `the_script_renders_exactly_what_this_crate_renders` holds the two to the
+/// same text.
+pub async fn build_schema(db: &str) {
+    let client = ChClient::new(conn_config("default"))
+        .await
+        .unwrap_or_else(|e| panic!("connect bootstrap client to build {db}: {e}"));
+
+    // **Already there means leave it alone.** Building restates every view,
+    // and restating one is `DROP VIEW` then `CREATE` — so a second call
+    // while the suite is running would take the views away under rows
+    // already landed. Suites that spawn a second server reach this a second
+    // time, and three of them lost their rows to it. A suite that wants a
+    // fresh schema drops the database first; `ScopedDb` does.
+    if pulsus_schema::database_exists(&client, db)
+        .await
+        .unwrap_or_else(|e| panic!("read whether {db} exists: {e}"))
+    {
+        return;
+    }
+
+    let params = pulsus_schema::RenderCtx {
+        retention_days: SCHEMA_RETENTION_DAYS,
+        ..pulsus_schema::RenderCtx::for_tests(db)
+    };
+    pulsus_schema_testkit::run_init(&client, &params)
+        .await
+        .unwrap_or_else(|e| panic!("build the schema in {db}: {e}"));
+}
+
+/// [`drop_db`] then [`build_schema`]: what a suite that spawns the server
+/// needs before it spawns one.
+pub async fn fresh_db(db: &str) {
+    drop_db(db).await;
+    build_schema(db).await;
+}
+
+/// [`build_schema`] from a synchronous context.
+///
+/// **Every suite that spawns the binary calls this from its own
+/// `spawn_ready`**, which is sync and reached from an async test — so it
+/// cannot `.await`, and `Handle::block_on` panics on a runtime worker
+/// thread. A throwaway thread with its own current-thread runtime avoids
+/// both, the same way [`ScopedDb`]'s `Drop` does.
+///
+/// Putting it at the spawn rather than beside each `drop_db` is the point: a
+/// spawn with no schema is a sixty-second `/ready` timeout, and there is one
+/// spawn helper per suite but several drops.
+pub fn build_schema_blocking(db: &str) {
+    let name = db.to_string();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime")
+            .block_on(build_schema(&name));
+    })
+    .join()
+    .expect("the schema-build thread");
+}
+
 /// A throwaway database name that drops its database on the way **in** and
 /// on the way **out**.
 ///
@@ -195,6 +277,9 @@ impl ScopedDb {
         if let Err(why) = try_drop_db(&name).await {
             panic!("entry drop: {why}");
         }
+        // The binary creates no schema, so a suite that spawns the server
+        // needs one here or `/ready` never reaches 200.
+        build_schema(&name).await;
         Self { name }
     }
 

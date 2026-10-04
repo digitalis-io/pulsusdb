@@ -1772,7 +1772,8 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
     }
     use futures::StreamExt;
     use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, Row};
-    use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+    use pulsus_schema::{RenderCtx, SchemaParams};
+    use pulsus_schema_testkit::run_init;
 
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
     struct CountRow {
@@ -1909,7 +1910,8 @@ use futures::StreamExt as _;
 use opentelemetry_proto::tonic::common::v1::EntityRef;
 use opentelemetry_proto::tonic::trace::v1::{Status, span};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, Row};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
 struct NumRow {

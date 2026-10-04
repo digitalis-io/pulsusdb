@@ -1,0 +1,13 @@
+[package]
+name = "pulsus-schema-testkit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Test support, never a `[dependencies]` entry of a crate the binary links.
+# It exists so the product ships no code that creates schema: `schema/schema.sh`
+# is what creates it, and this renders the same file for the test suites.
+[dependencies]
+pulsus-clickhouse = { path = "../pulsus-clickhouse" }
+pulsus-schema = { path = "../pulsus-schema" }

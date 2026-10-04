@@ -24,7 +24,6 @@ query_timeout: 30s
 skip_ddl: true
 retention_days: 14
 storage_policy: hot_cold
-rotation_interval: 2h
 log_rollup_resolution: 10s
 cluster: prod
 dist_suffix: _replica
@@ -103,7 +102,6 @@ fn full_fixture_round_trips_into_typed_values() {
     assert!(cfg.skip_ddl);
     assert_eq!(cfg.retention_days, 14);
     assert_eq!(cfg.storage_policy.as_deref(), Some("hot_cold"));
-    assert_eq!(cfg.rotation_interval.0, Duration::from_secs(2 * 3_600));
     assert_eq!(cfg.log_rollup_resolution.0, Duration::from_secs(10));
     assert_eq!(cfg.cluster.as_deref(), Some("prod"));
     assert_eq!(cfg.dist_suffix, "_replica");

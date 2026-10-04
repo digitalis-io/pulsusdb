@@ -1801,6 +1801,10 @@ impl Drop for ChildGuard {
 /// and `/loki/api/v1/tail` are all reachable — the driver above talks to
 /// exactly those paths, so both stores are probed by one body of code.
 fn spawn_pulsus(db: &str, port: u16) -> ChildGuard {
+    // The binary creates no schema; build it before the spawn or `/ready`
+    // never reaches 200.
+    live_db::build_schema_blocking(db);
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")

@@ -40,7 +40,8 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{TraceEngine, TraceReadConfig};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_schema_testkit::run_init;
 
 /// `true` when this suite should run. Skips cleanly on a developer
 /// machine with no container; **panics** rather than skipping when the

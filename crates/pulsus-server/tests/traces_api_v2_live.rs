@@ -214,6 +214,10 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
+    // The binary creates no schema: without this the process logs "database
+    // does not exist: build it with `schema/schema.sh`" and `/ready` never
+    // reaches 200. Idempotent, so repeated spawns cost one no-op render.
+    live_db::build_schema_blocking(db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -810,6 +814,10 @@ async fn the_compare_totals_cover_the_population_whatever_the_selection_window()
 /// `pulsusdb` with extra environment, for the cases that need the compat
 /// endpoints or a short suppression window.
 fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra: &[(&str, &str)]) -> ChildGuard {
+    // The binary creates no schema: without this the process logs "database
+    // does not exist: build it with `schema/schema.sh`" and `/ready` never
+    // reaches 200. Idempotent, so repeated spawns cost one no-op render.
+    live_db::build_schema_blocking(db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())

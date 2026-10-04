@@ -103,7 +103,8 @@ use std::time::{Duration, Instant};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{MetricLabelValue, TraceEngine, TraceMetricsResult, TraceReadConfig};
-use pulsus_schema::{RenderCtx, run_init};
+use pulsus_schema::RenderCtx;
+use pulsus_schema_testkit::run_init;
 
 /// The keys the value differential is scoped to: the three #189 keys plus
 /// the two #192 instrumentation-scope intrinsics (both data-driven from the
