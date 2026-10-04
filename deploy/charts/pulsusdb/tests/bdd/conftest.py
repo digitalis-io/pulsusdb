@@ -371,6 +371,14 @@ def _pods_ready(k8s_core_v1, namespace: str, label_selector: str | None = None) 
         # only run on-demand via `helm test`.
         if (pod.metadata.annotations or {}).get("helm.sh/hook") == "test":
             continue
+        # A finished Job's Pod is excluded for the same reason, and it is
+        # load-bearing now: the schema Job runs `schema/schema.sh` and exits,
+        # and a Pod in phase Succeeded carries Ready=False forever. Without
+        # this, every install wait times out the moment the release has a Job
+        # — which is what happened when the Job became part of the default
+        # install.
+        if pod.status.phase == "Succeeded":
+            continue
         conditions = {c.type: c.status for c in (pod.status.conditions or [])}
         if conditions.get("Ready") != "True":
             return False

@@ -184,13 +184,20 @@ send_file() {
     curl -sS --fail-with-body $auth "$url" --data-binary "@$1"
 }
 
-# **Wait for the server.** This runs as an init container and as a one-shot
+# **Wait for the server.** This runs as a Kubernetes Job and as a one-shot
 # compose service, neither of which is ordered against ClickHouse's own
-# readiness — the e2e harness in particular starts services by order alone,
-# and the first attempt met a port nothing was listening on yet (`curl` exit
-# 7). Polling here rather than asking every caller to order its graph.
+# readiness — the e2e harness starts services by order alone, and the first
+# attempt met a port nothing was listening on yet (`curl` exit 7).
+#
+# Five minutes by default, not seconds: the chart's Job is installed
+# alongside ClickHouse's own StatefulSet, which may be pulling an image or
+# waiting on a volume, and the chart's behavioural suite scales ClickHouse to
+# zero and back deliberately. A Job that gave up inside that window would
+# leave a release that can never become ready. `PULSUS_SCHEMA_WAIT_SECONDS`
+# shortens it where a caller wants a fast refusal.
+wait_seconds=${PULSUS_SCHEMA_WAIT_SECONDS:-300}
 ready=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$wait_seconds"); do
     if curl -sS -o /dev/null "$url" --data-binary 'SELECT 1' 2>/dev/null; then
         ready=1
         break
@@ -198,7 +205,7 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [ "$ready" = 0 ]; then
-    echo "schema.sh: clickhouse at $server:$port did not answer within 60s" >&2
+    echo "schema.sh: clickhouse at $server:$port did not answer within ${wait_seconds}s" >&2
     exit 1
 fi
 
