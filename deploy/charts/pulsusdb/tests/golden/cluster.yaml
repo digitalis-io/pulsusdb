@@ -1152,7 +1152,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: init
 spec:
-  backoffLimit: 3
+  backoffLimit: 10
   template:
     metadata:
       labels:

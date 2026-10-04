@@ -37,7 +37,15 @@ def _pulsusdb_pod_checksum_config(k8s_core_v1, namespace: str) -> str:
     pods = k8s_core_v1.list_namespaced_pod(
         namespace, label_selector="app.kubernetes.io/component=all"
     ).items
-    assert pods, f"expected an all-mode pulsusdb pod in {namespace}"
+    # **A pod being deleted is not the pod template.** `helm upgrade --wait`
+    # returns once the replacement is Ready, and the one it replaced can
+    # still be in the list, terminating, carrying the PREVIOUS checksum. It
+    # was `pods[0]` once: the rollout now completes faster, because a
+    # replacement no longer builds a schema before it can be ready, so the
+    # old pod is more often still there — and this read came back with the
+    # before value and the comparison below failed against itself.
+    pods = [p for p in pods if p.metadata.deletion_timestamp is None]
+    assert pods, f"expected a live all-mode pulsusdb pod in {namespace}"
     annotations = pods[0].metadata.annotations or {}
     checksum = annotations.get("checksum/config")
     assert checksum, f"expected a checksum/config annotation on {pods[0].metadata.name}, found none"

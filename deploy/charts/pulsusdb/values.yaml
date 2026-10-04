@@ -191,7 +191,12 @@ initJob:
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
-  backoffLimit: 3
+  # -- Attempts the schema Job gets. Generous, because its first attempt can
+  # legitimately find the cluster incomplete: a sharded install creates every
+  # shard's StatefulSet alongside this Job, and `ON CLUSTER` DDL needs all of
+  # them. The script waits `PULSUS_SCHEMA_WAIT_SECONDS` (300 by default) for
+  # that on its own, and these attempts are what follows if it still was not.
+  backoffLimit: 10
 
 clickhouse:
   # -- false => external/production ClickHouse: point
