@@ -15,6 +15,7 @@ mod error;
 mod render;
 mod replay;
 mod rotation;
+mod sql;
 
 // Issue #587: `table_column_names` is the one public door onto the
 // catalogue's declared column lists — the trace fetch's projection case
@@ -29,6 +30,7 @@ pub use error::SchemaError;
 pub use render::{Family, RenderCtx, rollup_suffix};
 pub use replay::{ReplayReport, replay_trace_window};
 pub use rotation::spawn_rotation;
+pub use sql::{SCHEMA_SQL, rendered, rendered_statements};
 
 #[cfg(test)]
 mod tests {
