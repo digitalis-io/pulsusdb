@@ -30,7 +30,7 @@ Fixes proposed elsewhere that this design deliberately **rejects**, and why:
 - **`minmax` skip indexes on unclustered string columns** — near-zero granule skipping unless data is physically clustered by that column; where we need that clustering we buy it explicitly (ordering key or projection).
 - **`ReplacingMergeTree` for sample data** — merge-time dedup forces `FINAL` or wrong results. Sample tables are plain `MergeTree`; only metadata tables use `ReplacingMergeTree`, and their read shapes (`LIMIT 1 BY`, `GROUP BY`) are duplicate-tolerant by construction.
 
-Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing` and `trace_landing` also gets a `_dist` Distributed wrapper — those three and the cluster-wide tables get none (§7 lists all ten); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document is rendered from the schema catalogue and applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
+Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing` and `trace_landing` also gets a `_dist` Distributed wrapper — those three and the cluster-wide tables get none (§7 lists all eight); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
 
 ---
 
@@ -746,10 +746,9 @@ TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 ```
 
-**The two re-sorted projections as they finally stand** (issue #555, migrations 44-48 —
-`crates/pulsus-schema/src/catalog.rs`, ids 44 to 48). These are `ALTER`s and not part of the
-frozen `CREATE` above, which is why they are printed here: their column list includes `shared`,
-`status_message`, `scope_name` and `scope_version`, which migrations 31, 35 and 37 add, so the
+**The two re-sorted projections as they finally stand** (issue #555). They are declared inside
+`trace_spans`' own `CREATE` in `schema/schema.sql`, and are printed separately here because their
+column list includes `shared`, `status_message`, `scope_name` and `scope_version`, so the
 list cannot appear inside a `CREATE` that does not declare them — ClickHouse answers
 `Code: 47 UNKNOWN_IDENTIFIER`.
 
@@ -773,10 +772,10 @@ ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time (
 ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time;
 ```
 
-**The span's own attribute arrays** (issue #556, migrations 49-59 —
-`crates/pulsus-schema/src/catalog.rs`, ids 49 to 59). Five aligned arrays plus the constraint
-that keeps them aligned. These are `ALTER`s and not part of the frozen `CREATE` above for the
-same reason as the projections: the constraint's `CHECK` names five columns the `CREATE` does
+**The span's own attribute arrays** (issue #556). Five aligned arrays plus the constraint that
+keeps them aligned, declared inside `trace_spans`' own `CREATE` in `schema/schema.sql`. They are
+printed separately here for the same reason as the projections: the constraint's `CHECK` names
+five columns the frozen `CREATE` above does
 not declare, so moving it inside the block stops it parsing —
 `Code: 47 ... Missing columns: 'attr_num' 'attr_key' ... (UNKNOWN_IDENTIFIER)`.
 
@@ -1437,7 +1436,7 @@ WHERE timestamp_ns > {now - 1h} AND timestamp_ns <= {now}
 
 ---
 
-## 6. Rules & bookkeeping
+## 6. Rules, and how the schema is created
 
 ```sql
 CREATE TABLE rules (
@@ -1449,29 +1448,33 @@ CREATE TABLE rules (
     is_valid    UInt8
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (namespace, group_name, kind);
-
-CREATE TABLE schema_migrations (
-    id           UInt32,
-    checksum     String,
-    applied_at   DateTime
-) ENGINE = ReplacingMergeTree(applied_at)
-ORDER BY id;
-
-CREATE TABLE mv_checksums (
-    mv_name     String,
-    checksum    String,
-    updated_at  DateTime
-) ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY mv_name;
 ```
 
-**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration is permitted only while the condition that allows it holds — no tagged release, no persistent deployments, databases created fresh. Two amendment windows have been taken while that condition held: the `fingerprint` widening to `UInt128` (issue #498, migrations 4, 5, 6, 7, 8, 9, 23 and 29) and the trace tables' widening (issue #587, migrations 66, 67, 68 and 71 — six new columns, five widened declarations and two identity inputs, because #586's definitions could not hold what OTLP sends). A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
+### How the schema is created
+
+**`schema/schema.sql` is the DDL and `schema/schema.sh` applies it. The binary creates no schema.**
+
+```sh
+schema/schema.sh                      # single-node
+PULSUS_CLUSTER=prod schema/schema.sh  # clustered
+schema/schema.sh --print              # render the statements, send nothing
+```
+
+The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 60 statements single-node, 75 clustered.
+
+**There are no migrations.** No numbered list, no bookkeeping table, no checksum drift guard. A schema change is an edit to `schema.sql` and another run of the script; the cost is the data in the database, and the development workflow is to drop and recreate. Nothing is upgraded in place, including retention: `PULSUS_RETENTION_DAYS` is declared in each table's `CREATE`, so changing it is a rebuild.
+
+**One file, two variants.** A line prefixed `--@single` is used on a single node, one prefixed `--@cluster` on a cluster, and every other line by both. A statement that exists in one variant only carries the prefix on all of its lines. The clustered side is where the `Replicated*` engines, `ON CLUSTER`, the `_dist` wrappers and the replication paths live.
+
+**Tokens are double-brace.** `{{db}}`, `{{on_cluster}}`, `{{retention_days}}` and the rest are substituted by the script and, for the two things read at run time, by `pulsus-schema`'s own renderer. ClickHouse's `{shard}` and `{replica}` are the **server's** macros and must reach it as those exact characters: a substitution matching a single brace pair eats them, and the server accepts the result without complaint — every shard then joins one replica set. Nothing in the file may be a single-brace token, and `crates/pulsus-schema/tests/schema_file.rs` holds that, along with the rule that every replication path names the table of its own `CREATE`.
+
+**Two things are read out of the file at run time**, neither of them DDL: a materialized view's own projection, which `rebuild-metrics` and `rebuild-traces` replay a landing window through, and a table's declared column list, from which the trace fetch derives its projection.
 
 ---
 
 ## 7. Distributed layout
 
-Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables gets a Distributed wrapper. Ten tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, in [ingest-one-source-table.md](ingest-one-source-table.md), and in §4.3's own bullet for the trace landing table). The other seven are the cluster-wide ones, one replica set each spanning every shard, read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `schema_migrations`, `mv_checksums`, `metric_metadata`, `trace_tag_catalog`, `resources`, `tag_names` and `tag_values` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
+Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables gets a Distributed wrapper. Eight tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, in [ingest-one-source-table.md](ingest-one-source-table.md), and in §4.3's own bullet for the trace landing table). The other five are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `trace_tag_catalog`, `resources`, `tag_names` and `tag_values` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|

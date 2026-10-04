@@ -105,9 +105,7 @@ tests:
           value: 3100
         template: service.yaml
 
-  - it: given the optional init Job, when rendering, then it has no probes at all (--mode init exits, it never serves HTTP)
-    set:
-      initJob.enabled: true
+  - it: given the schema Job, when rendering, then it has no probes at all (the script exits, it never serves HTTP) and it runs the script rather than the binary
     templates:
       - init-job.yaml
     asserts:
@@ -117,3 +115,8 @@ tests:
           path: spec.template.spec.containers[0].readinessProbe
       - notExists:
           path: spec.template.spec.containers[0].startupProbe
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+      - notExists:
+          path: spec.template.spec.containers[0].args

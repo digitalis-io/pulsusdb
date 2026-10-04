@@ -85,7 +85,6 @@ pulsusdb:
     skip_ddl: false
     retention_days: 7
     storage_policy: null
-    rotation_interval: 1h
     log_rollup_resolution: 5s
     # -- ClickHouse cluster name (enables `ON CLUSTER` DDL, `Replicated*`
     # engines, `_dist` tables). `null` here: auto-set to
@@ -170,17 +169,18 @@ pulsusdb:
       size: 5Gi
       storageClass: ""
 
-# -- Disabled-by-default operator-convenience `--mode init` Job (issue #38
-# plan round-2 amendment §1): NOT wired into install/upgrade. Every
-# serving pod already self-reconciles its own schema before it can serve
-# (`crates/pulsus-server/src/serve.rs`'s `ensure_schema_then_connect` runs
-# strictly before the pool is published; `/ready` is 503 until it
-# succeeds) and `run_init`/reconcile is idempotent, so N replicas each
-# self-reconciling is safe by contract — this Job exists only for
-# operators who want first-boot DDL serialized ahead of a very large
-# split/cluster fleet's first rollout. Normally unnecessary.
+# -- The Job that builds the schema, by running `schema/schema.sh` from the
+# image. **On by default, because nothing else creates schema**: the binary
+# creates none and a serving pod whose database does not exist stays
+# unready and logs the command to run.
+#
+# The script **drops the configured database and builds it fresh**. On an
+# install that is what you want. On an upgrade it would discard everything
+# collected, so disable it after the first install unless a schema change
+# calls for a rebuild — there are no migrations, and a schema change costs
+# a drop and a rebuild.
 initJob:
-  enabled: false
+  enabled: true
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }

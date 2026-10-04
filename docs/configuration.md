@@ -6,7 +6,7 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_MODE` | `all` | `all` \| `writer` \| `reader` \| `init` (create/migrate schema and exit) |
+| `PULSUS_MODE` | `all` | `all` \| `writer` \| `reader` |
 | `PULSUS_HOST` | `0.0.0.0` | HTTP bind address |
 | `PULSUS_PORT` | `3100` | HTTP port |
 | `PULSUS_LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
@@ -25,7 +25,7 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_SERVERS` | unset | comma-separated multi-endpoint list `host[:port][=zone]` for connection spreading — e.g. `ch1:8123=az-a,ch2:8123=az-a,ch3:8123=az-b`. Omitted port ⇒ `CLICKHOUSE_HTTP_PORT`; omitted zone ⇒ unzoned. See [Connection spreading & AZ affinity](#connection-spreading--az-affinity). IPv6 literals (which contain `:`) must use the YAML `clickhouse.servers:` objects, not this flat form |
 | `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)); also the per-endpoint port fallback for `CLICKHOUSE_SERVERS` entries that omit one |
 | `CLICKHOUSE_PORT` | `9000` | native-protocol port; reserved for the documented fallback client, unused by the current transport |
-| `CLICKHOUSE_DB` | `pulsus` | database (created by `init`/startup unless `PULSUS_SKIP_DDL=1`) |
+| `CLICKHOUSE_DB` | `pulsus` | database; created by `schema/schema.sh`, never by the binary — startup refuses when it does not exist |
 | `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001 |
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
@@ -50,10 +50,9 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_SKIP_DDL` | `false` | never issue DDL (schema managed externally / read-only credentials) |
+| `PULSUS_SKIP_DDL` | `false` | skip the startup check that the configured database exists (schema managed externally, e.g. reached through a view under another name). The binary issues no DDL either way |
 | `PULSUS_RETENTION_DAYS` | `7` | TTL for raw log/metric/trace/profile tables |
 | `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for all created tables |
-| `PULSUS_ROTATION_INTERVAL` | `1h` | how often the schema controller re-applies TTL/rotation |
 | `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
 | `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | TTL for `metric_landing`, the one table a metrics push is inserted into (issue #603), in hours. The four tables queries read are maintained from it by materialized view and keep `PULSUS_RETENTION_DAYS`. It is the **replay window**: expiring it deletes nothing the views already wrote, but a target that ends up wrong can be rebuilt only from landed rows that are still there, so a deployment that wants a longer window raises it — on a cheap `PULSUS_STORAGE_POLICY` volume it buys more of that window at that volume's speed. Accepted range `1..=168`; values outside this range are rejected at config load |
 | `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the four tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a single node there is no companion **time** window, the engine having `non_replicated_deduplication_window` and no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. On a cluster there is one, and it is pinned at the server's own default of one hour rather than configured: a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
@@ -90,7 +89,7 @@ Deployment topologies:
 
 1. **Single node** — one `pulsusdb` (mode `all`), one ClickHouse. No cluster vars.
 2. **Split tiers** — N × `PULSUS_MODE=writer` behind an ingest LB, M × `PULSUS_MODE=reader` behind a query LB, same ClickHouse.
-3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `pulsusdb --mode init` once (or an init container) to create replicated + distributed tables; writers/readers as in (2).
+3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `PULSUS_CLUSTER=<name> schema/schema.sh` once (or the chart's init Job) to create the replicated + distributed tables; writers/readers as in (2).
 4. **Cross-cluster reads** — a reader pointed at a query-only ClickHouse cluster whose `_dist`-suffixed tables front the storage cluster; set `PULSUS_DIST_SUFFIX` accordingly.
 
 ## 5. Writer
@@ -213,7 +212,7 @@ Everything above maps 1:1 into YAML (env var wins on conflict). This is the **co
 
 ```yaml
 # root scalars
-mode: all                        # all | writer | reader | init
+mode: all                        # all | writer | reader
 host: 0.0.0.0
 port: 3100
 log_level: info                  # error | warn | info | debug | trace
@@ -227,7 +226,6 @@ tls_key: null                    # PEM private key path; one-sided => startup er
 skip_ddl: false
 retention_days: 7
 storage_policy: null
-rotation_interval: 1h
 log_rollup_resolution: 5s
 metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
@@ -324,6 +322,19 @@ services:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s
 
+  # The schema. The binary creates none, so this one-shot service builds it
+  # before the server starts: it drops the database and applies
+  # `schema/schema.sql` fresh. Set `PULSUS_CLUSTER` here too for a sharded
+  # ClickHouse.
+  schema:
+    image: ghcr.io/digitalis-io/pulsusdb:latest
+    entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+    environment:
+      CLICKHOUSE_SERVER: clickhouse
+      PULSUS_RETENTION_DAYS: "7"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+
   pulsusdb:
     image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
@@ -332,6 +343,7 @@ services:
     ports: [ "3100:3100" ]
     depends_on:
       clickhouse: { condition: service_healthy }
+      schema: { condition: service_completed_successfully }
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -364,4 +376,4 @@ service:
 
 Query via the PulsusDB API (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`). To use existing dashboards or datasources that speak third-party observability APIs, set `PULSUS_COMPAT_ENDPOINTS=true` and point them at `http://pulsusdb:3100`.
 
-**Minimum supported ClickHouse: 26.3 LTS** (the supported LTS line; older servers do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412). The schema controller verifies the server version at startup and refuses to run DDL against older servers.
+**Minimum supported ClickHouse: 26.3 LTS** (the supported LTS line; older servers do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412). `schema/schema.sh` verifies the server version before it sends anything and refuses an older server; the serving process verifies it again at startup.

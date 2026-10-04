@@ -85,9 +85,11 @@ RUN cargo build --release -p pulsus-server --bin pulsusdb
 FROM docker.io/library/debian:bookworm-slim AS runtime
 # `wget` backs this image's own `/ready` healthcheck (compose overrides);
 # `ca-certificates` for any outbound TLS the process makes (e.g. a
-# `CLICKHOUSE_PROTO=https` deployment).
+# `CLICKHOUSE_PROTO=https` deployment); `curl` and `mawk` are what
+# `schema/schema.sh` needs — the binary creates no schema, so the image
+# carries the script that does and an install has something to run.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && apt-get install -y --no-install-recommends ca-certificates wget curl mawk \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user (issue #23 AC: "runs as non-root"). Fixed numeric
@@ -112,6 +114,14 @@ RUN groupadd --system --gid 10001 pulsus \
 WORKDIR /var/lib/pulsusdb
 
 COPY --from=build /src/target/release/pulsusdb /usr/local/bin/pulsusdb
+
+# The schema, and the script that applies it. The binary creates none, so
+# an install needs both: `schema.sh` reads `schema.sql` from its own
+# directory and the same environment variables the binary reads.
+#
+#   docker run --rm -e CLICKHOUSE_SERVER=... \
+#     --entrypoint /usr/local/share/pulsusdb/schema/schema.sh <image>
+COPY schema /usr/local/share/pulsusdb/schema
 
 EXPOSE 3100
 USER pulsus

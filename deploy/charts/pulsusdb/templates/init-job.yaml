@@ -1,13 +1,16 @@
 {{/*
-Disabled-by-default operator-convenience Job (`initJob.enabled`, issue #38
-plan round-2 amendment §1 — read `values.yaml`'s `initJob` comment for the
-full rationale). NOT a Helm hook and NOT wired into install/upgrade
-ordering: every serving pod already self-reconciles its own schema before
-it can serve, so this Job is redundant on the default path. It exists only
-for operators who want `--mode init` DDL serialized once, ahead of a very
-large split/cluster fleet's first rollout, instead of letting every
-replica's first self-reconcile race (safely — `run_init`/reconcile is
-idempotent — but redundantly at scale).
+The Job that builds the schema (`initJob.enabled`, on by default).
+
+**It is the only thing that creates schema.** The binary creates none, and
+a serving pod whose database does not exist stays unready and says so. So
+this is not an operator convenience any more: without it, or without the
+script run by hand, nothing serves.
+
+**`schema/schema.sh` drops the database and builds it fresh**, which is why
+it is not a Helm hook and not wired into upgrade ordering: it runs on
+install, and on an upgrade only when the operator asks for one by
+re-enabling it. The serving pods carry no ordering against it and need
+none — a pod that starts first retries until the schema is there.
 */}}
 {{- if .Values.initJob.enabled }}
 apiVersion: batch/v1

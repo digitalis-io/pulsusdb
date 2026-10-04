@@ -55,10 +55,9 @@ writes them.
 
 ### 1.1 The landing table
 
-`crates/pulsus-schema/src/catalog.rs`, `MIGRATIONS` id 64, `Ddl::Static`,
-`MigrationScope::Checksum`, `Replication::PerShard`. Every statement quoted in §1 and
-§1.3 is the template as it stands in the tree, token for token, re-indented for reading;
-`{{db}}` and `{{on_cluster}}` are substituted at render time:
+`schema/schema.sql`, `metric_landing`. Every statement quoted in §1 and §1.3 is the
+file's own text, token for token, re-indented for reading; `{{db}}` and `{{on_cluster}}`
+are substituted when the schema is built:
 
 ```sql
 CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}} (
@@ -118,7 +117,7 @@ Decisions inside that statement, each of which a second signal has to make again
 
 ### 1.2 The four views
 
-`crates/pulsus-schema/src/catalog.rs`, `MVS`. Each projection lists the target's
+`schema/schema.sql`, the `*_mv` statements. Each projection lists the target's
 columns **in the target's own column order**, aliased to the target's column names, so
 the view is correct whether the server matches by position or by name.
 
@@ -617,10 +616,10 @@ set — and which of those targets its own writer writes rather than a view — 
 that signal's own design, and a copy of the list here would state that decision twice and
 date it. Logs: `docs/schemas.md` §3. Traces: `docs/TraceQL/sql-schema.md` §1 and
 `docs/TraceQL/server-implementation.md` §2, whose accepted design replaces every trace
-table now in `crates/pulsus-schema/src/catalog.rs`, so a trace target list read off the
-catalogue today aims this work at tables that are going. The catalogue,
-`WriterTables::logs_default` and `TraceWriterTables::traces_default` answer what is in the
-tree now, which is a different question.
+table now in `schema/schema.sql`, so a trace target list read off the schema today aims
+this work at tables that are going. The schema file, `WriterTables::logs_default` and
+`TraceWriterTables::traces_default` answer what is in the tree now, which is a different
+question.
 
 **The discriminating values are the implementer's to choose: one per landed event shape,
 and one view per target — several views may read one value.** Metrics used `kind`
@@ -685,9 +684,9 @@ against a server.
 | every landing column carries the value its kind was built from | `every_landing_column_is_the_value_its_kind_was_built_from`; live: `a_push_lands_one_block_carrying_every_kind` (`crates/pulsus-write/tests/live_metric_writer.rs`) |
 | the insert omits the identity column so the server fills it | `the_insert_omits_event_id_so_the_server_fills_it` — in `crates/pulsus-write/src/writer/rows.rs` for the column list, and live in `crates/pulsus-write/tests/live_metric_writer.rs` for what the server stores |
 | every limit that forms a block, or disables deduplication, is pinned exactly | `the_landing_insert_pins_every_limit_that_forms_a_block`, `both_row_limits_follow_the_deployments_own_ceiling` (`crates/pulsus-clickhouse/src/settings.rs`) |
-| the pinned set and the startup name list are the same set, both ways | `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends` (`crates/pulsus-schema/src/controller.rs`) |
+| the pinned set and the startup name list are the same set, both ways | `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends` (`crates/pulsus-schema/src/checks.rs`) |
 | the pinned settings reach the wire | `the_production_inserter_sends_the_landing_settings_on_the_wire`, `the_calls_settings_win_over_the_inserters_own` (`crates/pulsus-write/tests/landing_insert_settings.rs`) |
-| a missing name refuses before any DDL | `a_missing_server_name_refuses_init_mode_before_any_ddl` (`crates/pulsus-server/src/schema_init.rs`); live: `required_names_are_read_from_the_server`, `a_catalogue_the_user_cannot_read_is_unchecked_not_a_refusal` (`crates/pulsus-schema/tests/live_schema.rs`) |
+| a missing name refuses startup, before anything sends it | `the_name_check_runs_first_whether_or_not_ddl_is_skipped` (`crates/pulsus-server/src/serve.rs`); live: `required_names_are_read_from_the_server`, `a_catalogue_the_user_cannot_read_is_unchecked_not_a_refusal` (`crates/pulsus-schema/tests/live_schema.rs`) |
 | the landing table, its views, its TTL and the five windows exist as configured | live: `metric_landing_and_its_views_exist_after_init`, `an_existing_landing_table_is_adopted_by_a_rerun`, `run_init_installs_the_landing_ttl_at_the_configured_hours`, `dedup_settings_reach_the_landing_table_and_all_four_targets` (`crates/pulsus-schema/tests/live_schema.rs`) |
 | a push too large is refused whole, before any reservation | `a_push_at_a_ceiling_is_refused_whole`, `a_suppressed_copy_of_an_oversized_push_stores_nothing`, `the_push_too_large_message_names_the_size_and_both_limits`; `a_push_too_large_is_413_on_both_metric_transports` (`crates/pulsus-write/src/ingest/http.rs`) |
 | an empty push is a success and is charged for nothing | `an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits` |

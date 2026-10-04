@@ -447,17 +447,72 @@ round-1 finding #8) — user-supplied `livenessProbe`/`readinessProbe`/
 `startupProbe` values may override every field *except* the port, which
 this helper always forces to the single source of truth.
 */}}
+{{/*
+The schema parameters `schema/schema.sh` reads, as environment variables.
+The script is shell and cannot read `config.yaml`, so the init Job renders
+the same `.Values` the ConfigMap renders — one source of values, two
+renderings of it, which is what every other template here does too.
+
+`CLICKHOUSE_AUTH` and the password come from `pulsusdb.commonEnv`, which
+the init container includes as well.
+
+**A key absent from `pulsusdb.config` emits no variable**, so the script
+falls back to its own default rather than this template restating one.
+`the_script_renders_exactly_what_this_crate_renders` holds the script's
+defaults equal to the binary's.
+*/}}
+{{- define "pulsusdb.schemaEnv" -}}
+{{- $cfg := .Values.pulsusdb.config -}}
+{{- $clusterName := "" -}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") -}}
+{{- $clusterName = .Values.clickhouse.clusterName -}}
+{{- else if $cfg.cluster -}}
+{{- $clusterName = $cfg.cluster -}}
+{{- end -}}
+- name: CLICKHOUSE_SERVER
+  value: {{ include "pulsusdb.clickhouseServer" . | trim | quote }}
+- name: CLICKHOUSE_HTTP_PORT
+  value: {{ $cfg.clickhouse.http_port | quote }}
+- name: CLICKHOUSE_DB
+  value: {{ $cfg.clickhouse.database | quote }}
+{{- if ne $clusterName "" }}
+- name: PULSUS_CLUSTER
+  value: {{ $clusterName | quote }}
+- name: PULSUS_DIST_SUFFIX
+  value: {{ $cfg.dist_suffix | quote }}
+{{- end }}
+{{- range $key, $var := dict
+      "retention_days" "PULSUS_RETENTION_DAYS"
+      "storage_policy" "PULSUS_STORAGE_POLICY"
+      "log_rollup_resolution" "PULSUS_LOG_ROLLUP_RESOLUTION"
+      "metrics_landing_retention_hours" "PULSUS_METRICS_LANDING_RETENTION_HOURS"
+      "log_landing_retention_hours" "PULSUS_LOG_LANDING_RETENTION_HOURS"
+      "trace_landing_retention_hours" "PULSUS_TRACE_LANDING_RETENTION_HOURS"
+      "metrics_dedup_window" "PULSUS_METRICS_DEDUP_WINDOW"
+      "log_dedup_window" "PULSUS_LOG_DEDUP_WINDOW"
+      "trace_dedup_window" "PULSUS_TRACE_DEDUP_WINDOW" }}
+{{- with (index $cfg $key) }}
+- name: {{ $var }}
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
 {{- define "pulsusdb.container" -}}
 {{- $root := .root -}}
 {{- $port := include "pulsusdb.httpPort" $root | int -}}
 name: pulsusdb
 image: {{ include "pulsusdb.image" $root }}
 imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+{{- if eq .mode "init" }}
+command: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
+{{- else }}
 args:
   - --mode
   - {{ .mode }}
   - --config
   - /etc/pulsusdb/config.yaml
+{{- end }}
 {{- if ne .mode "init" }}
 ports:
   - name: http
@@ -466,6 +521,9 @@ ports:
 {{- end }}
 env:
   {{- include "pulsusdb.commonEnv" $root | nindent 2 }}
+{{- if eq .mode "init" }}
+  {{- include "pulsusdb.schemaEnv" $root | nindent 2 }}
+{{- end }}
 {{- if ne .mode "init" }}
 {{- $lp := deepCopy $root.Values.livenessProbe }}
 {{- $_ := set $lp.tcpSocket "port" $port }}

@@ -27,7 +27,6 @@
 #skip_ddl: false
 #retention_days: 7
 #storage_policy: null
-#rotation_interval: 1h
 #log_rollup_resolution: 5s
 #cluster: null                    # ClickHouse cluster name; enables distributed DDL
 #dist_suffix: _dist
