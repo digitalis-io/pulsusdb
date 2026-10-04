@@ -94,13 +94,12 @@ use std::path::{Path, PathBuf};
 use source_scan::{line_of, preprocess_views, rs_files_under, workspace_root};
 
 /// The fully-qualified spellings that compose a per-run ClickHouse name.
-/// Matched as literal text — see the boundary note on why the qualified
-/// form is required.
-const HELPER_CALLS: &[&str] = &[
-    "pulsus_testkit::test_db(",
-    "pulsus_testkit::test_ident(",
-    "pulsus_testkit::TestDb::new(",
-];
+/// Declared once in `tests/support/source_scan.rs`, because
+/// `live_db_uniqueness.rs` keys its own rule on the same list and a
+/// composer added to one copy and not the other leaves one of the two
+/// guards blind. See [`source_scan::COMPOSER_CALLS`] for the rest, and
+/// the boundary note below for why the qualified form is required.
+use source_scan::COMPOSER_CALLS as HELPER_CALLS;
 
 /// Databases a test may name directly, because no test in the tree
 /// creates or drops one: `default` and `system` are ClickHouse's own, and

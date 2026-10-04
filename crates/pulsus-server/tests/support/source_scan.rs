@@ -19,6 +19,38 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The fully-qualified spellings that compose a per-run ClickHouse object
+/// name — `pulsus_testkit::test_db` for a throwaway database,
+/// `pulsus_testkit::test_ident` for a table or `query_id` inside a
+/// database the test does not own, and `pulsus_testkit::TestDb::new` for a
+/// suite-wide one.
+///
+/// Matched as literal text, fully qualified: the qualified spelling is
+/// what makes "this really is the shared composer, not a local function of
+/// the same name" checkable without resolving names.
+/// `crates/pulsus-server/tests/live_db_uniqueness.rs` refuses a bare
+/// `test_db(…)` in a scanned file for that reason.
+///
+/// **One owning declaration.** Two guards key on this list —
+/// `live_db_naming.rs` ("every reserved name is composed by one of these")
+/// and `live_db_uniqueness.rs` ("every name these compose is distinct") —
+/// and a fourth composer added to one copy and not the other would leave
+/// the second guard silently blind to a whole class of names.
+pub const COMPOSER_CALLS: &[&str] = &[
+    "pulsus_testkit::test_db(",
+    "pulsus_testkit::test_ident(",
+    "pulsus_testkit::TestDb::new(",
+];
+
+/// [`COMPOSER_CALLS`] without the `pulsus_testkit::` qualifier, in the
+/// same order. `live_db_uniqueness.rs` uses these to find a composer call
+/// written unqualified, which its scan would otherwise never see.
+pub const COMPOSER_ITEMS: &[&str] = &["test_db(", "test_ident(", "TestDb::new("];
+
+/// The qualifier every composer call must carry, and the prefix each
+/// [`COMPOSER_CALLS`] entry is [`COMPOSER_ITEMS`]' entry plus.
+pub const COMPOSER_QUALIFIER: &str = "pulsus_testkit::";
+
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
