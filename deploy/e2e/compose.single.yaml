@@ -53,7 +53,10 @@ services:
       CLICKHOUSE_SERVER: "172.29.0.10"
     networks:
       pulsus-e2e-single:
-        ipv4_address: 172.29.0.13
+        # .10 to .16 are taken by this file's other services; a collision
+        # resets the colliding service's connections rather than failing to
+        # start, which cost one run.
+        ipv4_address: 172.29.0.17
     depends_on: [ clickhouse ]
 
   pulsusdb:

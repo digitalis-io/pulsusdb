@@ -36,7 +36,10 @@ services:
     entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
     networks:
       pulsus-schema-it:
-        ipv4_address: 172.28.0.21
+        # .11/.12 are the shards, .20 to .22 this file's other services; a
+        # collision resets the colliding service's connections rather than
+        # failing to start, which cost one run.
+        ipv4_address: 172.28.0.23
     environment:
       CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
       PULSUS_CLUSTER: pulsus_test_cluster
