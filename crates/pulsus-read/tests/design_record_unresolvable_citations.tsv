@@ -56,8 +56,6 @@ docs/query-lowering.md	search_plan.rs:1890	blank_target_line
 docs/query-lowering.md	sql.rs:774	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:181	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:185	ambiguous_basename
-docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	not_a_tracked_file
-docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	not_a_tracked_file
 docs/query-to-sql.md	exec.rs:119	ambiguous_basename
 docs/query-to-sql.md	exec.rs:124	ambiguous_basename
 docs/query-to-sql.md	exec.rs:125	ambiguous_basename

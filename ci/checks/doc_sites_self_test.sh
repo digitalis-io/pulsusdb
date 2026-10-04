@@ -419,8 +419,22 @@ if [ "$MERGEDREV" != "$(git -C "$REPO" rev-parse "$BASE^{commit}")" ]; then
     | LC_ALL=C sort -u > "$work/base.refs"
   git show "$MERGEDREV:$rewrite_file" | grep -oE '#[0-9]+' \
     | LC_ALL=C sort -u > "$work/merged.refs"
-  from_main=$(LC_ALL=C comm -13 "$work/base.refs" "$work/merged.refs" | head -1)
-  [ -n "$from_main" ] || fail "the merged head introduced no reference into $rewrite_file"
+  # **Skip the ones a `refs=` column already licenses for this file.** The
+  # column is per file, so a licensed number is allowed on a new line by
+  # design and this attack cannot catch it — picking one makes the attack
+  # test the licence rather than the rule. Measured: with `#112` licensed for
+  # `docs/schemas.md` (issue #618 added both the reference and its column),
+  # `head -1` chose `#112` and the attack reported itself uncaught against an
+  # UNCHANGED tree, on the base commit as much as on any branch.
+  awk -v f="$rewrite_file" '
+    $1 == "rewrite" && $2 ~ "^" f ":" && $3 ~ /^refs=/ {
+      sub(/^refs=/, "", $3)
+      n = split($3, r, ",")
+      for (i = 1; i <= n; i++) { print r[i] }
+    }' "$REPO/ci/checks/doc_sites.txt" | LC_ALL=C sort -u > "$work/licensed.refs"
+  from_main=$(LC_ALL=C comm -13 "$work/base.refs" "$work/merged.refs" \
+    | LC_ALL=C comm -23 - "$work/licensed.refs" | head -1)
+  [ -n "$from_main" ] || fail "the merged head introduced no unlicensed reference into $rewrite_file"
   awk -v n="$rewrite_start" -v ref="$from_main" \
     'NR == n { print $0 " (follow-up " ref ")"; next } { print }' \
     "$work/tree/$rewrite_file" > "$work/patched"

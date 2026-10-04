@@ -210,6 +210,8 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3119	crates/pulsus-read/src/traces/exec.rs	3119		prose	generator_settings	generator_settings
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1117	crates/pulsus-read/src/traces/search_plan.rs	1117		line	parts	Ok(parts.join(" AND "))
+docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	crates/pulsus-schema/src/checks.rs	29		line	minor	if (major, minor) < (26, 3) {
+docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/src/checks.rs	76		line	format	let sql = format!(
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),

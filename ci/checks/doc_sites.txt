@@ -23,6 +23,16 @@ rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#58
 # rather than appended to the row above, whose column records a different
 # decision.
 rewrite docs/schemas.md:1089-1089 refs=#112
+# `#556` is the base branch's own reference, read as new because this change
+# rewrote the line that carries it: §4.3's attribute-array paragraph said
+# "issue #556, migrations 49-59 — crates/pulsus-schema/src/catalog.rs, ids 49
+# to 59", and the migrations and that file are gone, so the clause became
+# "issue #556". `git show <base>:docs/schemas.md | grep -c '#556'` is 2. The
+# range is the frozen base's own 691-692 (the `# base` line above), which is
+# where that clause sits there. Same
+# class as the `#556` on `docs/architecture.md` the header names, and the
+# column is per file.
+rewrite docs/schemas.md:691-692 refs=#556
 rewrite docs/architecture.md:378-378 refs=#560
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
@@ -48,8 +58,16 @@ rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#5
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126
-leave crates/pulsus-schema/src/catalog.rs:195-195
-leave crates/pulsus-schema/src/catalog.rs:254-254
+# The two `crates/pulsus-schema/src/catalog.rs` rows are gone with the file.
+# A row needs its path in BOTH the merge base and the tree (`doc_sites.sh`,
+# the two checks either side of its `git show "$BASE:$file"`), so a site
+# whose file a change deletes cannot be expressed as a row at all — not even
+# as a `rewrite` one. They pinned `fingerprint UInt128 CODEC(Delta(8),
+# ZSTD(1))` and `INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0)
+# GRANULARITY 1`, which are now in `schema/schema.sql` and asserted live by
+# `a_fresh_database_creates_every_fingerprint_column_as_uint128`
+# (`crates/pulsus-schema/tests/live_schema.rs`) and by the token-index gates
+# in `crates/pulsus-read/tests/query_log_gates.rs`.
 # `#587` here is the other half of the same move, and also new: the comment
 # records where the `JSON` column's codec went. Same decision as
 # `crates/pulsus-clickhouse/src/lib.rs` above.
