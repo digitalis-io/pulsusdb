@@ -144,7 +144,7 @@ use source_scan::{
 /// silently returns no files — fails instead of passing green over zero
 /// call sites. Set below the counts this scan measures (278 files
 /// scanned, 574 creating calls in 77 files — no two of them sharing a
-/// spelling — 37 of the 574 composed at run time, and 32 quoted
+/// spelling — 37 of the 574 composed at run time, and 29 quoted
 /// look-alikes) with enough slack that ordinary deletions do not trip
 /// them.
 ///
@@ -158,8 +158,10 @@ const MIN_COMPOSED_NAMES: usize = 25;
 /// At least one composer call in the tree is quoted text rather than a
 /// call. Without this the look-alike discriminator could stop working and
 /// only the fixtures in [`finder_tests`] would notice. Deliberately 1
-/// against a measured 32: this is an existence floor, and the 32 are
-/// fixtures in three files, any of which may legitimately be rewritten.
+/// against a measured 29: this is an existence floor, and the 29 are
+/// fixtures and quoted constants in three files (18 here, 8 in
+/// `live_db_naming.rs`, 3 in `tests/support/source_scan.rs`), any of
+/// which may legitimately be rewritten.
 const MIN_QUOTED_LOOKALIKES: usize = 1;
 
 /// Floors for [`the_composer_is_reachable_only_from_the_scanned_test_tree`],
