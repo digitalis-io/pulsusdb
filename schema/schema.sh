@@ -184,6 +184,24 @@ send_file() {
     curl -sS --fail-with-body $auth "$url" --data-binary "@$1"
 }
 
+# **Wait for the server.** This runs as an init container and as a one-shot
+# compose service, neither of which is ordered against ClickHouse's own
+# readiness — the e2e harness in particular starts services by order alone,
+# and the first attempt met a port nothing was listening on yet (`curl` exit
+# 7). Polling here rather than asking every caller to order its graph.
+ready=0
+for _ in $(seq 1 60); do
+    if curl -sS -o /dev/null "$url" --data-binary 'SELECT 1' 2>/dev/null; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" = 0 ]; then
+    echo "schema.sh: clickhouse at $server:$port did not answer within 60s" >&2
+    exit 1
+fi
+
 version=$(ask 'SELECT version() FORMAT TSVRaw')
 major=${version%%.*}
 rest=${version#*.}
