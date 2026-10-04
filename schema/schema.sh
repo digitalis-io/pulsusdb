@@ -179,9 +179,19 @@ ask() {
     curl -sS --fail-with-body $auth "$url" --data-binary "$1"
 }
 
+# **Prints the statement and the server's answer when one fails.** The body
+# `--fail-with-body` writes is the only thing that says WHY, and sending it
+# to /dev/null left a Kubernetes Job whose whole log was
+# `curl: (22) The requested URL returned error: 500`.
 # shellcheck disable=SC2086
 send_file() {
-    curl -sS --fail-with-body $auth "$url" --data-binary "@$1"
+    if ! body=$(curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
+        echo "schema.sh: the server refused this statement:" >&2
+        cat "$1" >&2
+        echo "schema.sh: the server said:" >&2
+        printf '%s\n' "$body" >&2
+        return 1
+    fi
 }
 
 # **Wait for the server.** This runs as a Kubernetes Job and as a one-shot
@@ -285,7 +295,7 @@ ask "DROP DATABASE IF EXISTS \`$db\`${on_cluster} SYNC" >/dev/null
 
 count=0
 for f in "$tmp"/*.sql; do
-    send_file "$f" >/dev/null
+    send_file "$f"
     count=$((count + 1))
 done
 
