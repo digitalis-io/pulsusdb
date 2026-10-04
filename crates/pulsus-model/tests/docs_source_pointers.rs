@@ -449,10 +449,15 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
                 w.pinned,
                 BTreeSet::new(),
             ));
-            // A comma list's further numbers each sit at their own place.
-            for (n, at) in &w.also {
+            // A comma list's further numbers share the span of the
+            // pointer they continue, so the name before it owns them
+            // too: `/api/logs/v1/tail` ... (`logs_api/mod.rs:156,184`)
+            // names one subject and two lines, and giving the name to
+            // the first number alone left the second unconvictable —
+            // moving it to a wrong line was observed passing.
+            for (n, end) in &w.also {
                 found.push((
-                    (*at, *at),
+                    (w.at, *end),
                     Form::Continuation,
                     w.path.clone(),
                     *n,
@@ -546,21 +551,25 @@ fn settle(
         // pointer before it convicted `trace.rs:9-19` in
         // `docs/traceql-schema-migration.md` §12 on `admit_batch`, which
         // belongs to the `` `:344-586` `` after it across a line break.
-        let Some((i, d)) = spans
+        let reach: Vec<(usize, usize)> = spans
             .iter()
             .enumerate()
             .filter(|(_, sp)| sp.0 >= tok_span.1)
             .map(|(i, sp)| (i, gap(*tok_span, *sp)))
-            .min_by_key(|(_, d)| *d)
-        else {
+            .collect();
+        let Some(d) = reach.iter().map(|(_, d)| *d).min() else {
             continue;
         };
         if d > NAME_REACH {
             continue;
         }
-        match &owned[i] {
-            Some((had, _)) if *had <= d => {}
-            _ => owned[i] = Some((d, ns.clone())),
+        // Every pointer at that distance, not one of them: a comma
+        // list's numbers all start where the pointer they continue does.
+        for (i, _) in reach.iter().filter(|(_, dist)| *dist == d) {
+            match &owned[*i] {
+                Some((had, _)) if *had <= d => {}
+                _ => owned[*i] = Some((d, ns.clone())),
+            }
         }
     }
     for (i, (_, mut p)) in drafts.drain(..).enumerate() {
@@ -676,7 +685,8 @@ struct Written {
     last: u32,
     /// Byte offset just past the pointer's last digit.
     end: usize,
-    /// The further lines of a comma list, each with its own offset.
+    /// The further lines of a comma list, each with the offset just past
+    /// its last digit.
     also: Vec<(u32, usize)>,
     pinned: bool,
 }
@@ -720,9 +730,8 @@ fn written_out(line: &str) -> Vec<Written> {
             if more.is_empty() {
                 break;
             }
-            let at = j + 1;
             j += 1 + m;
-            also.push((more.parse().expect("digits"), at));
+            also.push((more.parse().expect("digits"), j));
         }
         out.push(Written {
             at: start,

@@ -158,7 +158,6 @@ docs/api.md	vendor/github.com/prometheus/prometheus/model/labels/matcher.go:81-1
 docs/api.md	vendor/github.com/prometheus/prometheus/model/labels/matcher.go:97-104	not_in_this_repository
 docs/api.md	vendor/github.com/prometheus/prometheus/util/strutil/quote.go:66-231	pinned_to_another_version
 docs/api.md	web/api/v1/api.go:2200-2230	not_in_this_repository
-docs/architecture.md	crates/pulsus-read/src/compile/fold.rs:532	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	ast.go:2225-2233	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	ast.go:729-741	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	compressed.go:108-110	not_in_this_repository
