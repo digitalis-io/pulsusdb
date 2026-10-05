@@ -2248,6 +2248,23 @@ async fn w4_a_service_name_that_is_not_a_non_empty_string_round_trips() {
         "`spans.service` renders every arm"
     );
 
+    // And `spans.service_type` names the arm beside it, in the same order
+    // (issue #589): the empty string is a string, which `service` alone
+    // cannot tell from an absent key.
+    assert_eq!(
+        live_texts(
+            &client,
+            "SELECT toString(service_type) AS s FROM spans FINAL ORDER BY service"
+        )
+        .await,
+        vec![
+            "string".to_string(),
+            "int".to_string(),
+            "string".to_string()
+        ],
+        "`spans.service_type` names every arm"
+    );
+
     // And the stored attributes keep the value for every arm BUT a
     // non-empty string: `None` is what `dynamicType` answers for a path the
     // JSON column does not hold.

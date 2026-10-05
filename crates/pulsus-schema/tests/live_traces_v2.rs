@@ -237,7 +237,7 @@ fn landing_span_block_sql(db: &str, received_ms: i64, base_ns: i64, count: u64) 
          (received_ms, row_kind, trace_id, span_id, parent_span_id, start_ns, duration_ns, \
           resource_id, name, kind, status_code, service, attrs, scope_attrs, \
           scope_schema_url, scope_dropped_attrs, scope_attrs_other, end_ns, entity_refs, \
-          events, links) \
+          service_type, events, links) \
          SELECT {received_ms}, 0, \
           reinterpretAsFixedString(toUInt128(0x1000 + number)), \
           reinterpretAsFixedString(toUInt64(0x2000 + number)), \
@@ -250,6 +250,7 @@ fn landing_span_block_sql(db: &str, received_ms: i64, base_ns: i64, count: u64) 
           concat('scope.blob.', leftPad(toString(number), 20, '0')), \
           toUInt64({base_ns} + number * 1000000 + 1000000), \
           concat('entity.refs.', leftPad(toString(number), 28, '0')), \
+          'string', \
           [( \
             toUInt64({base_ns} + number * 1000000 + 500000), 'exception', \
             CAST('{{\"exception%2Etype\":\"IOError\"}}' AS JSON), \
@@ -279,9 +280,9 @@ fn landing_span_sql(
     format!(
         "INSERT INTO {db}.trace_landing \
          (received_ms, row_kind, trace_id, span_id, parent_span_id, start_ns, duration_ns, \
-          resource_id, name, kind, status_code, service, attrs, scope_attrs) \
+          resource_id, name, kind, status_code, service, service_type, attrs, scope_attrs) \
          SELECT {received_ms}, 0, unhex('{trace_hex}'), unhex('{span_hex}'), \
-          toFixedString('', 8), {start_ns}, 1000000, 1, 'GET /api', 2, 0, 'checkout', \
+          toFixedString('', 8), {start_ns}, 1000000, 1, 'GET /api', 2, 0, 'checkout', 'string', \
           CAST('{{\"http%2Erequest%2Emethod\":\"GET\",\"http%2Eresponse%2Estatus_code\":200}}' AS JSON), \
           CAST('{{}}' AS JSON)"
     )
@@ -532,10 +533,11 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        50,
-        "the five target tables' own column count (27 + 9 + 8 + 2 + 4), so \
+        51,
+        "the five target tables' own column count (28 + 9 + 8 + 2 + 4), so \
          the codec check below has a non-empty domain. Issue #587 added \
-         four columns to `spans`, two to `traces` and one to `resources`"
+         four columns to `spans`, two to `traces` and one to `resources`; \
+         issue #589 added one to `spans`"
     );
     let bare = names(
         &client,
@@ -564,7 +566,7 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 50] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 51] = [
     ("resources", "day", "CODEC(ZSTD(1))"),
     ("resources", "resource_id", "CODEC(ZSTD(1))"),
     ("resources", "service", "CODEC(ZSTD(1))"),
@@ -600,6 +602,7 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 50] = [
     ("spans", "scope_dropped_attrs", "CODEC(ZSTD(1))"),
     ("spans", "scope_attrs_other", "CODEC(ZSTD(1))"),
     ("spans", "end_ns", "CODEC(Delta(8), ZSTD(1))"),
+    ("spans", "service_type", "CODEC(ZSTD(1))"),
     ("tag_names", "scope", "CODEC(ZSTD(1))"),
     ("tag_names", "key", "CODEC(ZSTD(1))"),
     ("tag_values", "scope", "CODEC(ZSTD(1))"),

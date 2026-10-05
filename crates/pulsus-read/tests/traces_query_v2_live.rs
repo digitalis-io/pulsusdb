@@ -47,16 +47,21 @@ use std::time::Duration as StdDuration;
 use futures::StreamExt;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{
-    AnyValue, ArrayValue, InstrumentationScope, KeyValue, any_value,
+    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_read::traces::spans::predicate::{compile_span_predicate, span_membership_sql};
+use pulsus_read::traces::spans::predicate::{
+    PredicateCtx, compile_span_leaf_in, compile_span_predicate, compile_span_predicate_in,
+    span_membership_sql,
+};
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
-use pulsus_traceql::{ComparisonOp, FieldExpr, SpansetExpr, SpansetFilter};
+use pulsus_traceql::{
+    AttrScope, ComparisonOp, Field, FieldExpr, SpansetExpr, SpansetFilter, Value,
+};
 use pulsus_write::{TraceLandingRow, parse_trace_landing};
 
 // ---------------------------------------------------------------------
@@ -1375,4 +1380,718 @@ fn fixture_t_trace_id_is_the_literal_the_cases_write() {
     assert_eq!(hex, T_TRACE_HEX);
     assert_eq!(idt("a1"), "0a1b2c3d4e5f60a1");
     assert_eq!(id61("0009"), "0000000000000009");
+}
+
+// =====================================================================
+// Issue #589 part 1 — resource and instrumentation conditions, and the
+// boolean operators
+// =====================================================================
+//
+// Every statement below is compiled with `compile_span_predicate_in`, so a
+// resource condition carries its subquery over the suite's own
+// `resources` table, bounded by the request window's days.
+
+/// The resource table every statement below reads, unqualified for
+/// [`SPANS_TABLE`]'s reason.
+const RESOURCES_TABLE: &str = "resources";
+
+fn ctx_of(w: WindowSql) -> PredicateCtx<'static> {
+    PredicateCtx {
+        window: w,
+        resources_table: RESOURCES_TABLE,
+    }
+}
+
+/// The ids a statement answers with, or the driver's error text. The error
+/// can arrive before the first row or in the middle of the stream, so both
+/// are read.
+async fn try_ids_of(client: &ChClient, sql: &str) -> Result<Vec<String>, String> {
+    let mut stream = client
+        .query_stream::<IdRow>(&sql.replace('?', "??"), &read_settings())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.map_err(|e| e.to_string())?.id);
+    }
+    Ok(out)
+}
+
+/// Compiles `query` in the window's context and issues the membership
+/// statement. A refusal is an `Err` naming it.
+async fn answer_in(client: &ChClient, w: WindowSql, query: &str) -> Result<Vec<String>, String> {
+    let predicate = compile_span_predicate_in(&body(query), &ctx_of(w))
+        .map_err(|e| format!("<refused: {e}>"))?;
+    try_ids_of(client, &span_membership_sql(SPANS_TABLE, w, &predicate)).await
+}
+
+/// A statement this suite expects to FAIL: `Ok(text)` is the driver's
+/// error, `Err(ids)` is the answer it gave instead.
+async fn answer_err(client: &ChClient, w: WindowSql, query: &str) -> Result<String, Vec<String>> {
+    match answer_in(client, w, query).await {
+        Ok(ids) => Err(ids),
+        Err(text) => Ok(text),
+    }
+}
+
+/// What one case must do: answer exactly these ids, or fail with an error
+/// containing this message.
+enum Want {
+    Ids(&'static [&'static str]),
+    Fails(&'static str),
+}
+
+struct CaseIn {
+    name: &'static str,
+    query: &'static str,
+    want: Want,
+}
+
+async fn run_cases_in(
+    client: &ChClient,
+    w: WindowSql,
+    cases: &[CaseIn],
+    expand: fn(&str) -> String,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for case in cases {
+        let predicate = compile_span_predicate_in(&body(case.query), &ctx_of(w))
+            .map(|p| p.sql().to_string())
+            .unwrap_or_else(|e| format!("<refused: {e}>"));
+        match &case.want {
+            Want::Ids(ids) => {
+                let want: Vec<String> = ids.iter().copied().map(expand).collect();
+                let got = answer_in(client, w, case.query).await;
+                if got.as_ref() != Ok(&want) {
+                    wrong.push(format!(
+                        "{}  {}\n   expected {want:?}\n   answered {got:?}\n   predicate: \
+                         {predicate}",
+                        case.name, case.query
+                    ));
+                }
+            }
+            Want::Fails(message) => match answer_err(client, w, case.query).await {
+                Ok(text) if text.contains(message) && !text.starts_with("<refused") => {}
+                other => wrong.push(format!(
+                    "{}  {}\n   expected the statement to fail with {message:?}\n   got \
+                     {other:?}\n   predicate: {predicate}",
+                    case.name, case.query
+                )),
+            },
+        }
+    }
+    wrong
+}
+
+// ---------------------------------------------------------------------
+// 10.1 — the §6.1 fixture
+// ---------------------------------------------------------------------
+
+const ALL_BUT_PAYMENT_A: &[&str] = &["0001", "0002", "0003", "0004", "0007", "0008", "0009"];
+
+const CASES_61_RESOURCES: &[CaseIn] = &[
+    CaseIn {
+        name: "F2",
+        query: r#"{ resource.service.name = "payment" }"#,
+        want: Want::Ids(&["0005", "0006"]),
+    },
+    CaseIn {
+        name: "F18",
+        query: r#"{ resource.k8s.pod.name = "payment-a" }"#,
+        want: Want::Ids(&["0005", "0006"]),
+    },
+    CaseIn {
+        name: "RS1",
+        query: r#"{ resource.k8s.pod.name != "payment-a" }"#,
+        want: Want::Ids(ALL_BUT_PAYMENT_A),
+    },
+    CaseIn {
+        name: "RS2 front.*",
+        query: r#"{ resource.k8s.pod.name =~ "front.*" }"#,
+        want: Want::Ids(&["0001", "0002", "0007"]),
+    },
+    CaseIn {
+        name: "RS2 a",
+        query: r#"{ resource.k8s.pod.name =~ "a" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "RS3 =~",
+        query: r#"{ resource.service.name =~ "pay.*" }"#,
+        want: Want::Ids(&["0005", "0006"]),
+    },
+    CaseIn {
+        name: "RS3 !=",
+        query: r#"{ resource.service.name != "payment" }"#,
+        want: Want::Ids(ALL_BUT_PAYMENT_A),
+    },
+    CaseIn {
+        name: "BO1",
+        query: r#"{ span.rpc.system = "grpc" && status = error }"#,
+        want: Want::Ids(&["0005"]),
+    },
+    CaseIn {
+        name: "BO2",
+        query: r#"{ name = "SELECT ledger" || kind = consumer }"#,
+        want: Want::Ids(&["0006", "0008", "0009"]),
+    },
+    CaseIn {
+        name: "BO3",
+        query: r#"{ name = "SELECT ledger" || status = error && duration > 300ms }"#,
+        want: Want::Ids(&["0001"]),
+    },
+    CaseIn {
+        name: "BO4 ||",
+        query: r#"{ true || !span.app.cache.hit }"#,
+        want: Want::Ids(ALL_61),
+    },
+    CaseIn {
+        name: "BO4 &&",
+        query: r#"{ false && !span.app.cache.hit }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BN1",
+        query: r#"{ !span.app.cache.hit }"#,
+        want: Want::Ids(&["0001"]),
+    },
+    CaseIn {
+        name: "BN2",
+        query: r#"{ !(span.app.cache.hit = true) }"#,
+        want: Want::Ids(ALL_61),
+    },
+    CaseIn {
+        name: "BN3",
+        query: r#"{ !(span.http.response.status_code = 500 && span.app.cache.hit = false) }"#,
+        want: Want::Ids(&[
+            "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009",
+        ]),
+    },
+    CaseIn {
+        name: "BN4",
+        query: r#"{ !(span.app.tags = "gold") }"#,
+        want: Want::Ids(&[
+            "0001", "0002", "0004", "0005", "0006", "0007", "0008", "0009",
+        ]),
+    },
+    CaseIn {
+        name: "BN5 = true",
+        query: r#"{ !span.app.cache.hit = true }"#,
+        want: Want::Ids(&["0001"]),
+    },
+    CaseIn {
+        name: "BN5 != true",
+        query: r#"{ !span.app.cache.hit != true }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BN6",
+        query: r#"{ !resource.service.name }"#,
+        want: Want::Fails("expression (!resource.service.name) expected a boolean"),
+    },
+];
+
+/// Section 10.1: resource conditions and the operators on the §6.1
+/// fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_answers_resources_and_operators_on_the_worked_fixture() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589_fixture61");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_61_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589-61-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 9,
+        "the §6.1 fixture seeds nine spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+
+    let wrong = run_cases_in(&client, w, CASES_61_RESOURCES, id61).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} §6.1 cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_61_RESOURCES.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 10.2 — fixture R
+// ---------------------------------------------------------------------
+
+/// `r1` to `r4`: span ids `00000000000000a1` to `…a4`.
+fn idr(short: &str) -> String {
+    format!("00000000000000a{}", short.trim_start_matches('r'))
+}
+
+/// One request: one resource, one scope, one span — the shape fixtures R
+/// and S both use.
+fn one_span_request(
+    resource_attrs: Vec<KeyValue>,
+    scope: InstrumentationScope,
+    span: Span,
+) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: resource_attrs,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope),
+                spans: vec![span],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Fixture R, section 9.1: four requests, one span each.
+fn fixture_r_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    let r_scope = |attributes: Vec<KeyValue>| InstrumentationScope {
+        name: "io.pulsus.r".to_string(),
+        version: "1.0".to_string(),
+        attributes,
+        dropped_attributes_count: 0,
+    };
+    let r_span = |n: u8, attributes: Vec<KeyValue>| {
+        span_of(
+            vec![0xee; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, 0xa0 + n],
+            Vec::new(),
+            "span",
+            1,
+            base_ns + i64::from(0xa0 + n) * 1_000_000,
+            1_000_000,
+            attributes,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    vec![
+        one_span_request(
+            vec![
+                kv("service.name", str_value("svc-r")),
+                kv("tier", int_value(3)),
+                kv("canary", bool_value(true)),
+                kv("region", str_value("eu")),
+            ],
+            r_scope(vec![
+                kv("otel.scope.build", str_value("release")),
+                kv("lib.flag", bool_value(true)),
+            ]),
+            r_span(1, vec![kv("app.flag", bool_value(false))]),
+        ),
+        one_span_request(
+            vec![
+                kv("service.name", int_value(12345)),
+                kv("tier", double_value(3.5)),
+                kv("canary", bool_value(false)),
+            ],
+            r_scope(vec![kv("otel.scope.build", str_value("debug"))]),
+            r_span(2, vec![kv("app.flag", bool_value(true))]),
+        ),
+        one_span_request(
+            vec![kv("service.name", str_value(""))],
+            r_scope(Vec::new()),
+            r_span(3, vec![kv("otel.scope.build", str_value("release"))]),
+        ),
+        one_span_request(
+            vec![kv("region", str_value("us"))],
+            r_scope(vec![kv("lib.n", int_value(7))]),
+            r_span(4, vec![kv("app.flag", str_value("false"))]),
+        ),
+    ]
+}
+
+const CASES_R: &[CaseIn] = &[
+    CaseIn {
+        name: "RR1 = 3",
+        query: r#"{ resource.tier = 3 }"#,
+        want: Want::Ids(&["r1"]),
+    },
+    CaseIn {
+        name: "RR1 > 3",
+        query: r#"{ resource.tier > 3 }"#,
+        want: Want::Ids(&["r2"]),
+    },
+    CaseIn {
+        name: "RR2 = false",
+        query: r#"{ resource.canary = false }"#,
+        want: Want::Ids(&["r2"]),
+    },
+    CaseIn {
+        name: "RR2 truthiness",
+        query: r#"{ resource.canary }"#,
+        want: Want::Ids(&["r1"]),
+    },
+    CaseIn {
+        name: "RR3 != nil",
+        query: r#"{ resource.canary != nil }"#,
+        want: Want::Ids(&["r1", "r2"]),
+    },
+    CaseIn {
+        name: "RR3 = nil",
+        query: r#"{ resource.region = nil }"#,
+        want: Want::Ids(&["r2", "r3"]),
+    },
+    CaseIn {
+        name: "RR4",
+        query: r#"{ resource.tier != 3 }"#,
+        want: Want::Ids(&["r2", "r3", "r4"]),
+    },
+    CaseIn {
+        name: "RR5",
+        query: r#"{ resource.service.name = 12345 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "RR7",
+        query: r#"{ resource.service.name != nil }"#,
+        want: Want::Ids(&["r1", "r2", "r3"]),
+    },
+    CaseIn {
+        name: "RR8",
+        query: r#"{ resource.service.name = nil }"#,
+        want: Want::Ids(&["r4"]),
+    },
+    CaseIn {
+        name: "IS1",
+        query: r#"{ instrumentation.otel.scope.build = "release" }"#,
+        want: Want::Ids(&["r1"]),
+    },
+    CaseIn {
+        name: "IS2",
+        query: r#"{ instrumentation.otel.scope.build != "release" }"#,
+        want: Want::Ids(&["r2", "r3", "r4"]),
+    },
+    CaseIn {
+        name: "IS3 truthiness",
+        query: r#"{ instrumentation.lib.flag }"#,
+        want: Want::Ids(&["r1"]),
+    },
+    CaseIn {
+        name: "IS3 > 5",
+        query: r#"{ instrumentation.lib.n > 5 }"#,
+        want: Want::Ids(&["r4"]),
+    },
+    CaseIn {
+        name: "IS3 != nil",
+        query: r#"{ instrumentation.lib.n != nil }"#,
+        want: Want::Ids(&["r4"]),
+    },
+    CaseIn {
+        name: "BO5 ||",
+        query: r#"{ true || !span.app.flag }"#,
+        want: Want::Fails("expression (!span.app.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "BO5 &&",
+        query: r#"{ false && !span.app.flag }"#,
+        want: Want::Fails("expression (!span.app.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "BN7",
+        query: r#"{ !resource.canary }"#,
+        want: Want::Ids(&["r2"]),
+    },
+    CaseIn {
+        name: "BN8",
+        query: r#"{ !instrumentation.lib.flag }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BN9 bare",
+        query: r#"{ !span.app.flag }"#,
+        want: Want::Fails("expression (!span.app.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "BN9 = 1",
+        query: r#"{ !span.app.flag = 1 }"#,
+        want: Want::Fails("expression (!span.app.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "BN10",
+        query: r#"{ !resource.tier }"#,
+        want: Want::Fails("expression (!resource.tier) expected a boolean"),
+    },
+];
+
+/// `RR-MISS`'s three queries, run after `r4`'s resource row is deleted.
+const CASES_R_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "RR-MISS !=",
+        query: r#"{ resource.region != "eu" }"#,
+        want: Want::Ids(&["r2", "r3", "r4"]),
+    },
+    CaseIn {
+        name: "RR-MISS =",
+        query: r#"{ resource.region = "us" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "RR-MISS = nil",
+        query: r#"{ resource.region = nil }"#,
+        want: Want::Ids(&["r2", "r3", "r4"]),
+    },
+];
+
+/// Deletes the resource row of the span `span_hex`, synchronously.
+async fn delete_resource_row_of(client: &ChClient, span_hex: &str) {
+    client
+        .execute(
+            &format!(
+                "ALTER TABLE {RESOURCES_TABLE} DELETE WHERE resource_id IN \
+                 (SELECT resource_id FROM {SPANS_TABLE} WHERE span_id = unhex('{span_hex}'))"
+            ),
+            &QuerySettings::new().set("mutations_sync", 2),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("delete the resource row");
+}
+
+/// Section 10.2: fixture R. `RR-MISS` runs last: it deletes a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_answers_resource_and_scope_values() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589_fixturer");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_r_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589-r-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 4,
+        "fixture R seeds four spans; nothing below can be read as a predicate result until \
+         this holds"
+    );
+
+    let mut wrong = run_cases_in(&client, w, CASES_R, idr).await;
+    delete_resource_row_of(&client, &idr("r4")).await;
+    wrong.extend(run_cases_in(&client, w, CASES_R_MISS, idr).await);
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-R cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_R.len() + CASES_R_MISS.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 10.4 — fixture S, the service-name cross product
+// ---------------------------------------------------------------------
+
+/// `s1` to `s10`: span ids `00000000000000b1` to `…b9`, then `…ba`.
+fn ids_n(n: u8) -> String {
+    format!("00000000000000{:02x}", 0xb0 + n)
+}
+
+fn bytes_value(bytes: &[u8]) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::BytesValue(bytes.to_vec())),
+    }
+}
+
+fn kvlist_value(pairs: Vec<KeyValue>) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::KvlistValue(KeyValueList {
+            values: pairs,
+        })),
+    }
+}
+
+/// Section 3.4's stored forms of `service.name`, `s1`–`s9` in order, each
+/// with whether it is a `StringValue`. `s10` carries no `service.name`.
+fn fixture_s_forms() -> Vec<(AnyValue, bool)> {
+    vec![
+        (str_value("svc"), true),
+        (str_value(""), true),
+        (bool_value(true), false),
+        (int_value(12345), false),
+        (double_value(1.5), false),
+        (str_array_value(&["svc"]), false),
+        (kvlist_value(vec![kv("child", str_value("x"))]), false),
+        (bytes_value(&[0xde, 0xad, 0xbe]), false),
+        (kvlist_value(Vec::new()), false),
+    ]
+}
+
+/// Fixture S, section 9.2: ten requests, one span each.
+fn fixture_s_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    let s_span = |n: u8| {
+        span_of(
+            vec![0xdd; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, 0xb0 + n],
+            Vec::new(),
+            "span",
+            1,
+            base_ns + i64::from(0xb0 + n) * 1_000_000,
+            1_000_000,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let mut out: Vec<ExportTraceServiceRequest> = fixture_s_forms()
+        .into_iter()
+        .zip(1u8..)
+        .map(|((value, _), n)| {
+            one_span_request(vec![kv("service.name", value)], scope(), s_span(n))
+        })
+        .collect();
+    out.push(one_span_request(
+        vec![kv("region", str_value("x"))],
+        scope(),
+        s_span(10),
+    ));
+    out
+}
+
+/// An RE2 pattern matching exactly `text`.
+fn re2_literal(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ServiceRow {
+    id: String,
+    service: String,
+}
+
+/// Section 10.4: every stored form of `service.name` × `= != =~ !~`, the
+/// literal being the form's own `service` text, with the expected answer
+/// computed by the loop. Then `SX-MISS`, which deletes a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_service_name_is_compared_only_as_a_string() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589_fixtures");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_s_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589-s-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 10,
+        "fixture S seeds ten spans; nothing below can be read as a predicate result until \
+         this holds"
+    );
+
+    // Each form's own `service` text, as the writer stored it.
+    let mut texts: Vec<ServiceRow> = Vec::new();
+    let sql = format!(
+        "SELECT lower(hex(span_id)) AS id, toString(service) AS service FROM {SPANS_TABLE} \
+         ORDER BY id"
+    );
+    let mut stream = client
+        .query_stream::<ServiceRow>(&sql, &read_settings())
+        .await
+        .expect("the service read");
+    while let Some(row) = stream.next().await {
+        texts.push(row.expect("decode"));
+    }
+    let all: Vec<String> = (1..=10).map(ids_n).collect();
+    assert_eq!(
+        texts.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        all,
+        "one row per form"
+    );
+
+    let svc = Field::Attribute {
+        scope: AttrScope::Resource,
+        key: "service.name".to_string(),
+    };
+    let ctx = ctx_of(w);
+    let ops = [
+        ComparisonOp::Eq,
+        ComparisonOp::Neq,
+        ComparisonOp::Re,
+        ComparisonOp::Nre,
+    ];
+    let mut wrong = Vec::new();
+    let mut cells = 0usize;
+    for ((_, is_string), (n, row)) in fixture_s_forms().into_iter().zip((1u8..).zip(&texts)) {
+        let this = ids_n(n);
+        assert_eq!(row.id, this);
+        for op in ops {
+            cells += 1;
+            let lit = match op {
+                ComparisonOp::Re | ComparisonOp::Nre => re2_literal(&row.service),
+                _ => row.service.clone(),
+            };
+            let positive = matches!(op, ComparisonOp::Eq | ComparisonOp::Re);
+            let want: Vec<String> = match (is_string, positive) {
+                (true, true) => vec![this.clone()],
+                (true, false) => all.iter().filter(|i| **i != this).cloned().collect(),
+                (false, true) => Vec::new(),
+                (false, false) => all.clone(),
+            };
+            let got = match compile_span_leaf_in(&svc, op, &Value::String(lit.clone()), &ctx) {
+                Ok(p) => try_ids_of(&client, &span_membership_sql(SPANS_TABLE, w, &p)).await,
+                Err(e) => Err(format!("<refused: {e}>")),
+            };
+            if got.as_ref() != Ok(&want) {
+                wrong.push(format!(
+                    "SX s{n} resource.service.name {} {lit:?}\n   expected {want:?}\n   \
+                     answered {got:?}",
+                    op_symbol(op)
+                ));
+            }
+        }
+    }
+    assert_eq!(cells, 9 * 4, "SX runs every form against every operator");
+
+    // `SX-MISS`: with `s1`'s resource row gone, no form reads it.
+    delete_resource_row_of(&client, &ids_n(1)).await;
+    let s1 = ids_n(1);
+    let s10 = ids_n(10);
+    let but = |x: &String| -> Vec<String> { all.iter().filter(|i| *i != x).cloned().collect() };
+    for (query, want) in [
+        (r#"{ resource.service.name = "svc" }"#, vec![s1.clone()]),
+        (r#"{ resource.service.name != "svc" }"#, but(&s1)),
+        (r#"{ resource.service.name =~ "svc" }"#, vec![s1.clone()]),
+        (r#"{ resource.service.name !~ "svc" }"#, but(&s1)),
+        (r#"{ resource.service.name != nil }"#, but(&s10)),
+    ] {
+        let got = answer_in(&client, w, query).await;
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!(
+                "SX-MISS {query}\n   expected {want:?}\n   answered {got:?}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-S checks answer something else:\n\n{}",
+        wrong.len(),
+        cells + 5,
+        wrong.join("\n\n")
+    );
 }

@@ -1005,6 +1005,12 @@ fn any_value_to_string(value: Option<&AnyValue>) -> String {
     }
 }
 
+/// STUB (issue #589 part 1, tests first).
+#[allow(dead_code)]
+fn service_arm(_value: Option<&AnyValue>) -> &'static str {
+    ""
+}
+
 /// The stored type discriminator for an OTLP `AnyValue` (issue #476) —
 /// the companion of [`any_value_to_string`], and deliberately written
 /// beside it so the two cannot classify the same `AnyValue` differently.
@@ -3686,6 +3692,7 @@ fn land_span(
         links,
         dropped_links: span.dropped_links_count,
         service: service.to_string(),
+        service_type: "",
         attrs: span_attrs.json,
         attrs_other: encode_attrs_other(span_attrs.other),
         dropped_attrs: span.dropped_attributes_count,
@@ -3844,6 +3851,30 @@ mod landing_tests {
     /// `k4` is the control — a bytes value still goes to `attrs_other` — and
     /// the scope attribute is what shows the drop is not the span scope's
     /// alone.
+    /// **`service_arm` names the `AnyValue` arm of the resource's
+    /// `service.name`** (issue #589): the seven arms by name, and `""` for
+    /// no key, for a value with no arm set and for the profiling string
+    /// reference, which the writer lands nowhere.
+    #[test]
+    fn service_arm_names_every_arm() {
+        let arms = [
+            (str_value("svc"), "string"),
+            (str_value(""), "string"),
+            (bool_value(false), "bool"),
+            (int_value(12345), "int"),
+            (double_value(1.5), "double"),
+            (array_value(vec![str_value("svc")]), "array"),
+            (kvlist_value(vec![("child", str_value("x"))]), "kvlist"),
+            (bytes_value(&[0xde, 0xad, 0xbe]), "bytes"),
+            (unset_value(), ""),
+            (strindex_value(1), ""),
+        ];
+        for (value, want) in &arms {
+            assert_eq!(service_arm(Some(value)), *want, "{value:?}");
+        }
+        assert_eq!(service_arm(None), "", "no `service.name` key");
+    }
+
     #[test]
     fn a_profiling_string_reference_lands_nowhere() {
         let span = span_of(vec![

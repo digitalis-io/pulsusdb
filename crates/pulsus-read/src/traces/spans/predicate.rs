@@ -64,6 +64,37 @@ impl SpanPredicate {
     pub fn sql(&self) -> &str {
         &self.0
     }
+
+    /// STUB (issue #589 part 1, tests first).
+    pub fn demand_messages(&self) -> &[String] {
+        &[]
+    }
+}
+
+/// What a predicate needs from the statement it will sit in.
+#[derive(Debug, Clone, Copy)]
+pub struct PredicateCtx<'a> {
+    pub window: WindowSql,
+    /// Unqualified in the live suite, `<db>.resources` in production.
+    pub resources_table: &'a str,
+}
+
+/// STUB (issue #589 part 1, tests first).
+pub fn compile_span_predicate_in(
+    expr: &FieldExpr,
+    _ctx: &PredicateCtx<'_>,
+) -> Result<SpanPredicate, PlanError> {
+    compile_span_predicate(expr)
+}
+
+/// STUB (issue #589 part 1, tests first).
+pub fn compile_span_leaf_in(
+    field: &Field,
+    op: ComparisonOp,
+    value: &Value,
+    _ctx: &PredicateCtx<'_>,
+) -> Result<SpanPredicate, PlanError> {
+    compile_span_leaf(field, op, value)
 }
 
 /// Compiles one spanset filter body.

@@ -378,6 +378,8 @@ pub struct LandingSpan {
     pub dropped_links: u32,
     /// The resource's `service.name`, rendered verbatim, `""` when absent.
     pub service: String,
+    /// STUB (issue #589 part 1, tests first).
+    pub service_type: &'static str,
     pub attrs: TraceJson,
     /// The protobuf serialization of an
     /// `opentelemetry.proto.common.v1.KeyValueList` carrying the keys whose
