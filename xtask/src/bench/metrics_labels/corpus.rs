@@ -169,19 +169,20 @@ struct MetricSeriesRow {
     unix_milli: i64,
 }
 
-/// One `metric_labels` row: a series' label set, once per fingerprint.
+/// One `metric_labels` row: a series' own label row, keyed
+/// `(metric_name, fingerprint)` (issue #623).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MetricLabelsRow {
+    metric_name: String,
     fingerprint: Fingerprint,
     labels: String,
 }
 
-/// The label rows, once per fingerprint. Single-node they go into
-/// `metric_labels`. With `--dist` the activity rows are placed by the
-/// routing wrapper's key, which a label row keyed by the fingerprint alone
-/// cannot follow, so every shard is given every label set — the superset a
-/// shard-local read can always find its series' labels in. In production
-/// the view writes both rows on the node that received the push.
+/// The label rows, one per series. Single-node they go into
+/// `metric_labels`. With `--dist` every shard is given every label row —
+/// the superset a shard-local read can always find its series' own row in.
+/// In production the view writes both rows on the node that received the
+/// push.
 async fn insert_label_sets(
     client: &ChClient,
     spec: &MetricsCorpusSpec,
@@ -401,6 +402,7 @@ pub async fn load(
                 unix_milli: bucket,
             });
             label_rows.push(MetricLabelsRow {
+                metric_name: metric_name.clone(),
                 fingerprint,
                 labels: labels_json,
             });

@@ -157,12 +157,13 @@ TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 42
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{on_cluster}}
 (
+    metric_name LowCardinality(String),
     fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
     labels String CODEC(ZSTD(5))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_labels', '{replica}')
-ORDER BY fingerprint
+ORDER BY (metric_name, fingerprint)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -610,7 +611,7 @@ TTL toDateTime(least((toUInt32(day) * 86400) + ({{retention_days}} * 86400), 429
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_hist_samples', cityHash64(metric_name, fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_labels
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_labels', cityHash64(fingerprint));
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_labels', cityHash64(metric_name, fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(metric_name, fingerprint));
@@ -723,6 +724,7 @@ WHERE kind = 1;
 DROP VIEW IF EXISTS {{db}}.metric_labels_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels
 AS SELECT
+    metric_name AS metric_name,
     fingerprint AS fingerprint,
     labels AS labels
 FROM {{db}}.metric_landing

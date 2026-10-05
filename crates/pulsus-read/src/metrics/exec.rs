@@ -48,10 +48,7 @@ use pulsus_promql::{
 use super::compile;
 use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
 use super::matcher::{DataWindow, DiscoveryFilter};
-use super::sample_rows::{
-    HistSampleRow, MultiHistSampleRow, MultiSampleRow, MultiUnionSampleRow, SampleRow,
-    UnionSampleRow,
-};
+use super::sample_rows::{HistSampleRow, MultiHistSampleRow, MultiSampleRow, SampleRow};
 use super::sample_sql;
 use crate::compile::fold::Pred;
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -91,9 +88,9 @@ pub struct MetricsConfig {
     /// (issue #32) the discovery endpoints' own `metric_series`-backed
     /// query ([`super::sql::discovery_query`]).
     pub series_table: String,
-    /// `metric_labels` — one row per label set, keyed by fingerprint (issue
-    /// #623). Every read that needs a series' labels takes them from here;
-    /// `_dist`-aware like `series_table`.
+    /// `metric_labels` — one row per series, keyed `(metric_name,
+    /// fingerprint)` (issue #623). Every read that needs a series' labels
+    /// takes them from its own row here; `_dist`-aware like `series_table`.
     pub labels_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
@@ -379,7 +376,6 @@ impl Drop for ProbeGuard<'_> {
 /// together. A path that sent one only after the other finished parks its
 /// first for the whole wait and records one.
 #[derive(Debug)]
-#[allow(dead_code)] // STUB (issue #623, tests first)
 pub struct StatementProbe {
     in_flight: std::sync::atomic::AtomicUsize,
     max_in_flight: std::sync::atomic::AtomicUsize,
@@ -399,9 +395,40 @@ impl StatementProbe {
         })
     }
 
+    /// Counts this statement in, records the high-water mark, then waits
+    /// until a second statement has entered — at most [`Self::WAIT`], the
+    /// one bounded wait. The guard counts it out when the statement ends.
+    pub(crate) async fn enter(&self) -> StatementGuard<'_> {
+        let n = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_in_flight
+            .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        self.entered.send_modify(|entered| *entered += 1);
+        let mut rx = self.entered.subscribe();
+        // `wait_for` reads the retained count first, so the second
+        // statement passes at once; a timeout only ends the wait.
+        let _ = tokio::time::timeout(Self::WAIT, rx.wait_for(|entered| *entered >= 2)).await;
+        StatementGuard(self)
+    }
+
     /// The most statements that were in flight at once.
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// RAII guard returned by [`StatementProbe::enter`]; decrements
+/// `in_flight` when the statement ends.
+#[derive(Debug)]
+pub struct StatementGuard<'a>(&'a StatementProbe);
+
+impl Drop for StatementGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -864,9 +891,15 @@ impl MetricsEngine {
                             });
                         }
                     }
+                    let hist_sqls = build_hist_chunk_sqls(
+                        &self.config.hist_samples_table,
+                        metric_name,
+                        fps.clone(),
+                        lower_excl,
+                        upper_incl,
+                    );
                     let sqls = build_chunk_sqls(
                         &self.config.samples_table,
-                        &self.config.hist_samples_table,
                         metric_name,
                         fps,
                         lower_excl,
@@ -890,8 +923,15 @@ impl MetricsEngine {
                         // M7-A5a: the complementary histogram read appears in
                         // the explain trace beside the float read (built once,
                         // synchronously — never drifts from what executes).
+                        if let Some(first) = hist_sqls.first() {
+                            e.push("hist_sample_fetch", first.clone(), None);
+                        }
                     }
-                    SelectorFetchPlan::Chunks { sqls, labels_by_fp }
+                    SelectorFetchPlan::Chunks {
+                        sqls,
+                        hist_sqls,
+                        labels_by_fp,
+                    }
                 }
                 LabelledResolution::SqlFallback { sql, .. } => {
                     if explain.is_some() {
@@ -907,6 +947,12 @@ impl MetricsEngine {
                     }
                     let fetch_sql = sample_sql::sample_fetch_subquery(
                         &self.config.samples_table,
+                        metric_name,
+                        &sql,
+                        lower_excl,
+                        upper_incl,
+                    );
+                    let hist_sql = sample_sql::hist_sample_fetch_subquery(
                         &self.config.hist_samples_table,
                         metric_name,
                         &sql,
@@ -915,9 +961,11 @@ impl MetricsEngine {
                     );
                     if let Some(e) = explain.as_mut() {
                         e.push("sample_fetch", fetch_sql.clone(), None);
+                        e.push("hist_sample_fetch", hist_sql.clone(), None);
                     }
                     SelectorFetchPlan::Fallback {
                         sql: fetch_sql,
+                        hist_sql,
                         // Issue #82 (retroactive re-review, Finding 1):
                         // the degraded-path cap probe, built now (a pure
                         // function of the already-computed series-
@@ -1148,24 +1196,26 @@ impl MetricsEngine {
             .collect();
         fps.sort_unstable();
         fps.dedup();
+        // Labels per resolved `(metric_name, fingerprint)` pair. The flat
+        // IN×IN fetch can also return a pair the cache did not resolve (a
+        // series registered under a second name after the last sweep); its
+        // labels are looked up by the pair after the fetch (issue #623),
+        // never borrowed from another name's row.
         let mut labels_by: HashMap<(String, Fingerprint), LabelSet> = HashMap::new();
-        // Cross-pair hydration source (code review round 1, finding 1):
-        // `metric_fingerprint` excludes `__name__` (docs/schemas.md §2.1),
-        // so a fingerprint's label set is name-invariant — any resolved
-        // `(name', fp)` entry carries the exact labels of every genuine
-        // `(name, fp)` cross-pair the flat IN×IN fetch may return that
-        // the cache didn't resolve (a series registered under a second
-        // name inside the sanctioned post-sweep recency gap).
-        let mut labels_by_fp: HashMap<Fingerprint, LabelSet> = HashMap::new();
         for g in groups {
             for (fp, labels) in g.series {
-                labels_by_fp.entry(fp).or_insert_with(|| labels.clone());
                 labels_by.insert((g.metric_name.clone(), fp), labels);
             }
         }
 
         let sql = sample_sql::sample_fetch_multi(
             &self.config.samples_table,
+            &names,
+            &sql_literals(&fps),
+            lower_excl,
+            upper_incl,
+        );
+        let hist_sql = sample_sql::hist_sample_fetch_multi(
             &self.config.hist_samples_table,
             &names,
             &sql_literals(&fps),
@@ -1174,6 +1224,7 @@ impl MetricsEngine {
         );
         if let Some(e) = explain.as_mut() {
             e.push("sample_fetch", sql.clone(), None);
+            e.push("hist_sample_fetch", hist_sql.clone(), None);
         }
         // Issue #548: the fan-out's own predicate, built only under the
         // explain header.
@@ -1187,8 +1238,8 @@ impl MetricsEngine {
         Ok((
             SelectorFetchPlan::Multi {
                 sql,
+                hist_sql,
                 labels_by,
-                labels_by_fp,
             },
             read,
         ))
@@ -1223,28 +1274,38 @@ impl MetricsEngine {
         };
         match fetch_plan {
             SelectorFetchPlan::Empty => Ok(Vec::new()),
-            SelectorFetchPlan::Chunks { sqls, labels_by_fp } => {
-                if sqls.is_empty() {
+            SelectorFetchPlan::Chunks {
+                sqls,
+                hist_sqls,
+                labels_by_fp,
+            } => {
+                if sqls.is_empty() && hist_sqls.is_empty() {
                     return Ok(Vec::new());
                 }
                 let metric_name = concrete_name(sel)?;
-                // Issue #623: each chunk is one statement over both sample
-                // tables; its rows split back into the float and histogram
-                // streams the merge takes.
-                let rows = fetch_all_concurrently(sqls, |sql| {
-                    self.fetch_sample_rows::<UnionSampleRow>(sql, budget)
-                })
+                // M7-A5a: dispatch the float and complementary histogram
+                // chunk reads CONCURRENTLY (A1 v5 latency-hiding — the
+                // single-type complementary read is zero-granule but must
+                // not add a serial round trip).
+                let (rows, hist_rows) = fetch_dual_concurrently(
+                    fetch_all_concurrently(sqls, |sql| {
+                        self.fetch_sample_rows::<SampleRow>(sql, budget)
+                    }),
+                    fetch_all_concurrently(hist_sqls, |sql| {
+                        self.fetch_sample_rows::<HistSampleRow>(sql, budget)
+                    }),
+                )
                 .await?;
-                let (rows, hist_rows) = UnionSampleRow::split(rows);
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
             }
             SelectorFetchPlan::Fallback {
                 sql,
+                hist_sql,
                 info_series_probe,
             } => {
                 // Issue #82 (retroactive re-review, Finding 1): run the
                 // bounded cardinality probe FIRST and reject over-cap
-                // BEFORE `sql` (the real, unbounded sample
+                // BEFORE `sql`/`hist_sql` (the real, unbounded sample
                 // fetch) ever executes — bounded before materialization,
                 // not a post-fetch backstop.
                 if let Some(probe_sql) = info_series_probe {
@@ -1269,9 +1330,12 @@ impl MetricsEngine {
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
                 );
-                let rows: Vec<UnionSampleRow> =
-                    self.fetch_rows_with(sql, &settings, Some(budget)).await?;
-                let (rows, hist_rows) = UnionSampleRow::split(rows);
+                let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
+                    fetch_dual_concurrently(
+                        self.fetch_rows_with(sql, &settings, Some(budget)),
+                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
+                    )
+                    .await?;
                 if rows.is_empty() && hist_rows.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1304,12 +1368,39 @@ impl MetricsEngine {
             }
             SelectorFetchPlan::Multi {
                 sql,
-                labels_by,
-                labels_by_fp,
+                hist_sql,
+                mut labels_by,
             } => {
-                let rows: Vec<MultiUnionSampleRow> = self.fetch_sample_rows(sql, budget).await?;
-                let (rows, hist_rows) = MultiUnionSampleRow::split(rows);
-                group_merged_multi_rows(rows, hist_rows, &labels_by, &labels_by_fp)
+                let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
+                    fetch_dual_concurrently(
+                        self.fetch_sample_rows(sql, budget),
+                        self.fetch_sample_rows(hist_sql, budget),
+                    )
+                    .await?;
+                // Issue #623: a returned pair the cache did not resolve is
+                // looked up by the pair, so it carries its own label row; a
+                // pair with none is dropped by the grouping.
+                let mut unresolved: Vec<(String, FpLiteral)> = rows
+                    .iter()
+                    .map(|r| (&r.metric_name, r.fingerprint))
+                    .chain(hist_rows.iter().map(|r| (&r.metric_name, r.fingerprint)))
+                    .filter(|(name, fp)| !labels_by.contains_key(&((*name).clone(), *fp)))
+                    .map(|(name, fp)| (name.clone(), fp.sql_literal()))
+                    .collect();
+                unresolved.sort();
+                unresolved.dedup();
+                if !unresolved.is_empty() {
+                    let sql =
+                        super::sql::series_labels_by_pairs(&self.config.labels_table, &unresolved);
+                    let found: Vec<super::rows::PairLabelsRow> = self.fetch_rows(sql).await?;
+                    for r in found {
+                        labels_by.insert(
+                            (r.metric_name, r.fingerprint),
+                            crate::canonical_labels::parse_canonical_label_set(&r.labels),
+                        );
+                    }
+                }
+                group_merged_multi_rows(rows, hist_rows, &labels_by)
             }
         }
     }
@@ -1419,6 +1510,12 @@ impl MetricsEngine {
         settings: &QuerySettings,
         budget: Option<&SampleBudget>,
     ) -> Result<Vec<R>, ReadError> {
+        // Issue #623 TEST SEAM: every sample statement passes here with a
+        // budget. `None` in production: one `Option` branch.
+        let _statement = match (&self.statement_probe, budget) {
+            (Some(p), Some(_)) => Some(p.enter().await),
+            _ => None,
+        };
         self.dispatch.fetch_rows_with(sql, settings, budget).await
     }
 
@@ -1972,8 +2069,9 @@ const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 /// future non-co-located subquery silently return wrong shard-local results
 /// instead of failing loud.
 fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
-    // The label join's build side is one row per label set; the plain hash
-    // join, for `refresh::sweep_settings`' reason.
+    // The label joins' build side is the scoped metrics' label rows; the
+    // plain hash join, for `refresh::sweep_settings`' reason. The unnamed
+    // names join sets its own algorithm in its text.
     let base = metrics_read_settings(read_max_memory_bytes).set("join_algorithm", "hash");
     if distributed {
         base.set("distributed_product_mode", "local")
@@ -2089,22 +2187,27 @@ struct ProbeSpec {
 /// in phase 2 without re-deriving anything.
 enum SelectorFetchPlan {
     /// Cache-hit path: one `sample_fetch` SQL string per chunk (already
-    /// ascending-fingerprint-sorted — see [`build_chunk_sqls`]), each one
-    /// statement over both sample tables (issue #623), plus the labels the
-    /// cache already resolved.
+    /// ascending-fingerprint-sorted — see [`build_chunk_sqls`]), plus the
+    /// paired complementary `metric_hist_samples` chunk SQLs (M7-A5a
+    /// dual-read — same chunker/window/PK-prune, order-locked to `sqls`),
+    /// plus the labels the cache already resolved.
     Chunks {
         sqls: Vec<String>,
+        hist_sqls: Vec<String>,
         labels_by_fp: HashMap<Fingerprint, LabelSet>,
     },
     /// `SqlFallback` path: the single nested-subquery `sample_fetch` SQL
-    /// over both sample tables — labels are hydrated afterward from every
-    /// fingerprint it returns, float or histogram.
+    /// and its paired complementary `metric_hist_samples` subquery fetch
+    /// (M7-A5a) — labels are hydrated afterward from the UNION of
+    /// fingerprints both reads return (a histogram-only fingerprint must
+    /// still hydrate labels).
     Fallback {
         sql: String,
+        hist_sql: String,
         /// Issue #82 (retroactive re-review, Finding 1): `Some` only for
         /// an `info_family` selector — the `LIMIT cap+1`-bounded
         /// series-selection probe [`MetricsEngine::execute_fetch_plan`]
-        /// runs and counts BEFORE issuing `sql`, so an
+        /// runs and counts BEFORE issuing `sql`/`hist_sql`, so an
         /// over-cap `*_info` fetch never materializes a single sample
         /// row. `None` for an ordinary selector, which always fetches
         /// the complete (unbounded) result.
@@ -2113,16 +2216,16 @@ enum SelectorFetchPlan {
     /// Issue #85 (M6-08c): the name-less/regex-`__name__` fan-out — one
     /// flat `metric_name IN (…) AND fingerprint IN (…)` fetch, labels
     /// pre-resolved per `(metric_name, fingerprint)` (a fingerprint can
-    /// exist under several metric names, so the map key must carry both).
-    /// `labels_by_fp` is the cross-pair hydration source (code review
-    /// round 1, finding 1): the IN×IN can return a genuine pair the cache
-    /// didn't resolve (post-sweep recency gap); its labels are recovered
-    /// from the fingerprint's name-invariant label set, never fabricated
-    /// empty — see [`group_multi_rows`].
+    /// exist under several metric names, so the map key must carry both),
+    /// plus the paired complementary `metric_hist_samples` fetch (M7-A5a).
+    /// The IN×IN can return a genuine pair the cache didn't resolve
+    /// (post-sweep recency gap); its labels are looked up by the pair after
+    /// the fetch (issue #623), never borrowed from another name's label row
+    /// and never fabricated empty — see [`group_multi_rows`].
     Multi {
         sql: String,
+        hist_sql: String,
         labels_by: HashMap<(String, Fingerprint), LabelSet>,
-        labels_by_fp: HashMap<Fingerprint, LabelSet>,
     },
     /// Provably-empty selection with no fetch at all: a concrete-name
     /// selector whose `name_matchers` exclude its own name (issue #85),
@@ -2274,7 +2377,6 @@ impl Drop for CancelOnDrop {
 /// starts.
 fn build_chunk_sqls(
     samples_table: &str,
-    hist_samples_table: &str,
     metric_name: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
@@ -2286,7 +2388,6 @@ fn build_chunk_sqls(
         .map(|chunk| {
             sample_sql::sample_fetch(
                 samples_table,
-                hist_samples_table,
                 metric_name,
                 chunk,
                 lower_excl_ms,
@@ -2330,6 +2431,34 @@ fn build_grouped_sqls(
     out
 }
 
+/// [`build_chunk_sqls`]'s M7-A5a histogram counterpart — same sort, same
+/// chunker (`CHUNK_THRESHOLD`), same window; only the SELECT column list
+/// and table name differ ([`sample_sql::hist_sample_fetch`]). Rendered over
+/// the SAME fingerprint set so the paired chunk SQLs are index-aligned
+/// (both prune the identical granules; the complementary read is zero-
+/// granule for a pure-float fingerprint — the EXPLAIN gate).
+fn build_hist_chunk_sqls(
+    hist_samples_table: &str,
+    metric_name: &str,
+    mut fps: Vec<Fingerprint>,
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+) -> Vec<String> {
+    fps.sort_unstable();
+    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
+        .into_iter()
+        .map(|chunk| {
+            sample_sql::hist_sample_fetch(
+                hist_samples_table,
+                metric_name,
+                chunk,
+                lower_excl_ms,
+                upper_incl_ms,
+            )
+        })
+        .collect()
+}
+
 /// Fetches every already-built SQL string concurrently via `join_all`,
 /// concatenating results in **dispatch order** — `join_all` returns
 /// results in **input order**, regardless of which future actually
@@ -2349,6 +2478,24 @@ where
         rows.extend(r?);
     }
     Ok(rows)
+}
+
+/// M7-A5a: dispatches the float and complementary histogram reads
+/// CONCURRENTLY and returns both results, mirroring the injectable
+/// [`fetch_all_concurrently`] seam. Both futures are handed to
+/// [`futures::future::join`], so both are in flight before either is
+/// awaited — the A1 v5 latency-hiding contract (a single-type series' zero-
+/// granule complementary read must not add a serial round trip). The
+/// AC7b rendezvous-mock gate (`fetch_dual_concurrently_dispatches_both_*`)
+/// proves the two are simultaneously in flight: a serial dispatch would
+/// deadlock the two-sided barrier and trip the `tokio::time::timeout`.
+async fn fetch_dual_concurrently<FF, HF, T, U>(float: FF, hist: HF) -> Result<(T, U), ReadError>
+where
+    FF: Future<Output = Result<T, ReadError>>,
+    HF: Future<Output = Result<U, ReadError>>,
+{
+    let (float_res, hist_res) = futures::future::join(float, hist).await;
+    Ok((float_res?, hist_res?))
 }
 
 /// Decodes a `metric_hist_samples` row's value columns into a
@@ -2730,6 +2877,10 @@ fn merge_series_with<F: FloatPoint, H: HistPoint>(
 /// `metric_name` is the metric-scoped fetch's one concrete name, stamped
 /// onto every series' per-series name channel (issue #85 —
 /// `FetchedSeries::metric_name`).
+///
+/// **A fingerprint with no label row of its own yields no series** (issue
+/// #623): its rows are skipped, never answered with an empty label set,
+/// which would merge distinct series into one.
 fn group_rows(
     rows: Vec<SampleRow>,
     labels_by_fp: &HashMap<Fingerprint, LabelSet>,
@@ -2737,23 +2888,27 @@ fn group_rows(
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     let mut run = RunDedup::default();
+    let mut current: Option<Fingerprint> = None;
+    // Whether `current` produced an output series (false = skipped, so its
+    // remaining rows must not attach to an earlier fingerprint's series).
+    let mut current_kept = false;
     for row in rows {
-        match out.last_mut() {
+        if current == Some(row.fingerprint) {
             // Issue #494 §7: two rows identical in
             // `(fingerprint, unix_milli, value bits)` are one sample.
-            Some(last) if last.fingerprint == row.fingerprint => {
+            if current_kept && let Some(last) = out.last_mut() {
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
-            _ => {
-                run.end_run();
-                let labels = labels_by_fp
-                    .get(&row.fingerprint)
-                    .cloned()
-                    .unwrap_or_default();
+            continue;
+        }
+        run.end_run();
+        current = Some(row.fingerprint);
+        current_kept = match labels_by_fp.get(&row.fingerprint) {
+            Some(labels) => {
                 out.push(FetchedSeries {
                     fingerprint: row.fingerprint,
                     metric_name: Some(metric_name.to_string()),
-                    labels: to_promql_labels(&labels),
+                    labels: to_promql_labels(labels),
                     samples: Vec::new(),
                     start_ts: None,
                 });
@@ -2761,8 +2916,10 @@ fn group_rows(
                 // starts is one the next row can be read against.
                 let last = out.last_mut().expect("just pushed");
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
+                true
             }
-        }
+            None => false,
+        };
     }
     out
 }
@@ -2774,22 +2931,15 @@ fn group_rows(
 /// the per-series channel. Order stays deterministic (sorted names, then
 /// ascending fingerprints) without any re-sort here.
 ///
-/// **Labels are never fabricated (code review round 1, finding 1):** a
-/// pair absent from `labels_by` is a genuine cross-pair the cache didn't
-/// resolve (a series registered under a second metric name after the last
-/// sweep — the sanctioned recency gap). Its labels are hydrated from
-/// `labels_by_fp`: `metric_fingerprint` excludes `__name__`, so the
-/// fingerprint's label set is name-invariant and already known from the
-/// resolved sibling pair — and those labels passed the selector's
-/// matchers (matchers apply uniformly across names, the v3 Δ2 soundness
-/// argument), so the pair is a legitimate member of the matched set. A
-/// fingerprint absent from *both* maps is structurally impossible (the
-/// `IN` list is built from the resolved set) — skipped for totality, so
-/// an empty-labels series can never reach the evaluator.
+/// **Labels are never fabricated or borrowed (issue #623):** `labels_by`
+/// holds the pairs the cache resolved plus the pairs the fetch returned
+/// that it did not (a series registered under a second metric name after
+/// the last sweep), looked up by the pair. A pair with no label row of its
+/// own is skipped, so an empty-labels series never reaches the evaluator
+/// and another name's label row is never taken for it.
 fn group_multi_rows(
     rows: Vec<MultiSampleRow>,
     labels_by: &HashMap<(String, Fingerprint), LabelSet>,
-    labels_by_fp: &HashMap<Fingerprint, LabelSet>,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     let mut run = RunDedup::default();
@@ -2811,10 +2961,7 @@ fn group_multi_rows(
         }
         run.end_run();
         let key = (row.metric_name, row.fingerprint);
-        let labels = labels_by
-            .get(&key)
-            .or_else(|| labels_by_fp.get(&key.1))
-            .cloned();
+        let labels = labels_by.get(&key).cloned();
         current_kept = match labels {
             Some(labels) => {
                 out.push(FetchedSeries {
@@ -2874,8 +3021,12 @@ fn group_merged_rows(
         while hi < hist.len() && hist[hi].fingerprint == next_fp {
             hi += 1;
         }
+        // Issue #623: a fingerprint with no label row of its own yields no
+        // series (as in `group_rows`).
+        let Some(labels) = labels_by_fp.get(&next_fp).cloned() else {
+            continue;
+        };
         let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
-        let labels = labels_by_fp.get(&next_fp).cloned().unwrap_or_default();
         out.push(FetchedSeries {
             fingerprint: next_fp,
             metric_name: Some(metric_name.to_string()),
@@ -2890,19 +3041,17 @@ fn group_merged_rows(
 /// M7-A5a: [`group_multi_rows`]'s dual-read counterpart. Both reads arrive
 /// `ORDER BY metric_name, fingerprint, unix_milli`; a two-cursor walk over
 /// consecutive `(metric_name, fingerprint)` groups 2-way merges each
-/// series (histogram-wins). The label hydration / cross-pair skip rules are
-/// [`group_multi_rows`]'s exactly (an unresolved cross-pair hydrates from
-/// the fingerprint's name-invariant labels; a wholly-unknown pair is
-/// skipped). When `hist` is empty this reduces to the float-only
-/// [`group_multi_rows`] fast path (byte-identical).
+/// series (histogram-wins). The label rule is [`group_multi_rows`]'s
+/// exactly (a pair with no label row of its own is skipped). When `hist` is
+/// empty this reduces to the float-only [`group_multi_rows`] fast path
+/// (byte-identical).
 fn group_merged_multi_rows(
     float: Vec<MultiSampleRow>,
     hist: Vec<MultiHistSampleRow>,
     labels_by: &HashMap<(String, Fingerprint), LabelSet>,
-    labels_by_fp: &HashMap<Fingerprint, LabelSet>,
 ) -> Result<Vec<FetchedSeries>, ReadError> {
     if hist.is_empty() {
-        return Ok(group_multi_rows(float, labels_by, labels_by_fp));
+        return Ok(group_multi_rows(float, labels_by));
     }
     let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
@@ -2930,15 +3079,9 @@ fn group_merged_multi_rows(
         while hi < hist.len() && hist[hi].metric_name == key.0 && hist[hi].fingerprint == key.1 {
             hi += 1;
         }
-        // Labels: the resolved `(name, fp)` pair, else the fingerprint's
-        // name-invariant set; a pair absent from both is a structural
-        // impossibility (the IN list is built from the resolved set) —
-        // skipped for totality (matches `group_multi_rows`).
-        let Some(labels) = labels_by
-            .get(&key)
-            .or_else(|| labels_by_fp.get(&key.1))
-            .cloned()
-        else {
+        // Labels: the pair's own label row; a pair with none is skipped
+        // (matches `group_multi_rows`).
+        let Some(labels) = labels_by.get(&key).cloned() else {
             continue;
         };
         let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
@@ -3265,14 +3408,7 @@ mod tests {
         let names: Vec<String> = (0..1_000u32).map(|i| format!("{i:0254}")).collect();
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
-        let sql = sample_sql::sample_fetch_multi(
-            "metric_samples",
-            "metric_hist_samples",
-            &names,
-            &fps,
-            0,
-            i64::MAX,
-        );
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &fps, 0, i64::MAX);
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -3294,14 +3430,7 @@ mod tests {
         let names: Vec<String> = (0..1_000_000u32)
             .map(|i| format!("metric_name_{i}"))
             .collect();
-        let sql = sample_sql::sample_fetch_multi(
-            "metric_samples",
-            "metric_hist_samples",
-            &names,
-            &[],
-            0,
-            i64::MAX,
-        );
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &[], 0, i64::MAX);
         match crate::querytext::ensure_query_text_fits(&sql) {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
             other => panic!("expected QueryTextBytes rejection, got {other:?}"),
@@ -3341,7 +3470,6 @@ mod tests {
         // regardless of input order.
         let sqls = build_chunk_sqls(
             "metric_samples",
-            "metric_hist_samples",
             "up",
             vec![
                 Fingerprint::from_raw(3),
@@ -3353,7 +3481,7 @@ mod tests {
         );
         assert_eq!(sqls.len(), 1);
         assert!(
-            sqls[0].starts_with("WITH [toUInt128('1'), toUInt128('2'), toUInt128('3')] AS fps"),
+            sqls[0].contains("IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))"),
             "got: {}",
             sqls[0]
         );
@@ -3362,7 +3490,7 @@ mod tests {
     #[test]
     fn build_chunk_sqls_splits_at_the_chunk_threshold() {
         let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
-        let sqls = build_chunk_sqls("metric_samples", "metric_hist_samples", "up", fps, 0, 100);
+        let sqls = build_chunk_sqls("metric_samples", "up", fps, 0, 100);
         assert_eq!(sqls.len(), 3);
     }
 
@@ -3460,7 +3588,9 @@ mod tests {
         .await
         .unwrap();
 
-        let labels_by_fp = HashMap::new();
+        let labels_by_fp: HashMap<Fingerprint, LabelSet> = (1..=4)
+            .map(|fp| (Fingerprint::from_raw(fp), ls(&[("job", "a")])))
+            .collect();
         let chunked_series = group_rows(chunked_rows, &labels_by_fp, "m");
         let reference_series = group_rows(reference_rows, &labels_by_fp, "m");
 
@@ -3963,17 +4093,6 @@ mod tests {
         assert!(group_rows(Vec::new(), &HashMap::new(), "up").is_empty());
     }
 
-    #[test]
-    fn group_rows_defaults_to_empty_labels_for_an_unhydrated_fingerprint() {
-        let rows = vec![SampleRow {
-            fingerprint: Fingerprint::from_raw(1),
-            unix_milli: 0,
-            value: 1.0,
-        }];
-        let series = group_rows(rows, &HashMap::new(), "up");
-        assert!(series[0].labels.is_empty());
-    }
-
     // --- group_multi_rows (issue #85, M6-08c) ---
 
     #[test]
@@ -4010,9 +4129,7 @@ mod tests {
             ("bbb".to_string(), Fingerprint::from_raw(7)),
             ls(&[("job", "a")]),
         );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
+        let series = group_multi_rows(rows, &labels_by);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
         assert_eq!(series[0].samples.len(), 2);
@@ -4022,7 +4139,7 @@ mod tests {
 
     #[test]
     fn group_multi_rows_of_an_empty_input_is_empty() {
-        assert!(group_multi_rows(Vec::new(), &HashMap::new(), &HashMap::new()).is_empty());
+        assert!(group_multi_rows(Vec::new(), &HashMap::new()).is_empty());
     }
 
     /// U9 (issue #623): a pair the cache did not resolve (`(bbb, 7)`
@@ -4031,7 +4148,7 @@ mod tests {
     /// grouping; a pair still absent has no label row of its own and is
     /// dropped — neither empty labels nor `aaa`'s.
     #[test]
-    fn group_multi_rows_hydrates_an_unresolved_cross_pair_from_the_fingerprint_labels() {
+    fn group_multi_rows_never_takes_another_names_labels_for_an_unresolved_pair() {
         let rows = vec![
             MultiSampleRow {
                 metric_name: "aaa".to_string(),
@@ -4051,13 +4168,13 @@ mod tests {
             ("aaa".to_string(), Fingerprint::from_raw(7)),
             ls(&[("job", "a")]),
         );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows.clone(), &labels_by, &labels_by_fp);
+        let series = group_multi_rows(rows.clone(), &labels_by);
         assert_eq!(series.len(), 1, "{series:?}");
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
-        let merged = group_merged_multi_rows(rows, Vec::new(), &labels_by, &labels_by_fp).unwrap();
+        let hist = vec![multi_hist_row("bbb", Fingerprint::from_raw(7), 5)];
+        let merged = group_merged_multi_rows(rows, hist, &labels_by).unwrap();
         assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].metric_name.as_deref(), Some("aaa"));
     }
 
     /// U9 (issue #623): a fingerprint the hydration found no label row for
@@ -4080,10 +4197,8 @@ mod tests {
         assert_eq!(merged[0].fingerprint, Fingerprint::from_raw(1));
     }
 
-    /// Finding 1's totality arm: a fingerprint absent from BOTH maps
-    /// (structurally impossible — the IN list is built from the resolved
-    /// set) is skipped whole, including its follow-on rows, which must
-    /// not attach to the preceding series.
+    /// A pair with no label row of its own is skipped whole, including its
+    /// follow-on rows, which must not attach to the preceding series.
     #[test]
     fn group_multi_rows_skips_a_wholly_unknown_pair_and_all_its_rows() {
         let rows = vec![
@@ -4111,9 +4226,7 @@ mod tests {
             ("aaa".to_string(), Fingerprint::from_raw(7)),
             ls(&[("job", "a")]),
         );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
+        let series = group_multi_rows(rows, &labels_by);
         assert_eq!(series.len(), 1, "unknown pair never surfaces: {series:?}");
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
         assert_eq!(
@@ -4130,7 +4243,7 @@ mod tests {
             unix_milli: 0,
             value: 1.0,
         }];
-        let series = group_rows(rows, &HashMap::new(), "up");
+        let series = group_rows(rows, &labelled(1), "up");
         assert_eq!(series[0].metric_name.as_deref(), Some("up"));
     }
 
@@ -4315,12 +4428,39 @@ mod tests {
         }
     }
 
+    /// Fingerprint `fp`'s own label row, as the hydration would find it.
+    fn labelled(fp: u128) -> HashMap<Fingerprint, LabelSet> {
+        HashMap::from([(Fingerprint::from_raw(fp), ls(&[("job", "a")]))])
+    }
+
     fn multi_float_row(name: &str, fp: Fingerprint, t: i64, v: f64) -> MultiSampleRow {
         MultiSampleRow {
             metric_name: name.to_string(),
             fingerprint: fp,
             unix_milli: t,
             value: v,
+        }
+    }
+
+    fn multi_hist_row(name: &str, fp: Fingerprint, t: i64) -> MultiHistSampleRow {
+        let r = hist_row(fp, t, &single_histogram());
+        MultiHistSampleRow {
+            metric_name: name.to_string(),
+            fingerprint: fp,
+            unix_milli: t,
+            schema: r.schema,
+            zero_threshold: r.zero_threshold,
+            zero_count: r.zero_count,
+            count: r.count,
+            sum: r.sum,
+            pos_span_offsets: r.pos_span_offsets,
+            pos_span_lengths: r.pos_span_lengths,
+            pos_bucket_deltas: r.pos_bucket_deltas,
+            neg_span_offsets: r.neg_span_offsets,
+            neg_span_lengths: r.neg_span_lengths,
+            neg_bucket_deltas: r.neg_bucket_deltas,
+            custom_values: r.custom_values,
+            counter_reset_hint: r.counter_reset_hint,
         }
     }
 
@@ -4421,7 +4561,7 @@ mod tests {
             float_row(fp, 1, 7.0),
             float_row(fp, 1, 5.0),
         ];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         assert_eq!(series.len(), 1);
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![5.0, 7.0], "arrival order, one per identity");
@@ -4435,7 +4575,7 @@ mod tests {
             float_row(fp, 1, 5.0),
             float_row(fp, 2, 7.0),
         ];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let got: Vec<(i64, f64)> = series[0].samples.iter().map(|s| (s.t_ms, s.v)).collect();
         assert_eq!(got, vec![(1, 5.0), (2, 7.0)]);
     }
@@ -4446,7 +4586,7 @@ mod tests {
     fn group_rows_leaves_two_different_values_at_one_millisecond_alone() {
         let fp = Fingerprint::from_raw(1);
         let rows = vec![float_row(fp, 1, 1.0), float_row(fp, 1, 2.0)];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![1.0, 2.0]);
     }
@@ -4457,7 +4597,7 @@ mod tests {
     fn group_rows_keeps_negative_zero_beside_zero() {
         let fp = Fingerprint::from_raw(1);
         let rows = vec![float_row(fp, 1, -0.0), float_row(fp, 1, 0.0)];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let bits: Vec<u64> = series[0].samples.iter().map(|s| s.v.to_bits()).collect();
         assert_eq!(bits, vec![0x8000_0000_0000_0000, 0x0000_0000_0000_0000]);
     }
@@ -4470,9 +4610,9 @@ mod tests {
             multi_float_row("m", fp, 1, 7.0),
             multi_float_row("m", fp, 1, 5.0),
         ];
-        let mut by_fp = HashMap::new();
-        by_fp.insert(fp, ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &HashMap::new(), &by_fp);
+        let mut labels_by = HashMap::new();
+        labels_by.insert(("m".to_string(), fp), ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &labels_by);
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![5.0, 7.0]);
     }
@@ -4563,6 +4703,130 @@ mod tests {
         let merged = group_merged_rows(float.clone(), Vec::new(), &labels, "m").unwrap();
         let plain = group_rows(float, &labels, "m");
         assert_eq!(merged, plain);
+    }
+
+    // -- AC7b: fetch_dual_concurrently dispatches both fetches concurrently.
+    //    A two-sided rendezvous (tokio Barrier) completes ONLY if both
+    //    futures are in flight at once; a serial dispatch deadlocks it and
+    //    trips the timeout.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac7b_chunks_dispatches_float_and_hist_concurrently() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+        let barrier = Arc::new(Barrier::new(2));
+        let (bf, bh) = (barrier.clone(), barrier.clone());
+        let float_fut = fetch_all_concurrently(vec!["f".to_string()], move |_| {
+            let b = bf.clone();
+            async move {
+                b.wait().await;
+                Ok(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
+            }
+        });
+        let hist_fut = fetch_all_concurrently(vec!["h".to_string()], move |_| {
+            let b = bh.clone();
+            async move {
+                b.wait().await;
+                Ok(Vec::<HistSampleRow>::new())
+            }
+        });
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_dual_concurrently(float_fut, hist_fut),
+        )
+        .await
+        .expect("both fetches must be in flight simultaneously (serial dispatch deadlocks)")
+        .unwrap();
+        assert_eq!(out.0.len(), 1);
+        assert!(out.1.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac7b_fallback_dispatches_float_and_hist_concurrently() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+        let barrier = Arc::new(Barrier::new(2));
+        let (bf, bh) = (barrier.clone(), barrier.clone());
+        let float_fut = async move {
+            bf.wait().await;
+            Ok::<_, ReadError>(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
+        };
+        let hist_fut = async move {
+            bh.wait().await;
+            Ok::<_, ReadError>(vec![hist_row(
+                Fingerprint::from_raw(1),
+                5,
+                &single_histogram(),
+            )])
+        };
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_dual_concurrently(float_fut, hist_fut),
+        )
+        .await
+        .expect("serial dispatch would deadlock the rendezvous")
+        .unwrap();
+        assert_eq!(out.0.len(), 1);
+        assert_eq!(out.1.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac7b_multi_dispatches_float_and_hist_concurrently() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+        let barrier = Arc::new(Barrier::new(2));
+        let (bf, bh) = (barrier.clone(), barrier.clone());
+        let float_fut = async move {
+            bf.wait().await;
+            Ok::<_, ReadError>(Vec::<MultiSampleRow>::new())
+        };
+        let hist_fut = async move {
+            bh.wait().await;
+            Ok::<_, ReadError>(Vec::<MultiHistSampleRow>::new())
+        };
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_dual_concurrently(float_fut, hist_fut),
+        )
+        .await
+        .expect("serial dispatch would deadlock the rendezvous")
+        .unwrap();
+        assert!(out.0.is_empty());
+        assert!(out.1.is_empty());
+    }
+
+    /// The failure-mode proof: a SERIAL dispatch (await the float future to
+    /// completion before starting the histogram future) never reaches the
+    /// rendezvous's second party and times out — the exact regression the
+    /// concurrent `fetch_dual_concurrently` prevents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac7b_serial_dispatch_deadlocks_the_rendezvous() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+        let barrier = Arc::new(Barrier::new(2));
+        let (bf, bh) = (barrier.clone(), barrier.clone());
+        let float_fut = async move {
+            bf.wait().await;
+            Ok::<(), ReadError>(())
+        };
+        let hist_fut = async move {
+            bh.wait().await;
+            Ok::<(), ReadError>(())
+        };
+        let serial = async move {
+            float_fut.await?;
+            hist_fut.await?;
+            Ok::<(), ReadError>(())
+        };
+        let res = tokio::time::timeout(Duration::from_millis(300), serial).await;
+        assert!(
+            res.is_err(),
+            "serial dispatch must time out — the barrier's second party never arrives"
+        );
     }
 
     // -- M7-A5b-i: histogram-valued API results now ENCODE (VectorHist/

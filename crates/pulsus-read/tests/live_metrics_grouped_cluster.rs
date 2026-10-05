@@ -438,6 +438,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -461,6 +462,7 @@ async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
         })

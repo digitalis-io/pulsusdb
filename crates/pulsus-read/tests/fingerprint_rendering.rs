@@ -5,7 +5,7 @@
 //! spelling a compile error, and the typed signatures make a raw identity
 //! unable to reach a builder. Neither says what a builder actually emits:
 //! a site whose signature still reads `FpLiteral` but which stopped using
-//! it would pass both. So each of the six sites is driven with the four
+//! it would pass both. So each of the seven sites is driven with the four
 //! boundary values and its rendered text is read.
 //!
 //! **The four values are where the two readings first disagree**, measured
@@ -21,9 +21,9 @@
 //! A test built on the first two alone passes on a build that renders bare
 //! decimals, which is why all four are used at every site.
 //!
-//! **The six sites, by enclosing function** — the closed inventory issue
-//! #498 froze, derived by searching for the rendering rather than for
-//! callers of a helper:
+//! **The seven sites, by enclosing function** — the closed inventory issue
+//! #498 froze, plus the pair lookup issue #623 added, derived by searching
+//! for the rendering rather than for callers of a helper:
 //!
 //! ```text
 //!   1  fp_list                        logql/sql.rs        private, reached through stage2
@@ -33,6 +33,7 @@
 //!   4  render_fingerprint_list        metrics/sample_sql.rs
 //!   5  series_labels_by_fingerprint   metrics/sql.rs
 //!   6  discovery_fetch_multi          metrics/sql.rs
+//!   7  series_labels_by_pairs         metrics/sql.rs
 //! ```
 //!
 //! `metrics/sample_sql.rs`'s `fingerprints_predicate` and
@@ -196,14 +197,7 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
     let rendered = sample_sql::render_fingerprint_list(&literals());
     assert_every_boundary_value_is_an_exact_call("render_fingerprint_list", &rendered);
     // And the statement that embeds it, so the list reaches SQL whole.
-    let sql = sample_sql::sample_fetch(
-        "metric_samples",
-        "metric_hist_samples",
-        "up",
-        &literals(),
-        0,
-        100,
-    );
+    let sql = sample_sql::sample_fetch("metric_samples", "up", &literals(), 0, 100);
     assert_every_boundary_value_is_an_exact_call("sample_fetch", &sql);
 }
 
@@ -230,4 +224,15 @@ fn site_6_discovery_fetch_multi_renders_the_exact_call_form() {
     );
     assert_every_boundary_value_is_an_exact_call("discovery_fetch_multi", &sql);
     let _ = DiscoveryFilter::default();
+}
+
+/// Site 7: `series_labels_by_pairs` (issue #623).
+#[test]
+fn site_7_series_labels_by_pairs_renders_the_exact_call_form() {
+    let pairs: Vec<(String, FpLiteral)> = literals()
+        .into_iter()
+        .map(|fp| ("up".to_string(), fp))
+        .collect();
+    let sql = metrics_sql::series_labels_by_pairs("metric_labels", &pairs);
+    assert_every_boundary_value_is_an_exact_call("series_labels_by_pairs", &sql);
 }

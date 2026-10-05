@@ -168,6 +168,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -189,6 +190,7 @@ impl InsertSeries for ChClient {
         let labels: Vec<SeedLabelRow> = rows
             .iter()
             .map(|r| SeedLabelRow {
+                metric_name: r.metric_name.clone(),
                 fingerprint: r.fingerprint,
                 labels: r.labels.clone(),
             })
@@ -1693,7 +1695,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     const CONCRETE: &str = "metric_series\\nWHERE metric_name = \\'http_requests_total\\'%";
     // The wide statement's head since issue #623: the series side of the
     // label join, which is where the selection is written.
-    const WIDE_HEAD: &str = "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS \
+    const WIDE_HEAD: &str = "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS \
                              labels\\nFROM (\\nSELECT DISTINCT metric_name, fingerprint\\nFROM ";
     let concrete_narrow = statements_matching(
         &admin,
@@ -1740,8 +1742,10 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // resolution and omit newly active names — a wrong answer passing the
     // check.
     let narrow_before = narrow;
-    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, s.metric_name AS metric_name, \
-                            l.label_set AS labels\\nFROM (\\nSELECT DISTINCT metric_name, \
+    // Issue #623: the names-only fetch joins series to label rows by the
+    // pair.
+    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, metric_name, \
+                            l.labels AS labels\\nFROM (\\nSELECT DISTINCT metric_name, \
                             fingerprint\\nFROM metric_series\\nWHERE metric_name IN (%'";
     let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
     let probes_before = statements_matching(&admin, db, probe_96).await;

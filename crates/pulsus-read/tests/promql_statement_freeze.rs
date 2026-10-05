@@ -45,13 +45,6 @@
 //! to 56 across the same 30 entries, and every other entry is
 //! byte-identical.
 //!
-//! # Issue #623 moved it again, and every entry moved
-//!
-//! The float fetch and its complementary histogram fetch are now ONE
-//! statement over both sample tables, `UNION ALL`, so every entry that sent
-//! two statements sends one: 56 statements became 30, one per entry. The
-//! four grouped entries are byte-identical.
-//!
 //! # Every boundary in this golden is writer-emitted
 //!
 //! The writer emits `-- statement[i]` before each statement, and the live
@@ -132,14 +125,13 @@ fn freeze_config() -> MetricsConfig {
 const GOLDEN: &str = include_str!("golden/promql_statements.txt");
 const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
-/// The three constants published on issue #548 before the code existed,
-/// as issue #623 moved them.
+/// The three constants published on issue #548 before the code existed.
 const ENTRIES: usize = 30;
-const LINES: usize = 814;
-const BYTES: usize = 48_715;
-/// The statements the writer's markers declare. Sixty before issue #549,
-/// fifty-six after it; since issue #623 every entry sends ONE statement.
-const STATEMENTS: usize = 30;
+const LINES: usize = 736;
+const BYTES: usize = 39_043;
+/// The statements the writer's markers declare. Sixty before issue #549;
+/// four entries now send ONE statement where they sent two.
+const STATEMENTS: usize = 56;
 
 const START_MS: i64 = 1_782_907_200_000;
 const END_MS: i64 = 1_782_928_800_000;
@@ -269,13 +261,21 @@ fn render() -> String {
                 (_, Some(n)) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch(SAMPLES, HIST, n, &fps(), lo, hi),
+                        &sample_sql::sample_fetch(SAMPLES, n, &fps(), lo, hi),
+                    );
+                    emit(
+                        &mut out,
+                        &sample_sql::hist_sample_fetch(HIST, n, &fps(), lo, hi),
                     );
                 }
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, HIST, &names(), &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &fps(), lo, hi),
+                    );
+                    emit(
+                        &mut out,
+                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &fps(), lo, hi),
                     );
                 }
             }

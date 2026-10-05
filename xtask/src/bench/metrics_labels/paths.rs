@@ -630,9 +630,9 @@ fn now_unix_ms() -> i64 {
 }
 
 /// Hand-copied from `pulsus_read::metrics::sql::sweep_query` — see the
-/// module doc comment's "Sweep SQL drift" note: the activity rows since the
-/// bound, joined to their label sets (issue #623). `extra_predicate`, when
-/// given, is ANDed into the activity selection on both sides of the join
+/// module doc comment's "Sweep SQL drift" note: the own label row of every
+/// series active since the bound, read label rows first (issue #623).
+/// `extra_predicate`, when given, is ANDed into the activity selection
 /// (used by [`run_refresh_evidence`]'s incremental prototype).
 fn sweep_sql_copy(
     series_table: &str,
@@ -645,21 +645,14 @@ fn sweep_sql_copy(
         from_where.push_str(&format!("\n  AND {extra}"));
     }
     format!(
-        "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
-         FROM (\n\
-         SELECT DISTINCT metric_name, fingerprint\n\
-         {from_where}\n\
-         ) AS s\n\
-         INNER JOIN (\n\
-         SELECT fingerprint, any(labels) AS label_set\n\
+        "SELECT fingerprint, metric_name, labels\n\
          FROM {labels_table}\n\
-         WHERE fingerprint IN (\n\
-         SELECT fingerprint\n\
+         WHERE (metric_name, fingerprint) IN (\n\
+         SELECT metric_name, fingerprint\n\
          {from_where}\n\
          )\n\
-         GROUP BY fingerprint\n\
-         ) AS l USING (fingerprint)\n\
-         ORDER BY metric_name, fingerprint"
+         ORDER BY metric_name, fingerprint\n\
+         LIMIT 1 BY metric_name, fingerprint"
     )
 }
 

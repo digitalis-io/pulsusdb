@@ -7,8 +7,8 @@ use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
 /// One series from the §5.2 sweep and the discovery reads: a
-/// `(metric_name, fingerprint)` of `metric_series` with the label set
-/// `metric_labels` holds for the fingerprint (issue #623,
+/// `(metric_name, fingerprint)` of `metric_series` with its own label row in
+/// `metric_labels` (issue #623,
 /// [`super::sql::sweep_query`], docs/architecture.md §5.2).
 /// `labels` is the canonical JSON string the writer produced
 /// (`LabelSet::to_canonical_json`) — parsed into a `LabelSet` by
@@ -30,6 +30,17 @@ pub struct SeriesRow {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricNameRow {
     pub metric_name: String,
+}
+
+/// One series' own label row, looked up by its `(metric_name,
+/// fingerprint)` pair ([`super::sql::series_labels_by_pairs`], issue #623):
+/// the multi-metric fetch's pairs the label cache did not resolve. Column
+/// order is the statement's.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct PairLabelsRow {
+    pub metric_name: String,
+    pub fingerprint: Fingerprint,
+    pub labels: String,
 }
 
 #[cfg(test)]

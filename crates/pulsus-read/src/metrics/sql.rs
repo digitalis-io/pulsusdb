@@ -59,62 +59,127 @@ fn base_where(
     bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
+    let scope = name_scope(metric_name);
     format!(
-        "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
-        ch_string(metric_name),
+        "FROM {series_table}\nWHERE {scope}\n  AND {}",
         SeriesWhere::new(
             window,
             bucket_ms,
             matchers,
             MatcherTarget::Labels {
                 table: labels_table,
-                scope: None,
+                scope: Some(&scope),
             }
         )
         .where_tail()
     )
 }
 
+/// `metric_name = '<name>'`: one metric's scope, the head's name predicate
+/// and the label side's (issue #623).
+fn name_scope(metric_name: &str) -> String {
+    format!("metric_name = {}", ch_string(metric_name))
+}
+
+/// `metric_name IN ('<a>', '<b>')`: several metrics' scope.
+fn names_scope(metric_names: &[String]) -> String {
+    let name_list = metric_names
+        .iter()
+        .map(|n| ch_string(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("metric_name IN ({name_list})")
+}
+
+/// The key a label join meets on (issue #623): the fingerprint, where one
+/// metric scopes both sides, or the `(metric_name, fingerprint)` pair,
+/// where several do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelJoin {
+    Fingerprint,
+    Series,
+}
+
+/// The join builders' series side: `FROM {series}\nWHERE {scope}\n  AND
+/// {bound}`, the matchers left to the label side.
+fn scoped_from_where(series_table: &str, scope: &str, bound: &str) -> String {
+    format!("FROM {series_table}\nWHERE {scope}\n  AND {bound}")
+}
+
 /// `fingerprint, metric_name, labels` — one row per `(metric_name,
-/// fingerprint)` the series rows `from_where` select, carrying that
-/// fingerprint's label set (issue #623).
+/// fingerprint)` the series rows `from_where` select, joined to that
+/// series' own label row (issue #623).
 ///
-/// `metric_series` holds activity only, so the labels come from the
-/// one-row-per-label-set table. The label side reads only the fingerprints
-/// the same `from_where` names, and `any(labels)` collapses the copies a
-/// replacing table holds until it merges, or one per shard: a fingerprint
-/// names one label set, so every copy is the same text. The join is
-/// `INNER`: a series whose label row is missing is absent, never returned
+/// `metric_series` holds activity only and `metric_labels` one row per
+/// series, keyed `(metric_name, fingerprint)`. The series side is read
+/// once; the label side reads the scoped metrics' rows, `label_where`
+/// carrying the scope and the label matchers. `key` is
+/// [`LabelJoin::Fingerprint`] where one metric scopes both sides and
+/// [`LabelJoin::Series`] where several do. `ANY` keeps one label row per
+/// key while the replacing table holds unmerged copies. The join is
+/// `INNER`: a series with no label row of its own is absent, never returned
 /// with empty labels, which would merge distinct series into one.
-///
-/// `label_set` rather than `labels` inside the aggregate: an alias that
-/// shadows its own argument's column is resolved to the aggregate in
-/// `WHERE`, which the server refuses (measured on 26.3.29.7).
-fn with_label_sets(labels_table: &str, from_where: &str) -> String {
+fn with_label_sets(
+    labels_table: &str,
+    from_where: &str,
+    label_where: &str,
+    key: LabelJoin,
+) -> String {
+    match key {
+        LabelJoin::Fingerprint => format!(
+            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             {from_where}\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT fingerprint, labels\n\
+             FROM {labels_table}\n\
+             WHERE {label_where}\n\
+             ) AS l USING (fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
+        ),
+        LabelJoin::Series => format!(
+            "SELECT fingerprint, metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             {from_where}\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT metric_name, fingerprint, labels\n\
+             FROM {labels_table}\n\
+             WHERE {label_where}\n\
+             ) AS l USING (metric_name, fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
+        ),
+    }
+}
+
+/// `fingerprint, metric_name, labels` read label rows first (issue #623):
+/// the label row of every `(metric_name, fingerprint)` the series rows
+/// `from_where` select. For the reads no metric scopes — unnamed discovery
+/// and the sweep — where a join's build side would hold every series'
+/// label row. `LIMIT 1 BY` keeps one row per series while the replacing
+/// table holds unmerged copies; a series with no label row of its own is
+/// absent.
+fn label_first(labels_table: &str, from_where: &str) -> String {
     format!(
-        "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
-         FROM (\n\
-         SELECT DISTINCT metric_name, fingerprint\n\
-         {from_where}\n\
-         ) AS s\n\
-         INNER JOIN (\n\
-         SELECT fingerprint, any(labels) AS label_set\n\
+        "SELECT fingerprint, metric_name, labels\n\
          FROM {labels_table}\n\
-         WHERE fingerprint IN (\n\
-         SELECT fingerprint\n\
+         WHERE (metric_name, fingerprint) IN (\n\
+         SELECT metric_name, fingerprint\n\
          {from_where}\n\
          )\n\
-         GROUP BY fingerprint\n\
-         ) AS l USING (fingerprint)\n\
-         ORDER BY metric_name, fingerprint"
+         ORDER BY metric_name, fingerprint\n\
+         LIMIT 1 BY metric_name, fingerprint"
     )
 }
 
 /// The sweep's statement (`super::refresh`): every series active since
-/// `lower_bound_ms`, with its labels. No upper bound — the sweep runs as of
-/// now.
+/// `lower_bound_ms`, with its own labels. No upper bound — the sweep runs as
+/// of now.
 pub fn sweep_query(series_table: &str, labels_table: &str, lower_bound_ms: i64) -> String {
-    with_label_sets(
+    label_first(
         labels_table,
         &format!("FROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}"),
     )
@@ -190,17 +255,25 @@ pub fn historical_resolution_query(
     bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
-    let from_where = base_where(
-        series_table,
-        labels_table,
-        metric_name,
+    let scope = name_scope(metric_name);
+    let tail = SeriesWhere::new(
         window,
         bucket_ms,
         matchers,
+        MatcherTarget::Labels {
+            table: labels_table,
+            scope: Some(&scope),
+        },
     );
+    let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
     format!(
         "SELECT fingerprint, labels\nFROM (\n{}\n)",
-        with_label_sets(labels_table, &from_where)
+        with_label_sets(
+            labels_table,
+            &scoped_from_where(series_table, &scope, bound),
+            label_where,
+            LabelJoin::Fingerprint,
+        )
     )
 }
 
@@ -213,12 +286,12 @@ pub fn historical_resolution_query(
 /// hydrates *only those*, not the fallback's full (possibly much larger)
 /// matcher-matched set. No `window`/`matchers`/bucket-floor predicates
 /// here — the fingerprint list is already the answer; this is a pure
-/// `fingerprint -> labels` lookup on the label table (issue #623), keyed by
-/// the fingerprint alone, since a fingerprint names one label set whatever
-/// the metric. `any` collapses the copies the table holds until it merges.
+/// `fingerprint -> labels` lookup on the metric's own label rows (issue
+/// #623), a key range of `(metric_name, fingerprint)`. `any` collapses the
+/// copies the table holds until it merges.
 pub fn series_labels_by_fingerprint(
     labels_table: &str,
-    _metric_name: &str,
+    metric_name: &str,
     fps: &[FpLiteral],
 ) -> String {
     let fp_list = fps
@@ -227,7 +300,8 @@ pub fn series_labels_by_fingerprint(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT fingerprint, any(labels) AS labels\nFROM {labels_table}\nWHERE fingerprint IN ({fp_list})\nGROUP BY fingerprint"
+        "SELECT fingerprint, any(labels) AS labels\nFROM {labels_table}\nWHERE {}\n  AND fingerprint IN ({fp_list})\nGROUP BY fingerprint",
+        name_scope(metric_name)
     )
 }
 
@@ -251,10 +325,34 @@ pub fn discovery_query(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    with_label_sets(
-        labels_table,
-        &discovery_from_where(series_table, labels_table, filter, window, bucket_ms),
-    )
+    match &filter.metric_name {
+        // Named: the metric's series joined to its own label rows.
+        Some(name) => {
+            let scope = name_scope(name);
+            let tail = SeriesWhere::new(
+                window,
+                bucket_ms,
+                &filter.matchers,
+                MatcherTarget::Labels {
+                    table: labels_table,
+                    scope: Some(&scope),
+                },
+            );
+            let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
+            with_label_sets(
+                labels_table,
+                &scoped_from_where(series_table, &scope, bound),
+                label_where,
+                LabelJoin::Fingerprint,
+            )
+        }
+        // Unnamed: the label rows of the series the window and the
+        // matchers select.
+        None => label_first(
+            labels_table,
+            &discovery_from_where(series_table, labels_table, filter, window, bucket_ms),
+        ),
+    }
 }
 
 /// The `FROM <table>` + `WHERE …` head [`discovery_query`] and
@@ -272,22 +370,27 @@ fn discovery_from_where(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let tail = SeriesWhere::new(
-        window,
-        bucket_ms,
-        &filter.matchers,
-        MatcherTarget::Labels {
-            table: labels_table,
-            scope: None,
-        },
-    );
     match &filter.metric_name {
-        Some(name) => format!(
-            "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
-            ch_string(name),
-            tail.where_tail()
+        Some(name) => base_where(
+            series_table,
+            labels_table,
+            name,
+            window,
+            bucket_ms,
+            &filter.matchers,
         ),
-        None => format!("FROM {series_table}\nWHERE {}", tail.where_tail()),
+        None => {
+            let tail = SeriesWhere::new(
+                window,
+                bucket_ms,
+                &filter.matchers,
+                MatcherTarget::Labels {
+                    table: labels_table,
+                    scope: None,
+                },
+            );
+            format!("FROM {series_table}\nWHERE {}", tail.where_tail())
+        }
     }
 }
 
@@ -296,11 +399,15 @@ fn discovery_from_where(
 /// `filter`/`window`/`bucket_ms`.
 ///
 /// **Why the answer is unchanged.** [`discovery_query`] yields one row per
-/// `(metric_name, fingerprint)` of its `WHERE` that has a label set, and the
-/// distinct `metric_name` projection of that set
-/// *is* the distinct `metric_name` set of the same `WHERE`. The two share
-/// [`discovery_from_where`], so "the same `WHERE`" is a property of the
-/// code, not of a comment.
+/// `(metric_name, fingerprint)` of its `WHERE` that has its own label row,
+/// and the distinct `metric_name` projection of that set *is* the distinct
+/// `metric_name` set of the same `WHERE`. Named, the two share
+/// [`discovery_from_where`]'s head and label `WHERE`, so "the same `WHERE`"
+/// is a property of the code, not of a comment. Unnamed with label matchers
+/// (issue #623) this statement is [`names_join`]: the same window bound and
+/// the same label predicates, joined by the pair rather than nested, and
+/// `matchers_answer_from_own_label_rows` (live) holds the two to the same
+/// names.
 ///
 /// **`ORDER BY metric_name` is load-bearing, not cosmetic.** `metric_series
 /// ORDER BY (metric_name, fingerprint, unix_milli)` (docs/schemas.md:73,
@@ -316,9 +423,9 @@ fn discovery_from_where(
 /// **The label table is dropped from the statement, which is not the same
 /// as never being read.** With no `match[]` — the discovery client's actual
 /// first call — there are no matcher conjuncts, so `metric_labels` is not
-/// referenced at all. With label matchers the `WHERE` renders them as a
-/// `metric_labels` sub-query (issue #623), so the label sets **are** read to
-/// evaluate the filter; the win
+/// referenced at all. With label matchers the statement reads
+/// `metric_labels` to evaluate them (issue #623), so the label rows **are**
+/// read; the win
 /// there is transport and parse count (rows collapse from one-per-series to
 /// one-per-metric-name, and `parse_canonical_label_set` is not called at all),
 /// not bytes read.
@@ -336,9 +443,39 @@ pub fn discovery_distinct_names_query(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
+    if filter.metric_name.is_none() && !filter.matchers.is_empty() {
+        let tail = SeriesWhere::new(
+            window,
+            bucket_ms,
+            &filter.matchers,
+            MatcherTarget::Labels {
+                table: labels_table,
+                scope: None,
+            },
+        );
+        let (bound, preds) = tail.join_parts().expect("matchers make a label side");
+        return names_join(series_table, labels_table, bound, preds);
+    }
     format!(
         "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
         discovery_from_where(series_table, labels_table, filter, window, bucket_ms)
+    )
+}
+
+/// The unnamed names query with label matchers (issue #623): the series
+/// rows in the window joined to the label rows the matchers select, by the
+/// pair, keeping the names. `partial_merge` at the host's threads: a hash
+/// join's build side would hold every matching series' pair, and over many
+/// series a sort-merge join holds less (measured, plan §6; the owner
+/// accepted the slower small-data latency for the exact answer).
+fn names_join(series_table: &str, labels_table: &str, bound: &str, preds: &str) -> String {
+    format!(
+        "SELECT DISTINCT metric_name\n\
+         FROM (SELECT metric_name, fingerprint FROM {series_table} WHERE {bound}) AS s\n\
+         ANY INNER JOIN (SELECT metric_name, fingerprint FROM {labels_table} WHERE {preds}) AS l\n\
+         USING (metric_name, fingerprint)\n\
+         ORDER BY metric_name\n\
+         SETTINGS join_algorithm = 'partial_merge'"
     )
 }
 
@@ -356,10 +493,10 @@ pub fn discovery_distinct_names_query(
 /// Sound without per-pair filtering, by `sample_fetch_multi`'s argument: a
 /// `metric_name` is in the IN set only if it passed the selector's
 /// `name_matchers`, and `metric_fingerprint` excludes `__name__`
-/// (docs/schemas.md §2.1) so a fingerprint's label set is name-invariant —
-/// every `(metric_name, fingerprint)` cross-pair naming a real series is a
-/// genuine match. One row per series, with its label set, as in
-/// [`discovery_query`].
+/// (docs/schemas.md §2.1) so every `(metric_name, fingerprint)` cross-pair
+/// naming a real series is a genuine match. One row per series, joined by
+/// the pair to its own label row (issue #623): a cross-pair with none is
+/// absent, never given another name's row.
 pub fn discovery_fetch_multi(
     series_table: &str,
     labels_table: &str,
@@ -368,11 +505,7 @@ pub fn discovery_fetch_multi(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let name_list = metric_names
-        .iter()
-        .map(|n| ch_string(n))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = names_scope(metric_names);
     let fp_list = fps
         .iter()
         .map(FpLiteral::to_string)
@@ -389,12 +522,12 @@ pub fn discovery_fetch_multi(
             scope: None,
         },
     );
+    let scope = format!("{names}\n  AND fingerprint IN ({fp_list})");
     with_label_sets(
         labels_table,
-        &format!(
-            "FROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND {}",
-            tail.where_tail()
-        ),
+        &scoped_from_where(series_table, &scope, tail.where_tail()),
+        &scope,
+        LabelJoin::Series,
     )
 }
 
@@ -462,32 +595,44 @@ pub fn discovery_fetch_by_names(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let name_list = metric_names
-        .iter()
-        .map(|n| ch_string(n))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let scope = names_scope(metric_names);
     let tail = SeriesWhere::new(
         window,
         bucket_ms,
         matchers,
         MatcherTarget::Labels {
             table: labels_table,
-            scope: None,
+            scope: Some(&scope),
         },
     );
+    let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
     with_label_sets(
         labels_table,
-        &format!(
-            "FROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND {}",
-            tail.where_tail()
-        ),
+        &scoped_from_where(series_table, &scope, bound),
+        label_where,
+        LabelJoin::Series,
     )
 }
 
-/// STUB (issue #623, tests first).
-pub fn series_labels_by_pairs(_labels_table: &str, _pairs: &[(String, FpLiteral)]) -> String {
-    String::new()
+/// The label rows of `(metric_name, fingerprint)` pairs (issue #623): the
+/// multi-metric fetch's returned pairs the label cache did not resolve —
+/// a series registered under another name after the last sweep — each
+/// looked up by its own pair, never by the fingerprint, which another name
+/// may share. `LIMIT 1 BY` keeps one row per pair while the table holds
+/// unmerged copies; a pair with no label row is absent.
+pub fn series_labels_by_pairs(labels_table: &str, pairs: &[(String, FpLiteral)]) -> String {
+    let pair_list = pairs
+        .iter()
+        .map(|(name, fp)| format!("({}, {fp})", ch_string(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT metric_name, fingerprint, labels\n\
+         FROM {labels_table}\n\
+         WHERE (metric_name, fingerprint) IN ({pair_list})\n\
+         ORDER BY metric_name, fingerprint\n\
+         LIMIT 1 BY metric_name, fingerprint"
+    )
 }
 
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
@@ -1128,7 +1273,7 @@ mod tests {
         assert!(sql.contains("metric_name = 'up'"));
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
         assert!(sql.starts_with(
-            "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\nFROM ("
+            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\nFROM ("
         ));
         assert!(sql.ends_with("ORDER BY metric_name, fingerprint"));
     }

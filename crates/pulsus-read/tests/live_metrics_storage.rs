@@ -710,6 +710,9 @@ async fn a_late_sample_of_the_other_kind_is_read() {
     drop_database(&bootstrap, &db).await;
 }
 
+/// `(metric_name, fingerprint, labels)`: one answered series.
+type Triple = (String, u128, Vec<(String, String)>);
+
 /// One seeded series of the L1 fixture.
 struct Rec {
     name: &'static str,
@@ -1018,17 +1021,16 @@ async fn matchers_answer_from_own_label_rows() {
             },
         ],
     ];
-    let triples =
-        |name: Option<&str>, ms: &[M]| -> BTreeSet<(String, u128, Vec<(String, String)>)> {
-            recs.iter()
-                .filter(|r| name.is_none_or(|n| n == r.name))
-                .filter(|r| r.label_row && in_window(r))
-                .filter(|r| ms.iter().all(|m| m.holds(&r.labels)))
-                .map(|r| (r.name.to_string(), r.fp, r.labels.clone()))
-                .collect()
-        };
+    let triples = |name: Option<&str>, ms: &[M]| -> BTreeSet<Triple> {
+        recs.iter()
+            .filter(|r| name.is_none_or(|n| n == r.name))
+            .filter(|r| r.label_row && in_window(r))
+            .filter(|r| ms.iter().all(|m| m.holds(&r.labels)))
+            .map(|r| (r.name.to_string(), r.fp, r.labels.clone()))
+            .collect()
+    };
     let as_triples = |rows: Vec<pulsus_read::metrics::rows::SeriesRow>| {
-        let raw: Vec<(String, u128, Vec<(String, String)>)> = rows
+        let raw: Vec<Triple> = rows
             .into_iter()
             .map(|r| (r.metric_name, raw(r.fingerprint), label_pairs(&r.labels)))
             .collect();
@@ -1179,7 +1181,26 @@ async fn matchers_answer_from_own_label_rows() {
     assert_eq!(got, want, "discovery_fetch_multi");
 
     // The names query answers exactly the names of discovery's rows, for
-    // each shape of filter.
+    // each shape of filter — except where the filter has no label matcher
+    // and no name: that names query reads the activity rows alone (issue
+    // #472's narrow projection, which never reads `metric_labels`), so a
+    // name whose series in the window all lack a label row of their own is
+    // in it and not in discovery. Computed from the seed.
+    let unlabelled_names: BTreeSet<String> = recs
+        .iter()
+        .filter(|r| in_window(r))
+        .map(|r| r.name.to_string())
+        .filter(|name| {
+            !recs
+                .iter()
+                .any(|r| r.name == name && r.label_row && in_window(r))
+        })
+        .collect();
+    assert_eq!(
+        unlabelled_names,
+        BTreeSet::from(["m_orphan".to_string()]),
+        "the fixture's one name with activity and no label row"
+    );
     for filter in [
         DiscoveryFilter::default(),
         DiscoveryFilter {
@@ -1237,7 +1258,11 @@ async fn matchers_answer_from_own_label_rows() {
         .into_iter()
         .map(|r| r.metric_name)
         .collect();
-        assert_eq!(narrow, wide, "the names of discovery's rows, {filter:?}");
+        let mut want = wide.clone();
+        if filter.metric_name.is_none() && filter.matchers.is_empty() {
+            want.extend(unlabelled_names.iter().cloned());
+        }
+        assert_eq!(narrow, want, "the names of discovery's rows, {filter:?}");
     }
 
     // The sweep: every m_q series with its own label row, none borrowed.

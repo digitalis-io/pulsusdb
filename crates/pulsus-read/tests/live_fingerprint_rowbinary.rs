@@ -23,14 +23,13 @@
 //!   18446744073709551618   2^64 + 2   its neighbour
 //! ```
 //!
-//! **The inventory.** Twenty-three production `Row` structs carry a
+//! **The inventory.** Twenty-four production `Row` structs carry a
 //! `fingerprint` field — ten in `logql/rows.rs`, four in
-//! `metrics/sample_rows.rs` (six since issue #623 added the two rows of the
-//! one-statement fetch over both sample tables), one in `metrics/rows.rs`, two in
-//! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. Two of
-//! the twenty-three were private, which is why a `pub struct` search
-//! returns twenty-one; they are `pub` now with that reason recorded on
-//! them. A twenty-fourth, `MetricRangeUnwrappedRow`, carries no
+//! `metrics/sample_rows.rs`, two in `metrics/rows.rs` (the second, the pair
+//! lookup's, since issue #623), two in `metrics/exec.rs` and six in
+//! `pulsus-write`'s `writer/rows.rs`. Two of them were private, which is
+//! why a `pub struct` search once returned two fewer; they are `pub` now
+//! with that reason recorded on them. One more, `MetricRangeUnwrappedRow`, carries no
 //! `fingerprint` field but reads the `class` column, which is the
 //! fingerprint itself when the group-key plan groups per fingerprint — so
 //! it is exercised here too.
@@ -596,74 +595,33 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
-    // Issue #623: the one statement over both sample tables, through the
-    // builders the engine sends. The floats are `pulsus_probe` and the
-    // histograms `pulsus_probe_hist`: the concrete-name fetch reads the
-    // histogram branch, the fan-out over both names reads both branches.
-    let fp_literals: Vec<pulsus_model::FpLiteral> = fingerprints()
-        .into_iter()
-        .map(Fingerprint::sql_literal)
-        .collect();
-    let both = |rows: Vec<Fingerprint>| -> Vec<Fingerprint> {
-        let mut once = rows;
-        once.sort_unstable();
-        once.dedup();
-        once
-    };
-    let rows: Vec<sample_rows::UnionSampleRow> = read_all(
-        &client,
-        "UnionSampleRow",
-        &pulsus_read::metrics::sample_sql::sample_fetch(
-            "metric_samples",
-            "metric_hist_samples",
-            "pulsus_probe_hist",
-            &fp_literals,
-            0,
-            i64::MAX,
-        ),
-    )
-    .await;
-    assert!(
-        rows.iter().all(|r| r.hist.len() == 1),
-        "the histogram branch"
-    );
-    assert_the_four_boundary_values(
-        "UnionSampleRow",
-        both(rows.into_iter().map(|r| r.fingerprint).collect()),
-    );
-
-    let rows: Vec<sample_rows::MultiUnionSampleRow> = read_all(
-        &client,
-        "MultiUnionSampleRow",
-        &pulsus_read::metrics::sample_sql::sample_fetch_multi(
-            "metric_samples",
-            "metric_hist_samples",
-            &["pulsus_probe".to_string(), "pulsus_probe_hist".to_string()],
-            &fp_literals,
-            0,
-            i64::MAX,
-        ),
-    )
-    .await;
-    assert_eq!(rows.len(), 8, "a float and a histogram row per fingerprint");
-    assert_the_four_boundary_values(
-        "MultiUnionSampleRow",
-        both(rows.into_iter().map(|r| r.fingerprint).collect()),
-    );
-
-    // --- crates/pulsus-read/src/metrics/rows.rs (1) -------------------
+    // --- crates/pulsus-read/src/metrics/rows.rs (2) -------------------
     let rows: Vec<metrics_rows::SeriesRow> = read_all(
         &client,
         "SeriesRow",
         &format!(
             "SELECT fingerprint, metric_name, labels FROM metric_series \
-             INNER JOIN metric_labels USING (fingerprint) \
+             INNER JOIN metric_labels USING (metric_name, fingerprint) \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
     .await;
     assert_the_four_boundary_values(
         "SeriesRow",
+        rows.into_iter().map(|r| r.fingerprint).collect(),
+    );
+
+    let rows: Vec<metrics_rows::PairLabelsRow> = read_all(
+        &client,
+        "PairLabelsRow",
+        &format!(
+            "SELECT metric_name, fingerprint, labels FROM metric_labels \
+             WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
+        ),
+    )
+    .await;
+    assert_the_four_boundary_values(
+        "PairLabelsRow",
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
@@ -747,7 +705,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         "MetricSeriesRow",
         &format!(
             "SELECT metric_name, fingerprint, unix_milli, labels, value_type FROM metric_series \
-             INNER JOIN metric_labels USING (fingerprint) \
+             INNER JOIN metric_labels USING (metric_name, fingerprint) \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )

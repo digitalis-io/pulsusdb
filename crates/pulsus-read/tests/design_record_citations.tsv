@@ -205,6 +205,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3049	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3050	crates/pulsus-read/src/logql/pipeline.rs	3050		line	604_800	("w", 604_800.0),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3101	crates/pulsus-read/src/logql/pipeline.rs	3101		line	is_ascii_digit	.find(|c: char| !(c.is_ascii_digit() || c == '.'))
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json	serde_json::Value::Number(n) => n.to_string(),
+docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1216	crates/pulsus-read/src/logql/sql.rs	1216		line	formation	/// full-body `tie_rank` order is imposed in Rust at group formation. And
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3119	crates/pulsus-read/src/traces/exec.rs	3119		prose	generator_settings	generator_settings

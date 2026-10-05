@@ -114,23 +114,6 @@ async fn setup_db(db: &str) -> ChClient {
         )
         .await
         .expect("create metric_samples");
-    // Issue #623: the fan-out fetch reads both sample tables in one
-    // statement. The histogram table's columns are the union's.
-    client
-        .execute(
-            "CREATE TABLE metric_hist_samples (metric_name String, fingerprint UInt128, \
-             unix_milli Int64, schema Int8, zero_threshold Float64, zero_count UInt64, \
-             count UInt64, sum Float64, pos_span_offsets Array(Int32), \
-             pos_span_lengths Array(UInt32), pos_bucket_deltas Array(Int64), \
-             neg_span_offsets Array(Int32), neg_span_lengths Array(UInt32), \
-             neg_bucket_deltas Array(Int64), custom_values Array(Float64), \
-             counter_reset_hint UInt8) ENGINE = MergeTree \
-             ORDER BY (metric_name, fingerprint, unix_milli)",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create metric_hist_samples");
     client
 }
 
@@ -139,6 +122,14 @@ struct Stage2Row {
     fingerprint: u128,
     service: String,
     labels: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MultiSampleRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    value: f64,
 }
 
 /// A synthetic fingerprint set whose `IN (...)` list alone renders past
@@ -222,7 +213,6 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     let fps = oversized_fingerprint_set();
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         "metric_samples",
-        "metric_hist_samples",
         &["up".to_string()],
         &fps,
         0,
@@ -235,12 +225,7 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     );
 
     let default_result =
-        run_to_completion::<pulsus_read::metrics::sample_rows::MultiUnionSampleRow>(
-            &client,
-            &sql,
-            &QuerySettings::new(),
-        )
-        .await;
+        run_to_completion::<MultiSampleRow>(&client, &sql, &QuerySettings::new()).await;
     let err = default_result.expect_err(
         "an oversized sample_fetch_multi SQL text must fail to parse under ClickHouse's \
          server-default max_query_size",
@@ -252,10 +237,8 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     );
 
     let raised = QuerySettings::new().set("max_query_size", MAX_QUERY_TEXT_BYTES);
-    let rows = run_to_completion::<pulsus_read::metrics::sample_rows::MultiUnionSampleRow>(
-        &client, &sql, &raised,
-    )
-    .await
-    .expect("the same SQL text must succeed once max_query_size is raised");
+    let rows = run_to_completion::<MultiSampleRow>(&client, &sql, &raised)
+        .await
+        .expect("the same SQL text must succeed once max_query_size is raised");
     assert_eq!(rows, 0, "the fixture table is empty by construction");
 }

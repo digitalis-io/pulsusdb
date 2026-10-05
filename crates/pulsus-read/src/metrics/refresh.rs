@@ -1,6 +1,6 @@
 //! The only ClickHouse-touching code in this module: the docs/architecture.md
 //! §5.2 sweep (every `(metric_name, fingerprint)` in `metric_series` since
-//! `floor(now - window)`, joined to its label set in `metric_labels` —
+//! `floor(now - window)`, with its own label row in `metric_labels` —
 //! [`super::sql::sweep_query`]), building a whole new
 //! [`super::labels::CacheSnapshot`] and atomically swapping it into the
 //! resident [`super::labels::LabelCache`]. [`spawn_refresh_loop`] runs this
@@ -155,19 +155,20 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 /// connection (the `read_query_settings`/`probe_fanout_bound` precedent).
 ///
 /// **`distributed_product_mode = 'local'`, always** (issue #623). Clustered,
-/// the label side reads `metric_labels*_dist` for the fingerprints a nested
-/// `metric_series*_dist` read names, which the default `'deny'` refuses.
+/// the sweep reads `metric_labels*_dist` for the `(metric_name,
+/// fingerprint)` pairs a nested `metric_series*_dist` read names, which the
+/// default `'deny'` refuses.
 /// `'local'` is exact: one kind-2 row writes a series' activity row and its
 /// label row on the same node, so each shard's labels cover each shard's
 /// series. Single-node there is no `Distributed` table and the setting
 /// changes nothing.
 ///
-/// **`join_algorithm = 'hash'`** (issue #623): the label join's build side
-/// is one row per label set. Left to the server's default the join became
-/// `parallel_hash`, which reserved about 42 MiB before reading a row — a
-/// ten-series sweep failed a 4 MiB ceiling that the plain hash join meets
-/// (measured on 26.3.29.7), and the reservation grows with the thread
-/// count, so a ceiling would not mean the same on two machines.
+/// **`join_algorithm = 'hash'`** (issue #623). The sweep reads label rows
+/// first and joins nothing, so the setting decides nothing for it today; it
+/// is the metrics reads' join choice ([`super::exec`]'s series reads), kept
+/// here so a sweep that did join would not fall to the server's default
+/// `parallel_hash`, which reserved about 42 MiB before reading a row —
+/// measured on 26.3.29.7, growing with the thread count.
 pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_memory_usage", read_max_memory_bytes)

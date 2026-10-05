@@ -119,14 +119,14 @@ fn create_dist_sql(db: &str, cluster: &str) -> String {
 
 fn populate_sql(source_table: &str, labels_table: &str, target_table: &str) -> String {
     // Issue #623: the label text is in `metric_labels`, one row per
-    // fingerprint, joined back onto each activity row.
+    // series, joined back onto each activity row by the pair.
     format!(
         "INSERT INTO {target_table}\n\
-         SELECT s.unix_milli AS bucket, s.metric_name, kv.1 AS key, kv.2 AS val, fingerprint\n\
+         SELECT s.unix_milli AS bucket, metric_name, kv.1 AS key, kv.2 AS val, fingerprint\n\
          FROM {source_table} AS s\n\
-         INNER JOIN (SELECT fingerprint, any(labels) AS label_set FROM {labels_table} \
-         GROUP BY fingerprint) AS l USING (fingerprint)\n\
-         ARRAY JOIN JSONExtractKeysAndValues(l.label_set, 'String') AS kv"
+         ANY INNER JOIN (SELECT metric_name, fingerprint, labels FROM {labels_table}) AS l \
+         USING (metric_name, fingerprint)\n\
+         ARRAY JOIN JSONExtractKeysAndValues(l.labels, 'String') AS kv"
     )
 }
 
@@ -255,8 +255,10 @@ mod tests {
     #[test]
     fn populate_sql_array_joins_over_json_extract_keys_and_values() {
         let sql = populate_sql("metric_series", "metric_labels", "metric_series_idx");
-        assert!(sql.contains("ARRAY JOIN JSONExtractKeysAndValues(l.label_set, 'String') AS kv"));
+        assert!(sql.contains("ARRAY JOIN JSONExtractKeysAndValues(l.labels, 'String') AS kv"));
         assert!(sql.contains("FROM metric_labels"));
+        // Issue #623: each activity row meets its own series' label row.
+        assert!(sql.contains("USING (metric_name, fingerprint)"));
         assert!(sql.contains("INSERT INTO metric_series_idx"));
         assert!(sql.contains("FROM metric_series"));
     }

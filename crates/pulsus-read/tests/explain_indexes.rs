@@ -2022,10 +2022,8 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     );
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
-    let hist = format!("{db}.metric_hist_samples");
     pulsus_read::metrics::sample_sql::sample_fetch(
         &table,
-        &hist,
         plan.selectors[0]
             .metric_name
             .as_deref()
@@ -2160,10 +2158,8 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     assert_eq!(plan.selectors[0].metric_name, None, "name-less selector");
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
-    let hist = format!("{db}.metric_hist_samples");
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         &table,
-        &hist,
         &["mq".to_string(), "mq2".to_string()],
         &[
             Fingerprint::from_raw(u128::from(MFP)).sql_literal(),
@@ -2262,10 +2258,8 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
 
     let (lower_excl, upper_incl) = info_sel.fetch_window(&params);
     let samples_table = format!("{db}.metric_samples");
-    let hist_table = format!("{db}.metric_hist_samples");
     let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
         &samples_table,
-        &hist_table,
         "target_info",
         &[Fingerprint::from_raw(u128::from(INFO_FP)).sql_literal()],
         lower_excl,
@@ -2425,11 +2419,13 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
             "unix_milli",
             "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), and((fingerprint in #-element set), (metric_name in #-element set))))",
             // Issue #623: the label join reads `metric_labels` by its key,
-            // for the fingerprints the series side named.
+            // `(metric_name, fingerprint)`, for the resolved names and
+            // fingerprints.
             "PrimaryKey",
             "Keys:",
+            "metric_name",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (metric_name in #-element set))",
         ]),
         "both the metric_name IN and fingerprint IN components must engage the metric_series primary key"
     );
@@ -2523,21 +2519,22 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
          MinMax/Partition/PrimaryKey analysis"
     );
     let wide = explain(&client, &wide_sql).await;
-    // Issue #623: the wide statement reads the series rows exactly as the
-    // narrow one does, then the label table by its key for the
-    // fingerprints those rows named.
-    let mut wide_series = narrow.clone();
-    wide_series.extend(v(&[
-        "PrimaryKey",
-        "Keys:",
-        "fingerprint",
-        "Condition: (fingerprint in #-element set)",
-    ]));
+    // Issue #623: the unnamed wide statement reads label rows first, by
+    // their key, for the `(metric_name, fingerprint)` pairs the series
+    // rows in the window name. Its series read is the `IN` set's
+    // sub-query — the narrow statement's own `WHERE`, analysed when the set
+    // is built and not printed here — so the narrow statement's index usage
+    // above is the series side of the read it replaces.
     assert_eq!(
-        wide, wide_series,
-        "issue #472 must not trade the wide discovery read for a differently-indexed one: \
-         the narrow statement's index usage must equal the series side of the statement it \
-         replaces"
+        wide,
+        v(&[
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "fingerprint",
+            "Condition: ((metric_name, fingerprint) in #-element set)",
+        ]),
+        "the wide discovery read must reach `metric_labels` through its key"
     );
 }
 
@@ -2670,16 +2667,15 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
             "PrimaryKey",
             "Keys:",
             "metric_name",
-            "fingerprint",
             "unix_milli",
-            // Issue #623: the label matcher is a sub-query over
-            // `metric_labels`, whose fingerprint set prunes the series key
-            // too.
-            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in #-element set))))",
+            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in #-element set)))",
+            // Issue #623: the label join reads the probed names' own label
+            // rows, a key range of `metric_labels`, where the label
+            // matcher runs.
             "PrimaryKey",
             "Keys:",
-            "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "metric_name",
+            "Condition: (metric_name in #-element set)",
         ]),
         "the metric_name IN component must engage the metric_series primary key"
     );

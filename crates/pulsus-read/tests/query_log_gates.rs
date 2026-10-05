@@ -2157,10 +2157,11 @@ async fn seed_metric_series_472(
         ),
         format!(
             "CREATE TABLE {db}.{labels} (\
+               metric_name  LowCardinality(String), \
                fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
                labels       String  CODEC(ZSTD(5))\
              ) ENGINE = ReplacingMergeTree \
-             ORDER BY fingerprint"
+             ORDER BY (metric_name, fingerprint)"
         ),
         format!(
             "INSERT INTO {db}.{table} (metric_name, fingerprint, unix_milli) \
@@ -2171,7 +2172,8 @@ async fn seed_metric_series_472(
         ),
         format!(
             "INSERT INTO {db}.{labels} \
-             SELECT number + 1, \
+             SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
+                    number + 1, \
                     concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
                            '\",\"pod\":\"pod-', toString(number), \
                            '\",\"pad\":\"', repeat('x', {pad}), '\"}}') \
@@ -2243,12 +2245,11 @@ async fn corpus_shape(client: &ChClient, db: &str, table: &str, labels: &str) ->
 /// issue #25; nothing here asserts a duration.
 ///
 /// **What this gate does NOT claim.** Blob-invariance holds for the
-/// **unfiltered** call only. A `match[]` carrying a label matcher renders
-/// a `metric_labels` sub-query into the same `WHERE` (issue #623), so the
-/// label table is read to evaluate the filter and the narrow form's bytes
-/// grow with the blob too; that case's win is transport and parse count,
-/// not bytes read. Since #623 the wide statement is the label join, and
-/// the blob it pays for is the label table's.
+/// **unfiltered** call only. A `match[]` carrying a label matcher reads
+/// `metric_labels` to evaluate the filter (issue #623), so the narrow
+/// form's bytes grow with the blob too; that case's win is transport and
+/// parse count, not bytes read. Since #623 the wide statement reads each
+/// series' own label row, and the blob it pays for is the label table's.
 #[tokio::test]
 async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invariant() {
     skip_unless_live!();
@@ -8876,8 +8877,9 @@ async fn exec_623(client: &ChClient, sql: &str) {
         .unwrap_or_else(|e| panic!("{e}\n{sql}"));
 }
 
-async fn fresh_db_623(name: &str) -> (ChClient, String, ChClient) {
-    let db = pulsus_testkit::test_db(name);
+/// A fresh database `db` (composed by the caller through
+/// `pulsus_testkit::test_db`), schema applied.
+async fn fresh_db_623(db: String) -> (ChClient, String, ChClient) {
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     admin
         .execute(
@@ -8945,7 +8947,8 @@ async fn fingerprints_623(client: &ChClient, sql: &str, settings: &QuerySettings
 #[tokio::test]
 async fn matchers_read_only_the_metrics_labels() {
     skip_unless_live!();
-    let (admin, db, client) = fresh_db_623("pulsus_read_it_qlg_623_own_labels").await;
+    let (admin, db, client) =
+        fresh_db_623(pulsus_testkit::test_db("pulsus_read_it_qlg_623_own_labels")).await;
     let now_ms = now_ns() / 1_000_000;
     let bucket_ms: i64 = 3_600_000;
     let bucket = (now_ms / bucket_ms) * bucket_ms;
@@ -9050,7 +9053,10 @@ async fn matchers_read_only_the_metrics_labels() {
 #[tokio::test]
 async fn two_million_series_within_128_mib() {
     skip_unless_live!();
-    let (admin, db, client) = fresh_db_623("pulsus_read_it_qlg_623_two_million").await;
+    let (admin, db, client) = fresh_db_623(pulsus_testkit::test_db(
+        "pulsus_read_it_qlg_623_two_million",
+    ))
+    .await;
     let now_ms = now_ns() / 1_000_000;
     let bucket_ms: i64 = 3_600_000;
     let bucket = (now_ms / bucket_ms) * bucket_ms;
@@ -9374,13 +9380,33 @@ async fn unnamed_label_reads_fit_where_todays_did() {
         end_ms: b + 4 * h + h / 2,
     };
     let bound = format!("unix_milli >= {b} AND unix_milli <= {}", b + 4 * h);
-    for (tag, large, shared) in [
-        ("small_x1", false, false),
-        ("small_x2", false, true),
-        ("large_x1", true, false),
-        ("large_x2", true, true),
+    for (tag, large, shared, db) in [
+        (
+            "small_x1",
+            false,
+            false,
+            pulsus_testkit::test_db("pulsus_read_it_qlg_623_q3_small_x1"),
+        ),
+        (
+            "small_x2",
+            false,
+            true,
+            pulsus_testkit::test_db("pulsus_read_it_qlg_623_q3_small_x2"),
+        ),
+        (
+            "large_x1",
+            true,
+            false,
+            pulsus_testkit::test_db("pulsus_read_it_qlg_623_q3_large_x1"),
+        ),
+        (
+            "large_x2",
+            true,
+            true,
+            pulsus_testkit::test_db("pulsus_read_it_qlg_623_q3_large_x2"),
+        ),
     ] {
-        let (admin, db, client) = fresh_db_623(&format!("pulsus_read_it_qlg_623_q3_{tag}")).await;
+        let (admin, db, client) = fresh_db_623(db).await;
         seed_q3_fixture(&client, &db, large, shared, &frame, now_ms).await;
 
         // (what, today's text, the new text, the exactness columns, the

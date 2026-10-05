@@ -610,7 +610,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     let upper_bound_ms = floor_to_activity_bucket(far_future_window.end_ms, bucket);
     let truth_sql = format!(
         "SELECT DISTINCT fingerprint FROM metric_series \
-         INNER JOIN metric_labels USING (fingerprint) \
+         INNER JOIN metric_labels USING (metric_name, fingerprint) \
          WHERE metric_name = 'http_requests_total' \
            AND unix_milli >= {lower_bound_ms} AND unix_milli <= {upper_bound_ms} \
            AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')"
@@ -920,7 +920,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
 }
 
 /// Issue #623: a series is two rows now — its activity in `metric_series`
-/// and its label set, once, in `metric_labels`.
+/// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
     metric_name: String,
@@ -930,6 +930,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -947,6 +948,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
         })

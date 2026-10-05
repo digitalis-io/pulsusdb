@@ -46,11 +46,12 @@ at the column type's default.
 |---|---|---|---|
 | 0 | a float sample | `metric_samples` | `metric_samples_mv` |
 | 1 | a native-histogram sample | `metric_hist_samples` | `metric_hist_samples_mv` |
-| 2 | a series registration | `metric_series` (activity) and `metric_labels` (the label set) | `metric_series_mv`, `metric_labels_mv` |
+| 2 | a series registration | `metric_series` (activity) and `metric_labels` (the series' label set) | `metric_series_mv`, `metric_labels_mv` |
 | 3 | a metadata descriptor | `metric_metadata` | `metric_metadata_mv` |
 
 Issue #623 split the kind-2 target in two: `metric_series` keeps the activity rows and
-`metric_labels` the label set, once per fingerprint (`docs/schemas.md` §2.1).
+`metric_labels` the label set, one row per series keyed `(metric_name, fingerprint)`
+(`docs/schemas.md` §2.1).
 
 ### 1.1 The landing table
 
@@ -145,7 +146,7 @@ SELECT metric_name AS metric_name, fingerprint AS fingerprint,
 FROM {{db}}.metric_landing WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels AS
-SELECT fingerprint AS fingerprint, labels AS labels
+SELECT metric_name AS metric_name, fingerprint AS fingerprint, labels AS labels
 FROM {{db}}.metric_landing WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata AS

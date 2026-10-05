@@ -55,7 +55,7 @@ pub const BODY: &str = "body";
 /// key inside it is a name that is not a column and resolves to an
 /// extraction over one — the same shape the shipped metrics read path
 /// already renders for `labels`
-/// (`crates/pulsus-read/src/metrics/series_where.rs:333`).
+/// (`crates/pulsus-read/src/metrics/series_where.rs:384`).
 ///
 /// **Why the seed carries one at all.** Without a resolvable
 /// structured-metadata name, [`LabelFilterLower::capability`] refuses

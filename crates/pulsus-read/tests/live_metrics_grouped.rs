@@ -1297,7 +1297,6 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         );
         let raw_sql = sample_sql::sample_fetch(
             "metric_samples",
-            "metric_hist_samples",
             case.metric,
             &fps,
             case.lower_excl_ms,
@@ -1314,7 +1313,7 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         ids.push((pushed_id, pushed_sql.len().to_string(), 0));
         let raw_id = format!("{tag}_{n}_raw");
         for _ in 0..3 {
-            h.run_tagged::<pulsus_read::metrics::sample_rows::UnionSampleRow>(&raw_sql, &raw_id)
+            h.run_tagged::<pulsus_read::metrics::SampleRow>(&raw_sql, &raw_id)
                 .await;
         }
         ids.push((raw_id, raw_sql.len().to_string(), 0));
@@ -2021,7 +2020,7 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
 }
 
 /// Issue #623: a series is two rows now — its activity in `metric_series`
-/// and its label set, once, in `metric_labels`.
+/// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
     metric_name: String,
@@ -2031,6 +2030,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -2048,6 +2048,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
         })

@@ -10,7 +10,7 @@
 //! worth stating exactly, because the wider claim is false.
 //!
 //! The read path builds a float sample at two places — `group_rows` and
-//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2116` and
+//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2268` and
 //! `:2170`). Mutating **both**, one mutation at a time, against the three
 //! live suites for this engine (`live_metrics_engine`,
 //! `live_metrics_cache`, `live_discovery_fallback` — 39 tests) and the two
@@ -1828,7 +1828,7 @@ async fn every_query_answers_the_same_through_the_read_path_and_in_memory() {
 }
 
 /// Issue #623: a series is two rows now — its activity in `metric_series`
-/// and its label set, once, in `metric_labels`.
+/// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
     metric_name: String,
@@ -1838,6 +1838,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -1855,6 +1856,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
         })

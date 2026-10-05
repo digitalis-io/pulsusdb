@@ -59,8 +59,8 @@ pub struct LabelCacheConfig {
     /// `metric_series` (or its `_dist`-suffixed wrapper — cluster-aware
     /// resolution lives in the server's config wiring, not here).
     pub series_table: String,
-    /// `metric_labels` (or its `_dist`-suffixed wrapper), the one row per
-    /// label set the sweep joins back onto the series it finds (issue #623).
+    /// `metric_labels` (or its `_dist`-suffixed wrapper), one row per
+    /// series, which the sweep reads for the series it finds (issue #623).
     pub labels_table: String,
     /// `PULSUS_SERIES_ACTIVITY_BUCKET`, milliseconds.
     pub bucket_ms: i64,

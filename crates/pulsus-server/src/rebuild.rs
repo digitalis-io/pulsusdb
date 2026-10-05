@@ -29,7 +29,7 @@ use crate::chconfig::{conn_config_from, schema_params_from};
 /// without dropping those partitions first.
 ///
 /// `metric_metadata` and `metric_labels` do: each is a replacing table keyed
-/// on what a replayed row repeats (`metric_name`, `fingerprint`), so a
+/// on what a replayed row repeats (`metric_name`; `(metric_name, fingerprint)`), so a
 /// replayed row is the same row or loses to a newer one. The other three are
 /// append-only, so a replay that does not drop first stores every row twice
 /// and inflates every counting query.

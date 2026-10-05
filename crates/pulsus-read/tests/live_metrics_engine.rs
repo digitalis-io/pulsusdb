@@ -903,7 +903,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
 /// every selector fetch at entry until released, so a `sum(foo) +
 /// sum(bar)` query's two selector fetches can only both be observed
 /// in-flight (`FetchProbe::in_flight() == 2`) if `query_inner`'s
-/// `join_all` (`metrics/exec.rs:524-529`) truly dispatched them
+/// `join_all` (`metrics/exec.rs:597-602`) truly dispatched them
 /// concurrently — under a regression to a sequential per-selector loop,
 /// the second selector's fetch is never even constructed until the first
 /// completes, so `in_flight` can never reach 2 and the rendezvous below
@@ -1893,13 +1893,11 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     assert!(
         fetch_stage
             .sql
-            .contains("SELECT fingerprint, unix_milli, hist, value"),
+            .contains("SELECT fingerprint, unix_milli, value"),
         "expected real sample_fetch SQL, got: {}",
         fetch_stage.sql
     );
-    // Issue #623: one statement over both sample tables.
-    assert!(fetch_stage.sql.contains("FROM metric_samples\n"));
-    assert!(fetch_stage.sql.contains("FROM metric_hist_samples\n"));
+    assert!(fetch_stage.sql.contains("FROM metric_samples"));
     assert!(fetch_stage.sql.contains("PREWHERE metric_name = 'up'"));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
@@ -3231,9 +3229,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
         "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
     );
-    // Issue #623: the list is named once for both sample tables.
-    assert!(sql.starts_with("WITH [toUInt128('1')] AS fps\n"), "{sql}");
-    assert_eq!(sql.matches("fingerprint IN fps").count(), 2, "{sql}");
+    assert!(sql.contains("fingerprint IN (toUInt128('1'))"), "{sql}");
     assert!(!sql.contains("other_metric"), "{sql}");
 
     match result {
@@ -3296,10 +3292,10 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
 /// Issue #85 code review round 1, finding 1 (live gap): a genuine
 /// `(metric_name, fingerprint)` cross-pair the cache did NOT resolve —
 /// the name is known via one fingerprint, the fingerprint via another
-/// name, and the pair itself exists only in `metric_samples` (a series
-/// registered inside the post-sweep recency gap). The flat IN×IN fetch
-/// returns its rows; they must surface with the fingerprint's hydrated
-/// (name-invariant) labels, NEVER an empty label set.
+/// name, and the pair registered inside the post-sweep recency gap. The
+/// flat IN×IN fetch returns its rows; they must surface with the pair's
+/// own label row, looked up by the pair (issue #623), NEVER an empty label
+/// set.
 #[tokio::test]
 async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels() {
     skip_unless_live!();
@@ -3352,10 +3348,21 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
     cache.refresh().await.expect("refresh");
     assert!(cache.is_warm());
 
-    // POST-sweep: the cross-pair's samples land (its metric_series row
-    // would land too in production, but the resident snapshot predates
-    // it — the sanctioned recency gap). fp1's labels are name-invariant
-    // ({job:"api"}), known to the cache only via cross_a_total.
+    // POST-sweep: the cross-pair registers and its samples land. Its
+    // activity and label rows are written as production writes them (one
+    // kind-2 row each), but the resident snapshot predates them — the
+    // sanctioned recency gap. Issue #623: the fan-out looks the pair up by
+    // the pair and finds its own label row.
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "cross_b_total".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            labels: r#"{"job":"api"}"#.to_string(),
+        }],
+    )
+    .await;
     seed_samples(
         &client,
         &[
@@ -4328,7 +4335,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
 }
 
 /// Issue #623: a series is two rows now — its activity in `metric_series`
-/// and its label set, once, in `metric_labels`.
+/// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
     metric_name: String,
@@ -4338,6 +4345,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    metric_name: String,
     fingerprint: u128,
     labels: String,
 }
@@ -4355,6 +4363,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
         })

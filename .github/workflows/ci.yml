@@ -1790,8 +1790,8 @@ jobs:
         run: cargo test -p pulsus-read --test live_metrics_engine
 
       # Issue #623: every series read against answers written from the seed,
-      # with labels stored once per fingerprint, and the one statement that
-      # reads both sample tables.
+      # each series answered from its own label row, and the float and
+      # histogram reads sent together on every fetch path.
       - name: Live metrics storage suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

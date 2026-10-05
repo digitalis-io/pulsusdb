@@ -54,11 +54,11 @@
 //! `impl` headers, not the language's notion of visibility — see the
 //! test's own doc for what it cannot see:
 //!
-//! * [`SeriesWhere`] — the type name (`pub(super)`); its `tail` field
-//!   stays private, so the type can be named but not forged, and there is
-//!   no direct `w.tail` access. Its derived `Debug` does print `tail`,
-//!   which confers nothing beyond what `where_tail` already hands to the
-//!   same audience.
+//! * [`SeriesWhere`] — the type name (`pub(super)`); its fields stay
+//!   private, so the type can be named but not forged, and there is no
+//!   direct `w.tail` access. Its derived `Debug` does print them, which
+//!   confers nothing beyond what `where_tail` and `join_parts` already hand
+//!   to the same audience.
 //! * [`SeriesWhere::new`] — consumes the matchers and renders bound,
 //!   probe and matcher conjuncts together.
 //! * [`SeriesWhere::where_tail`] — the whole tail, one string.
@@ -171,10 +171,13 @@ impl PromqlRe2Fallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MatcherTarget<'a> {
     /// Ordinary label matchers, read out of the stored JSON blob in
-    /// `table` (`metric_labels`, one row per label set, issue #623).
-    /// `JSONExtractString` returns `''` for a missing key, which is
-    /// Prometheus's absent-label rule and matches `super::labels`'
-    /// in-process `""` — load-bearing for the cache-vs-SQL differential.
+    /// `table` (`metric_labels`, one row per series keyed `(metric_name,
+    /// fingerprint)`, issue #623). `scope` is the head's name predicate
+    /// (`metric_name = 'up'`, `metric_name IN ('a', 'b')`): the label rows
+    /// read are that metric's alone. `JSONExtractString` returns `''` for a
+    /// missing key, which is Prometheus's absent-label rule and matches
+    /// `super::labels`' in-process `""` — load-bearing for the cache-vs-SQL
+    /// differential.
     Labels {
         table: &'a str,
         scope: Option<&'a str>,
@@ -233,12 +236,18 @@ pub(super) enum MatcherTarget<'a> {
 #[derive(Debug)]
 pub(super) struct SeriesWhere {
     /// `unix_milli >= <floor><probe> AND unix_milli <= <floor>` followed by
-    /// the matchers: one `fingerprint IN (<label table sub-query>)` for label
-    /// matchers, one `\n  AND <predicate>` each for name matchers. Private:
-    /// the two halves are never handed out separately, which is what makes
-    /// "a regex without its probe" unrepresentable rather than merely
-    /// untested.
+    /// the matchers: one label-table sub-query for label matchers, one
+    /// `\n  AND <predicate>` each for name matchers. Private: the bound and
+    /// the matchers are never handed out separately except as
+    /// [`Self::join_parts`]' pair, whose bound still carries the probe —
+    /// which is what makes "a regex without its probe" unrepresentable
+    /// rather than merely untested.
     tail: String,
+    /// The bound alone, probe included, for [`Self::join_parts`].
+    bound: String,
+    /// A join's label side, for [`Self::join_parts`]: the scope and the
+    /// label predicates; `None` when there is neither.
+    label_where: Option<String>,
 }
 
 impl SeriesWhere {
@@ -254,19 +263,41 @@ impl SeriesWhere {
         let lower = floored_bound(window.start_ms, bucket_ms);
         let upper = floored_bound(window.end_ms, bucket_ms);
         let probe = re2_compile_probe(matchers);
-        let mut tail = format!("unix_milli >= {lower}{probe} AND unix_milli <= {upper}");
+        let bound = format!("unix_milli >= {lower}{probe} AND unix_milli <= {upper}");
+        let mut tail = bound.clone();
+        let mut label_where = None;
         match target {
             // The series rows hold no label text (issue #623): the matchers
-            // select fingerprints out of the one-row-per-label-set table.
-            MatcherTarget::Labels { table, .. } if !matchers.is_empty() => {
-                let predicates: Vec<String> =
-                    matchers.iter().map(|m| predicate(m, target)).collect();
-                tail.push_str(&format!(
-                    "\n  AND fingerprint IN (\n    SELECT fingerprint\n    FROM {table}\n    WHERE {}\n  )",
-                    predicates.join("\n      AND ")
-                ));
+            // select series out of the label table, one row per series. With
+            // a scope they read that metric's label rows and select its
+            // fingerprints; without one they select `(metric_name,
+            // fingerprint)` pairs, since a fingerprint is shared by names and
+            // a series meets only its own label row.
+            MatcherTarget::Labels { table, scope } => {
+                let preds = (!matchers.is_empty()).then(|| {
+                    matchers
+                        .iter()
+                        .map(|m| predicate(m, target))
+                        .collect::<Vec<String>>()
+                        .join("\n      AND ")
+                });
+                label_where = match (scope, &preds) {
+                    (Some(scope), Some(preds)) => Some(format!("{scope}\n      AND {preds}")),
+                    (Some(scope), None) => Some(scope.to_string()),
+                    (None, Some(preds)) => Some(preds.clone()),
+                    (None, None) => None,
+                };
+                match (scope, &preds) {
+                    (Some(_), Some(_)) => tail.push_str(&format!(
+                        "\n  AND fingerprint IN (\n    SELECT fingerprint\n    FROM {table}\n    WHERE {}\n  )",
+                        label_where.as_deref().unwrap_or_default()
+                    )),
+                    (None, Some(preds)) => tail.push_str(&format!(
+                        "\n  AND (metric_name, fingerprint) IN (\n    SELECT metric_name, fingerprint\n    FROM {table}\n    WHERE {preds}\n  )"
+                    )),
+                    (_, None) => {}
+                }
             }
-            MatcherTarget::Labels { .. } => {}
             MatcherTarget::MetricNameColumn => {
                 for m in matchers {
                     tail.push_str("\n  AND ");
@@ -274,7 +305,11 @@ impl SeriesWhere {
                 }
             }
         }
-        SeriesWhere { tail }
+        SeriesWhere {
+            tail,
+            bound,
+            label_where,
+        }
     }
 
     /// The rendered `WHERE` tail — bound, probe and matchers, as one
@@ -284,10 +319,14 @@ impl SeriesWhere {
         &self.tail
     }
 
-    /// STUB (issue #623, tests first).
-    #[allow(dead_code)]
+    /// The join form's two halves (issue #623): the series side's bound,
+    /// probe included, and the label side's `WHERE` — the scope and the
+    /// label predicates, or the predicates alone when unscoped. `None` when
+    /// there is neither scope nor matcher, so no label side to hold.
     pub(super) fn join_parts(&self) -> Option<(&str, &str)> {
-        None
+        self.label_where
+            .as_deref()
+            .map(|label_where| (self.bound.as_str(), label_where))
     }
 }
 
