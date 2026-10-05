@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Two fixtures, two databases.**
+//! **Six fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -20,8 +20,17 @@
 //!   boolean `true`, an integer at and just past `f64`'s exactness limit,
 //!   and an id containing a hex letter. §6.1's ids are digits only, so no
 //!   uppercase literal can discriminate there.
+//! * Fixture R — four spans, one resource each: resource and
+//!   instrumentation values of every type, and a resource row deleted.
+//! * Fixture S — ten spans, one stored form of `service.name` each.
+//! * Fixture C — the catalogue fixture, 34 spans transcribed from
+//!   `docs/TraceQL/measure/fixture/make_catalogue_fixture.py`, whose answers
+//!   are `docs/TraceQL/query-catalogue-accepted.md`'s.
+//! * Fixture V — eight spans whose events, links and scopes tell
+//!   any-match from first-element and all-match, and the unscoped chain's
+//!   order from any other.
 //!
-//! Both are seeded by building the OTLP request bodies and handing them to
+//! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
 //! produces into `trace_landing`: the fixture's bytes go through the
 //! shipped encoder, so a case cannot pass against an `attrs` value the
@@ -2093,6 +2102,1234 @@ async fn the_service_name_is_compared_only_as_a_string() {
         "{} of {} fixture-S checks answer something else:\n\n{}",
         wrong.len(),
         cells + 5,
+        wrong.join("\n\n")
+    );
+}
+
+// =====================================================================
+// Issue #589 part 2 — event and link conditions, the four event and link
+// intrinsics, and the unscoped `.k` chain
+// =====================================================================
+
+/// One span with its own status message — `span_of` writes `"boom"` for
+/// every non-zero status, and the catalogue fixture carries `''` on all
+/// but one.
+#[allow(clippy::too_many_arguments)]
+fn span_with_message(
+    trace_id: Vec<u8>,
+    span_id: Vec<u8>,
+    parent_span_id: Vec<u8>,
+    name: &str,
+    kind: i32,
+    start_ns: i64,
+    duration_ns: i64,
+    attributes: Vec<KeyValue>,
+    status: Option<(i32, &str)>,
+    events: Vec<span::Event>,
+    links: Vec<span::Link>,
+) -> Span {
+    Span {
+        status: status.map(|(code, message)| Status {
+            message: message.to_string(),
+            code,
+        }),
+        ..span_of(
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            kind,
+            start_ns,
+            duration_ns,
+            attributes,
+            0,
+            events,
+            links,
+        )
+    }
+}
+
+/// One request: one resource, one scope, the spans given.
+fn group_request(
+    resource_attrs: Vec<KeyValue>,
+    scope: InstrumentationScope,
+    spans: Vec<Span>,
+) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: resource_attrs,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+fn scope_named(name: &str, version: &str, attributes: Vec<KeyValue>) -> InstrumentationScope {
+    InstrumentationScope {
+        name: name.to_string(),
+        version: version.to_string(),
+        attributes,
+        dropped_attributes_count: 0,
+    }
+}
+
+fn event_of(time_ns: i64, name: &str, attributes: Vec<KeyValue>) -> span::Event {
+    span::Event {
+        time_unix_nano: time_ns as u64,
+        name: name.to_string(),
+        attributes,
+        dropped_attributes_count: 0,
+    }
+}
+
+fn link_of(trace_id: Vec<u8>, span_id: Vec<u8>, attributes: Vec<KeyValue>) -> span::Link {
+    span::Link {
+        trace_id,
+        span_id,
+        trace_state: String::new(),
+        attributes,
+        dropped_attributes_count: 0,
+        flags: 0,
+    }
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// 10.1 — the §6.1 fixture
+// ---------------------------------------------------------------------
+
+const CASES_61_PART2: &[CaseIn] = &[
+    CaseIn {
+        name: "F10",
+        query: r#"{ event.exception.type = "java.lang.IllegalStateException" }"#,
+        want: Want::Ids(&["0005"]),
+    },
+    CaseIn {
+        name: "F11",
+        query: r#"{ link:traceID = "11111111111111111111111111111111" }"#,
+        want: Want::Ids(&["0008"]),
+    },
+    CaseIn {
+        name: "F17",
+        query: r#"{ .app.user.id = "u-1" }"#,
+        want: Want::Ids(&["0001"]),
+    },
+    CaseIn {
+        name: "EN61",
+        query: r#"{ event:name = "exception" }"#,
+        want: Want::Ids(&["0005"]),
+    },
+    CaseIn {
+        name: "LS61",
+        query: r#"{ link:spanID = "0000000000000005" }"#,
+        want: Want::Ids(&["0008"]),
+    },
+];
+
+/// Section 10.1: events, links and the chain on the §6.1 fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_answers_events_links_and_the_chain_on_the_worked_fixture() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p2_fixture61");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_61_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p2-61-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 9,
+        "the §6.1 fixture seeds nine spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+
+    let wrong = run_cases_in(&client, w, CASES_61_PART2, id61).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} §6.1 cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_61_PART2.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 10.2 — fixture C, the catalogue fixture
+// ---------------------------------------------------------------------
+
+/// The catalogue fixture's window: `[base, base + 60 s)`.
+const CATALOGUE_WINDOW_NS: i64 = 60_000_000_000;
+
+/// The generator's `sid(n)`.
+fn sid(n: u64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
+}
+
+/// Fixture C, section 9.1: the generator's seven requests, in its
+/// first-appearance order, every span field the generator's.
+fn fixture_catalogue_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const NS: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    let t = |b: u8| vec![b; 16];
+    let res = |service: &str, env: &str, pod: &str| {
+        vec![
+            kv("service.name", str_value(service)),
+            kv("deployment.environment", str_value(env)),
+            kv("k8s.pod.name", str_value(pod)),
+        ]
+    };
+    let http = || scope_named("io.opentelemetry.http", "2.9.0", Vec::new());
+    // The generator's `span(...)`, with no event, no link, and the status
+    // given.
+    #[allow(clippy::too_many_arguments)]
+    fn s(
+        base_ns: i64,
+        trace: Vec<u8>,
+        n: u64,
+        parent: u64,
+        name: &str,
+        kind: i32,
+        t_off: i64,
+        dur: i64,
+        attrs: Vec<KeyValue>,
+        status: Option<(i32, &str)>,
+    ) -> Span {
+        span_with_message(
+            trace,
+            sid(n),
+            if parent == 0 { Vec::new() } else { sid(parent) },
+            name,
+            kind,
+            base_ns + t_off,
+            dur,
+            attrs,
+            status,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+    let b = base_ns;
+    let i = |k: &str, v: i64| kv(k, int_value(v));
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+
+    let req0 = group_request(
+        res("checkout", "prod", "checkout-a"),
+        http(),
+        vec![
+            s(
+                b,
+                t(0x11),
+                1,
+                0,
+                "GET /api/orders",
+                2,
+                0,
+                3 * NS,
+                vec![
+                    i("a", 1),
+                    i("b", 2),
+                    st("foo", "f"),
+                    st("env", "prod"),
+                    kv("success", bool_value(true)),
+                    i("retries", 1),
+                    kv("retried", bool_value(true)),
+                    i("http.status_code", 500),
+                    st("http.method", "POST"),
+                    st("http.url", "/api/orders/17"),
+                    st("http.route", "/api/v2/list"),
+                    i("bytes", 1500),
+                    i("client.timeout", 5 * NS),
+                    i("attr with spaces", 1),
+                    st("foo bar", "x"),
+                ],
+                Some((2, "boom")),
+            ),
+            s(
+                b,
+                t(0x11),
+                2,
+                1,
+                "b",
+                3,
+                100 * MS,
+                2 * NS,
+                vec![i("b", 2), i("c", 3), i("bytes", 900), i("retries", 3)],
+                None,
+            ),
+            s(
+                b,
+                t(0x11),
+                3,
+                2,
+                "c",
+                1,
+                200 * MS,
+                NS,
+                vec![i("c", 3), i("d", 4), kv("a", double_value(1.0))],
+                None,
+            ),
+        ],
+    );
+
+    let link_trace = hex_bytes("000102030405060708090a0b0c0d0e0f");
+    let link_span = hex_bytes("0a1b2c3d4e5f6071");
+    let mut span4 = s(
+        b,
+        t(0x22),
+        4,
+        0,
+        "GET /",
+        2,
+        10 * NS,
+        3 * NS,
+        vec![
+            i("a", 1),
+            i("d", 4),
+            i("http.status_code", 200),
+            st("env", "dev"),
+        ],
+        None,
+    );
+    span4.events = vec![event_of(
+        b + 10 * NS + 2 * MS,
+        "exception",
+        vec![
+            st("exception.type", "IOError"),
+            st("exception.message", "io"),
+        ],
+    )];
+    span4.links = vec![link_of(
+        link_trace,
+        link_span,
+        vec![st("relation", "child_of")],
+    )];
+    let req1 = group_request(
+        res("gw", "dev", "gw-a"),
+        scope_named(
+            "otel",
+            "1.0",
+            vec![st("name", "otel"), st("otel.scope.build", "release")],
+        ),
+        vec![span4],
+    );
+    let req2 = group_request(
+        res("gw", "dev", "gw-a"),
+        scope_named("otel", "1.0", Vec::new()),
+        vec![
+            s(
+                b,
+                t(0x22),
+                5,
+                4,
+                "GET /api/orders",
+                3,
+                10 * NS + 5 * MS,
+                NS,
+                vec![
+                    i("a", 1),
+                    i("b", 2),
+                    st("http.method", "GET"),
+                    st("http.url", "/api/v3/list"),
+                ],
+                None,
+            ),
+            s(
+                b,
+                t(0x22),
+                6,
+                5,
+                "child",
+                5,
+                10 * NS + 10 * MS,
+                500 * MS,
+                vec![i("c", 3), kv("success", bool_value(false))],
+                None,
+            ),
+        ],
+    );
+
+    let t6 = t(0x66);
+    let req3 = group_request(
+        res("plain", "staging", "plain-a"),
+        http(),
+        vec![
+            s(
+                b,
+                t(0x33),
+                7,
+                0,
+                "bare",
+                1,
+                20 * NS,
+                100 * MS,
+                Vec::new(),
+                None,
+            ),
+            s(
+                b,
+                t(0x33),
+                8,
+                7,
+                "bare child",
+                4,
+                20 * NS + 10 * MS,
+                50 * MS,
+                vec![kv("a", double_value(2.5)), i("retries", 5)],
+                Some((1, "")),
+            ),
+            s(
+                b,
+                t6.clone(),
+                40,
+                0,
+                "checkout",
+                0,
+                50 * NS,
+                1,
+                vec![i("a", 3)],
+                None,
+            ),
+            s(
+                b,
+                t6.clone(),
+                41,
+                40,
+                "Az",
+                1,
+                50 * NS + MS,
+                NS,
+                vec![i("a", 8)],
+                Some((2, "")),
+            ),
+            s(
+                b,
+                t6.clone(),
+                42,
+                40,
+                "A\n",
+                1,
+                50 * NS + 2 * MS,
+                NS,
+                vec![i("a", 2), i("b", 2)],
+                Some((2, "")),
+            ),
+            s(
+                b,
+                t6.clone(),
+                43,
+                40,
+                "\u{e9}\u{65e5}\u{1F600}",
+                1,
+                50 * NS + 3 * MS,
+                NS,
+                vec![i("a", 6)],
+                Some((2, "")),
+            ),
+            s(
+                b,
+                t6.clone(),
+                44,
+                40,
+                "col1\tcol2\n\"quoted\" \\ bell\x07 vt\x0b bs\x08 ff\x0c cr\r",
+                1,
+                50 * NS + 4 * MS,
+                NS,
+                vec![i("a", -1)],
+                Some((2, "")),
+            ),
+            s(
+                b,
+                t6.clone(),
+                45,
+                40,
+                "b",
+                1,
+                50 * NS + 5 * MS,
+                1_073_741_824,
+                vec![i("a", 1), kv("foo", bool_value(true))],
+                None,
+            ),
+            s(
+                b,
+                t6.clone(),
+                49,
+                45,
+                "b-child-1",
+                1,
+                50 * NS + 8 * MS,
+                NS,
+                Vec::new(),
+                None,
+            ),
+            s(
+                b,
+                t6.clone(),
+                50,
+                45,
+                "b-child-2",
+                1,
+                50 * NS + 9 * MS,
+                NS,
+                Vec::new(),
+                None,
+            ),
+            s(
+                b,
+                t6.clone(),
+                46,
+                40,
+                "min",
+                1,
+                50 * NS + 6 * MS,
+                NS,
+                vec![i("a", i64::MIN)],
+                None,
+            ),
+        ],
+    );
+
+    let t4 = t(0x44);
+    let t5 = t(0x55);
+    let edge = |n: u64, parent: u64, name: &str, kind: i32, t_off: i64, dur: i64, attrs| {
+        s(
+            b,
+            if n == 30 || n == 31 {
+                t5.clone()
+            } else {
+                t4.clone()
+            },
+            n,
+            parent,
+            name,
+            kind,
+            t_off,
+            dur,
+            attrs,
+            None,
+        )
+    };
+    let req4 = group_request(
+        res("edge", "prod", "edge-a"),
+        http(),
+        vec![
+            edge(20, 0, "P", 2, 30 * NS, 5 * NS, Vec::new()),
+            edge(21, 20, "A2", 1, 30 * NS + MS, NS, vec![i("a", 1)]),
+            edge(22, 21, "B1", 1, 30 * NS + 2 * MS, NS, vec![i("b", 2)]),
+            edge(23, 22, "A1", 1, 30 * NS + 3 * MS, NS, vec![i("a", 1)]),
+            edge(24, 20, "P2", 1, 30 * NS + 4 * MS, NS, Vec::new()),
+            edge(25, 24, "A3", 1, 30 * NS + 5 * MS, NS, vec![i("a", 1)]),
+            edge(26, 24, "B2", 1, 30 * NS + 6 * MS, NS, vec![i("b", 2)]),
+            edge(27, 999, "orphan", 1, 30 * NS + 7 * MS, NS, vec![i("b", 2)]),
+            edge(36, 24, "B3", 1, 30 * NS + 8 * MS, NS, vec![i("b", 2)]),
+            edge(32, 20, "A4", 1, 30 * NS + 9 * MS, NS, vec![i("a", 1)]),
+            edge(37, 32, "N1", 1, 30 * NS + 10 * MS, NS, Vec::new()),
+            edge(38, 37, "N2", 1, 30 * NS + 11 * MS, NS, Vec::new()),
+            edge(33, 38, "B4", 1, 30 * NS + 12 * MS, NS, vec![i("b", 2)]),
+            edge(30, 31, "cyc-a", 1, 40 * NS, NS, vec![i("a", 1)]),
+            edge(31, 30, "cyc-b", 1, 40 * NS + MS, NS, vec![i("b", 2)]),
+        ],
+    );
+
+    let mut shadow = res("shadow", "prod", "shadow-a");
+    shadow.push(i("http.status_code", 200));
+    let req5 = group_request(
+        shadow,
+        http(),
+        vec![s(
+            b,
+            t6.clone(),
+            47,
+            40,
+            "shadow",
+            1,
+            50 * NS + 7 * MS,
+            NS,
+            vec![i("http.status_code", 500)],
+            None,
+        )],
+    );
+    let req6 = group_request(
+        res("regex", "development", "regex-a"),
+        http(),
+        vec![s(
+            b,
+            t6,
+            48,
+            40,
+            "xGETy",
+            1,
+            50 * NS + 10 * MS,
+            NS,
+            vec![st("http.url", "x/api/z"), st("http.route", "z/api/v2/x")],
+            None,
+        )],
+    );
+    vec![req0, req1, req2, req3, req4, req5, req6]
+}
+
+/// The generator's 34 span ids, by their last four hex digits.
+const ALL_C: &[&str] = &[
+    "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0014", "0015", "0016", "0017",
+    "0018", "0019", "001a", "001b", "001e", "001f", "0020", "0021", "0024", "0025", "0026", "0028",
+    "0029", "002a", "002b", "002c", "002d", "002e", "002f", "0030", "0031", "0032",
+];
+
+const ALL_C_BUT_0001: &[&str] = &[
+    "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0014", "0015", "0016", "0017", "0018",
+    "0019", "001a", "001b", "001e", "001f", "0020", "0021", "0024", "0025", "0026", "0028", "0029",
+    "002a", "002b", "002c", "002d", "002e", "002f", "0030", "0031", "0032",
+];
+
+const ALL_C_BUT_0004: &[&str] = &[
+    "0001", "0002", "0003", "0005", "0006", "0007", "0008", "0014", "0015", "0016", "0017", "0018",
+    "0019", "001a", "001b", "001e", "001f", "0020", "0021", "0024", "0025", "0026", "0028", "0029",
+    "002a", "002b", "002c", "002d", "002e", "002f", "0030", "0031", "0032",
+];
+
+const CASES_C: &[CaseIn] = &[
+    CaseIn {
+        name: "CAT18",
+        query: r#"{ .http.status_code = 200 }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "UC1",
+        query: r#"{ .http.status_code = 500 }"#,
+        want: Want::Ids(&["0001", "002f"]),
+    },
+    CaseIn {
+        name: "CAT11",
+        query: r#"{ .env != "prod" }"#,
+        want: Want::Ids(ALL_C_BUT_0001),
+    },
+    CaseIn {
+        name: "CAT19",
+        query: r#"{ .foo }"#,
+        want: Want::Ids(&["002d"]),
+    },
+    CaseIn {
+        name: "CAT40",
+        query: r#"{ .a = nil }"#,
+        want: Want::Ids(&[
+            "0002", "0006", "0007", "0014", "0016", "0018", "001a", "001b", "001f", "0021", "0024",
+            "0025", "0026", "002f", "0030", "0031", "0032",
+        ]),
+    },
+    CaseIn {
+        name: "CAT41",
+        query: r#"{ .a != nil }"#,
+        want: Want::Ids(&[
+            "0001", "0003", "0004", "0005", "0008", "0015", "0017", "0019", "001e", "0020", "0028",
+            "0029", "002a", "002b", "002c", "002d", "002e",
+        ]),
+    },
+    CaseIn {
+        name: "CAT48",
+        query: r#"{ .a = 1 }"#,
+        want: Want::Ids(&[
+            "0001", "0003", "0004", "0005", "0015", "0017", "0019", "001e", "0020", "002d",
+        ]),
+    },
+    CaseIn {
+        name: "CAT101",
+        query: r#"{ !(.a = 1) }"#,
+        want: Want::Ids(&[
+            "0002", "0006", "0007", "0008", "0014", "0016", "0018", "001a", "001b", "001f", "0021",
+            "0024", "0025", "0026", "0028", "0029", "002a", "002b", "002c", "002e", "002f", "0030",
+            "0031", "0032",
+        ]),
+    },
+    CaseIn {
+        name: "UC-SVC",
+        query: r#"{ .service.name = "gw" }"#,
+        want: Want::Ids(&["0004", "0005", "0006"]),
+    },
+    CaseIn {
+        name: "UC-NIL service.name",
+        query: r#"{ .service.name != nil }"#,
+        want: Want::Ids(ALL_C),
+    },
+    CaseIn {
+        name: "UC-NIL deployment.environment",
+        query: r#"{ .deployment.environment != nil }"#,
+        want: Want::Ids(ALL_C),
+    },
+    CaseIn {
+        name: "UC-NIL exception.type",
+        query: r#"{ .exception.type = nil }"#,
+        want: Want::Ids(ALL_C_BUT_0004),
+    },
+    CaseIn {
+        name: "UC-RES",
+        query: r#"{ .deployment.environment = "dev" }"#,
+        want: Want::Ids(&["0004", "0005", "0006"]),
+    },
+    CaseIn {
+        name: "UC-EV",
+        query: r#"{ .exception.type = "IOError" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "UC-LK",
+        query: r#"{ .relation = "child_of" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "UC-IN",
+        query: r#"{ .otel.scope.build = "release" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "CAT51",
+        query: r#"{ event:name = "exception" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "TSS > 1ms (CAT52)",
+        query: r#"{ event:timeSinceStart > 1ms }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "TSS < 3ms",
+        query: r#"{ event:timeSinceStart < 3ms }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "CAT57",
+        query: r#"{ link:spanID = "0a1b2c3d4e5f6071" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "CAT58",
+        query: r#"{ link:traceID = "000102030405060708090a0b0c0d0e0f" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "LK-UP",
+        query: r#"{ link:traceID = "000102030405060708090A0B0C0D0E0F" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "CAT115",
+        query: r#"{ event.exception.type = "IOError" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+    CaseIn {
+        name: "CAT117",
+        query: r#"{ link.relation = "child_of" }"#,
+        want: Want::Ids(&["0004"]),
+    },
+];
+
+/// Section 10.2: the catalogue fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_answers_events_links_and_the_chain_on_the_catalogue_fixture() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p2_catalogue");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_catalogue_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p2-c-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + CATALOGUE_WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 34,
+        "the catalogue fixture seeds 34 spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+    let ids = ids_of(
+        &client,
+        &format!("SELECT lower(hex(span_id)) AS id FROM {SPANS_TABLE} ORDER BY id"),
+    )
+    .await;
+    let want: Vec<String> = ALL_C.iter().copied().map(id61).collect();
+    assert_eq!(ids, want, "the 34 span ids are the generator's");
+
+    let wrong = run_cases_in(&client, w, CASES_C, id61).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} catalogue-fixture cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_C.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 10.3 — fixture V, any element and the chain order
+// ---------------------------------------------------------------------
+
+/// `v1` to `v8`: span ids `00000000000000c1` to `…c8`.
+fn idv(short: &str) -> String {
+    format!("00000000000000c{}", short.trim_start_matches('v'))
+}
+
+/// Fixture V, section 9.2: eight requests, one span each.
+fn fixture_v_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let start = |n: u8| base_ns + i64::from(n) * MS;
+    let v_span = |n: u8,
+                  attrs: Vec<KeyValue>,
+                  events: Vec<(i64, &str, Vec<KeyValue>)>,
+                  links: Vec<span::Link>| {
+        span_with_message(
+            vec![0xcc; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, 0xc0 + n],
+            Vec::new(),
+            "span",
+            1,
+            start(n),
+            MS,
+            attrs,
+            None,
+            events
+                .into_iter()
+                .map(|(offset, name, a)| event_of(start(n) + offset, name, a))
+                .collect(),
+            links,
+        )
+    };
+    let resource = |n: u8, extra: Vec<KeyValue>| {
+        let service = match n {
+            3 => double_value(1.461413291919332),
+            6 => int_value(12345),
+            8 => str_array_value(&["vsvc", "x"]),
+            _ => str_value("vsvc"),
+        };
+        let mut attrs = vec![kv("service.name", service)];
+        attrs.extend(extra);
+        attrs
+    };
+    let v_scope = |attrs: Vec<KeyValue>| scope_named("io.pulsus.v", "1.0", attrs);
+    let dd_link = || link_of(vec![0xdd; 16], vec![0xdd; 8], vec![st("k", "l")]);
+    let e1 = || vec![(2 * MS, "e1", vec![st("k", "e")])];
+
+    vec![
+        one_span_request(
+            resource(1, vec![st("k", "r")]),
+            v_scope(vec![st("k", "i")]),
+            v_span(1, vec![st("k", "s")], e1(), vec![dd_link()]),
+        ),
+        one_span_request(
+            resource(2, vec![st("k", "r")]),
+            v_scope(vec![st("k", "i")]),
+            v_span(2, Vec::new(), e1(), vec![dd_link()]),
+        ),
+        one_span_request(
+            resource(3, Vec::new()),
+            v_scope(vec![st("k", "i")]),
+            v_span(3, Vec::new(), e1(), vec![dd_link()]),
+        ),
+        one_span_request(
+            resource(4, Vec::new()),
+            v_scope(vec![st("k", "i")]),
+            v_span(4, Vec::new(), Vec::new(), vec![dd_link()]),
+        ),
+        one_span_request(
+            resource(5, Vec::new()),
+            v_scope(vec![st("k", "i")]),
+            v_span(
+                5,
+                Vec::new(),
+                vec![(-MS, "evN", vec![kv("tags", str_array_value(&["a", "b"]))])],
+                Vec::new(),
+            ),
+        ),
+        one_span_request(
+            resource(6, Vec::new()),
+            v_scope(Vec::new()),
+            v_span(6, Vec::new(), Vec::new(), Vec::new()),
+        ),
+        one_span_request(
+            resource(7, Vec::new()),
+            v_scope(Vec::new()),
+            v_span(
+                7,
+                Vec::new(),
+                vec![
+                    (MS, "evA", vec![st("code", "c1")]),
+                    (2 * MS, "evB", vec![st("code", "c2"), st("flag", "yes")]),
+                    (5 * MS, "evC", vec![kv("code", int_value(3))]),
+                ],
+                vec![
+                    link_of(
+                        vec![0x01; 16],
+                        hex_bytes("0a0a0a0a0a0a0a01"),
+                        vec![st("lk", "l1")],
+                    ),
+                    link_of(
+                        vec![0x02; 16],
+                        hex_bytes("0b0b0b0b0b0b0b02"),
+                        vec![st("lk", "l2")],
+                    ),
+                ],
+            ),
+        ),
+        one_span_request(
+            resource(8, Vec::new()),
+            v_scope(Vec::new()),
+            v_span(
+                8,
+                Vec::new(),
+                vec![(2 * MS, "evX", vec![kv("flag", bool_value(false))])],
+                vec![link_of(
+                    vec![0x03; 16],
+                    hex_bytes("0c0c0c0c0c0c0c03"),
+                    vec![kv("lflag", bool_value(false))],
+                )],
+            ),
+        ),
+    ]
+}
+
+const ALL_V: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
+const ALL_V_BUT_V5: &[&str] = &["v1", "v2", "v3", "v4", "v6", "v7", "v8"];
+const ALL_V_BUT_V6: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v7", "v8"];
+const ALL_V_BUT_V7: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v8"];
+const ALL_V_BUT_V8: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v7"];
+const V_SVC_STRING: &[&str] = &["v1", "v2", "v4", "v5", "v7"];
+
+const CASES_V: &[CaseIn] = &[
+    CaseIn {
+        name: "CH s",
+        query: r#"{ .k = "s" }"#,
+        want: Want::Ids(&["v1"]),
+    },
+    CaseIn {
+        name: "CH r",
+        query: r#"{ .k = "r" }"#,
+        want: Want::Ids(&["v2"]),
+    },
+    CaseIn {
+        name: "CH e",
+        query: r#"{ .k = "e" }"#,
+        want: Want::Ids(&["v3"]),
+    },
+    CaseIn {
+        name: "CH l",
+        query: r#"{ .k = "l" }"#,
+        want: Want::Ids(&["v4"]),
+    },
+    CaseIn {
+        name: "CH i",
+        query: r#"{ .k = "i" }"#,
+        want: Want::Ids(&["v5"]),
+    },
+    CaseIn {
+        name: "CH6",
+        query: r#"{ .k != "e" }"#,
+        want: Want::Ids(&["v1", "v2", "v4", "v5", "v6", "v7", "v8"]),
+    },
+    CaseIn {
+        name: "CH7 != nil",
+        query: r#"{ .k != nil }"#,
+        want: Want::Ids(&["v1", "v2", "v3", "v4", "v5"]),
+    },
+    CaseIn {
+        name: "CH7 = nil",
+        query: r#"{ .k = nil }"#,
+        want: Want::Ids(&["v6", "v7", "v8"]),
+    },
+    CaseIn {
+        name: "SV1 >",
+        query: r#"{ .service.name > "u" }"#,
+        want: Want::Ids(V_SVC_STRING),
+    },
+    CaseIn {
+        name: "SV1 <",
+        query: r#"{ .service.name < "u" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV2 =",
+        query: r#"{ .service.name = 12345 }"#,
+        want: Want::Ids(&["v6"]),
+    },
+    CaseIn {
+        name: "SV2 !=",
+        query: r#"{ .service.name != 12345 }"#,
+        want: Want::Ids(ALL_V_BUT_V6),
+    },
+    CaseIn {
+        name: "SVD =",
+        query: r#"{ .service.name = 1.461413291919332 }"#,
+        want: Want::Ids(&["v3"]),
+    },
+    CaseIn {
+        name: "SVD >",
+        query: r#"{ .service.name > 1.4 }"#,
+        want: Want::Ids(&["v3", "v6"]),
+    },
+    CaseIn {
+        name: "SV3 =",
+        query: r#"{ .service.name = "12345" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV3 =~",
+        query: r#"{ .service.name =~ "1.*" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV4 =",
+        query: r#"{ .service.name = "x" }"#,
+        want: Want::Ids(&["v8"]),
+    },
+    CaseIn {
+        name: "SV4 !=",
+        query: r#"{ .service.name != "x" }"#,
+        want: Want::Ids(ALL_V_BUT_V8),
+    },
+    CaseIn {
+        name: "EV1",
+        query: r#"{ event.code = "c2" }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EV2",
+        query: r#"{ event.code != "c2" }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "EV3 = 3",
+        query: r#"{ event.code = 3 }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EV3 > 2",
+        query: r#"{ event.code > 2 }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EV4",
+        query: r#"{ event.code !~ "c.*" }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "EV5 != nil",
+        query: r#"{ event.code != nil }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EV5 = nil",
+        query: r#"{ event.code = nil }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "EV6 event.tags =",
+        query: r#"{ event.tags = "b" }"#,
+        want: Want::Ids(&["v5"]),
+    },
+    CaseIn {
+        name: "EV6 .tags",
+        query: r#"{ .tags = "a" }"#,
+        want: Want::Ids(&["v5"]),
+    },
+    CaseIn {
+        name: "EV6 event.tags !=",
+        query: r#"{ event.tags != "b" }"#,
+        want: Want::Ids(ALL_V_BUT_V5),
+    },
+    CaseIn {
+        name: "LK1",
+        query: r#"{ link.lk = "l2" }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "LK2",
+        query: r#"{ link.lk != "l1" }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "EN1 =",
+        query: r#"{ event:name = "evB" }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EN1 !=",
+        query: r#"{ event:name != "evB" }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "EN2 ev[A-C]",
+        query: r#"{ event:name =~ "ev[A-C]" }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "EN2 ev",
+        query: r#"{ event:name =~ "ev" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "TS1",
+        query: r#"{ event:timeSinceStart > 4ms }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "TS2",
+        query: r#"{ event:timeSinceStart != 2ms }"#,
+        want: Want::Ids(&["v4", "v5", "v6"]),
+    },
+    CaseIn {
+        name: "TS3 < 0",
+        query: r#"{ event:timeSinceStart < 0 }"#,
+        want: Want::Ids(&["v5"]),
+    },
+    CaseIn {
+        name: "TS3 < 1ms",
+        query: r#"{ event:timeSinceStart < 1ms }"#,
+        want: Want::Ids(&["v5"]),
+    },
+    CaseIn {
+        name: "LI1",
+        query: r#"{ link:spanID = "0b0b0b0b0b0b0b02" }"#,
+        want: Want::Ids(&["v7"]),
+    },
+    CaseIn {
+        name: "LI2",
+        query: r#"{ link:traceID != "02020202020202020202020202020202" }"#,
+        want: Want::Ids(ALL_V_BUT_V7),
+    },
+    CaseIn {
+        name: "NE1",
+        query: r#"{ !link.lflag }"#,
+        want: Want::Ids(&["v8"]),
+    },
+    CaseIn {
+        name: "NE2",
+        query: r#"{ !event.flag }"#,
+        want: Want::Fails("expression (!event.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "NE3",
+        query: r#"{ !.lflag }"#,
+        want: Want::Ids(&["v8"]),
+    },
+    CaseIn {
+        name: "NE4",
+        query: r#"{ !.flag }"#,
+        want: Want::Fails("expression (!.flag) expected a boolean"),
+    },
+    CaseIn {
+        name: "NE5",
+        query: r#"{ false && !event.flag }"#,
+        want: Want::Fails("expression (!event.flag) expected a boolean"),
+    },
+];
+
+/// `UC-MISS`: run after `v2`'s resource row (shared with `v1`) is deleted.
+const CASES_V_UC_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "UC-MISS r",
+        query: r#"{ .k = "r" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "UC-MISS e",
+        query: r#"{ .k = "e" }"#,
+        want: Want::Ids(&["v2", "v3"]),
+    },
+    CaseIn {
+        name: "UC-MISS != r",
+        query: r#"{ .k != "r" }"#,
+        want: Want::Ids(ALL_V),
+    },
+];
+
+/// `SV-MISS`: run after `UC-MISS` and the deletion of `v3`'s, `v6`'s,
+/// `v7`'s and `v8`'s resource rows — every resource row is then gone.
+const CASES_V_SV_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "SV-MISS = vsvc",
+        query: r#"{ .service.name = "vsvc" }"#,
+        want: Want::Ids(V_SVC_STRING),
+    },
+    CaseIn {
+        name: "SV-MISS > u",
+        query: r#"{ .service.name > "u" }"#,
+        want: Want::Ids(V_SVC_STRING),
+    },
+    CaseIn {
+        name: "SV-MISS = 12345",
+        query: r#"{ .service.name = 12345 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV-MISS = 1.461413291919332",
+        query: r#"{ .service.name = 1.461413291919332 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV-MISS = x",
+        query: r#"{ .service.name = "x" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SV-MISS = nil",
+        query: r#"{ .service.name = nil }"#,
+        want: Want::Ids(&["v3", "v6", "v8"]),
+    },
+    CaseIn {
+        name: "SV-MISS != nil",
+        query: r#"{ .service.name != nil }"#,
+        want: Want::Ids(V_SVC_STRING),
+    },
+];
+
+/// Section 10.3: fixture V. `UC-MISS` and then `SV-MISS` run last: each
+/// deletes resource rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_answers_any_element_and_the_chain_order() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p2_fixturev");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_v_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p2-v-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 8,
+        "fixture V seeds eight spans; nothing below can be read as a predicate result until \
+         this holds"
+    );
+
+    let mut wrong = run_cases_in(&client, w, CASES_V, idv).await;
+    delete_resource_row_of(&client, &idv("v2")).await;
+    wrong.extend(run_cases_in(&client, w, CASES_V_UC_MISS, idv).await);
+    for v in ["v3", "v6", "v7", "v8"] {
+        delete_resource_row_of(&client, &idv(v)).await;
+    }
+    wrong.extend(run_cases_in(&client, w, CASES_V_SV_MISS, idv).await);
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-V cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_V.len() + CASES_V_UC_MISS.len() + CASES_V_SV_MISS.len(),
         wrong.join("\n\n")
     );
 }
