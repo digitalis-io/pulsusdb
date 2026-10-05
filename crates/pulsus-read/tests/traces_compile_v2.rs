@@ -268,7 +268,8 @@ fn every_request_window_renders_the_one_half_open_bound() {
 
 use pulsus_read::traces::PlanError;
 use pulsus_read::traces::spans::predicate::{
-    compile_span_leaf, compile_span_predicate, span_membership_sql,
+    PredicateCtx, compile_span_leaf, compile_span_leaf_in, compile_span_predicate,
+    compile_span_predicate_in, span_membership_sql,
 };
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_traceql::{
@@ -560,9 +561,45 @@ const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
     Intrinsic::InstrumentationVersion,
 ];
 
+/// The issue each out-of-scope intrinsic is refused with, and `None` for
+/// the ten this compiler serves. **No wildcard arm**: a new `Intrinsic`
+/// variant fails to compile here until it is classified.
+fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
+    match intrinsic {
+        Intrinsic::Name
+        | Intrinsic::Duration
+        | Intrinsic::Status
+        | Intrinsic::Kind
+        | Intrinsic::StatusMessage
+        | Intrinsic::SpanId
+        | Intrinsic::ParentId
+        | Intrinsic::TraceId
+        | Intrinsic::InstrumentationName
+        | Intrinsic::InstrumentationVersion => None,
+        Intrinsic::EventName
+        | Intrinsic::EventTimeSinceStart
+        | Intrinsic::LinkSpanId
+        | Intrinsic::LinkTraceId => Some("#589 part 2"),
+        Intrinsic::NestedSetParent
+        | Intrinsic::NestedSetLeft
+        | Intrinsic::NestedSetRight
+        | Intrinsic::ChildCount
+        | Intrinsic::TraceDuration
+        | Intrinsic::RootName
+        | Intrinsic::RootServiceName => Some("#594"),
+    }
+}
+
+/// Section 2's refusal: a `resource.` field compiled with no context.
+const RESOURCE_NEEDS_WINDOW: &str = "the \"resource.\" attribute scope needs the request window: \
+                                     compile it with compile_span_predicate_in (issue #589)";
+
 /// `T-C5`: driven from `Intrinsic::ALL` and `AttrScope::ALL`, which the
 /// `enum_with_all!` macro generates from the same token list as the
 /// variants — so a new variant fails this test rather than being skipped.
+///
+/// Each refusal's issue is asserted as the whole `(issue …)` suffix: a
+/// bare `#589` would also match the wrong part.
 #[test]
 fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
     let mut out_of_scope = 0usize;
@@ -572,18 +609,19 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
             ComparisonOp::Eq,
             &Value::String("x".to_string()),
         );
-        if IN_SCOPE_INTRINSICS.contains(&intrinsic) {
+        let Some(target) = intrinsic_target(intrinsic) else {
             assert!(
                 !matches!(got, Err(PlanError::UnsupportedField(_))),
-                "{intrinsic} is in scope for part 1 but refused as unsupported: {got:?}"
+                "{intrinsic} is served but refused as unsupported: {got:?}"
             );
             continue;
-        }
+        };
         out_of_scope += 1;
         match got {
             Err(PlanError::UnsupportedField(msg)) => assert!(
-                msg.contains(&intrinsic.to_string()) && msg.contains("#589"),
-                "{intrinsic}: the refusal must name the construct and the issue, got {msg:?}"
+                msg.contains(&intrinsic.to_string()) && msg.ends_with(&format!("(issue {target})")),
+                "{intrinsic}: the refusal must name the construct and end `(issue {target})`, \
+                 got {msg:?}"
             ),
             other => panic!("{intrinsic} must be UnsupportedField, got {other:?}"),
         }
@@ -593,8 +631,11 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
         Intrinsic::ALL.len(),
         "every intrinsic is either in scope or refused — a new variant belongs in one list"
     );
+    for intrinsic in IN_SCOPE_INTRINSICS {
+        assert_eq!(intrinsic_target(intrinsic), None, "{intrinsic}");
+    }
 
-    let mut out_of_scope_scopes = 0usize;
+    let mut refused_scopes = 0usize;
     for scope in AttrScope::ALL.iter().copied() {
         let got = compile_span_leaf(
             &Field::Attribute {
@@ -604,37 +645,60 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
             ComparisonOp::Eq,
             &Value::String("x".to_string()),
         );
-        if scope == AttrScope::Span {
-            assert!(got.is_ok(), "span. is part 1's scope: {got:?}");
-            continue;
-        }
-        out_of_scope_scopes += 1;
-        match got {
-            Err(PlanError::UnsupportedField(msg)) => assert!(
-                msg.contains(&format!("\"{scope}\"")) && msg.contains("#589"),
-                "{scope}: the refusal must name the scope and the issue, got {msg:?}"
-            ),
-            other => panic!("the {scope} scope must be UnsupportedField, got {other:?}"),
+        match scope {
+            AttrScope::Span | AttrScope::Instrumentation => {
+                assert!(got.is_ok(), "{scope} compiles with no context: {got:?}");
+            }
+            AttrScope::Resource => {
+                assert_eq!(
+                    got.map(|p| p.sql().to_string()),
+                    Err(PlanError::UnsupportedField(
+                        RESOURCE_NEEDS_WINDOW.to_string()
+                    )),
+                    "resource. with no context"
+                );
+            }
+            AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
+                refused_scopes += 1;
+                match got {
+                    Err(PlanError::UnsupportedField(msg)) => assert!(
+                        msg.contains(&format!("\"{scope}\""))
+                            && msg.ends_with("(issue #589 part 2)"),
+                        "{scope}: the refusal must name the scope and `(issue #589 part 2)`, \
+                         got {msg:?}"
+                    ),
+                    other => panic!("the {scope} scope must be UnsupportedField, got {other:?}"),
+                }
+            }
         }
     }
-    assert_eq!(out_of_scope_scopes + 1, AttrScope::ALL.len());
+    assert_eq!(refused_scopes + 3, AttrScope::ALL.len());
 
-    // The expression-level constructs section 6 defers, each naming itself.
+    // The expression-level constructs section 7 defers to part 3, each
+    // naming itself.
     for (query, token) in [
         (r#"{ span.a + 1 = 2 }"#, "arithmetic"),
         (r#"{ span.a = span.b }"#, "field-against-field"),
-        (r#"{ span.a = 1 && span.b = 2 }"#, "&&"),
-        (r#"{ span.a = 1 || span.b = 2 }"#, "||"),
-        (r#"{ !(span.a = 1) }"#, "!"),
+        (r#"{ 1 = 1 }"#, "two literals"),
+        (r#"{ (span.a = 1) = true }"#, "boolean-valued"),
+        (r#"{ !span.a = span.b }"#, "boolean-valued"),
     ] {
         match refusal(query) {
             PlanError::UnsupportedField(msg) => assert!(
-                msg.contains(token) && msg.contains("#589"),
-                "{query}: the refusal must name {token:?} and the issue, got {msg:?}"
+                msg.contains(token) && msg.ends_with("(issue #589 part 3)"),
+                "{query}: the refusal must name {token:?} and `(issue #589 part 3)`, got {msg:?}"
             ),
             other => panic!("{query} must be UnsupportedField, got {other:?}"),
         }
     }
+    assert_eq!(
+        compile_span_predicate(&FieldExpr::Literal(Value::Number("5".to_string())))
+            .map(|p| p.sql().to_string()),
+        Err(PlanError::TypeMismatch(
+            "a non-boolean literal is not a predicate".to_string()
+        )),
+        "{{ 5 }}, which the validator rejects first and nothing will serve"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -812,4 +876,472 @@ fn t_c11_a_literal_on_the_left_mirrors_the_operator() {
         rendered(r#"{ 200 != span.http.response.status_code }"#),
         rendered(r#"{ span.http.response.status_code != 200 }"#)
     );
+}
+
+// =====================================================================
+// Issue #589 part 1 — resource and instrumentation conditions, and the
+// boolean operators, text only
+// =====================================================================
+
+/// `T-B1`'s window and the unqualified resource table: what every
+/// resource leaf below is compiled against.
+fn ctx() -> PredicateCtx<'static> {
+    PredicateCtx {
+        window: t_b1_window(),
+        resources_table: "resources",
+    }
+}
+
+/// `R(p)` — section 3.1's resource subquery, from `W`'s own day bound.
+fn r_of(p: &str) -> String {
+    format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {} AND ({p}))",
+        t_b1_window().resources_day_clause()
+    )
+}
+
+/// The predicate text `query` compiles to with [`ctx`].
+fn rendered_in(query: &str) -> String {
+    compile_span_predicate_in(&filter_body(query), &ctx())
+        .unwrap_or_else(|e| panic!("{query} must compile in a context: {e}"))
+        .sql()
+        .to_string()
+}
+
+fn scoped(scope: AttrScope, key: &str) -> Field {
+    Field::Attribute {
+        scope,
+        key: key.to_string(),
+    }
+}
+
+/// The four operand kinds the cross products run every operator against.
+fn cross_operands() -> [Value; 4] {
+    [
+        Value::String("v".to_string()),
+        Value::Number("3".to_string()),
+        duration_value(r#"{ duration > 1s }"#),
+        Value::Bool(true),
+    ]
+}
+
+/// One cross-product cell: the span leaf, and the same leaf at `scope`.
+/// `None` is the truthiness cell, `{ <scope>k }`.
+fn cell(
+    scope: AttrScope,
+    cell: Option<(ComparisonOp, &Value)>,
+    with_ctx: bool,
+) -> (Result<String, PlanError>, Result<String, PlanError>) {
+    let text = |r: Result<pulsus_read::traces::spans::predicate::SpanPredicate, PlanError>| {
+        r.map(|p| p.sql().to_string())
+    };
+    match cell {
+        Some((op, value)) => {
+            let span = text(compile_span_leaf(&attr("k"), op, value));
+            let other = if with_ctx {
+                text(compile_span_leaf_in(&scoped(scope, "k"), op, value, &ctx()))
+            } else {
+                text(compile_span_leaf(&scoped(scope, "k"), op, value))
+            };
+            (span, other)
+        }
+        None => {
+            let span = text(compile_span_predicate(&FieldExpr::Field(attr("k"))));
+            let expr = FieldExpr::Field(scoped(scope, "k"));
+            let other = if with_ctx {
+                text(compile_span_predicate_in(&expr, &ctx()))
+            } else {
+                text(compile_span_predicate(&expr))
+            };
+            (span, other)
+        }
+    }
+}
+
+/// Every cell of the cross product: `ALL_OPS` × [`cross_operands`], then
+/// truthiness.
+fn cross_cells() -> Vec<Option<(ComparisonOp, Value)>> {
+    let mut out: Vec<Option<(ComparisonOp, Value)>> = Vec::new();
+    for op in ALL_OPS {
+        for value in cross_operands() {
+            out.push(Some((op, value)));
+        }
+    }
+    out.push(None);
+    out
+}
+
+// ---------------------------------------------------------------------
+// T-C12 — the resource cross product
+// ---------------------------------------------------------------------
+
+/// `T-C12`: where `span.k` renders `L`, `resource.k` renders `R(pos(L))`,
+/// or `NOT (R(pos(L)))` when `L` is negated — the negation is OUTSIDE the
+/// subquery. Where `span.k` is refused, `resource.k` is refused with the
+/// same error.
+#[test]
+fn t_c12_a_resource_leaf_is_the_span_leaf_inside_the_subquery() {
+    let mut seen = 0usize;
+    for c in cross_cells() {
+        let (span, resource) = cell(
+            AttrScope::Resource,
+            c.as_ref().map(|(op, v)| (*op, v)),
+            true,
+        );
+        seen += 1;
+        let want = match span {
+            Ok(l) => Ok(match l.strip_prefix("NOT ") {
+                Some(pos) => format!("NOT ({})", r_of(pos)),
+                None => r_of(&l),
+            }),
+            Err(e) => Err(e),
+        };
+        assert_eq!(resource, want, "{c:?}");
+    }
+    assert_eq!(seen, ALL_OPS.len() * 4 + 1);
+
+    assert_eq!(
+        rendered_in(r#"{ resource.k != nil }"#),
+        r_of("dynamicType(attrs.`k`) != 'None'")
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.k = nil }"#),
+        format!("NOT ({})", r_of("dynamicType(attrs.`k`) != 'None'"))
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C13 — the instrumentation cross product
+// ---------------------------------------------------------------------
+
+/// `T-C13`: `instrumentation.k` is `span.k` with the root `scope_attrs.`
+/// in place of `attrs.`, for every cell. It needs no context.
+#[test]
+fn t_c13_an_instrumentation_leaf_is_the_span_leaf_on_scope_attrs() {
+    let mut seen = 0usize;
+    for c in cross_cells() {
+        let (span, scope) = cell(
+            AttrScope::Instrumentation,
+            c.as_ref().map(|(op, v)| (*op, v)),
+            false,
+        );
+        seen += 1;
+        let want = span.map(|l| l.replace("attrs.`", "scope_attrs.`"));
+        assert_eq!(scope, want, "{c:?}");
+    }
+    assert_eq!(seen, ALL_OPS.len() * 4 + 1);
+
+    assert_eq!(
+        rendered(r#"{ instrumentation.k != nil }"#),
+        "dynamicType(scope_attrs.`k`) != 'None'"
+    );
+    assert_eq!(
+        rendered(r#"{ instrumentation.k = nil }"#),
+        "dynamicType(scope_attrs.`k`) = 'None'"
+    );
+
+    // `T-T9`'s compile half.
+    let build = rendered(r#"{ instrumentation.otel.scope.build = "release" }"#);
+    assert_eq!(
+        build,
+        "(coalesce(scope_attrs.`otel%2Escope%2Ebuild`.:String = 'release', false) OR \
+         has(scope_attrs.`otel%2Escope%2Ebuild`.:`Array(Nullable(String))`, 'release'))"
+    );
+    assert_eq!(
+        build.matches("attrs.`").count(),
+        build.matches("scope_attrs.`").count(),
+        "every attribute path is under scope_attrs: {build}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C14 — `resource.service.name`
+// ---------------------------------------------------------------------
+
+/// `T-C14`: section 3.3's table, byte for byte. Every string and regex
+/// comparison is gated on the value having been stored as a string, and
+/// a negation goes outside the gate.
+#[test]
+fn t_c14_the_service_name_reads_the_span_row_gated_on_its_type() {
+    let svc = scoped(AttrScope::Resource, "service.name");
+    let leaf = |op: ComparisonOp, v: Value| {
+        compile_span_leaf_in(&svc, op, &v, &ctx()).map(|p| p.sql().to_string())
+    };
+    let s = |t: &str| Value::String(t.to_string());
+    let n = |t: &str| Value::Number(t.to_string());
+
+    assert_eq!(
+        leaf(ComparisonOp::Eq, s("svc")),
+        Ok("(service_type = 'string' AND service = 'svc')".to_string())
+    );
+    assert_eq!(
+        leaf(ComparisonOp::Neq, s("svc")),
+        Ok("NOT (service_type = 'string' AND service = 'svc')".to_string())
+    );
+    assert_eq!(
+        leaf(ComparisonOp::Re, s("sv.*")),
+        Ok("(service_type = 'string' AND match(service, '^(?:sv.*)$'))".to_string())
+    );
+    assert_eq!(
+        leaf(ComparisonOp::Nre, s("sv.*")),
+        Ok("NOT (service_type = 'string' AND match(service, '^(?:sv.*)$'))".to_string())
+    );
+    for v in [n("5"), Value::Bool(true)] {
+        assert_eq!(leaf(ComparisonOp::Eq, v.clone()), Ok("false".to_string()));
+        assert_eq!(leaf(ComparisonOp::Neq, v), Ok("false".to_string()));
+    }
+    for op in ordered_ops() {
+        for v in [s("a"), n("5")] {
+            assert_eq!(
+                leaf(op, v),
+                Err(PlanError::TypeMismatch(
+                    "resource.service.name supports only = != =~ !~".to_string()
+                )),
+                "{op}"
+            );
+        }
+    }
+    for op in [ComparisonOp::Re, ComparisonOp::Nre] {
+        assert_eq!(
+            leaf(op, n("5")),
+            Err(PlanError::TypeMismatch(
+                "resource.service.name requires a string value".to_string()
+            )),
+            "{op}"
+        );
+    }
+    // The two refusals again, from the query text.
+    assert_eq!(
+        refusal_in(r#"{ resource.service.name > "a" }"#),
+        PlanError::TypeMismatch("resource.service.name supports only = != =~ !~".to_string())
+    );
+    assert_eq!(
+        refusal_in(r#"{ resource.service.name =~ 5 }"#),
+        PlanError::TypeMismatch("resource.service.name requires a string value".to_string())
+    );
+
+    // Truthiness matches no span; presence reads the type, never the text.
+    assert_eq!(rendered_in(r#"{ resource.service.name }"#), "false");
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name != nil }"#),
+        "service_type != ''"
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name = nil }"#),
+        "NOT (service_type != '')"
+    );
+}
+
+/// The error `query` is refused with in [`ctx`].
+fn refusal_in(query: &str) -> PlanError {
+    match compile_span_predicate_in(&filter_body(query), &ctx()) {
+        Err(e) => e,
+        Ok(p) => panic!("{query} must be refused, it compiled to `{}`", p.sql()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C15 — the subquery, the context and the window
+// ---------------------------------------------------------------------
+
+/// `T-C15`: the subquery is inline text carrying `W`'s own day bound;
+/// with no context a resource field is refused; and a predicate compiled
+/// for one window cannot be composed with another.
+#[test]
+fn t_c15_a_resource_leaf_carries_its_window_inline() {
+    assert_eq!(
+        rendered_in(r#"{ resource.k8s.pod.name = "payment-a" }"#),
+        "resource_id IN (SELECT resource_id FROM resources WHERE \
+         day >= toDate(fromUnixTimestamp64Nano(1790094846486853636), 'UTC') \
+         AND day <= toDate(fromUnixTimestamp64Nano(1790094846486853636), 'UTC') AND \
+         ((coalesce(attrs.`k8s%2Epod%2Ename`.:String = 'payment-a', false) OR \
+         has(attrs.`k8s%2Epod%2Ename`.:`Array(Nullable(String))`, 'payment-a'))))"
+    );
+    assert_eq!(
+        refusal(r#"{ resource.k8s.pod.name = "payment-a" }"#),
+        PlanError::UnsupportedField(RESOURCE_NEEDS_WINDOW.to_string())
+    );
+    // The same window composes.
+    let p = compile_span_predicate_in(
+        &filter_body(r#"{ resource.k8s.pod.name = "payment-a" }"#),
+        &ctx(),
+    )
+    .expect("compiles");
+    assert!(span_membership_sql("spans", t_b1_window(), &p).contains("resource_id IN"));
+}
+
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c15_a_resource_predicate_refuses_another_window() {
+    let p = compile_span_predicate_in(
+        &filter_body(r#"{ resource.k8s.pod.name = "payment-a" }"#),
+        &ctx(),
+    )
+    .expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
+}
+
+// ---------------------------------------------------------------------
+// T-C16 / T-C17 — the operators
+// ---------------------------------------------------------------------
+
+/// `T-C16`: every operand parenthesised once, so the SQL grouping is the
+/// parse tree's and SQL's own `AND`-before-`OR` never applies.
+#[test]
+fn t_c16_the_operators_keep_the_parse_trees_grouping() {
+    let a = rendered(r#"{ span.a = 1 }"#);
+    let b = rendered(r#"{ span.b = 2 }"#);
+    let c = rendered(r#"{ span.c = 3 }"#);
+    assert_eq!(
+        rendered(r#"{ span.a = 1 && span.b = 2 }"#),
+        format!("({a}) AND ({b})")
+    );
+    assert_eq!(
+        rendered(r#"{ span.a = 1 || span.b = 2 }"#),
+        format!("({a}) OR ({b})")
+    );
+    assert_eq!(
+        rendered(r#"{ span.a = 1 || span.b = 2 && span.c = 3 }"#),
+        format!("(({a}) OR ({b})) AND ({c})")
+    );
+    assert_eq!(rendered(r#"{ !(span.a = 1) }"#), format!("NOT ({a})"));
+}
+
+/// `T-C17`: `!=` at resource scope is the complement of `=`, and the same
+/// text as `!(… = …)`.
+#[test]
+fn t_c17_a_resource_inequality_is_the_negated_equality() {
+    assert_eq!(
+        rendered_in(r#"{ resource.k != "v" }"#),
+        rendered_in(r#"{ !(resource.k = "v") }"#)
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C18 — `!` over a bare field
+// ---------------------------------------------------------------------
+
+/// The demand condition and message for `!<root>.<key>` at span or
+/// instrumentation scope.
+fn demand(path: &str, field: &str) -> String {
+    format!(
+        "throwIf(dynamicType({path}) != 'None' AND dynamicType({path}) != 'Bool', \
+         'expression (!{field}) expected a boolean')"
+    )
+}
+
+/// `T-C18`: `{ !f }` matches only `false`, and a present non-boolean
+/// fails the statement. Every demand is lifted out of the expression into
+/// one `plus`, which does not short-circuit.
+#[test]
+fn t_c18_not_over_a_bare_field_demands_a_boolean() {
+    let k = "attrs.`k`";
+    let dk = demand(k, "span.k");
+    let t_false = format!("coalesce({k}.:Bool = false, false)");
+    let t_true = format!("coalesce({k}.:Bool = true, false)");
+
+    assert_eq!(
+        rendered(r#"{ !span.k }"#),
+        format!("({dk} + toUInt8({t_false})) = 1")
+    );
+    assert_eq!(
+        rendered(r#"{ !instrumentation.k }"#),
+        format!(
+            "({} + toUInt8(coalesce(scope_attrs.`k`.:Bool = false, false))) = 1",
+            demand("scope_attrs.`k`", "instrumentation.k")
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ !resource.k }"#),
+        format!(
+            "(throwIf({}, 'expression (!resource.k) expected a boolean') + toUInt8({})) = 1",
+            r_of("dynamicType(attrs.`k`) != 'None' AND dynamicType(attrs.`k`) != 'Bool'"),
+            r_of("coalesce(attrs.`k`.:Bool = false, false)")
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ !resource.service.name }"#),
+        "(throwIf(service_type != '' AND service_type != 'bool', \
+         'expression (!resource.service.name) expected a boolean') + \
+         toUInt8((service_type = 'bool' AND service = 'false'))) = 1"
+    );
+    // `(!f) op lit`: `= b` wants `!b`, `!= b` wants `b`, anything else
+    // matches nothing — and the demand stays.
+    assert_eq!(
+        rendered(r#"{ !span.k = true }"#),
+        format!("({dk} + toUInt8({t_false})) = 1")
+    );
+    assert_eq!(
+        rendered(r#"{ !span.k != true }"#),
+        format!("({dk} + toUInt8({t_true})) = 1")
+    );
+    assert_eq!(
+        rendered(r#"{ !span.k = 1 }"#),
+        format!("({dk} + toUInt8(false)) = 1")
+    );
+    assert_eq!(
+        rendered(r#"{ true = !span.k }"#),
+        format!("({dk} + toUInt8({t_false})) = 1")
+    );
+    // Lifted out of a short-circuiting operator.
+    assert_eq!(
+        rendered(r#"{ true || !span.k }"#),
+        format!("({dk} + toUInt8((true) OR ({t_false}))) = 1")
+    );
+    // One `throwIf` per distinct demand, in pre-order.
+    let (a, b) = ("attrs.`a`", "attrs.`b`");
+    assert_eq!(
+        rendered(r#"{ !span.a && !span.b }"#),
+        format!(
+            "({} + {} + toUInt8((coalesce({a}.:Bool = false, false)) AND \
+             (coalesce({b}.:Bool = false, false)))) = 1",
+            demand(a, "span.a"),
+            demand(b, "span.b")
+        )
+    );
+    assert_eq!(
+        rendered(r#"{ !span.k && !span.k }"#),
+        format!("({dk} + toUInt8(({t_false}) AND ({t_false}))) = 1")
+    );
+    let both = compile_span_predicate(&filter_body(r#"{ !span.a && !span.b }"#)).expect("compiles");
+    assert_eq!(
+        both.demand_messages(),
+        [
+            "expression (!span.a) expected a boolean".to_string(),
+            "expression (!span.b) expected a boolean".to_string(),
+        ]
+    );
+
+    // No demand, no wrapper.
+    let plain = rendered(r#"{ span.a = 1 }"#);
+    assert!(
+        !plain.contains("throwIf") && !plain.contains("toUInt8"),
+        "{plain}"
+    );
+    assert!(
+        compile_span_predicate(&filter_body(r#"{ span.a = 1 }"#))
+            .expect("compiles")
+            .demand_messages()
+            .is_empty()
+    );
+
+    assert_eq!(
+        refusal(r#"{ !instrumentation:name }"#),
+        PlanError::TypeMismatch(
+            "expression (!instrumentation:name) expected a boolean".to_string()
+        )
+    );
+
+    for query in [
+        r#"{ !span.k }"#,
+        r#"{ !instrumentation.k }"#,
+        r#"{ !span.a && !span.b }"#,
+        r#"{ true || !span.k }"#,
+    ] {
+        assert!(!rendered(query).contains("NOT IN ('None'"), "{query}");
+    }
+    for query in [r#"{ !resource.k }"#, r#"{ !resource.service.name }"#] {
+        assert!(!rendered_in(query).contains("NOT IN ('None'"), "{query}");
+    }
 }

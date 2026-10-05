@@ -388,9 +388,9 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 
 | stage as written | SQL emitted today | marking and source |
 |---|---|---|
-| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `predicate.rs:947` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
+| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `logql/predicate.rs:947` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
 | `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:522` |
-| `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:951`. Not anchored: a LogQL line filter searches for a substring |
+| `\|~ "re"` | `match(body, 're')` | *emitted today*, `logql/predicate.rs:951`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `logql/predicate.rs:522` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `logql/predicate.rs:501`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3797`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
@@ -480,7 +480,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 |---|---|---|
 | `{ .k = "v" }` | `key = 'k' AND val = 'v'` over `trace_attrs_idx` | *emitted today*, `search_sql.rs:224`. An unscoped attribute adds **no** `scope` term (`filter.rs:1220`, `AttrScope::Unscoped => None`) |
 | `{ resource.service.name = "checkout" }` | `PREWHERE service = 'checkout'` over `trace_spans` | *emitted today*, golden `count_pipeline.sql`. This one attribute is a physical column, so it reads the span table directly |
-| `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, golden `val_num_range.sql`. Skips granules on the `key` prefix only: `val_num` is not part of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:348`) |
+| `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, golden `val_num_range.sql`. Skips granules on the `key` prefix only: `val_num` is not part of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:349`) |
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | *emitted today*, golden `service_regex.sql`. Anchored, unlike a LogQL line filter |
 | `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, golden `existence_present.sql`. `ValuePred::KeyExists` renders the constant `1` (`filter.rs:978`), leaving a pure `key` prefix scan |
 | `{ .env != "prod" }` | the **positive** form as a predicate column on the hydration read — the locate over `(attr_key, attr_scope)`, then `attr_val[pi0] = 'prod'`; the first statement has no predicate at all | *emitted today*, golden `negated_attr.sql`. The negation is applied after the read, against the set of spans that matched the positive form |
@@ -729,7 +729,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`, not a `GROUP BY` column: `HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2` when an aggregate lands in the same level, and nothing at all when none does | *emitted today* (issue #492 part 5), superseding `docs/query-lowering.md:609`'s `GROUP BY name`. The statement keeps one aggregation state per (trace × key value) where the ungrouped one keeps one per trace; the map form measured 334 MB against the wrapped `GROUP BY trace_id, name` form's 523 MB on the same corpus, with byte-identical `EXPLAIN indexes = 1` |
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
-| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:471`) and the attribute index (`schema/schema.sql:332-350`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
+| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:473`) and the attribute index (`schema/schema.sql:333-351`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
 | `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1262`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2130`); this work does not change that |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:964` records it, `traces/exec.rs:3789` applies it. Still `400` on the search route (`search_plan.rs:2136`) |
@@ -796,7 +796,7 @@ WHERE trace_id IN (unhex('…'), … the 20 that won)
 
 **After this work** — **four statements in total**, and the first of them is the one that
 changes. `trace_attrs_idx` carries `timestamp_ns` and `duration_ns` on every attribute row
-(`schema/schema.sql:339`, `:383`), so for a single-condition selector with a `duration`- or
+(`schema/schema.sql:340`, `:384`), so for a single-condition selector with a `duration`- or
 `count`-sourced aggregate the attribute index answers the FILTER inside the first statement: no
 join, no subquery, no second table.
 
@@ -1165,26 +1165,26 @@ nothing and reads fewer rows; it simply keeps paging.
 
 `<d0>`, `<d1>` are the window's first and last dates. Two tables are in play:
 `trace_attrs_idx`, ordered by `(key, val, scope, timestamp_ns, trace_id, span_id)` and partitioned by
-date (`schema/schema.sql:347-348`), and `trace_spans`, ordered by `(trace_id, timestamp_ns)` with a
-`service_time` projection ordered by `(service, timestamp_ns)` (`schema/schema.sql:501-528`, migration 45).
+date (`schema/schema.sql:348-349`), and `trace_spans`, ordered by `(trace_id, timestamp_ns)` with a
+`service_time` projection ordered by `(service, timestamp_ns)` (`schema/schema.sql:503-530`, migration 45).
 
 | written as | the fragment it contributes | where it lands | what the database does less of |
 |---|---|---|---|
 | `{ .k = "v" }` | `key = 'k' AND val = 'v'` | `WHERE`, over `trace_attrs_idx` | *emitted today*. Two leading columns of the ordering key, so the prune is tight: measured on 200,000 spans, `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules |
 | `{ resource.service.name = "checkout" }` | `PREWHERE service = 'checkout'` | `PREWHERE`, over `trace_spans` | *emitted today*. This attribute is a physical column, so the read goes to the span table and the `service_time` projection puts `service` first |
-| `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | `WHERE`, over `trace_attrs_idx` | *emitted today*. `key` prunes; `val_num` does not, because it is not in the ordering key (`schema/schema.sql:348`) |
+| `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | `WHERE`, over `trace_attrs_idx` | *emitted today*. `key` prunes; `val_num` does not, because it is not in the ordering key (`schema/schema.sql:349`) |
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | `WHERE` | *emitted today*. Anchored, unlike a LogQL line filter |
 | `{ .a != nil }` | `key = 'a' AND 1` | `WHERE` | *emitted today*. A pure `key` prefix scan |
 | `{ .env != "prod" }` | `NOT (key = 'env' AND val = 'prod')` when the inner condition means exactly what it says, otherwise the constant `1` | `WHERE` | *from the design*, `docs/query-lowering.md:304-305`. **This is a change:** today the negation is applied after the read against the set that matched the positive form |
 | `{ a && b }` | `sql_a AND sql_b`, in one statement | `WHERE` | *from the design*, `docs/query-lowering.md:302`. A side that does not become SQL contributes the constant `1`. **This is a change:** today the second half of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
 | `{ a \|\| b }` | `sql_a OR sql_b`, in one statement, or the constant `1` if either side cannot | `WHERE` | *from the design*, `docs/query-lowering.md:303`. **This is a change:** today each side is its own statement. Executed on the container: an `OR` of two different `key` values runs as one statement and reads both key prefixes |
-| `{ duration > 2s }` | `duration_ns > 2000000000` | `WHERE`, over `trace_spans` | *emitted today*. The `idx_duration` minmax index on `duration_ns` skips granules at granularity 4 (`schema/schema.sql:489`) |
+| `{ duration > 2s }` | `duration_ns > 2000000000` | `WHERE`, over `trace_spans` | *emitted today*. The `idx_duration` minmax index on `duration_ns` skips granules at granularity 4 (`schema/schema.sql:491`) |
 | `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | `WHERE` | *from the design*, `docs/query-lowering.md:777`. The text already exists on the metrics route (`metrics_sql.rs:562`) |
 | `{ nestedSetLeft … }`, other than the root test | | — | **cannot become SQL.** A per-trace numbering computed at query time from the parent/child structure; no stored column carries it |
 | `{ traceDuration > 2s }`, `rootName`, `rootServiceName` | | — | **cannot become SQL.** Resolved from a read across the whole trace with no time bound, because the true root may start before the window |
 | `{ span:childCount > 2 }` | | — | **cannot become SQL**, the same reason |
 | `{ a } > { b }` and every other structural relation | | — | **cannot become SQL.** The relation holds between two spans of one trace and is decided over the spans read back, which are cut at 10,000 per trace (`exec.rs:124`) |
-| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | `HAVING` | *emitted today* (issue #492 parts 4 and 5). Executed on the container over `trace_attrs_idx` alone: the index carries `duration_ns` on every attribute row (`schema/schema.sql:342`), so a single-condition selector with a duration aggregate needs no second table. **Only `>` and `>=`**: the statement aggregates the generator's ROWS and the evaluator its DEDUPLICATED, selector-matched spans, so `R ⊇ D` and `max` reads HIGH. Under `<`, `<=`, `=` or `!=` a HIGH reading LOSES a qualifying trace and phase 2 cannot put it back — measured on a seven-trace corpus where one `(trace_id, span_id)` carries two rows with different durations, `max(duration) < 2s` returned one trace unpushed and none pushed |
+| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | `HAVING` | *emitted today* (issue #492 parts 4 and 5). Executed on the container over `trace_attrs_idx` alone: the index carries `duration_ns` on every attribute row (`schema/schema.sql:343`), so a single-condition selector with a duration aggregate needs no second table. **Only `>` and `>=`**: the statement aggregates the generator's ROWS and the evaluator its DEDUPLICATED, selector-matched spans, so `R ⊇ D` and `max` reads HIGH. Under `<`, `<=`, `=` or `!=` a HIGH reading LOSES a qualifying trace and phase 2 cannot put it back — measured on a seven-trace corpus where one `(trace_id, span_id)` carries two rows with different durations, `max(duration) < 2s` returned one trace unpushed and none pushed |
 | `\| count() > 2` | `HAVING uniqExact(span_id) > 2` | `HAVING` | *emitted today*. Worked in §2.9's TraceQL27. `count()` reads HIGH for the same reason, and it is not exempt: a trace with 10 002 matched spans is evaluated on 10 000 of them (`hydration_sql`'s `LIMIT 10001 BY trace_id`) while `uniqExact(span_id)` counts all 10 002, so `count() < 10001` returned one trace unpushed and none pushed. **Only `>` and `>=`** |
 | `\| min(duration) < 2s` | `HAVING min(duration_ns) < 2000000000` | `HAVING` | *emitted today*. `min` over a superset reads LOW, so `<` and `<=` produce a superset phase 2 re-filters and the other four LOSE a trace. **Only `<` and `<=`** |
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`: `arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 2` | `HAVING` | *emitted today* (issue #492 part 5). **Not the `SELECT` list and not the `GROUP BY`**: those would make the statement's rows one per (trace, group), which is not what the executor consumes, and would need an outer statement to collapse them back. The map form asks the trace-level question — "does any group satisfy it?" — on the statement part 4 already sends. The key renders through `search_sql::byte_cap_expr`, the same function `hydration_sql` projects the column through, so the SQL partition and the evaluator's are one function of one column. It renders only on a `trace_spans` generator and only when an aggregate lands in the same level |
@@ -1732,7 +1732,7 @@ first refusal would emit no `body` term and read every `ipcase` line.
 
 Same rule as §2.8 for the SQL and a different one for the answers. **Every statement below was
 executed** on `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, against
-`trace_spans` and `trace_attrs_idx` built from `schema/schema.sql:332-350` plus the later added columns,
+`trace_spans` and `trace_attrs_idx` built from `schema/schema.sql:333-351` plus the later added columns,
 holding 200,000 spans in 50,000 traces of four spans each and 600,000 attribute rows.
 **No response bodies are stated**, for the reason part 4.8 gives and part 9 repeats: no reference
 instance was run for traces, and a body written from understanding looks exactly like one that was
@@ -1776,7 +1776,7 @@ LIMIT 20
 Ran, returning 20 rows; read 131,072 rows and 4.78 MiB.
 
 **What it avoids.** `service` is the first column of the `service_time` projection
-(`schema/schema.sql:501-528`), so the span side is a prefix read rather than a scan of the window. The
+(`schema/schema.sql:503-530`), so the span side is a prefix read rather than a scan of the window. The
 attribute side prunes on `key`, the first column of that table's ordering key. Today this query
 produces one statement per branch and then two to five statements for every batch of 32 candidate
 traces (`exec.rs:119`); at the 100,000-candidate ceiling that is 3,125 rounds.
@@ -1984,7 +1984,7 @@ form above collapses the per-batch value read into a single read for the whole r
 value read is issued once per 32 candidates (`search_sql.rs:501`, `exec.rs:119`); at the candidate
 ceiling that is 3,125 statements over the same `key = 'foo'` prefix, and the `trace_id IN (…32)`
 term in each of them prunes nothing, because `trace_id` is the fifth column of the ordering key
-(`schema/schema.sql:348`). **The collapse does not survive the shipped generator memory ceiling.**
+(`schema/schema.sql:349`). **The collapse does not survive the shipped generator memory ceiling.**
 Reproduced in [query-lowering.md](query-lowering.md) §9.8, table 4, at
 `max_memory_usage = 536870912` — the shipped `reader.traceql_generator_max_memory_bytes` — the form
 above refused on all three takes:
@@ -2025,7 +2025,7 @@ LIMIT 20
 Ran, returning 20 rows; read 200,000 rows and 7.63 MiB — no attribute-index read at all.
 
 **What it avoids.** Both conditions are columns of `trace_spans`, so there is no join and no second
-table. `duration_ns` carries a minmax skip index at granularity 4 (`schema/schema.sql:489`), so granules
+table. `duration_ns` carries a minmax skip index at granularity 4 (`schema/schema.sql:491`), so granules
 whose largest duration is at or below two seconds are skipped without reading a row. Today
 **neither** condition is in the statement: the golden `nested_set_root.sql` shows a first statement
 with no predicate, and the root test is applied after the read.
@@ -2438,7 +2438,7 @@ so its pattern is unescaped — the contrast with LogQL1 is the point.
 {service_name="checkout"} |~ "CONN_REFUSED"
 ```
 
-**SQL today** — one statement, `sql.rs:774`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`predicate.rs:951`, `escape.rs:172-179`).
+**SQL today** — one statement, `sql.rs:774`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`logql/predicate.rs:951`, `escape.rs:172-179`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3697,7 +3697,7 @@ The complement of LogQL41. The pair fixes both directions of the rule.
 {service_name="checkout"} |~ "("
 ```
 
-**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`predicate.rs:951` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
+**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`logql/predicate.rs:951` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
 
 **SQL after this work** — unchanged, and this property is load-bearing for compiling more stages: every new predicate that carries a user pattern must validate at the same point.
 
@@ -3857,7 +3857,7 @@ LIMIT 100001
 **SQL after this work** — unchanged in text; the per-batch membership statement disappears and an ordering and limit are added, as TraceQL1.
 
 Skips granules on the `key` prefix only. `val_num` is not part of
-`ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:348`), so the numeric
+`ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:349`), so the numeric
 comparison narrows rows but prunes nothing. **Compiling a stage and pruning granules are separate
 facts**, and this entry is where they come apart.
 
@@ -4121,7 +4121,7 @@ LIMIT 20
 
 **SQL today** — as TraceQL9: the aggregate produces no SQL. The statements are TraceQL1's.
 
-**SQL today** (issue #492 parts 4 and 5) — `HAVING max(duration_ns) > 1000000000`. `trace_attrs_idx` carries `duration_ns` on every attribute row (`schema/schema.sql:342`), so the attribute index answers the whole query — no join, no subquery, no second table.
+**SQL today** (issue #492 parts 4 and 5) — `HAVING max(duration_ns) > 1000000000`. `trace_attrs_idx` carries `duration_ns` on every attribute row (`schema/schema.sql:343`), so the attribute index answers the whole query — no join, no subquery, no second table.
 
 `>` is one of the two operators `max` may push under. The statement aggregates the generator's ROWS
 and the evaluator its DEDUPLICATED, selector-matched spans, so the statement's maximum reads HIGH:
@@ -4738,7 +4738,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
 | 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and the unwired LogQL model in our source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:685`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
-| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`schema/schema.sql:471`) and the attribute index (`schema/schema.sql:332-350`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:1009`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
+| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`schema/schema.sql:473`) and the attribute index (`schema/schema.sql:333-351`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:1009`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
 (`clickhouse/clickhouse-server:26.3`) and `grafana/loki:3.7.4`, digest
@@ -5474,7 +5474,7 @@ cheaper than having the next reader find them.
 | the `400` body of LogQL32 | the template at `logql/error.rs:816-819` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:809-815`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |
-| every SQL text marked *decided here* parses and executes | each was run against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:82-104` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:332-350` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
+| every SQL text marked *decided here* parses and executes | each was run against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:82-104` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:333-351` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
 | the §2.8 statements agree with the reference over this corpus | the **nine** log-query statements (LogQL45–51, LogQL53, LogQL58) were run and their returned timestamps compared to the reference's captured entries: all nine contain every answer row, and LogQL45, LogQL48 and LogQL51 return exactly it. The **three** metric statements (LogQL54, LogQL55, LogQL56) were run and compared for equality, not containment, and each reproduced the reference's answer exactly — including LogQL56's tie between `edge` and `ipcase` | that containment holds on **any** corpus. The corpus is fourteen lines. The property is argued below and the argument, not this run, is what carries it. LogQL52 is held back and LogQL57's aggregation does not compile, so neither is in either count |
 | the fourteen answers of §2.8 | captured from `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus, with `data.stats` removed and no other edit | the same limit as part 4's answers: only that the reference answers this way over **this** corpus |
 | the ClickHouse behaviours the guards rest on | run and pasted into the cells that use them: `JSONExtractString('{"c":31.0}','c')` is `31`; `JSONExtractString('{"b":500}','b')` is `500`; `JSONExtractFloat('{"i":1e3}','i')` is `1000`; `JSONExtractFloat('{"s":"12abc"}','s')` is `0`; `JSONType('{"a":1}trailing')` is `Null`; `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; `extractGroups('a\nb','(?P<x>a.b)')` is `['a\nb']` and with `(?-s)` is `[]` | that they hold on another ClickHouse version. They were run on 26.3.17.110 only, which is the version floor (`crates/pulsus-schema/src/checks.rs:29`) |

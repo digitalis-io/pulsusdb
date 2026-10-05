@@ -42,7 +42,7 @@ local disks: the object-storage requirements were withdrawn by the owner on
 | events, links | arrays of tuples, each with its own `attrs` **and its own `attrs_other`**; an event's time is stored **unsigned**, and a link's two ids are the bytes the sender sent, whatever their length |
 | scope name, version, attributes, schema url, dropped count | six columns: `scope_name`, `scope_version`, `scope_attrs`, `scope_attrs_other`, `scope_schema_url`, `scope_dropped_attrs` |
 | resource attributes and entity references | a 128-bit `resource_id` over **all three** `Resource` fields and the schema url, plus one row in `resources` carrying `entity_refs` |
-| the service name | the `spans.service` column, and removed from the resource's attributes **only when its value is a non-empty string** — the one arm that column carries losslessly. Every other arm stays in `resources.attrs` as the typed value it was, and is never a catalog entry either way |
+| the service name | the `spans.service` column, and removed from the resource's attributes **only when its value is a non-empty string** — the one arm that column carries losslessly. Every other arm stays in `resources.attrs` as the typed value it was, and is never a catalog entry either way. `spans.service_type` names the arm the value arrived as, so the span row alone tells an empty string from an absent key (issue #589) |
 
 There is no payload blob: a fetch rebuilds the OTLP message from the columns.
 That is where today's 58.12 B/span of payload goes.

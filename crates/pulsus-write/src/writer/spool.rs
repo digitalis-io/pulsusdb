@@ -1104,6 +1104,7 @@ mod tests {
             }],
             dropped_links: 5,
             service: "checkout".to_string(),
+            service_type: "string",
             attrs: json("k", &long),
             attrs_other: vec![0x0a, 0x03, 0x6b, 0x65, 0x79],
             dropped_attrs: 2,

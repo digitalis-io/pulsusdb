@@ -1525,7 +1525,7 @@ async fn two_events_and_two_links_in_one_span_all_land() {
     drop_db(&db).await;
 }
 
-/// **The insert omits `event_id`, so the server fills it.** Thirty-six
+/// **The insert omits `event_id`, so the server fills it.** Thirty-seven
 /// columns in the insert's column list and `event_id` is not one of them;
 /// live, every landed row's own identity is non-zero and distinct.
 #[tokio::test]
@@ -1536,8 +1536,8 @@ async fn the_insert_omits_event_id_so_the_server_fills_it() {
     let names = <TraceLandingRow as clickhouse::Row>::COLUMN_NAMES;
     assert_eq!(
         names.len(),
-        36,
-        "the table has 37 columns and the row type declares the other 36: {names:?}"
+        37,
+        "the table has 38 columns and the row type declares the other 37: {names:?}"
     );
     assert!(
         !names.contains(&"event_id"),

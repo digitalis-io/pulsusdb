@@ -538,8 +538,8 @@ fn the_file_still_answers_the_two_run_time_questions() {
 
     let spans = pulsus_schema::table_column_names("spans").expect("spans is in the file");
     assert_eq!(spans.first(), Some(&"trace_id"));
-    assert_eq!(spans.last(), Some(&"end_ns"));
-    assert_eq!(spans.len(), 27);
+    assert_eq!(spans.last(), Some(&"service_type"));
+    assert_eq!(spans.len(), 28);
     let resources = pulsus_schema::table_column_names("resources").expect("resources");
     assert_eq!(
         resources,

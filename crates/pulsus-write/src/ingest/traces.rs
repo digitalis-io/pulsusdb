@@ -378,6 +378,12 @@ pub struct LandingSpan {
     pub dropped_links: u32,
     /// The resource's `service.name`, rendered verbatim, `""` when absent.
     pub service: String,
+    /// The `AnyValue` arm `service` was rendered from — `string`, `bool`,
+    /// `int`, `double`, `array`, `kvlist`, `bytes` — or `""` for no key, no
+    /// arm, or the profiling string reference (issue #589). `service`
+    /// alone cannot tell the empty string from an absent key, or the
+    /// integer `12345` from the string `"12345"`.
+    pub service_type: &'static str,
     pub attrs: TraceJson,
     /// The protobuf serialization of an
     /// `opentelemetry.proto.common.v1.KeyValueList` carrying the keys whose
