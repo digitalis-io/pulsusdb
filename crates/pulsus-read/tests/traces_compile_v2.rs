@@ -546,9 +546,9 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
 // T-C5 — every out-of-scope construct refuses, naming itself
 // ---------------------------------------------------------------------
 
-/// The intrinsics part 1 serves. Every other `Intrinsic` variant is
-/// #589's or later and must REFUSE rather than compile something wrong.
-const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
+/// The intrinsics this compiler serves. Every other `Intrinsic` variant is
+/// #594's and must REFUSE rather than compile something wrong.
+const IN_SCOPE_INTRINSICS: [Intrinsic; 14] = [
     Intrinsic::Name,
     Intrinsic::Duration,
     Intrinsic::Status,
@@ -559,11 +559,15 @@ const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
     Intrinsic::TraceId,
     Intrinsic::InstrumentationName,
     Intrinsic::InstrumentationVersion,
+    Intrinsic::EventName,
+    Intrinsic::EventTimeSinceStart,
+    Intrinsic::LinkSpanId,
+    Intrinsic::LinkTraceId,
 ];
 
 /// The issue each out-of-scope intrinsic is refused with, and `None` for
-/// the ten this compiler serves. **No wildcard arm**: a new `Intrinsic`
-/// variant fails to compile here until it is classified.
+/// the fourteen this compiler serves. **No wildcard arm**: a new
+/// `Intrinsic` variant fails to compile here until it is classified.
 fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
     match intrinsic {
         Intrinsic::Name
@@ -575,11 +579,11 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
         | Intrinsic::ParentId
         | Intrinsic::TraceId
         | Intrinsic::InstrumentationName
-        | Intrinsic::InstrumentationVersion => None,
-        Intrinsic::EventName
+        | Intrinsic::InstrumentationVersion
+        | Intrinsic::EventName
         | Intrinsic::EventTimeSinceStart
         | Intrinsic::LinkSpanId
-        | Intrinsic::LinkTraceId => Some("#589 part 2"),
+        | Intrinsic::LinkTraceId => None,
         Intrinsic::NestedSetParent
         | Intrinsic::NestedSetLeft
         | Intrinsic::NestedSetRight
@@ -592,6 +596,10 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
 
 /// Section 2's refusal: a `resource.` field compiled with no context.
 const RESOURCE_NEEDS_WINDOW: &str = "the \"resource.\" attribute scope needs the request window: \
+                                     compile it with compile_span_predicate_in (issue #589)";
+
+/// Part 2 section 5.1's refusal: a `.` field compiled with no context.
+const UNSCOPED_NEEDS_WINDOW: &str = "the \".\" attribute scope needs the request window: \
                                      compile it with compile_span_predicate_in (issue #589)";
 
 /// `T-C5`: driven from `Intrinsic::ALL` and `AttrScope::ALL`, which the
@@ -635,7 +643,7 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
         assert_eq!(intrinsic_target(intrinsic), None, "{intrinsic}");
     }
 
-    let mut refused_scopes = 0usize;
+    let mut visited_scopes = 0usize;
     for scope in AttrScope::ALL.iter().copied() {
         let got = compile_span_leaf(
             &Field::Attribute {
@@ -645,8 +653,9 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
             ComparisonOp::Eq,
             &Value::String("x".to_string()),
         );
+        visited_scopes += 1;
         match scope {
-            AttrScope::Span | AttrScope::Instrumentation => {
+            AttrScope::Span | AttrScope::Instrumentation | AttrScope::Event | AttrScope::Link => {
                 assert!(got.is_ok(), "{scope} compiles with no context: {got:?}");
             }
             AttrScope::Resource => {
@@ -658,21 +667,18 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
                     "resource. with no context"
                 );
             }
-            AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
-                refused_scopes += 1;
-                match got {
-                    Err(PlanError::UnsupportedField(msg)) => assert!(
-                        msg.contains(&format!("\"{scope}\""))
-                            && msg.ends_with("(issue #589 part 2)"),
-                        "{scope}: the refusal must name the scope and `(issue #589 part 2)`, \
-                         got {msg:?}"
-                    ),
-                    other => panic!("the {scope} scope must be UnsupportedField, got {other:?}"),
-                }
+            AttrScope::Unscoped => {
+                assert_eq!(
+                    got.map(|p| p.sql().to_string()),
+                    Err(PlanError::UnsupportedField(
+                        UNSCOPED_NEEDS_WINDOW.to_string()
+                    )),
+                    ". with no context"
+                );
             }
         }
     }
-    assert_eq!(refused_scopes + 3, AttrScope::ALL.len());
+    assert_eq!(visited_scopes, AttrScope::ALL.len());
 
     // The expression-level constructs section 7 defers to part 3, each
     // naming itself.
@@ -1344,4 +1350,591 @@ fn t_c18_not_over_a_bare_field_demands_a_boolean() {
     for query in [r#"{ !resource.k }"#, r#"{ !resource.service.name }"#] {
         assert!(!rendered_in(query).contains("NOT IN ('None'"), "{query}");
     }
+}
+
+// =====================================================================
+// Issue #589 part 2 — event and link conditions, the four event and link
+// intrinsics, and the unscoped `.k` chain, text only
+// =====================================================================
+
+/// The five typed reads a span-row attribute text carries, each with the
+/// lambda variable an element condition binds it to (section 3.1).
+const READS: [(&str, &str); 5] = [
+    (".:String", "s"),
+    (".:Int64", "i"),
+    (".:Float64", "f"),
+    (".:Bool", "b"),
+    (".:`Array(Nullable(String))`", "sa"),
+];
+
+/// This test's own rewrite of the span leaf `span_text` (key `k`) into the
+/// element condition over `e` (`events` or `links`): strip a leading
+/// `NOT `, replace each ``attrs.`k`<suffix>`` with its variable, list the
+/// variables in first-use order, wrap in `arrayExists`, and put the `NOT`
+/// back OUTSIDE it.
+fn element_of(e: &str, span_text: &str) -> String {
+    let (negated, positive) = match span_text.strip_prefix("NOT ") {
+        Some(p) => (true, p),
+        None => (false, span_text),
+    };
+    let needle = "attrs.`k`";
+    let mut body = String::new();
+    let mut vars: Vec<(&str, &str)> = Vec::new();
+    let mut rest = positive;
+    while let Some(at) = rest.find(needle) {
+        body.push_str(&rest[..at]);
+        let after = &rest[at + needle.len()..];
+        let (suffix, var) = READS
+            .iter()
+            .copied()
+            .find(|(suffix, _)| after.starts_with(suffix))
+            .unwrap_or_else(|| panic!("an untyped read in {span_text}"));
+        body.push_str(var);
+        if !vars.iter().any(|(_, v)| *v == var) {
+            vars.push((suffix, var));
+        }
+        rest = &after[suffix.len()..];
+    }
+    body.push_str(rest);
+    assert!(!vars.is_empty(), "no attribute read in {span_text}");
+    let names: Vec<&str> = vars.iter().map(|(_, v)| *v).collect();
+    let args = if names.len() > 1 {
+        format!("({})", names.join(", "))
+    } else {
+        names[0].to_string()
+    };
+    let arrays: Vec<String> = vars
+        .iter()
+        .map(|(suffix, _)| format!("{e}.attrs.`k`{suffix}"))
+        .collect();
+    let inner = format!("arrayExists({args} -> {body}, {})", arrays.join(", "));
+    if negated {
+        format!("NOT {inner}")
+    } else {
+        inner
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C20 — the element cross product
+// ---------------------------------------------------------------------
+
+/// `T-C20`: where `span.k` renders `L`, `event.k` and `link.k` render the
+/// test's own rewrite of `L` ([`element_of`]); where `span.k` is refused,
+/// they are refused with the same error. The negation is OUTSIDE
+/// `arrayExists`, never inside the lambda.
+#[test]
+fn t_c20_an_event_or_link_leaf_is_any_match_over_the_typed_array() {
+    let mut seen = 0usize;
+    for (scope, e) in [(AttrScope::Event, "events"), (AttrScope::Link, "links")] {
+        for c in cross_cells() {
+            let (span, element) = cell(scope, c.as_ref().map(|(op, v)| (*op, v)), false);
+            seen += 1;
+            assert_eq!(element, span.map(|l| element_of(e, &l)), "{scope} {c:?}");
+        }
+    }
+    assert_eq!(seen, 2 * (ALL_OPS.len() * 4 + 1));
+
+    // Section 3.2's four texts.
+    assert_eq!(
+        rendered(r#"{ event.k = "v" }"#),
+        "arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+         events.attrs.`k`.:String, events.attrs.`k`.:`Array(Nullable(String))`)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k != 3 }"#),
+        "NOT arrayExists((i, f) -> (coalesce(i = 3, false) OR coalesce(f = 3, false)), \
+         events.attrs.`k`.:Int64, events.attrs.`k`.:Float64)"
+    );
+    assert_eq!(
+        rendered(r#"{ link.k =~ "v" }"#),
+        "arrayExists(s -> coalesce(match(s, '^(?:v)$'), false), links.attrs.`k`.:String)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k }"#),
+        "arrayExists(b -> coalesce(b = true, false), events.attrs.`k`.:Bool)"
+    );
+    // Section 3.3's two.
+    assert_eq!(
+        rendered(r#"{ event.k != nil }"#),
+        "arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k = nil }"#),
+        "NOT arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C21 — the unscoped chain, generated
+// ---------------------------------------------------------------------
+
+/// The chain's scopes, in its order (section 5.1).
+const CHAIN: [AttrScope; 5] = [
+    AttrScope::Span,
+    AttrScope::Resource,
+    AttrScope::Event,
+    AttrScope::Link,
+    AttrScope::Instrumentation,
+];
+
+/// What `field` compiles to in [`ctx`]: the cell's leaf, or `{ field }`.
+fn chain_cell_text(
+    field: Field,
+    cell: &Option<(ComparisonOp, Value)>,
+) -> Result<String, PlanError> {
+    match cell {
+        Some((op, v)) => compile_span_leaf_in(&field, *op, v, &ctx()),
+        None => compile_span_predicate_in(&FieldExpr::Field(field), &ctx()),
+    }
+    .map(|p| p.sql().to_string())
+}
+
+/// `{ <scope>key != nil }` in [`ctx`].
+fn presence_text(scope: AttrScope, key: &str) -> String {
+    compile_span_predicate_in(
+        &FieldExpr::Exists {
+            field: scoped(scope, key),
+            negated: false,
+        },
+        &ctx(),
+    )
+    .unwrap_or_else(|e| panic!("{scope}{key} != nil must compile: {e}"))
+    .sql()
+    .to_string()
+}
+
+/// Section 5.2's `P_resource` at `service.name`.
+fn service_present_resource() -> String {
+    format!(
+        "(service_type = 'string' OR {})",
+        r_of("dynamicType(attrs.`service%2Ename`) != 'None'")
+    )
+}
+
+/// The symbol of `pos(op)` (section 4): `!=` to `=`, the others unchanged.
+fn pos_symbol(op: ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq | ComparisonOp::Neq => "=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        ComparisonOp::Re | ComparisonOp::Nre => "=~",
+    }
+}
+
+/// Section 5.2's `X_resource` at `service.name`, built from `p` (the span
+/// leaf's positive text), `R` and `G`.
+fn service_x_resource(span_text: &str, cell: &Option<(ComparisonOp, Value)>) -> String {
+    let (negated, p) = match span_text.strip_prefix("NOT ") {
+        Some(p) => (true, p),
+        None => (false, span_text),
+    };
+    let r = r_of(p);
+    match cell {
+        Some((op, Value::String(s))) => {
+            let g = match op {
+                ComparisonOp::Re | ComparisonOp::Nre => {
+                    format!("match(service, '^(?:{s})$')")
+                }
+                other => format!("service {} '{s}'", pos_symbol(*other)),
+            };
+            let x = format!("((service_type = 'string' AND {g}) OR {r})");
+            if negated { format!("NOT {x}") } else { x }
+        }
+        _ => {
+            if negated {
+                format!("NOT ({r})")
+            } else {
+                r
+            }
+        }
+    }
+}
+
+/// `T-C21`: `.key <op> v` is section 5.1's `multiIf` over the five scopes'
+/// own compiled texts, in the chain's order, with `D` from `X_span`'s
+/// polarity; at `service.name` the resource branch is section 5.2's.
+#[test]
+fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
+    let mut seen = 0usize;
+    for key in ["k", "service.name"] {
+        for c in cross_cells() {
+            seen += 1;
+            let got = chain_cell_text(scoped(AttrScope::Unscoped, key), &c);
+            let x_span = chain_cell_text(scoped(AttrScope::Span, key), &c);
+            let want = x_span.map(|x_span| {
+                let mut args: Vec<String> = Vec::new();
+                for scope in CHAIN {
+                    let (p, x) = if scope == AttrScope::Resource && key == "service.name" {
+                        (service_present_resource(), service_x_resource(&x_span, &c))
+                    } else {
+                        let x = chain_cell_text(scoped(scope, key), &c).unwrap_or_else(|e| {
+                            panic!("{scope}{key} refuses where span.{key} compiles: {e}")
+                        });
+                        (presence_text(scope, key), x)
+                    };
+                    args.push(p);
+                    args.push(x);
+                }
+                let d = if x_span.starts_with("NOT ") {
+                    "true"
+                } else {
+                    "false"
+                };
+                format!("multiIf({}, {d})", args.join(", "))
+            });
+            assert_eq!(got, want, ".{key} {c:?}");
+        }
+    }
+    assert_eq!(seen, 2 * (ALL_OPS.len() * 4 + 1));
+
+    let d = t_b1_window().resources_day_clause();
+    // Section 5.3's text.
+    assert_eq!(
+        rendered_in(r#"{ .k != "v" }"#),
+        format!(
+            "multiIf(dynamicType(attrs.`k`) != 'None', NOT (coalesce(attrs.`k`.:String = 'v', false) \
+             OR has(attrs.`k`.:`Array(Nullable(String))`, 'v')), \
+             resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+             (dynamicType(attrs.`k`) != 'None')), \
+             NOT (resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+             ((coalesce(attrs.`k`.:String = 'v', false) OR \
+             has(attrs.`k`.:`Array(Nullable(String))`, 'v'))))), \
+             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+             events.attrs.`k`.:String, events.attrs.`k`.:`Array(Nullable(String))`), \
+             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+             links.attrs.`k`.:String, links.attrs.`k`.:`Array(Nullable(String))`), \
+             dynamicType(scope_attrs.`k`) != 'None', \
+             NOT (coalesce(scope_attrs.`k`.:String = 'v', false) OR \
+             has(scope_attrs.`k`.:`Array(Nullable(String))`, 'v')), \
+             true)"
+        )
+    );
+
+    // Section 5.2's resource branches and `P_resource`, byte for byte, each
+    // the second and first argument pair of its chain.
+    let svc_x = format!(
+        "((service_type = 'string' AND service = 'x') OR resource_id IN (SELECT resource_id FROM \
+         resources WHERE {d} AND ((coalesce(attrs.`service%2Ename`.:String = 'x', false) OR \
+         has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'x')))))"
+    );
+    let svc_n = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         ((coalesce(attrs.`service%2Ename`.:Int64 = 12345, false) OR \
+         coalesce(attrs.`service%2Ename`.:Float64 = 12345, false))))"
+    );
+    let svc_p = format!(
+        "(service_type = 'string' OR resource_id IN (SELECT resource_id FROM resources WHERE {d} \
+         AND (dynamicType(attrs.`service%2Ename`) != 'None')))"
+    );
+    for (query, x_resource) in [
+        (r#"{ .service.name = "x" }"#, &svc_x),
+        (r#"{ .service.name = 12345 }"#, &svc_n),
+    ] {
+        let got = rendered_in(query);
+        let span_pair = format!(
+            "multiIf({}, {}, ",
+            presence_text(AttrScope::Span, "service.name"),
+            chain_cell_text(
+                scoped(AttrScope::Span, "service.name"),
+                &match filter_body(query) {
+                    FieldExpr::Binary { rhs, .. } => match *rhs {
+                        FieldExpr::Literal(v) => Some((ComparisonOp::Eq, v)),
+                        other => panic!("{other}"),
+                    },
+                    other => panic!("{other}"),
+                }
+            )
+            .expect("span.service.name compiles")
+        );
+        let prefix = format!("{span_pair}{svc_p}, {x_resource}, ");
+        assert!(
+            got.starts_with(&prefix),
+            "{query}:\n{got}\nmust start\n{prefix}"
+        );
+    }
+
+    // Presence and absence: every scope's presence, ORed in the chain's
+    // order, never ANDed.
+    let presence = format!(
+        "(dynamicType(attrs.`k`) != 'None') OR ({}) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
+         (dynamicType(scope_attrs.`k`) != 'None')",
+        r_of("dynamicType(attrs.`k`) != 'None'")
+    );
+    assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
+    assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
+}
+
+// ---------------------------------------------------------------------
+// T-C22 — the four intrinsics
+// ---------------------------------------------------------------------
+
+/// `T-C22`: section 4's texts and refusals, byte for byte.
+#[test]
+fn t_c22_the_event_and_link_intrinsics_are_any_match_over_their_arrays() {
+    assert_eq!(
+        rendered(r#"{ event:name !~ "e.*" }"#),
+        "NOT arrayExists(n -> match(n, '^(?:e.*)$'), events.name)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart < 3ms }"#),
+        "arrayExists(t -> toInt128(t) - start_ns < 3000000, events.time_ns)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart != 2ms }"#),
+        "NOT arrayExists(t -> toInt128(t) - start_ns = 2000000, events.time_ns)"
+    );
+    assert_eq!(
+        rendered(r#"{ link:traceID != "AB" }"#),
+        "NOT arrayExists(h -> lower(hex(h)) = 'ab', links.trace_id)"
+    );
+    assert_eq!(
+        rendered(r#"{ link:spanID =~ "0A.*" }"#),
+        "arrayExists(h -> match(lower(hex(h)), '^(?:0A.*)$'), links.span_id)"
+    );
+    // A bare number is nanoseconds.
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart > 5 }"#),
+        "arrayExists(t -> toInt128(t) - start_ns > 5, events.time_ns)"
+    );
+    // An ordered string comparison renders.
+    assert_eq!(
+        rendered(r#"{ event:name > "a" }"#),
+        "arrayExists(n -> n > 'a', events.name)"
+    );
+
+    for (query, message) in [
+        (
+            r#"{ event:name = 5 }"#,
+            "event:name requires a string value",
+        ),
+        (
+            r#"{ event:timeSinceStart = "x" }"#,
+            "event:timeSinceStart requires a duration or a number",
+        ),
+        (
+            r#"{ event:timeSinceStart =~ "x" }"#,
+            "event:timeSinceStart requires a duration or a number",
+        ),
+        (
+            r#"{ link:spanID = 5 }"#,
+            "link:spanID requires a string value",
+        ),
+        (
+            r#"{ link:traceID = 5 }"#,
+            "link:traceID requires a string value",
+        ),
+    ] {
+        assert_eq!(
+            refusal(query),
+            PlanError::TypeMismatch(message.to_string()),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        compile_span_leaf(
+            &Field::Intrinsic(Intrinsic::EventTimeSinceStart),
+            ComparisonOp::Re,
+            &duration_value(r#"{ duration > 1ms }"#),
+        )
+        .map(|p| p.sql().to_string()),
+        Err(PlanError::TypeMismatch(
+            "event:timeSinceStart does not support regex operators".to_string()
+        ))
+    );
+    // `!` over each keeps part 1's plan-time refusal.
+    for intrinsic in [
+        "event:name",
+        "event:timeSinceStart",
+        "link:spanID",
+        "link:traceID",
+    ] {
+        assert_eq!(
+            refusal(&format!("{{ !{intrinsic} }}")),
+            PlanError::TypeMismatch(format!("expression (!{intrinsic}) expected a boolean"))
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C23 — `!` over the new scopes
+// ---------------------------------------------------------------------
+
+/// `T-C23`: section 6. `T` and the demand condition `c` are any-match for
+/// `event.`/`link.`, and a `multiIf` over the scopes for `.`.
+#[test]
+fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
+    let elem = |e: &str| {
+        (
+            format!("arrayExists(b -> coalesce(b = false, false), {e}.attrs.`k`.:Bool)"),
+            format!(
+                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                 {e}.attrs.`k`)"
+            ),
+        )
+    };
+    let (t_ev, c_ev) = elem("events");
+    let (t_lk, c_lk) = elem("links");
+    assert_eq!(
+        rendered(r#"{ !event.k }"#),
+        format!(
+            "(throwIf({c_ev}, 'expression (!event.k) expected a boolean') + toUInt8({t_ev})) = 1"
+        )
+    );
+    assert_eq!(
+        rendered(r#"{ !link.k = true }"#),
+        format!(
+            "(throwIf({c_lk}, 'expression (!link.k) expected a boolean') + toUInt8({t_lk})) = 1"
+        )
+    );
+
+    let c_span = "dynamicType(attrs.`k`) != 'None' AND dynamicType(attrs.`k`) != 'Bool'";
+    let t_span = "coalesce(attrs.`k`.:Bool = false, false)";
+    let c_in = "dynamicType(scope_attrs.`k`) != 'None' AND dynamicType(scope_attrs.`k`) != 'Bool'";
+    let t_in = "coalesce(scope_attrs.`k`.:Bool = false, false)";
+    let p = |scope: AttrScope| presence_text(scope, "k");
+    let t = format!(
+        "multiIf({}, {t_span}, {}, {}, {}, {t_ev}, {}, {t_lk}, {}, {t_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(t_span),
+        p(AttrScope::Event),
+        p(AttrScope::Link),
+        p(AttrScope::Instrumentation),
+    );
+    let c = format!(
+        "multiIf({}, {c_span}, {}, {}, {}, {c_ev}, {}, {c_lk}, {}, {c_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(c_span),
+        p(AttrScope::Event),
+        p(AttrScope::Link),
+        p(AttrScope::Instrumentation),
+    );
+    assert_eq!(
+        rendered_in(r#"{ !.k }"#),
+        format!("(throwIf({c}, 'expression (!.k) expected a boolean') + toUInt8({t})) = 1")
+    );
+
+    // At `service.name`: section 5.2's `P_resource`, part 1's `T` and `c`.
+    let ps = |scope: AttrScope| presence_text(scope, "service.name");
+    let span_path = "attrs.`service%2Ename`";
+    let in_path = "scope_attrs.`service%2Ename`";
+    let elem_s = |e: &str| {
+        (
+            format!(
+                "arrayExists(b -> coalesce(b = false, false), {e}.attrs.`service%2Ename`.:Bool)"
+            ),
+            format!(
+                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                 {e}.attrs.`service%2Ename`)"
+            ),
+        )
+    };
+    let (ts_ev, cs_ev) = elem_s("events");
+    let (ts_lk, cs_lk) = elem_s("links");
+    let ts = format!(
+        "multiIf({}, coalesce({span_path}.:Bool = false, false), {}, \
+         (service_type = 'bool' AND service = 'false'), {}, {ts_ev}, {}, {ts_lk}, {}, \
+         coalesce({in_path}.:Bool = false, false), false)",
+        ps(AttrScope::Span),
+        service_present_resource(),
+        ps(AttrScope::Event),
+        ps(AttrScope::Link),
+        ps(AttrScope::Instrumentation),
+    );
+    let cs = format!(
+        "multiIf({}, dynamicType({span_path}) != 'None' AND dynamicType({span_path}) != 'Bool', \
+         {}, service_type != '' AND service_type != 'bool', {}, {cs_ev}, {}, {cs_lk}, {}, \
+         dynamicType({in_path}) != 'None' AND dynamicType({in_path}) != 'Bool', false)",
+        ps(AttrScope::Span),
+        service_present_resource(),
+        ps(AttrScope::Event),
+        ps(AttrScope::Link),
+        ps(AttrScope::Instrumentation),
+    );
+    assert_eq!(
+        rendered_in(r#"{ !.service.name }"#),
+        format!(
+            "(throwIf({cs}, 'expression (!.service.name) expected a boolean') + toUInt8({ts})) = 1"
+        )
+    );
+
+    // Lifted out of a short-circuiting operator, once.
+    let lifted = rendered(r#"{ true || !event.k }"#);
+    assert_eq!(
+        lifted,
+        format!(
+            "(throwIf({c_ev}, 'expression (!event.k) expected a boolean') + \
+             toUInt8((true) OR ({t_ev}))) = 1"
+        )
+    );
+    assert_eq!(lifted.matches("throwIf(").count(), 1, "{lifted}");
+    assert_eq!(
+        compile_span_predicate(&filter_body(r#"{ true || !event.k }"#))
+            .expect("compiles")
+            .demand_messages(),
+        ["expression (!event.k) expected a boolean".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C24 — the chain's truthiness, presence and context
+// ---------------------------------------------------------------------
+
+/// `T-C24`: `{ .k }` is the chain of `{ sc.k }` with `D = false`;
+/// `{ .k = nil }` and `{ .k != nil }` are the ORed presences; the chain
+/// needs the window, and `event.` does not.
+#[test]
+fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
+    let d = t_b1_window().resources_day_clause();
+    let r_present = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         (dynamicType(attrs.`k`) != 'None'))"
+    );
+    let r_true = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         (coalesce(attrs.`k`.:Bool = true, false)))"
+    );
+    assert_eq!(
+        rendered_in(r#"{ .k }"#),
+        format!(
+            "multiIf(dynamicType(attrs.`k`) != 'None', coalesce(attrs.`k`.:Bool = true, false), \
+             {r_present}, {r_true}, \
+             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             arrayExists(b -> coalesce(b = true, false), events.attrs.`k`.:Bool), \
+             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             arrayExists(b -> coalesce(b = true, false), links.attrs.`k`.:Bool), \
+             dynamicType(scope_attrs.`k`) != 'None', coalesce(scope_attrs.`k`.:Bool = true, false), \
+             false)"
+        )
+    );
+    let presence = format!(
+        "(dynamicType(attrs.`k`) != 'None') OR ({r_present}) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
+         (dynamicType(scope_attrs.`k`) != 'None')"
+    );
+    assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
+    assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
+
+    assert_eq!(
+        refusal(r#"{ .k = 1 }"#),
+        PlanError::UnsupportedField(UNSCOPED_NEEDS_WINDOW.to_string())
+    );
+    assert_eq!(
+        rendered(r#"{ event.k = 1 }"#),
+        "arrayExists((i, f) -> (coalesce(i = 1, false) OR coalesce(f = 1, false)), \
+         events.attrs.`k`.:Int64, events.attrs.`k`.:Float64)"
+    );
+    let p = compile_span_predicate(&filter_body(r#"{ event.k = 1 }"#)).expect("compiles");
+    // No resource subquery, so no window is carried: another window composes.
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    assert!(span_membership_sql("spans", other, &p).contains("arrayExists"));
 }
