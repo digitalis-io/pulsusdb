@@ -430,6 +430,39 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
         .collect();
     assert_eq!(got_sorted, want, "the fallback fetch");
 
+    // An activity row whose label row never landed — the one outcome the
+    // two views add, when one commits and the other does not — is absent
+    // from every read, never returned with empty labels: an empty label
+    // set would make distinct series one.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli) \
+                 VALUES ('orphan', 9999, {hour})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed an activity row with no label row");
+    cache.refresh().await.expect("refresh");
+    match cache.resolve_labelled("orphan", &[], window) {
+        LabelledResolution::Series(series) => {
+            assert!(series.is_empty(), "the sweep returned {series:?}")
+        }
+        other => panic!("the warm cache must answer, got {other:?}"),
+    }
+    assert!(
+        discovered(DiscoveryFilter {
+            metric_name: Some("orphan".to_string()),
+            name_matchers: Vec::new(),
+            matchers: Vec::new(),
+        })
+        .await
+        .is_empty(),
+        "discovery returned a series with no label set"
+    );
+
     // Stored once: one label row per label set, not one per name and hour.
     assert_eq!(
         count(
