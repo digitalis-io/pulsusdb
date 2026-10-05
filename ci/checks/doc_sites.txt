@@ -13,7 +13,12 @@ rewrite docs/schemas.md:33-33
 # reads as added, while the protected base ranges it compares against are
 # different lines. Declaring them records that, and the presence rule above
 # keeps the declaration honest about the file.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555
+# Issue #623 adds #26 and #623. #26 is carried: the `metric_metadata`
+# paragraph that already cited it gained the hourly descriptor resend, so the
+# rule reads the line as added. #623 is the change itself, cited where
+# `docs/schemas.md` states the label table, the activity TTL, the sorting-key
+# setting and the one-statement fetch.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
