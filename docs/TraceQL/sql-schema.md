@@ -987,7 +987,10 @@ drop:   0.068 s
 after:  0 parts, 0 rows; 0 mutations scheduled; 0 merges running
 ```
 
-`spans`, `resources` and `traces` are partitioned by day and drop together;
+`spans`, `resources` and `traces` are partitioned by day. Each drops a part
+once its last row has expired: a span at its start + retention, a resource row
+at the end of its day + retention, and a per-trace row at its latest span's
+start + retention. A span inside retention therefore always finds both rows;
 `tag_names` and `tag_values` are time-less and are not dropped, which is what
 `docs/api.md` §4.3 requires of the catalog ("catalog entries can therefore
 outlive the 7-day span retention").

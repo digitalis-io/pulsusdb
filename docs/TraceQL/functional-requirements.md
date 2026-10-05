@@ -528,6 +528,8 @@ input and one expected result; none of them leaves a choice to the coder.
 | `T-S6` | apply the schema twice | the second application | no error, no column re-added | the migration set is new |
 | `T-R1` | load two days, `ALTER TABLE spans DROP PARTITION` the older | elapsed, `system.mutations`, `system.merges`, remaining rows | the day is gone, 0 mutations, 0 merges, the other day intact (measured 0.068 s for 2,000,064 spans) | the table does not exist |
 | `T-R2` | a span on 2106-02-06 | the rendered TTL expression | the clamped form, no overflow past 2106-02-06 | new DDL |
+| `T-R3` | apply the schema with a retention of one day; every second of 2026-10-01 .. 2026-10-07, and one block per minute of 2026-10-04 whose latest span is up to three days later | `(min, max, count)` of the resource row's TTL minus its span's, and of the per-trace row's TTL minus its latest span's, in seconds, from the stored TTL expressions | `(1,86400,604800)` and `(0,0,6220800)` | `(-86399,0,604800)` and `(-345480,0,6220800)` |
+| `T-R4` | a retention of one day; `Y` = yesterday's UTC midnight; one landing block: span `a1` of `aa` at `Y + 1 day - 1 ns`, `b1` of `bb` at `Y - 1 ns`, `c1` and `c2` of `cc` at `Y - 12 h` and `Y + 1 day - 2 ns`, resource rows 101 and 103 under `Y`'s day and 102 and 103 under the day before, each with `k = "r"`; wait until no part is wholly past its TTL | the fetch of `aa`, `cc` and `bb`; the resource rows read without `FINAL`; `{ resource.k = "r" }` over `[Y - 1 day, now + 1 s)` | `a1` with 101, `c2` with 103, `bb` empty; `(101, Y)` and `(103, Y)`; `a1` and `c2` | every fetch empty, no resource row, no match |
 
 ### 8.2 The window rule
 

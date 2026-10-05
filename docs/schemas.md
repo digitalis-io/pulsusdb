@@ -1239,6 +1239,7 @@ CREATE TABLE spans (
 ) ENGINE = ReplacingMergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
+TTL toDateTime(least(intDiv(start_ns, 1000000000) + (7 * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
 
 CREATE TABLE traces (
@@ -1254,6 +1255,7 @@ CREATE TABLE traces (
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
 ORDER BY trace_id
+TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + (7 * 86400), 4294967295))
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
 
 CREATE TABLE resources (
@@ -1267,7 +1269,8 @@ CREATE TABLE resources (
     entity_refs    String                  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
 PARTITION BY day
-ORDER BY (service, resource_id);
+ORDER BY (service, resource_id)
+TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + (7 * 86400), 4294967295));
 
 CREATE TABLE tag_names (
     scope  LowCardinality(String)  CODEC(ZSTD(1)),  -- span | resource | event | link | instrumentation
@@ -1371,12 +1374,12 @@ landed event a row is; a row sets that kind's columns and the rest default.
   through a `Distributed` wrapper would split one push per shard and one push
   would stop being one block. The routing happens one step later, on the way
   out of the two per-trace views (§7).
-- **Three of the five targets carry no TTL statement and two of those carry no
-  TTL at all.** `spans`, `traces` and `resources` take a saturating
-  delete-TTL at run time from `apply_ttl`, the shape §4.1's own
-  admitted-domain note describes; `tag_names` and `tag_values` carry a
-  deduplication window and no TTL, because `docs/api.md` §4.3 requires
-  catalog entries to outlive span retention.
+- **The catalogs carry no TTL; the other three targets carry one in their
+  `CREATE`.** `spans` expires on `start_ns`, `traces` on `last_start_ns`, and
+  `resources` on the end of its `day`, each plus `PULSUS_RETENTION_DAYS` in the
+  saturating form. `tag_names` and `tag_values` carry a deduplication window
+  and no TTL, because `docs/api.md` §4.3 requires catalog entries to outlive
+  span retention.
 - **Six deduplication windows, one per write-path table.** A view's insert
   into its target carries a block id derived from the source block, and only a
   table with a window recognises the repeat.
