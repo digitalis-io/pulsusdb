@@ -117,12 +117,16 @@ fn create_dist_sql(db: &str, cluster: &str) -> String {
     )
 }
 
-fn populate_sql(source_table: &str, target_table: &str) -> String {
+fn populate_sql(source_table: &str, labels_table: &str, target_table: &str) -> String {
+    // Issue #623: the label text is in `metric_labels`, one row per
+    // fingerprint, joined back onto each activity row.
     format!(
         "INSERT INTO {target_table}\n\
-         SELECT unix_milli AS bucket, metric_name, kv.1 AS key, kv.2 AS val, fingerprint\n\
-         FROM {source_table}\n\
-         ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv"
+         SELECT s.unix_milli AS bucket, s.metric_name, kv.1 AS key, kv.2 AS val, fingerprint\n\
+         FROM {source_table} AS s\n\
+         INNER JOIN (SELECT fingerprint, any(labels) AS label_set FROM {labels_table} \
+         GROUP BY fingerprint) AS l USING (fingerprint)\n\
+         ARRAY JOIN JSONExtractKeysAndValues(l.label_set, 'String') AS kv"
     )
 }
 
@@ -174,7 +178,7 @@ pub async fn build(
         )
         .await?;
 
-    let (source_table, target_table) = if dist {
+    let (source_table, labels_table, target_table) = if dist {
         client
             .execute(
                 &create_dist_sql(db, cluster),
@@ -184,16 +188,21 @@ pub async fn build(
             .await?;
         (
             "metric_series_dist".to_string(),
+            "metric_labels".to_string(),
             "metric_series_idx_dist".to_string(),
         )
     } else {
-        ("metric_series".to_string(), "metric_series_idx".to_string())
+        (
+            "metric_series".to_string(),
+            "metric_labels".to_string(),
+            "metric_series_idx".to_string(),
+        )
     };
 
     let start = Instant::now();
     client
         .execute(
-            &populate_sql(&source_table, &target_table),
+            &populate_sql(&source_table, &labels_table, &target_table),
             &QuerySettings::new(),
             // An INSERT ... SELECT backfill is never auto-retried by the
             // client wrapper (pulsus_clickhouse::Idempotency's own
@@ -245,8 +254,9 @@ mod tests {
 
     #[test]
     fn populate_sql_array_joins_over_json_extract_keys_and_values() {
-        let sql = populate_sql("metric_series", "metric_series_idx");
-        assert!(sql.contains("ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv"));
+        let sql = populate_sql("metric_series", "metric_labels", "metric_series_idx");
+        assert!(sql.contains("ARRAY JOIN JSONExtractKeysAndValues(l.label_set, 'String') AS kv"));
+        assert!(sql.contains("FROM metric_labels"));
         assert!(sql.contains("INSERT INTO metric_series_idx"));
         assert!(sql.contains("FROM metric_series"));
     }

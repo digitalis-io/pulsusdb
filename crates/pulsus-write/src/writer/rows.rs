@@ -856,12 +856,8 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 26 columns **less `event_id`**, in the table's own declaration
-/// order: the insert's column list is exactly this type's `COLUMN_NAMES`,
-/// so leaving the column out is what makes the server fill it from
-/// `DEFAULT generateUUIDv7()`. A row type carrying the column would store
-/// whatever the writer put there — the nil UUID on every row, for an
-/// explicit zero.
+/// table's 25 columns, in the table's own declaration order: the insert's
+/// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
 /// `hist_sum`, `hist_zero_threshold` and `hist_custom_values` may be NaN

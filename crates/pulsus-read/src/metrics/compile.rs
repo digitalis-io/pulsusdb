@@ -45,15 +45,14 @@
 //!
 //! The two queries differ in one token.
 //!
-//! # A selector's read is TWO statements, so it is two parts
+//! # A selector's read is ONE statement, so it is one part
 //!
-//! Every selector that reads sends a float read and its complementary
-//! histogram read. They are expressed the way the core already expresses
-//! "one statement per source, merged in our process": a predicate that is
-//! a disjunction whose two leaves name different sources, which
-//! [`plan_of`] partitions into two parts with `cut: disjoint_sources` on
-//! the second. One part would have the plan say one statement where two
-//! are sent, on every PromQL query.
+//! Every selector that reads sends one statement over both sample tables,
+//! `UNION ALL` (issue #623; the grouped read since issue #549). It is one
+//! SQL part named for `metric_samples` that also reads
+//! `metric_hist_samples` ([`Pql::also_reads`]). Before #623 the two tables
+//! were two statements, a disjunction of two leaves that [`plan_of`]
+//! partitioned into two parts with `cut: disjoint_sources` on the second.
 //!
 //! # `Fidelity::Wider` on the source link
 //!
@@ -296,15 +295,13 @@ impl Lang for Pql {
         }
     }
 
-    /// The grouped instant read (issue #549) unions `metric_samples` and
-    /// `metric_hist_samples` inside ONE statement, so the part named for
-    /// the first also reads the second. Every other PromQL statement
-    /// reads exactly one table and this returns nothing for it, which is
-    /// what keeps the wire field absent from every plan but that one.
+    /// Every PromQL read unions `metric_samples` and `metric_hist_samples`
+    /// inside ONE statement — the grouped instant read since issue #549,
+    /// the sample fetch since issue #623 — so the part named for the first
+    /// also reads the second.
     fn also_reads(rel: &Relation<Pql>) -> Vec<SourceRef> {
         match rel.shape {
-            PqlShape::GroupedRuns => vec![METRIC_HIST_SAMPLES],
-            PqlShape::Samples => Vec::new(),
+            PqlShape::GroupedRuns | PqlShape::Samples => vec![METRIC_HIST_SAMPLES],
         }
     }
 }
@@ -395,19 +392,17 @@ impl Lower<Pql> for NodeLower {
 // The seed
 // ---------------------------------------------------------------------
 
-/// One selector's read, as one predicate: the float read **or** the
-/// histogram read, one leaf each, tagged with the table it reads.
-///
-/// A disjunction because that is what the two statements mean: they are
-/// issued together, neither consumes the other, and their rows are merged
-/// in our process — the core's own description of `Cut::DisjointSources`.
-/// `Pred::disjoint_or_branches` then partitions them into two parts.
+/// One selector's read, as one predicate: the sample fetch reads
+/// `metric_samples` and `metric_hist_samples` in ONE statement (issue
+/// #623), so it is one leaf naming the table the part is named for, with
+/// the other carried additively by [`Pql::also_reads`] — the grouped
+/// read's form ([`grouped_selector_pred`]). Before #623 the two tables
+/// were two statements and this was a disjunction of two leaves.
 ///
 /// The three fragments come from [`super::sample_sql`]'s own producers,
 /// so the leaf text and the statement text cannot disagree.
 pub fn selector_pred(name: &str, window: &str, fps: &str) -> Pred {
-    let text = format!("{name} AND {window} AND {fps}");
-    Pred::leaf(text.clone(), METRIC_SAMPLES).or(Pred::leaf(text, METRIC_HIST_SAMPLES))
+    Pred::leaf(format!("{name} AND {window} AND {fps}"), METRIC_SAMPLES)
 }
 
 /// One pushed selector's read, as one predicate: the grouped statement
@@ -1297,7 +1292,7 @@ pub(crate) fn plan_shapes(
 mod tests {
     use super::*;
 
-    use crate::compile::plan::{Cut, Part};
+    use crate::compile::plan::Part;
     use crate::compile::testkit::{EffectRow, assert_every_residual_state_effect};
     use pulsus_promql::{DEFAULT_LOOKBACK_MS, PlanParams, parse};
 
@@ -1394,15 +1389,15 @@ mod tests {
         let cases: [(&str, &str); 3] = [
             (
                 "stddev by (status) (http_requests_total{status=\"500\"})",
-                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"Aggregate(stddev)","how":"residual","why":"not_yet_lowered"}]}"#,
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","also_reads":["metric_hist_samples"],"issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"engine","links":[1]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":1,"stage":"Aggregate(stddev)","how":"residual","why":"not_yet_lowered"}]}"#,
             ),
             (
                 "max by (status) (rate(http_requests_total{status=\"500\"}[5m]))",
-                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"RangeFn(rate)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","also_reads":["metric_hist_samples"],"issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":1,"stage":"RangeFn(rate)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":1,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
             ),
             (
                 "max by (status) (abs(http_requests_total{status=\"500\"}))",
-                r#"{"parts":[{"kind":"sql","name":"metric_samples","issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"sql","name":"metric_hist_samples","issue":"once","cut":{"why":"disjoint_sources","sources":["metric_samples","metric_hist_samples"]},"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":2,"stage":"MathFn(abs)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":2,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
+                r#"{"parts":[{"kind":"sql","name":"metric_samples","also_reads":["metric_hist_samples"],"issue":"once","cut":null,"seed":null,"yields":"candidates"},{"kind":"engine","links":[1,2]}],"links":[{"i":0,"part":0,"stage":"Select(0)","how":"lowered","fidelity":"wider"},{"i":1,"part":1,"stage":"MathFn(abs)","how":"residual","why":"not_yet_lowered"},{"i":2,"part":1,"stage":"Aggregate(max)","how":"residual","why":"not_yet_lowered"}]}"#,
             ),
         ];
         for (query, want) in cases {
@@ -1603,10 +1598,10 @@ mod tests {
         }
     }
 
-    /// The worked query of the plan: one chain, two SQL parts and one
+    /// The worked query of the plan: one chain, one SQL part and one
     /// engine part, with the aggregate residual.
     #[test]
-    fn the_worked_query_yields_two_sql_parts_and_one_engine_part() {
+    fn the_worked_query_yields_one_sql_part_and_one_engine_part() {
         let plan = planned("max by (status) (http_requests_total{status=\"500\"})");
         let mut reads = SelectorReads::empty();
         reads.push(SelectorRead {
@@ -1622,10 +1617,13 @@ mod tests {
             "the float read opens the plan"
         );
         assert_eq!(json["parts"][0]["cut"], serde_json::Value::Null);
-        assert_eq!(json["parts"][1]["name"], "metric_hist_samples");
-        assert_eq!(json["parts"][1]["cut"]["why"], "disjoint_sources");
-        assert_eq!(json["parts"][2]["kind"], "engine");
-        assert_eq!(json["parts"][2]["links"], serde_json::json!([1]));
+        assert_eq!(
+            json["parts"][0]["also_reads"],
+            serde_json::json!(["metric_hist_samples"]),
+            "the one statement reads both sample tables"
+        );
+        assert_eq!(json["parts"][1]["kind"], "engine");
+        assert_eq!(json["parts"][1]["links"], serde_json::json!([1]));
         assert_eq!(json["links"][0]["stage"], "Select(0)");
         assert_eq!(json["links"][0]["how"], "lowered");
         assert_eq!(json["links"][0]["fidelity"], "wider");
@@ -1635,11 +1633,11 @@ mod tests {
         assert_eq!(json["parts"][0]["yields"], "candidates");
     }
 
-    /// The dual read is two parts because the seed is a disjunction over
-    /// two sources — stated against the core's own cut rather than
-    /// against the rendered JSON.
+    /// The read is one part because the seed is one leaf — stated against
+    /// the core's own parts rather than against the rendered JSON (issue
+    /// #623: one statement reads both sample tables).
     #[test]
-    fn a_selectors_two_statements_are_two_sql_parts_cut_on_disjoint_sources() {
+    fn a_selectors_one_statement_is_one_sql_part_that_also_reads_the_histogram_table() {
         let plan = planned("http_requests_total");
         let mut reads = SelectorReads::empty();
         reads.push(SelectorRead {
@@ -1672,15 +1670,13 @@ mod tests {
                 Part::Engine { .. } => None,
             })
             .collect();
-        assert_eq!(sql.len(), 2, "a selector's read is two statements");
+        assert_eq!(sql.len(), 1, "a selector's read is one statement");
         assert_eq!(sql[0].rel.source_ref(), METRIC_SAMPLES);
-        assert_eq!(sql[1].rel.source_ref(), METRIC_HIST_SAMPLES);
-        assert!(sql[0].cut.is_none(), "the first part opens the plan");
-        assert!(
-            matches!(&sql[1].cut, Some(Cut::DisjointSources { sources })
-                if sources == &[METRIC_SAMPLES, METRIC_HIST_SAMPLES]),
-            "the second part's cut: {:?}",
-            sql[1].cut
+        assert!(sql[0].cut.is_none(), "the part opens the plan");
+        assert_eq!(
+            <Pql as Lang>::also_reads(&sql[0].rel),
+            vec![METRIC_HIST_SAMPLES],
+            "and reads the histogram table in the same statement"
         );
     }
 

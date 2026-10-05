@@ -1,5 +1,5 @@
 //! `pulsusdb rebuild-metrics`: replays a window of `metric_landing` into one
-//! of the four tables the materialized views maintain (issue #603).
+//! of the five tables the materialized views maintain (issues #603, #623).
 //!
 //! **Why it exists.** A view never reconciles against its source — it reacts
 //! to new inserts. So if a target ends up wrong (a bad view definition, a
@@ -24,14 +24,15 @@ use pulsus_config::Config;
 
 use crate::chconfig::{conn_config_from, schema_params_from};
 
-/// The four targets, each with the materialized view that maintains it, the
+/// The five targets, each with the materialized view that maintains it, the
 /// expression its partitions are keyed on, and whether it tolerates a replay
 /// without dropping those partitions first.
 ///
-/// `metric_metadata` does: it is a `ReplacingMergeTree(updated_ns)` keyed on
-/// `metric_name`, so a replayed row either loses to a newer descriptor or is
-/// the same row. The other three are append-only, so a replay that does not
-/// drop first stores every row twice and inflates every counting query.
+/// `metric_metadata` and `metric_labels` do: each is a replacing table keyed
+/// on what a replayed row repeats (`metric_name`, `fingerprint`), so a
+/// replayed row is the same row or loses to a newer one. The other three are
+/// append-only, so a replay that does not drop first stores every row twice
+/// and inflates every counting query.
 const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "metric_samples",
@@ -46,17 +47,20 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "metric_series",
         "metric_series_mv",
-        Some("toYYYYMM(fromUnixTimestamp64Milli(unix_milli))"),
+        Some("toDate(fromUnixTimestamp64Milli(unix_milli))"),
     ),
     // No partition key, and no need to drop: the engine collapses on
     // `metric_name`.
     ("metric_metadata", "metric_metadata_mv", None),
+    // No partition key, and no need to drop: the engine collapses on
+    // `fingerprint`, and a fingerprint names one label set.
+    ("metric_labels", "metric_labels_mv", None),
 ];
 
 #[derive(Args, Debug)]
 pub(crate) struct RebuildMetrics {
     /// Which table to rebuild: `metric_samples`, `metric_series`,
-    /// `metric_metadata` or `metric_hist_samples`.
+    /// `metric_metadata`, `metric_labels` or `metric_hist_samples`.
     #[arg(long)]
     target: String,
 

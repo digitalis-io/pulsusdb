@@ -2235,8 +2235,8 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
-                 VALUES ('target_info', {INFO_FP}, {now_ms}, '{{\"instance\":\"a\",\"job\":\"1\"}}')"
+                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
+                 VALUES (2, 'target_info', {INFO_FP}, {now_ms}, '{{\"instance\":\"a\",\"job\":\"1\"}}')"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -2355,9 +2355,9 @@ async fn seed_metric_series(client: &ChClient, db: &str, now_ms: i64) {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
-                 VALUES ('sv', {SFP1}, {now_ms}, '{{\"job\":\"api\"}}'), \
-                        ('sv2', {SFP2}, {now_ms}, '{{\"job\":\"api\"}}')"
+                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
+                 VALUES (2, 'sv', {SFP1}, {now_ms}, '{{\"job\":\"api\"}}'), \
+                        (2, 'sv2', {SFP2}, {now_ms}, '{{\"job\":\"api\"}}')"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -2424,6 +2424,12 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
             "fingerprint",
             "unix_milli",
             "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), and((fingerprint in #-element set), (metric_name in #-element set))))",
+            // Issue #623: the label join reads `metric_labels` by its key,
+            // for the fingerprints the series side named.
+            "PrimaryKey",
+            "Keys:",
+            "fingerprint",
+            "Condition: (fingerprint in #-element set)",
         ]),
         "both the metric_name IN and fingerprint IN components must engage the metric_series primary key"
     );
@@ -2517,10 +2523,21 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
          MinMax/Partition/PrimaryKey analysis"
     );
     let wide = explain(&client, &wide_sql).await;
+    // Issue #623: the wide statement reads the series rows exactly as the
+    // narrow one does, then the label table by its key for the
+    // fingerprints those rows named.
+    let mut wide_series = narrow.clone();
+    wide_series.extend(v(&[
+        "PrimaryKey",
+        "Keys:",
+        "fingerprint",
+        "Condition: (fingerprint in #-element set)",
+    ]));
     assert_eq!(
-        narrow, wide,
+        wide, wide_series,
         "issue #472 must not trade the wide discovery read for a differently-indexed one: \
-         the narrow statement's index usage must equal the statement it replaces"
+         the narrow statement's index usage must equal the series side of the statement it \
+         replaces"
     );
 }
 
@@ -2653,8 +2670,16 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
             "PrimaryKey",
             "Keys:",
             "metric_name",
+            "fingerprint",
             "unix_milli",
-            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in #-element set)))",
+            // Issue #623: the label matcher is a sub-query over
+            // `metric_labels`, whose fingerprint set prunes the series key
+            // too.
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in #-element set))))",
+            "PrimaryKey",
+            "Keys:",
+            "fingerprint",
+            "Condition: (fingerprint in #-element set)",
         ]),
         "the metric_name IN component must engage the metric_series primary key"
     );
@@ -2737,8 +2762,11 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
             "PrimaryKey",
             "Keys:",
             "metric_name",
+            "fingerprint",
             "unix_milli",
-            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in ['sv', 'sv'])))",
+            // Issue #623: the matcher's `metric_labels` sub-query prunes the
+            // fingerprint key too.
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in ['sv', 'sv']))))",
         ]),
         "the bucket-floored window must still prune on unix_milli and metric_name"
     );

@@ -1252,7 +1252,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **The two reasons we are wider.** First, what an unscoped attribute MEANS:
   `.k` asks for "the attribute `k`, wherever this span carries it", and a span
   whose only `k` sits at instrumentation scope has a `k`. Second, our own tag
-  route already advertises five scopes (`docs/api.md:1010`), so a user who
+  route already advertises five scopes (`docs/api.md:1007`), so a user who
   discovers a key through the tag API and then filters on it unscoped would
   otherwise find nothing.
 

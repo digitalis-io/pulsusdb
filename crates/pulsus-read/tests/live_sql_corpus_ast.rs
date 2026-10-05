@@ -212,10 +212,13 @@ const CONTROL: &str = "with_binding_control.txt";
 /// phase-1 generator, the hydration read and the root read — which is the
 /// whole of the `+9`.** The ten goldens that change move their generator
 /// section's text only; none gains or loses a section.
+///
+/// **Issue #623 moves `PROMQL_STATEMENTS` 56 -> 30**: every PromQL entry
+/// now sends ONE statement over both sample tables where 26 sent two.
 const SQL_FILES: usize = 130;
 const SQL_STATEMENTS: usize = 394;
 const PROMQL_ENTRIES: usize = 30;
-const PROMQL_STATEMENTS: usize = 56;
+const PROMQL_STATEMENTS: usize = 30;
 const CONTROL_STATEMENTS: usize = 1;
 
 fn golden_root() -> PathBuf {

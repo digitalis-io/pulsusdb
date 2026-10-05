@@ -2126,50 +2126,63 @@ async fn run_name_projection<R: pulsus_clickhouse::ChRow>(
     evidence
 }
 
-/// Creates `{db}.{table}` with `metric_series`'s own DDL and fills it with
-/// [`SERIES_472`] rows over [`NAMES_472`] names in ONE activity bucket,
-/// server-side (`INSERT … SELECT FROM numbers`), so no row crosses the
-/// wire. `pad_bytes` is the only thing that differs between the two
-/// tables: `(metric_name, fingerprint, unix_milli)` is a pure function of
-/// `number` and `bucket_ms`, so the two tables are identical in every
-/// column the `WHERE` and the projection touch — asserted by the identity
-/// hash in the test below, which is what makes the blob-invariance
-/// comparison a comparison of blob size and nothing else.
-async fn seed_metric_series_472(client: &ChClient, db: &str, table: &str, bucket: i64, pad: u64) {
-    client
-        .execute(
-            &format!(
-                "CREATE TABLE {db}.{table} (\
-                   metric_name  LowCardinality(String), \
-                   fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
-                   unix_milli   Int64   CODEC(Delta(8), ZSTD(1)), \
-                   labels       String  CODEC(ZSTD(5))\
-                 ) ENGINE = MergeTree \
-                 PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli)) \
-                 ORDER BY (metric_name, fingerprint, unix_milli)"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create the #472 corpus table");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.{table} \
-                 SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
-                        number + 1, \
-                        {bucket}, \
-                        concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
-                               '\",\"pod\":\"pod-', toString(number), \
-                               '\",\"pad\":\"', repeat('x', {pad}), '\"}}') \
-                 FROM numbers({SERIES_472})"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed the #472 corpus");
+/// Creates `{db}.{table}` with `metric_series`' own DDL and `{db}.{labels}`
+/// with `metric_labels`' (issue #623), and fills them with [`SERIES_472`]
+/// series over [`NAMES_472`] names in ONE activity bucket, server-side
+/// (`INSERT … SELECT FROM numbers`), so no row crosses the wire. `pad_bytes`
+/// is the only thing that differs between the two corpora, and it is in the
+/// label table alone: `(metric_name, fingerprint, unix_milli)` is a pure
+/// function of `number` and `bucket_ms`, so the two series tables are
+/// identical in every column — asserted by the identity hash in the test
+/// below, which is what makes the blob-invariance comparison a comparison
+/// of blob size and nothing else.
+async fn seed_metric_series_472(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    labels: &str,
+    bucket: i64,
+    pad: u64,
+) {
+    for ddl in [
+        format!(
+            "CREATE TABLE {db}.{table} (\
+               metric_name  LowCardinality(String), \
+               fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
+               unix_milli   Int64   CODEC(Delta(8), ZSTD(1)), \
+               value_type   UInt8 DEFAULT 0\
+             ) ENGINE = MergeTree \
+             PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli)) \
+             ORDER BY (metric_name, fingerprint, unix_milli)"
+        ),
+        format!(
+            "CREATE TABLE {db}.{labels} (\
+               fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
+               labels       String  CODEC(ZSTD(5))\
+             ) ENGINE = ReplacingMergeTree \
+             ORDER BY fingerprint"
+        ),
+        format!(
+            "INSERT INTO {db}.{table} (metric_name, fingerprint, unix_milli) \
+             SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
+                    number + 1, \
+                    {bucket} \
+             FROM numbers({SERIES_472})"
+        ),
+        format!(
+            "INSERT INTO {db}.{labels} \
+             SELECT number + 1, \
+                    concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
+                           '\",\"pod\":\"pod-', toString(number), \
+                           '\",\"pad\":\"', repeat('x', {pad}), '\"}}') \
+             FROM numbers({SERIES_472})"
+        ),
+    ] {
+        client
+            .execute(&ddl, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed the #472 corpus: {e}\n{ddl}"));
+    }
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -2180,10 +2193,10 @@ struct CorpusShapeRow {
     identity: u64,
 }
 
-async fn corpus_shape(client: &ChClient, db: &str, table: &str) -> CorpusShapeRow {
+async fn corpus_shape(client: &ChClient, db: &str, table: &str, labels: &str) -> CorpusShapeRow {
     let sql = format!(
         "SELECT count() AS rows, uniqExact(metric_name) AS names, \
-         avg(length(labels)) AS mean_label_bytes, \
+         ifNull((SELECT avg(length(labels)) FROM {db}.{labels}), 0) AS mean_label_bytes, \
          sum(cityHash64(metric_name, fingerprint, unix_milli)) AS identity \
          FROM {db}.{table}"
     );
@@ -2231,9 +2244,11 @@ async fn corpus_shape(client: &ChClient, db: &str, table: &str) -> CorpusShapeRo
 ///
 /// **What this gate does NOT claim.** Blob-invariance holds for the
 /// **unfiltered** call only. A `match[]` carrying a label matcher renders
-/// `JSONExtractString(labels, …)` into the same `WHERE`, so `labels` is
-/// read to evaluate the filter and the narrow form's bytes grow with the
-/// blob too; that case's win is transport and parse count, not bytes read.
+/// a `metric_labels` sub-query into the same `WHERE` (issue #623), so the
+/// label table is read to evaluate the filter and the narrow form's bytes
+/// grow with the blob too; that case's win is transport and parse count,
+/// not bytes read. Since #623 the wide statement is the label join, and
+/// the blob it pays for is the label table's.
 #[tokio::test]
 async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invariant() {
     skip_unless_live!();
@@ -2259,11 +2274,11 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
 
     let bucket_ms: i64 = 3_600_000;
     let bucket = (now_ns() / 1_000_000 / bucket_ms) * bucket_ms;
-    seed_metric_series_472(&client, db, "series_small", bucket, 100).await;
-    seed_metric_series_472(&client, db, "series_big", bucket, 1_890).await;
+    seed_metric_series_472(&client, db, "series_small", "labels_small", bucket, 100).await;
+    seed_metric_series_472(&client, db, "series_big", "labels_big", bucket, 1_890).await;
 
-    let small = corpus_shape(&client, db, "series_small").await;
-    let big = corpus_shape(&client, db, "series_big").await;
+    let small = corpus_shape(&client, db, "series_small", "labels_small").await;
+    let big = corpus_shape(&client, db, "series_big", "labels_big").await;
     eprintln!(
         "#472 corpus: small {} rows / {} names / {:.1} B labels; big {} rows / {} names / {:.1} B \
          labels; blob inflation {:.2}x",

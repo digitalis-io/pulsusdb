@@ -22,10 +22,10 @@ tree, and the arithmetic over them is shown where it is used.
 
 ## 1. The shape
 
-**One push becomes one `INSERT` of one block into `metric_landing`.** Four materialized
-views maintain `metric_samples`, `metric_hist_samples`, `metric_series` and
-`metric_metadata` from that one table. The writer inserts into none of the four and
-names none of them.
+**One push becomes one `INSERT` of one block into `metric_landing`.** Five materialized
+views maintain `metric_samples`, `metric_hist_samples`, `metric_series`, `metric_labels`
+and `metric_metadata` from that one table (`metric_labels` since issue #623). The writer
+inserts into none of them and names none of them.
 
 **This is the shape the engine is built for**: one source table, one materialized view
 per derived table, and the fan-out performed by the server as part of processing that one
@@ -34,9 +34,8 @@ not because the process stopped. **What it does not give:** the fan-out across t
 targets is not a transaction — §9 D1 says what an observer sees when one view throws.
 
 Three things depart from the plainest form of that shape, each stated where it is
-decided: one source table feeds four targets with different column sets, so it carries a
-discriminating column (below); the writer leaves the identity column out of the insert so
-the server's own default fills it (§1.1); and every setting that could divide the request
+decided: one source table feeds several targets with different column sets, so it
+carries a discriminating column (below); and every setting that could divide the request
 into more than one block is pinned on the insert rather than inherited from the server's
 profile (§2.1).
 
@@ -47,11 +46,11 @@ at the column type's default.
 |---|---|---|---|
 | 0 | a float sample | `metric_samples` | `metric_samples_mv` |
 | 1 | a native-histogram sample | `metric_hist_samples` | `metric_hist_samples_mv` |
-| 2 | a series registration | `metric_series` | `metric_series_mv` |
+| 2 | a series registration | `metric_series` (activity) and `metric_labels` (the label set) | `metric_series_mv`, `metric_labels_mv` |
 | 3 | a metadata descriptor | `metric_metadata` | `metric_metadata_mv` |
 
-The four target tables' columns, keys and engines did not change. What changed is who
-writes them.
+Issue #623 split the kind-2 target in two: `metric_series` keeps the activity rows and
+`metric_labels` the label set, once per fingerprint (`docs/schemas.md` §2.1).
 
 ### 1.1 The landing table
 
@@ -61,7 +60,6 @@ are substituted when the schema is built:
 
 ```sql
 CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}} (
-    event_id                 UUID DEFAULT generateUUIDv7(),
     received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),
     kind                     UInt8  CODEC(ZSTD(1)),
     metric_name              LowCardinality(String),
@@ -101,11 +99,10 @@ Decisions inside that statement, each of which a second signal has to make again
   carries the same `received_ms` (`MetricWriter::admit_batch` takes it once), so a
   block lies in one partition — which is what keeps `max_partitions_per_insert_block`
   out of the settings a push has to reason about (§2.1).
-- **`event_id` is the landed event's identity and the writer never sets it.**
-  `MetricLandingRow` declares the other 25 columns, and the insert's column list is
-  exactly that row type's `COLUMN_NAMES`, so the server fills the column from its own
-  default. A row type carrying the column would store whatever the writer put there.
-  `event_id` is not the retry mechanism (§3) and no target holds it.
+- **No identity column** (issue #623). The table carried a server-filled `event_id`
+  that nothing outside tests read and that was 87% of its bytes; it is gone.
+  `MetricLandingRow` declares all 25 columns, and the insert's column list is exactly
+  that row type's `COLUMN_NAMES`. The retry mechanism is the deduplication token (§3).
 - **The two engine settings that are fixed sit here.** The delete-TTL and the
   deduplication window carry configuration values, so they are applied at run time
   instead (§1.3): migration identity is checksummed over the rendered template, so a
@@ -113,9 +110,9 @@ Decisions inside that statement, each of which a second signal has to make again
   deployment changed it.
 - **No `Ddl::Dist` sibling.** This table has no distributed wrapper, so
   `chconfig::metric_writer_tables_from` returns the bare name in every mode, clustered
-  or not. The four targets keep their wrappers for reads.
+  or not. The targets keep their wrappers for reads.
 
-### 1.2 The four views
+### 1.2 The views
 
 `schema/schema.sql`, the `*_mv` statements. Each projection lists the target's
 columns **in the target's own column order**, aliased to the target's column names, so
@@ -144,7 +141,11 @@ FROM {{db}}.metric_landing WHERE kind = 1;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_series_mv{{on_cluster}} TO {{db}}.metric_series AS
 SELECT metric_name AS metric_name, fingerprint AS fingerprint,
-       unix_milli AS unix_milli, labels AS labels, value_type AS value_type
+       unix_milli AS unix_milli, value_type AS value_type
+FROM {{db}}.metric_landing WHERE kind = 2;
+
+CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels AS
+SELECT fingerprint AS fingerprint, labels AS labels
 FROM {{db}}.metric_landing WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata AS
@@ -588,10 +589,10 @@ any of them is covered.
 | **D13** | the other shipped log, trace and per-target row shapes | they keep the collect-then-write encoder, which builds one value tree per row. Nothing is claimed about their peak, and it was not measured |
 | **D14** | a new scalar type declared bounded wrongly | the piece refusal turns it into an error and the widest-value case into a failing test, rather than silent growth — but the compiler cannot catch it |
 | **D15** | `pulsusdb rebuild-metrics` | deliberately without tests: there is no environment in this tree that would exercise it faithfully. It refuses a replay into the three append-only targets unless the caller also asks for their partitions to be dropped first, because a replay without that stores every row twice |
-| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged, once that block's own byte reservation is granted, is the caller's answer — the original push's outcome; a queue with no room for that reservation refuses the repeat `429` and nothing of its descriptors is built, queued or sent (§3). Nothing gates, caches or promotes a descriptor, so the next push carrying those descriptors emits them again |
+| **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged, once that block's own byte reservation is granted, is the caller's answer — the original push's outcome; a queue with no room for that reservation refuses the repeat `429` and nothing of its descriptors is built, queued or sent (§3). Since issue #623 a descriptor is sent only when it differs from the one this writer last committed, or its hour has turned, so a repeat carrying the descriptor its original already committed sends no block at all; only a commit records a descriptor, so after any other ending the next push carrying it emits it again |
 | **D17** | a steady push rate above the rate §3 derives from `PULSUS_METRICS_DEDUP_WINDOW` | a token can be evicted before its resend arrives and the block is stored twice. Sizing the window is a deployment matter and nothing checks it |
 | **D18** | the landing table's TTL | it floors `received_ms` to the second, so expiry can fall up to 999 ms before the exact instant and never after it; and a part's drop waits for a TTL merge, so this design states no instant at which landed rows stop occupying storage |
-| **D19** | a landed event's identity | `event_id` lives only in the landing table and only while retention keeps it. No target holds it |
+| **D19** | a landed event's identity | none is stored (issue #623). A row is identified by its kind's own key |
 
 ---
 
@@ -682,7 +683,7 @@ against a server.
 |---|---|
 | one push is one insert into the landing table | `one_push_is_one_insert_into_the_landing_table`, `two_pushes_are_two_inserts` |
 | every landing column carries the value its kind was built from | `every_landing_column_is_the_value_its_kind_was_built_from`; live: `a_push_lands_one_block_carrying_every_kind` (`crates/pulsus-write/tests/live_metric_writer.rs`) |
-| the insert omits the identity column so the server fills it | `the_insert_omits_event_id_so_the_server_fills_it` — in `crates/pulsus-write/src/writer/rows.rs` for the column list, and live in `crates/pulsus-write/tests/live_metric_writer.rs` for what the server stores |
+| the insert names every landing column, in the table's order | `the_insert_names_every_landing_column_in_order` (`crates/pulsus-write/src/writer/rows.rs`); live: `metric_landing_and_its_views_exist_after_init` (`crates/pulsus-schema/tests/live_schema.rs`) |
 | every limit that forms a block, or disables deduplication, is pinned exactly | `the_landing_insert_pins_every_limit_that_forms_a_block`, `both_row_limits_follow_the_deployments_own_ceiling` (`crates/pulsus-clickhouse/src/settings.rs`) |
 | the pinned set and the startup name list are the same set, both ways | `the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends` (`crates/pulsus-schema/src/checks.rs`) |
 | the pinned settings reach the wire | `the_production_inserter_sends_the_landing_settings_on_the_wire`, `the_calls_settings_win_over_the_inserters_own` (`crates/pulsus-write/tests/landing_insert_settings.rs`) |

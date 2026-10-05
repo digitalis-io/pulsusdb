@@ -1257,12 +1257,15 @@ fn wide_template() -> ParsedMetrics {
     }
 }
 
-/// [`wide_template`] with its descriptors' versions moved on, so no two pushes
-/// are the same body.
+/// [`wide_template`] with its descriptors' versions and units moved on, so no
+/// two pushes are the same body and every push's descriptors differ from the
+/// ones last sent — an unchanged descriptor is not sent again (issue #623),
+/// and a push with nothing to send makes no block.
 fn restamped(template: &ParsedMetrics, push: u128) -> ParsedMetrics {
     let mut batch = template.clone();
     for descriptor in &mut batch.metadata {
         descriptor.updated_ns = push as i64;
+        descriptor.unit = push.to_string();
     }
     batch
 }

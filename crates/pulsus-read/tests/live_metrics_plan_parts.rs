@@ -275,10 +275,7 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             value: i as f64,
         });
     }
-    client
-        .insert_block("metric_series", &series)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, &series).await;
     client
         .insert_block("metric_samples", &samples)
         .await
@@ -427,16 +424,41 @@ impl Harness {
             .expect("query");
     }
 
-    /// The float read this test writes out for `metric`, over the window
-    /// `(start - back, end]`, with `fps` as a rendered list.
-    fn float_read(&self, metric: &str, fps: &str, back: i64) -> String {
+    /// The sample read this test writes out for `metric`, over the window
+    /// `(start - back, end]`, with `fps` as a rendered list: ONE statement
+    /// over both sample tables (issue #623), the list named once.
+    fn sample_read(&self, metric: &str, fps: &str, back: i64) -> String {
         let p = self.range();
+        let lower = p.start_ms - back;
+        let upper = p.end_ms;
         format!(
-            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nPREWHERE metric_name = \
-             '{metric}'\nWHERE unix_milli > {} AND unix_milli <= {}\n  AND fingerprint IN \
-             ({fps})\nORDER BY fingerprint, unix_milli",
-            p.start_ms - back,
-            p.end_ms
+            "WITH [{fps}] AS fps\n\
+             SELECT fingerprint, unix_milli, is_hist, value, {HIST_COLUMNS}\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, \
+             CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, \
+             CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, \
+             CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, \
+             CAST([], 'Array(UInt32)') AS pos_span_lengths, \
+             CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
+             CAST([], 'Array(Int32)') AS neg_span_offsets, \
+             CAST([], 'Array(UInt32)') AS neg_span_lengths, \
+             CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
+             CAST([], 'Array(Float64)') AS custom_values, \
+             CAST(0, 'UInt8') AS counter_reset_hint\n\
+             \x20 FROM metric_samples\n\
+             \x20 PREWHERE metric_name = '{metric}'\n\
+             \x20 WHERE unix_milli > {lower} AND unix_milli <= {upper}\n\
+             \x20   AND fingerprint IN fps\n\
+             \x20 UNION ALL\n\
+             \x20 SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, \
+             CAST(0, 'Float64') AS value, {HIST_COLUMNS}\n\
+             \x20 FROM metric_hist_samples\n\
+             \x20 PREWHERE metric_name = '{metric}'\n\
+             \x20 WHERE unix_milli > {lower} AND unix_milli <= {upper}\n\
+             \x20   AND fingerprint IN fps\n\
+             )\n\
+             ORDER BY fingerprint, unix_milli"
         )
     }
 
@@ -522,18 +544,6 @@ impl Harness {
              GROUP BY gid, run\n\
              ORDER BY gid, gi_start",
             p.start_ms, p.step_ms
-        )
-    }
-
-    /// The complementary histogram read, written out the same way.
-    fn hist_read(&self, metric: &str, fps: &str, back: i64) -> String {
-        let p = self.range();
-        format!(
-            "SELECT fingerprint, unix_milli, {HIST_COLUMNS}\nFROM \
-             metric_hist_samples\nPREWHERE metric_name = '{metric}'\nWHERE unix_milli > {} AND \
-             unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
-            p.start_ms - back,
-            p.end_ms
         )
     }
 }
@@ -653,7 +663,7 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     assert_eq!(unexplained, want, "the unexplained request sends the same");
 
-    // 3 — two chains: four statements, and the window carries the range
+    // 3 — two chains: two statements, and the window carries the range
     // as well as the lookback.
     let mark = now_micros(&h.admin).await;
     h.explained(&format!(
@@ -668,13 +678,11 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     let back = LOOKBACK_MS + RANGE_MS;
     let want_two = sorted(vec![
-        h.float_read(METRIC, FPS_SQL, back),
-        h.hist_read(METRIC, FPS_SQL, back),
-        h.float_read(ERRORS, ERROR_FPS_SQL, back),
-        h.hist_read(ERRORS, ERROR_FPS_SQL, back),
+        h.sample_read(METRIC, FPS_SQL, back),
+        h.sample_read(ERRORS, ERROR_FPS_SQL, back),
     ]);
-    assert_eq!(got.len(), 4, "two selectors, two statements each");
-    assert_eq!(got, want_two, "the two chains' four statements");
+    assert_eq!(got.len(), 2, "two selectors, one statement each");
+    assert_eq!(got, want_two, "the two chains' two statements");
 
     // 4 — a query that sends nothing. The poll stops on stability without
     // ever seeing a row.
@@ -777,18 +785,17 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
             received, named,
             "{query}: the tables the database read, against the plan's SQL part names"
         );
-        // And the shape of each plan. Two shapes now (issue #549):
+        // And the shape of each plan. Every read is ONE statement over both
+        // sample tables (the grouped read since issue #549, the sample
+        // fetch since issue #623), so every plan opens with ONE SQL part
+        // naming `metric_samples` and additively naming
+        // `metric_hist_samples`, with no cut. Two shapes after it:
         //
         // ```text
-        //   unpushed   two SQL parts, the second cut on the two sources
-        //              being disjoint, plus ONE engine part when there is
-        //              a residual link to put in it — a bare selector has
-        //              none, its whole chain being the source link
-        //   pushed     ONE SQL part, naming `metric_samples` and
-        //              additively naming `metric_hist_samples` as read
-        //              inside the same statement; no cut, because there
-        //              is no second statement, and no engine part,
-        //              because every link lowers
+        //   unpushed   ONE engine part when there is a residual link to
+        //              put in it — a bare selector has none, its whole
+        //              chain being the source link
+        //   pushed     no engine part, because every link lowers
         // ```
         //
         // Which shape a plan has is read FROM THE PLAN, not chosen from
@@ -797,45 +804,71 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
         for plan in &explain.plans {
             let json = serde_json::to_value(plan).expect("serialize");
             assert_eq!(json["parts"][0]["name"], "metric_samples", "{query}");
-            assert_eq!(json["links"][0]["how"], "lowered", "{query}");
-            assert_eq!(json["links"][0]["fidelity"], "wider", "{query}");
-            if json["parts"][0]["also_reads"].is_array() {
-                assert_eq!(
-                    json["parts"][0]["also_reads"],
-                    serde_json::json!(["metric_hist_samples"]),
-                    "{query}"
-                );
-                assert_eq!(
-                    plan.parts.len(),
-                    1,
-                    "{query}: the pushed read is one statement, so one part"
-                );
-                assert_eq!(
-                    json["parts"][0]["cut"],
-                    serde_json::Value::Null,
-                    "{query}: one statement has nothing to be cut from"
-                );
-                assert!(
-                    plan.links.iter().all(|l| l.how == "lowered"),
-                    "{query}: every link of a pushed chain lowers, so there is no engine part"
-                );
-                continue;
-            }
-            assert_eq!(json["parts"][1]["name"], "metric_hist_samples", "{query}");
             assert_eq!(
-                json["parts"][1]["cut"]["why"], "disjoint_sources",
+                json["parts"][0]["also_reads"],
+                serde_json::json!(["metric_hist_samples"]),
                 "{query}"
             );
-            if plan.links.len() > 1 {
-                assert_eq!(json["parts"][2]["kind"], "engine", "{query}");
-                assert_eq!(plan.parts.len(), 3, "{query}");
+            assert_eq!(
+                json["parts"][0]["cut"],
+                serde_json::Value::Null,
+                "{query}: one statement has nothing to be cut from"
+            );
+            assert_eq!(json["links"][0]["how"], "lowered", "{query}");
+            assert_eq!(json["links"][0]["fidelity"], "wider", "{query}");
+            let residual = plan.links.iter().any(|l| l.how != "lowered");
+            if residual {
+                assert_eq!(json["parts"][1]["kind"], "engine", "{query}");
+                assert_eq!(plan.parts.len(), 2, "{query}");
             } else {
                 assert_eq!(
                     plan.parts.len(),
-                    2,
-                    "{query}: a chain whose only link lowers has no engine part"
+                    1,
+                    "{query}: a chain whose every link lowers has no engine part"
                 );
             }
         }
     }
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its label set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

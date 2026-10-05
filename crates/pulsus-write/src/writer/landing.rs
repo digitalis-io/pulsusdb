@@ -270,8 +270,7 @@ impl LandingFate {
 /// layout is 128 bits of two fields it already has to hand.
 ///
 /// It is the batch's identity for retry purposes only — it is not a landed
-/// event's identity, which is the landing table's own `event_id` column, and
-/// it is never derived from the block's content.
+/// event's identity, and it is never derived from the block's content.
 pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

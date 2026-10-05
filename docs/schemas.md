@@ -52,13 +52,15 @@ CREATE TABLE metric_samples (
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
 ORDER BY (metric_name, fingerprint, unix_milli)
 TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
+SETTINGS ttl_only_drop_parts = 1,
+         primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1;
 ```
 
 - **`metric_name` leads the key.** PromQL queries name their metric; the primary index immediately confines the read to that metric's granules. `LowCardinality` makes the leading column nearly free to store and filter.
 - **`fingerprint` second** clusters each series contiguously within its metric → per-series reads (every PromQL evaluation) are sequential scans of a few granules.
 - **Daily partitions** on the raw table: retention drops whole partitions (`ttl_only_drop_parts`), and time predicates prune partitions before the index is even consulted.
 - **No string data.** The fetch hot path moves only `(UInt64, Int64, Float64)` columns.
+- **The whole key stays in the in-memory index** (issue #623). At the engine's default ratio of `0.9`, a part where `metric_name` is nearly unique per granule — many small metrics — drops `fingerprint` and `unix_milli` from the index it keeps in memory, and a one-series read stops pruning on them: measured on a mixed-volume demo part at ratio 0.912, one series for a day selected 91 marks at the default and 2 with the setting at `1`, same answer. `metric_hist_samples` carries the same setting.
 - **Resolution-agnostic.** Sample timestamps are stored **verbatim at millisecond precision** — never quantized, bucketed, or aligned. PulsusDB assumes nothing about the source scrape/export interval: 1s, 15s, 5m, or irregular push cadences all land as-is, per-series intervals may differ and drift, and the PromQL engine derives actual intervals from the data (as Prometheus does for extrapolation and staleness) rather than from configuration. Rollup tiers (§2.2) are *optional derived data* at operator-chosen resolutions; they never constrain or replace what raw ingestion accepts.
 - **Admitted metric timestamp domain and runtime TTL (issue #137, mirroring #131).** Ingest admits a metric data point only if its UTC day lies in `[1970-01-01, 2106-02-06]` (days `0..=49_709`, `pulsus_model::Date::start_of_day_utc_ms_datetime_safe`); a data point outside that domain is rejected (OTLP metrics: per-point partial success; remote write: per-sample drop counted in `rejected_total`). Two wrap mechanisms motivate the gate: `PARTITION BY toDate(...)` evaluates in the 16-bit `Date` domain and wraps for days past 2149-06-06, and the delete-TTL evaluates the row timestamp in the 32-bit `DateTime` domain and wraps for instants past 2106-02-07T06:28:15Z (u32-seconds maximum, `4294967295`); day `49_710` (2106-02-07) is excluded because only part of it is u32-representable. The CREATE-time TTL shown above is superseded at runtime: `apply_ttl` re-issues `ALTER TABLE ... MODIFY TTL toDateTime(least(intDiv(unix_milli, 1000) + retention_days * 86400, 4294967295)) DELETE` on `metric_samples` and `metric_hist_samples` (§2.4) at init and on every rotation tick, so for a stored row with epoch-seconds `s = intDiv(unix_milli, 1000)` the operative expiry is `expiry(s) = min(s + retention_days * 86400, 4294967295)` — i.e. `min(configured_expiry, 2106-02-07T06:28:15Z)`. If `s + retention_days * 86400 <= 4294967295`, the expiry equals the configured instant, bit-identical to the pre-#137 expression; otherwise the expiry is `4294967295`, the actual retention is `4294967295 - s`, and the shortfall vs the configured value is `s + retention_days * 86400 - 4294967295`, which grows without bound as `retention_days` grows. For the enforced range `retention_days >= 1` (config validation rejects `< 1`, `crates/pulsus-config/src/validate.rs:285-287`), a row at the last admitted day (`49_709`, `s = 4_294_943_999`) has actual retention capped at `4_294_967_295 - 4_294_943_999 = 23_296 s ≈ 0.27 days (~6.5 hours)`. For every enforced `retention_days >= 1`, the saturating form strictly dominates the pre-#137 expression: pre-#137, a row with `s + retention_days * 86400 > 4294967295` wrapped to a ~1970-epoch expiry and its part became drop-eligible immediately or near-immediately after insert (`ttl_only_drop_parts = 1`); under the saturating form the same row becomes drop-eligible no earlier than 2106-02-07T06:28:15Z. The admission cutoff is deliberately not coupled to `retention_days`: retention is runtime-ALTERed after rows are stored (a changed `PULSUS_RETENTION_DAYS` re-ALTERs existing tables on the next rotation tick) and has no upper bound, so no admission-time gate can honor a retention value that did not exist when the row was admitted.
 
@@ -67,13 +69,23 @@ CREATE TABLE metric_series (
     metric_name  LowCardinality(String),
     fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),
     unix_milli   Int64   CODEC(Delta(8), ZSTD(1)),   -- hour-bucketed "last active"
-    labels       String  CODEC(ZSTD(5))              -- canonical JSON, sorted keys
+    value_type   UInt8 DEFAULT 0
 ) ENGINE = MergeTree
-PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (metric_name, fingerprint, unix_milli);
+PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
+ORDER BY (metric_name, fingerprint, unix_milli)
+TTL toDateTime(least(intDiv(unix_milli, 1000) + 7 * 86400, 4294967295))
+SETTINGS ttl_only_drop_parts = 1;
+
+CREATE TABLE metric_labels (
+    fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),
+    labels       String  CODEC(ZSTD(5))              -- canonical JSON, sorted keys
+) ENGINE = ReplacingMergeTree
+ORDER BY fingerprint;
 ```
 
-- Written once per series per **activity bucket** (`PULSUS_SERIES_ACTIVITY_BUCKET`, default `1h`): the writer floors `unix_milli` to the bucket and skips known `(metric_name, fingerprint, bucket)` triples via an in-process LRU — **metric-name-scoped**, not `(fingerprint, bucket)` alone: `metric_fingerprint` (§2.1's fingerprint function) excludes `__name__`, so two differently-named metrics sharing the same label set share a fingerprint, and a name-less key would let one metric's registration false-hit-suppress the other's `metric_series` row. Natural duplicates collapse at read time with `LIMIT 1 BY metric_name, fingerprint` — **no `ReplacingMergeTree`, no `FINAL`**.
+- **Activity and labels are two tables** (issue #623). One kind-2 landing row feeds both views: `metric_series_mv` writes the activity row and `metric_labels_mv` the label set. A fingerprint names one label set whatever the metric, so `metric_labels` holds one row per label set where `metric_series` once repeated the text once per metric name per hour — measured on a single-host demo, 383 label sets stored 100,745 times in 45 hours. Every read that needs labels joins them back on `fingerprint` with `INNER JOIN`, taking `any(labels)` over the copies the replacing table holds until it merges: a series whose label row is missing is absent, never returned with empty labels.
+- **Activity rows expire with the samples; label sets are kept.** `metric_series` copies `metric_samples`' daily partitions, TTL and `ttl_only_drop_parts`, since an activity row past retention points at samples that no longer exist. `metric_labels` has no TTL: the label sets are kept on disk permanently (the owner's decision on #186).
+- Written once per series per **activity bucket** (`PULSUS_SERIES_ACTIVITY_BUCKET`, default `1h`): the writer floors `unix_milli` to the bucket and skips known `(metric_name, fingerprint, bucket)` triples via an in-process LRU — **metric-name-scoped**, not `(fingerprint, bucket)` alone: `metric_fingerprint` (§2.1's fingerprint function) excludes `__name__`, so two differently-named metrics sharing the same label set share a fingerprint, and a name-less key would let one metric's registration false-hit-suppress the other's `metric_series` row. Natural duplicates collapse at read time, which takes the distinct `(metric_name, fingerprint)` pairs — **no `ReplacingMergeTree`, no `FINAL`** on the activity rows.
 - **Size the activity bucket to cardinality.** Rows/month ≈ active series × (30d ÷ bucket). At 5M continuously active series, hourly buckets produce ~3.6B metadata rows/month; a `1d` bucket produces ~150M — the recommended setting at multi-million-series scale. Coarser buckets are always *logically safe*: the bucket-floored read bounds (§2.1 lookup SQL, rendered from the same config constant the writer uses) can over-include series adjacent to the query window — they match no samples — but can never miss one. They are not computationally free, though: a 10-minute historical query against a `1d` bucket drags that whole day's series for the metric through label matching. Bucket size is therefore part of the label-resolution benchmark below, not just a storage knob. **This is not just an internal read-path detail:** it is the documented, deliberate contract for the discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values` for historical windows, docs/api.md §3.3) — their result set is the bucket-granularity active set, a bounded superset of Prometheus's exact-sample-window set (never a subset — over-inclusion is bounded by activity-bucket size, and it is never a false empty).
 
 #### Label resolution at scale — the strategy ladder
@@ -81,7 +93,7 @@ ORDER BY (metric_name, fingerprint, unix_milli);
 At the design-target cardinality (millions of active series), **label resolution — not sample reads — is the metrics path's primary risk**. The sample table stays strong for any bounded fingerprint set; the question is what produces that set. Three paths, benchmarked separately against the 5M-series scale corpus:
 
 1. **Cache matcher (hot path):** in-process evaluation over the active window. Scaling concern: the refresh sweep (`LIMIT 1 BY` over millions of rows every `PULSUS_CACHE_TTL`) — if the M2 benchmark shows it unsustainable, the planned evolution is **incremental refresh**: sweep only activity buckets newer than the last refresh, merging into the resident map (the schema already supports this; it is a reader change only).
-2. **SQL fallback (historical windows, selectors past `PULSUS_CACHE_MAX_SERIES`):** the §2.1 lookup — `JSONExtractString` matching over `metric_series`, scoped by `metric_name` and activity bucket. This is exactly the first-generation pain shape, *bounded by metric scope*; it is affordable when a metric's cardinality is modest and potentially dominant when one metric carries millions of series. Broad selectors at scale will hit this path routinely — it is not assumed rare.
+2. **SQL fallback (historical windows, selectors past `PULSUS_CACHE_MAX_SERIES`):** the §2.1 lookup — `JSONExtractString` matching over `metric_labels`, one row per label set, intersected with `metric_series` scoped by `metric_name` and activity bucket. This is exactly the first-generation pain shape, *bounded by metric scope*; it is affordable when a metric's cardinality is modest and potentially dominant when one metric carries millions of series. Broad selectors at scale will hit this path routinely — it is not assumed rare.
 3. **Optional inverted label index (`metric_series_idx`) — spec'd now, created only on benchmark evidence:**
 
    ```sql
@@ -105,16 +117,23 @@ At the design-target cardinality (millions of active series), **label resolution
 - **The cache is time-scoped**: it may answer only queries whose data window lies inside the cache window. A series alive last week but silent today is absent from the cache, so answering a historical query from it would return false empties. Older ranges resolve directly from this table with **hour-bucket-aware bounds** — `unix_milli` is bucketed, so the lower bound must be floored to the hour (a series emitting at 10:35 has a 10:00 row; a 10:30–10:40 query with a raw `>= 10:30` bound would miss it) and the upper bound must exclude series first seen after the query window:
 
   ```sql
-  SELECT fingerprint, labels
-  FROM metric_series
-  WHERE metric_name = {name}
-    AND unix_milli >= intDiv({data_start}, {bucket_ms}) * {bucket_ms}   -- {bucket_ms} rendered from
-    AND unix_milli <= intDiv({data_end},   {bucket_ms}) * {bucket_ms}   -- PULSUS_SERIES_ACTIVITY_BUCKET (default 3600000)
-  ORDER BY unix_milli DESC
-  LIMIT 1 BY metric_name, fingerprint
+  SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels
+  FROM (
+    SELECT DISTINCT metric_name, fingerprint
+    FROM metric_series
+    WHERE metric_name = {name}
+      AND unix_milli >= intDiv({data_start}, {bucket_ms}) * {bucket_ms}   -- {bucket_ms} rendered from
+      AND unix_milli <= intDiv({data_end},   {bucket_ms}) * {bucket_ms}   -- PULSUS_SERIES_ACTIVITY_BUCKET (default 3600000)
+  ) AS s
+  INNER JOIN (
+    SELECT fingerprint, any(labels) AS label_set
+    FROM metric_labels
+    WHERE fingerprint IN (SELECT fingerprint FROM metric_series WHERE {the same selection})
+    GROUP BY fingerprint
+  ) AS l USING (fingerprint)
   ```
 
-  The `metric_name`-first ordering makes this a metric-scoped scan of 1–2 monthly partitions. Correctness tests cover sub-hour historical windows and series appearing only after the query end.
+  The `metric_name`-first ordering makes the series side a metric-scoped scan of the window's daily partitions, and the label side reads only the fingerprints it names. Correctness tests cover sub-hour historical windows and series appearing only after the query end.
 
 ```sql
 CREATE TABLE metric_metadata (
@@ -127,7 +146,7 @@ CREATE TABLE metric_metadata (
 ORDER BY metric_name;
 ```
 
-`metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known. **`updated_ns` is the `ReplacingMergeTree` version column** (issue #26 fix, mirroring `log_streams`' `ReplacingMergeTree(updated_ns)`): every non-key column here (`metric_type`/`help`/`unit`) sits outside `ORDER BY metric_name`, so without a version column a merge's latest-wins outcome would be nondeterministic — unacceptable given `metric_type` drives planner correctness. The writer emits a new row (receiver-injected `now_ns`) only when the incoming `(metric_type, help, unit)` tuple differs from the last value it durably emitted for that `metric_name` (a bounded last-value cache, success-only promoted on a confirmed flush) — idempotent on repeats, and a type change that later reverts (A→B→A) re-emits on the second A rather than being suppressed by a static once-only registration.
+`metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known. **`updated_ns` is the `ReplacingMergeTree` version column** (issue #26 fix, mirroring `log_streams`' `ReplacingMergeTree(updated_ns)`): every non-key column here (`metric_type`/`help`/`unit`) sits outside `ORDER BY metric_name`, so without a version column a merge's latest-wins outcome would be nondeterministic — unacceptable given `metric_type` drives planner correctness. The writer emits a new row (receiver-injected `now_ns`) only when the incoming `(metric_type, help, unit)` tuple differs from the last value it durably emitted for that `metric_name`, or the hour has turned since it did (a bounded last-value cache, promoted only when the block commits; issue #623) — idempotent on repeats, and a type change that later reverts (A→B→A) re-emits on the second A rather than being suppressed by a static once-only registration. The hourly resend bounds how long one writer's descriptor can stand over another writer's different one; on a single-host demo every push re-sending every descriptor came to 345,362 rows an hour, 39% of all landed rows.
 
 **`metric_metadata.metric_name` is keyed by the BASE family name, never a derived-series name** (issue #27 architect plan, task-manager-pinned docs contract). A receiver that flattens one metric descriptor into several physical series — a histogram's `<name>_bucket`/`<name>_sum`/`<name>_count`, an exponential histogram's identical shape, or a summary's quantile series plus `<name>_sum`/`<name>_count` — registers exactly **one** `metric_metadata` row for `<name>` itself, typed `histogram`/`summary`, never one row per suffixed series. **Any consumer resolving a metric family's type must strip a trailing `_bucket`, `_sum`, or `_count` suffix (and, for a Summary's quantile series, no suffix at all — the quantile series shares the base name verbatim, distinguished only by its `quantile` label) before looking the family up in `metric_metadata`.** This is the contract issue #30 (label cache)/#31/#32 (PromQL planner, counter-function legality, rollup eligibility) implement against — not tribal knowledge. A lookup that fails to strip suffixes will find no metadata row for `<name>_bucket`/`<name>_sum`/`<name>_count` at all (they were never registered under those names) and must not misinterpret that absence as "unknown metric".
 
@@ -179,14 +198,26 @@ GROUP BY metric_name, fingerprint, ts;
 **`rate(http_requests_total{job="api", status=~"5.."}[5m])`, 24h window, 60s step.** The label cache resolves both matchers (regex included) in-process → sorted fingerprints. One fetch:
 
 ```sql
-SELECT fingerprint, unix_milli, value
-FROM metric_samples
-PREWHERE metric_name = 'http_requests_total'
-WHERE unix_milli >  {start - 300000 - lookback}
-  AND unix_milli <= {end}
-  AND fingerprint IN (101, 205, 990, ...)
+SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, ..., counter_reset_hint
+FROM (
+  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value,
+         CAST(0, 'Int8') AS schema, ...    -- the histogram columns at their empty values
+  FROM metric_samples
+  PREWHERE metric_name = 'http_requests_total'
+  WHERE unix_milli >  {start - 300000 - lookback} AND unix_milli <= {end}
+    AND fingerprint IN (101, 205, 990, ...)
+  UNION ALL
+  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value,
+         schema, zero_threshold, ..., counter_reset_hint
+  FROM metric_hist_samples
+  PREWHERE metric_name = 'http_requests_total'
+  WHERE unix_milli >  {start - 300000 - lookback} AND unix_milli <= {end}
+    AND fingerprint IN (101, 205, 990, ...)
+)
 ORDER BY fingerprint, unix_milli
 ```
+
+**One statement reads both sample tables** (issue #623). Each branch carries the same selection and prunes on its own table's key; the reader splits the rows on `is_hist` into the float and histogram streams the merge has always taken, so a key present in both tables is answered as before. It replaces a second statement every selector sent to `metric_hist_samples` — on a single-host demo 15,674 of them in three days, returning one row between them.
 
 Partition pruning (daily) → primary-index pruning (metric, then fingerprints) → sequential per-series reads. Evaluation (extrapolation, resets, staleness) happens in the engine, series-first — **for every query but the four below**. Fingerprint lists ≥ 500 split into parallel chunk fetches; selectors matching more than `PULSUS_CACHE_MAX_SERIES` fall back to:
 
@@ -196,14 +227,18 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
     WHERE metric_name = 'http_requests_total'
       AND unix_milli >= {lower} + 0 * (match('', '(?-s)^(?:5..)$'))
       AND unix_milli <= {upper}
-      AND JSONExtractString(labels, 'job') = 'api'
-      AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')
+      AND fingerprint IN (
+        SELECT fingerprint
+        FROM metric_labels
+        WHERE JSONExtractString(labels, 'job') = 'api'
+          AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')
+      )
 )
 ```
 
 **Two details in that regex predicate.** ClickHouse's `match()` compiles with RE2's `dot_nl` option set, so `.` matches a newline there and does not in RE2 — and therefore not in Prometheus, which compiles matchers with Go's `regexp`. Every pattern this path renders is prefixed with RE2's own `(?-s)` flag group to restore the reference reading; a `(?s)` the user wrote still overrides it. And because ClickHouse compiles a pattern only when it evaluates `match()` on a row, a selector naming a metric with **no rows in the window** would never reach RE2 at all and an invalid pattern would answer an empty `200` instead of Prometheus's `400`. The lower bound therefore carries one constant `match()` per regex matcher: ClickHouse folds it during query analysis (so the primary-key condition, partition pruning and the PREWHERE move are all unchanged — EXPLAIN-gated) and rejects an uncompilable pattern before reading a part. A matcher set with no regex renders no probe at all.
 
-**Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subquery's `metric_series_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting that nested subquery to each shard's **local** `metric_series` table (exact under `metric_samples`/`metric_series`'s shared `cityHash64(metric_name, fingerprint)` co-sharding, §7; the same rewrite already applied to the traces metrics semi-join). Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+**Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subqueries' `metric_series_dist` and `metric_labels_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting those nested subqueries to each shard's **local** tables (the same rewrite already applied to the traces metrics semi-join). It is exact because one kind-2 landing row writes a series' activity row and its label row on the node that received the push, beside that push's samples. Every series read that filters on labels or returns them carries the same setting, the label-cache sweep included. Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
 
 **`max by (status) (http_requests_total)`, one hour, 15 s step — the grouped instant read (issue #549).** `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name — do not take the fetch above. They compile into ONE statement per fingerprint chunk, which returns the answer already reduced:
 
@@ -342,7 +377,7 @@ ALTER TABLE metric_series ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;
 
 `value_type` is the per-series float/histogram discriminator: `0 = float`, `1 = histogram`. Pre-M7 rows read back `0` (the `DEFAULT`), so no data migration is required.
 
-**Writer contract (M7-A4).** `value_type` is a *per-row* discriminator on `metric_series`, and it is part of the writer's registration key `(metric_name, fingerprint, activity-bucket, value_type)`. Registration is driven from **both** float samples (`value_type = 0`) and native-histogram samples (`value_type = 1`), so a series that carries both a float and a histogram sample in one activity bucket registers **two** `metric_series` rows — a "mixed" series is the `groupBitOr(bitShiftLeft(1, value_type))` rollup over those rows (`3` = mixed), computed at read time, never stored. Within a single ingest request the writer never emits a float and a native histogram at the same `(metric_name, fingerprint, unix_milli)` — the histogram wins and the colliding float is dropped. Across independent requests both a `metric_samples` and a `metric_hist_samples` row may coexist at one key by design. **The read path dual-reads both tables and does *not* consult `value_type` for routing** (#112), and the reason is durability rather than merge determinism: the four views over `metric_landing` are not a transaction ([ingest-one-source-table.md](ingest-one-source-table.md) §9, D1; the 300-trial measurement of that shape — one throwing view and three healthy siblings over one source table — is §4.1, "What a failing view leaves behind"), so `metric_hist_samples_mv` can commit for a block while `metric_series_mv` does not, leaving a stored histogram sample whose `value_type = 1` row never existed — and nothing goes back to write it. Under the dual read that sample is still returned once the series resolves from any other row; under a type mask the registration rows that did survive mask to `1`, `metric_hist_samples` is never read for that fingerprint, and the sample stays invisible for as long as it is retained. Coexistence itself is not what a mask breaks — a mixed series masks to `3` and reads both tables — the mask's own completeness is. See [ADR 0005](decisions/0005-native-histogram-storage.md) §(c), where the superseded type-mask design is marked as such.
+**Writer contract (M7-A4).** `value_type` is a *per-row* discriminator on `metric_series`, and it is part of the writer's registration key `(metric_name, fingerprint, activity-bucket, value_type)`. Registration is driven from **both** float samples (`value_type = 0`) and native-histogram samples (`value_type = 1`), so a series that carries both a float and a histogram sample in one activity bucket registers **two** `metric_series` rows — a "mixed" series is the `groupBitOr(bitShiftLeft(1, value_type))` rollup over those rows (`3` = mixed), computed at read time, never stored. Within a single ingest request the writer never emits a float and a native histogram at the same `(metric_name, fingerprint, unix_milli)` — the histogram wins and the colliding float is dropped. Across independent requests both a `metric_samples` and a `metric_hist_samples` row may coexist at one key by design. **The read path reads both tables, in one `UNION ALL` statement since issue #623, and does *not* consult `value_type` for routing** (#112), and the reason is durability rather than merge determinism: the views over `metric_landing` are not a transaction ([ingest-one-source-table.md](ingest-one-source-table.md) §9, D1; the 300-trial measurement of that shape — one throwing view and three healthy siblings over one source table — is §4.1, "What a failing view leaves behind"), so `metric_hist_samples_mv` can commit for a block while `metric_series_mv` does not, leaving a stored histogram sample whose `value_type = 1` row never existed — and nothing goes back to write it. Under the dual read that sample is still returned once the series resolves from any other row; under a type mask the registration rows that did survive mask to `1`, `metric_hist_samples` is never read for that fingerprint, and the sample stays invisible for as long as it is retained. Coexistence itself is not what a mask breaks — a mixed series masks to `3` and reads both tables — the mask's own completeness is. See [ADR 0005](decisions/0005-native-histogram-storage.md) §(c), where the superseded type-mask design is marked as such.
 
 ---
 
@@ -1479,6 +1514,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, a
 | Table | Sharding key | Why |
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
+| `metric_labels` | `cityHash64(fingerprint)` | one label set per fingerprint, shared by every metric name that carries it (issue #623). **Nothing is inserted through the wrapper**: one kind-2 landing row writes a series' activity row and its label row on the node that took the push, so every series read that joins the two runs shard-local (`distributed_product_mode = 'local'`) and finds a series' labels beside its activity |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | **this expression governs reads, not writes** (issue #603). The writer inserts into `log_landing` under its bare name and the views write that shard's local targets, so a fingerprint's rows sit wherever its pushes landed and can sit on several shards. The reads tolerate it: the stream-resolution `GROUP BY fingerprint HAVING ...` counts distinct `(key, val)` pairs and `log_streams_idx`'s sorting key covers its whole row, so a cross-shard duplicate changes nothing; stage-2 hydration already keeps one row per fingerprint; the rollup, `/patterns` and volume reads merge partial aggregates at the initiator. What it ends is shard-local **label discovery**, whose semi-join asked whether a fingerprint was active *anywhere* and could only be answered per shard while one fingerprint's index and rollup rows co-resided — see the paragraph below the tables  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
 | `trace_spans`, `trace_attrs_idx`, `trace_edges`, `trace_recent`, `trace_error_spans`, `spans`, `traces` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local. `spans` and `traces` are the two tables the TraceQL read design queries (issues #584 to #586); their wrappers carry the key as a literal rather than through `Ddl::Dist`, for the reason §4.3 gives, and `the_routing_wrappers_use_the_family_sharding_expression` is what keeps the two forms identical |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |

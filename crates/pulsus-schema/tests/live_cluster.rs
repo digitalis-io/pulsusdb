@@ -247,6 +247,9 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     let dist_tables = [
         ("metric_series_dist", METRICS_KEY),
         ("metric_samples_dist", METRICS_KEY),
+        // Issue #623: one label set per fingerprint, shared by every name
+        // that carries it; nothing is inserted through this wrapper.
+        ("metric_labels_dist", LOGS_KEY),
         ("log_streams_dist", LOGS_KEY),
         ("log_streams_idx_dist", LOGS_KEY),
         ("log_samples_dist", LOGS_KEY),
@@ -946,7 +949,7 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
     ctx.log_dedup_window = 5_000;
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
-    const WRITE_PATH_TABLES: [&str; 11] = [
+    const WRITE_PATH_TABLES: [&str; 12] = [
         "log_landing",
         "log_samples",
         "log_streams",
@@ -958,6 +961,7 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         "metric_series",
         "metric_metadata",
         "metric_hist_samples",
+        "metric_labels",
     ];
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {

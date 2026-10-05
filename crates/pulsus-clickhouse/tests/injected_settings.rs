@@ -60,6 +60,8 @@ const INJECTED_SETTINGS: &[&str] = &[
     "insert_quorum_parallel",
     "insert_quorum_timeout",
     "insert_shard_id",
+    // Issue #623: the label join on every series read that returns labels.
+    "join_algorithm",
     "json_type_escape_dots_in_keys",
     "log_comment",
     "materialized_views_ignore_errors",

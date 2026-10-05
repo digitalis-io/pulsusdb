@@ -93,11 +93,12 @@ use futures::StreamExt;
 use prost::Message;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::Fingerprint;
+use pulsus_write::SeriesRef;
 use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
 use pulsus_write::protocols::remote_write::{
     Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest,
 };
-use pulsus_write::writer::{MetricHistSampleRow, MetricSampleRow, MetricSeriesRow};
+use pulsus_write::writer::{MetricHistSampleRow, MetricLandingRow, MetricSampleRow};
 
 /// One fixed listener port per test: the suites in this crate run as
 /// separate processes, so each test needs its own. Integer literals,
@@ -1178,17 +1179,23 @@ async fn a_retried_remote_write_stores_one_copy() {
 /// millisecond is not the state M2 is about (that one is a cross-writer
 /// or pre-#494 store).
 async fn seed_series(client: &ChClient, name: &str, fp: u128, at_ms: i64, job: &str) {
-    let series = vec![MetricSeriesRow {
-        metric_name: name.to_string(),
-        fingerprint: Fingerprint::from_raw(fp),
-        unix_milli: at_ms - (at_ms % 3_600_000),
-        labels: format!(r#"{{"job":"{job}"}}"#),
-        value_type: 0,
-    }];
+    // Issue #623: one kind-2 landing row, which the two views turn into the
+    // activity row and the label row.
+    let series = vec![MetricLandingRow::series(
+        at_ms,
+        &SeriesRef {
+            metric_name: name.into(),
+            fingerprint: Fingerprint::from_raw(fp),
+            labels: pulsus_model::LabelSet::from_normalized([("job".to_string(), job.to_string())])
+                .0,
+        },
+        at_ms - (at_ms % 3_600_000),
+        0,
+    )];
     client
-        .insert_block("metric_series", &series)
+        .insert_block("metric_landing", &series)
         .await
-        .expect("seed metric_series");
+        .expect("seed the series through metric_landing");
 }
 
 async fn seed_floats(client: &ChClient, name: &str, fp: u128, rows: &[(i64, f64)]) {

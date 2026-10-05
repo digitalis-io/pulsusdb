@@ -70,6 +70,15 @@ pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
     format!("fingerprint IN ({})", render_fingerprint_list(fps))
 }
 
+/// `WITH [toUInt128('101'), toUInt128('205')] AS fps` — a resolved
+/// fingerprint list, named once for both branches of a fetch over the two
+/// sample tables, which test it as `fingerprint IN fps` ([`union_fetch`]).
+/// The list is [`fingerprints_predicate`]'s, so the explain surface's leaf
+/// and the statement name the same set.
+pub fn fingerprints_with(fps: &[FpLiteral]) -> String {
+    format!("WITH [{}] AS fps\n", render_fingerprint_list(fps))
+}
+
 /// `fingerprint IN (\n<subquery>\n  )` — the degraded-cache path's
 /// inlined series selection, layout included because the sub-query is
 /// rendered on its own lines.
@@ -77,13 +86,82 @@ pub fn subquery_predicate(subquery: &str) -> String {
     format!("fingerprint IN (\n{subquery}\n  )")
 }
 
-/// The §2.3 fast-path fetch: an explicit, sorted `fingerprint IN (...)`
-/// list. Callers pre-sort/dedup `fps` (the resolver's own contract); this
-/// function renders whatever order it is given, unmodified — snapshot
-/// stability is the caller's responsibility, not re-derived here.
+/// The 13 `metric_hist_samples` value columns, order-locked to the table's
+/// `CREATE` and [`super::sample_rows::UnionSampleRow`].
+const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
+     pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+     neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
+     counter_reset_hint";
+
+/// The same 13 columns as a float row carries them: each at its empty value,
+/// cast to the histogram column's own type so the two branches of the union
+/// agree.
+const FLOAT_HIST_DEFAULTS: &str = "CAST(0, 'Int8') AS schema, \
+     CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, \
+     CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, \
+     CAST([], 'Array(Int32)') AS pos_span_offsets, \
+     CAST([], 'Array(UInt32)') AS pos_span_lengths, \
+     CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
+     CAST([], 'Array(Int32)') AS neg_span_offsets, \
+     CAST([], 'Array(UInt32)') AS neg_span_lengths, \
+     CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
+     CAST([], 'Array(Float64)') AS custom_values, \
+     CAST(0, 'UInt8') AS counter_reset_hint";
+
+/// **One statement over both sample tables** (issue #623): the float rows
+/// and the histogram rows under one selection, `UNION ALL`, in one order.
+/// It replaces a float fetch and a second, complementary histogram fetch
+/// that every selector sent and that almost always returned nothing — the
+/// grouped read (`super::grouped_sql`) already reads both tables this way.
+///
+/// Each branch carries the same `PREWHERE` and `WHERE`, so each prunes on
+/// its own table's primary key as the two statements did. `is_hist` says
+/// which table a row came from; the caller splits the rows back into the
+/// two streams the merge has always taken, so a key present in both tables
+/// is answered as before.
+///
+/// **A resolved fingerprint list is written once**, as `WITH [...] AS fps`,
+/// and each branch tests `fingerprint IN fps` — the grouped read's form.
+/// Written into both branches it would double the statement's AST, and a
+/// fan-out under the server's `max_ast_elements` of 50,000 would cross it
+/// (measured: `TOO_BIG_AST` on 26.3.29.7). The set built from the alias
+/// prunes the primary key exactly as the literal list does (measured: the
+/// same granules selected, `EXPLAIN indexes = 1`).
+fn union_fetch(
+    lead: &str,
+    samples_table: &str,
+    hist_table: &str,
+    with: &str,
+    prewhere: &str,
+    selection: &str,
+    order: &str,
+) -> String {
+    format!(
+        "{with}SELECT {lead}unix_milli, is_hist, value, {HIST_VALUE_COLUMNS}\n\
+         FROM (\n\
+         \x20 SELECT {lead}unix_milli, CAST(0, 'UInt8') AS is_hist, value, {FLOAT_HIST_DEFAULTS}\n\
+         \x20 FROM {samples_table}\n\
+         \x20 PREWHERE {prewhere}\n\
+         \x20 WHERE {selection}\n\
+         \x20 UNION ALL\n\
+         \x20 SELECT {lead}unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, \
+         {HIST_VALUE_COLUMNS}\n\
+         \x20 FROM {hist_table}\n\
+         \x20 PREWHERE {prewhere}\n\
+         \x20 WHERE {selection}\n\
+         )\n\
+         ORDER BY {order}"
+    )
+}
+
+/// The §2.3 fast-path fetch: an explicit, sorted fingerprint list
+/// ([`fingerprints_with`]), over both sample tables ([`union_fetch`]). Callers pre-sort/dedup
+/// `fps` (the resolver's own contract); this function renders whatever
+/// order it is given, unmodified — snapshot stability is the caller's
+/// responsibility, not re-derived here.
 pub fn sample_fetch(
     table: &str,
-    _hist_table: &str,
+    hist_table: &str,
     metric_name: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
@@ -91,19 +169,24 @@ pub fn sample_fetch(
 ) -> String {
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
-    let fps = fingerprints_predicate(fps);
-    format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+    union_fetch(
+        "fingerprint, ",
+        table,
+        hist_table,
+        &fingerprints_with(fps),
+        &name,
+        &format!("{window}\n    AND fingerprint IN fps"),
+        "fingerprint, unix_milli",
     )
 }
 
 /// The over-cap / `SqlFallback` variant: `subquery` (#30's
 /// `historical_series_subquery` output, already injection-safe) inlined
-/// verbatim as `fingerprint IN ( <subquery> )` — never a materialized
-/// giant `IN` list (edge case 6, AC).
+/// verbatim as `fingerprint IN ( <subquery> )` in each branch — never a
+/// materialized giant `IN` list (edge case 6, AC).
 pub fn sample_fetch_subquery(
     table: &str,
-    _hist_table: &str,
+    hist_table: &str,
     metric_name: &str,
     subquery: &str,
     lower_excl_ms: i64,
@@ -112,8 +195,14 @@ pub fn sample_fetch_subquery(
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let sub = subquery_predicate(subquery);
-    format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
+    union_fetch(
+        "fingerprint, ",
+        table,
+        hist_table,
+        "",
+        &name,
+        &format!("{window}\n    AND {sub}"),
+        "fingerprint, unix_milli",
     )
 }
 
@@ -121,17 +210,19 @@ pub fn sample_fetch_subquery(
 /// a name-less/regex-`__name__` selector's whole resolved set —
 /// `PREWHERE metric_name IN (<matched names>)` (leading-primary-key
 /// granule pruning, the EXPLAIN-gated compound prune's first component)
-/// plus `fingerprint IN (<matched fps>)` (the second PK component),
+/// plus `fingerprint IN fps` over the matched list (the second PK
+/// component, [`fingerprints_with`]),
 /// never a global unfiltered sample scan. Sound without per-pair
 /// filtering (plan v3 Δ2, reviewer-verified): label matchers exclude
 /// `__name__` and apply uniformly across metrics, so any
 /// `(metric_name, fingerprint)` cross-pair naming a real series has
 /// matcher-passing labels by construction — the IN×IN cannot over-match.
 /// `metric_name` joins the projection so rows group into per-
-/// `(metric_name, fingerprint)` series ([`super::sample_rows::MultiSampleRow`]).
+/// `(metric_name, fingerprint)` series
+/// ([`super::sample_rows::MultiUnionSampleRow`]).
 pub fn sample_fetch_multi(
     table: &str,
-    _hist_table: &str,
+    hist_table: &str,
     metric_names: &[String],
     fps: &[FpLiteral],
     lower_excl_ms: i64,
@@ -139,80 +230,14 @@ pub fn sample_fetch_multi(
 ) -> String {
     let names = names_predicate(metric_names);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
-    let fps = fingerprints_predicate(fps);
-    format!(
-        "SELECT metric_name, fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
-    )
-}
-
-/// The 13 `metric_hist_samples` value columns, order-locked to the catalog
-/// `CREATE` (id-23, plus the id-27 additive `counter_reset_hint` — LAST,
-/// issue #125) and [`super::sample_rows::HistSampleRow`]. Appended
-/// after the identity columns in every histogram fetch's SELECT list; the
-/// **only** difference from the float builders is this column list and the
-/// table name (M7-A5a AC1/AC5 — the PREWHERE/window/IN/ORDER-BY shape is
-/// byte-for-byte the float shape). The extra fixed-width `UInt8` column
-/// changes no PREWHERE/ORDER-BY shape and adds no per-row bucket work.
-const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
-     pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-     neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
-     counter_reset_hint";
-
-/// The histogram half of [`sample_fetch`]: the complementary
-/// `metric_hist_samples` read for the same `(metric_name, fingerprint set,
-/// window)`. Byte-for-byte [`sample_fetch`]'s PREWHERE/window/`IN`/ORDER-BY
-/// shape — only the SELECT column list and table name differ (M7-A5a).
-pub fn hist_sample_fetch(
-    table: &str,
-    metric_name: &str,
-    fps: &[FpLiteral],
-    lower_excl_ms: i64,
-    upper_incl_ms: i64,
-) -> String {
-    let name = name_predicate(metric_name);
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
-    let fps = fingerprints_predicate(fps);
-    format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
-    )
-}
-
-/// The histogram half of [`sample_fetch_subquery`] — the `SqlFallback`
-/// path's complementary read. Byte-for-byte its shape (the injection-safe
-/// sub-query inlined verbatim as `fingerprint IN ( <subquery> )`), only the
-/// SELECT column list and table name differ (M7-A5a).
-pub fn hist_sample_fetch_subquery(
-    table: &str,
-    metric_name: &str,
-    subquery: &str,
-    lower_excl_ms: i64,
-    upper_incl_ms: i64,
-) -> String {
-    let name = name_predicate(metric_name);
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
-    let sub = subquery_predicate(subquery);
-    format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
-    )
-}
-
-/// The histogram half of [`sample_fetch_multi`] — the name-less/regex-
-/// `__name__` fan-out's complementary read. Byte-for-byte its flat
-/// `PREWHERE metric_name IN (…) … fingerprint IN (…)` shape, only the
-/// SELECT column list (leading `metric_name`, then the 13 value columns)
-/// and table name differ (M7-A5a).
-pub fn hist_sample_fetch_multi(
-    table: &str,
-    metric_names: &[String],
-    fps: &[FpLiteral],
-    lower_excl_ms: i64,
-    upper_incl_ms: i64,
-) -> String {
-    let names = names_predicate(metric_names);
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
-    let fps = fingerprints_predicate(fps);
-    format!(
-        "SELECT metric_name, fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
+    union_fetch(
+        "metric_name, fingerprint, ",
+        table,
+        hist_table,
+        &fingerprints_with(fps),
+        &names,
+        &format!("{window}\n    AND fingerprint IN fps"),
+        "metric_name, fingerprint, unix_milli",
     )
 }
 
@@ -296,31 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn sample_fetch_renders_the_schemas_md_2_3_shape() {
-        let sql = sample_fetch(
-            "metric_samples",
-            "metric_hist_samples",
-            "http_requests_total",
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-                Fingerprint::from_raw(990).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, unix_milli, value\n\
-             FROM metric_samples\n\
-             PREWHERE metric_name = 'http_requests_total'\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
-             ORDER BY fingerprint, unix_milli"
-        );
-    }
-
-    #[test]
     fn sample_fetch_window_is_left_open_right_closed() {
         let sql = sample_fetch(
             "metric_samples",
@@ -337,9 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn sample_fetch_of_an_empty_fingerprint_list_renders_empty_parens() {
+    fn sample_fetch_of_an_empty_fingerprint_list_renders_an_empty_list() {
         let sql = sample_fetch("metric_samples", "metric_hist_samples", "up", &[], 0, 100);
-        assert!(sql.contains("fingerprint IN ()"));
+        assert!(sql.starts_with("WITH [] AS fps\n"), "{sql}");
     }
 
     #[test]
@@ -426,30 +426,6 @@ mod tests {
     // --- sample_fetch_multi (issue #85, M6-08c) ---
 
     #[test]
-    fn sample_fetch_multi_renders_the_flat_in_in_shape() {
-        let sql = sample_fetch_multi(
-            "metric_samples",
-            "metric_hist_samples",
-            &["foo_total".to_string(), "bar_total".to_string()],
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(
-            sql,
-            "SELECT metric_name, fingerprint, unix_milli, value\n\
-             FROM metric_samples\n\
-             PREWHERE metric_name IN ('foo_total', 'bar_total')\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             ORDER BY metric_name, fingerprint, unix_milli"
-        );
-    }
-
-    #[test]
     fn sample_fetch_multi_window_is_left_open_right_closed() {
         let sql = sample_fetch_multi(
             "metric_samples",
@@ -477,202 +453,6 @@ mod tests {
         assert!(sql.contains(&format!("metric_name IN ({})", ch_string(&payload))));
     }
 
-    /// The concrete-name fetch SQL is byte-unchanged by #85 — the flat
-    /// IN-set shape is a *new* builder alongside it, never a rewrite of
-    /// the single-metric fast path (the EXPLAIN-gated PK prune).
-    #[test]
-    fn sample_fetch_single_name_shape_is_untouched_by_the_multi_builder() {
-        let sql = sample_fetch(
-            "metric_samples",
-            "metric_hist_samples",
-            "up",
-            &[
-                Fingerprint::from_raw(1).sql_literal(),
-                Fingerprint::from_raw(2).sql_literal(),
-            ],
-            0,
-            100,
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, unix_milli, value\n\
-             FROM metric_samples\n\
-             PREWHERE metric_name = 'up'\n\
-             WHERE unix_milli > 0 AND unix_milli <= 100\n\
-             \x20 AND fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
-             ORDER BY fingerprint, unix_milli"
-        );
-    }
-
-    // --- M7-A5a: histogram fetch builders (dual-read complementary half) ---
-
-    const HIST_COLS: &str = "schema, zero_threshold, zero_count, count, sum, \
-         pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-         neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
-         counter_reset_hint";
-
-    /// AC1: the Chunks-path histogram builder renders the float builder's
-    /// exact PREWHERE/window/`IN`/ORDER-BY shape with the 13 histogram
-    /// value columns and the `metric_hist_samples` table.
-    #[test]
-    fn hist_sample_fetch_renders_the_12_column_shape() {
-        let sql = hist_sample_fetch(
-            "metric_hist_samples",
-            "http_request_duration_seconds",
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-                Fingerprint::from_raw(990).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(
-            sql,
-            format!(
-                "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
-                 FROM metric_hist_samples\n\
-                 PREWHERE metric_name = 'http_request_duration_seconds'\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
-                 ORDER BY fingerprint, unix_milli"
-            )
-        );
-    }
-
-    #[test]
-    fn hist_sample_fetch_window_is_left_open_right_closed() {
-        let sql = hist_sample_fetch(
-            "metric_hist_samples",
-            "up",
-            &[Fingerprint::from_raw(1).sql_literal()],
-            0,
-            100,
-        );
-        assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
-        assert!(!sql.contains("unix_milli >= 0"));
-    }
-
-    #[test]
-    fn hist_sample_fetch_subquery_inlines_the_subquery_verbatim() {
-        let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = hist_sample_fetch_subquery("metric_hist_samples", "up", subquery, 0, 100);
-        assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
-        assert!(sql.starts_with(&format!("SELECT fingerprint, unix_milli, {HIST_COLS}")));
-    }
-
-    #[test]
-    fn hist_sample_fetch_multi_renders_the_flat_in_in_shape() {
-        let sql = hist_sample_fetch_multi(
-            "metric_hist_samples",
-            &["foo_seconds".to_string(), "bar_seconds".to_string()],
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(
-            sql,
-            format!(
-                "SELECT metric_name, fingerprint, unix_milli, {HIST_COLS}\n\
-                 FROM metric_hist_samples\n\
-                 PREWHERE metric_name IN ('foo_seconds', 'bar_seconds')\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-                 ORDER BY metric_name, fingerprint, unix_milli"
-            )
-        );
-    }
-
-    /// Extracts the PREWHERE+WHERE+ORDER-BY tail — everything after the
-    /// `FROM <table>` line — so a float/hist pair can be compared for
-    /// predicate/window overlap independent of the SELECT list and table.
-    fn predicate_tail(sql: &str) -> &str {
-        let from = sql.find("\nFROM ").expect("has FROM");
-        let after_table = sql[from + 1..].find('\n').expect("table line") + from + 1;
-        &sql[after_table..]
-    }
-
-    /// AC7a (Chunks): the float read and its complementary histogram read
-    /// share the identical PREWHERE metric-name, window literal, fingerprint
-    /// predicate, and ORDER BY — only the SELECT list and table differ.
-    #[test]
-    fn ac7a_chunks_float_and_hist_predicates_are_identical() {
-        let float = sample_fetch(
-            "metric_samples",
-            "metric_hist_samples",
-            "up",
-            &[
-                Fingerprint::from_raw(7).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        let hist = hist_sample_fetch(
-            "metric_hist_samples",
-            "up",
-            &[
-                Fingerprint::from_raw(7).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
-        assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
-        assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
-        assert!(predicate_tail(&float).contains("PREWHERE metric_name = 'up'"));
-    }
-
-    /// AC7a (Fallback): identical inlined `fingerprint IN ( <subquery> )`,
-    /// window and metric-name predicate.
-    #[test]
-    fn ac7a_fallback_float_and_hist_predicates_are_identical() {
-        let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let float = sample_fetch_subquery(
-            "metric_samples",
-            "metric_hist_samples",
-            "up",
-            subquery,
-            1_000,
-            2_000,
-        );
-        let hist = hist_sample_fetch_subquery("metric_hist_samples", "up", subquery, 1_000, 2_000);
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
-    }
-
-    /// AC7a (Multi): identical `metric_name IN (…)`, window and
-    /// `fingerprint IN (…)`.
-    #[test]
-    fn ac7a_multi_float_and_hist_predicates_are_identical() {
-        let names = vec!["a_seconds".to_string(), "b_seconds".to_string()];
-        let float = sample_fetch_multi(
-            "metric_samples",
-            "metric_hist_samples",
-            &names,
-            &[
-                Fingerprint::from_raw(7).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        let hist = hist_sample_fetch_multi(
-            "metric_hist_samples",
-            &names,
-            &[
-                Fingerprint::from_raw(7).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ],
-            1_000,
-            2_000,
-        );
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
-    }
-
     // -- issue #623: one statement reads both sample tables ------------
 
     /// **The concrete-name fetch is one statement over both tables.** The
@@ -691,7 +471,8 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, \
+            "WITH [toUInt128('101'), toUInt128('205')] AS fps\n\
+             SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, \
              count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
              neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
              FROM (\n\
@@ -709,7 +490,7 @@ mod tests {
              \x20 FROM metric_samples\n\
              \x20 PREWHERE metric_name = 'http_requests_total'\n\
              \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20   AND fingerprint IN fps\n\
              \x20 UNION ALL\n\
              \x20 SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, \
              CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, \
@@ -718,7 +499,7 @@ mod tests {
              \x20 FROM metric_hist_samples\n\
              \x20 PREWHERE metric_name = 'http_requests_total'\n\
              \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20   AND fingerprint IN fps\n\
              )\n\
              ORDER BY fingerprint, unix_milli"
         );
@@ -749,7 +530,7 @@ mod tests {
             (&fallback, subquery, "\nORDER BY fingerprint, unix_milli"),
             (
                 &multi,
-                "fingerprint IN (toUInt128('1'))",
+                "fingerprint IN fps",
                 "\nORDER BY metric_name, fingerprint, unix_milli",
             ),
         ] {
@@ -768,8 +549,15 @@ mod tests {
             assert!(sql.ends_with(order), "{sql}");
         }
         assert!(
-            multi.starts_with("SELECT metric_name, fingerprint, unix_milli, is_hist, value,"),
+            multi.starts_with(
+                "WITH [toUInt128('1')] AS fps\nSELECT metric_name, fingerprint, unix_milli, is_hist, value,"
+            ),
             "{multi}"
+        );
+        assert_eq!(
+            multi.matches("toUInt128('1')").count(),
+            1,
+            "the list is written once"
         );
     }
 }

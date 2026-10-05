@@ -69,7 +69,10 @@ struct SentDescriptor {
 }
 
 /// The descriptors this writer last sent, one per metric name, bounded like
-/// [`SeriesLru`] (issue #623).
+/// [`SeriesLru`] (issue #623). A push sends a metric's descriptor only when it
+/// differs from the one recorded here or the hour has turned since. Promoted
+/// only when a block commits, so a block that failed records nothing and the
+/// next push sends the descriptor again. An evicted name is sent again too.
 pub struct DescriptorCache {
     names: LruSet<Arc<str>>,
     sent: HashMap<Arc<str>, SentDescriptor>,
@@ -86,18 +89,24 @@ impl DescriptorCache {
     /// `true` when `(metric_type, help, unit)` is what this writer last sent
     /// for `metric_name`, in `hour`: the push need not send it again.
     pub fn is_current(
-        &mut self,
+        &self,
         metric_name: &str,
         metric_type: &str,
         help: &str,
         unit: &str,
         hour: i64,
     ) -> bool {
-        let _ = (metric_name, metric_type, help, unit, hour);
-        false
+        self.sent.get(metric_name).is_some_and(|sent| {
+            sent.hour == hour
+                && sent.metric_type == metric_type
+                && sent.help == help
+                && sent.unit == unit
+        })
     }
 
-    /// Records a descriptor a committed block carried.
+    /// Records a descriptor a committed block carried. A descriptor older
+    /// than the one recorded is ignored: blocks can commit out of order, and
+    /// the table keeps the newest.
     pub fn promote(
         &mut self,
         metric_name: &str,
@@ -107,15 +116,32 @@ impl DescriptorCache {
         hour: i64,
         updated_ns: i64,
     ) {
-        let _ = (metric_name, metric_type, help, unit, hour, updated_ns);
+        if self
+            .sent
+            .get(metric_name)
+            .is_some_and(|sent| sent.updated_ns > updated_ns)
+        {
+            return;
+        }
+        let name: Arc<str> = Arc::from(metric_name);
+        if let Some(evicted) = self.names.insert_evicting(name.clone()) {
+            self.sent.remove(&evicted);
+        }
+        self.sent.insert(
+            name,
+            SentDescriptor {
+                metric_type: metric_type.to_string(),
+                help: help.to_string(),
+                unit: unit.to_string(),
+                hour,
+                updated_ns,
+            },
+        );
     }
 
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.sent.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sent.is_empty()
     }
 }
 

@@ -215,7 +215,9 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 /// worth sharing, issue #34 task-manager resolution #1).
 fn reader_settings(dist: bool, query_id: &str) -> QuerySettings {
     let base = if dist {
-        QuerySettings::clustered_reader(false)
+        // Issue #623: the fallback's series read nests the label table, as
+        // the engine's does (`series_read_settings`).
+        QuerySettings::clustered_reader(false).set("distributed_product_mode", "local")
     } else {
         QuerySettings::new()
     };
@@ -627,23 +629,38 @@ fn now_unix_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// Hand-copied from `pulsus_read::metrics::refresh::sweep_sql` — see the
-/// module doc comment's "Sweep SQL drift" note. `extra_predicate`, when
-/// given, is ANDed in (used by [`run_refresh_evidence`]'s incremental
-/// prototype).
+/// Hand-copied from `pulsus_read::metrics::sql::sweep_query` — see the
+/// module doc comment's "Sweep SQL drift" note: the activity rows since the
+/// bound, joined to their label sets (issue #623). `extra_predicate`, when
+/// given, is ANDed into the activity selection on both sides of the join
+/// (used by [`run_refresh_evidence`]'s incremental prototype).
 fn sweep_sql_copy(
     series_table: &str,
+    labels_table: &str,
     lower_bound_ms: i64,
     extra_predicate: Option<&str>,
 ) -> String {
-    let mut sql = format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}"
-    );
+    let mut from_where = format!("FROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}");
     if let Some(extra) = extra_predicate {
-        sql.push_str(&format!("\n  AND {extra}"));
+        from_where.push_str(&format!("\n  AND {extra}"));
     }
-    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
-    sql
+    format!(
+        "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
+         FROM (\n\
+         SELECT DISTINCT metric_name, fingerprint\n\
+         {from_where}\n\
+         ) AS s\n\
+         INNER JOIN (\n\
+         SELECT fingerprint, any(labels) AS label_set\n\
+         FROM {labels_table}\n\
+         WHERE fingerprint IN (\n\
+         SELECT fingerprint\n\
+         {from_where}\n\
+         )\n\
+         GROUP BY fingerprint\n\
+         ) AS l USING (fingerprint)\n\
+         ORDER BY metric_name, fingerprint"
+    )
 }
 
 /// Path 1's refresh-sweep cost: one real `LabelCache::refresh()` call
@@ -661,6 +678,7 @@ async fn run_refresh_evidence(
     cfg: &PathsConfig<'_>,
     cache: &LabelCache,
     series_table: &str,
+    labels_table: &str,
     summary: &MetricsCorpusSummary,
 ) -> anyhow::Result<Vec<RefreshEvidence>> {
     let t0 = Instant::now();
@@ -678,7 +696,7 @@ async fn run_refresh_evidence(
     // comment for why the guard band exists.
     let now_ms = summary.end_ms;
     let full_lower = floor_to_activity_bucket(now_ms - summary.window_ms, summary.bucket_ms);
-    let full_sql = sweep_sql_copy(series_table, full_lower, None);
+    let full_sql = sweep_sql_copy(series_table, labels_table, full_lower, None);
     let full_id = format!("bench-metrics-refresh-full-{}", std::process::id());
     fetch_sweep_rows(cfg.client, &full_sql, &full_id, cfg.dist).await?;
     if cfg.dist {
@@ -704,6 +722,7 @@ async fn run_refresh_evidence(
     let incr_lower = floor_to_activity_bucket(now_ms - summary.bucket_ms, summary.bucket_ms);
     let incr_sql = sweep_sql_copy(
         series_table,
+        labels_table,
         full_lower,
         Some(&format!("unix_milli > {incr_lower}")),
     );
@@ -844,7 +863,8 @@ pub async fn run_all(
     // `run_refresh_evidence` performs the (only) `cache.refresh()` call —
     // the same warm snapshot it produces is what every `cache.resolve(...)`
     // call below reads.
-    let refresh_evidence = run_refresh_evidence(cfg, &cache, &series_table, summary).await?;
+    let refresh_evidence =
+        run_refresh_evidence(cfg, &cache, &series_table, &labels_table, summary).await?;
 
     // Guard-band drift bound (issue #34 CODE review round-2 [valid] finding
     // #3): `super::corpus`'s `buckets[0]` guard neutralizes at most one
@@ -1025,18 +1045,22 @@ mod tests {
 
     #[test]
     fn sweep_sql_copy_matches_the_product_shape() {
-        // Pinned against `pulsus_read::metrics::refresh`'s own
-        // `sweep_sql_renders_the_lower_bound_with_no_upper_bound` test —
-        // the module doc comment's "Sweep SQL drift" discipline.
-        let sql = sweep_sql_copy("metric_series", 1_000, None);
-        assert!(sql.contains("unix_milli >= 1000"));
-        assert!(!sql.contains("unix_milli <="));
-        assert!(sql.ends_with("LIMIT 1 BY metric_name, fingerprint"));
+        // Pinned against the product's own sweep — the module doc
+        // comment's "Sweep SQL drift" discipline.
+        assert_eq!(
+            sweep_sql_copy("metric_series", "metric_labels", 1_000, None),
+            pulsus_read::metrics::sql::sweep_query("metric_series", "metric_labels", 1_000)
+        );
     }
 
     #[test]
     fn sweep_sql_copy_incremental_variant_adds_the_extra_predicate() {
-        let sql = sweep_sql_copy("metric_series", 0, Some("unix_milli > 3600000"));
+        let sql = sweep_sql_copy(
+            "metric_series",
+            "metric_labels",
+            0,
+            Some("unix_milli > 3600000"),
+        );
         assert!(sql.contains("unix_milli >= 0"));
         assert!(sql.contains("AND unix_milli > 3600000"));
     }

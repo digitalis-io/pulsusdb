@@ -74,6 +74,51 @@ fn base_where(
     )
 }
 
+/// `fingerprint, metric_name, labels` — one row per `(metric_name,
+/// fingerprint)` the series rows `from_where` select, carrying that
+/// fingerprint's label set (issue #623).
+///
+/// `metric_series` holds activity only, so the labels come from the
+/// one-row-per-label-set table. The label side reads only the fingerprints
+/// the same `from_where` names, and `any(labels)` collapses the copies a
+/// replacing table holds until it merges, or one per shard: a fingerprint
+/// names one label set, so every copy is the same text. The join is
+/// `INNER`: a series whose label row is missing is absent, never returned
+/// with empty labels, which would merge distinct series into one.
+///
+/// `label_set` rather than `labels` inside the aggregate: an alias that
+/// shadows its own argument's column is resolved to the aggregate in
+/// `WHERE`, which the server refuses (measured on 26.3.29.7).
+fn with_label_sets(labels_table: &str, from_where: &str) -> String {
+    format!(
+        "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
+         FROM (\n\
+         SELECT DISTINCT metric_name, fingerprint\n\
+         {from_where}\n\
+         ) AS s\n\
+         INNER JOIN (\n\
+         SELECT fingerprint, any(labels) AS label_set\n\
+         FROM {labels_table}\n\
+         WHERE fingerprint IN (\n\
+         SELECT fingerprint\n\
+         {from_where}\n\
+         )\n\
+         GROUP BY fingerprint\n\
+         ) AS l USING (fingerprint)\n\
+         ORDER BY metric_name, fingerprint"
+    )
+}
+
+/// The sweep's statement (`super::refresh`): every series active since
+/// `lower_bound_ms`, with its labels. No upper bound — the sweep runs as of
+/// now.
+pub fn sweep_query(series_table: &str, labels_table: &str, lower_bound_ms: i64) -> String {
+    with_label_sets(
+        labels_table,
+        &format!("FROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}"),
+    )
+}
+
 /// The injection-safe `metric_series` sub-query issue #31 inlines verbatim
 /// as `fingerprint IN ( <this> )` against `metric_samples`, for **every**
 /// fallback (task-manager resolution #4 on issue #30: a uniform inline
@@ -144,19 +189,18 @@ pub fn historical_resolution_query(
     bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
-    let mut sql = format!(
-        "SELECT fingerprint, labels\n{}",
-        base_where(
-            series_table,
-            labels_table,
-            metric_name,
-            window,
-            bucket_ms,
-            matchers
-        )
+    let from_where = base_where(
+        series_table,
+        labels_table,
+        metric_name,
+        window,
+        bucket_ms,
+        matchers,
     );
-    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
-    sql
+    format!(
+        "SELECT fingerprint, labels\nFROM (\n{}\n)",
+        with_label_sets(labels_table, &from_where)
+    )
 }
 
 /// Issue #31's label-hydration query: `fingerprint -> labels` for an
@@ -168,21 +212,17 @@ pub fn historical_resolution_query(
 /// hydrates *only those*, not the fallback's full (possibly much larger)
 /// matcher-matched set. No `window`/`matchers`/bucket-floor predicates
 /// here — the fingerprint list is already the answer; this is a pure
-/// `fingerprint -> labels` lookup, filtered only by `metric_name` (the
-/// schema's metric-scoping invariant) and the explicit `IN (...)` list.
-pub fn series_labels_by_fingerprint(
-    series_table: &str,
-    metric_name: &str,
-    fps: &[FpLiteral],
-) -> String {
+/// `fingerprint -> labels` lookup on the label table (issue #623), keyed by
+/// the fingerprint alone, since a fingerprint names one label set whatever
+/// the metric. `any` collapses the copies the table holds until it merges.
+pub fn series_labels_by_fingerprint(labels_table: &str, fps: &[FpLiteral]) -> String {
     let fp_list = fps
         .iter()
         .map(FpLiteral::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT fingerprint, labels\nFROM {series_table}\nWHERE metric_name = {}\n  AND fingerprint IN ({fp_list})\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
-        ch_string(metric_name)
+        "SELECT fingerprint, any(labels) AS labels\nFROM {labels_table}\nWHERE fingerprint IN ({fp_list})\nGROUP BY fingerprint"
     )
 }
 
@@ -206,9 +246,9 @@ pub fn discovery_query(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    format!(
-        "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
-        discovery_from_where(series_table, labels_table, filter, window, bucket_ms)
+    with_label_sets(
+        labels_table,
+        &discovery_from_where(series_table, labels_table, filter, window, bucket_ms),
     )
 }
 
@@ -342,9 +382,12 @@ pub fn discovery_fetch_multi(
             table: labels_table,
         },
     );
-    format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND {}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
-        tail.where_tail()
+    with_label_sets(
+        labels_table,
+        &format!(
+            "FROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND {}",
+            tail.where_tail()
+        ),
     )
 }
 
@@ -425,12 +468,13 @@ pub fn discovery_fetch_by_names(
             table: labels_table,
         },
     );
-    let mut sql = format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND {}",
-        tail.where_tail()
-    );
-    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
-    sql
+    with_label_sets(
+        labels_table,
+        &format!(
+            "FROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND {}",
+            tail.where_tail()
+        ),
+    )
 }
 
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
@@ -560,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_resolution_query_dedups_with_limit_1_by() {
+    fn historical_resolution_query_is_the_label_join_over_one_metric() {
         let sql = historical_resolution_query(
             "metric_series",
             "metric_labels",
@@ -569,15 +613,27 @@ mod tests {
             3_600_000,
             &[],
         );
-        assert!(sql.starts_with("SELECT fingerprint, labels\nFROM metric_series"));
-        assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+        let from_where = base_where(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT fingerprint, labels\nFROM (\n{}\n)",
+                with_label_sets("metric_labels", &from_where)
+            )
+        );
     }
 
     #[test]
     fn series_labels_by_fingerprint_renders_an_explicit_fingerprint_list() {
         let sql = series_labels_by_fingerprint(
-            "metric_series",
-            "up",
+            "metric_labels",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -586,15 +642,14 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, labels\nFROM metric_series\nWHERE metric_name = 'up'\n  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
+            "SELECT fingerprint, any(labels) AS labels\nFROM metric_labels\nWHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nGROUP BY fingerprint"
         );
     }
 
     #[test]
     fn series_labels_by_fingerprint_has_no_window_or_matcher_predicates() {
         let sql = series_labels_by_fingerprint(
-            "metric_series",
-            "up",
+            "metric_labels",
             &[Fingerprint::from_raw(1).sql_literal()],
         );
         assert!(!sql.contains("unix_milli >="));
@@ -1052,8 +1107,10 @@ mod tests {
         );
         assert!(sql.contains("metric_name = 'up'"));
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
-        assert!(sql.starts_with("SELECT fingerprint, metric_name, labels\nFROM metric_series"));
-        assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+        assert!(sql.starts_with(
+            "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\nFROM ("
+        ));
+        assert!(sql.ends_with("ORDER BY metric_name, fingerprint"));
     }
 
     #[test]
@@ -1150,18 +1207,15 @@ mod tests {
         ]
     }
 
-    /// Issue #472 AC1 — the wide statement is still exactly its projection
-    /// prefix, the shared head, and its `ORDER BY`/`LIMIT 1 BY` suffix.
+    /// Issue #472 AC1 — the wide statement is exactly the label join
+    /// (issue #623) over the shared head.
     ///
-    /// **What this pins and what it does not.** The head is now shared, so
+    /// **What this pins and what it does not.** The head is shared, so
     /// this equality cannot see a change *inside* the head — that is what
     /// [`the_narrow_discovery_builder_is_byte_exact`] freezes, byte for
     /// byte, and what
     /// [`the_two_discovery_builders_share_one_where_byte_for_byte`] carries
-    /// across to this builder. What this test earns on its own is the part
-    /// only `discovery_query` has: that the projection list, the `ORDER BY
-    /// unix_milli DESC` and the `LIMIT 1 BY metric_name, fingerprint` are
-    /// unmoved by the extraction.
+    /// across to this builder.
     #[test]
     fn discovery_query_is_its_projection_plus_the_shared_head_plus_its_suffix() {
         for (what, filter) in discovery_filter_table() {
@@ -1172,16 +1226,15 @@ mod tests {
                 window(),
                 3_600_000,
             );
-            let expected = format!(
-                "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli \
-                 DESC\nLIMIT 1 BY metric_name, fingerprint",
-                discovery_from_where(
+            let expected = with_label_sets(
+                "metric_labels",
+                &discovery_from_where(
                     "metric_series",
                     "metric_labels",
                     &filter,
                     window(),
-                    3_600_000
-                )
+                    3_600_000,
+                ),
             );
             assert_eq!(sql, expected, "{what}");
         }
@@ -1221,13 +1274,16 @@ mod tests {
                 3_600_000
             ),
             "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE metric_name = 'up'\n  AND \
-             unix_milli >= 0 AND unix_milli <= 3600000\n  AND JSONExtractString(labels, 'job') = \
-             'api'\nORDER BY metric_name"
+             unix_milli >= 0 AND unix_milli <= 3600000\n  AND fingerprint IN (\n    SELECT \
+             fingerprint\n    FROM metric_labels\n    WHERE JSONExtractString(labels, 'job') = \
+             'api'\n  )\nORDER BY metric_name"
         );
     }
 
     /// Issue #472 AC3 — the two builders' `FROM …WHERE …` heads are
-    /// byte-identical over the whole filter table.
+    /// byte-identical over the whole filter table: the narrow statement is
+    /// the head with its own projection, and the wide one carries the same
+    /// head on both sides of its label join (issue #623).
     ///
     /// **What it does not prove:** that the head is *shared* rather than
     /// duplicated-and-currently-equal. That is what [`discovery_from_where`]
@@ -1249,16 +1305,11 @@ mod tests {
                 window(),
                 3_600_000,
             );
-            let head = |sql: &str| -> String {
-                let from = sql
-                    .find("FROM ")
-                    .expect("a FROM in every discovery statement");
-                let order = sql
-                    .rfind("\nORDER BY ")
-                    .expect("an ORDER BY in every discovery statement");
-                sql[from..order].to_string()
-            };
-            assert_eq!(head(&wide), head(&narrow), "{what}");
+            let head = narrow
+                .strip_prefix("SELECT DISTINCT metric_name\n")
+                .and_then(|rest| rest.strip_suffix("\nORDER BY metric_name"))
+                .expect("the narrow statement is its projection around the head");
+            assert_eq!(wide.matches(head).count(), 2, "{what}: {wide}");
         }
     }
 
@@ -1279,13 +1330,13 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, metric_name, labels\n\
-             FROM metric_series\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             ORDER BY unix_milli DESC\n\
-             LIMIT 1 BY metric_name, fingerprint"
+            with_label_sets(
+                "metric_labels",
+                "FROM metric_series\n\
+                 WHERE metric_name IN ('up', 'up_alias')\n\
+                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20 AND unix_milli >= 0 AND unix_milli <= 3600000"
+            )
         );
     }
 
@@ -1451,13 +1502,17 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, metric_name, labels\n\
-             FROM metric_series\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             \x20 AND JSONExtractString(labels, 'job') = 'api'\n\
-             ORDER BY unix_milli DESC\n\
-             LIMIT 1 BY metric_name, fingerprint"
+            with_label_sets(
+                "metric_labels",
+                "FROM metric_series\n\
+                 WHERE metric_name IN ('up', 'up_alias')\n\
+                 \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+                 \x20 AND fingerprint IN (\n\
+                 \x20   SELECT fingerprint\n\
+                 \x20   FROM metric_labels\n\
+                 \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+                 \x20 )"
+            )
         );
     }
 
@@ -1471,10 +1526,10 @@ mod tests {
             window(),
             3_600_000,
         );
-        assert!(!sql.contains("fingerprint IN"));
+        assert!(!sql.contains("fingerprint IN (toUInt128"));
         assert!(sql.contains("metric_name IN ('up')"));
         assert!(sql.contains("AND unix_milli >= "));
-        assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+        assert!(sql.ends_with("ORDER BY metric_name, fingerprint"));
     }
 
     #[test]

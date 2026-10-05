@@ -129,6 +129,9 @@ pub struct MetricsCorpusSpec {
     /// instead of the bare local table — required for `--dist` mode, same
     /// rationale as `dataset.rs::DatasetSpec::dist`.
     pub dist: bool,
+    /// The cluster `--dist` loads into, so the label rows can be placed on
+    /// every shard.
+    pub cluster: String,
 }
 
 /// One cardinality tier's identity — the fingerprint of series `0`
@@ -156,16 +159,66 @@ pub struct MetricsCorpusSummary {
     pub load_elapsed_ms: u64,
 }
 
-/// Wire shape matching `metric_series`' physical column order exactly
-/// (`pulsus_schema::catalog`'s migration id 4: `metric_name, fingerprint,
-/// unix_milli, labels`) — RowBinary insert requires this order, same
-/// convention as `dataset.rs`'s `SeedStreamRow`/`SeedSampleRow`.
+/// One `metric_series` activity row (issue #623: the table holds no label
+/// text) — RowBinary insert names its columns, same convention as
+/// `dataset.rs`'s `SeedStreamRow`/`SeedSampleRow`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MetricSeriesRow {
     metric_name: String,
     fingerprint: Fingerprint,
     unix_milli: i64,
+}
+
+/// One `metric_labels` row: a series' label set, once per fingerprint.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MetricLabelsRow {
+    fingerprint: Fingerprint,
     labels: String,
+}
+
+/// The label rows, once per fingerprint. Single-node they go into
+/// `metric_labels`. With `--dist` the activity rows are placed by the
+/// routing wrapper's key, which a label row keyed by the fingerprint alone
+/// cannot follow, so every shard is given every label set — the superset a
+/// shard-local read can always find its series' labels in. In production
+/// the view writes both rows on the node that received the push.
+async fn insert_label_sets(
+    client: &ChClient,
+    spec: &MetricsCorpusSpec,
+    rows: &[MetricLabelsRow],
+) -> anyhow::Result<()> {
+    if !spec.dist {
+        for block in rows.chunks(INSERT_BATCH_ROWS) {
+            client.insert_block("metric_labels", block).await?;
+        }
+        return Ok(());
+    }
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ShardsRow {
+        n: u32,
+    }
+    let sql = format!(
+        "SELECT toUInt32(max(shard_num)) AS n FROM system.clusters WHERE cluster = '{}'",
+        spec.cluster
+    );
+    let mut stream = client
+        .query_stream::<ShardsRow>(&sql, &QuerySettings::new())
+        .await?;
+    let shards = match stream.next().await {
+        Some(row) => row?.n,
+        None => 0,
+    };
+    drop(stream);
+    anyhow::ensure!(shards >= 1, "cluster {} has no shards", spec.cluster);
+    for shard in 1..=shards {
+        let settings = QuerySettings::new().set("insert_shard_id", u64::from(shard));
+        for block in rows.chunks(INSERT_BATCH_ROWS) {
+            client
+                .insert_block_with("metric_labels_dist", block, &settings)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Series `i`'s label set — see the module doc comment's controlled-
@@ -327,6 +380,7 @@ pub async fn load(
     let mut tiers = Vec::with_capacity(spec.cardinalities.len());
     let mut total_series_rows: u64 = 0;
     let mut batch: Vec<MetricSeriesRow> = Vec::with_capacity(INSERT_BATCH_ROWS);
+    let mut label_rows: Vec<MetricLabelsRow> = Vec::new();
 
     for &cardinality in &spec.cardinalities {
         anyhow::ensure!(cardinality >= 1, "every cardinality must be >= 1");
@@ -345,6 +399,9 @@ pub async fn load(
                 metric_name: metric_name.clone(),
                 fingerprint,
                 unix_milli: bucket,
+            });
+            label_rows.push(MetricLabelsRow {
+                fingerprint,
                 labels: labels_json,
             });
             total_series_rows += 1;
@@ -376,6 +433,8 @@ pub async fn load(
             narrow_fp,
         });
     }
+
+    insert_label_sets(client, spec, &label_rows).await?;
 
     if spec.dist {
         poll_count_until_visible(

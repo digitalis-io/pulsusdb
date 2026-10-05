@@ -422,7 +422,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:790` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:825` already names the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the
@@ -2494,7 +2494,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:967`
+> — `docs/schemas.md:1002`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -4350,13 +4350,13 @@ repository-relative.
 
 ### `docs/schemas.md`
 
-**`:720-720`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:755-755`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   720  | `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
 ```
 
-**`:897-897`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:932-932`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   897  **Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
@@ -4728,7 +4728,7 @@ repository-relative.
   321  /// (docs/schemas.md §2.2/§8: replaying a partially-committed block
 ```
 
-**`:367-434`**  (68 lines in the range; comments and blanks elided, 30 shown)
+**`:402-469`**  (68 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
   367  async fn finish_generation<R>(
@@ -4922,25 +4922,25 @@ repository-relative.
   380  ///
 ```
 
-**`:397-397`**
+**`:432-432`**
 
 ```rust
   397  pub fn event_set_sql(
 ```
 
-**`:428-428`**
+**`:463-463`**
 
 ```rust
   428  pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:468-468`**
+**`:503-503`**
 
 ```rust
   468  pub fn trace_ctx_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:492-492`**
+**`:527-527`**
 
 ```rust
   492  pub fn child_count_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {

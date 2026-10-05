@@ -144,10 +144,7 @@ async fn seed_hist_samples(client: &ChClient, rows: &[SeedHistRow]) {
 }
 
 async fn seed_series(client: &ChClient, rows: &[SeedSeriesRow]) {
-    client
-        .insert_block("metric_series", rows)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, rows).await;
 }
 
 async fn seed_samples(client: &ChClient, rows: &[SeedSampleRow]) {
@@ -1896,11 +1893,13 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     assert!(
         fetch_stage
             .sql
-            .contains("SELECT fingerprint, unix_milli, value"),
+            .contains("SELECT fingerprint, unix_milli, is_hist, value"),
         "expected real sample_fetch SQL, got: {}",
         fetch_stage.sql
     );
-    assert!(fetch_stage.sql.contains("FROM metric_samples"));
+    // Issue #623: one statement over both sample tables.
+    assert!(fetch_stage.sql.contains("FROM metric_samples\n"));
+    assert!(fetch_stage.sql.contains("FROM metric_hist_samples\n"));
     assert!(fetch_stage.sql.contains("PREWHERE metric_name = 'up'"));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
@@ -3129,7 +3128,9 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
         "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
     );
-    assert!(sql.contains("fingerprint IN (toUInt128('1'))"), "{sql}");
+    // Issue #623: the list is named once for both sample tables.
+    assert!(sql.starts_with("WITH [toUInt128('1')] AS fps\n"), "{sql}");
+    assert_eq!(sql.matches("fingerprint IN fps").count(), 2, "{sql}");
     assert!(!sql.contains("other_metric"), "{sql}");
 
     match result {
@@ -4221,4 +4222,46 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
     );
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its label set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

@@ -25,7 +25,8 @@
 //!
 //! **The inventory.** Twenty-three production `Row` structs carry a
 //! `fingerprint` field — ten in `logql/rows.rs`, four in
-//! `metrics/sample_rows.rs`, one in `metrics/rows.rs`, two in
+//! `metrics/sample_rows.rs` (six since issue #623 added the two rows of the
+//! one-statement fetch over both sample tables), one in `metrics/rows.rs`, two in
 //! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. Two of
 //! the twenty-three were private, which is why a `pub struct` search
 //! returns twenty-one; they are `pub` now with that reason recorded on
@@ -51,9 +52,10 @@ use pulsus_read::metrics::exec as metrics_exec;
 use pulsus_read::metrics::{rows as metrics_rows, sample_rows};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use pulsus_write::SeriesRef;
 use pulsus_write::writer::{
-    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricSampleRow,
-    MetricSeriesRow,
+    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricLandingRow,
+    MetricSampleRow, MetricSeriesRow,
 };
 
 /// `2^64-1`, `2^64`, `2^64+1`, `2^64+2`.
@@ -213,20 +215,33 @@ async fn seed(client: &ChClient, db: &str) {
         .await
         .expect("insert log_patterns through LogPatternRow");
 
-    let series: Vec<MetricSeriesRow> = fingerprints()
+    // Issue #623: a series is written as a kind-2 landing row, which the two
+    // views turn into an activity row and a label row. `metric_series` has
+    // no label column for `MetricSeriesRow` to be inserted into, so it is
+    // read back below through the join that reassembles it.
+    let series: Vec<MetricLandingRow> = fingerprints()
         .into_iter()
-        .map(|fingerprint| MetricSeriesRow {
-            metric_name: "pulsus_probe".to_string(),
-            fingerprint,
-            unix_milli: ts_ms,
-            labels: r#"{"service_name":"checkout"}"#.to_string(),
-            value_type: 0,
+        .map(|fingerprint| {
+            MetricLandingRow::series(
+                ts_ms,
+                &SeriesRef {
+                    metric_name: "pulsus_probe".into(),
+                    fingerprint,
+                    labels: pulsus_model::LabelSet::from_normalized([(
+                        "service_name".to_string(),
+                        "checkout".to_string(),
+                    )])
+                    .0,
+                },
+                ts_ms,
+                0,
+            )
         })
         .collect();
     client
-        .insert_block("metric_series", &series)
+        .insert_block("metric_landing", &series)
         .await
-        .expect("insert metric_series through MetricSeriesRow");
+        .expect("insert a kind-2 row per fingerprint through MetricLandingRow");
 
     let metric_samples: Vec<MetricSampleRow> = fingerprints()
         .into_iter()
@@ -581,12 +596,65 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
+    // Issue #623: the one statement over both sample tables, through the
+    // builders the engine sends. The floats are `pulsus_probe` and the
+    // histograms `pulsus_probe_hist`: the concrete-name fetch reads the
+    // histogram branch, the fan-out over both names reads both branches.
+    let fp_literals: Vec<pulsus_model::FpLiteral> = fingerprints()
+        .into_iter()
+        .map(Fingerprint::sql_literal)
+        .collect();
+    let both = |rows: Vec<Fingerprint>| -> Vec<Fingerprint> {
+        let mut once = rows;
+        once.sort_unstable();
+        once.dedup();
+        once
+    };
+    let rows: Vec<sample_rows::UnionSampleRow> = read_all(
+        &client,
+        "UnionSampleRow",
+        &pulsus_read::metrics::sample_sql::sample_fetch(
+            "metric_samples",
+            "metric_hist_samples",
+            "pulsus_probe_hist",
+            &fp_literals,
+            0,
+            i64::MAX,
+        ),
+    )
+    .await;
+    assert!(rows.iter().all(|r| r.is_hist == 1), "the histogram branch");
+    assert_the_four_boundary_values(
+        "UnionSampleRow",
+        both(rows.into_iter().map(|r| r.fingerprint).collect()),
+    );
+
+    let rows: Vec<sample_rows::MultiUnionSampleRow> = read_all(
+        &client,
+        "MultiUnionSampleRow",
+        &pulsus_read::metrics::sample_sql::sample_fetch_multi(
+            "metric_samples",
+            "metric_hist_samples",
+            &["pulsus_probe".to_string(), "pulsus_probe_hist".to_string()],
+            &fp_literals,
+            0,
+            i64::MAX,
+        ),
+    )
+    .await;
+    assert_eq!(rows.len(), 8, "a float and a histogram row per fingerprint");
+    assert_the_four_boundary_values(
+        "MultiUnionSampleRow",
+        both(rows.into_iter().map(|r| r.fingerprint).collect()),
+    );
+
     // --- crates/pulsus-read/src/metrics/rows.rs (1) -------------------
     let rows: Vec<metrics_rows::SeriesRow> = read_all(
         &client,
         "SeriesRow",
         &format!(
             "SELECT fingerprint, metric_name, labels FROM metric_series \
+             INNER JOIN metric_labels USING (fingerprint) \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
@@ -602,7 +670,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "HydratedLabelsRow",
         &format!(
-            "SELECT fingerprint, labels FROM metric_series WHERE fingerprint IN ({fps}) \
+            "SELECT fingerprint, labels FROM metric_labels WHERE fingerprint IN ({fps}) \
              ORDER BY fingerprint"
         ),
     )
@@ -676,6 +744,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         "MetricSeriesRow",
         &format!(
             "SELECT metric_name, fingerprint, unix_milli, labels, value_type FROM metric_series \
+             INNER JOIN metric_labels USING (fingerprint) \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )

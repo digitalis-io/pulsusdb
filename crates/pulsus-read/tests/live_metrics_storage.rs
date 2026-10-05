@@ -29,6 +29,10 @@ use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{HistogramPoint, MetricLandingRow, MetricPoint, SeriesRef};
 
+/// One series as the seed states it: its name, its fingerprint and its
+/// label pairs, sorted.
+type SeriesEntry = (String, Fingerprint, Vec<(String, String)>);
+
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
 }
@@ -185,11 +189,10 @@ fn engine_config(db: &str) -> MetricsConfig {
 
 /// A fresh database, and clients bound to it for seeding, the cache and the
 /// engine.
-async fn fresh(name: &str) -> (ChClient, String, ChClient) {
+async fn fresh(db: String) -> (ChClient, String, ChClient) {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = pulsus_testkit::test_db(name);
     drop_database(&bootstrap, &db).await;
     run_init(&bootstrap, &RenderCtx::for_tests(&db))
         .await
@@ -237,7 +240,10 @@ fn corpus() -> BTreeMap<String, Vec<u128>> {
 #[tokio::test]
 async fn every_series_read_returns_the_seeded_series_with_their_labels() {
     skip_unless_live!();
-    let (bootstrap, db, client) = fresh("pulsus_read_it_metrics_storage_labels").await;
+    let (bootstrap, db, client) = fresh(pulsus_testkit::test_db(
+        "pulsus_read_it_metrics_storage_labels",
+    ))
+    .await;
 
     let now = now_ms();
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
@@ -259,7 +265,7 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
         .await
         .expect("seed metric_landing");
 
-    let expected: BTreeSet<(String, Fingerprint, Vec<(String, String)>)> = corpus
+    let expected: BTreeSet<SeriesEntry> = corpus
         .iter()
         .flat_map(|(name, fps)| {
             fps.iter()
@@ -309,7 +315,7 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
                 .collect::<BTreeSet<Vec<(String, String)>>>()
         }
     };
-    let as_series = |keep: &dyn Fn(&(String, Fingerprint, Vec<(String, String)>)) -> bool| {
+    let as_series = |keep: &dyn Fn(&SeriesEntry) -> bool| {
         expected
             .iter()
             .filter(|e| keep(e))
@@ -466,7 +472,10 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
 #[tokio::test]
 async fn one_statement_reads_both_sample_tables_and_the_answer_is_unchanged() {
     skip_unless_live!();
-    let (bootstrap, db, client) = fresh("pulsus_read_it_metrics_storage_union").await;
+    let (bootstrap, db, client) = fresh(pulsus_testkit::test_db(
+        "pulsus_read_it_metrics_storage_union",
+    ))
+    .await;
 
     let now = now_ms();
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;

@@ -2065,7 +2065,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/predicate.rs", 15),
     ("pulsus-read/src/logql/sql.rs", 2),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
-    ("pulsus-read/src/metrics/series_where.rs", 10),
+    // Issue #623: two more in a test expectation, the label-table
+    // sub-query's rendering of a regex matcher and its probe.
+    ("pulsus-read/src/metrics/series_where.rs", 12),
     ("pulsus-read/src/metrics/sql.rs", 14),
     ("pulsus-read/src/traces/filter.rs", 12),
     ("pulsus-read/src/traces/search_plan.rs", 2),
@@ -2087,7 +2089,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 74;
+const MATCH_RENDER_TOTAL: usize = 76;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

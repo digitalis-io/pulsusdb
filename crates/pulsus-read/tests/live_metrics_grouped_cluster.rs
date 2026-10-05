@@ -108,6 +108,16 @@ fn shard1_config(database: &str) -> ChConnConfig {
     )
 }
 
+fn shard2_config(database: &str) -> ChConnConfig {
+    shard_config(
+        "PULSUS_TEST_CH_SHARD2_HOST",
+        "172.28.0.12",
+        "PULSUS_TEST_CH_SHARD2_HTTP_PORT",
+        8123,
+        database,
+    )
+}
+
 fn cluster_ctx(db: &str) -> RenderCtx {
     RenderCtx {
         db: db.to_string(),
@@ -283,9 +293,10 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         }
     }
     client
-        .insert_block("metric_series_dist", &series)
+        .insert_block("metric_series_dist", &activity_rows(&series))
         .await
         .expect("seed metric_series_dist");
+    seed_labels_on_every_shard(&db, &series).await;
     client
         .insert_block("metric_samples_dist", &samples)
         .await
@@ -414,4 +425,51 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     stream.next().await.expect("a row").expect("decode").n
+}
+
+/// Issue #623: a series is an activity row in `metric_series` and its label
+/// set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+fn activity_rows(rows: &[SeedSeriesRow]) -> Vec<SeedActivityRow> {
+    rows.iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect()
+}
+
+/// The label rows go into every shard's local table. In production the
+/// view writes a series' label row on the node that writes its activity
+/// row; the activity rows here are placed by the routing wrapper's sharding
+/// key instead, so every shard is given every label set, which is the
+/// superset a shard-local read can always find its series' labels in.
+async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    for cfg in [shard1_config(db), shard2_config(db)] {
+        let shard = ChClient::new(cfg).await.expect("connect a shard");
+        shard
+            .insert_block("metric_labels", &labels)
+            .await
+            .expect("seed metric_labels on a shard");
+    }
 }

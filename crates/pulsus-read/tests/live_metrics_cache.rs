@@ -99,10 +99,7 @@ struct SeedSeriesRow {
 }
 
 async fn seed(client: &ChClient, rows: &[SeedSeriesRow]) {
-    client
-        .insert_block("metric_series", rows)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, rows).await;
 }
 
 /// Doubles literal `?` before executing raw SQL text against the real
@@ -150,9 +147,11 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
 }
 
 /// The whole point of the time-awareness invariant (docs/architecture.md
-/// §5.2): a series alive last week but silent today must be absent from
-/// the (24h-windowed) cache, and a historical query for last week must
-/// still resolve it via `metric_series` — never a false empty.
+/// §5.2): a series alive days ago but silent today must be absent from
+/// the (24h-windowed) cache, and a historical query for those days must
+/// still resolve it via `metric_series` — never a false empty. Three days
+/// rather than a week since issue #623: the activity rows expire with the
+/// samples, at the fixture's seven-day retention.
 #[tokio::test]
 async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metric_series() {
     skip_unless_live!();
@@ -178,9 +177,9 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
             .as_millis(),
     )
     .expect("now fits in i64");
-    let one_week_ms = 7 * 24 * 3_600_000;
+    let three_days_ms = 3 * 24 * 3_600_000;
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
-    let last_week_bucket = ((now_ms - one_week_ms) / bucket) * bucket;
+    let last_week_bucket = ((now_ms - three_days_ms) / bucket) * bucket;
 
     seed(
         &client,
@@ -243,8 +242,19 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         .expect("connect (target db)");
 
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS; // 1h
-    let ten_am_bucket = 10 * 3_600_000i64; // an arbitrary "10:00" epoch-relative instant
-    let eleven_am_bucket = 11 * 3_600_000i64;
+    // Yesterday's 10:00 and 11:00 UTC. Inside the fixture's retention: the
+    // activity rows expire with the samples since issue #623, so an epoch-
+    // relative 10:00 would be dropped before the read.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("now fits in i64");
+    let yesterday = (now_ms / 86_400_000 - 1) * 86_400_000;
+    let ten_am_bucket = yesterday + 10 * 3_600_000i64;
+    let eleven_am_bucket = yesterday + 11 * 3_600_000i64;
 
     seed(
         &client,
@@ -600,6 +610,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     let upper_bound_ms = floor_to_activity_bucket(far_future_window.end_ms, bucket);
     let truth_sql = format!(
         "SELECT DISTINCT fingerprint FROM metric_series \
+         INNER JOIN metric_labels USING (fingerprint) \
          WHERE metric_name = 'http_requests_total' \
            AND unix_milli >= {lower_bound_ms} AND unix_milli <= {upper_bound_ms} \
            AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')"
@@ -872,8 +883,8 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
-                 SELECT 'up', number + 1000, {recent}, \
+                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
+                 SELECT 2, 'up', number + 1000, {recent}, \
                         concat('{{\"job\":\"w', toString(number), '\"}}') \
                  FROM numbers(200000)"
             ),
@@ -906,4 +917,46 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     assert!(cache.is_warm(), "a failed sweep must not un-warm the cache");
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its label set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

@@ -138,6 +138,135 @@ impl MultiHistSampleRow {
     }
 }
 
+/// One row of the one-statement fetch over both sample tables (issue #623,
+/// [`super::sample_sql::sample_fetch`] /
+/// [`super::sample_sql::sample_fetch_subquery`]): a float row carries
+/// `is_hist = 0`, its `value` and the histogram columns' empty values; a
+/// histogram row carries `is_hist = 1`, `value = 0` and its own columns.
+/// [`Self::split`] hands the merge the two streams it had before.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct UnionSampleRow {
+    pub fingerprint: Fingerprint,
+    pub unix_milli: i64,
+    pub is_hist: u8,
+    pub value: f64,
+    pub schema: i8,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub pos_span_offsets: Vec<i32>,
+    pub pos_span_lengths: Vec<u32>,
+    pub pos_bucket_deltas: Vec<i64>,
+    pub neg_span_offsets: Vec<i32>,
+    pub neg_span_lengths: Vec<u32>,
+    pub neg_bucket_deltas: Vec<i64>,
+    pub custom_values: Vec<f64>,
+    pub counter_reset_hint: u8,
+}
+
+impl UnionSampleRow {
+    /// The float rows and the histogram rows, each in the order the
+    /// statement returned them — ascending `(fingerprint, unix_milli)`.
+    pub fn split(rows: Vec<Self>) -> (Vec<SampleRow>, Vec<HistSampleRow>) {
+        let mut float = Vec::new();
+        let mut hist = Vec::new();
+        for r in rows {
+            if r.is_hist == 0 {
+                float.push(SampleRow {
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.unix_milli,
+                    value: r.value,
+                });
+            } else {
+                hist.push(HistSampleRow {
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.unix_milli,
+                    schema: r.schema,
+                    zero_threshold: r.zero_threshold,
+                    zero_count: r.zero_count,
+                    count: r.count,
+                    sum: r.sum,
+                    pos_span_offsets: r.pos_span_offsets,
+                    pos_span_lengths: r.pos_span_lengths,
+                    pos_bucket_deltas: r.pos_bucket_deltas,
+                    neg_span_offsets: r.neg_span_offsets,
+                    neg_span_lengths: r.neg_span_lengths,
+                    neg_bucket_deltas: r.neg_bucket_deltas,
+                    custom_values: r.custom_values,
+                    counter_reset_hint: r.counter_reset_hint,
+                });
+            }
+        }
+        (float, hist)
+    }
+}
+
+/// [`UnionSampleRow`] for the multi-metric fan-out
+/// ([`super::sample_sql::sample_fetch_multi`]), with a leading
+/// `metric_name`.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct MultiUnionSampleRow {
+    pub metric_name: String,
+    pub fingerprint: Fingerprint,
+    pub unix_milli: i64,
+    pub is_hist: u8,
+    pub value: f64,
+    pub schema: i8,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub pos_span_offsets: Vec<i32>,
+    pub pos_span_lengths: Vec<u32>,
+    pub pos_bucket_deltas: Vec<i64>,
+    pub neg_span_offsets: Vec<i32>,
+    pub neg_span_lengths: Vec<u32>,
+    pub neg_bucket_deltas: Vec<i64>,
+    pub custom_values: Vec<f64>,
+    pub counter_reset_hint: u8,
+}
+
+impl MultiUnionSampleRow {
+    /// [`UnionSampleRow::split`] for the fan-out: each stream in the order
+    /// the statement returned it, ascending `(metric_name, fingerprint,
+    /// unix_milli)`.
+    pub fn split(rows: Vec<Self>) -> (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) {
+        let mut float = Vec::new();
+        let mut hist = Vec::new();
+        for r in rows {
+            if r.is_hist == 0 {
+                float.push(MultiSampleRow {
+                    metric_name: r.metric_name,
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.unix_milli,
+                    value: r.value,
+                });
+            } else {
+                hist.push(MultiHistSampleRow {
+                    metric_name: r.metric_name,
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.unix_milli,
+                    schema: r.schema,
+                    zero_threshold: r.zero_threshold,
+                    zero_count: r.zero_count,
+                    count: r.count,
+                    sum: r.sum,
+                    pos_span_offsets: r.pos_span_offsets,
+                    pos_span_lengths: r.pos_span_lengths,
+                    pos_bucket_deltas: r.pos_bucket_deltas,
+                    neg_span_offsets: r.neg_span_offsets,
+                    neg_span_lengths: r.neg_span_lengths,
+                    neg_bucket_deltas: r.neg_bucket_deltas,
+                    custom_values: r.custom_values,
+                    counter_reset_hint: r.counter_reset_hint,
+                });
+            }
+        }
+        (float, hist)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

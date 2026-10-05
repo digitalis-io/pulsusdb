@@ -208,9 +208,10 @@ async fn seed_dist(db: &str, metric_name: &str, fps: &[u64], unix_milli: i64) {
         })
         .collect();
     data_client
-        .insert_block("metric_series_dist", &series_rows)
+        .insert_block("metric_series_dist", &activity_rows(&series_rows))
         .await
         .expect("seed metric_series_dist");
+    seed_labels_on_every_shard(db, &series_rows).await;
     data_client
         .insert_block("metric_samples_dist", &sample_rows)
         .await
@@ -530,4 +531,51 @@ async fn engine_returns_exact_samples_across_shards_via_the_local_product_mode_f
     }
 
     drop_database(&shard1_bootstrap, db).await;
+}
+
+/// Issue #623: a series is an activity row in `metric_series` and its label
+/// set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+fn activity_rows(rows: &[SeedSeriesRow]) -> Vec<SeedActivityRow> {
+    rows.iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect()
+}
+
+/// The label rows go into every shard's local table. In production the
+/// view writes a series' label row on the node that writes its activity
+/// row; the activity rows here are placed by the routing wrapper's sharding
+/// key instead, so every shard is given every label set, which is the
+/// superset a shard-local read can always find its series' labels in.
+async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    for cfg in [shard1_config(db), shard2_config(db)] {
+        let shard = ChClient::new(cfg).await.expect("connect a shard");
+        shard
+            .insert_block("metric_labels", &labels)
+            .await
+            .expect("seed metric_labels on a shard");
+    }
 }

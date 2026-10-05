@@ -227,9 +227,11 @@ pub(super) enum MatcherTarget<'a> {
 #[derive(Debug)]
 pub(super) struct SeriesWhere {
     /// `unix_milli >= <floor><probe> AND unix_milli <= <floor>` followed by
-    /// one `\n  AND <predicate>` per matcher. Private: the two halves are
-    /// never handed out separately, which is what makes "a regex without
-    /// its probe" unrepresentable rather than merely untested.
+    /// the matchers: one `fingerprint IN (<label table sub-query>)` for label
+    /// matchers, one `\n  AND <predicate>` each for name matchers. Private:
+    /// the two halves are never handed out separately, which is what makes
+    /// "a regex without its probe" unrepresentable rather than merely
+    /// untested.
     tail: String,
 }
 
@@ -247,9 +249,24 @@ impl SeriesWhere {
         let upper = floored_bound(window.end_ms, bucket_ms);
         let probe = re2_compile_probe(matchers);
         let mut tail = format!("unix_milli >= {lower}{probe} AND unix_milli <= {upper}");
-        for m in matchers {
-            tail.push_str("\n  AND ");
-            tail.push_str(&predicate(m, target));
+        match target {
+            // The series rows hold no label text (issue #623): the matchers
+            // select fingerprints out of the one-row-per-label-set table.
+            MatcherTarget::Labels { table } if !matchers.is_empty() => {
+                let predicates: Vec<String> =
+                    matchers.iter().map(|m| predicate(m, target)).collect();
+                tail.push_str(&format!(
+                    "\n  AND fingerprint IN (\n    SELECT fingerprint\n    FROM {table}\n    WHERE {}\n  )",
+                    predicates.join("\n      AND ")
+                ));
+            }
+            MatcherTarget::Labels { .. } => {}
+            MatcherTarget::MetricNameColumn => {
+                for m in matchers {
+                    tail.push_str("\n  AND ");
+                    tail.push_str(&predicate(m, target));
+                }
+            }
         }
         SeriesWhere { tail }
     }

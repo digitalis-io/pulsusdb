@@ -113,10 +113,7 @@ struct ProbeNameRow {
 }
 
 async fn seed_series(client: &ChClient, rows: &[SeedSeriesRow]) {
-    client
-        .insert_block("metric_series", rows)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, rows).await;
 }
 
 fn now_ms() -> i64 {
@@ -432,4 +429,46 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
     }
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its label set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            unix_milli: r.unix_milli,
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

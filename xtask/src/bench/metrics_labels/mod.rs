@@ -206,6 +206,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             window_ms,
             ref_ms,
             dist: args.dist,
+            cluster: args.cluster.clone(),
         };
         eprintln!("--- generating metric_series corpus ---");
         let summary = corpus::load(&client, &spec).await?;

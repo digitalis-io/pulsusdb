@@ -1953,7 +1953,9 @@ mod tests {
                     reason,
                     FallbackReason::OverCardinality { matched: 2, cap: 1 }
                 );
-                assert!(!sql.contains(" IN ("));
+                // The matchers select from the label table in a sub-query
+                // (issue #623); no fingerprint list is materialized.
+                assert!(!sql.contains("IN (toUInt128"), "{sql}");
             }
             other => panic!("expected SqlFallback, got {other:?}"),
         }

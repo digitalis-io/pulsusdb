@@ -54,8 +54,8 @@ docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	crates
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:484	crates/pulsus-read/src/logql/sql.rs	484		line	stage1	pub fn stage1(
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:521	crates/pulsus-read/src/logql/sql.rs	521		line	probe	pub fn probe(
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:851	crates/pulsus-read/src/logql/sql.rs	851		prose	stage3_keyset	stage3_keyset
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:274	crates/pulsus-read/src/metrics/labels.rs	274		line	compile_user_regex_anchored	let re = pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(&m.value))
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:620	crates/pulsus-read/src/metrics/labels.rs	620		line	compile_user_regex_anchored	Arc::new(pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(pattern)).ok()?);
+docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:277	crates/pulsus-read/src/metrics/labels.rs	277		line	compile_user_regex_anchored	let re = pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(&m.value))
+docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:623	crates/pulsus-read/src/metrics/labels.rs	623		line	compile_user_regex_anchored	Arc::new(pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(pattern)).ok()?);
 docs/query-lowering.md	crates/pulsus-read/src/metrics/re2_authority.rs:89	crates/pulsus-read/src/metrics/re2_authority.rs	89		line	re2_pattern_to_rust	let rewritten = re2_pattern_to_rust(&m.value);
 docs/query-lowering.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		prose	MAX_QUERY_TEXT_BYTES	MAX_QUERY_TEXT_BYTES
 docs/query-lowering.md	crates/pulsus-read/src/traces/compile.rs:1396-1404	crates/pulsus-read/src/traces/compile.rs	1396	1404	prose	NotASearchLinkLower	capability

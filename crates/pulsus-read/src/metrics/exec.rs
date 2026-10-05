@@ -48,7 +48,10 @@ use pulsus_promql::{
 use super::compile;
 use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
 use super::matcher::{DataWindow, DiscoveryFilter};
-use super::sample_rows::{HistSampleRow, MultiHistSampleRow, MultiSampleRow, SampleRow};
+use super::sample_rows::{
+    HistSampleRow, MultiHistSampleRow, MultiSampleRow, MultiUnionSampleRow, SampleRow,
+    UnionSampleRow,
+};
 use super::sample_sql;
 use crate::compile::fold::Pred;
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -153,8 +156,8 @@ pub struct MetricsConfig {
     /// distributed`] — `true` iff `Config::cluster` is configured
     /// (`pulsus-server`'s `metrics_config_from`). Gates
     /// `distributed_product_mode='local'` on the `SqlFallback` sample
-    /// fetches only ([`fallback_fetch_settings`]); every other dispatch
-    /// keeps [`metrics_read_settings`] unchanged.
+    /// fetch and the series and label reads ([`series_read_settings`]);
+    /// the `Chunks`/`Multi` sample fetches keep [`metrics_read_settings`].
     pub distributed: bool,
     /// Issue #398: `reader.promql_read_max_memory_bytes` — the
     /// `max_memory_usage` ceiling (throw-not-spill) every metrics read
@@ -815,13 +818,6 @@ impl MetricsEngine {
                             });
                         }
                     }
-                    let hist_sqls = build_hist_chunk_sqls(
-                        &self.config.hist_samples_table,
-                        metric_name,
-                        fps.clone(),
-                        lower_excl,
-                        upper_incl,
-                    );
                     let sqls = build_chunk_sqls(
                         &self.config.samples_table,
                         &self.config.hist_samples_table,
@@ -848,15 +844,8 @@ impl MetricsEngine {
                         // M7-A5a: the complementary histogram read appears in
                         // the explain trace beside the float read (built once,
                         // synchronously — never drifts from what executes).
-                        if let Some(first) = hist_sqls.first() {
-                            e.push("hist_sample_fetch", first.clone(), None);
-                        }
                     }
-                    SelectorFetchPlan::Chunks {
-                        sqls,
-                        hist_sqls,
-                        labels_by_fp,
-                    }
+                    SelectorFetchPlan::Chunks { sqls, labels_by_fp }
                 }
                 LabelledResolution::SqlFallback { sql, .. } => {
                     if explain.is_some() {
@@ -878,20 +867,11 @@ impl MetricsEngine {
                         lower_excl,
                         upper_incl,
                     );
-                    let hist_sql = sample_sql::hist_sample_fetch_subquery(
-                        &self.config.hist_samples_table,
-                        metric_name,
-                        &sql,
-                        lower_excl,
-                        upper_incl,
-                    );
                     if let Some(e) = explain.as_mut() {
                         e.push("sample_fetch", fetch_sql.clone(), None);
-                        e.push("hist_sample_fetch", hist_sql.clone(), None);
                     }
                     SelectorFetchPlan::Fallback {
                         sql: fetch_sql,
-                        hist_sql,
                         // Issue #82 (retroactive re-review, Finding 1):
                         // the degraded-path cap probe, built now (a pure
                         // function of the already-computed series-
@@ -1146,16 +1126,8 @@ impl MetricsEngine {
             lower_excl,
             upper_incl,
         );
-        let hist_sql = sample_sql::hist_sample_fetch_multi(
-            &self.config.hist_samples_table,
-            &names,
-            &sql_literals(&fps),
-            lower_excl,
-            upper_incl,
-        );
         if let Some(e) = explain.as_mut() {
             e.push("sample_fetch", sql.clone(), None);
-            e.push("hist_sample_fetch", hist_sql.clone(), None);
         }
         // Issue #548: the fan-out's own predicate, built only under the
         // explain header.
@@ -1169,7 +1141,6 @@ impl MetricsEngine {
         Ok((
             SelectorFetchPlan::Multi {
                 sql,
-                hist_sql,
                 labels_by,
                 labels_by_fp,
             },
@@ -1206,43 +1177,33 @@ impl MetricsEngine {
         };
         match fetch_plan {
             SelectorFetchPlan::Empty => Ok(Vec::new()),
-            SelectorFetchPlan::Chunks {
-                sqls,
-                hist_sqls,
-                labels_by_fp,
-            } => {
-                if sqls.is_empty() && hist_sqls.is_empty() {
+            SelectorFetchPlan::Chunks { sqls, labels_by_fp } => {
+                if sqls.is_empty() {
                     return Ok(Vec::new());
                 }
                 let metric_name = concrete_name(sel)?;
-                // M7-A5a: dispatch the float and complementary histogram
-                // chunk reads CONCURRENTLY (A1 v5 latency-hiding — the
-                // single-type complementary read is zero-granule but must
-                // not add a serial round trip).
-                let (rows, hist_rows) = fetch_dual_concurrently(
-                    fetch_all_concurrently(sqls, |sql| {
-                        self.fetch_sample_rows::<SampleRow>(sql, budget)
-                    }),
-                    fetch_all_concurrently(hist_sqls, |sql| {
-                        self.fetch_sample_rows::<HistSampleRow>(sql, budget)
-                    }),
-                )
+                // Issue #623: each chunk is one statement over both sample
+                // tables; its rows split back into the float and histogram
+                // streams the merge takes.
+                let rows = fetch_all_concurrently(sqls, |sql| {
+                    self.fetch_sample_rows::<UnionSampleRow>(sql, budget)
+                })
                 .await?;
+                let (rows, hist_rows) = UnionSampleRow::split(rows);
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
             }
             SelectorFetchPlan::Fallback {
                 sql,
-                hist_sql,
                 info_series_probe,
             } => {
                 // Issue #82 (retroactive re-review, Finding 1): run the
                 // bounded cardinality probe FIRST and reject over-cap
-                // BEFORE `sql`/`hist_sql` (the real, unbounded sample
+                // BEFORE `sql` (the real, unbounded sample
                 // fetch) ever executes — bounded before materialization,
                 // not a post-fetch backstop.
                 if let Some(probe_sql) = info_series_probe {
                     let cap = self.config.max_info_series;
-                    let rows: Vec<FingerprintOnlyRow> = self.fetch_rows(probe_sql).await?;
+                    let rows: Vec<FingerprintOnlyRow> = self.fetch_series_rows(probe_sql).await?;
                     if rows.len() as u64 > cap {
                         return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
                             matched: rows.len(),
@@ -1256,18 +1217,15 @@ impl MetricsEngine {
                 // double-distributed IN, rejected at analysis time under
                 // ClickHouse's default `distributed_product_mode='deny'`
                 // (Code 288) on a clustered `_dist` table set —
-                // `fallback_fetch_settings` injects the exact `'local'`
+                // `series_read_settings` injects the exact `'local'`
                 // rewrite ONLY here (never a blanket client-wide default).
-                let settings = fallback_fetch_settings(
+                let settings = series_read_settings(
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
                 );
-                let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
-                    fetch_dual_concurrently(
-                        self.fetch_rows_with(sql, &settings, Some(budget)),
-                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
-                    )
-                    .await?;
+                let rows: Vec<UnionSampleRow> =
+                    self.fetch_rows_with(sql, &settings, Some(budget)).await?;
+                let (rows, hist_rows) = UnionSampleRow::split(rows);
                 if rows.is_empty() && hist_rows.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1282,8 +1240,7 @@ impl MetricsEngine {
                 fps.sort_unstable();
                 fps.dedup();
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
-                    &self.config.series_table,
-                    metric_name,
+                    &self.config.labels_table,
                     &sql_literals(&fps),
                 );
                 let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
@@ -1300,16 +1257,11 @@ impl MetricsEngine {
             }
             SelectorFetchPlan::Multi {
                 sql,
-                hist_sql,
                 labels_by,
                 labels_by_fp,
             } => {
-                let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
-                    fetch_dual_concurrently(
-                        self.fetch_sample_rows(sql, budget),
-                        self.fetch_sample_rows(hist_sql, budget),
-                    )
-                    .await?;
+                let rows: Vec<MultiUnionSampleRow> = self.fetch_sample_rows(sql, budget).await?;
+                let (rows, hist_rows) = MultiUnionSampleRow::split(rows);
                 group_merged_multi_rows(rows, hist_rows, &labels_by, &labels_by_fp)
             }
         }
@@ -1364,8 +1316,9 @@ impl MetricsEngine {
     }
 
     /// [`Self::fetch_rows_with`] under the standard [`metrics_read_settings`]
-    /// — every dispatch except the `SqlFallback` sample fetches (issue
-    /// #136), which instead carry [`fallback_fetch_settings`]. Never
+    /// — every dispatch except the `SqlFallback` sample fetch (issue #136)
+    /// and the series reads that nest the label table
+    /// ([`Self::fetch_series_rows`]), which carry [`series_read_settings`]. Never
     /// charges the sample budget (issue #138): this is the probe/
     /// hydration/discovery dispatch — sample fetches go through
     /// [`Self::fetch_sample_rows`] (or `fetch_rows_with` with
@@ -1379,11 +1332,23 @@ impl MetricsEngine {
         .await
     }
 
+    /// [`Self::fetch_rows`] for a series read that nests the label table
+    /// (issue #623): the discovery reads and the `info()` cardinality probe
+    /// carry [`series_read_settings`]. Never charges the sample budget.
+    async fn fetch_series_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
+        self.fetch_rows_with(
+            sql,
+            &series_read_settings(self.config.read_max_memory_bytes, self.config.distributed),
+            None,
+        )
+        .await
+    }
+
     /// Issue #138: [`Self::fetch_rows_with`] under the standard
     /// [`metrics_read_settings`], charging `budget` per drained row — the
     /// Chunks and Multi sample dispatches' fetch. The `SqlFallback` sample
     /// dispatches call `fetch_rows_with` directly (they carry
-    /// [`fallback_fetch_settings`]) with `Some(budget)`.
+    /// [`series_read_settings`]) with `Some(budget)`.
     async fn fetch_sample_rows<R: ChRow>(
         &self,
         sql: String,
@@ -1493,7 +1458,7 @@ impl MetricsEngine {
         // Wave 2: fetch every (direct + probe-derived) query concurrently.
         let fetches = fetch_sqls
             .into_iter()
-            .map(|sql| self.fetch_rows::<super::rows::SeriesRow>(sql));
+            .map(|sql| self.fetch_series_rows::<super::rows::SeriesRow>(sql));
         let results: Vec<Result<Vec<super::rows::SeriesRow>, ReadError>> = join_all(fetches).await;
         let mut seen: std::collections::HashSet<(String, Fingerprint)> =
             std::collections::HashSet::new();
@@ -1783,7 +1748,7 @@ impl MetricsEngine {
         let narrow = async {
             let fetches = narrow_sqls
                 .into_iter()
-                .map(|sql| self.fetch_rows::<super::rows::MetricNameRow>(sql));
+                .map(|sql| self.fetch_series_rows::<super::rows::MetricNameRow>(sql));
             join_all(fetches).await
         };
         let wide_series = async {
@@ -1940,25 +1905,29 @@ fn metrics_read_settings(read_max_memory_bytes: u64) -> QuerySettings {
 /// read's blocks (issue #549).
 const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 
-/// The `SqlFallback` sample-fetch settings (issue #136): [`metrics_read_settings`]
-/// plus, when clustered, `distributed_product_mode='local'`. The fallback
-/// fetch's `FROM metric_samples*_dist … WHERE fingerprint IN (SELECT … FROM
-/// metric_series*_dist …)` shape is a double-distributed IN, rejected at
-/// analysis time under ClickHouse's default `distributed_product_mode=
-/// 'deny'` (Code 288, `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`) — deterministic
-/// 500s on a clustered deployment. `local` is exact here (not merely
-/// permissive): `metric_samples` and `metric_series` are both Metrics-family
-/// tables sharded on the identical `cityHash64(metric_name, fingerprint)`
-/// key (docs/schemas.md §7), so a sample row's series row is always
-/// shard-local and shard-local `IN` decides identically to global `IN` —
-/// the same precedent already applied to the traces metrics semi-join
-/// (`crate::traces::exec::metrics_settings`, issue #59). Applied ONLY to
-/// the two fallback dispatches
-/// ([`MetricsEngine::execute_fetch_plan`]'s `Fallback` arm) — a blanket
-/// client-wide default would let a future non-co-sharded subquery silently
-/// return wrong shard-local results instead of failing loud.
-fn fallback_fetch_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
-    let base = metrics_read_settings(read_max_memory_bytes);
+/// The settings of every read that nests one metrics table inside another
+/// (issues #136, #623): [`metrics_read_settings`] plus, when clustered,
+/// `distributed_product_mode='local'`. Those are the `SqlFallback` sample
+/// fetch (`metric_samples*_dist` over a `metric_series*_dist` sub-query) and
+/// every series read that filters on or returns labels
+/// (`metric_series*_dist` beside a `metric_labels*_dist` sub-query or join).
+/// A double-distributed shape is rejected at analysis time under
+/// ClickHouse's default `distributed_product_mode='deny'` (Code 288,
+/// `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+///
+/// `local` is exact here (not merely permissive): one kind-2 landing row
+/// writes a series' activity row and its label row on the node that received
+/// the push, and that node's samples beside them, so the rows one shard-local
+/// read pairs are the rows that belong together — the same precedent already
+/// applied to the traces metrics semi-join (`crate::traces::exec::
+/// metrics_settings`, issue #59). Not applied to the `Chunks`/`Multi` sample
+/// fetches, which nest nothing — a blanket client-wide default would let a
+/// future non-co-located subquery silently return wrong shard-local results
+/// instead of failing loud.
+fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
+    // The label join's build side is one row per label set; the plain hash
+    // join, for `refresh::sweep_settings`' reason.
+    let base = metrics_read_settings(read_max_memory_bytes).set("join_algorithm", "hash");
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -2073,27 +2042,22 @@ struct ProbeSpec {
 /// in phase 2 without re-deriving anything.
 enum SelectorFetchPlan {
     /// Cache-hit path: one `sample_fetch` SQL string per chunk (already
-    /// ascending-fingerprint-sorted — see [`build_chunk_sqls`]), plus the
-    /// paired complementary `metric_hist_samples` chunk SQLs (M7-A5a
-    /// dual-read — same chunker/window/PK-prune, order-locked to `sqls`),
-    /// plus the labels the cache already resolved.
+    /// ascending-fingerprint-sorted — see [`build_chunk_sqls`]), each one
+    /// statement over both sample tables (issue #623), plus the labels the
+    /// cache already resolved.
     Chunks {
         sqls: Vec<String>,
-        hist_sqls: Vec<String>,
         labels_by_fp: HashMap<Fingerprint, LabelSet>,
     },
     /// `SqlFallback` path: the single nested-subquery `sample_fetch` SQL
-    /// and its paired complementary `metric_hist_samples` subquery fetch
-    /// (M7-A5a) — labels are hydrated afterward from the UNION of
-    /// fingerprints both reads return (a histogram-only fingerprint must
-    /// still hydrate labels).
+    /// over both sample tables — labels are hydrated afterward from every
+    /// fingerprint it returns, float or histogram.
     Fallback {
         sql: String,
-        hist_sql: String,
         /// Issue #82 (retroactive re-review, Finding 1): `Some` only for
         /// an `info_family` selector — the `LIMIT cap+1`-bounded
         /// series-selection probe [`MetricsEngine::execute_fetch_plan`]
-        /// runs and counts BEFORE issuing `sql`/`hist_sql`, so an
+        /// runs and counts BEFORE issuing `sql`, so an
         /// over-cap `*_info` fetch never materializes a single sample
         /// row. `None` for an ordinary selector, which always fetches
         /// the complete (unbounded) result.
@@ -2110,7 +2074,6 @@ enum SelectorFetchPlan {
     /// empty — see [`group_multi_rows`].
     Multi {
         sql: String,
-        hist_sql: String,
         labels_by: HashMap<(String, Fingerprint), LabelSet>,
         labels_by_fp: HashMap<Fingerprint, LabelSet>,
     },
@@ -2320,34 +2283,6 @@ fn build_grouped_sqls(
     out
 }
 
-/// [`build_chunk_sqls`]'s M7-A5a histogram counterpart — same sort, same
-/// chunker (`CHUNK_THRESHOLD`), same window; only the SELECT column list
-/// and table name differ ([`sample_sql::hist_sample_fetch`]). Rendered over
-/// the SAME fingerprint set so the paired chunk SQLs are index-aligned
-/// (both prune the identical granules; the complementary read is zero-
-/// granule for a pure-float fingerprint — the EXPLAIN gate).
-fn build_hist_chunk_sqls(
-    hist_samples_table: &str,
-    metric_name: &str,
-    mut fps: Vec<Fingerprint>,
-    lower_excl_ms: i64,
-    upper_incl_ms: i64,
-) -> Vec<String> {
-    fps.sort_unstable();
-    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
-        .into_iter()
-        .map(|chunk| {
-            sample_sql::hist_sample_fetch(
-                hist_samples_table,
-                metric_name,
-                chunk,
-                lower_excl_ms,
-                upper_incl_ms,
-            )
-        })
-        .collect()
-}
-
 /// Fetches every already-built SQL string concurrently via `join_all`,
 /// concatenating results in **dispatch order** — `join_all` returns
 /// results in **input order**, regardless of which future actually
@@ -2367,24 +2302,6 @@ where
         rows.extend(r?);
     }
     Ok(rows)
-}
-
-/// M7-A5a: dispatches the float and complementary histogram reads
-/// CONCURRENTLY and returns both results, mirroring the injectable
-/// [`fetch_all_concurrently`] seam. Both futures are handed to
-/// [`futures::future::join`], so both are in flight before either is
-/// awaited — the A1 v5 latency-hiding contract (a single-type series' zero-
-/// granule complementary read must not add a serial round trip). The
-/// AC7b rendezvous-mock gate (`fetch_dual_concurrently_dispatches_both_*`)
-/// proves the two are simultaneously in flight: a serial dispatch would
-/// deadlock the two-sided barrier and trip the `tokio::time::timeout`.
-async fn fetch_dual_concurrently<FF, HF, T, U>(float: FF, hist: HF) -> Result<(T, U), ReadError>
-where
-    FF: Future<Output = Result<T, ReadError>>,
-    HF: Future<Output = Result<U, ReadError>>,
-{
-    let (float_res, hist_res) = futures::future::join(float, hist).await;
-    Ok((float_res?, hist_res?))
 }
 
 /// Decodes a `metric_hist_samples` row's value columns into a
@@ -3251,11 +3168,11 @@ mod tests {
         );
         // The `SqlFallback` variant layers on top and must keep both.
         for distributed in [false, true] {
-            let f = fallback_fetch_settings(TEST_READ_MEM, distributed);
+            let f = series_read_settings(TEST_READ_MEM, distributed);
             assert_eq!(
                 f.get("max_memory_usage"),
                 Some(TEST_READ_MEM.to_string().as_str()),
-                "fallback_fetch_settings(distributed={distributed}) must carry the ceiling"
+                "series_read_settings(distributed={distributed}) must carry the ceiling"
             );
             assert_eq!(f.get("max_bytes_before_external_group_by"), Some("0"));
         }
@@ -3275,6 +3192,10 @@ mod tests {
             Some(TEST_READ_MEM.to_string().as_str())
         );
         assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
+        // Issue #623: the label side nests the series read, and the join
+        // is the plain hash join.
+        assert_eq!(s.get("distributed_product_mode"), Some("local"));
+        assert_eq!(s.get("join_algorithm"), Some("hash"));
     }
 
     #[test]
@@ -3343,9 +3264,8 @@ mod tests {
     // --- Issue #136: SqlFallback settings gate the local product mode ---
 
     #[test]
-    fn fallback_fetch_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered()
-    {
-        let unclustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, false));
+    fn series_read_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered() {
+        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false));
         assert!(
             unclustered.contains("max_query_size"),
             "missing max_query_size in {unclustered}"
@@ -3357,8 +3277,8 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fetch_settings_adds_the_local_product_mode_when_clustered() {
-        let clustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, true));
+    fn series_read_settings_adds_the_local_product_mode_when_clustered() {
+        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true));
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
@@ -3386,7 +3306,7 @@ mod tests {
         );
         assert_eq!(sqls.len(), 1);
         assert!(
-            sqls[0].contains("IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))"),
+            sqls[0].starts_with("WITH [toUInt128('1'), toUInt128('2'), toUInt128('3')] AS fps"),
             "got: {}",
             sqls[0]
         );
@@ -4578,130 +4498,6 @@ mod tests {
         let merged = group_merged_rows(float.clone(), Vec::new(), &labels, "m").unwrap();
         let plain = group_rows(float, &labels, "m");
         assert_eq!(merged, plain);
-    }
-
-    // -- AC7b: fetch_dual_concurrently dispatches both fetches concurrently.
-    //    A two-sided rendezvous (tokio Barrier) completes ONLY if both
-    //    futures are in flight at once; a serial dispatch deadlocks it and
-    //    trips the timeout.
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac7b_chunks_dispatches_float_and_hist_concurrently() {
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::sync::Barrier;
-        let barrier = Arc::new(Barrier::new(2));
-        let (bf, bh) = (barrier.clone(), barrier.clone());
-        let float_fut = fetch_all_concurrently(vec!["f".to_string()], move |_| {
-            let b = bf.clone();
-            async move {
-                b.wait().await;
-                Ok(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
-            }
-        });
-        let hist_fut = fetch_all_concurrently(vec!["h".to_string()], move |_| {
-            let b = bh.clone();
-            async move {
-                b.wait().await;
-                Ok(Vec::<HistSampleRow>::new())
-            }
-        });
-        let out = tokio::time::timeout(
-            Duration::from_secs(5),
-            fetch_dual_concurrently(float_fut, hist_fut),
-        )
-        .await
-        .expect("both fetches must be in flight simultaneously (serial dispatch deadlocks)")
-        .unwrap();
-        assert_eq!(out.0.len(), 1);
-        assert!(out.1.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac7b_fallback_dispatches_float_and_hist_concurrently() {
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::sync::Barrier;
-        let barrier = Arc::new(Barrier::new(2));
-        let (bf, bh) = (barrier.clone(), barrier.clone());
-        let float_fut = async move {
-            bf.wait().await;
-            Ok::<_, ReadError>(vec![float_row(Fingerprint::from_raw(1), 0, 1.0)])
-        };
-        let hist_fut = async move {
-            bh.wait().await;
-            Ok::<_, ReadError>(vec![hist_row(
-                Fingerprint::from_raw(1),
-                5,
-                &single_histogram(),
-            )])
-        };
-        let out = tokio::time::timeout(
-            Duration::from_secs(5),
-            fetch_dual_concurrently(float_fut, hist_fut),
-        )
-        .await
-        .expect("serial dispatch would deadlock the rendezvous")
-        .unwrap();
-        assert_eq!(out.0.len(), 1);
-        assert_eq!(out.1.len(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac7b_multi_dispatches_float_and_hist_concurrently() {
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::sync::Barrier;
-        let barrier = Arc::new(Barrier::new(2));
-        let (bf, bh) = (barrier.clone(), barrier.clone());
-        let float_fut = async move {
-            bf.wait().await;
-            Ok::<_, ReadError>(Vec::<MultiSampleRow>::new())
-        };
-        let hist_fut = async move {
-            bh.wait().await;
-            Ok::<_, ReadError>(Vec::<MultiHistSampleRow>::new())
-        };
-        let out = tokio::time::timeout(
-            Duration::from_secs(5),
-            fetch_dual_concurrently(float_fut, hist_fut),
-        )
-        .await
-        .expect("serial dispatch would deadlock the rendezvous")
-        .unwrap();
-        assert!(out.0.is_empty());
-        assert!(out.1.is_empty());
-    }
-
-    /// The failure-mode proof: a SERIAL dispatch (await the float future to
-    /// completion before starting the histogram future) never reaches the
-    /// rendezvous's second party and times out — the exact regression the
-    /// concurrent `fetch_dual_concurrently` prevents.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac7b_serial_dispatch_deadlocks_the_rendezvous() {
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::sync::Barrier;
-        let barrier = Arc::new(Barrier::new(2));
-        let (bf, bh) = (barrier.clone(), barrier.clone());
-        let float_fut = async move {
-            bf.wait().await;
-            Ok::<(), ReadError>(())
-        };
-        let hist_fut = async move {
-            bh.wait().await;
-            Ok::<(), ReadError>(())
-        };
-        let serial = async move {
-            float_fut.await?;
-            hist_fut.await?;
-            Ok::<(), ReadError>(())
-        };
-        let res = tokio::time::timeout(Duration::from_millis(300), serial).await;
-        assert!(
-            res.is_err(),
-            "serial dispatch must time out — the barrier's second party never arrives"
-        );
     }
 
     // -- M7-A5b-i: histogram-valued API results now ENCODE (VectorHist/

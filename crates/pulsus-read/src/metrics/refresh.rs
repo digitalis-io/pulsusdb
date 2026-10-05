@@ -1,7 +1,7 @@
 //! The only ClickHouse-touching code in this module: the docs/architecture.md
-//! §5.2 sweep (`SELECT fingerprint, metric_name, labels FROM metric_series
-//! WHERE unix_milli >= floor(now - window) ORDER BY unix_milli DESC LIMIT 1
-//! BY metric_name, fingerprint`), building a whole new
+//! §5.2 sweep (every `(metric_name, fingerprint)` in `metric_series` since
+//! `floor(now - window)`, joined to its label set in `metric_labels` —
+//! [`super::sql::sweep_query`]), building a whole new
 //! [`super::labels::CacheSnapshot`] and atomically swapping it into the
 //! resident [`super::labels::LabelCache`]. [`spawn_refresh_loop`] runs this
 //! on an interval in the self-healing shape of
@@ -23,13 +23,12 @@ use tokio::task::JoinHandle;
 use super::labels::{CacheSnapshot, LabelCache};
 use super::rows::SeriesRow;
 
-/// Renders the §5.2 sweep SQL: `unix_milli >= floor(now - window)`, no
-/// upper bound (the sweep always runs "as of now"). Pure so it is
-/// snapshot-testable without a clock/DB.
-fn sweep_sql(series_table: &str, _labels_table: &str, lower_bound_ms: i64) -> String {
-    format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
-    )
+/// Renders the §5.2 sweep SQL ([`super::sql::sweep_query`]): every series
+/// active since `floor(now - window)`, with its labels, no upper bound (the
+/// sweep always runs "as of now"). Pure so it is snapshot-testable without a
+/// clock/DB.
+fn sweep_sql(series_table: &str, labels_table: &str, lower_bound_ms: i64) -> String {
+    super::sql::sweep_query(series_table, labels_table, lower_bound_ms)
 }
 
 /// Wall-clock now, milliseconds since the Unix epoch. `SystemTime::now()`
@@ -154,10 +153,27 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 /// throw-not-spill pair `metrics::exec::metrics_read_settings` sets. A
 /// free function so the decision is provable without a ClickHouse
 /// connection (the `read_query_settings`/`probe_fanout_bound` precedent).
+///
+/// **`distributed_product_mode = 'local'`, always** (issue #623). Clustered,
+/// the label side reads `metric_labels*_dist` for the fingerprints a nested
+/// `metric_series*_dist` read names, which the default `'deny'` refuses.
+/// `'local'` is exact: one kind-2 row writes a series' activity row and its
+/// label row on the same node, so each shard's labels cover each shard's
+/// series. Single-node there is no `Distributed` table and the setting
+/// changes nothing.
+///
+/// **`join_algorithm = 'hash'`** (issue #623): the label join's build side
+/// is one row per label set. Left to the server's default the join became
+/// `parallel_hash`, which reserved about 42 MiB before reading a row — a
+/// ten-series sweep failed a 4 MiB ceiling that the plain hash join meets
+/// (measured on 26.3.29.7), and the reservation grows with the thread
+/// count, so a ceiling would not mean the same on two machines.
 pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+        .set("distributed_product_mode", "local")
+        .set("join_algorithm", "hash")
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
