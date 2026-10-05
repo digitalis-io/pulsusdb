@@ -86,27 +86,19 @@ pub fn subquery_predicate(subquery: &str) -> String {
     format!("fingerprint IN (\n{subquery}\n  )")
 }
 
-/// The 13 `metric_hist_samples` value columns, order-locked to the table's
-/// `CREATE` and [`super::sample_rows::UnionSampleRow`].
-const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
+/// The type of the one column a histogram row's 13 value columns travel in:
+/// an array of one tuple, order-locked to `metric_hist_samples`' `CREATE`
+/// and [`super::sample_rows::HistColumnsTuple`]. A float row carries the
+/// empty array.
+const HIST_TYPE: &str = "Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), \
+     Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), \
+     UInt8))";
+
+/// A histogram row's 13 value columns, as the one tuple [`HIST_TYPE`] holds.
+const HIST_TUPLE: &str = "tuple(schema, zero_threshold, zero_count, count, sum, \
      pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
-     counter_reset_hint";
-
-/// The same 13 columns as a float row carries them: each at its empty value,
-/// cast to the histogram column's own type so the two branches of the union
-/// agree.
-const FLOAT_HIST_DEFAULTS: &str = "CAST(0, 'Int8') AS schema, \
-     CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, \
-     CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, \
-     CAST([], 'Array(Int32)') AS pos_span_offsets, \
-     CAST([], 'Array(UInt32)') AS pos_span_lengths, \
-     CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
-     CAST([], 'Array(Int32)') AS neg_span_offsets, \
-     CAST([], 'Array(UInt32)') AS neg_span_lengths, \
-     CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
-     CAST([], 'Array(Float64)') AS custom_values, \
-     CAST(0, 'UInt8') AS counter_reset_hint";
+     counter_reset_hint)";
 
 /// **One statement over both sample tables** (issue #623): the float rows
 /// and the histogram rows under one selection, `UNION ALL`, in one order.
@@ -115,10 +107,17 @@ const FLOAT_HIST_DEFAULTS: &str = "CAST(0, 'Int8') AS schema, \
 /// grouped read (`super::grouped_sql`) already reads both tables this way.
 ///
 /// Each branch carries the same `PREWHERE` and `WHERE`, so each prunes on
-/// its own table's primary key as the two statements did. `is_hist` says
-/// which table a row came from; the caller splits the rows back into the
-/// two streams the merge has always taken, so a key present in both tables
-/// is answered as before.
+/// its own table's primary key as the two statements did. The caller splits
+/// the rows back into the two streams the merge has always taken, so a key
+/// present in both tables is answered as before.
+///
+/// **The histogram columns travel as one column, `hist`, placed before
+/// `value`**: an empty array on a float row, one tuple on a histogram row.
+/// Measured over 144,000 float samples on 26.3.29.7, compressed as the
+/// client receives them: the separate float read 1,414,713 bytes; this form
+/// 1,412,651; the 13 columns written out flat, empty on a float row,
+/// 1,642,805. Where the extra byte sits matters too: after `value` it cost
+/// 1,553,278.
 ///
 /// **A resolved fingerprint list is written once**, as `WITH [...] AS fps`,
 /// and each branch tests `fingerprint IN fps` — the grouped read's form.
@@ -137,15 +136,15 @@ fn union_fetch(
     order: &str,
 ) -> String {
     format!(
-        "{with}SELECT {lead}unix_milli, is_hist, value, {HIST_VALUE_COLUMNS}\n\
+        "{with}SELECT {lead}unix_milli, hist, value\n\
          FROM (\n\
-         \x20 SELECT {lead}unix_milli, CAST(0, 'UInt8') AS is_hist, value, {FLOAT_HIST_DEFAULTS}\n\
+         \x20 SELECT {lead}unix_milli, CAST([], '{HIST_TYPE}') AS hist, value\n\
          \x20 FROM {samples_table}\n\
          \x20 PREWHERE {prewhere}\n\
          \x20 WHERE {selection}\n\
          \x20 UNION ALL\n\
-         \x20 SELECT {lead}unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, \
-         {HIST_VALUE_COLUMNS}\n\
+         \x20 SELECT {lead}unix_milli, CAST([{HIST_TUPLE}], '{HIST_TYPE}') AS hist, \
+         CAST(0, 'Float64') AS value\n\
          \x20 FROM {hist_table}\n\
          \x20 PREWHERE {prewhere}\n\
          \x20 WHERE {selection}\n\
@@ -455,10 +454,10 @@ mod tests {
 
     // -- issue #623: one statement reads both sample tables ------------
 
-    /// **The concrete-name fetch is one statement over both tables.** The
-    /// float branch fills the histogram columns with their empty values and
-    /// the histogram branch fills `value` with zero; `is_hist` says which
-    /// table a row came from. The order is the one both fetches had.
+    /// **The concrete-name fetch is one statement over both tables.** A
+    /// float row carries an empty `hist`; a histogram row carries its
+    /// columns as the one element of `hist` and a zero `value`. The order
+    /// is the one both fetches had.
     #[test]
     fn sample_fetch_reads_both_tables_in_one_statement() {
         let sql = sample_fetch(
@@ -469,39 +468,32 @@ mod tests {
             1_000,
             2_000,
         );
+        let hist_type = "Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), \
+                         Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), \
+                         Array(Int64), Array(Float64), UInt8))";
         assert_eq!(
             sql,
-            "WITH [toUInt128('101'), toUInt128('205')] AS fps\n\
-             SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, \
-             count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
-             neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
-             FROM (\n\
-             \x20 SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, \
-             CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, \
-             CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, \
-             CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, \
-             CAST([], 'Array(UInt32)') AS pos_span_lengths, \
-             CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
-             CAST([], 'Array(Int32)') AS neg_span_offsets, \
-             CAST([], 'Array(UInt32)') AS neg_span_lengths, \
-             CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
-             CAST([], 'Array(Float64)') AS custom_values, \
-             CAST(0, 'UInt8') AS counter_reset_hint\n\
-             \x20 FROM metric_samples\n\
-             \x20 PREWHERE metric_name = 'http_requests_total'\n\
-             \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20   AND fingerprint IN fps\n\
-             \x20 UNION ALL\n\
-             \x20 SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, \
-             CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, \
-             pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
-             neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
-             \x20 FROM metric_hist_samples\n\
-             \x20 PREWHERE metric_name = 'http_requests_total'\n\
-             \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20   AND fingerprint IN fps\n\
-             )\n\
-             ORDER BY fingerprint, unix_milli"
+            format!(
+                "WITH [toUInt128('101'), toUInt128('205')] AS fps\n\
+                 SELECT fingerprint, unix_milli, hist, value\n\
+                 FROM (\n\
+                 \x20 SELECT fingerprint, unix_milli, CAST([], '{hist_type}') AS hist, value\n\
+                 \x20 FROM metric_samples\n\
+                 \x20 PREWHERE metric_name = 'http_requests_total'\n\
+                 \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 \x20   AND fingerprint IN fps\n\
+                 \x20 UNION ALL\n\
+                 \x20 SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, \
+                 zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                 neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
+                 counter_reset_hint)], '{hist_type}') AS hist, CAST(0, 'Float64') AS value\n\
+                 \x20 FROM metric_hist_samples\n\
+                 \x20 PREWHERE metric_name = 'http_requests_total'\n\
+                 \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 \x20   AND fingerprint IN fps\n\
+                 )\n\
+                 ORDER BY fingerprint, unix_milli"
+            )
         );
     }
 
@@ -550,7 +542,7 @@ mod tests {
         }
         assert!(
             multi.starts_with(
-                "WITH [toUInt128('1')] AS fps\nSELECT metric_name, fingerprint, unix_milli, is_hist, value,"
+                "WITH [toUInt128('1')] AS fps\nSELECT metric_name, fingerprint, unix_milli, hist, value\n"
             ),
             "{multi}"
         );

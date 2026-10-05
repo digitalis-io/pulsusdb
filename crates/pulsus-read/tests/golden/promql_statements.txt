@@ -2,17 +2,17 @@
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[000] offset=00000251 len=001562
+-- statement[000] offset=00000251 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -24,17 +24,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[001] offset=00002071 len=001562
+-- statement[001] offset=00001670 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -47,7 +47,7 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Max gids=[0, 1, 0]
--- statement[002] offset=00003937 len=002746
+-- statement[002] offset=00003135 len=002746
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
@@ -109,7 +109,7 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Min gids=[0, 1, 0]
--- statement[003] offset=00006994 len=002746
+-- statement[003] offset=00006192 len=002746
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
@@ -171,7 +171,7 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Count gids=[0, 1, 0]
--- statement[004] offset=00010035 len=002405
+-- statement[004] offset=00009233 len=002405
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
@@ -230,7 +230,7 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Group gids=[0, 1, 0]
--- statement[005] offset=00012735 len=002399
+-- statement[005] offset=00011933 len=002399
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
@@ -288,17 +288,17 @@ ORDER BY gid, gi_start
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[006] offset=00015396 len=001562
+-- statement[006] offset=00014594 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -310,17 +310,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[007] offset=00017230 len=001562
+-- statement[007] offset=00016027 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -332,17 +332,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[008] offset=00019066 len=001562
+-- statement[008] offset=00017462 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -354,17 +354,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[009] offset=00020906 len=001562
+-- statement[009] offset=00018901 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -376,17 +376,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[010] offset=00022765 len=001562
+-- statement[010] offset=00020359 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -398,17 +398,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[011] offset=00024591 len=001562
+-- statement[011] offset=00021784 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -420,17 +420,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[012] offset=00026414 len=001562
+-- statement[012] offset=00023206 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -442,17 +442,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782907200000]
--- statement[013] offset=00028236 len=001562
+-- statement[013] offset=00024627 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782907200000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782907200000
@@ -464,17 +464,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[014] offset=00030066 len=001562
+-- statement[014] offset=00026056 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
@@ -486,17 +486,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[015] offset=00031914 len=001562
+-- statement[015] offset=00027503 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
@@ -508,17 +508,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=60000 window=(1782906840000, 1782928800000]
--- statement[016] offset=00033752 len=001562
+-- statement[016] offset=00028940 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906840000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906840000 AND unix_milli <= 1782928800000
@@ -530,17 +530,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=600000 window=(1782906300000, 1782928800000]
--- statement[017] offset=00035602 len=001562
+-- statement[017] offset=00030389 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906300000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906300000 AND unix_milli <= 1782928800000
@@ -552,17 +552,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782903000000, 1782925200000]
--- statement[018] offset=00037451 len=001562
+-- statement[018] offset=00031837 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782903000000 AND unix_milli <= 1782925200000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782903000000 AND unix_milli <= 1782925200000
@@ -574,17 +574,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782899400000, 1782900000000]
--- statement[019] offset=00039303 len=001562
+-- statement[019] offset=00033288 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782899400000 AND unix_milli <= 1782900000000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782899400000 AND unix_milli <= 1782900000000
@@ -596,17 +596,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906600000, 1782928800000]
--- statement[020] offset=00041131 len=001562
+-- statement[020] offset=00034715 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
@@ -618,17 +618,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782907200000]
--- statement[021] offset=00042951 len=001562
+-- statement[021] offset=00036134 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782907200000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782907200000
@@ -652,17 +652,17 @@ selectors 0
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[022] offset=00045046 len=001562
+-- statement[022] offset=00037828 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -670,17 +670,17 @@ FROM (
 )
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=target_info range_ms=- window=(1782906900000, 1782928800000]
--- statement[023] offset=00046735 len=001546
+-- statement[023] offset=00039116 len=001145
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'target_info'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'target_info'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -692,17 +692,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[024] offset=00048607 len=001562
+-- statement[024] offset=00040587 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
@@ -710,17 +710,17 @@ FROM (
 )
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=http_errors_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[025] offset=00050307 len=001558
+-- statement[025] offset=00041886 len=001157
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_errors_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_errors_total'
   WHERE unix_milli > 1782906600000 AND unix_milli <= 1782928800000
@@ -732,17 +732,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[026] offset=00052156 len=001562
+-- statement[026] offset=00043334 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -750,17 +750,17 @@ FROM (
 )
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[027] offset=00053853 len=001562
+-- statement[027] offset=00044630 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -772,17 +772,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[028] offset=00055674 len=001562
+-- statement[028] offset=00046050 len=001161
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
@@ -794,17 +794,17 @@ ORDER BY fingerprint, unix_milli
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=<none> range_ms=- window=(1782906900000, 1782928800000]
--- statement[029] offset=00057477 len=001662
+-- statement[029] offset=00047452 len=001261
 WITH [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps
-SELECT metric_name, fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+SELECT metric_name, fingerprint, unix_milli, hist, value
 FROM (
-  SELECT metric_name, fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, CAST([], 'Array(UInt32)') AS pos_span_lengths, CAST([], 'Array(Int64)') AS pos_bucket_deltas, CAST([], 'Array(Int32)') AS neg_span_offsets, CAST([], 'Array(UInt32)') AS neg_span_lengths, CAST([], 'Array(Int64)') AS neg_bucket_deltas, CAST([], 'Array(Float64)') AS custom_values, CAST(0, 'UInt8') AS counter_reset_hint
+  SELECT metric_name, fingerprint, unix_milli, CAST([], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name IN ('http_requests_total', 'http_errors_total')
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000
     AND fingerprint IN fps
   UNION ALL
-  SELECT metric_name, fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
+  SELECT metric_name, fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint)], 'Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name IN ('http_requests_total', 'http_errors_total')
   WHERE unix_milli > 1782906900000 AND unix_milli <= 1782928800000

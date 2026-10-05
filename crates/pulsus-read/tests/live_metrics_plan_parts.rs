@@ -116,6 +116,11 @@ const EXCLUDED_NAME: &str = "{__name__=\"up\",__name__=\"down\"}";
 /// The thirteen histogram value columns, in the catalogue's own order,
 /// written out here rather than read from `sample_sql` — this file is the
 /// second producer of the statement text.
+/// The type of the one column a histogram row travels in (issue #623).
+const HIST_TYPE: &str = "Array(Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), \
+     Array(UInt32), Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), \
+     UInt8))";
+
 const HIST_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
      pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
@@ -433,26 +438,16 @@ impl Harness {
         let upper = p.end_ms;
         format!(
             "WITH [{fps}] AS fps\n\
-             SELECT fingerprint, unix_milli, is_hist, value, {HIST_COLUMNS}\n\
+             SELECT fingerprint, unix_milli, hist, value\n\
              FROM (\n\
-             \x20 SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, \
-             CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, \
-             CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, \
-             CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, \
-             CAST([], 'Array(UInt32)') AS pos_span_lengths, \
-             CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
-             CAST([], 'Array(Int32)') AS neg_span_offsets, \
-             CAST([], 'Array(UInt32)') AS neg_span_lengths, \
-             CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
-             CAST([], 'Array(Float64)') AS custom_values, \
-             CAST(0, 'UInt8') AS counter_reset_hint\n\
+             \x20 SELECT fingerprint, unix_milli, CAST([], '{HIST_TYPE}') AS hist, value\n\
              \x20 FROM metric_samples\n\
              \x20 PREWHERE metric_name = '{metric}'\n\
              \x20 WHERE unix_milli > {lower} AND unix_milli <= {upper}\n\
              \x20   AND fingerprint IN fps\n\
              \x20 UNION ALL\n\
-             \x20 SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, \
-             CAST(0, 'Float64') AS value, {HIST_COLUMNS}\n\
+             \x20 SELECT fingerprint, unix_milli, CAST([tuple({HIST_COLUMNS})], '{HIST_TYPE}') \
+             AS hist, CAST(0, 'Float64') AS value\n\
              \x20 FROM metric_hist_samples\n\
              \x20 PREWHERE metric_name = '{metric}'\n\
              \x20 WHERE unix_milli > {lower} AND unix_milli <= {upper}\n\

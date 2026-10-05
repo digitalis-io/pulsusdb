@@ -623,7 +623,10 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         ),
     )
     .await;
-    assert!(rows.iter().all(|r| r.is_hist == 1), "the histogram branch");
+    assert!(
+        rows.iter().all(|r| r.hist.len() == 1),
+        "the histogram branch"
+    );
     assert_the_four_boundary_values(
         "UnionSampleRow",
         both(rows.into_iter().map(|r| r.fingerprint).collect()),

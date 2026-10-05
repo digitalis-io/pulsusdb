@@ -198,26 +198,26 @@ GROUP BY metric_name, fingerprint, ts;
 **`rate(http_requests_total{job="api", status=~"5.."}[5m])`, 24h window, 60s step.** The label cache resolves both matchers (regex included) in-process → sorted fingerprints. One fetch:
 
 ```sql
-SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, ..., counter_reset_hint
+WITH [toUInt128('101'), toUInt128('205'), toUInt128('990'), ...] AS fps
+SELECT fingerprint, unix_milli, hist, value
 FROM (
-  SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value,
-         CAST(0, 'Int8') AS schema, ...    -- the histogram columns at their empty values
+  SELECT fingerprint, unix_milli, CAST([], 'Array(Tuple(...))') AS hist, value
   FROM metric_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli >  {start - 300000 - lookback} AND unix_milli <= {end}
-    AND fingerprint IN (101, 205, 990, ...)
+    AND fingerprint IN fps
   UNION ALL
-  SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, CAST(0, 'Float64') AS value,
-         schema, zero_threshold, ..., counter_reset_hint
+  SELECT fingerprint, unix_milli, CAST([tuple(schema, zero_threshold, ..., counter_reset_hint)],
+         'Array(Tuple(...))') AS hist, CAST(0, 'Float64') AS value
   FROM metric_hist_samples
   PREWHERE metric_name = 'http_requests_total'
   WHERE unix_milli >  {start - 300000 - lookback} AND unix_milli <= {end}
-    AND fingerprint IN (101, 205, 990, ...)
+    AND fingerprint IN fps
 )
 ORDER BY fingerprint, unix_milli
 ```
 
-**One statement reads both sample tables** (issue #623). Each branch carries the same selection and prunes on its own table's key; the reader splits the rows on `is_hist` into the float and histogram streams the merge has always taken, so a key present in both tables is answered as before. It replaces a second statement every selector sent to `metric_hist_samples` — on a single-host demo 15,674 of them in three days, returning one row between them.
+**One statement reads both sample tables** (issue #623). Each branch carries the same selection and prunes on its own table's key, and the fingerprint list is written once. A histogram row's columns travel as the one element of `hist`, empty on a float row, placed before `value` — the form that costs a float read no compressed bytes (`crates/pulsus-read/src/metrics/sample_sql.rs` carries the measurement). The reader splits the rows on `hist` into the float and histogram streams the merge has always taken, so a key present in both tables is answered as before. It replaces a second statement every selector sent to `metric_hist_samples` — on a single-host demo 15,674 of them in three days, returning one row between them.
 
 Partition pruning (daily) → primary-index pruning (metric, then fingerprints) → sequential per-series reads. Evaluation (extrapolation, resets, staleness) happens in the engine, series-first — **for every query but the four below**. Fingerprint lists ≥ 500 split into parallel chunk fetches; selectors matching more than `PULSUS_CACHE_MAX_SERIES` fall back to:
 

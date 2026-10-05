@@ -136,7 +136,7 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 /// as issue #623 moved them.
 const ENTRIES: usize = 30;
 const LINES: usize = 814;
-const BYTES: usize = 59_141;
+const BYTES: usize = 48_715;
 /// The statements the writer's markers declare. Sixty before issue #549,
 /// fifty-six after it; since issue #623 every entry sends ONE statement.
 const STATEMENTS: usize = 30;

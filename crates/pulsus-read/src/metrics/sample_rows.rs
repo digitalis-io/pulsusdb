@@ -138,31 +138,63 @@ impl MultiHistSampleRow {
     }
 }
 
+/// A histogram row's 13 value columns as the one-statement fetch carries
+/// them (issue #623, [`super::sample_sql::sample_fetch`]): the tuple in
+/// `metric_hist_samples`' column order.
+pub type HistColumnsTuple = (
+    i8,
+    f64,
+    u64,
+    u64,
+    f64,
+    Vec<i32>,
+    Vec<u32>,
+    Vec<i64>,
+    Vec<i32>,
+    Vec<u32>,
+    Vec<i64>,
+    Vec<f64>,
+    u8,
+);
+
 /// One row of the one-statement fetch over both sample tables (issue #623,
 /// [`super::sample_sql::sample_fetch`] /
-/// [`super::sample_sql::sample_fetch_subquery`]): a float row carries
-/// `is_hist = 0`, its `value` and the histogram columns' empty values; a
-/// histogram row carries `is_hist = 1`, `value = 0` and its own columns.
-/// [`Self::split`] hands the merge the two streams it had before.
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+/// [`super::sample_sql::sample_fetch_subquery`]): a float row carries its
+/// `value` and an empty `hist`; a histogram row carries `value = 0` and its
+/// columns as the one element of `hist`. [`Self::split`] hands the merge the
+/// two streams it had before.
+/// No `Debug` or `Clone`: a 13-element tuple has neither.
+#[derive(Row, Serialize, Deserialize)]
 pub struct UnionSampleRow {
     pub fingerprint: Fingerprint,
     pub unix_milli: i64,
-    pub is_hist: u8,
+    pub hist: Vec<HistColumnsTuple>,
     pub value: f64,
-    pub schema: i8,
-    pub zero_threshold: f64,
-    pub zero_count: u64,
-    pub count: u64,
-    pub sum: f64,
-    pub pos_span_offsets: Vec<i32>,
-    pub pos_span_lengths: Vec<u32>,
-    pub pos_bucket_deltas: Vec<i64>,
-    pub neg_span_offsets: Vec<i32>,
-    pub neg_span_lengths: Vec<u32>,
-    pub neg_bucket_deltas: Vec<i64>,
-    pub custom_values: Vec<f64>,
-    pub counter_reset_hint: u8,
+}
+
+/// The histogram row `h` stands for, at `(fingerprint, unix_milli)`.
+fn hist_sample_row(
+    fingerprint: Fingerprint,
+    unix_milli: i64,
+    h: HistColumnsTuple,
+) -> HistSampleRow {
+    HistSampleRow {
+        fingerprint,
+        unix_milli,
+        schema: h.0,
+        zero_threshold: h.1,
+        zero_count: h.2,
+        count: h.3,
+        sum: h.4,
+        pos_span_offsets: h.5,
+        pos_span_lengths: h.6,
+        pos_bucket_deltas: h.7,
+        neg_span_offsets: h.8,
+        neg_span_lengths: h.9,
+        neg_bucket_deltas: h.10,
+        custom_values: h.11,
+        counter_reset_hint: h.12,
+    }
 }
 
 impl UnionSampleRow {
@@ -172,30 +204,13 @@ impl UnionSampleRow {
         let mut float = Vec::new();
         let mut hist = Vec::new();
         for r in rows {
-            if r.is_hist == 0 {
-                float.push(SampleRow {
+            match r.hist.into_iter().next() {
+                Some(h) => hist.push(hist_sample_row(r.fingerprint, r.unix_milli, h)),
+                None => float.push(SampleRow {
                     fingerprint: r.fingerprint,
                     unix_milli: r.unix_milli,
                     value: r.value,
-                });
-            } else {
-                hist.push(HistSampleRow {
-                    fingerprint: r.fingerprint,
-                    unix_milli: r.unix_milli,
-                    schema: r.schema,
-                    zero_threshold: r.zero_threshold,
-                    zero_count: r.zero_count,
-                    count: r.count,
-                    sum: r.sum,
-                    pos_span_offsets: r.pos_span_offsets,
-                    pos_span_lengths: r.pos_span_lengths,
-                    pos_bucket_deltas: r.pos_bucket_deltas,
-                    neg_span_offsets: r.neg_span_offsets,
-                    neg_span_lengths: r.neg_span_lengths,
-                    neg_bucket_deltas: r.neg_bucket_deltas,
-                    custom_values: r.custom_values,
-                    counter_reset_hint: r.counter_reset_hint,
-                });
+                }),
             }
         }
         (float, hist)
@@ -205,26 +220,14 @@ impl UnionSampleRow {
 /// [`UnionSampleRow`] for the multi-metric fan-out
 /// ([`super::sample_sql::sample_fetch_multi`]), with a leading
 /// `metric_name`.
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+/// No `Debug` or `Clone`: a 13-element tuple has neither.
+#[derive(Row, Serialize, Deserialize)]
 pub struct MultiUnionSampleRow {
     pub metric_name: String,
     pub fingerprint: Fingerprint,
     pub unix_milli: i64,
-    pub is_hist: u8,
+    pub hist: Vec<HistColumnsTuple>,
     pub value: f64,
-    pub schema: i8,
-    pub zero_threshold: f64,
-    pub zero_count: u64,
-    pub count: u64,
-    pub sum: f64,
-    pub pos_span_offsets: Vec<i32>,
-    pub pos_span_lengths: Vec<u32>,
-    pub pos_bucket_deltas: Vec<i64>,
-    pub neg_span_offsets: Vec<i32>,
-    pub neg_span_lengths: Vec<u32>,
-    pub neg_bucket_deltas: Vec<i64>,
-    pub custom_values: Vec<f64>,
-    pub counter_reset_hint: u8,
 }
 
 impl MultiUnionSampleRow {
@@ -235,32 +238,34 @@ impl MultiUnionSampleRow {
         let mut float = Vec::new();
         let mut hist = Vec::new();
         for r in rows {
-            if r.is_hist == 0 {
-                float.push(MultiSampleRow {
+            match r.hist.into_iter().next() {
+                Some(h) => {
+                    let row = hist_sample_row(r.fingerprint, r.unix_milli, h);
+                    hist.push(MultiHistSampleRow {
+                        metric_name: r.metric_name,
+                        fingerprint: row.fingerprint,
+                        unix_milli: row.unix_milli,
+                        schema: row.schema,
+                        zero_threshold: row.zero_threshold,
+                        zero_count: row.zero_count,
+                        count: row.count,
+                        sum: row.sum,
+                        pos_span_offsets: row.pos_span_offsets,
+                        pos_span_lengths: row.pos_span_lengths,
+                        pos_bucket_deltas: row.pos_bucket_deltas,
+                        neg_span_offsets: row.neg_span_offsets,
+                        neg_span_lengths: row.neg_span_lengths,
+                        neg_bucket_deltas: row.neg_bucket_deltas,
+                        custom_values: row.custom_values,
+                        counter_reset_hint: row.counter_reset_hint,
+                    });
+                }
+                None => float.push(MultiSampleRow {
                     metric_name: r.metric_name,
                     fingerprint: r.fingerprint,
                     unix_milli: r.unix_milli,
                     value: r.value,
-                });
-            } else {
-                hist.push(MultiHistSampleRow {
-                    metric_name: r.metric_name,
-                    fingerprint: r.fingerprint,
-                    unix_milli: r.unix_milli,
-                    schema: r.schema,
-                    zero_threshold: r.zero_threshold,
-                    zero_count: r.zero_count,
-                    count: r.count,
-                    sum: r.sum,
-                    pos_span_offsets: r.pos_span_offsets,
-                    pos_span_lengths: r.pos_span_lengths,
-                    pos_bucket_deltas: r.pos_bucket_deltas,
-                    neg_span_offsets: r.neg_span_offsets,
-                    neg_span_lengths: r.neg_span_lengths,
-                    neg_bucket_deltas: r.neg_bucket_deltas,
-                    custom_values: r.custom_values,
-                    counter_reset_hint: r.counter_reset_hint,
-                });
+                }),
             }
         }
         (float, hist)

@@ -1893,7 +1893,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     assert!(
         fetch_stage
             .sql
-            .contains("SELECT fingerprint, unix_milli, is_hist, value"),
+            .contains("SELECT fingerprint, unix_milli, hist, value"),
         "expected real sample_fetch SQL, got: {}",
         fetch_stage.sql
     );
