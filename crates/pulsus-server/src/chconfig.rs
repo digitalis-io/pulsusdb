@@ -812,6 +812,7 @@ mod tests {
         let config = Config::default();
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series");
+        assert_eq!(cfg.labels_table, "metric_labels");
     }
 
     #[test]
@@ -822,6 +823,7 @@ mod tests {
         };
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series_dist");
+        assert_eq!(cfg.labels_table, "metric_labels_dist");
     }
 
     #[test]
@@ -830,6 +832,7 @@ mod tests {
         let cfg = metrics_config_from(&config);
         assert_eq!(cfg.samples_table, "metric_samples");
         assert_eq!(cfg.series_table, "metric_series");
+        assert_eq!(cfg.labels_table, "metric_labels");
         assert_eq!(cfg.metadata_table, "metric_metadata");
         assert!(!cfg.distributed);
     }
@@ -843,6 +846,7 @@ mod tests {
         let cfg = metrics_config_from(&config);
         assert_eq!(cfg.samples_table, "metric_samples_dist");
         assert_eq!(cfg.series_table, "metric_series_dist");
+        assert_eq!(cfg.labels_table, "metric_labels_dist");
         assert_eq!(
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"

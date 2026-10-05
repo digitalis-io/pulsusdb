@@ -96,9 +96,9 @@ pub struct LabelCacheConfig {
 #[derive(Debug, Default)]
 pub struct CacheSnapshot {
     pub(crate) by_fingerprint: HashMap<Fingerprint, LabelSet>,
-    /// Values are sorted, deduped fingerprint lists — a consequence of the
-    /// sweep's `LIMIT 1 BY metric_name, fingerprint` dedup, re-sorted after
-    /// the sweep completes (see [`super::refresh`]).
+    /// Values are sorted, deduped fingerprint lists — the sweep returns one
+    /// row per `(metric_name, fingerprint)`, re-sorted after the sweep
+    /// completes (see [`super::refresh`]).
     pub(crate) by_metric: HashMap<String, Vec<Fingerprint>>,
     /// The sweep's own `now_ms` (wall-clock milliseconds since the Unix
     /// epoch, [`super::refresh::now_unix_ms`]) — meaningless (`0`) only for

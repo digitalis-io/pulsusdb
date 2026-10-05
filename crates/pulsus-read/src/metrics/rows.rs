@@ -6,9 +6,10 @@ use pulsus_clickhouse::Row;
 use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
-/// One `metric_series` row from the §5.2 sweep (`SELECT fingerprint,
-/// metric_name, labels FROM metric_series WHERE ... ORDER BY unix_milli
-/// DESC LIMIT 1 BY metric_name, fingerprint`, docs/architecture.md §5.2).
+/// One series from the §5.2 sweep and the discovery reads: a
+/// `(metric_name, fingerprint)` of `metric_series` with the label set
+/// `metric_labels` holds for the fingerprint (issue #623,
+/// [`super::sql::sweep_query`], docs/architecture.md §5.2).
 /// `labels` is the canonical JSON string the writer produced
 /// (`LabelSet::to_canonical_json`) — parsed into a `LabelSet` by
 /// [`super::refresh`], not here (this module only owns the wire shape).

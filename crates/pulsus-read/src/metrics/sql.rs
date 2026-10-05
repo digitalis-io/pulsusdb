@@ -177,7 +177,7 @@ pub fn info_series_cardinality_probe(series_subquery_sql: &str, cap: u64) -> Str
 }
 
 /// The standalone, deduplicated `fingerprint, labels` form — docs/schemas.md
-/// §2.1's `LIMIT 1 BY metric_name, fingerprint` lookup SQL. Used by the
+/// §2.1's lookup SQL, one row per series. Used by the
 /// live differential test (a materialized comparison set against the
 /// in-process resolution) and by any caller wanting the historical labels
 /// themselves rather than an `IN (...)` sub-query.
@@ -289,9 +289,9 @@ fn discovery_from_where(
 /// exactly the series [`discovery_query`] would have returned, for the SAME
 /// `filter`/`window`/`bucket_ms`.
 ///
-/// **Why the answer is unchanged.** [`discovery_query`]'s `LIMIT 1 BY
-/// metric_name, fingerprint` yields one row per `(metric_name, fingerprint)`
-/// of its `WHERE`, and the distinct `metric_name` projection of that set
+/// **Why the answer is unchanged.** [`discovery_query`] yields one row per
+/// `(metric_name, fingerprint)` of its `WHERE` that has a label set, and the
+/// distinct `metric_name` projection of that set
 /// *is* the distinct `metric_name` set of the same `WHERE`. The two share
 /// [`discovery_from_where`], so "the same `WHERE`" is a property of the
 /// code, not of a comment.
@@ -307,12 +307,12 @@ fn discovery_from_where(
 /// preliminary one into `DistinctTransform` — both gated in
 /// `crates/pulsus-read/tests/explain_indexes.rs`.
 ///
-/// **`labels` is dropped from the projection, which is not the same as
-/// never being read.** With no `match[]` — the discovery client's actual
-/// first call — there are no matcher conjuncts, so `labels` is not
-/// referenced at all and the column is genuinely not touched. With label
-/// matchers the `WHERE` renders them as `JSONExtractString(labels, '<key>')`
-/// predicates, so `labels` **is** read to evaluate the filter; the win
+/// **The label table is dropped from the statement, which is not the same
+/// as never being read.** With no `match[]` — the discovery client's actual
+/// first call — there are no matcher conjuncts, so `metric_labels` is not
+/// referenced at all. With label matchers the `WHERE` renders them as a
+/// `metric_labels` sub-query (issue #623), so the label sets **are** read to
+/// evaluate the filter; the win
 /// there is transport and parse count (rows collapse from one-per-series to
 /// one-per-metric-name, and `parse_canonical_label_set` is not called at all),
 /// not bytes read.
@@ -352,8 +352,8 @@ pub fn discovery_distinct_names_query(
 /// `name_matchers`, and `metric_fingerprint` excludes `__name__`
 /// (docs/schemas.md §2.1) so a fingerprint's label set is name-invariant —
 /// every `(metric_name, fingerprint)` cross-pair naming a real series is a
-/// genuine match. `LIMIT 1 BY metric_name, fingerprint` dedups to one row
-/// per series, as in [`discovery_query`].
+/// genuine match. One row per series, with its label set, as in
+/// [`discovery_query`].
 pub fn discovery_fetch_multi(
     series_table: &str,
     labels_table: &str,

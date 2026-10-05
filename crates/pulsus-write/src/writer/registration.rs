@@ -10,8 +10,9 @@
 //! O(1) `contains`/`insert`/eviction via an intrusive doubly-linked list
 //! over a slab (`Vec<Slot>`), indexed by a `HashMap<K, usize>`. A false miss
 //! is always harmless here (architect plan amendment 1): it just re-emits a
-//! registration row that either `ReplacingMergeTree` (`log_streams`) or a
-//! read-time `LIMIT 1 BY` (`metric_series`, docs/schemas.md §2.1) collapses,
+//! registration row that either `ReplacingMergeTree` (`log_streams`) or the
+//! read's distinct `(metric_name, fingerprint)` (`metric_series`,
+//! docs/schemas.md §2.1) collapses,
 //! so this cache trades a little redundant writing for a simple,
 //! well-understood eviction policy — never correctness. Optimistic
 //! promotion is deliberately NOT implemented: `insert` is called only after
