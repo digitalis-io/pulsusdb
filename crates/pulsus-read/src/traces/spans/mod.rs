@@ -9,7 +9,11 @@
 //!   complete-predicate read for a bucket set that may have truncated,
 //!   and the window fallback;
 //! * [`rows`] — the three result-row shapes, the four nested element
-//!   tuples, the route enum and the request window.
+//!   tuples, the route enum and the request window;
+//! * [`predicate`] — the span-scope predicate compiler (issue #588): one
+//!   TraceQL leaf to one ClickHouse boolean over a `spans` row, and the
+//!   one place a window and a predicate compose.
 
 pub mod fetch;
+pub mod predicate;
 pub mod rows;

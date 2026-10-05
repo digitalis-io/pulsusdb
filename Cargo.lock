@@ -1781,6 +1781,7 @@ dependencies = [
  "chrono-tz",
  "clickhouse",
  "futures",
+ "opentelemetry-proto",
  "proc-macro2",
  "pulsus-clickhouse",
  "pulsus-config",

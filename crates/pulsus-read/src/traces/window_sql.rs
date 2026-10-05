@@ -243,6 +243,31 @@ impl WindowSql {
         self.time_clause_on("start_ns")
     }
 
+    /// The span table's daily-partition bound (issue #588), the SECOND
+    /// production delegation to [`date_clause_on`] —
+    /// [`WindowSql::date_clause`] is the first.
+    ///
+    /// The expression is byte-identical to `spans`' own `PARTITION BY`
+    /// (`schema/schema.sql`), **including the explicit `'UTC'`**: a bare
+    /// `toDate(fromUnixTimestamp64Nano(start_ns))` is a different
+    /// expression and the partition prune is lost. Measured with
+    /// `EXPLAIN indexes = 1` on 26.3.29.7, the `Partition` stage's
+    /// `Condition` reads `and((toDate(fromUnixTimestamp64Nano(start_ns),
+    /// 'UTC') in (-Inf, 20718]), (… in [20718, +Inf)))` with the zone and
+    /// `true` without it.
+    ///
+    /// **No part saving is claimed for it.** On that table
+    /// `intDiv(start_ns, 300000000000)` leads the sorting key and had
+    /// already cut three parts to one, so the day clause pruned no
+    /// additional part. It is kept because `docs/TraceQL/sql-schema.md`
+    /// puts the day bound under the one-value rule and
+    /// [`super::spans::fetch`] writes the same expression out.
+    ///
+    /// [`date_clause_on`]: WindowSql::date_clause_on
+    pub fn span_day_clause(self) -> String {
+        self.date_clause_on("toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')")
+    }
+
     /// The resource table's `day` partition bound (issue #587), from this
     /// window's own two nanoseconds. [`resources_day_bound`] is the text.
     pub fn resources_day_clause(self) -> String {

@@ -647,6 +647,7 @@ docs/query-lowering.md	exec.rs:709	ambiguous_basename
 docs/query-lowering.md	labels.rs:318	ambiguous_basename
 docs/query-lowering.md	labels.rs:328	ambiguous_basename
 docs/query-lowering.md	logql/compile.rs:314-317	no_name_the_target_file_holds
+docs/query-lowering.md	logql/predicate.rs:93	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:111	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:562	no_name_the_target_file_holds
 docs/query-lowering.md	metrics_sql.rs:951	no_name_the_target_file_holds
@@ -667,7 +668,6 @@ docs/query-lowering.md	plan.rs:2328	ambiguous_basename
 docs/query-lowering.md	plan.rs:3388	ambiguous_basename
 docs/query-lowering.md	plan.rs:3393	ambiguous_basename
 docs/query-lowering.md	plan.rs:3402	ambiguous_basename
-docs/query-lowering.md	predicate.rs:93	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2439	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2464	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2483	no_name_the_target_file_holds
@@ -765,9 +765,9 @@ docs/query-to-sql.md	docs/query-lowering.md:829-830	no_name_the_target_file_hold
 docs/query-to-sql.md	docs/query-lowering.md:854-860	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:100	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:101	no_name_the_target_file_holds
-docs/query-to-sql.md	escape.rs:139-149	no_name_the_target_file_holds
-docs/query-to-sql.md	escape.rs:151-156	no_name_the_target_file_holds
-docs/query-to-sql.md	escape.rs:156-163	no_name_the_target_file_holds
+docs/query-to-sql.md	escape.rs:155-165	no_name_the_target_file_holds
+docs/query-to-sql.md	escape.rs:167-172	no_name_the_target_file_holds
+docs/query-to-sql.md	escape.rs:172-179	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:51-67	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:93	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:93-105	no_name_the_target_file_holds
@@ -790,6 +790,9 @@ docs/query-to-sql.md	logql/charge.rs:1296	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/error.rs:809-815	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:121	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1266	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:501	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:501-520	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:522	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/window.rs:148	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_plan.rs:398	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_sql.rs:1036	no_name_the_target_file_holds
@@ -832,9 +835,6 @@ docs/query-to-sql.md	plan.rs:2695	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3750	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3779	ambiguous_basename
 docs/query-to-sql.md	predicate.rs:1939	no_name_the_target_file_holds
-docs/query-to-sql.md	predicate.rs:501	no_name_the_target_file_holds
-docs/query-to-sql.md	predicate.rs:501-520	no_name_the_target_file_holds
-docs/query-to-sql.md	predicate.rs:522	no_name_the_target_file_holds
 docs/query-to-sql.md	predicate.rs:947	no_name_the_target_file_holds
 docs/query-to-sql.md	predicate.rs:951	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-config/src/model.rs:510	no_name_the_target_file_holds

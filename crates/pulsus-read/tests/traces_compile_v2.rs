@@ -251,3 +251,565 @@ fn every_request_window_renders_the_one_half_open_bound() {
         wrong.join("\n\n")
     );
 }
+
+// =====================================================================
+// Issue #588 — the span-scope predicate compiler, text only
+// =====================================================================
+//
+// Hermetic. What a leaf and a membership statement RENDER; the answers
+// those renderings give live in `tests/traces_query_v2_live.rs`, and the
+// two halves meet at `T-C4`, which freezes the exact statement that suite
+// issues.
+//
+// `T-C7` is not a case here: it is the existing `golden_sql_freeze` suite,
+// run unchanged. `PINNED_SQL_CORPUS` must not move — this change adds a
+// `WindowSql` method and edits no existing method body, so `search_sql`
+// and `metrics_sql` cannot render different text.
+
+use pulsus_read::traces::PlanError;
+use pulsus_read::traces::spans::predicate::{
+    compile_span_leaf, compile_span_predicate, span_membership_sql,
+};
+use pulsus_read::traces::window_sql::WindowSql;
+use pulsus_traceql::{
+    AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, SpansetExpr, SpansetFilter, Value,
+};
+
+/// The `T-B1` window: `[start, end)` one nanosecond wide, so all three
+/// clauses are rendered from one instant and the day and bucket bounds are
+/// each a single value.
+const T_B1_START: i64 = 1_790_094_846_486_853_636;
+const T_B1_END: i64 = 1_790_094_846_486_853_637;
+
+fn t_b1_window() -> WindowSql {
+    WindowSql::start_closed_end_open(T_B1_START, T_B1_END)
+}
+
+/// The filter body of a one-spanset query.
+fn filter_body(query: &str) -> FieldExpr {
+    let parsed =
+        pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+    match parsed.spanset {
+        SpansetExpr::Filter(SpansetFilter { body: Some(b) }) => b,
+        other => panic!("{query}: expected one filter with a body, got {other}"),
+    }
+}
+
+/// The predicate text `query` compiles to.
+fn rendered(query: &str) -> String {
+    compile_span_predicate(&filter_body(query))
+        .unwrap_or_else(|e| panic!("{query} must compile: {e}"))
+        .sql()
+        .to_string()
+}
+
+/// The error `query` is refused with.
+fn refusal(query: &str) -> PlanError {
+    match compile_span_predicate(&filter_body(query)) {
+        Err(e) => e,
+        Ok(p) => panic!("{query} must be refused, it compiled to `{}`", p.sql()),
+    }
+}
+
+fn attr(key: &str) -> Field {
+    Field::Attribute {
+        scope: AttrScope::Span,
+        key: key.to_string(),
+    }
+}
+
+/// A `Value::Duration`, taken from a parsed query — `Duration::from_nanos`
+/// is crate-private, so the parser is the only constructor a test has.
+fn duration_value(query: &str) -> Value {
+    match filter_body(query) {
+        FieldExpr::Binary { rhs, .. } => match *rhs {
+            FieldExpr::Literal(v @ Value::Duration(_)) => v,
+            other => panic!("{query}: expected a duration literal, got {other}"),
+        },
+        other => panic!("{query}: expected a comparison, got {other}"),
+    }
+}
+
+fn leaf_text(field: &Field, op: ComparisonOp, value: &Value) -> String {
+    compile_span_leaf(field, op, value)
+        .unwrap_or_else(|e| panic!("{field} {op} {value} must compile: {e}"))
+        .sql()
+        .to_string()
+}
+
+// ---------------------------------------------------------------------
+// the operator set, for the two generated matrices
+// ---------------------------------------------------------------------
+
+/// Every `ComparisonOp` the language has. **The compile gate is
+/// [`op_is_ordered`]**, whose `match` has no wildcard arm: a ninth variant
+/// fails to compile until it is classified. This array is the iteration
+/// order and `the_four_ordered_operators_are_a_complement` checks the two
+/// classes partition it.
+const ALL_OPS: [ComparisonOp; 8] = [
+    ComparisonOp::Eq,
+    ComparisonOp::Neq,
+    ComparisonOp::Gt,
+    ComparisonOp::Gte,
+    ComparisonOp::Lt,
+    ComparisonOp::Lte,
+    ComparisonOp::Re,
+    ComparisonOp::Nre,
+];
+
+/// **No wildcard arm**: a ninth `ComparisonOp` variant fails to compile
+/// here rather than being skipped by `T-C6b`.
+fn op_is_ordered(op: ComparisonOp) -> bool {
+    match op {
+        ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte => true,
+        ComparisonOp::Eq | ComparisonOp::Neq | ComparisonOp::Re | ComparisonOp::Nre => false,
+    }
+}
+
+/// The four ordered operators, as the COMPLEMENT of the four that are not
+/// — `pulsus_traceql` offers no constant for it, and a list written out
+/// here is how an earlier draft of this case used `>` twice and `<` not at
+/// all.
+fn ordered_ops() -> Vec<ComparisonOp> {
+    ALL_OPS
+        .into_iter()
+        .filter(|op| op_is_ordered(*op))
+        .collect()
+}
+
+#[test]
+fn the_four_ordered_operators_are_a_complement() {
+    for (i, a) in ALL_OPS.iter().enumerate() {
+        for b in &ALL_OPS[i + 1..] {
+            assert_ne!(a, b, "ALL_OPS lists an operator twice");
+        }
+    }
+    let not_ordered: Vec<ComparisonOp> = ALL_OPS
+        .into_iter()
+        .filter(|op| !op_is_ordered(*op))
+        .collect();
+    assert_eq!(
+        not_ordered,
+        vec![
+            ComparisonOp::Eq,
+            ComparisonOp::Neq,
+            ComparisonOp::Re,
+            ComparisonOp::Nre
+        ]
+    );
+    assert_eq!(ordered_ops().len() + not_ordered.len(), ALL_OPS.len());
+    assert_eq!(ordered_ops().len(), 4);
+}
+
+// ---------------------------------------------------------------------
+// T-C1 — the static keywords' digits, which do not go through `f64`
+// ---------------------------------------------------------------------
+
+/// `T-C1`: `maxInt` and `minInt` arrive as ordinary decimal literals and
+/// must render as their own digits. `render_num(parse_num("9223372036854775807"))`
+/// is `9223372036854776000` — one more than `2^63 - 1`, which ClickHouse
+/// types `UInt64` — so a rendering that goes through `f64` is visible in
+/// the text even where no answer distinguishes it (`minInt`'s case).
+#[test]
+fn t_c1_the_static_integer_keywords_render_their_own_digits() {
+    let max = rendered(r#"{ span.a < maxInt }"#);
+    assert_eq!(
+        max,
+        "(coalesce(attrs.`a`.:Int64 < 9223372036854775807, false) OR \
+         coalesce(attrs.`a`.:Float64 < 9223372036854775807, false))"
+    );
+    assert_eq!(
+        max.matches("9223372036854775807").count(),
+        2,
+        "the digit string appears once per typed variant: {max}"
+    );
+    let min = rendered(r#"{ span.a = minInt }"#);
+    assert_eq!(
+        min,
+        "(coalesce(attrs.`a`.:Int64 = -9223372036854775808, false) OR \
+         coalesce(attrs.`a`.:Float64 = -9223372036854775808, false))"
+    );
+    assert_eq!(
+        min.matches("-9223372036854775808").count(),
+        2,
+        "the digit string appears once per typed variant: {min}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C2 — the attribute path, twice escaped
+// ---------------------------------------------------------------------
+
+/// `T-C2`: the writer's own JSON-path escape, then the identifier quote.
+/// Neither is optional and the order is not free — escaping `%` first is
+/// what keeps the key spelled `a%2Eb` off the key `a.b`'s stored path.
+#[test]
+fn t_c2_the_attribute_path_carries_both_escapes() {
+    let dotted = leaf_text(
+        &attr("http.response.status_code"),
+        ComparisonOp::Eq,
+        &Value::Number("200".to_string()),
+    );
+    assert!(
+        dotted.contains("attrs.`http%2Eresponse%2Estatus_code`"),
+        "{dotted}"
+    );
+
+    // A client-chosen OTLP key becomes a SQL IDENTIFIER here for the first
+    // time. Unescaped, `attrs.`a`b`` is `Code: 62 ... Back quoted string is
+    // not closed`.
+    let backtick = leaf_text(
+        &attr("a`b"),
+        ComparisonOp::Eq,
+        &Value::Number("1".to_string()),
+    );
+    assert!(backtick.contains("attrs.`a\\`b`"), "{backtick}");
+
+    let escaped_percent = leaf_text(
+        &attr("a%2Eb"),
+        ComparisonOp::Eq,
+        &Value::Number("1".to_string()),
+    );
+    let dot_key = leaf_text(
+        &attr("a.b"),
+        ComparisonOp::Eq,
+        &Value::Number("1".to_string()),
+    );
+    assert!(
+        escaped_percent.contains("attrs.`a%252Eb`"),
+        "{escaped_percent}"
+    );
+    assert!(dot_key.contains("attrs.`a%2Eb`"), "{dot_key}");
+    assert_ne!(
+        escaped_percent, dot_key,
+        "the key `a%2Eb` and the key `a.b` must not share a stored path"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C3 / T-C4 — the window, and the one place it composes with a predicate
+// ---------------------------------------------------------------------
+
+/// `T-C3`: the three clauses the span table's read carries, each rendered
+/// from one `WindowSql`.
+///
+/// Two of them differ in shape from the issue's own text, and both
+/// differences are decisions already taken: the bucket bound divides
+/// **server-side** so the reader never reproduces `intDiv`'s rounding, and
+/// the day clause carries the explicit `'UTC'` that makes it
+/// byte-identical to `spans`' own `PARTITION BY` — without it the
+/// expression is a different one and the partition prune is lost.
+#[test]
+fn t_c3_the_span_tables_three_window_clauses() {
+    let w = t_b1_window();
+    assert_eq!(
+        w.span_time_clause(),
+        "start_ns >= 1790094846486853636 AND start_ns < 1790094846486853637"
+    );
+    assert_eq!(
+        w.span_bucket_clause(),
+        "intDiv(start_ns, 300000000000) BETWEEN intDiv(1790094846486853636, 300000000000) AND \
+         intDiv(1790094846486853636, 300000000000)"
+    );
+    assert_eq!(
+        w.span_day_clause(),
+        "toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND \
+         toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')"
+    );
+}
+
+/// `T-C4`: the whole membership statement, byte for byte — the ONE place a
+/// window and a predicate compose, so the text frozen here is the text the
+/// live suite ran.
+#[test]
+fn t_c4_the_membership_statement_is_frozen_whole() {
+    let predicate =
+        compile_span_predicate(&filter_body(r#"{ span.http.response.status_code != 200 }"#))
+            .expect("T-A1 compiles");
+    assert_eq!(
+        span_membership_sql("spans", t_b1_window(), &predicate),
+        "SELECT lower(hex(span_id)) AS id\n\
+         FROM spans\n\
+         WHERE start_ns >= 1790094846486853636 AND start_ns < 1790094846486853637\n\
+         \x20 AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790094846486853636, 300000000000) \
+         AND intDiv(1790094846486853636, 300000000000)\n\
+         \x20 AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND \
+         toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')\n\
+         \x20 AND (NOT (coalesce(attrs.`http%2Eresponse%2Estatus_code`.:Int64 = 200, false) OR \
+         coalesce(attrs.`http%2Eresponse%2Estatus_code`.:Float64 = 200, false)))\n\
+         ORDER BY id"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C5 — every out-of-scope construct refuses, naming itself
+// ---------------------------------------------------------------------
+
+/// The intrinsics part 1 serves. Every other `Intrinsic` variant is
+/// #589's or later and must REFUSE rather than compile something wrong.
+const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
+    Intrinsic::Name,
+    Intrinsic::Duration,
+    Intrinsic::Status,
+    Intrinsic::Kind,
+    Intrinsic::StatusMessage,
+    Intrinsic::SpanId,
+    Intrinsic::ParentId,
+    Intrinsic::TraceId,
+    Intrinsic::InstrumentationName,
+    Intrinsic::InstrumentationVersion,
+];
+
+/// `T-C5`: driven from `Intrinsic::ALL` and `AttrScope::ALL`, which the
+/// `enum_with_all!` macro generates from the same token list as the
+/// variants — so a new variant fails this test rather than being skipped.
+#[test]
+fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
+    let mut out_of_scope = 0usize;
+    for intrinsic in Intrinsic::ALL.iter().copied() {
+        let got = compile_span_leaf(
+            &Field::Intrinsic(intrinsic),
+            ComparisonOp::Eq,
+            &Value::String("x".to_string()),
+        );
+        if IN_SCOPE_INTRINSICS.contains(&intrinsic) {
+            assert!(
+                !matches!(got, Err(PlanError::UnsupportedField(_))),
+                "{intrinsic} is in scope for part 1 but refused as unsupported: {got:?}"
+            );
+            continue;
+        }
+        out_of_scope += 1;
+        match got {
+            Err(PlanError::UnsupportedField(msg)) => assert!(
+                msg.contains(&intrinsic.to_string()) && msg.contains("#589"),
+                "{intrinsic}: the refusal must name the construct and the issue, got {msg:?}"
+            ),
+            other => panic!("{intrinsic} must be UnsupportedField, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        out_of_scope + IN_SCOPE_INTRINSICS.len(),
+        Intrinsic::ALL.len(),
+        "every intrinsic is either in scope or refused — a new variant belongs in one list"
+    );
+
+    let mut out_of_scope_scopes = 0usize;
+    for scope in AttrScope::ALL.iter().copied() {
+        let got = compile_span_leaf(
+            &Field::Attribute {
+                scope,
+                key: "k".to_string(),
+            },
+            ComparisonOp::Eq,
+            &Value::String("x".to_string()),
+        );
+        if scope == AttrScope::Span {
+            assert!(got.is_ok(), "span. is part 1's scope: {got:?}");
+            continue;
+        }
+        out_of_scope_scopes += 1;
+        match got {
+            Err(PlanError::UnsupportedField(msg)) => assert!(
+                msg.contains(&format!("\"{scope}\"")) && msg.contains("#589"),
+                "{scope}: the refusal must name the scope and the issue, got {msg:?}"
+            ),
+            other => panic!("the {scope} scope must be UnsupportedField, got {other:?}"),
+        }
+    }
+    assert_eq!(out_of_scope_scopes + 1, AttrScope::ALL.len());
+
+    // The expression-level constructs section 6 defers, each naming itself.
+    for (query, token) in [
+        (r#"{ span.a + 1 = 2 }"#, "arithmetic"),
+        (r#"{ span.a = span.b }"#, "field-against-field"),
+        (r#"{ span.a = 1 && span.b = 2 }"#, "&&"),
+        (r#"{ span.a = 1 || span.b = 2 }"#, "||"),
+        (r#"{ !(span.a = 1) }"#, "!"),
+    ] {
+        match refusal(query) {
+            PlanError::UnsupportedField(msg) => assert!(
+                msg.contains(token) && msg.contains("#589"),
+                "{query}: the refusal must name {token:?} and the issue, got {msg:?}"
+            ),
+            other => panic!("{query} must be UnsupportedField, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C6 / T-C6b — the refusals that are kept
+// ---------------------------------------------------------------------
+
+/// `T-C6`: the fixed refusals, each message compared byte for byte against
+/// `filter.rs`'s own text — so `{ span.k = error }` is the same `400` on
+/// both compilers.
+///
+/// `{ duration =~ "x" }` takes the OPERAND message, not the operator one:
+/// `filter.rs` checks the value before the operator and this compiler
+/// keeps that order, which is what makes the two byte-identical. The
+/// operator message is reachable only with a duration operand, asserted
+/// below through the leaf.
+#[test]
+fn t_c6_the_fixed_refusals_keep_their_messages() {
+    for (query, message) in [
+        (
+            r#"{ duration > 100 }"#,
+            "duration requires a duration literal",
+        ),
+        (
+            r#"{ duration =~ "x" }"#,
+            "duration requires a duration literal",
+        ),
+        (r#"{ name = 5 }"#, "name requires a string value"),
+        (r#"{ status > ok }"#, "status supports only = and !="),
+        (r#"{ kind > internal }"#, "kind supports only = and !="),
+        (
+            r#"{ span.k > true }"#,
+            "attribute \"k\" does not support operator > on this value type",
+        ),
+        (
+            r#"{ span.k = error }"#,
+            "attribute \"k\" does not support operator = on this value type",
+        ),
+    ] {
+        assert_eq!(
+            refusal(query),
+            PlanError::TypeMismatch(message.to_string()),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        compile_span_leaf(
+            &Field::Intrinsic(Intrinsic::Duration),
+            ComparisonOp::Re,
+            &duration_value(r#"{ duration > 1ns }"#),
+        )
+        .expect_err("a regex operator on duration is refused"),
+        PlanError::TypeMismatch("duration does not support regex operators".to_string())
+    );
+}
+
+/// `T-C6b`: the two carved-out fields' refusal matrix, as a CROSS PRODUCT
+/// rather than a list of queries — `docs/api.md:1039` says of them that
+/// "any ordered comparison at those fields stay `400`", and a list is how
+/// an earlier draft used `>` twice and `<` not at all.
+#[test]
+fn t_c6b_the_carved_out_fields_refuse_every_ordered_comparison() {
+    const CARVED_OUT: [Intrinsic; 2] = [
+        Intrinsic::InstrumentationName,
+        Intrinsic::InstrumentationVersion,
+    ];
+    let operands = [
+        Value::String("j".to_string()),
+        Value::Number("5".to_string()),
+    ];
+    let mut seen = 0usize;
+    for field in CARVED_OUT {
+        for op in ordered_ops() {
+            for value in &operands {
+                let err = compile_span_leaf(&Field::Intrinsic(field), op, value)
+                    .expect_err("an ordered comparison at a carved-out field is a 400");
+                assert_eq!(
+                    err,
+                    PlanError::TypeMismatch(format!("{field} supports only = != =~ !~")),
+                    "{field} {op} {value:?}"
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        CARVED_OUT.len() * ordered_ops().len() * operands.len()
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C8 — the shapes at those same fields that are NOT refusals
+// ---------------------------------------------------------------------
+
+/// `T-C8`: a cross-type `=`/`!=` at a carved-out field folds to the
+/// literal `false`, and an ordered comparison on a STRING renders — it is
+/// a reference `200` (`crates/pulsus-traceql/src/validate.rs:767-770`) and
+/// our own validator accepts it, so the shipped compiler's `400` there was
+/// strictness this pass must not inherit.
+#[test]
+fn t_c8_the_shapes_that_render_rather_than_refuse() {
+    assert_eq!(rendered(r#"{ instrumentation:name = 5 }"#), "false");
+    assert_eq!(rendered(r#"{ instrumentation:version != 5 }"#), "false");
+    assert_eq!(rendered(r#"{ name > "a" }"#), "name > 'a'");
+    assert_eq!(
+        rendered(r#"{ span.k >= "a" }"#),
+        "coalesce(attrs.`k`.:String >= 'a', false)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C9 / T-C10 — the three id columns
+// ---------------------------------------------------------------------
+
+/// `T-C9`: the literal is lowercased for `=`/`!=` and for nothing else,
+/// and the raw-byte fast path carries the OPERATOR — an earlier draft
+/// admitted `!=` to that path and then rendered `=`, which inverts all
+/// three id columns' answers.
+#[test]
+fn t_c9_the_id_columns_fast_path_keeps_its_operator_and_lowercases_only_equality() {
+    assert_eq!(
+        rendered(r#"{ span:id = "0A1B2C3D4E5F60A1" }"#),
+        "span_id = unhex('0a1b2c3d4e5f60a1')"
+    );
+    assert_eq!(
+        rendered(r#"{ span:id != "0A1B2C3D4E5F60A1" }"#),
+        "span_id != unhex('0a1b2c3d4e5f60a1')"
+    );
+    assert_eq!(
+        rendered(r#"{ span:parentID != "0A1B2C3D4E5F60A1" }"#),
+        "parent_span_id != unhex('0a1b2c3d4e5f60a1')"
+    );
+    assert_eq!(
+        rendered(r#"{ trace:id != "0A1B2C3D4E5F60710A1B2C3D4E5F6071" }"#),
+        "trace_id != toFixedString(unhex('0a1b2c3d4e5f60710a1b2c3d4e5f6071'), 16)"
+    );
+    // A regex may be deliberately case-sensitive, so the pattern's case
+    // survives and the key read is NOT taken.
+    assert_eq!(
+        rendered(r#"{ span:id =~ "0A1B.*" }"#),
+        "match(lower(hex(span_id)), '^(?:0A1B.*)$')"
+    );
+    // The width guard: `unhex('')` is zero bytes and a `FixedString`
+    // right-pads, so dropping it makes `= ""` equal every root span.
+    let empty = rendered(r#"{ span:parentID = "" }"#);
+    assert_eq!(empty, "lower(hex(parent_span_id)) = ''");
+    assert!(!empty.contains("unhex"), "{empty}");
+}
+
+/// `T-C10`: an ordered operator never takes the key read. No answer on
+/// either fixture distinguishes `lower(hex(col)) <op> S` from a
+/// `FixedString` comparison — hex encoding preserves order — so this text
+/// is the only instrument.
+#[test]
+fn t_c10_an_ordered_id_comparison_is_lexicographic_on_hex_text() {
+    let text = rendered(r#"{ span:id < "0a1b2c3d4e5f60a4" }"#);
+    assert_eq!(text, "lower(hex(span_id)) < '0a1b2c3d4e5f60a4'");
+    assert!(!text.contains("unhex"), "{text}");
+    assert!(!text.contains("FixedString"), "{text}");
+}
+
+// ---------------------------------------------------------------------
+// T-C11 — the literal on the left
+// ---------------------------------------------------------------------
+
+/// `T-C11`: a literal on the left mirrors the operator, so the two
+/// spellings are one rendering.
+#[test]
+fn t_c11_a_literal_on_the_left_mirrors_the_operator() {
+    assert_eq!(
+        rendered(r#"{ 500 <= span.http.response.status_code }"#),
+        rendered(r#"{ span.http.response.status_code >= 500 }"#)
+    );
+    assert_eq!(
+        rendered(r#"{ 200 != span.http.response.status_code }"#),
+        rendered(r#"{ span.http.response.status_code != 200 }"#)
+    );
+}

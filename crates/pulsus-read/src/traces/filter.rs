@@ -662,11 +662,11 @@ pub(crate) const OP_SYMBOLS: [(ComparisonOp, &str); 6] = [
     (ComparisonOp::Lte, "<="),
 ];
 
-fn sql_op(op: ComparisonOp) -> Option<&'static str> {
+pub(super) fn sql_op(op: ComparisonOp) -> Option<&'static str> {
     OP_SYMBOLS.iter().find(|(o, _)| *o == op).map(|(_, s)| *s)
 }
 
-fn status_code(v: StatusValue) -> i8 {
+pub(super) fn status_code(v: StatusValue) -> i8 {
     match v {
         StatusValue::Unset => 0,
         StatusValue::Ok => 1,
@@ -687,7 +687,7 @@ fn status_code(v: StatusValue) -> i8 {
 /// `kind_keyword` has a `_ =>` arm and `metrics_sql.rs`'s `KIND_MAP` is a
 /// SQL string constant, so neither would have complained. Adding a
 /// wildcard here would remove the only type-checked one.
-fn kind_code(v: SpanKindValue) -> i8 {
+pub(super) fn kind_code(v: SpanKindValue) -> i8 {
     match v {
         SpanKindValue::Unspecified => 0,
         SpanKindValue::Internal => 1,
@@ -702,7 +702,7 @@ fn kind_code(v: SpanKindValue) -> i8 {
 /// construction) to a finite `f64` for `val_num` comparisons — re-rendered
 /// via Rust `Display` so the SQL fragment is deterministic and can never
 /// carry raw user text.
-fn parse_num(raw: &str) -> Result<f64, PlanError> {
+pub(super) fn parse_num(raw: &str) -> Result<f64, PlanError> {
     raw.parse::<f64>()
         .ok()
         .filter(|n| n.is_finite())
@@ -821,7 +821,7 @@ fn never_matching_leaf() -> CompiledLeaf {
 /// the inner reason moves: `escape::ch_regex_anchored_checked` reports the
 /// error of the pattern the CLIENT wrote when that alone fails to compile
 /// (the #240 rule), instead of the `^(?:…)$` rewrite's error.
-fn anchored_regex_sql(pat: &str) -> Result<String, PlanError> {
+pub(super) fn anchored_regex_sql(pat: &str) -> Result<String, PlanError> {
     escape::ch_regex_anchored_checked(pat).map_err(|e| {
         let PipelineError::BadRegex(reason) = e else {
             // `ch_regex_anchored_checked` constructs no other variant;
@@ -2679,7 +2679,7 @@ fn first_attr_key(node: &ArithNode) -> Option<(String, Option<&'static str>)> {
 /// Reflects a comparison operator across its operands (`a < b` ⇒ `b > a`)
 /// so a folded `<scalar> <op> <attr>` becomes an `<attr>`-first numeric
 /// leaf. Equality/inequality are symmetric.
-fn flip_comparison(op: ComparisonOp) -> ComparisonOp {
+pub(super) fn flip_comparison(op: ComparisonOp) -> ComparisonOp {
     match op {
         ComparisonOp::Gt => ComparisonOp::Lt,
         ComparisonOp::Gte => ComparisonOp::Lte,

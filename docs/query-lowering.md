@@ -5381,8 +5381,8 @@ and left the check to be run by hand. **That claim was false.** The workspace al
 the form this repository uses for exactly this purpose: rustdoc `compile_fail` fences, in
 `crates/pulsus-read/src/logql/predicate.rs` (`:257`, `:295`, `:332`, `:373`) and
 `crates/pulsus-read/src/logql/sql.rs` (`:453`, `:467`), with a module doc that sets the bar for them
-— *"a fence is only worth what its REMOVAL TEST is worth"* (`predicate.rs:93`) — and a measured
-caveat that the annotated error code is not checked at all (`predicate.rs:87-91`, issue #286).
+— *"a fence is only worth what its REMOVAL TEST is worth"* (`logql/predicate.rs:93`) — and a measured
+caveat that the annotated error code is not checked at all (`logql/predicate.rs:87-91`, issue #286).
 Doctests are not run by `nextest`; CI runs them separately as `cargo test --workspace --doc`
 (`.github/workflows/ci.yml:126`, whose own comment says *"nextest never runs doctests"*). Re-run on
 this tree at `2f78c53`, and NOT re-taken at `acf44c49`: `cargo test --doc -p pulsus-read` lists all six fences by file and line and
@@ -5538,7 +5538,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | quantity | at this revision |
 |---|---|
 | citation occurrences in the five artefacts | 693 |
-| of those, citing a bare basename | 519 |
+| of those, citing a bare basename | 511 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
 | `(document, token)` pairs the rule resolves | 362 |
@@ -5565,7 +5565,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 693 citation occurrences the five artefacts make, 519 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 492 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
+Of the 693 citation occurrences the five artefacts make, 511 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 492 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

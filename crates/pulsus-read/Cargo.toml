@@ -90,6 +90,14 @@ pulsus-schema = { path = "../pulsus-schema" }
 # unchanged and acyclic — `cargo tree -p pulsus-read -e normal` must
 # never show pulsus-write.
 pulsus-write = { path = "../pulsus-write" }
+# DEV-ONLY (issue #588): `tests/traces_query_v2_live.rs` seeds its two
+# fixtures by building the OTLP `ExportTraceServiceRequest` bodies and
+# handing them to `pulsus_write::parse_trace_landing`, so the fixture's
+# bytes go through the shipped encoder. Naming that request type needs the
+# crate that defines it as a direct dependency; `pulsus-write` carries it
+# as a normal dependency and does not re-export it. Never a production
+# dependency — `cargo tree -p pulsus-read -e normal` must not show it.
+opentelemetry-proto.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Unique per-invocation run-database naming for the #90 query_log gates
 # (strict `CREATE DATABASE`), so concurrent/repeat live runs never collide.

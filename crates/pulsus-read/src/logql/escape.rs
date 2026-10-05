@@ -105,10 +105,26 @@ pub fn ch_like_contains(needle: &str) -> String {
     ch_string(&pattern)
 }
 
-/// Renders `s` as a backtick-quoted ClickHouse identifier. Reserved for
-/// fixed, trusted schema names (database/table) supplied by [`super::params::PlanCtx`]
-/// — matcher keys and values are always string literals via [`ch_string`],
-/// never identifiers.
+/// Renders `s` as a backtick-quoted ClickHouse identifier: a `` ` `` and a
+/// `\` are each escaped with a backslash.
+///
+/// On the LogQL path it carries fixed, trusted schema names
+/// (database/table) supplied by [`super::params::PlanCtx`] — a matcher key
+/// or value there is always a string literal via [`ch_string`], never an
+/// identifier.
+///
+/// **It carries CLIENT-CHOSEN text too, from one call site** (issue #588):
+/// `traces::spans::predicate`'s `attr_path` renders an OTLP attribute
+/// key's stored JSON path as a subcolumn identifier,
+/// ``attrs.`http%2Eresponse%2Estatus_code` ``. The key is whatever the
+/// client sent, so the escape above is load-bearing rather than
+/// decoration — measured on ClickHouse 26.3.29.7 for a span carrying the
+/// key `` a`b ``:
+///
+/// ```text
+/// SELECT dynamicType(attrs.`a`b`)       -> Code: 62 ... Back quoted string is not closed
+/// SELECT toString(attrs.`a\`b`.:Int64)  -> 1
+/// ```
 pub fn ch_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('`');
