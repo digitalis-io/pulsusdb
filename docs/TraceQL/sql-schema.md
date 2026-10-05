@@ -29,7 +29,8 @@ and no offload path here.
 
      resources    one row per DISTINCT resource per day; spans carry a 128-bit id
        key: (service, resource_id)      service.name is dropped from attrs ONLY
-                                        when its value is a non-empty string
+                                        when its value is a non-empty string;
+                                        spans.service_type names its arm
 
      traces       one row per (day, trace): extent, last start, root, services,
                   and the trace's own distinct 5-minute span buckets  granule 1024

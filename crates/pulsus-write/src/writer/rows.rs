@@ -2899,8 +2899,9 @@ pub struct TraceLandingRow {
     /// populated, zero bytes when there are none (issue #587 row 8).
     #[serde(with = "serde_bytes")]
     pub entity_refs: Vec<u8>,
-    /// STUB (issue #589 part 1, tests first): not yet a column.
-    #[serde(skip)]
+    /// The `AnyValue` arm of the resource's `service.name`, on the kind-0
+    /// row beside `service` (issue #589). `String`, not `&'static str`:
+    /// the row derives `Deserialize`.
     pub service_type: String,
 }
 
@@ -3032,6 +3033,7 @@ impl TraceLandingRow {
                 .collect(),
             dropped_links: span.dropped_links,
             service: span.service,
+            service_type: span.service_type.to_string(),
             attrs: span.attrs,
             attrs_other: span.attrs_other,
             dropped_attrs: span.dropped_attrs,
@@ -3084,8 +3086,11 @@ impl TraceLandingRow {
     /// expansion ceiling, so a charge that priced the vector headers alone
     /// would not bound what the queue holds.
     pub fn est_span_bytes(span: &LandingSpan) -> u64 {
+        // `service_type` is a `&'static str` here, but `span` converts it to
+        // an owned `String`, so the row pays for its bytes.
         let text = span.name.len()
             + span.service.len()
+            + span.service_type.len()
             + span.status_message.len()
             + span.trace_state.len()
             + span.scope_name.len()
@@ -3190,6 +3195,7 @@ impl SpoolEncode for TraceLandingRow {
                 "links": self.links.len() as u64,
                 "dropped_links": self.dropped_links,
                 "service": self.service,
+                "service_type": self.service_type,
                 "scope_schema_url": self.scope_schema_url,
                 "scope_dropped_attrs": self.scope_dropped_attrs,
                 "scope_attrs_other_bytes": self.scope_attrs_other.len() as u64,
@@ -3279,6 +3285,7 @@ impl SpoolEncode for TraceLandingRow {
                     .await?;
                 o.str_field("scope_version", &self.scope_version).await?;
                 o.str_field("service", &self.service).await?;
+                o.str_field("service_type", &self.service_type).await?;
                 o.str_field("span_id", &hex_lower(&self.span_id)).await?;
                 o.field("start_ns", &self.start_ns).await?;
                 o.field("status_code", &self.status_code).await?;

@@ -1005,10 +1005,29 @@ fn any_value_to_string(value: Option<&AnyValue>) -> String {
     }
 }
 
-/// STUB (issue #589 part 1, tests first).
-#[allow(dead_code)]
-fn service_arm(_value: Option<&AnyValue>) -> &'static str {
-    ""
+/// The name of the `AnyValue` arm a resource's `service.name` arrived as
+/// — the companion of [`any_value_to_string`], stored beside its output
+/// as `spans.service_type` (issue #589).
+///
+/// [`any_value_type`] is not reused: it folds array, kvlist and bytes into
+/// `String`, which is the type of what that function STORES, not of what
+/// arrived. `""` is no key, no arm, and the profiling string reference,
+/// which the writer lands nowhere. **No wildcard arm**: a new `AnyValue`
+/// arm fails to compile here.
+fn service_arm(value: Option<&AnyValue>) -> &'static str {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        return "";
+    };
+    match value {
+        Value::StringValue(_) => "string",
+        Value::BoolValue(_) => "bool",
+        Value::IntValue(_) => "int",
+        Value::DoubleValue(_) => "double",
+        Value::ArrayValue(_) => "array",
+        Value::KvlistValue(_) => "kvlist",
+        Value::BytesValue(_) => "bytes",
+        Value::StringValueStrindex(_) => "",
+    }
 }
 
 /// The stored type discriminator for an OTLP `AnyValue` (issue #476) —
@@ -3391,6 +3410,7 @@ pub fn parse_landing(
         let service = service_kv
             .map(|kv| any_value_to_string(kv.value.as_ref()))
             .unwrap_or_default();
+        let service_type = service_arm(service_kv.and_then(|kv| kv.value.as_ref()));
         let resource_id = resource_identity(resource, &resource_spans.schema_url);
 
         // The resource's own landed attributes, built once per
@@ -3458,6 +3478,7 @@ pub fn parse_landing(
                     span,
                     resource_id,
                     &service,
+                    service_type,
                     &scope_name,
                     &scope_version,
                     &scope_schema_url,
@@ -3528,6 +3549,7 @@ fn land_span(
     span: &Span,
     resource_id: Fingerprint,
     service: &str,
+    service_type: &'static str,
     scope_name: &str,
     scope_version: &str,
     scope_schema_url: &str,
@@ -3692,7 +3714,7 @@ fn land_span(
         links,
         dropped_links: span.dropped_links_count,
         service: service.to_string(),
-        service_type: "",
+        service_type,
         attrs: span_attrs.json,
         attrs_other: encode_attrs_other(span_attrs.other),
         dropped_attrs: span.dropped_attributes_count,
