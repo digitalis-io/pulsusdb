@@ -90,7 +90,7 @@ pulsus-schema = { path = "../pulsus-schema" }
 # unchanged and acyclic — `cargo tree -p pulsus-read -e normal` must
 # never show pulsus-write.
 pulsus-write = { path = "../pulsus-write" }
-# DEV-ONLY (issue #588): `tests/traces_query_v2_live.rs` seeds its two
+# DEV-ONLY (issue #588): `tests/traces_query_v2_live.rs` seeds its
 # fixtures by building the OTLP `ExportTraceServiceRequest` bodies and
 # handing them to `pulsus_write::parse_trace_landing`, so the fixture's
 # bytes go through the shipped encoder. Naming that request type needs the
