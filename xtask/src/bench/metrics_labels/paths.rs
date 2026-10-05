@@ -775,8 +775,10 @@ pub async fn over_inclusion_probe(
         end_ms,
     };
     let matchers = SelectorKind::BroadEq.matchers();
+    let labels_table = table_name("metric_labels", cfg.dist);
     let sql = metrics_sql::historical_series_subquery(
         &series_table,
+        &labels_table,
         &tier.metric_name,
         window,
         bucket_ms,
@@ -819,6 +821,7 @@ pub async fn run_all(
     summary: &MetricsCorpusSummary,
 ) -> anyhow::Result<(Vec<PathEvidence>, Vec<RefreshEvidence>)> {
     let series_table = table_name("metric_series", cfg.dist);
+    let labels_table = table_name("metric_labels", cfg.dist);
     let idx_table = table_name("metric_series_idx", cfg.dist);
 
     let cache_cfg = LabelCacheConfig {
@@ -829,6 +832,7 @@ pub async fn run_all(
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: cfg.db.to_string(),
         series_table: series_table.clone(),
+        labels_table: labels_table.clone(),
         bucket_ms: summary.bucket_ms,
         window_ms: summary.window_ms,
         cache_max_series: cfg.cache_max_series,
@@ -877,6 +881,7 @@ pub async fn run_all(
 
             let sql2 = metrics_sql::historical_series_subquery(
                 &series_table,
+                &labels_table,
                 &tier.metric_name,
                 window,
                 summary.bucket_ms,

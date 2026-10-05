@@ -140,6 +140,7 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: series_table.to_string(),
+        labels_table: series_table.replace("metric_series", "metric_labels"),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms,
         cache_max_series: 50_000,
@@ -269,7 +270,8 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         start_ms: ten_am_bucket + 30 * 60_000,
         end_ms: ten_am_bucket + 40 * 60_000,
     };
-    let sql = historical_series_subquery("metric_series", "up", window, bucket, &[]);
+    let sql =
+        historical_series_subquery("metric_series", "metric_labels", "up", window, bucket, &[]);
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(
         fingerprints,
@@ -361,6 +363,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
 
     let sql = historical_resolution_query(
         "metric_series",
+        "metric_labels",
         "http_requests_total",
         window,
         bucket,
@@ -727,7 +730,14 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
     };
     assert_eq!(in_process, [7].map(Fingerprint::from_raw));
 
-    let sql = historical_series_subquery("metric_series", "up", window, bucket, &[matcher]);
+    let sql = historical_series_subquery(
+        "metric_series",
+        "metric_labels",
+        "up",
+        window,
+        bucket,
+        &[matcher],
+    );
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(in_process, via_sql);
 

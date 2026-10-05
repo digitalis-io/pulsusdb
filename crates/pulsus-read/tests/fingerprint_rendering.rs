@@ -196,7 +196,14 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
     let rendered = sample_sql::render_fingerprint_list(&literals());
     assert_every_boundary_value_is_an_exact_call("render_fingerprint_list", &rendered);
     // And the statement that embeds it, so the list reaches SQL whole.
-    let sql = sample_sql::sample_fetch("metric_samples", "up", &literals(), 0, 100);
+    let sql = sample_sql::sample_fetch(
+        "metric_samples",
+        "metric_hist_samples",
+        "up",
+        &literals(),
+        0,
+        100,
+    );
     assert_every_boundary_value_is_an_exact_call("sample_fetch", &sql);
 }
 
@@ -212,6 +219,7 @@ fn site_5_series_labels_by_fingerprint_renders_the_exact_call_form() {
 fn site_6_discovery_fetch_multi_renders_the_exact_call_form() {
     let sql = metrics_sql::discovery_fetch_multi(
         "metric_series",
+        "metric_labels",
         &["up".to_string()],
         &literals(),
         DataWindow {

@@ -26,7 +26,7 @@ use super::rows::SeriesRow;
 /// Renders the §5.2 sweep SQL: `unix_milli >= floor(now - window)`, no
 /// upper bound (the sweep always runs "as of now"). Pure so it is
 /// snapshot-testable without a clock/DB.
-fn sweep_sql(series_table: &str, lower_bound_ms: i64) -> String {
+fn sweep_sql(series_table: &str, _labels_table: &str, lower_bound_ms: i64) -> String {
     format!(
         "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
     )
@@ -56,7 +56,11 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     let now_ms = now_unix_ms();
     let lower_bound_ms =
         floor_to_activity_bucket(now_ms - cache.config.window_ms, cache.config.bucket_ms);
-    let sql = sweep_sql(&cache.config.series_table, lower_bound_ms);
+    let sql = sweep_sql(
+        &cache.config.series_table,
+        &cache.config.labels_table,
+        lower_bound_ms,
+    );
 
     let result = fetch_rows(cache, &sql).await;
     let rows = match result {
@@ -183,12 +187,33 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
 mod tests {
     use super::*;
 
+    /// **Issue #623: the sweep reads activity from the series table and
+    /// each label set once from the label table.** One row per `(metric_name,
+    /// fingerprint)` active since the bound, carrying that fingerprint's
+    /// labels; the label table is read only for the fingerprints the series
+    /// table names. No upper bound: the sweep runs as of now.
     #[test]
-    fn sweep_sql_renders_the_lower_bound_with_no_upper_bound() {
-        let sql = sweep_sql("metric_series", 1_000);
-        assert!(sql.contains("unix_milli >= 1000"));
-        assert!(!sql.contains("unix_milli <="));
-        assert!(sql.ends_with("LIMIT 1 BY metric_name, fingerprint"));
+    fn sweep_sql_joins_each_active_series_to_its_label_set() {
+        assert_eq!(
+            sweep_sql("metric_series", "metric_labels", 1_000),
+            "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE unix_milli >= 1000\n\
+             ) AS s\n\
+             INNER JOIN (\n\
+             SELECT fingerprint, any(labels) AS label_set\n\
+             FROM metric_labels\n\
+             WHERE fingerprint IN (\n\
+             SELECT fingerprint\n\
+             FROM metric_series\n\
+             WHERE unix_milli >= 1000\n\
+             )\n\
+             GROUP BY fingerprint\n\
+             ) AS l USING (fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
+        );
     }
 
     #[test]

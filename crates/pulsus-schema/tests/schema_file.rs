@@ -46,17 +46,17 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 23 tables, 18 views each
+/// The inventory, single-node: one database, 24 tables, 19 views each
 /// dropped before it is created. No `Replicated*` engine, no `Distributed`
 /// wrapper, no `ON CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 60, "statement count");
+    assert_eq!(stmts.len(), 63, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 23);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 18);
-    assert_eq!(starting_with(&stmts, "DROP VIEW"), 18);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 24);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 19);
+    assert_eq!(starting_with(&stmts, "DROP VIEW"), 19);
 
     let text = rendered(&single());
     assert!(
@@ -85,18 +85,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 15 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 16 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 75, "statement count");
+    assert_eq!(stmts.len(), 79, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        38,
-        "23 tables + 15 wrappers"
+        40,
+        "24 tables + 16 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 18);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 19);
 
     let text = rendered(&clustered());
     assert!(
@@ -105,19 +105,19 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        75,
+        79,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 18 tables take a per-shard replica set and 5 take the
-    // cluster-wide one, so 23 paths name `{replica}` and 18 name `{shard}`.
+    // literally. 19 tables take a per-shard replica set and 5 take the
+    // cluster-wide one, so 24 paths name `{replica}` and 19 name `{shard}`.
     assert_eq!(
         text.matches("{shard}").count(),
-        18,
+        19,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 23, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 24, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         5,
@@ -176,7 +176,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 23, "every replicated table's path was checked");
+    assert_eq!(checked, 24, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -259,12 +259,16 @@ fn every_view_is_dropped_before_it_is_created() {
                 );
             }
         }
-        assert_eq!(dropped.len(), 18, "every view is dropped");
+        assert_eq!(dropped.len(), 19, "every view is dropped");
     }
 }
 
 /// A family's routing wrappers all shard on one expression: a series'
 /// rollups must land on the shard its samples do.
+///
+/// `metric_labels` is its own family: it has no `metric_name`, one label
+/// set serves every name that carries it, and no write goes through its
+/// wrapper — the view fills it on the node that received the push.
 #[test]
 fn every_wrapper_in_a_family_shards_on_the_same_expression() {
     let text = rendered(&clustered());
@@ -291,7 +295,9 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             .strip_prefix("CREATE TABLE IF NOT EXISTS pulsus.")
             .expect("a wrapper names its database")
             .to_string();
-        let family = if name.starts_with("metric") {
+        let family = if name.starts_with("metric_labels") {
+            "metric labels"
+        } else if name.starts_with("metric") {
             "metrics"
         } else if name.starts_with("log") {
             "logs"
@@ -300,7 +306,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 3, "three families have wrappers");
+    assert_eq!(by_family.len(), 4, "four families have wrappers");
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -331,7 +337,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 23);
+    assert_eq!(on_tables, 24);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -526,6 +532,7 @@ fn the_file_still_answers_the_two_run_time_questions() {
         "metric_series_mv",
         "metric_metadata_mv",
         "metric_hist_samples_mv",
+        "metric_labels_mv",
     ] {
         let projection =
             pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));
@@ -894,7 +901,7 @@ fn no_view_reads_a_table_another_view_writes() {
             "a view that names no source: {stmt}"
         );
     }
-    assert_eq!(targets.len(), 18, "eighteen views");
+    assert_eq!(targets.len(), 19, "nineteen views");
     let mut distinct: Vec<String> = sources.clone();
     distinct.sort();
     distinct.dedup();
@@ -941,4 +948,142 @@ fn the_cluster_wide_replica_set_is_exactly_the_catalog_tables() {
         "the shard-less `/clickhouse/tables/all/` path belongs to the catalog \
          tables alone (docs/architecture.md §3)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #623: the metrics tables' storage shape.
+// ---------------------------------------------------------------------------
+
+/// The rendered `CREATE TABLE` of base table `table` under `ctx`.
+fn create_of(ctx: &RenderCtx, table: &str) -> String {
+    let head = format!("CREATE TABLE IF NOT EXISTS pulsus.{table}");
+    rendered_statements(ctx)
+        .into_iter()
+        .find(|s| {
+            s.trim_start()
+                .strip_prefix(&head)
+                .is_some_and(|rest| rest.starts_with([' ', '\n']) && !rest.contains("Distributed("))
+        })
+        .unwrap_or_else(|| panic!("no CREATE TABLE for {table}"))
+}
+
+/// The one line of `stmt` that starts with `prefix`.
+fn line_of<'a>(stmt: &'a str, prefix: &str) -> &'a str {
+    let hits: Vec<&str> = stmt
+        .lines()
+        .filter(|l| l.trim_start().starts_with(prefix))
+        .collect();
+    assert_eq!(hits.len(), 1, "one {prefix:?} line in {stmt}");
+    hits[0]
+}
+
+/// **`metric_landing` carries no `event_id`.** Nothing outside tests read it,
+/// and it was most of the table's bytes.
+#[test]
+fn metric_landing_carries_no_event_id() {
+    let columns = pulsus_schema::table_column_names("metric_landing").expect("in the file");
+    assert!(
+        !columns.contains(&"event_id"),
+        "metric_landing still declares event_id: {columns:?}"
+    );
+    assert_eq!(columns.len(), 25, "the 25 columns the writer sends");
+    assert_eq!(columns.first(), Some(&"received_ms"));
+    // The log and trace landing tables keep theirs.
+    for other in ["log_landing", "trace_landing"] {
+        let columns = pulsus_schema::table_column_names(other).expect("in the file");
+        assert_eq!(columns.first(), Some(&"event_id"), "{other}");
+    }
+}
+
+/// **`metric_series` is activity only, and it expires with the samples.**
+/// No `labels` column; daily partitions, the samples' TTL and
+/// `ttl_only_drop_parts`, in both variants.
+#[test]
+fn metric_series_is_activity_only_and_expires_with_the_samples() {
+    assert_eq!(
+        pulsus_schema::table_column_names("metric_series").expect("in the file"),
+        vec!["metric_name", "fingerprint", "unix_milli", "value_type"],
+    );
+    for ctx in [single(), clustered()] {
+        let series = create_of(&ctx, "metric_series");
+        let samples = create_of(&ctx, "metric_samples");
+        for prefix in ["PARTITION BY", "TTL"] {
+            assert_eq!(
+                line_of(&series, prefix),
+                line_of(&samples, prefix),
+                "metric_series must copy metric_samples' {prefix}"
+            );
+        }
+        assert!(
+            line_of(&series, "SETTINGS").contains("ttl_only_drop_parts = 1"),
+            "{series}"
+        );
+    }
+}
+
+/// **`metric_labels` holds one label set per fingerprint and keeps it.** A
+/// replacing engine keyed by the fingerprint, no TTL, filled by a view from
+/// the kind-2 rows, with a routing wrapper and a per-shard replica set.
+#[test]
+fn metric_labels_holds_one_label_set_per_fingerprint_and_never_expires() {
+    assert_eq!(
+        pulsus_schema::table_column_names("metric_labels").expect("in the file"),
+        vec!["fingerprint", "labels"],
+    );
+    let single_create = create_of(&single(), "metric_labels");
+    assert!(
+        single_create.contains("ENGINE = ReplacingMergeTree\n"),
+        "{single_create}"
+    );
+    assert_eq!(line_of(&single_create, "ORDER BY"), "ORDER BY fingerprint");
+    for ctx in [single(), clustered()] {
+        let create = create_of(&ctx, "metric_labels");
+        assert!(
+            !create.contains("TTL"),
+            "label sets are never expired: {create}"
+        );
+    }
+    let clustered_create = create_of(&clustered(), "metric_labels");
+    assert!(
+        clustered_create.contains(
+            "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.metric_labels', '{replica}')"
+        ),
+        "{clustered_create}"
+    );
+    assert!(
+        rendered(&clustered()).contains("CREATE TABLE IF NOT EXISTS pulsus.metric_labels_dist"),
+        "metric_labels has a routing wrapper"
+    );
+    let projection = pulsus_schema::mv_projection("metric_labels_mv", &single())
+        .expect("the view is in the file");
+    assert!(projection.ends_with("WHERE kind = 2"), "{projection}");
+    assert!(
+        projection.contains("FROM pulsus.metric_landing"),
+        "{projection}"
+    );
+    let series = pulsus_schema::mv_projection("metric_series_mv", &single())
+        .expect("the view is in the file");
+    assert!(
+        !series.contains("labels"),
+        "metric_series_mv no longer copies the labels: {series}"
+    );
+}
+
+/// **Both sample tables keep the whole sorting key in memory.** At the
+/// default ratio the engine drops `fingerprint` and `unix_milli` from the
+/// in-memory index of a part where `metric_name` is nearly unique per
+/// granule, and a one-series read stops pruning.
+#[test]
+fn both_sample_tables_keep_the_whole_key_in_memory() {
+    for ctx in [single(), clustered()] {
+        for table in ["metric_samples", "metric_hist_samples"] {
+            let create = create_of(&ctx, table);
+            assert!(
+                line_of(&create, "SETTINGS").contains(
+                    "primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1,"
+                ),
+                "{table}: {create}"
+            );
+        }
+    }
 }

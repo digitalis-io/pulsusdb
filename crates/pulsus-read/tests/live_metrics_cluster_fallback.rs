@@ -320,6 +320,7 @@ fn cache_config_dist(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series_dist".to_string(),
+        labels_table: "metric_labels_dist".to_string(),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
@@ -337,6 +338,7 @@ fn engine_config_dist(db: &str) -> MetricsConfig {
         samples_table: "metric_samples_dist".to_string(),
         hist_samples_table: "metric_hist_samples_dist".to_string(),
         series_table: "metric_series_dist".to_string(),
+        labels_table: "metric_labels_dist".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -392,10 +394,17 @@ async fn fallback_fetch_sql_is_denied_by_default_on_the_cluster() {
         start_ms: bucket,
         end_ms: bucket,
     };
-    let series_sql =
-        historical_series_subquery("metric_series_dist", metric_name, window, bucket, &[]);
+    let series_sql = historical_series_subquery(
+        "metric_series_dist",
+        "metric_labels_dist",
+        metric_name,
+        window,
+        bucket,
+        &[],
+    );
     let fetch_sql = sample_fetch_subquery(
         "metric_samples_dist",
+        "metric_hist_samples_dist",
         metric_name,
         &series_sql,
         bucket - 1,

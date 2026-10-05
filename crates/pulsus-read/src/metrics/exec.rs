@@ -88,6 +88,10 @@ pub struct MetricsConfig {
     /// (issue #32) the discovery endpoints' own `metric_series`-backed
     /// query ([`super::sql::discovery_query`]).
     pub series_table: String,
+    /// `metric_labels` — one row per label set, keyed by fingerprint (issue
+    /// #623). Every read that needs a series' labels takes them from here;
+    /// `_dist`-aware like `series_table`.
+    pub labels_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
     /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —
@@ -820,6 +824,7 @@ impl MetricsEngine {
                     );
                     let sqls = build_chunk_sqls(
                         &self.config.samples_table,
+                        &self.config.hist_samples_table,
                         metric_name,
                         fps,
                         lower_excl,
@@ -867,6 +872,7 @@ impl MetricsEngine {
                     }
                     let fetch_sql = sample_sql::sample_fetch_subquery(
                         &self.config.samples_table,
+                        &self.config.hist_samples_table,
                         metric_name,
                         &sql,
                         lower_excl,
@@ -1134,6 +1140,7 @@ impl MetricsEngine {
 
         let sql = sample_sql::sample_fetch_multi(
             &self.config.samples_table,
+            &self.config.hist_samples_table,
             &names,
             &sql_literals(&fps),
             lower_excl,
@@ -1474,6 +1481,7 @@ impl MetricsEngine {
                 if !names.is_empty() {
                     fetch_sqls.push(super::sql::discovery_fetch_by_names(
                         &self.config.series_table,
+                        &self.config.labels_table,
                         &names,
                         &spec.matchers,
                         window,
@@ -1547,12 +1555,14 @@ impl MetricsEngine {
             DiscoveryQuery::Sql(match projection {
                 DiscoveryProjection::SeriesLabels => super::sql::discovery_query(
                     &self.config.series_table,
+                    &self.config.labels_table,
                     filter,
                     window,
                     bucket_ms,
                 ),
                 DiscoveryProjection::MetricNamesOnly => super::sql::discovery_distinct_names_query(
                     &self.config.series_table,
+                    &self.config.labels_table,
                     filter,
                     window,
                     bucket_ms,
@@ -1649,6 +1659,7 @@ impl MetricsEngine {
         Ok(Some(DiscoveryQuery::Sql(
             super::sql::discovery_fetch_multi(
                 &self.config.series_table,
+                &self.config.labels_table,
                 &names,
                 &sql_literals(&fps),
                 window,
@@ -2253,6 +2264,7 @@ impl Drop for CancelOnDrop {
 /// starts.
 fn build_chunk_sqls(
     samples_table: &str,
+    hist_samples_table: &str,
     metric_name: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
@@ -2264,6 +2276,7 @@ fn build_chunk_sqls(
         .map(|chunk| {
             sample_sql::sample_fetch(
                 samples_table,
+                hist_samples_table,
                 metric_name,
                 chunk,
                 lower_excl_ms,
@@ -3284,7 +3297,14 @@ mod tests {
         let names: Vec<String> = (0..1_000u32).map(|i| format!("{i:0254}")).collect();
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &fps, 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi(
+            "metric_samples",
+            "metric_hist_samples",
+            &names,
+            &fps,
+            0,
+            i64::MAX,
+        );
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -3306,7 +3326,14 @@ mod tests {
         let names: Vec<String> = (0..1_000_000u32)
             .map(|i| format!("metric_name_{i}"))
             .collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &[], 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi(
+            "metric_samples",
+            "metric_hist_samples",
+            &names,
+            &[],
+            0,
+            i64::MAX,
+        );
         match crate::querytext::ensure_query_text_fits(&sql) {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
             other => panic!("expected QueryTextBytes rejection, got {other:?}"),
@@ -3347,6 +3374,7 @@ mod tests {
         // regardless of input order.
         let sqls = build_chunk_sqls(
             "metric_samples",
+            "metric_hist_samples",
             "up",
             vec![
                 Fingerprint::from_raw(3),
@@ -3367,7 +3395,7 @@ mod tests {
     #[test]
     fn build_chunk_sqls_splits_at_the_chunk_threshold() {
         let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
-        let sqls = build_chunk_sqls("metric_samples", "up", fps, 0, 100);
+        let sqls = build_chunk_sqls("metric_samples", "metric_hist_samples", "up", fps, 0, 100);
         assert_eq!(sqls.len(), 3);
     }
 

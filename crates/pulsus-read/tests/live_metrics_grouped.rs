@@ -201,6 +201,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
@@ -216,6 +217,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -1298,6 +1300,7 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         );
         let raw_sql = sample_sql::sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             case.metric,
             &fps,
             case.lower_excl_ms,

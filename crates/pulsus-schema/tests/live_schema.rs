@@ -551,6 +551,7 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
         "log_samples",
         "metric_hist_samples",
         "log_patterns",
+        "metric_series",
     ] {
         let after = create_table_query(&client, db, table).await;
         assert!(
@@ -892,6 +893,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
         "log_streams",
         "log_streams_idx",
         "metric_hist_samples",
+        "metric_labels",
         "metric_landing",
         "metric_samples",
         "metric_series",
@@ -993,7 +995,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 }
 
 // ---------------------------------------------------------------------
-// The metrics landing table and its four views (issue #603)
+// The metrics landing table and its views (issues #603, #623)
 // ---------------------------------------------------------------------
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1004,7 +1006,7 @@ struct LandingColumnRow {
     default_expression: String,
 }
 
-/// `metric_landing`'s 26 columns, in declaration order, with the type and
+/// `metric_landing`'s 25 columns, in declaration order, with the type and
 /// codec each carries **as the server reports them**. Written out so the
 /// shipped table cannot drift from the row type the writer sends.
 ///
@@ -1012,8 +1014,7 @@ struct LandingColumnRow {
 /// `Gorilla` is reported as `Gorilla(8)`, and a column with no codec clause
 /// reports the empty string. The same normalisation the four shipped TTL
 /// assertions read around a parenthesised product.
-const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
-    ("event_id", "UUID", ""),
+const LANDING_COLUMNS: [(&str, &str, &str); 25] = [
     ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("kind", "UInt8", "CODEC(ZSTD(1))"),
     ("metric_name", "LowCardinality(String)", ""),
@@ -1046,10 +1047,9 @@ const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
 ];
 
 /// A fresh `run_init` creates `metric_landing` with exactly the declared
-/// columns, in order, with the declared types and codecs, `event_id`
-/// defaulted by the server's own time-ordered UUID function, and the engine,
-/// partition, sorting key and fixed settings the design pins. The four
-/// `metric_*_mv` views exist beside it.
+/// columns, in order, with the declared types and codecs, and the engine,
+/// partition, sorting key and fixed settings the design pins. It carries no
+/// `event_id` (issue #623). The five `metric_*_mv` views exist beside it.
 #[tokio::test]
 async fn metric_landing_and_its_views_exist_after_init() {
     skip_unless_live!();
@@ -1078,9 +1078,9 @@ async fn metric_landing_and_its_views_exist_after_init() {
         assert_eq!(got.r#type, ty, "{name}'s type");
         assert_eq!(got.compression_codec, codec, "{name}'s codec");
     }
-    assert_eq!(
-        seen[0].default_expression, "generateUUIDv7()",
-        "the landed event's identity is the server's, not the writer's"
+    assert!(
+        seen.iter().all(|c| c.default_expression.is_empty()),
+        "no landing column is filled by the server"
     );
 
     let create = create_table_query(&client, db, "metric_landing").await;
@@ -1100,6 +1100,7 @@ async fn metric_landing_and_its_views_exist_after_init() {
         "metric_hist_samples_mv",
         "metric_series_mv",
         "metric_metadata_mv",
+        "metric_labels_mv",
     ] {
         assert!(
             names.contains(&view.to_string()),
@@ -1135,7 +1136,6 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
 
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {db}.metric_landing (
-             event_id                 UUID DEFAULT generateUUIDv7(),
              received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),
              kind                     UInt8  CODEC(ZSTD(1)),
              metric_name              LowCardinality(String),
@@ -1239,6 +1239,7 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         "metric_series",
         "metric_metadata",
         "metric_hist_samples",
+        "metric_labels",
     ] {
         let create = create_table_query(&client, db, table).await;
         assert!(
@@ -1246,6 +1247,137 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
             "{table} must carry the configured block window: {create}"
         );
     }
+
+    drop_database(&client, db).await;
+}
+
+/// One landing row, every column, in the table's order. The client sends
+/// a full row; a kind-2 row leaves the other kinds' columns at zero.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+struct LandingSeriesRow {
+    received_ms: i64,
+    kind: u8,
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    value: f64,
+    labels: String,
+    value_type: u8,
+    metric_type: String,
+    help: String,
+    unit: String,
+    updated_ns: i64,
+    hist_schema: i8,
+    hist_zero_threshold: f64,
+    hist_zero_count: u64,
+    hist_count: u64,
+    hist_sum: f64,
+    hist_pos_span_offsets: Vec<i32>,
+    hist_pos_span_lengths: Vec<u32>,
+    hist_pos_bucket_deltas: Vec<i64>,
+    hist_neg_span_offsets: Vec<i32>,
+    hist_neg_span_lengths: Vec<u32>,
+    hist_neg_bucket_deltas: Vec<i64>,
+    hist_custom_values: Vec<f64>,
+    hist_counter_reset_hint: u8,
+}
+
+/// **Issue #623: a label set is stored once, activity once per hour.** Three
+/// metric names over one label set, registered in two hours, land six kind-2
+/// rows. `metric_series` keeps the six activity rows and no label text;
+/// `metric_labels` keeps the one label set, once the engine has merged.
+#[tokio::test]
+async fn kind_2_rows_store_one_label_set_and_one_activity_row_per_hour() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_labels");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg).await.expect("connect (data)");
+
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("fits i64");
+    let hour = (now / 3_600_000) * 3_600_000;
+    let labels = r#"{"instance":"a:9100","job":"node"}"#;
+    let mut rows = Vec::new();
+    for name in ["up", "node_load1", "node_cpu_seconds_total"] {
+        for bucket in [hour - 3_600_000, hour] {
+            rows.push(LandingSeriesRow {
+                received_ms: now,
+                kind: 2,
+                metric_name: name.to_string(),
+                fingerprint: 77,
+                unix_milli: bucket,
+                labels: labels.to_string(),
+                ..Default::default()
+            });
+        }
+    }
+    // Two blocks, so the label table holds two parts until it merges.
+    data_client
+        .insert_block("metric_landing", &rows[..3])
+        .await
+        .expect("insert the first block");
+    data_client
+        .insert_block("metric_landing", &rows[3..])
+        .await
+        .expect("insert the second block");
+
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_series")
+        )
+        .await,
+        6,
+        "one activity row per name per hour"
+    );
+    let series_columns = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.columns \
+             WHERE database = '{db}' AND table = 'metric_series' AND name = 'labels'"
+        ),
+    )
+    .await;
+    assert_eq!(series_columns, 0, "metric_series stores no label text");
+
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.metric_labels FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge metric_labels");
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_labels")
+        )
+        .await,
+        1,
+        "one row per label set"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM {db}.metric_labels \
+                 WHERE fingerprint = 77 AND labels = '{labels}'"
+            ),
+        )
+        .await,
+        1,
+        "the label set is the one the kind-2 rows carried"
+    );
 
     drop_database(&client, db).await;
 }

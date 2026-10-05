@@ -2304,10 +2304,12 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
     let mut evidence = Vec::new();
     for (tag, table) in [("small", "series_small"), ("big", "series_big")] {
         let qualified = format!("{db}.{table}");
-        let wide_sql =
-            pulsus_read::metrics::sql::discovery_query(&qualified, &filter, window, bucket_ms);
+        let labels = format!("{db}.labels_{tag}");
+        let wide_sql = pulsus_read::metrics::sql::discovery_query(
+            &qualified, &labels, &filter, window, bucket_ms,
+        );
         let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
-            &qualified, &filter, window, bucket_ms,
+            &qualified, &labels, &filter, window, bucket_ms,
         );
         let wide = run_name_projection::<pulsus_read::metrics::rows::SeriesRow>(
             &client,

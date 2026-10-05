@@ -166,12 +166,13 @@ impl PromqlRe2Fallback {
 /// added without the build failing here — the same "adding a variant
 /// breaks the build" property the `MatchOp` arms already carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MatcherTarget {
-    /// Ordinary label matchers, read out of the stored JSON blob.
+pub(super) enum MatcherTarget<'a> {
+    /// Ordinary label matchers, read out of the stored JSON blob in
+    /// `table` (`metric_labels`, one row per label set, issue #623).
     /// `JSONExtractString` returns `''` for a missing key, which is
     /// Prometheus's absent-label rule and matches `super::labels`'
     /// in-process `""` — load-bearing for the cache-vs-SQL differential.
-    Labels,
+    Labels { table: &'a str },
     /// `__name__` matchers (issue #96's degraded-cache discovery probe),
     /// which address the **`metric_name` column** — the leading
     /// primary-key component of `metric_series`, never a stored label
@@ -240,7 +241,7 @@ impl SeriesWhere {
         window: DataWindow,
         bucket_ms: i64,
         matchers: &[LabelMatcher],
-        target: MatcherTarget,
+        target: MatcherTarget<'_>,
     ) -> Self {
         let lower = floored_bound(window.start_ms, bucket_ms);
         let upper = floored_bound(window.end_ms, bucket_ms);
@@ -328,9 +329,9 @@ fn re2_compile_probe(matchers: &[LabelMatcher]) -> String {
 /// One matcher, against whichever column `target` names. Label keys are
 /// always string literals (see `super::sql`'s escaping table) — never
 /// `ch_ident`, which is reserved for trusted schema identifiers.
-fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
+fn predicate(m: &LabelMatcher, target: MatcherTarget<'_>) -> String {
     let column = match target {
-        MatcherTarget::Labels => format!("JSONExtractString(labels, {})", ch_string(&m.key)),
+        MatcherTarget::Labels { .. } => format!("JSONExtractString(labels, {})", ch_string(&m.key)),
         MatcherTarget::MetricNameColumn => "metric_name".to_string(),
     };
     match m.op {
@@ -360,7 +361,12 @@ mod tests {
         }
     }
 
-    fn tail(matchers: &[LabelMatcher], target: MatcherTarget) -> String {
+    /// The label table every `Labels` case below renders against.
+    const LABELS: MatcherTarget<'static> = MatcherTarget::Labels {
+        table: "metric_labels",
+    };
+
+    fn tail(matchers: &[LabelMatcher], target: MatcherTarget<'_>) -> String {
         SeriesWhere::new(window(), 3_600_000, matchers, target)
             .where_tail()
             .to_string()
@@ -456,7 +462,7 @@ mod tests {
             declared("pub"),
             [
                 "pub(crate) struct PromqlRe2Fallback(());",
-                "pub(super) enum MatcherTarget {",
+                "pub(super) enum MatcherTarget<'a> {",
                 "pub(super) struct SeriesWhere {",
                 "pub(super) fn new(",
                 "pub(super) fn where_tail(&self) -> &str {",
@@ -548,7 +554,7 @@ mod tests {
     fn a_rendered_regex_and_its_compile_probe_are_inseparable() {
         let regex_ops = [MatchOp::Re, MatchOp::Nre];
         let literal_ops = [MatchOp::Eq, MatchOp::Neq];
-        for target in [MatcherTarget::Labels, MatcherTarget::MetricNameColumn] {
+        for target in [LABELS, MatcherTarget::MetricNameColumn] {
             for op in regex_ops {
                 let rendered = tail(&[m(op, "job", "5..")], target);
                 assert!(rendered.contains("match("), "{op:?}/{target:?}: {rendered}");
@@ -572,7 +578,7 @@ mod tests {
         }
         // The empty set is the `discovery_fetch_multi` shape: bound only.
         assert_eq!(
-            tail(&[], MatcherTarget::Labels),
+            tail(&[], LABELS),
             "unix_milli >= 0 AND unix_milli <= 3600000"
         );
     }
@@ -588,7 +594,7 @@ mod tests {
                 m(MatchOp::Eq, "job", "api"),
                 m(MatchOp::Nre, "env", "dev"),
             ],
-            MatcherTarget::Labels,
+            LABELS,
         );
         assert!(
             rendered.starts_with(
@@ -604,7 +610,7 @@ mod tests {
     /// docs/schemas.md §2.1).
     #[test]
     fn the_matcher_target_selects_the_column() {
-        let labels = tail(&[m(MatchOp::Re, "job", "api")], MatcherTarget::Labels);
+        let labels = tail(&[m(MatchOp::Re, "job", "api")], LABELS);
         assert!(labels.contains("match(JSONExtractString(labels, 'job'), '(?-s)^(?:api)$')"));
 
         let names = tail(
@@ -613,5 +619,38 @@ mod tests {
         );
         assert!(names.contains("match(metric_name, '(?-s)^(?:up.*)$')"));
         assert!(!names.contains("JSONExtractString"));
+    }
+
+    /// **Issue #623: label matchers select fingerprints from the label
+    /// table.** `metric_series` holds no label text, so the matchers become
+    /// one sub-query over the one-row-per-label-set table, and the window
+    /// bound and its compile probe stay on the series rows.
+    #[test]
+    fn label_matchers_render_one_subquery_over_the_label_table() {
+        let rendered = tail(
+            &[
+                m(MatchOp::Eq, "job", "api"),
+                m(MatchOp::Re, "status", "5.."),
+            ],
+            LABELS,
+        );
+        assert_eq!(
+            rendered,
+            "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20 )"
+        );
+        // The name target is a column of the series rows themselves.
+        assert_eq!(
+            tail(
+                &[m(MatchOp::Neq, "__name__", "up")],
+                MatcherTarget::MetricNameColumn
+            ),
+            "unix_milli >= 0 AND unix_milli <= 3600000\n  AND metric_name != 'up'"
+        );
     }
 }

@@ -322,6 +322,7 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
     LabelCacheConfig {
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
+        labels_table: format!("metric_labels{dist}"),
         bucket_ms: config.reader.series_activity_bucket.0.as_millis() as i64,
         window_ms: config.reader.cache_window.0.as_millis() as i64,
         cache_max_series: config.reader.cache_max_series,
@@ -359,6 +360,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         db: config.clickhouse.database.clone(),
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),
+        labels_table: format!("metric_labels{dist}"),
         metadata_table: "metric_metadata".to_string(),
         // M7-A5a: the dual-read's complementary histogram table, `_dist`-
         // aware exactly like `samples_table` (co-sharded Metrics family).

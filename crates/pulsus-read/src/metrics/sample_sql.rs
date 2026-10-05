@@ -83,6 +83,7 @@ pub fn subquery_predicate(subquery: &str) -> String {
 /// stability is the caller's responsibility, not re-derived here.
 pub fn sample_fetch(
     table: &str,
+    _hist_table: &str,
     metric_name: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
@@ -102,6 +103,7 @@ pub fn sample_fetch(
 /// giant `IN` list (edge case 6, AC).
 pub fn sample_fetch_subquery(
     table: &str,
+    _hist_table: &str,
     metric_name: &str,
     subquery: &str,
     lower_excl_ms: i64,
@@ -129,6 +131,7 @@ pub fn sample_fetch_subquery(
 /// `(metric_name, fingerprint)` series ([`super::sample_rows::MultiSampleRow`]).
 pub fn sample_fetch_multi(
     table: &str,
+    _hist_table: &str,
     metric_names: &[String],
     fps: &[FpLiteral],
     lower_excl_ms: i64,
@@ -296,6 +299,7 @@ mod tests {
     fn sample_fetch_renders_the_schemas_md_2_3_shape() {
         let sql = sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             "http_requests_total",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -320,6 +324,7 @@ mod tests {
     fn sample_fetch_window_is_left_open_right_closed() {
         let sql = sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             "up",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -333,14 +338,21 @@ mod tests {
 
     #[test]
     fn sample_fetch_of_an_empty_fingerprint_list_renders_empty_parens() {
-        let sql = sample_fetch("metric_samples", "up", &[], 0, 100);
+        let sql = sample_fetch("metric_samples", "metric_hist_samples", "up", &[], 0, 100);
         assert!(sql.contains("fingerprint IN ()"));
     }
 
     #[test]
     fn sample_fetch_subquery_inlines_the_subquery_verbatim() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", "up", subquery, 0, 100);
+        let sql = sample_fetch_subquery(
+            "metric_samples",
+            "metric_hist_samples",
+            "up",
+            subquery,
+            0,
+            100,
+        );
         assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
         assert!(!sql.contains("IN (SELECT fingerprint FROM metric_series"));
     }
@@ -348,7 +360,14 @@ mod tests {
     #[test]
     fn sample_fetch_subquery_never_materializes_a_giant_in_list() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", "up", subquery, 0, 100);
+        let sql = sample_fetch_subquery(
+            "metric_samples",
+            "metric_hist_samples",
+            "up",
+            subquery,
+            0,
+            100,
+        );
         // No comma-separated numeric literal list anywhere in this SQL.
         assert!(!sql.contains("IN (1,"));
     }
@@ -358,6 +377,7 @@ mod tests {
         let payload = "up'; DROP TABLE metric_samples; --";
         let sql = sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             payload,
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -409,6 +429,7 @@ mod tests {
     fn sample_fetch_multi_renders_the_flat_in_in_shape() {
         let sql = sample_fetch_multi(
             "metric_samples",
+            "metric_hist_samples",
             &["foo_total".to_string(), "bar_total".to_string()],
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -432,6 +453,7 @@ mod tests {
     fn sample_fetch_multi_window_is_left_open_right_closed() {
         let sql = sample_fetch_multi(
             "metric_samples",
+            "metric_hist_samples",
             &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -446,6 +468,7 @@ mod tests {
         let payload = "up'; DROP TABLE metric_samples; --".to_string();
         let sql = sample_fetch_multi(
             "metric_samples",
+            "metric_hist_samples",
             std::slice::from_ref(&payload),
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -461,6 +484,7 @@ mod tests {
     fn sample_fetch_single_name_shape_is_untouched_by_the_multi_builder() {
         let sql = sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             "up",
             &[
                 Fingerprint::from_raw(1).sql_literal(),
@@ -578,6 +602,7 @@ mod tests {
     fn ac7a_chunks_float_and_hist_predicates_are_identical() {
         let float = sample_fetch(
             "metric_samples",
+            "metric_hist_samples",
             "up",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -607,7 +632,14 @@ mod tests {
     #[test]
     fn ac7a_fallback_float_and_hist_predicates_are_identical() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let float = sample_fetch_subquery("metric_samples", "up", subquery, 1_000, 2_000);
+        let float = sample_fetch_subquery(
+            "metric_samples",
+            "metric_hist_samples",
+            "up",
+            subquery,
+            1_000,
+            2_000,
+        );
         let hist = hist_sample_fetch_subquery("metric_hist_samples", "up", subquery, 1_000, 2_000);
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
     }
@@ -619,6 +651,7 @@ mod tests {
         let names = vec!["a_seconds".to_string(), "b_seconds".to_string()];
         let float = sample_fetch_multi(
             "metric_samples",
+            "metric_hist_samples",
             &names,
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -638,5 +671,105 @@ mod tests {
             2_000,
         );
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
+    }
+
+    // -- issue #623: one statement reads both sample tables ------------
+
+    /// **The concrete-name fetch is one statement over both tables.** The
+    /// float branch fills the histogram columns with their empty values and
+    /// the histogram branch fills `value` with zero; `is_hist` says which
+    /// table a row came from. The order is the one both fetches had.
+    #[test]
+    fn sample_fetch_reads_both_tables_in_one_statement() {
+        let sql = sample_fetch(
+            "metric_samples",
+            "metric_hist_samples",
+            "http_requests_total",
+            &[fp(101), fp(205)],
+            1_000,
+            2_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, unix_milli, is_hist, value, schema, zero_threshold, zero_count, \
+             count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
+             neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, unix_milli, CAST(0, 'UInt8') AS is_hist, value, \
+             CAST(0, 'Int8') AS schema, CAST(0, 'Float64') AS zero_threshold, \
+             CAST(0, 'UInt64') AS zero_count, CAST(0, 'UInt64') AS count, \
+             CAST(0, 'Float64') AS sum, CAST([], 'Array(Int32)') AS pos_span_offsets, \
+             CAST([], 'Array(UInt32)') AS pos_span_lengths, \
+             CAST([], 'Array(Int64)') AS pos_bucket_deltas, \
+             CAST([], 'Array(Int32)') AS neg_span_offsets, \
+             CAST([], 'Array(UInt32)') AS neg_span_lengths, \
+             CAST([], 'Array(Int64)') AS neg_bucket_deltas, \
+             CAST([], 'Array(Float64)') AS custom_values, \
+             CAST(0, 'UInt8') AS counter_reset_hint\n\
+             \x20 FROM metric_samples\n\
+             \x20 PREWHERE metric_name = 'http_requests_total'\n\
+             \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 UNION ALL\n\
+             \x20 SELECT fingerprint, unix_milli, CAST(1, 'UInt8') AS is_hist, \
+             CAST(0, 'Float64') AS value, schema, zero_threshold, zero_count, count, sum, \
+             pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
+             neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
+             \x20 FROM metric_hist_samples\n\
+             \x20 PREWHERE metric_name = 'http_requests_total'\n\
+             \x20 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             )\n\
+             ORDER BY fingerprint, unix_milli"
+        );
+    }
+
+    /// The fallback and fan-out fetches take the same union: both tables,
+    /// one statement, each branch carrying the same selection.
+    #[test]
+    fn the_fallback_and_fan_out_fetches_read_both_tables_in_one_statement() {
+        let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
+        let fallback = sample_fetch_subquery(
+            "metric_samples",
+            "metric_hist_samples",
+            "up",
+            subquery,
+            0,
+            100,
+        );
+        let multi = sample_fetch_multi(
+            "metric_samples",
+            "metric_hist_samples",
+            &["a".to_string(), "b".to_string()],
+            &[fp(1)],
+            0,
+            100,
+        );
+        for (sql, selection, order) in [
+            (&fallback, subquery, "\nORDER BY fingerprint, unix_milli"),
+            (
+                &multi,
+                "fingerprint IN (toUInt128('1'))",
+                "\nORDER BY metric_name, fingerprint, unix_milli",
+            ),
+        ] {
+            assert_eq!(sql.matches("UNION ALL").count(), 1, "{sql}");
+            assert_eq!(sql.matches("FROM metric_samples\n").count(), 1, "{sql}");
+            assert_eq!(
+                sql.matches("FROM metric_hist_samples\n").count(),
+                1,
+                "{sql}"
+            );
+            assert_eq!(
+                sql.matches(selection).count(),
+                2,
+                "both branches select: {sql}"
+            );
+            assert!(sql.ends_with(order), "{sql}");
+        }
+        assert!(
+            multi.starts_with("SELECT metric_name, fingerprint, unix_milli, is_hist, value,"),
+            "{multi}"
+        );
     }
 }

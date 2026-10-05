@@ -109,6 +109,7 @@ fn freeze_config() -> MetricsConfig {
         samples_table: SAMPLES.to_string(),
         hist_samples_table: HIST.to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: true,
         max_metric_fanout: 1_000,
@@ -260,7 +261,7 @@ fn render() -> String {
                 (_, Some(n)) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch(SAMPLES, n, &fps(), lo, hi),
+                        &sample_sql::sample_fetch(SAMPLES, HIST, n, &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
@@ -270,7 +271,7 @@ fn render() -> String {
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(SAMPLES, HIST, &names(), &fps(), lo, hi),
                     );
                     emit(
                         &mut out,

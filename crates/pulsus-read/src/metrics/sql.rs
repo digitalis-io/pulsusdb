@@ -53,6 +53,7 @@ use super::series_where::{MatcherTarget, SeriesWhere};
 /// also states the one unsealed crossing rustc does not police).
 fn base_where(
     series_table: &str,
+    labels_table: &str,
     metric_name: &str,
     window: DataWindow,
     bucket_ms: i64,
@@ -61,7 +62,15 @@ fn base_where(
     format!(
         "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
         ch_string(metric_name),
-        SeriesWhere::new(window, bucket_ms, matchers, MatcherTarget::Labels).where_tail()
+        SeriesWhere::new(
+            window,
+            bucket_ms,
+            matchers,
+            MatcherTarget::Labels {
+                table: labels_table
+            }
+        )
+        .where_tail()
     )
 }
 
@@ -74,6 +83,7 @@ fn base_where(
 /// fallback shape.
 pub fn historical_series_subquery(
     series_table: &str,
+    labels_table: &str,
     metric_name: &str,
     window: DataWindow,
     bucket_ms: i64,
@@ -81,7 +91,14 @@ pub fn historical_series_subquery(
 ) -> String {
     format!(
         "SELECT fingerprint\n{}",
-        base_where(series_table, metric_name, window, bucket_ms, matchers)
+        base_where(
+            series_table,
+            labels_table,
+            metric_name,
+            window,
+            bucket_ms,
+            matchers
+        )
     )
 }
 
@@ -121,6 +138,7 @@ pub fn info_series_cardinality_probe(series_subquery_sql: &str, cap: u64) -> Str
 /// themselves rather than an `IN (...)` sub-query.
 pub fn historical_resolution_query(
     series_table: &str,
+    labels_table: &str,
     metric_name: &str,
     window: DataWindow,
     bucket_ms: i64,
@@ -128,7 +146,14 @@ pub fn historical_resolution_query(
 ) -> String {
     let mut sql = format!(
         "SELECT fingerprint, labels\n{}",
-        base_where(series_table, metric_name, window, bucket_ms, matchers)
+        base_where(
+            series_table,
+            labels_table,
+            metric_name,
+            window,
+            bucket_ms,
+            matchers
+        )
     );
     sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
     sql
@@ -176,13 +201,14 @@ pub fn series_labels_by_fingerprint(
 /// to — needed to populate `__name__` per row.
 pub fn discovery_query(
     series_table: &str,
+    labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
     format!(
         "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
-        discovery_from_where(series_table, filter, window, bucket_ms)
+        discovery_from_where(series_table, labels_table, filter, window, bucket_ms)
     )
 }
 
@@ -196,11 +222,19 @@ pub fn discovery_query(
 /// what would catch that.
 fn discovery_from_where(
     series_table: &str,
+    labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let tail = SeriesWhere::new(window, bucket_ms, &filter.matchers, MatcherTarget::Labels);
+    let tail = SeriesWhere::new(
+        window,
+        bucket_ms,
+        &filter.matchers,
+        MatcherTarget::Labels {
+            table: labels_table,
+        },
+    );
     match &filter.metric_name {
         Some(name) => format!(
             "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
@@ -251,13 +285,14 @@ fn discovery_from_where(
 /// measured gain. Scale-dependent early termination routes to issue #25.
 pub fn discovery_distinct_names_query(
     series_table: &str,
+    labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
     format!(
         "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
-        discovery_from_where(series_table, filter, window, bucket_ms)
+        discovery_from_where(series_table, labels_table, filter, window, bucket_ms)
     )
 }
 
@@ -281,6 +316,7 @@ pub fn discovery_distinct_names_query(
 /// per series, as in [`discovery_query`].
 pub fn discovery_fetch_multi(
     series_table: &str,
+    labels_table: &str,
     metric_names: &[String],
     fps: &[FpLiteral],
     window: DataWindow,
@@ -298,7 +334,14 @@ pub fn discovery_fetch_multi(
         .join(", ");
     // No matchers: the resolved `(name, fingerprint)` set IS the answer, so
     // the tail is a bare window bound and carries no probe.
-    let tail = SeriesWhere::new(window, bucket_ms, &[], MatcherTarget::Labels);
+    let tail = SeriesWhere::new(
+        window,
+        bucket_ms,
+        &[],
+        MatcherTarget::Labels {
+            table: labels_table,
+        },
+    );
     format!(
         "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND {}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
         tail.where_tail()
@@ -363,6 +406,7 @@ pub fn distinct_metric_names_probe(
 /// each primary-key-pruned metric.
 pub fn discovery_fetch_by_names(
     series_table: &str,
+    labels_table: &str,
     metric_names: &[String],
     matchers: &[LabelMatcher],
     window: DataWindow,
@@ -373,7 +417,14 @@ pub fn discovery_fetch_by_names(
         .map(|n| ch_string(n))
         .collect::<Vec<_>>()
         .join(", ");
-    let tail = SeriesWhere::new(window, bucket_ms, matchers, MatcherTarget::Labels);
+    let tail = SeriesWhere::new(
+        window,
+        bucket_ms,
+        matchers,
+        MatcherTarget::Labels {
+            table: labels_table,
+        },
+    );
     let mut sql = format!(
         "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND {}",
         tail.where_tail()
@@ -442,6 +493,7 @@ mod tests {
     fn historical_series_subquery_renders_bucket_floored_bounds() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "http_requests_total",
             window(),
             3_600_000,
@@ -456,6 +508,7 @@ mod tests {
     fn historical_series_subquery_has_no_order_by_or_limit_1_by() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -472,7 +525,14 @@ mod tests {
     /// `LIMIT cap+1` applied over the deduplicated set.
     #[test]
     fn info_series_cardinality_probe_dedups_fingerprints_before_the_cap_plus_one_limit() {
-        let base = historical_series_subquery("metric_series", "target_info", window(), 1, &[]);
+        let base = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "target_info",
+            window(),
+            1,
+            &[],
+        );
         let sql = info_series_cardinality_probe(&base, 999);
         assert_eq!(
             sql,
@@ -487,14 +547,28 @@ mod tests {
     /// overflow or panic — `saturating_add(1)` clamps to `u64::MAX`.
     #[test]
     fn info_series_cardinality_probe_does_not_overflow_at_max_cap() {
-        let base = historical_series_subquery("metric_series", "target_info", window(), 1, &[]);
+        let base = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "target_info",
+            window(),
+            1,
+            &[],
+        );
         let sql = info_series_cardinality_probe(&base, u64::MAX);
         assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
     }
 
     #[test]
     fn historical_resolution_query_dedups_with_limit_1_by() {
-        let sql = historical_resolution_query("metric_series", "up", window(), 3_600_000, &[]);
+        let sql = historical_resolution_query(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[],
+        );
         assert!(sql.starts_with("SELECT fingerprint, labels\nFROM metric_series"));
         assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
     }
@@ -531,6 +605,7 @@ mod tests {
     fn eq_matcher_renders_json_extract_equality() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -546,7 +621,14 @@ mod tests {
             op: MatchOp::Neq,
             value: "api".to_string(),
         };
-        let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[m],
+        );
         assert!(sql.contains("JSONExtractString(labels, 'job') != 'api'"));
     }
 
@@ -557,7 +639,14 @@ mod tests {
             op: MatchOp::Re,
             value: "5..".to_string(),
         };
-        let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[m],
+        );
         assert!(sql.contains("match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
     }
 
@@ -568,7 +657,14 @@ mod tests {
             op: MatchOp::Nre,
             value: "5..".to_string(),
         };
-        let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[m],
+        );
         assert!(sql.contains("NOT match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
     }
 
@@ -589,6 +685,7 @@ mod tests {
     fn every_rendered_pattern_carries_re2s_dot_excludes_newline_flag() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -633,6 +730,7 @@ mod tests {
         // compile probe identically — they share the renderer.
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -653,6 +751,7 @@ mod tests {
     fn a_regex_matcher_adds_a_constant_compile_probe_to_the_lower_bound() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -678,6 +777,7 @@ mod tests {
         };
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "up",
             window(),
             3_600_000,
@@ -706,8 +806,14 @@ mod tests {
                 value: "api".to_string(),
             }],
         ] {
-            let sql =
-                historical_series_subquery("metric_series", "up", window(), 3_600_000, &matchers);
+            let sql = historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "up",
+                window(),
+                3_600_000,
+                &matchers,
+            );
             assert!(
                 sql.contains("AND unix_milli >= 0 AND unix_milli <= 3600000"),
                 "got: {sql}"
@@ -750,6 +856,7 @@ mod tests {
         let built = [
             historical_series_subquery(
                 "metric_series",
+                "metric_labels",
                 "up",
                 window(),
                 3_600_000,
@@ -757,21 +864,47 @@ mod tests {
             ),
             historical_resolution_query(
                 "metric_series",
+                "metric_labels",
                 "up",
                 window(),
                 3_600_000,
                 &[re("status", "5..")],
             ),
-            discovery_query("metric_series", &filter, window(), 3_600_000),
-            discovery_query("metric_series", &nameless, window(), 3_600_000),
+            discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            ),
+            discovery_query(
+                "metric_series",
+                "metric_labels",
+                &nameless,
+                window(),
+                3_600_000,
+            ),
             // Issue #472's narrow projection shares `discovery_from_where`
             // with `discovery_query`, so it inherits the same sealed tail —
             // listed here anyway, because the list is what says a builder
             // was considered.
-            discovery_distinct_names_query("metric_series", &filter, window(), 3_600_000),
-            discovery_distinct_names_query("metric_series", &nameless, window(), 3_600_000),
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            ),
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &nameless,
+                window(),
+                3_600_000,
+            ),
             discovery_fetch_by_names(
                 "metric_series",
+                "metric_labels",
                 &["up".to_string()],
                 &[re("status", "5..")],
                 window(),
@@ -792,6 +925,7 @@ mod tests {
     fn multiple_matchers_are_all_anded_together() {
         let sql = historical_series_subquery(
             "metric_series",
+            "metric_labels",
             "http_requests_total",
             window(),
             3_600_000,
@@ -812,7 +946,14 @@ mod tests {
     fn label_key_injection_stays_inside_one_literal() {
         let payload = "job'; DROP TABLE metric_series; --\n\t\0";
         let m = eq(payload, "api");
-        let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[m],
+        );
         assert!(sql.contains(&format!(
             "JSONExtractString(labels, {})",
             ch_string(payload)
@@ -832,7 +973,14 @@ mod tests {
             op: MatchOp::Re,
             value: payload.to_string(),
         };
-        let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            "up",
+            window(),
+            3_600_000,
+            &[m],
+        );
         let expected = anchored_re2_literal_for_test(payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!(
@@ -856,8 +1004,14 @@ mod tests {
         let name_payload = "up'; DROP TABLE metric_series; --";
         let value_payload = "api' OR '1'='1";
         let m = eq("job", value_payload);
-        let sql =
-            historical_series_subquery("metric_series", name_payload, window(), 3_600_000, &[m]);
+        let sql = historical_series_subquery(
+            "metric_series",
+            "metric_labels",
+            name_payload,
+            window(),
+            3_600_000,
+            &[m],
+        );
         assert!(sql.contains(&format!("metric_name = {}", ch_string(name_payload))));
         assert!(sql.contains(&format!(
             "JSONExtractString(labels, 'job') = {}",
@@ -889,7 +1043,13 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
-        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        let sql = discovery_query(
+            "metric_series",
+            "metric_labels",
+            &filter,
+            window(),
+            3_600_000,
+        );
         assert!(sql.contains("metric_name = 'up'"));
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
         assert!(sql.starts_with("SELECT fingerprint, metric_name, labels\nFROM metric_series"));
@@ -899,7 +1059,13 @@ mod tests {
     #[test]
     fn discovery_query_without_a_metric_name_has_no_metric_name_predicate() {
         let filter = DiscoveryFilter::default();
-        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        let sql = discovery_query(
+            "metric_series",
+            "metric_labels",
+            &filter,
+            window(),
+            3_600_000,
+        );
         assert!(!sql.contains("metric_name ="));
         assert!(sql.contains("unix_milli >= 0 AND unix_milli <= 3600000"));
     }
@@ -911,7 +1077,13 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
-        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        let sql = discovery_query(
+            "metric_series",
+            "metric_labels",
+            &filter,
+            window(),
+            3_600_000,
+        );
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
     }
 
@@ -923,7 +1095,13 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![],
         };
-        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        let sql = discovery_query(
+            "metric_series",
+            "metric_labels",
+            &filter,
+            window(),
+            3_600_000,
+        );
         assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }
@@ -987,11 +1165,23 @@ mod tests {
     #[test]
     fn discovery_query_is_its_projection_plus_the_shared_head_plus_its_suffix() {
         for (what, filter) in discovery_filter_table() {
-            let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+            let sql = discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            );
             let expected = format!(
                 "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli \
                  DESC\nLIMIT 1 BY metric_name, fingerprint",
-                discovery_from_where("metric_series", &filter, window(), 3_600_000)
+                discovery_from_where(
+                    "metric_series",
+                    "metric_labels",
+                    &filter,
+                    window(),
+                    3_600_000
+                )
             );
             assert_eq!(sql, expected, "{what}");
         }
@@ -1009,6 +1199,7 @@ mod tests {
         assert_eq!(
             discovery_distinct_names_query(
                 "metric_series",
+                "metric_labels",
                 &DiscoveryFilter::default(),
                 plain_window,
                 3_600_000
@@ -1022,7 +1213,13 @@ mod tests {
             matchers: vec![eq("job", "api")],
         };
         assert_eq!(
-            discovery_distinct_names_query("metric_series", &scoped, plain_window, 3_600_000),
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &scoped,
+                plain_window,
+                3_600_000
+            ),
             "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE metric_name = 'up'\n  AND \
              unix_milli >= 0 AND unix_milli <= 3600000\n  AND JSONExtractString(labels, 'job') = \
              'api'\nORDER BY metric_name"
@@ -1038,9 +1235,20 @@ mod tests {
     #[test]
     fn the_two_discovery_builders_share_one_where_byte_for_byte() {
         for (what, filter) in discovery_filter_table() {
-            let wide = discovery_query("metric_series", &filter, window(), 3_600_000);
-            let narrow =
-                discovery_distinct_names_query("metric_series", &filter, window(), 3_600_000);
+            let wide = discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            );
+            let narrow = discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            );
             let head = |sql: &str| -> String {
                 let from = sql
                     .find("FROM ")
@@ -1060,6 +1268,7 @@ mod tests {
     fn discovery_fetch_multi_renders_the_flat_in_by_in_shape() {
         let sql = discovery_fetch_multi(
             "metric_series",
+            "metric_labels",
             &["up".to_string(), "up_alias".to_string()],
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -1084,6 +1293,7 @@ mod tests {
     fn discovery_fetch_multi_floors_both_window_bounds_to_the_bucket() {
         let sql = discovery_fetch_multi(
             "metric_series",
+            "metric_labels",
             &["up".to_string()],
             &[Fingerprint::from_raw(7).sql_literal()],
             DataWindow {
@@ -1102,6 +1312,7 @@ mod tests {
     fn discovery_fetch_multi_always_constrains_the_request_window() {
         let sql = discovery_fetch_multi(
             "metric_series",
+            "metric_labels",
             &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
@@ -1116,6 +1327,7 @@ mod tests {
         let payload = "up'; DROP TABLE metric_series; --";
         let sql = discovery_fetch_multi(
             "metric_series",
+            "metric_labels",
             &[payload.to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
@@ -1231,6 +1443,7 @@ mod tests {
     fn discovery_fetch_by_names_renders_the_flat_name_in_with_label_matchers() {
         let sql = discovery_fetch_by_names(
             "metric_series",
+            "metric_labels",
             &["up".to_string(), "up_alias".to_string()],
             &[eq("job", "api")],
             window(),
@@ -1252,6 +1465,7 @@ mod tests {
     fn discovery_fetch_by_names_has_no_fingerprint_in_component() {
         let sql = discovery_fetch_by_names(
             "metric_series",
+            "metric_labels",
             &["up".to_string()],
             &[],
             window(),
@@ -1268,6 +1482,7 @@ mod tests {
         let payload = "up'; DROP TABLE metric_series; --";
         let sql = discovery_fetch_by_names(
             "metric_series",
+            "metric_labels",
             &[payload.to_string()],
             &[],
             window(),
@@ -1337,5 +1552,116 @@ mod tests {
         let sql = metadata_query("metric_metadata", Some(payload), None);
         assert!(sql.contains(&format!("WHERE metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
+    }
+
+    // -- issue #623: labels come from the label table --------------------
+
+    /// **Discovery reads activity from the series table and labels from the
+    /// label table.** The matchers select fingerprints out of the label
+    /// table; the join puts each surviving series' label set back.
+    #[test]
+    fn discovery_query_joins_the_matched_series_to_their_label_sets() {
+        let filter = DiscoveryFilter {
+            metric_name: Some("up".to_string()),
+            name_matchers: Vec::new(),
+            matchers: vec![eq("job", "api")],
+        };
+        let from_where = "FROM metric_series\n\
+             WHERE metric_name = 'up'\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+             \x20 )";
+        assert_eq!(
+            discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000
+            ),
+            format!(
+                "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
+                 FROM (\n\
+                 SELECT DISTINCT metric_name, fingerprint\n\
+                 {from_where}\n\
+                 ) AS s\n\
+                 INNER JOIN (\n\
+                 SELECT fingerprint, any(labels) AS label_set\n\
+                 FROM metric_labels\n\
+                 WHERE fingerprint IN (\n\
+                 SELECT fingerprint\n\
+                 {from_where}\n\
+                 )\n\
+                 GROUP BY fingerprint\n\
+                 ) AS l USING (fingerprint)\n\
+                 ORDER BY metric_name, fingerprint"
+            )
+        );
+    }
+
+    /// No builder reads label text from the series table: every one that
+    /// returns labels or filters on them names the label table.
+    #[test]
+    fn every_label_reading_builder_names_the_label_table() {
+        let filter = DiscoveryFilter {
+            metric_name: None,
+            name_matchers: Vec::new(),
+            matchers: vec![eq("job", "api")],
+        };
+        let fps = [Fingerprint::from_raw(7).sql_literal()];
+        for sql in [
+            historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "up",
+                window(),
+                3_600_000,
+                &[eq("job", "api")],
+            ),
+            historical_resolution_query(
+                "metric_series",
+                "metric_labels",
+                "up",
+                window(),
+                3_600_000,
+                &[],
+            ),
+            discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            ),
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window(),
+                3_600_000,
+            ),
+            discovery_fetch_multi(
+                "metric_series",
+                "metric_labels",
+                &["up".to_string()],
+                &fps,
+                window(),
+                3_600_000,
+            ),
+            discovery_fetch_by_names(
+                "metric_series",
+                "metric_labels",
+                &["up".to_string()],
+                &[eq("job", "api")],
+                window(),
+                3_600_000,
+            ),
+        ] {
+            assert!(sql.contains("FROM metric_labels\n"), "{sql}");
+            assert!(!sql.contains("LIMIT 1 BY"), "{sql}");
+        }
     }
 }

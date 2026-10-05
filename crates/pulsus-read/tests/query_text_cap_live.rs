@@ -213,6 +213,7 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     let fps = oversized_fingerprint_set();
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         "metric_samples",
+        "metric_hist_samples",
         &["up".to_string()],
         &fps,
         0,

@@ -2022,8 +2022,10 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     );
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
+    let hist = format!("{db}.metric_hist_samples");
     pulsus_read::metrics::sample_sql::sample_fetch(
         &table,
+        &hist,
         plan.selectors[0]
             .metric_name
             .as_deref()
@@ -2158,8 +2160,10 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     assert_eq!(plan.selectors[0].metric_name, None, "name-less selector");
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
+    let hist = format!("{db}.metric_hist_samples");
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         &table,
+        &hist,
         &["mq".to_string(), "mq2".to_string()],
         &[
             Fingerprint::from_raw(u128::from(MFP)).sql_literal(),
@@ -2258,8 +2262,10 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
 
     let (lower_excl, upper_incl) = info_sel.fetch_window(&params);
     let samples_table = format!("{db}.metric_samples");
+    let hist_table = format!("{db}.metric_hist_samples");
     let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
         &samples_table,
+        &hist_table,
         "target_info",
         &[Fingerprint::from_raw(u128::from(INFO_FP)).sql_literal()],
         lower_excl,
@@ -2297,8 +2303,10 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
         start_ms: now_ms - 3_600_000,
         end_ms: now_ms,
     };
+    let labels_table = format!("{db}.metric_labels");
     let series_sql = pulsus_read::metrics::sql::historical_series_subquery(
         &series_table,
+        &labels_table,
         "target_info",
         window,
         1,
@@ -2387,8 +2395,10 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
         end_ms: now_ms,
     };
     let table = format!("{db}.metric_series");
+    let labels = format!("{db}.metric_labels");
     let sql = pulsus_read::metrics::sql::discovery_fetch_multi(
         &table,
+        &labels,
         &["sv".to_string(), "sv2".to_string()],
         &[
             Fingerprint::from_raw(u128::from(SFP1)).sql_literal(),
@@ -2478,13 +2488,15 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
         end_ms: now_ms,
     };
     let table = format!("{db}.metric_series");
+    let labels = format!("{db}.metric_labels");
     let filter = unfiltered_discovery_filter();
     // `bucket_ms = 1` floors to the exact bounds, so the seeded now-stamped
     // rows stay inside the queried window and the analysis runs against a
     // populated part.
-    let narrow_sql =
-        pulsus_read::metrics::sql::discovery_distinct_names_query(&table, &filter, window, 1);
-    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &filter, window, 1);
+    let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
+        &table, &labels, &filter, window, 1,
+    );
+    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &labels, &filter, window, 1);
 
     let narrow = explain(&client, &narrow_sql).await;
     assert_eq!(
@@ -2551,6 +2563,7 @@ async fn discovery_distinct_names_uses_the_sorted_key_distinct_transform() {
     let table = format!("{db}.metric_series");
     let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
         &table,
+        &format!("{db}.metric_labels"),
         &unfiltered_discovery_filter(),
         window,
         1,
@@ -2616,6 +2629,7 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
     // floors to the exact bounds so the seeded rows stay in-window.
     let sql = pulsus_read::metrics::sql::discovery_fetch_by_names(
         &table,
+        &format!("{db}.metric_labels"),
         &["sv".to_string(), "sv2".to_string()],
         &[pulsus_read::metrics::LabelMatcher {
             key: "job".to_string(),
@@ -2683,6 +2697,7 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
     let subquery = |op| {
         pulsus_read::metrics::sql::historical_series_subquery(
             &table,
+            &format!("{db}.metric_labels"),
             "sv",
             window,
             1,
