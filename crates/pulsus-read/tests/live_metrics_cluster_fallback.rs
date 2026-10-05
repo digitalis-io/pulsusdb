@@ -533,6 +533,197 @@ async fn engine_returns_exact_samples_across_shards_via_the_local_product_mode_f
     drop_database(&shard1_bootstrap, db).await;
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct C1Row {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Runs `sql` wrapped to `fingerprint, labels` (`labels` empty where the
+/// statement has none), in the order the rows arrive.
+async fn c1_rows(
+    client: &ChClient,
+    sql: &str,
+    has_labels: bool,
+    settings: &QuerySettings,
+) -> Result<Vec<(u128, String)>, ChError> {
+    let labels = if has_labels { "toString(labels)" } else { "''" };
+    let wrapped = format!(
+        "SELECT toUInt128(fingerprint) AS fingerprint, {labels} AS labels FROM (\n{sql}\n)"
+    )
+    .replace('?', "??");
+    let mut stream = client.query_stream::<C1Row>(&wrapped, settings).await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row?;
+        out.push((row.fingerprint, row.labels));
+    }
+    Ok(out)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct C1Count {
+    rows: u64,
+    fps: u64,
+}
+
+/// One shard's own rows of `table` for the C1 fingerprints.
+async fn c1_local(shard: &ChClient, db: &str, table: &str) -> (u64, u64) {
+    let sql = format!(
+        "SELECT count() AS rows, uniqExact(fingerprint) AS fps FROM {db}.{table} \
+         WHERE fingerprint BETWEEN 1 AND 45"
+    );
+    let mut stream = shard
+        .query_stream::<C1Count>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("local {table}: {e}"));
+    let row = stream.next().await.expect("one row").expect("decode");
+    (row.rows, row.fps)
+}
+
+/// **C1 (issue #623): the label reads on a cluster are shard-local and
+/// answer each series once.** Kind-2 rows go into each shard's own
+/// `metric_landing`, so each shard's views write its own activity and label
+/// rows, as production does: fingerprints 1-20 and 41-45 on shard 1, 21-40
+/// on shard 2, and 21-25 on both. `status="500"` on 1-20, absent on 21-45,
+/// `job="api"` everywhere. Over the `_dist` tables with
+/// `distributed_product_mode = 'local'`, `status!="500"` answers exactly
+/// 21-45, each once, with `{"job":"api"}`. At default settings the scoped
+/// joins answer the same, and the nested activity read is denied (288).
+#[tokio::test]
+async fn label_reads_are_shard_local_and_answer_each_series_once() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_own_labels");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let metric_name = "c1_metric";
+    let bucket = historical_bucket();
+    let labels_of = |fp: u64| {
+        if fp <= 20 {
+            r#"{"job":"api","status":"500"}"#
+        } else {
+            r#"{"job":"api"}"#
+        }
+    };
+    let shard1_fps: Vec<u64> = (1..=20).chain(41..=45).chain(21..=25).collect();
+    let shard2_fps: Vec<u64> = (21..=40).collect();
+    let shard1 = ChClient::new(shard1_config(db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(db))
+        .await
+        .expect("connect shard2");
+    for (shard, fps) in [(&shard1, &shard1_fps), (&shard2, &shard2_fps)] {
+        let values = fps
+            .iter()
+            .map(|fp| {
+                format!(
+                    "({}, 2, '{metric_name}', {fp}, {bucket}, '{}', 0)",
+                    now_ms(),
+                    labels_of(*fp)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        shard
+            .execute(
+                &format!(
+                    "INSERT INTO metric_landing \
+                     (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                     VALUES {values}"
+                ),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .expect("seed a shard's own metric_landing");
+    }
+    for (shard, n, what) in [(&shard1, 30u64, "shard 1"), (&shard2, 20, "shard 2")] {
+        for table in ["metric_series", "metric_labels"] {
+            assert_eq!(
+                c1_local(shard, db, table).await,
+                (n, n),
+                "{what}'s own {table} rows"
+            );
+        }
+    }
+
+    let window = DataWindow {
+        start_ms: bucket,
+        end_ms: bucket,
+    };
+    let matchers = vec![pulsus_read::LabelMatcher {
+        key: "status".to_string(),
+        op: pulsus_read::MatchOp::Neq,
+        value: "500".to_string(),
+    }];
+    let named = pulsus_read::DiscoveryFilter {
+        metric_name: Some(metric_name.to_string()),
+        name_matchers: Vec::new(),
+        matchers: matchers.clone(),
+    };
+    let unnamed = pulsus_read::DiscoveryFilter {
+        metric_name: None,
+        ..named.clone()
+    };
+    let (series, labels) = ("metric_series_dist", "metric_labels_dist");
+    let bucket_ms = DEFAULT_ACTIVITY_BUCKET_MS;
+    use pulsus_read::metrics::sql;
+    let subquery =
+        historical_series_subquery(series, labels, metric_name, window, bucket_ms, &matchers);
+    let resolution =
+        sql::historical_resolution_query(series, labels, metric_name, window, bucket_ms, &matchers);
+    let discovery_named = sql::discovery_query(series, labels, &named, window, bucket_ms);
+    let discovery_unnamed = sql::discovery_query(series, labels, &unnamed, window, bucket_ms);
+
+    let want: Vec<(u128, String)> = (21..=45u128)
+        .map(|fp| (fp, r#"{"job":"api"}"#.to_string()))
+        .collect();
+    let sorted = |mut v: Vec<(u128, String)>| {
+        v.sort();
+        v
+    };
+    let local = QuerySettings::new().set("distributed_product_mode", "local");
+    let mut got = c1_rows(&shard1, &subquery, false, &local)
+        .await
+        .unwrap_or_else(|e| panic!("historical_series_subquery: {e}\n{subquery}"));
+    got.sort();
+    got.dedup();
+    assert_eq!(
+        got.into_iter().map(|(fp, _)| fp).collect::<Vec<_>>(),
+        (21..=45u128).collect::<Vec<_>>(),
+        "historical_series_subquery, as a set"
+    );
+    for (what, sql_text, settings) in [
+        ("historical_resolution_query", &resolution, &local),
+        ("discovery_query named", &discovery_named, &local),
+        ("discovery_query unnamed", &discovery_unnamed, &local),
+        (
+            "historical_resolution_query, default settings",
+            &resolution,
+            &QuerySettings::new(),
+        ),
+        (
+            "discovery_query named, default settings",
+            &discovery_named,
+            &QuerySettings::new(),
+        ),
+    ] {
+        let got = c1_rows(&shard1, sql_text, true, settings)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}\n{sql_text}"));
+        assert_eq!(sorted(got), want, "{what}: 21-45, each once\n{sql_text}");
+    }
+    match c1_rows(&shard1, &subquery, false, &QuerySettings::new()).await {
+        Err(ChError::Server { code, .. }) => assert_eq!(code, 288, "{subquery}"),
+        other => panic!(
+            "the nested activity read at default settings must be denied (288), got {other:?}"
+        ),
+    }
+
+    drop_database(&shard1_bootstrap, db).await;
+}
+
 /// Issue #623: a series is an activity row in `metric_series` and its label
 /// set, once, in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]

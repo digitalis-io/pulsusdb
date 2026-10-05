@@ -370,6 +370,41 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+/// TEST SEAM (issue #623) — never installed by `pulsus-server`. Entered by
+/// every sample statement, on all three fetch paths, at
+/// [`MetricsEngine::fetch_rows_with`] (the one point they all pass, with a
+/// sample budget). The first statement waits there until a second has
+/// entered, for at most [`StatementProbe::WAIT`]; [`Self::max_in_flight`]
+/// then says whether a selector's float and histogram reads were in flight
+/// together. A path that sent one only after the other finished parks its
+/// first for the whole wait and records one.
+#[derive(Debug)]
+#[allow(dead_code)] // STUB (issue #623, tests first)
+pub struct StatementProbe {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::watch::Sender<usize>,
+}
+
+impl StatementProbe {
+    /// How long the first statement waits for a second.
+    pub const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new() -> std::sync::Arc<Self> {
+        let (entered, _rx) = tokio::sync::watch::channel(0);
+        std::sync::Arc::new(Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            entered,
+        })
+    }
+
+    /// The most statements that were in flight at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Issue #138: the per-query fetched-sample budget
 /// ([`MetricsConfig::max_samples`] ← `reader.promql_max_samples`). One
 /// instance per [`MetricsEngine::query_inner`] call, shared by reference
@@ -446,6 +481,8 @@ pub struct MetricsEngine {
     /// one `Option` branch per selector fetch in `execute_fetch_plan` —
     /// zero atomics, zero clock.
     fetch_probe: Option<std::sync::Arc<FetchProbe>>,
+    /// TEST SEAM (issue #623): see [`StatementProbe`]. `None` in production.
+    statement_probe: Option<std::sync::Arc<StatementProbe>>,
     /// TEST SEAM (issue #549) — how many fingerprints one grouped
     /// statement carries. Always [`sample_sql::CHUNK_THRESHOLD`] in
     /// production; `pulsus-server` never calls
@@ -476,6 +513,7 @@ impl MetricsEngine {
                 crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
             )),
             fetch_probe: None,
+            statement_probe: None,
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
         }
     }
@@ -497,6 +535,14 @@ impl MetricsEngine {
     /// `fetch_probe: None`.
     pub fn with_fetch_probe(mut self, probe: std::sync::Arc<FetchProbe>) -> Self {
         self.fetch_probe = Some(probe);
+        self
+    }
+
+    /// TEST SEAM (issue #623) — installs a [`StatementProbe`]. Never called
+    /// by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_statement_probe(mut self, probe: std::sync::Arc<StatementProbe>) -> Self {
+        self.statement_probe = Some(probe);
         self
     }
 
@@ -1241,6 +1287,7 @@ impl MetricsEngine {
                 fps.dedup();
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
                     &self.config.labels_table,
+                    metric_name,
                     &sql_literals(&fps),
                 );
                 let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
@@ -3978,10 +4025,11 @@ mod tests {
         assert!(group_multi_rows(Vec::new(), &HashMap::new(), &HashMap::new()).is_empty());
     }
 
-    /// Code review round 1, finding 1: a genuine cross-pair the cache
-    /// didn't resolve (`(bbb, 7)` absent from `labels_by`) hydrates from
-    /// the fingerprint's name-invariant labels — NEVER an empty label
-    /// set.
+    /// U9 (issue #623): a pair the cache did not resolve (`(bbb, 7)`
+    /// absent from `labels_by`) never borrows another name's labels for the
+    /// same fingerprint. The engine looks such pairs up by the pair before
+    /// grouping; a pair still absent has no label row of its own and is
+    /// dropped — neither empty labels nor `aaa`'s.
     #[test]
     fn group_multi_rows_hydrates_an_unresolved_cross_pair_from_the_fingerprint_labels() {
         let rows = vec![
@@ -4005,14 +4053,31 @@ mod tests {
         );
         let mut labels_by_fp = HashMap::new();
         labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
-        assert_eq!(series.len(), 2);
-        assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
-        assert_eq!(
-            series[1].labels.get("job"),
-            Some("a"),
-            "cross-pair labels hydrated from the fingerprint, not empty: {series:?}"
-        );
+        let series = group_multi_rows(rows.clone(), &labels_by, &labels_by_fp);
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
+        let merged = group_merged_multi_rows(rows, Vec::new(), &labels_by, &labels_by_fp).unwrap();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+    }
+
+    /// U9 (issue #623): a fingerprint the hydration found no label row for
+    /// yields no series, float or histogram — never one with empty labels,
+    /// which would merge distinct series into one.
+    #[test]
+    fn a_fingerprint_with_no_label_row_yields_no_series() {
+        let hist = single_histogram();
+        let float = vec![
+            float_row(Fingerprint::from_raw(1), 0, 1.0),
+            float_row(Fingerprint::from_raw(3), 0, 3.0),
+        ];
+        let h = vec![hist_row(Fingerprint::from_raw(2), 0, &hist)];
+        let mut labels = HashMap::new();
+        labels.insert(Fingerprint::from_raw(1), ls(&[("job", "a")]));
+        let plain = group_rows(float.clone(), &labels, "m");
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        let merged = group_merged_rows(float, h, &labels, "m").unwrap();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].fingerprint, Fingerprint::from_raw(1));
     }
 
     /// Finding 1's totality arm: a fingerprint absent from BOTH maps

@@ -266,9 +266,10 @@ fn every_view_is_dropped_before_it_is_created() {
 /// A family's routing wrappers all shard on one expression: a series'
 /// rollups must land on the shard its samples do.
 ///
-/// `metric_labels` is its own family: it has no `metric_name`, one label
-/// set serves every name that carries it, and no write goes through its
-/// wrapper — the view fills it on the node that received the push.
+/// `metric_labels` is in the metrics family (issue #623): one label row
+/// per series, keyed like the series, so its wrapper shards on the same
+/// `(metric_name, fingerprint)`. No write goes through it — the view fills
+/// it on the node that received the push.
 #[test]
 fn every_wrapper_in_a_family_shards_on_the_same_expression() {
     let text = rendered(&clustered());
@@ -295,9 +296,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             .strip_prefix("CREATE TABLE IF NOT EXISTS pulsus.")
             .expect("a wrapper names its database")
             .to_string();
-        let family = if name.starts_with("metric_labels") {
-            "metric labels"
-        } else if name.starts_with("metric") {
+        let family = if name.starts_with("metric") {
             "metrics"
         } else if name.starts_with("log") {
             "logs"
@@ -306,7 +305,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 4, "four families have wrappers");
+    assert_eq!(by_family.len(), 3, "three families have wrappers");
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -1021,21 +1020,26 @@ fn metric_series_is_activity_only_and_expires_with_the_samples() {
     }
 }
 
-/// **`metric_labels` holds one label set per fingerprint and keeps it.** A
+/// **S1 (issue #623): `metric_labels` holds one label row per series and
+/// keeps it**, keyed and sorted like the series, `(metric_name,
+/// fingerprint)`, so a metric's label read is a key range. A
 /// replacing engine keyed by the fingerprint, no TTL, filled by a view from
 /// the kind-2 rows, with a routing wrapper and a per-shard replica set.
 #[test]
-fn metric_labels_holds_one_label_set_per_fingerprint_and_never_expires() {
+fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_labels").expect("in the file"),
-        vec!["fingerprint", "labels"],
+        vec!["metric_name", "fingerprint", "labels"],
     );
     let single_create = create_of(&single(), "metric_labels");
     assert!(
         single_create.contains("ENGINE = ReplacingMergeTree\n"),
         "{single_create}"
     );
-    assert_eq!(line_of(&single_create, "ORDER BY"), "ORDER BY fingerprint");
+    assert_eq!(
+        line_of(&single_create, "ORDER BY"),
+        "ORDER BY (metric_name, fingerprint)"
+    );
     for ctx in [single(), clustered()] {
         let create = create_of(&ctx, "metric_labels");
         assert!(
@@ -1057,6 +1061,10 @@ fn metric_labels_holds_one_label_set_per_fingerprint_and_never_expires() {
     let projection = pulsus_schema::mv_projection("metric_labels_mv", &single())
         .expect("the view is in the file");
     assert!(projection.ends_with("WHERE kind = 2"), "{projection}");
+    assert!(
+        projection.contains("metric_name AS metric_name"),
+        "the view projects the series' name: {projection}"
+    );
     assert!(
         projection.contains("FROM pulsus.metric_landing"),
         "{projection}"

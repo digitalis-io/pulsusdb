@@ -47,7 +47,7 @@
 //!
 //! # Boundary inventory
 //!
-//! Six declarations carry a visibility modifier, pinned by the in-file
+//! Seven declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
@@ -61,7 +61,10 @@
 //!   same audience.
 //! * [`SeriesWhere::new`] — consumes the matchers and renders bound,
 //!   probe and matcher conjuncts together.
-//! * [`SeriesWhere::where_tail`] — the only accessor, one string.
+//! * [`SeriesWhere::where_tail`] — the whole tail, one string.
+//! * [`SeriesWhere::join_parts`] — the bound (with its probe) and the
+//!   label side's predicates, for the join builders (issue #623). The probe
+//!   never leaves the bound, so it cannot be dropped from a regex.
 //! * [`MatcherTarget`] — `new`'s column selector (`pub(super)`); its
 //!   variants inherit that visibility and are constructible wherever the
 //!   enum is, which yields nothing renderable: a target names a column.
@@ -172,7 +175,10 @@ pub(super) enum MatcherTarget<'a> {
     /// `JSONExtractString` returns `''` for a missing key, which is
     /// Prometheus's absent-label rule and matches `super::labels`'
     /// in-process `""` — load-bearing for the cache-vs-SQL differential.
-    Labels { table: &'a str },
+    Labels {
+        table: &'a str,
+        scope: Option<&'a str>,
+    },
     /// `__name__` matchers (issue #96's degraded-cache discovery probe),
     /// which address the **`metric_name` column** — the leading
     /// primary-key component of `metric_series`, never a stored label
@@ -252,7 +258,7 @@ impl SeriesWhere {
         match target {
             // The series rows hold no label text (issue #623): the matchers
             // select fingerprints out of the one-row-per-label-set table.
-            MatcherTarget::Labels { table } if !matchers.is_empty() => {
+            MatcherTarget::Labels { table, .. } if !matchers.is_empty() => {
                 let predicates: Vec<String> =
                     matchers.iter().map(|m| predicate(m, target)).collect();
                 tail.push_str(&format!(
@@ -276,6 +282,12 @@ impl SeriesWhere {
     /// for the matchers alone would be able to rebuild the #315 hole.
     pub(super) fn where_tail(&self) -> &str {
         &self.tail
+    }
+
+    /// STUB (issue #623, tests first).
+    #[allow(dead_code)]
+    pub(super) fn join_parts(&self) -> Option<(&str, &str)> {
+        None
     }
 }
 
@@ -381,6 +393,13 @@ mod tests {
     /// The label table every `Labels` case below renders against.
     const LABELS: MatcherTarget<'static> = MatcherTarget::Labels {
         table: "metric_labels",
+        scope: None,
+    };
+
+    /// The label target scoped to one metric, as a named builder passes it.
+    const SCOPED: MatcherTarget<'static> = MatcherTarget::Labels {
+        table: "metric_labels",
+        scope: Some("metric_name = 'up'"),
     };
 
     fn tail(matchers: &[LabelMatcher], target: MatcherTarget<'_>) -> String {
@@ -483,6 +502,7 @@ mod tests {
                 "pub(super) struct SeriesWhere {",
                 "pub(super) fn new(",
                 "pub(super) fn where_tail(&self) -> &str {",
+                "pub(super) fn join_parts(&self) -> Option<(&str, &str)> {",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -525,6 +545,7 @@ mod tests {
                 "SeriesWhere",
                 "SeriesWhere::new",
                 "SeriesWhere::where_tail",
+                "SeriesWhere::join_parts",
                 "MatcherTarget",
                 "PromqlRe2Fallback",
                 "anchored_re2_literal_for_test",
@@ -638,28 +659,43 @@ mod tests {
         assert!(!names.contains("JSONExtractString"));
     }
 
-    /// **Issue #623: label matchers select fingerprints from the label
-    /// table.** `metric_series` holds no label text, so the matchers become
-    /// one sub-query over the one-row-per-label-set table, and the window
-    /// bound and its compile probe stay on the series rows.
+    /// **U1 (issue #623): label matchers read only the metric's label
+    /// rows.** Scoped to a metric, the sub-query names it, so the matchers
+    /// run over that metric's label rows alone. Unscoped, the matchers
+    /// select `(metric_name, fingerprint)` pairs: a fingerprint is shared by
+    /// names, and a series meets only its own label row. The window bound
+    /// and its compile probe stay on the series rows.
     #[test]
     fn label_matchers_render_one_subquery_over_the_label_table() {
-        let rendered = tail(
-            &[
-                m(MatchOp::Eq, "job", "api"),
-                m(MatchOp::Re, "status", "5.."),
-            ],
-            LABELS,
-        );
+        let matchers = [
+            m(MatchOp::Eq, "job", "api"),
+            m(MatchOp::Re, "status", "5.."),
+        ];
         assert_eq!(
-            rendered,
+            tail(&matchers, SCOPED),
             "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
              \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              \x20   FROM metric_labels\n\
+             \x20   WHERE metric_name = 'up'\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20 )"
+        );
+        assert_eq!(
+            tail(&matchers, LABELS),
+            "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
+             \x20 AND (metric_name, fingerprint) IN (\n\
+             \x20   SELECT metric_name, fingerprint\n\
+             \x20   FROM metric_labels\n\
              \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
              \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
              \x20 )"
+        );
+        // No matchers: the bound alone, scoped or not.
+        assert_eq!(
+            tail(&[], SCOPED),
+            "unix_milli >= 0 AND unix_milli <= 3600000"
         );
         // The name target is a column of the series rows themselves.
         assert_eq!(
@@ -668,6 +704,49 @@ mod tests {
                 MatcherTarget::MetricNameColumn
             ),
             "unix_milli >= 0 AND unix_milli <= 3600000\n  AND metric_name != 'up'"
+        );
+    }
+
+    /// **U2 (issue #623): the join form's two halves carry the probe.** A
+    /// join builder puts the bound on the series side and the label
+    /// predicates on the label side; the probe stays in the bound, so a
+    /// regex still cannot reach SQL without it. With no scope and no
+    /// matchers there is nothing for a label side to hold.
+    #[test]
+    fn join_parts_carry_the_probe() {
+        let matchers = [
+            m(MatchOp::Eq, "job", "api"),
+            m(MatchOp::Re, "status", "5.."),
+        ];
+        let w = SeriesWhere::new(window(), 3_600_000, &matchers, SCOPED);
+        assert_eq!(
+            w.join_parts(),
+            Some((
+                "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000",
+                "metric_name = 'up'\n      AND JSONExtractString(labels, 'job') = 'api'\n      \
+                 AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"
+            ))
+        );
+        let w = SeriesWhere::new(window(), 3_600_000, &[], SCOPED);
+        assert_eq!(
+            w.join_parts(),
+            Some((
+                "unix_milli >= 0 AND unix_milli <= 3600000",
+                "metric_name = 'up'"
+            ))
+        );
+        let w = SeriesWhere::new(window(), 3_600_000, &[], LABELS);
+        assert_eq!(w.join_parts(), None);
+        // Unscoped with matchers (the unnamed names join): the label side is
+        // the predicates alone.
+        let w = SeriesWhere::new(window(), 3_600_000, &matchers, LABELS);
+        assert_eq!(
+            w.join_parts(),
+            Some((
+                "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000",
+                "JSONExtractString(labels, 'job') = 'api'\n      \
+                 AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"
+            ))
         );
     }
 }

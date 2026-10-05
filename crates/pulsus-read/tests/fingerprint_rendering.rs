@@ -210,7 +210,7 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
 /// Site 5: `series_labels_by_fingerprint`.
 #[test]
 fn site_5_series_labels_by_fingerprint_renders_the_exact_call_form() {
-    let sql = metrics_sql::series_labels_by_fingerprint("metric_labels", &literals());
+    let sql = metrics_sql::series_labels_by_fingerprint("metric_labels", "up", &literals());
     assert_every_boundary_value_is_an_exact_call("series_labels_by_fingerprint", &sql);
 }
 

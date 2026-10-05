@@ -203,32 +203,23 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
 mod tests {
     use super::*;
 
-    /// **Issue #623: the sweep reads activity from the series table and
-    /// each label set once from the label table.** One row per `(metric_name,
-    /// fingerprint)` active since the bound, carrying that fingerprint's
-    /// labels; the label table is read only for the fingerprints the series
-    /// table names. No upper bound: the sweep runs as of now.
+    /// **U6 (issue #623): the sweep reads each active series' own label
+    /// row.** The label rows of every `(metric_name, fingerprint)` active
+    /// since the bound, read by the pair, one per series while the table
+    /// holds unmerged copies. No upper bound: the sweep runs as of now.
     #[test]
     fn sweep_sql_joins_each_active_series_to_its_label_set() {
         assert_eq!(
             sweep_sql("metric_series", "metric_labels", 1_000),
-            "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE unix_milli >= 1000\n\
-             ) AS s\n\
-             INNER JOIN (\n\
-             SELECT fingerprint, any(labels) AS label_set\n\
+            "SELECT fingerprint, metric_name, labels\n\
              FROM metric_labels\n\
-             WHERE fingerprint IN (\n\
-             SELECT fingerprint\n\
+             WHERE (metric_name, fingerprint) IN (\n\
+             SELECT metric_name, fingerprint\n\
              FROM metric_series\n\
              WHERE unix_milli >= 1000\n\
              )\n\
-             GROUP BY fingerprint\n\
-             ) AS l USING (fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
+             ORDER BY metric_name, fingerprint\n\
+             LIMIT 1 BY metric_name, fingerprint"
         );
     }
 

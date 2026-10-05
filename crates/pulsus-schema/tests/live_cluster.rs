@@ -247,9 +247,9 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     let dist_tables = [
         ("metric_series_dist", METRICS_KEY),
         ("metric_samples_dist", METRICS_KEY),
-        // Issue #623: one label set per fingerprint, shared by every name
-        // that carries it; nothing is inserted through this wrapper.
-        ("metric_labels_dist", LOGS_KEY),
+        // Issue #623: one label row per series, keyed like the series;
+        // nothing is inserted through this wrapper.
+        ("metric_labels_dist", METRICS_KEY),
         ("log_streams_dist", LOGS_KEY),
         ("log_streams_idx_dist", LOGS_KEY),
         ("log_samples_dist", LOGS_KEY),

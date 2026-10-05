@@ -240,6 +240,17 @@ pub fn sample_fetch_multi(
     )
 }
 
+/// STUB (issue #623, tests first): `main`'s histogram read.
+pub fn hist_sample_fetch(
+    _table: &str,
+    _metric_name: &str,
+    _fps: &[FpLiteral],
+    _lower_excl_ms: i64,
+    _upper_incl_ms: i64,
+) -> String {
+    String::new()
+}
+
 /// The comma-separated `toUInt128('<decimal>')` list an `IN (...)`
 /// carries. `pub` because `super::compile`'s `handoff_cost` bound is
 /// asserted against what this renders (issue #548 criterion 7), and a
@@ -550,6 +561,34 @@ mod tests {
             multi.matches("toUInt128('1')").count(),
             1,
             "the list is written once"
+        );
+    }
+
+    /// T2 (issue #623): the histogram read is `main`'s own statement again,
+    /// sent beside the float read rather than folded into one union.
+    #[test]
+    fn hist_sample_fetch_renders_the_12_column_shape() {
+        let sql = hist_sample_fetch(
+            "metric_hist_samples",
+            "http_request_duration_seconds",
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
+            1_000,
+            2_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, \
+             pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
+             neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint\n\
+             FROM metric_hist_samples\n\
+             PREWHERE metric_name = 'http_request_duration_seconds'\n\
+             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+             ORDER BY fingerprint, unix_milli"
         );
     }
 }

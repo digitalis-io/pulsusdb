@@ -108,7 +108,8 @@ pub mod stats;
 pub(crate) use series_where::PromqlRe2Fallback;
 
 pub use exec::{
-    FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus,
+    FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,
+    TsdbStatus,
 };
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,

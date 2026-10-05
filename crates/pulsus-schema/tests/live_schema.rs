@@ -1282,12 +1282,13 @@ struct LandingSeriesRow {
     hist_counter_reset_hint: u8,
 }
 
-/// **Issue #623: a label set is stored once, activity once per hour.** Three
-/// metric names over one label set, registered in two hours, land six kind-2
-/// rows. `metric_series` keeps the six activity rows and no label text;
-/// `metric_labels` keeps the one label set, once the engine has merged.
+/// **S3 (issue #623): a label row is stored once per series, activity once
+/// per hour.** Three metric names over one label set, registered in two
+/// hours, land six kind-2 rows. `metric_series` keeps the six activity rows
+/// and no label text; `metric_labels` keeps one label row per series —
+/// three, each under its own name — once the engine has merged.
 #[tokio::test]
-async fn kind_2_rows_store_one_label_set_and_one_activity_row_per_hour() {
+async fn kind_2_rows_store_one_label_set_and_one_activity_row_per_series() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_labels");
@@ -1363,20 +1364,20 @@ async fn kind_2_rows_store_one_label_set_and_one_activity_row_per_hour() {
             &format!("SELECT count() AS n FROM {db}.metric_labels")
         )
         .await,
-        1,
-        "one row per label set"
+        3,
+        "one label row per series"
     );
     assert_eq!(
         count(
             &client,
             &format!(
-                "SELECT count() AS n FROM {db}.metric_labels \
+                "SELECT uniqExact(metric_name) AS n FROM {db}.metric_labels \
                  WHERE fingerprint = 77 AND labels = '{labels}'"
             ),
         )
         .await,
-        1,
-        "the label set is the one the kind-2 rows carried"
+        3,
+        "each series' label row is the one its kind-2 rows carried"
     );
 
     drop_database(&client, db).await;

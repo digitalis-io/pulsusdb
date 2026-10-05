@@ -8820,3 +8820,663 @@ SQL:
             });
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #623 — label matchers read only the metric's label rows.
+// ---------------------------------------------------------------------
+
+/// The rows of one series as the #623 fixtures generate it, for
+/// `INSERT … SELECT` into `metric_landing` as kind-2 rows (the views write
+/// `metric_series` and `metric_labels`) and into an expectation table.
+/// Every source selects `metric_name, fingerprint, labels, job, status,
+/// bucket`; an absent `status` is `''` and is left out of `labels`.
+fn labels_json_623(instance: &str, job: &str, status: &str) -> String {
+    format!(
+        "concat('{{\"instance\":\"', {instance}, '\",\"job\":\"', {job}, '\"', \
+         if({status} = '', '', concat(',\"status\":\"', {status}, '\"')), '}}')"
+    )
+}
+
+fn source_623(
+    name: &str,
+    fp: &str,
+    instance: &str,
+    job: &str,
+    status: &str,
+    bucket: &str,
+    n: u64,
+) -> String {
+    format!(
+        "SELECT toString({name}) AS metric_name, toUInt128({fp}) AS fingerprint, \
+         {labels} AS labels, toString({job}) AS job, toString({status}) AS status, \
+         toInt64({bucket}) AS bucket \
+         FROM numbers({n})",
+        labels = labels_json_623(instance, job, status)
+    )
+}
+
+/// Lands `source`'s rows as kind-2 rows, so the views write the activity and
+/// label rows production writes.
+async fn land_623(client: &ChClient, source: &str, now_ms: i64) {
+    let sql = format!(
+        "INSERT INTO metric_landing \
+         (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT {now_ms}, 2, metric_name, fingerprint, bucket, labels, 0 FROM ({source})"
+    );
+    client
+        .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("seed: {e}\n{sql}"));
+}
+
+async fn exec_623(client: &ChClient, sql: &str) {
+    client
+        .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+}
+
+async fn fresh_db_623(name: &str) -> (ChClient, String, ChClient) {
+    let db = pulsus_testkit::test_db(name);
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client_with_deadline(&db, Duration::from_secs(600)).await;
+    (admin, db, client)
+}
+
+async fn drop_db_623(admin: &ChClient, db: &str) {
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+}
+
+/// A builder's text as the client sends it: the driver reads `?` as a bind
+/// placeholder, and the regex probe carries `(?-s)`.
+fn unbound(sql: &str) -> String {
+    sql.replace('?', "??")
+}
+
+fn eq_matcher(key: &str, value: &str) -> pulsus_read::metrics::LabelMatcher {
+    pulsus_read::metrics::LabelMatcher {
+        key: key.to_string(),
+        op: pulsus_read::metrics::MatchOp::Eq,
+        value: value.to_string(),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct FpRow623 {
+    fingerprint: u128,
+}
+
+async fn fingerprints_623(client: &ChClient, sql: &str, settings: &QuerySettings) -> Vec<u128> {
+    let wrapped = unbound(&format!(
+        "SELECT toUInt128(fingerprint) AS fingerprint FROM (\n{sql}\n) ORDER BY fingerprint"
+    ));
+    let mut stream = client
+        .query_stream::<FpRow623>(&wrapped, settings)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{wrapped}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.unwrap_or_else(|e| panic!("{e}\n{wrapped}")).fingerprint);
+    }
+    out
+}
+
+/// **Q1 (issue #623): a metric's label matchers read that metric's label
+/// rows, not every series'.** 400,000 background series under 1,000 names
+/// all match `job="api"`; `m_q` has 100 series. Each read for `m_q` reads
+/// fewer than 100,000 rows; a label read that evaluated the matchers over
+/// every label row reads at least 400,000.
+#[tokio::test]
+async fn matchers_read_only_the_metrics_labels() {
+    skip_unless_live!();
+    let (admin, db, client) = fresh_db_623("pulsus_read_it_qlg_623_own_labels").await;
+    let now_ms = now_ns() / 1_000_000;
+    let bucket_ms: i64 = 3_600_000;
+    let bucket = (now_ms / bucket_ms) * bucket_ms;
+    land_623(
+        &client,
+        &source_623(
+            "concat('bg_', toString(number % 1000))",
+            "2 * number + 1",
+            "concat('bg-', toString(number))",
+            "'api'",
+            "'500'",
+            &bucket.to_string(),
+            400_000,
+        ),
+        now_ms,
+    )
+    .await;
+    land_623(
+        &client,
+        &source_623(
+            "'m_q'",
+            "8000 * (number + 1)",
+            "concat('q-', toString(number))",
+            "'api'",
+            "'500'",
+            &bucket.to_string(),
+            100,
+        ),
+        now_ms,
+    )
+    .await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: bucket,
+        end_ms: bucket,
+    };
+    let matchers = [eq_matcher("job", "api")];
+    let filter = pulsus_read::metrics::DiscoveryFilter {
+        metric_name: Some("m_q".to_string()),
+        name_matchers: Vec::new(),
+        matchers: matchers.to_vec(),
+    };
+    let fps: Vec<pulsus_model::FpLiteral> = (1..=100u128)
+        .map(|k| Fingerprint::from_raw(8000 * k).sql_literal())
+        .collect();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    for (what, sql, want) in [
+        (
+            "historical_series_subquery",
+            pulsus_read::metrics::sql::historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "m_q",
+                window,
+                bucket_ms,
+                &matchers,
+            ),
+            100,
+        ),
+        (
+            "discovery_query",
+            pulsus_read::metrics::sql::discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window,
+                bucket_ms,
+            ),
+            100,
+        ),
+        (
+            "series_labels_by_fingerprint",
+            pulsus_read::metrics::sql::series_labels_by_fingerprint("metric_labels", "m_q", &fps),
+            100,
+        ),
+    ] {
+        let wrapped = unbound(&format!(
+            "SELECT toUInt128(fingerprint) AS fingerprint FROM (\n{sql}\n)"
+        ));
+        let (returned, evidence) =
+            run_and_capture::<FpRow623>(&client, &admin, &wrapped, &format!("q623-{what}-{nonce}"))
+                .await;
+        eprintln!(
+            "Q1 {what}: returned {returned}, read_rows {}",
+            evidence.read_rows
+        );
+        assert_eq!(returned, want, "{what}: m_q's 100 series");
+        assert!(
+            evidence.read_rows < 100_000,
+            "{what} read {} rows: it must read m_q's label rows, not every series'\n{sql}",
+            evidence.read_rows
+        );
+    }
+
+    drop_db_623(&admin, &db).await;
+}
+
+/// **Q2 (issue #623): a selective matcher over two million series of one
+/// metric runs within 128 MiB.** `m_big{status="503"}` matches 50 of
+/// 2,000,000; the activity read and discovery return exactly those, at
+/// `max_memory_usage = 134217728`.
+#[tokio::test]
+async fn two_million_series_within_128_mib() {
+    skip_unless_live!();
+    let (admin, db, client) = fresh_db_623("pulsus_read_it_qlg_623_two_million").await;
+    let now_ms = now_ns() / 1_000_000;
+    let bucket_ms: i64 = 3_600_000;
+    let bucket = (now_ms / bucket_ms) * bucket_ms;
+    land_623(
+        &client,
+        &source_623(
+            "'m_big'",
+            "number + 1",
+            "concat('b-', toString(number))",
+            "'api'",
+            "if(number % 40000 = 0, '503', '200')",
+            &bucket.to_string(),
+            2_000_000,
+        ),
+        now_ms,
+    )
+    .await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: bucket,
+        end_ms: bucket,
+    };
+    let matchers = [eq_matcher("status", "503")];
+    let filter = pulsus_read::metrics::DiscoveryFilter {
+        metric_name: Some("m_big".to_string()),
+        name_matchers: Vec::new(),
+        matchers: matchers.to_vec(),
+    };
+    let want: Vec<u128> = (0..50u128).map(|k| 40_000 * k + 1).collect();
+    let settings = QuerySettings::new()
+        .set("max_memory_usage", 134_217_728u64)
+        .set("use_query_condition_cache", 0);
+    for (what, sql) in [
+        (
+            "historical_series_subquery",
+            pulsus_read::metrics::sql::historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "m_big",
+                window,
+                bucket_ms,
+                &matchers,
+            ),
+        ),
+        (
+            "discovery_query",
+            pulsus_read::metrics::sql::discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window,
+                bucket_ms,
+            ),
+        ),
+    ] {
+        let mut got = fingerprints_623(&client, &sql, &settings).await;
+        got.dedup();
+        assert_eq!(got, want, "{what}");
+    }
+
+    drop_db_623(&admin, &db).await;
+}
+
+/// The bucket arithmetic of a Q3 fixture: activity at `b + k·h`, the window
+/// floors to `[b, b + 4h]`, the sweep reads from `b`.
+struct Frame623 {
+    b: i64,
+    h: i64,
+}
+
+/// One Q3 fixture (`labels-matcher` §6): a background of 1,000,000 label
+/// sets under one name each, or two; `m_small`'s 400 series with edge
+/// buckets, five fingerprints shared with `m_twin` and 100 repeated rows;
+/// for the large fixtures `m_big`'s 2,000,000 series; and per metric three
+/// series with activity but no label row of their own, on background
+/// fingerprints, plus `m_orphan`'s one. Today's label table is kept beside
+/// the production one, written by its own view from the same landing rows.
+async fn seed_q3_fixture(
+    client: &ChClient,
+    db: &str,
+    large: bool,
+    shared: bool,
+    f: &Frame623,
+    now_ms: i64,
+) {
+    let Frame623 { b, h } = *f;
+    exec_623(
+        client,
+        &format!(
+            "CREATE TABLE {db}.labels_today (\
+               fingerprint UInt128 CODEC(Delta(8), ZSTD(1)), \
+               labels String CODEC(ZSTD(5))\
+             ) ENGINE = ReplacingMergeTree ORDER BY fingerprint \
+             SETTINGS index_granularity = 8192"
+        ),
+    )
+    .await;
+    exec_623(
+        client,
+        &format!(
+            "CREATE MATERIALIZED VIEW {db}.labels_today_mv TO {db}.labels_today \
+             AS SELECT fingerprint AS fingerprint, labels AS labels \
+             FROM {db}.metric_landing WHERE kind = 2"
+        ),
+    )
+    .await;
+    exec_623(
+        client,
+        &format!(
+            "CREATE TABLE {db}.expect (metric_name String, fingerprint UInt128, labels String, \
+             job String, status String, bucket Int64) ENGINE = MergeTree ORDER BY tuple()"
+        ),
+    )
+    .await;
+
+    let bg = |name: &str, n: u64| {
+        source_623(
+            name,
+            "number + 1",
+            "concat('bg-', toString(number))",
+            "if(number % 2 = 0, 'api', 'web')",
+            "if(number % 1000 = 0, '503', '200')",
+            &(b + h).to_string(),
+            n,
+        )
+    };
+    let small_status = "if(number % 16 = 15, '', if(number % 8 = 0, '503', '200'))";
+    let small = |name: &str, bucket: &str, n: u64| {
+        source_623(
+            name,
+            "10000000 + number",
+            "concat('s-', toString(number))",
+            "if(number % 2 = 0, 'api', 'db')",
+            small_status,
+            bucket,
+            n,
+        )
+    };
+    let small_bucket = format!(
+        "{b} + {h} * multiIf(number < 350, toInt64(number % 4), number < 375, toInt64(-1), toInt64(5))"
+    );
+    let mut sources = vec![
+        bg("concat('bg_', toString(number % 1000))", 1_000_000),
+        small("'m_small'", &small_bucket, 400),
+        small("'m_twin'", &(b + 2 * h).to_string(), 5),
+    ];
+    if shared {
+        sources.push(bg(
+            "concat('bg_', toString((number + 500) % 1000))",
+            1_000_000,
+        ));
+    }
+    if large {
+        sources.push(source_623(
+            "'m_big'",
+            "20000000 + number",
+            "concat('b-', toString(number))",
+            "'api'",
+            "if(number % 40000 = 0, '503', '200')",
+            &(b + 2 * h).to_string(),
+            2_000_000,
+        ));
+    }
+    for source in &sources {
+        land_623(client, source, now_ms).await;
+        exec_623(client, &format!("INSERT INTO {db}.expect {source}")).await;
+    }
+    // Repeated rows, each in parts of their own and left unmerged.
+    land_623(
+        client,
+        &bg("concat('bg_', toString(number % 1000))", 100_000),
+        now_ms + 1,
+    )
+    .await;
+    land_623(client, &small("'m_small'", &small_bucket, 100), now_ms + 1).await;
+    // Activity with no label row of its own, on background fingerprints.
+    let mut orphans = vec![
+        format!("('m_small', 2, {})", b + h),
+        format!("('m_small', 3, {})", b + h),
+        format!("('m_small', 4, {})", b + h),
+        format!("('m_orphan', 8, {})", b + h),
+    ];
+    if large {
+        for fp in 5..=7 {
+            orphans.push(format!("('m_big', {fp}, {})", b + h));
+        }
+    }
+    exec_623(
+        client,
+        &format!(
+            "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli) VALUES {}",
+            orphans.join(", ")
+        ),
+    )
+    .await;
+}
+
+/// Today's (`c0bbe95a`) label join over one-row-per-fingerprint labels,
+/// kept here as the Q3 baseline.
+fn todays_label_sets_623(labels: &str, from_where: &str) -> String {
+    format!(
+        "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
+         FROM (\n\
+         SELECT DISTINCT metric_name, fingerprint\n\
+         {from_where}\n\
+         ) AS s\n\
+         INNER JOIN (\n\
+         SELECT fingerprint, any(labels) AS label_set\n\
+         FROM {labels}\n\
+         WHERE fingerprint IN (\n\
+         SELECT fingerprint\n\
+         {from_where}\n\
+         )\n\
+         GROUP BY fingerprint\n\
+         ) AS l USING (fingerprint)\n\
+         ORDER BY metric_name, fingerprint"
+    )
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PeakRow623 {
+    memory_usage: u64,
+    exception_code: i32,
+}
+
+/// Runs `sql` under `settings` with a fresh `query_id`; `Ok(peak bytes)` or
+/// the error text.
+async fn peak_623(client: &ChClient, sql: &str, settings: &QuerySettings) -> Result<u64, String> {
+    let query_id = uuid::Uuid::new_v4().simple().to_string();
+    let result = client
+        .execute(
+            &unbound(sql),
+            &settings.clone().set("query_id", query_id.as_str()),
+            Idempotency::NonIdempotent,
+        )
+        .await;
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    if let Err(e) = result {
+        return Err(e.to_string());
+    }
+    let log_sql = format!(
+        "SELECT memory_usage, exception_code FROM system.query_log \
+         WHERE query_id = '{query_id}' AND type = 'QueryFinish' LIMIT 1"
+    );
+    let mut stream = client
+        .query_stream::<PeakRow623>(&log_sql, &QuerySettings::new())
+        .await
+        .expect("query_log");
+    let row = stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("no query_log row for {query_id}"))
+        .expect("decode query_log row");
+    Ok(row.memory_usage)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ExactRow623 {
+    got: u64,
+    common: u64,
+    want: u64,
+}
+
+/// `got` rows, `common` of them distinct and in `expected`, and `want`
+/// expected rows: exact, with no repeat, when all three are equal.
+async fn exact_623(client: &ChClient, sql: &str, columns: &str, expected: &str) -> ExactRow623 {
+    let check = unbound(&format!(
+        "SELECT \
+           assumeNotNull((SELECT count() FROM (\n{sql}\n))) AS got, \
+           assumeNotNull((SELECT count() FROM (SELECT {columns} FROM (\n{sql}\n) INTERSECT {expected}))) AS common, \
+           assumeNotNull((SELECT count() FROM ({expected}))) AS want"
+    ));
+    let mut stream = client
+        .query_stream::<ExactRow623>(&check, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{check}"));
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("{e}\n{check}"))
+}
+
+fn median_623(mut v: Vec<u64>) -> u64 {
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// **Q3 (issue #623): the unnamed label reads fit where today's did.** On
+/// the four fixtures of the plan's §6 (small and large, each label set
+/// under one name or two), today's and the new unnamed discovery, sweep and
+/// names statements, for `job="api"` and `status="503"`, nine runs each,
+/// interleaved, at the settings the server sends. The new statement's
+/// median peak is at most 1.10 × today's, and it completes three of three
+/// runs with `max_memory_usage` at 1.10 × today's median peak; its answer
+/// is exact, repeated label rows folded.
+#[tokio::test]
+async fn unnamed_label_reads_fit_where_todays_did() {
+    skip_unless_live!();
+    const RUNS: usize = 9;
+    const RATIO: f64 = 1.10;
+    let base = QuerySettings::new()
+        .set("max_block_size", 65_409u64)
+        .set("max_bytes_before_external_group_by", 0u64)
+        .set("join_algorithm", "hash")
+        .set("max_memory_usage", 8_589_934_592u64)
+        .set("use_query_condition_cache", 0);
+    let now_ms = now_ns() / 1_000_000;
+    let h: i64 = 3_600_000;
+    let b = (now_ms / h) * h - 6 * h;
+    let frame = Frame623 { b, h };
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: b + h / 2,
+        end_ms: b + 4 * h + h / 2,
+    };
+    let bound = format!("unix_milli >= {b} AND unix_milli <= {}", b + 4 * h);
+    for (tag, large, shared) in [
+        ("small_x1", false, false),
+        ("small_x2", false, true),
+        ("large_x1", true, false),
+        ("large_x2", true, true),
+    ] {
+        let (admin, db, client) = fresh_db_623(&format!("pulsus_read_it_qlg_623_q3_{tag}")).await;
+        seed_q3_fixture(&client, &db, large, shared, &frame, now_ms).await;
+
+        // (what, today's text, the new text, the exactness columns, the
+        // expected rows)
+        let mut cases: Vec<(String, String, String, &str, String)> = Vec::new();
+        for (key, value) in [("job", "api"), ("status", "503")] {
+            let filter = pulsus_read::metrics::DiscoveryFilter {
+                metric_name: None,
+                name_matchers: Vec::new(),
+                matchers: vec![eq_matcher(key, value)],
+            };
+            let today_where = format!(
+                "FROM metric_series\nWHERE {bound}\n  AND fingerprint IN (\n    SELECT fingerprint\n    FROM labels_today\n    WHERE JSONExtractString(labels, '{key}') = '{value}'\n  )"
+            );
+            let expected = format!(
+                "SELECT metric_name, fingerprint, labels FROM {db}.expect \
+                 WHERE bucket >= {b} AND bucket <= {} AND {key} = '{value}'",
+                b + 4 * h
+            );
+            cases.push((
+                format!("discovery {key}={value}"),
+                todays_label_sets_623("labels_today", &today_where),
+                pulsus_read::metrics::sql::discovery_query(
+                    "metric_series",
+                    "metric_labels",
+                    &filter,
+                    window,
+                    h,
+                ),
+                "toString(metric_name), toUInt128(fingerprint), toString(labels)",
+                expected.clone(),
+            ));
+            cases.push((
+                format!("names {key}={value}"),
+                format!("SELECT DISTINCT metric_name\n{today_where}\nORDER BY metric_name"),
+                pulsus_read::metrics::sql::discovery_distinct_names_query(
+                    "metric_series",
+                    "metric_labels",
+                    &filter,
+                    window,
+                    h,
+                ),
+                "toString(metric_name)",
+                format!("SELECT DISTINCT metric_name FROM ({expected})"),
+            ));
+        }
+        cases.push((
+            "sweep".to_string(),
+            todays_label_sets_623(
+                "labels_today",
+                &format!("FROM metric_series\nWHERE unix_milli >= {b}"),
+            ),
+            pulsus_read::metrics::sql::sweep_query("metric_series", "metric_labels", b),
+            "toString(metric_name), toUInt128(fingerprint), toString(labels)",
+            format!("SELECT metric_name, fingerprint, labels FROM {db}.expect WHERE bucket >= {b}"),
+        ));
+
+        for (what, today, new, columns, expected) in &cases {
+            let exact = exact_623(&client, new, columns, expected).await;
+            assert!(
+                exact.got == exact.want && exact.common == exact.want,
+                "{tag} {what}: the answer must be exactly the seeded series, each once \
+                 ({exact:?})\n{new}"
+            );
+            let (mut todays, mut news) = (Vec::new(), Vec::new());
+            for _ in 0..RUNS {
+                todays.push(
+                    peak_623(&client, today, &base)
+                        .await
+                        .unwrap_or_else(|e| panic!("{tag} {what}: today's statement failed: {e}")),
+                );
+                news.push(
+                    peak_623(&client, new, &base)
+                        .await
+                        .unwrap_or_else(|e| panic!("{tag} {what}: {e}\n{new}")),
+                );
+            }
+            let (today_median, new_median) = (median_623(todays.clone()), median_623(news.clone()));
+            let limit = (today_median as f64 * RATIO) as u64;
+            eprintln!(
+                "Q3 {tag} {what}: median peak today {today_median} / new {new_median} bytes \
+                 (ratio {:.3}); today {todays:?}; new {news:?}",
+                new_median as f64 / today_median as f64
+            );
+            assert!(
+                new_median as f64 <= RATIO * today_median as f64,
+                "{tag} {what}: median peak {new_median} > {RATIO} x today's {today_median}"
+            );
+            for run in 0..3 {
+                let limited = base.clone().set("max_memory_usage", limit);
+                if let Err(e) = peak_623(&client, new, &limited).await {
+                    panic!("{tag} {what}: run {run} at {limit} bytes failed: {e}");
+                }
+            }
+        }
+
+        drop_db_623(&admin, &db).await;
+    }
+}

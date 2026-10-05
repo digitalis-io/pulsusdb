@@ -67,7 +67,8 @@ fn base_where(
             bucket_ms,
             matchers,
             MatcherTarget::Labels {
-                table: labels_table
+                table: labels_table,
+                scope: None,
             }
         )
         .where_tail()
@@ -215,7 +216,11 @@ pub fn historical_resolution_query(
 /// `fingerprint -> labels` lookup on the label table (issue #623), keyed by
 /// the fingerprint alone, since a fingerprint names one label set whatever
 /// the metric. `any` collapses the copies the table holds until it merges.
-pub fn series_labels_by_fingerprint(labels_table: &str, fps: &[FpLiteral]) -> String {
+pub fn series_labels_by_fingerprint(
+    labels_table: &str,
+    _metric_name: &str,
+    fps: &[FpLiteral],
+) -> String {
     let fp_list = fps
         .iter()
         .map(FpLiteral::to_string)
@@ -273,6 +278,7 @@ fn discovery_from_where(
         &filter.matchers,
         MatcherTarget::Labels {
             table: labels_table,
+            scope: None,
         },
     );
     match &filter.metric_name {
@@ -380,6 +386,7 @@ pub fn discovery_fetch_multi(
         &[],
         MatcherTarget::Labels {
             table: labels_table,
+            scope: None,
         },
     );
     with_label_sets(
@@ -466,6 +473,7 @@ pub fn discovery_fetch_by_names(
         matchers,
         MatcherTarget::Labels {
             table: labels_table,
+            scope: None,
         },
     );
     with_label_sets(
@@ -475,6 +483,11 @@ pub fn discovery_fetch_by_names(
             tail.where_tail()
         ),
     )
+}
+
+/// STUB (issue #623, tests first).
+pub fn series_labels_by_pairs(_labels_table: &str, _pairs: &[(String, FpLiteral)]) -> String {
+    String::new()
 }
 
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
@@ -603,6 +616,7 @@ mod tests {
         assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
     }
 
+    /// U5 (issue #623): the metric's series joined to its own label rows.
     #[test]
     fn historical_resolution_query_is_the_label_join_over_one_metric() {
         let sql = historical_resolution_query(
@@ -613,27 +627,32 @@ mod tests {
             3_600_000,
             &[],
         );
-        let from_where = base_where(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[],
-        );
         assert_eq!(
             sql,
-            format!(
-                "SELECT fingerprint, labels\nFROM (\n{}\n)",
-                with_label_sets("metric_labels", &from_where)
-            )
+            "SELECT fingerprint, labels\nFROM (\n\
+             SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE metric_name = 'up'\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT fingerprint, labels\n\
+             FROM metric_labels\n\
+             WHERE metric_name = 'up'\n\
+             ) AS l USING (fingerprint)\n\
+             ORDER BY metric_name, fingerprint\n\
+             )"
         );
     }
 
+    /// U5 (issue #623): the hydration reads the metric's own label rows.
     #[test]
     fn series_labels_by_fingerprint_renders_an_explicit_fingerprint_list() {
         let sql = series_labels_by_fingerprint(
             "metric_labels",
+            "up",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -642,7 +661,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, any(labels) AS labels\nFROM metric_labels\nWHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nGROUP BY fingerprint"
+            "SELECT fingerprint, any(labels) AS labels\nFROM metric_labels\nWHERE metric_name = 'up'\n  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nGROUP BY fingerprint"
         );
     }
 
@@ -650,6 +669,7 @@ mod tests {
     fn series_labels_by_fingerprint_has_no_window_or_matcher_predicates() {
         let sql = series_labels_by_fingerprint(
             "metric_labels",
+            "up",
             &[Fingerprint::from_raw(1).sql_literal()],
         );
         assert!(!sql.contains("unix_milli >="));
@@ -1207,42 +1227,10 @@ mod tests {
         ]
     }
 
-    /// Issue #472 AC1 — the wide statement is exactly the label join
-    /// (issue #623) over the shared head.
-    ///
-    /// **What this pins and what it does not.** The head is shared, so
-    /// this equality cannot see a change *inside* the head — that is what
-    /// [`the_narrow_discovery_builder_is_byte_exact`] freezes, byte for
-    /// byte, and what
-    /// [`the_two_discovery_builders_share_one_where_byte_for_byte`] carries
-    /// across to this builder.
-    #[test]
-    fn discovery_query_is_its_projection_plus_the_shared_head_plus_its_suffix() {
-        for (what, filter) in discovery_filter_table() {
-            let sql = discovery_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            );
-            let expected = with_label_sets(
-                "metric_labels",
-                &discovery_from_where(
-                    "metric_series",
-                    "metric_labels",
-                    &filter,
-                    window(),
-                    3_600_000,
-                ),
-            );
-            assert_eq!(sql, expected, "{what}");
-        }
-    }
-
     /// Issue #472 AC2 — the narrow builder's literal bytes, for the
-    /// unfiltered call the discovery client actually makes and for a
-    /// concrete-name-plus-matcher filter.
+    /// unfiltered call the discovery client actually makes, for a
+    /// concrete-name-plus-matcher filter, and (U4, issue #623) for a
+    /// matcher with no name, which joins series to label rows by the pair.
     #[test]
     fn the_narrow_discovery_builder_is_byte_exact() {
         let plain_window = DataWindow {
@@ -1275,15 +1263,38 @@ mod tests {
             ),
             "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE metric_name = 'up'\n  AND \
              unix_milli >= 0 AND unix_milli <= 3600000\n  AND fingerprint IN (\n    SELECT \
-             fingerprint\n    FROM metric_labels\n    WHERE JSONExtractString(labels, 'job') = \
-             'api'\n  )\nORDER BY metric_name"
+             fingerprint\n    FROM metric_labels\n    WHERE metric_name = 'up'\n      AND \
+             JSONExtractString(labels, 'job') = 'api'\n  )\nORDER BY metric_name"
+        );
+        let nameless = DiscoveryFilter {
+            metric_name: None,
+            name_matchers: vec![],
+            matchers: vec![eq("job", "api")],
+        };
+        assert_eq!(
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &nameless,
+                plain_window,
+                3_600_000
+            ),
+            "SELECT DISTINCT metric_name\n\
+             FROM (SELECT metric_name, fingerprint FROM metric_series WHERE unix_milli >= 0 AND \
+             unix_milli <= 3600000) AS s\n\
+             ANY INNER JOIN (SELECT metric_name, fingerprint FROM metric_labels WHERE \
+             JSONExtractString(labels, 'job') = 'api') AS l\n\
+             USING (metric_name, fingerprint)\n\
+             ORDER BY metric_name\n\
+             SETTINGS join_algorithm = 'partial_merge'"
         );
     }
 
-    /// Issue #472 AC3 — the two builders' `FROM …WHERE …` heads are
-    /// byte-identical over the whole filter table: the narrow statement is
-    /// the head with its own projection, and the wide one carries the same
-    /// head on both sides of its label join (issue #623).
+    /// Issue #472 AC3 / U8 (issue #623) — the two builders read the same
+    /// series and the same label rows. For a named filter the wide
+    /// statement holds the narrow statement's head up to its label
+    /// sub-query, and the narrow sub-query's `WHERE` as its label side. For
+    /// an unnamed one both carry the same window bound.
     ///
     /// **What it does not prove:** that the head is *shared* rather than
     /// duplicated-and-currently-equal. That is what [`discovery_from_where`]
@@ -1305,16 +1316,36 @@ mod tests {
                 window(),
                 3_600_000,
             );
-            let head = narrow
-                .strip_prefix("SELECT DISTINCT metric_name\n")
-                .and_then(|rest| rest.strip_suffix("\nORDER BY metric_name"))
-                .expect("the narrow statement is its projection around the head");
-            assert_eq!(wide.matches(head).count(), 2, "{what}: {wide}");
+            if filter.metric_name.is_some() {
+                let body = narrow
+                    .strip_prefix("SELECT DISTINCT metric_name\n")
+                    .and_then(|rest| rest.strip_suffix("\nORDER BY metric_name"))
+                    .expect("the narrow statement is its projection around the head");
+                let head = body
+                    .split("\n  AND fingerprint IN (")
+                    .next()
+                    .expect("a head");
+                assert!(wide.contains(head), "{what}: {wide}");
+                if let Some((_, label_side)) = body.split_once("\n    WHERE ") {
+                    let label_where = label_side
+                        .strip_suffix("\n  )")
+                        .expect("the sub-query closes the statement");
+                    assert!(
+                        wide.contains(&format!("WHERE {label_where}\n) AS l")),
+                        "{what}: {wide}"
+                    );
+                }
+            } else {
+                let bound = "unix_milli >= 0";
+                assert!(wide.contains(bound) && narrow.contains(bound), "{what}");
+            }
         }
     }
 
     // --- discovery_fetch_multi (issue #89) ---
 
+    /// U5 (issue #623): the fan-out joins series to label rows by the pair,
+    /// the label side reading only the resolved names and fingerprints.
     #[test]
     fn discovery_fetch_multi_renders_the_flat_in_by_in_shape() {
         let sql = discovery_fetch_multi(
@@ -1330,13 +1361,21 @@ mod tests {
         );
         assert_eq!(
             sql,
-            with_label_sets(
-                "metric_labels",
-                "FROM metric_series\n\
-                 WHERE metric_name IN ('up', 'up_alias')\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-                 \x20 AND unix_milli >= 0 AND unix_milli <= 3600000"
-            )
+            "SELECT fingerprint, metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT metric_name, fingerprint, labels\n\
+             FROM metric_labels\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             ) AS l USING (metric_name, fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
         );
     }
 
@@ -1490,6 +1529,8 @@ mod tests {
         assert!(sql.contains(&format!("match(metric_name, {expected})")));
     }
 
+    /// U5 (issue #623): the probed names scope both sides; the label
+    /// matchers run on the label side over those names' rows alone.
     #[test]
     fn discovery_fetch_by_names_renders_the_flat_name_in_with_label_matchers() {
         let sql = discovery_fetch_by_names(
@@ -1502,17 +1543,20 @@ mod tests {
         );
         assert_eq!(
             sql,
-            with_label_sets(
-                "metric_labels",
-                "FROM metric_series\n\
-                 WHERE metric_name IN ('up', 'up_alias')\n\
-                 \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-                 \x20 AND fingerprint IN (\n\
-                 \x20   SELECT fingerprint\n\
-                 \x20   FROM metric_labels\n\
-                 \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
-                 \x20 )"
-            )
+            "SELECT fingerprint, metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT metric_name, fingerprint, labels\n\
+             FROM metric_labels\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             ) AS l USING (metric_name, fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
         );
     }
 
@@ -1611,24 +1655,17 @@ mod tests {
 
     // -- issue #623: labels come from the label table --------------------
 
-    /// **Discovery reads activity from the series table and labels from the
-    /// label table.** The matchers select fingerprints out of the label
-    /// table; the join puts each surviving series' label set back.
+    /// **U3 (issue #623): a named discovery joins the metric's series to
+    /// the metric's own label rows.** Each side is read once; the label
+    /// side runs the matchers over that metric's rows alone; `ANY` keeps
+    /// one label row per fingerprint while the table holds unmerged copies.
     #[test]
     fn discovery_query_joins_the_matched_series_to_their_label_sets() {
         let filter = DiscoveryFilter {
             metric_name: Some("up".to_string()),
             name_matchers: Vec::new(),
-            matchers: vec![eq("job", "api")],
+            matchers: vec![eq("job", "api"), re("status", "5..")],
         };
-        let from_where = "FROM metric_series\n\
-             WHERE metric_name = 'up'\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             \x20 AND fingerprint IN (\n\
-             \x20   SELECT fingerprint\n\
-             \x20   FROM metric_labels\n\
-             \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
-             \x20 )";
         assert_eq!(
             discovery_query(
                 "metric_series",
@@ -1637,32 +1674,62 @@ mod tests {
                 window(),
                 3_600_000
             ),
-            format!(
-                "SELECT fingerprint, s.metric_name AS metric_name, l.label_set AS labels\n\
-                 FROM (\n\
-                 SELECT DISTINCT metric_name, fingerprint\n\
-                 {from_where}\n\
-                 ) AS s\n\
-                 INNER JOIN (\n\
-                 SELECT fingerprint, any(labels) AS label_set\n\
-                 FROM metric_labels\n\
-                 WHERE fingerprint IN (\n\
-                 SELECT fingerprint\n\
-                 {from_where}\n\
-                 )\n\
-                 GROUP BY fingerprint\n\
-                 ) AS l USING (fingerprint)\n\
-                 ORDER BY metric_name, fingerprint"
-            )
+            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
+             FROM (\n\
+             SELECT DISTINCT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE metric_name = 'up'\n\
+             \x20 AND unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
+             ) AS s\n\
+             ANY INNER JOIN (\n\
+             SELECT fingerprint, labels\n\
+             FROM metric_labels\n\
+             WHERE metric_name = 'up'\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             ) AS l USING (fingerprint)\n\
+             ORDER BY metric_name, fingerprint"
+        );
+        // Unnamed: the label rows of the series the window and the matchers
+        // select, read by the pair.
+        let nameless = DiscoveryFilter {
+            metric_name: None,
+            name_matchers: Vec::new(),
+            matchers: vec![eq("job", "api"), re("status", "5..")],
+        };
+        assert_eq!(
+            discovery_query(
+                "metric_series",
+                "metric_labels",
+                &nameless,
+                window(),
+                3_600_000
+            ),
+            "SELECT fingerprint, metric_name, labels\n\
+             FROM metric_labels\n\
+             WHERE (metric_name, fingerprint) IN (\n\
+             SELECT metric_name, fingerprint\n\
+             FROM metric_series\n\
+             WHERE unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
+             \x20 AND (metric_name, fingerprint) IN (\n\
+             \x20   SELECT metric_name, fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20 )\n\
+             )\n\
+             ORDER BY metric_name, fingerprint\n\
+             LIMIT 1 BY metric_name, fingerprint"
         );
     }
 
-    /// No builder reads label text from the series table: every one that
-    /// returns labels or filters on them names the label table.
+    /// U7 (issue #623): every builder that takes a metric name reads only
+    /// that metric's label rows — the line after each `FROM metric_labels`
+    /// names `metric_name`.
     #[test]
     fn every_label_reading_builder_names_the_label_table() {
         let filter = DiscoveryFilter {
-            metric_name: None,
+            metric_name: Some("up".to_string()),
             name_matchers: Vec::new(),
             matchers: vec![eq("job", "api")],
         };
@@ -1682,7 +1749,7 @@ mod tests {
                 "up",
                 window(),
                 3_600_000,
-                &[],
+                &[eq("job", "api")],
             ),
             discovery_query(
                 "metric_series",
@@ -1714,9 +1781,39 @@ mod tests {
                 window(),
                 3_600_000,
             ),
+            series_labels_by_fingerprint("metric_labels", "up", &fps),
+            series_labels_by_pairs("metric_labels", &[("up".to_string(), fps[0])]),
         ] {
-            assert!(sql.contains("FROM metric_labels\n"), "{sql}");
-            assert!(!sql.contains("LIMIT 1 BY"), "{sql}");
+            let mut lines = sql.lines();
+            let mut reads = 0;
+            while let Some(line) = lines.next() {
+                if line.trim() == "FROM metric_labels" {
+                    reads += 1;
+                    let next = lines.next().unwrap_or_default();
+                    assert!(next.contains("metric_name"), "{next:?} in {sql}");
+                }
+            }
+            assert!(reads > 0, "no label read in {sql}");
         }
+    }
+
+    /// U5 (issue #623): the pair lookup reads each `(metric_name,
+    /// fingerprint)` the cache did not resolve from its own label row.
+    #[test]
+    fn series_labels_by_pairs_reads_each_pairs_own_label_row() {
+        assert_eq!(
+            series_labels_by_pairs(
+                "metric_labels",
+                &[
+                    ("up".to_string(), Fingerprint::from_raw(7).sql_literal()),
+                    ("down".to_string(), Fingerprint::from_raw(9).sql_literal()),
+                ],
+            ),
+            "SELECT metric_name, fingerprint, labels\n\
+             FROM metric_labels\n\
+             WHERE (metric_name, fingerprint) IN (('up', toUInt128('7')), ('down', toUInt128('9')))\n\
+             ORDER BY metric_name, fingerprint\n\
+             LIMIT 1 BY metric_name, fingerprint"
+        );
     }
 }

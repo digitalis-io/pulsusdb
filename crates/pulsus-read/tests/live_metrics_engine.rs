@@ -34,7 +34,7 @@ use pulsus_promql::parser::parse;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExplainStage, FetchProbe, LabelCache, LabelCacheConfig,
     LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
-    QueryResult, ReadError,
+    QueryResult, ReadError, StatementProbe,
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -1903,6 +1903,109 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     assert!(fetch_stage.sql.contains("PREWHERE metric_name = 'up'"));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// **T5 (issue #623): every fetch path sends a selector's float read and
+/// histogram read at once.** A [`StatementProbe`] parks the first sample
+/// statement until a second enters (for at most [`StatementProbe::WAIT`]);
+/// a path that awaited one read before sending the other parks its first
+/// for the whole wait and records one statement in flight. A fresh probe
+/// and one chunk per path: the cache's chunks, the fallback (a window
+/// outside the cache) and the multi-metric fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_fetch_path_sends_both_reads_at_once() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_both_reads");
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent = (now / bucket) * bucket;
+    let historical = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
+    let mut series = Vec::new();
+    let mut samples = Vec::new();
+    for (name, fp) in [("up", 1u128), ("down", 2)] {
+        for at in [recent, historical] {
+            series.push(SeedSeriesRow {
+                metric_name: name.to_string(),
+                fingerprint: fp,
+                unix_milli: at,
+                labels: r#"{"job":"api"}"#.to_string(),
+            });
+            samples.push(SeedSampleRow {
+                metric_name: name.to_string(),
+                fingerprint: fp,
+                unix_milli: at,
+                value: 1.0,
+            });
+        }
+    }
+    seed_series(&client, &series).await;
+    seed_samples(&client, &samples).await;
+
+    // A 24h cache window: `historical` is outside it.
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (cache)"),
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+
+    for (path, query, at) in [
+        ("chunks", "up", recent),
+        ("fallback", "up", historical),
+        ("multi", r#"{__name__=~"up|down"}"#, recent),
+    ] {
+        let probe = StatementProbe::new();
+        let engine = MetricsEngine::new(
+            ChClient::new(test_config(db))
+                .await
+                .expect("connect (engine)"),
+            Arc::clone(&cache),
+            engine_config(db),
+        )
+        .with_statement_probe(Arc::clone(&probe));
+        let params = MetricQueryParams {
+            start_ms: at,
+            end_ms: at,
+            step_ms: 0,
+        };
+        let (_, _, explain) = engine
+            .query_explained(&parse(query).expect("parse"), &params)
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        // The path taken: only the fallback's fetch nests the activity
+        // read; only the fan-out's names more than one metric.
+        let fetch = &stage(&explain, "sample_fetch").sql;
+        assert_eq!(
+            (
+                fetch.contains("FROM metric_series"),
+                fetch.contains("metric_name IN ("),
+            ),
+            match path {
+                "chunks" => (false, false),
+                "fallback" => (true, false),
+                _ => (false, true),
+            },
+            "{path}: {fetch}"
+        );
+        assert!(
+            probe.max_in_flight() >= 2,
+            "{path}: the float and histogram reads must be in flight together; \
+             the probe saw at most {} statement(s) in flight",
+            probe.max_in_flight()
+        );
+    }
 
     drop_database(&bootstrap, db).await;
 }
