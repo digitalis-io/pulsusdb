@@ -200,6 +200,19 @@ async fn columns(client: &ChClient, db: &str, table: &str) -> Vec<(String, Strin
     out
 }
 
+/// The TTL expression out of one table's stored definition. The stored
+/// text carries no `DELETE` — 26.3.29.7 drops the default action — so the
+/// expression runs to the `SETTINGS` clause.
+fn ttl_expr(engine_full: &str, table: &str) -> String {
+    let (_, after) = engine_full
+        .split_once("TTL ")
+        .unwrap_or_else(|| panic!("{table} carries no TTL: {engine_full}"));
+    let (expr, _) = after
+        .split_once(" SETTINGS")
+        .unwrap_or_else(|| panic!("{table}'s TTL has no SETTINGS after it: {engine_full}"));
+    expr.to_string()
+}
+
 /// Now, in epoch milliseconds. The fixtures below take their stamps from the
 /// clock rather than from a literal: `ttl_only_drop_parts = 1` makes a whole
 /// already-expired part eligible for deletion right after the insert, so a
@@ -796,24 +809,11 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    /// The TTL expression out of one table's stored definition. The stored
-    /// text carries no `DELETE` — 26.3.29.7 drops the default action — so
-    /// the expression runs to the `SETTINGS` clause.
-    fn ttl_expr(engine_full: &str, table: &str) -> String {
-        let (_, after) = engine_full
-            .split_once("TTL ")
-            .unwrap_or_else(|| panic!("{table} carries no TTL: {engine_full}"));
-        let (expr, _) = after
-            .split_once(" SETTINGS")
-            .unwrap_or_else(|| panic!("{table}'s TTL has no SETTINGS after it: {engine_full}"));
-        expr.to_string()
-    }
-
     // The clamp is in the stored text of all three retained tables.
     for (table, column) in [
         ("spans", "intDiv(start_ns, 1000000000)"),
-        ("traces", "(toUInt32(day) * 86400)"),
-        ("resources", "(toUInt32(day) * 86400)"),
+        ("traces", "intDiv(last_start_ns, 1000000000)"),
+        ("resources", "((toUInt32(day) + 1) * 86400)"),
     ] {
         let engine = engine_full(&client, db, table).await;
         let want = format!("TTL toDateTime(least({column} + (7 * 86400), 4294967295))");
@@ -841,13 +841,94 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
         &client,
         &format!(
             "SELECT toString({}) AS s FROM (SELECT toDate('2106-02-06') AS day)",
-            ttl_expr(&engine_full(&client, db, "traces").await, "traces")
+            ttl_expr(&engine_full(&client, db, "resources").await, "resources")
         ),
     )
     .await;
     assert_eq!(
         from_day, from_ns,
-        "the Date form clamps to the same instant as the nanosecond one"
+        "the resource row's Date form clamps to the same instant as the span's"
+    );
+
+    let from_last_start = scalar(
+        &client,
+        &format!(
+            "SELECT toString({}) AS s \
+             FROM (SELECT toInt64(4294943999000000000) AS last_start_ns)",
+            ttl_expr(&engine_full(&client, db, "traces").await, "traces")
+        ),
+    )
+    .await;
+    assert_eq!(
+        from_last_start, from_ns,
+        "the per-trace row's TTL clamps to the same instant as the span's"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// **T-R3.** Every resource row and every per-trace row outlives the spans
+/// it covers: the gap, the dependency's TTL minus the span's, is never
+/// negative.
+///
+/// All three expressions are read off the server's stored definitions. The
+/// resource case runs every second of 2026-10-01 .. 2026-10-07, each at the
+/// last nanosecond of that second, against the resource row of the span's
+/// own UTC day. The per-trace case runs one block per minute of 2026-10-04,
+/// whose earliest span files the row under its day, with the block's latest
+/// span up to three days later.
+///
+/// `min = 1` for resources is the row outliving its day's last span by one
+/// second; one day less gives `-86399`. `max = 86400` is a span at the
+/// start of its day, which the day-grained row must also cover. The gaps do
+/// not depend on the retention.
+#[tokio::test]
+async fn every_resource_and_trace_row_outlives_the_spans_it_covers() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_ttlgap");
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    ctx.retention_days = 1;
+    run_init(&client, &ctx).await.expect("run_init");
+
+    let span_ttl = ttl_expr(&engine_full(&client, db, "spans").await, "spans");
+    let resource_ttl = ttl_expr(&engine_full(&client, db, "resources").await, "resources");
+    let trace_ttl = ttl_expr(&engine_full(&client, db, "traces").await, "traces");
+
+    let resource_gap = scalar(
+        &client,
+        &format!(
+            "SELECT toString((min(g), max(g), count())) AS s FROM ( \
+               SELECT toInt64(toUInt32({resource_ttl})) - toInt64(toUInt32({span_ttl})) AS g \
+               FROM (SELECT start_ns, toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') AS day \
+                     FROM (SELECT toInt64((1790812800 + number) * 1000000000 + 999999999) \
+                                  AS start_ns \
+                           FROM numbers(604800))))"
+        ),
+    )
+    .await;
+    assert_eq!(
+        resource_gap, "(1,86400,604800)",
+        "(min, max, count) of a resource row's TTL minus its span's, in seconds"
+    );
+
+    let trace_gap = scalar(
+        &client,
+        &format!(
+            "SELECT toString((min(g), max(g), count())) AS s FROM ( \
+               SELECT toInt64(toUInt32({trace_ttl})) - toInt64(toUInt32({span_ttl})) AS g \
+               FROM (SELECT toDate(fromUnixTimestamp64Nano(s1), 'UTC') AS day, \
+                            s2 AS last_start_ns, s2 AS start_ns \
+                     FROM (SELECT toInt64((1791072000 + a.number * 60) * 1000000000) AS s1, \
+                                  s1 + toInt64(b.number * 60 * 1000000000) AS s2 \
+                           FROM numbers(1440) AS a CROSS JOIN numbers(4320) AS b)))"
+        ),
+    )
+    .await;
+    assert_eq!(
+        trace_gap, "(0,0,6220800)",
+        "(min, max, count) of a per-trace row's TTL minus its latest span's, in seconds"
     );
 
     drop_database(&client, db).await;

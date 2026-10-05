@@ -38,7 +38,11 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::spans::fetch::{BUCKET_NS, BUCKET_SET_CAP};
+use pulsus_read::traces::spans::predicate::{
+    PredicateCtx, compile_span_predicate_in, span_membership_sql,
+};
 use pulsus_read::traces::spans::rows::{FetchRoute, FetchWindow};
+use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_read::{TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
@@ -959,6 +963,241 @@ async fn a_seeded_trace_fetches_its_span_and_an_absent_one_fetches_empty() {
     assert_eq!(
         empty.statements, 1,
         "an absent trace costs one statement, not a full-retention scan"
+    );
+
+    drop_db(&db).await;
+}
+
+// =====================================================================
+// T-R4 — at the retention edge, a live span keeps its resource and its
+// per-trace row
+// =====================================================================
+
+/// One nanosecond-per-day constant for the retention-edge case.
+const DAY_NS: i64 = 86_400_000_000_000;
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct IdRow {
+    id: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourceDayRow {
+    r: u64,
+    d: u32,
+}
+
+/// One `trace_landing` row of the retention-edge fixture, as a `SELECT`
+/// arm of the one `INSERT`.
+fn landing_arm(
+    received_ms: i64,
+    row_kind: u8,
+    id_bytes: (&str, &str),
+    start_ns: i64,
+    resource_id: u64,
+    day: &str,
+    attrs: &str,
+) -> String {
+    let (trace_hex, span_hex) = id_bytes;
+    let service_type = if row_kind == 0 { "string" } else { "" };
+    format!(
+        "SELECT toInt64({received_ms}), toUInt8({row_kind}), \
+           toFixedString(unhex('{trace}'), 16), toFixedString(unhex('{span}'), 8), \
+           toInt64({start_ns}), toUInt128({resource_id}), 'checkout', '{service_type}', \
+           {day}, CAST('{attrs}' AS JSON)",
+        trace = trace_hex.repeat(16),
+        span = span_hex.repeat(8),
+    )
+}
+
+/// `T-R4`: **with a one-day retention, a span inside retention still finds
+/// its resource row and its per-trace row once every expired part has
+/// gone**, through the engine's own fetch and the span-scope membership
+/// statement.
+///
+/// `Y` is yesterday's UTC midnight. `aa`'s one span is at the last
+/// nanosecond of yesterday; `cc`'s block starts half a day before `Y`, so
+/// its per-trace row files under the day before yesterday while its latest
+/// span `c2` is yesterday's second-to-last nanosecond; `bb`'s one span is
+/// the day before yesterday's last nanosecond, already expired. Resource
+/// rows are filed under the day of the spans they describe: `101` and the
+/// second `103` under yesterday, `102` and the first `103` under the day
+/// before.
+///
+/// **Merges are NOT stopped here** — no `fresh_db` — because the case needs
+/// the TTL drops. It polls until no active part of the three tables holds
+/// a part wholly past its TTL.
+///
+/// **The UTC day must not change under the case.** Span `a1` expires at
+/// the end of today, so a run straddling midnight would read a different
+/// state. The case waits out the last five minutes of a day before it
+/// starts, and re-reads the day after every read and before any assertion:
+/// a changed day panics with the reason rather than asserting or passing.
+///
+/// `resources` is read **without `FINAL`**: its replacing key omits `day`,
+/// so `FINAL` folds two days' rows for one resource into one and would hide
+/// a resource row kept a day too long.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_fetch_retention_edge_it");
+    let admin = admin().await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    let mut ctx = test_ctx(&db);
+    ctx.retention_days = 1;
+    run_init(&admin, &ctx).await.expect("run_init");
+
+    // The late-night guard: never start inside a day's last 300 s.
+    let guard_ns = 300 * 1_000_000_000;
+    let into_day = now_ns().rem_euclid(DAY_NS);
+    if into_day > DAY_NS - guard_ns {
+        let wait = DAY_NS - into_day + 1_000_000_000;
+        eprintln!(
+            "T-R4: {} s before UTC midnight; waiting for the next day",
+            (DAY_NS - into_day) / 1_000_000_000
+        );
+        tokio::time::sleep(Duration::from_nanos(u64::try_from(wait).expect("positive"))).await;
+    }
+    let today = now_ns().div_euclid(DAY_NS);
+    let y = (today - 1) * DAY_NS;
+    let yd = format!("toDate(fromUnixTimestamp64Nano(toInt64({y})), 'UTC')");
+    let yd_less_1 = format!("({yd} - 1)");
+    let epoch = "toDate('1970-01-01')";
+    let received_ms = now_ns() / 1_000_000;
+
+    let no_attrs = "{}";
+    let k_r = r#"{"k":"r"}"#;
+    let arm = |kind, ids, start_ns, resource_id, day: &str, attrs| {
+        landing_arm(received_ms, kind, ids, start_ns, resource_id, day, attrs)
+    };
+    let arms = [
+        arm(0, ("aa", "a1"), y + DAY_NS - 1, 101, epoch, no_attrs),
+        arm(0, ("bb", "b1"), y - 1, 102, epoch, no_attrs),
+        arm(0, ("cc", "c1"), y - DAY_NS / 2, 103, epoch, no_attrs),
+        arm(0, ("cc", "c2"), y + DAY_NS - 2, 103, epoch, no_attrs),
+        arm(1, ("00", "00"), 0, 101, &yd, k_r),
+        arm(1, ("00", "00"), 0, 102, &yd_less_1, k_r),
+        arm(1, ("00", "00"), 0, 103, &yd_less_1, k_r),
+        arm(1, ("00", "00"), 0, 103, &yd, k_r),
+    ];
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.trace_landing \
+             (received_ms, row_kind, trace_id, span_id, start_ns, resource_id, service, \
+              service_type, day, attrs) \
+             {}",
+            arms.join(" UNION ALL ")
+        ),
+    )
+    .await;
+
+    // Wait until no active part of the three tables is past its TTL.
+    let expired_parts = format!(
+        "SELECT count() AS n FROM system.parts \
+         WHERE database = '{db}' AND table IN ('spans', 'resources', 'traces') \
+           AND active AND delete_ttl_info_max > 0 AND delete_ttl_info_max <= now()"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if scalar_u64(&admin, &expired_parts).await == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired parts were still active after 120 s in {db}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Every read first; the assertions come after the day re-check.
+    let engine = engine_on(&db, &prefix()).await;
+    let mut fetched = Vec::new();
+    for t in ["aa", "cc", "bb"] {
+        let f = engine
+            .fetch_by_id(&t.repeat(16), None)
+            .await
+            .unwrap_or_else(|e| panic!("the {t} fetch executes: {e}"));
+        let spans: Vec<String> = f.spans.iter().map(|s| hex(&s.span_id)).collect();
+        let resources: Vec<u128> = f.resources.iter().map(|r| r.resource_id).collect();
+        fetched.push((t, spans, resources));
+    }
+
+    let client = data(&db).await;
+    let resource_days_sql = "SELECT DISTINCT toUInt64(resource_id) AS r, toUInt32(day) AS d \
+                             FROM resources ORDER BY r, d";
+    let mut stream = client
+        .query_stream::<ResourceDayRow>(resource_days_sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("resource read failed: {e}\nSQL:\n{resource_days_sql}"));
+    let mut resource_days = Vec::new();
+    while let Some(row) = stream.next().await {
+        resource_days.push(row.expect("decode ResourceDayRow"));
+    }
+
+    let w = WindowSql::start_closed_end_open(y - DAY_NS, now_ns() + 1_000_000_000);
+    let query = r#"{ resource.k = "r" }"#;
+    let parsed =
+        pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+    let body = match parsed.spanset {
+        pulsus_traceql::SpansetExpr::Filter(pulsus_traceql::SpansetFilter { body: Some(b) }) => b,
+        other => panic!("{query}: expected one filter with a body, got {other}"),
+    };
+    let predicate = compile_span_predicate_in(
+        &body,
+        &PredicateCtx {
+            window: w,
+            resources_table: "resources",
+        },
+    )
+    .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+    let membership_sql = span_membership_sql("spans", w, &predicate);
+    let mut stream = client
+        .query_stream::<IdRow>(
+            &membership_sql.replace('?', "??"),
+            &QuerySettings::new().set("final", 1),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("membership read failed: {e}\nSQL:\n{membership_sql}"));
+    let mut members = Vec::new();
+    while let Some(row) = stream.next().await {
+        members.push(row.expect("decode IdRow").id);
+    }
+
+    let after = now_ns().div_euclid(DAY_NS);
+    assert_eq!(
+        after, today,
+        "T-R4 crossed UTC midnight between its insert and its last read, so the state it read \
+         is not the one it asserts on: it cannot assert, rerun it"
+    );
+
+    let a1 = "a1".repeat(8);
+    let c2 = "c2".repeat(8);
+    assert_eq!(
+        fetched,
+        vec![
+            ("aa", vec![a1.clone()], vec![101u128]),
+            ("cc", vec![c2.clone()], vec![103u128]),
+            ("bb", vec![], vec![]),
+        ],
+        "(trace, span ids, resource ids) for each fetch"
+    );
+    let yd_num = u32::try_from(today - 1).expect("a day number");
+    assert_eq!(
+        resource_days,
+        vec![
+            ResourceDayRow { r: 101, d: yd_num },
+            ResourceDayRow { r: 103, d: yd_num },
+        ],
+        "the resource rows left, read without FINAL"
+    );
+    assert_eq!(
+        members,
+        vec![a1, c2],
+        "the spans {query} matches in the window"
     );
 
     drop_db(&db).await;
