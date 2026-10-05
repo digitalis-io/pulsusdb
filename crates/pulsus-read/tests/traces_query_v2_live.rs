@@ -1852,9 +1852,10 @@ async fn delete_resource_row_of(client: &ChClient, span_hex: &str) {
         .execute(
             &format!(
                 "ALTER TABLE {RESOURCES_TABLE} DELETE WHERE resource_id IN \
-                 (SELECT resource_id FROM {SPANS_TABLE} WHERE span_id = unhex('{span_hex}'))"
+                 (SELECT resource_id FROM {SPANS_TABLE} WHERE span_id = unhex('{span_hex}')) \
+                 SETTINGS mutations_sync = 2"
             ),
-            &QuerySettings::new().set("mutations_sync", 2),
+            &QuerySettings::new(),
             Idempotency::Idempotent,
         )
         .await

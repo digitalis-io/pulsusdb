@@ -299,8 +299,8 @@ docs/query-to-sql.md	predicate.rs:1933-1940	crates/pulsus-read/src/logql/predica
 docs/query-to-sql.md	predicate.rs:1939	crates/pulsus-read/src/logql/predicate.rs	1939		prose	body	'%%'
 docs/query-to-sql.md	predicate.rs:467-483	crates/pulsus-read/src/logql/predicate.rs	467	483	prose	BAD_ARGUMENTS	BAD_ARGUMENTS
 docs/query-to-sql.md	predicate.rs:493	crates/pulsus-read/src/logql/predicate.rs	493		prose	CheckedFragment	line_filter
-docs/query-to-sql.md	predicate.rs:947	crates/pulsus-read/src/logql/predicate.rs	947		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {
-docs/query-to-sql.md	predicate.rs:951	crates/pulsus-read/src/logql/predicate.rs	951		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	logql/predicate.rs:947	crates/pulsus-read/src/logql/predicate.rs	947		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {
+docs/query-to-sql.md	logql/predicate.rs:951	crates/pulsus-read/src/logql/predicate.rs	951		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
 docs/query-to-sql.md	pulsus-config/src/model.rs:510	crates/pulsus-config/src/model.rs	510		line	pipeline	/// hint** for fetch-until-limit paging, applied when a query pipeline
 docs/query-to-sql.md	pulsus-config/src/model.rs:685	crates/pulsus-config/src/model.rs	685		line	template_timezone	template_timezone: TemplateTimezone::UTC,
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limits.rs	96		line	157_680_000_000_000_000	pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;
