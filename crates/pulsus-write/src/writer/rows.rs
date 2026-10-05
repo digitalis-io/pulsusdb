@@ -2886,6 +2886,10 @@ pub struct TraceLandingRow {
     /// populated, zero bytes when there are none (issue #587 row 8).
     #[serde(with = "serde_bytes")]
     pub entity_refs: Vec<u8>,
+    /// The `AnyValue` arm of the resource's `service.name`, on the kind-0
+    /// row beside `service` (issue #589). `String`, not `&'static str`:
+    /// the row derives `Deserialize`.
+    pub service_type: String,
 }
 
 /// One traces landing row's own inline footprint, in the shape the WRITER
@@ -2958,6 +2962,7 @@ impl TraceLandingRow {
             scope_attrs_other: Vec::new(),
             end_ns: 0,
             entity_refs: Vec::new(),
+            service_type: String::new(),
         }
     }
 
@@ -3015,6 +3020,7 @@ impl TraceLandingRow {
                 .collect(),
             dropped_links: span.dropped_links,
             service: span.service,
+            service_type: span.service_type.to_string(),
             attrs: span.attrs,
             attrs_other: span.attrs_other,
             dropped_attrs: span.dropped_attrs,
@@ -3067,8 +3073,11 @@ impl TraceLandingRow {
     /// expansion ceiling, so a charge that priced the vector headers alone
     /// would not bound what the queue holds.
     pub fn est_span_bytes(span: &LandingSpan) -> u64 {
+        // `service_type` is a `&'static str` here, but `span` converts it to
+        // an owned `String`, so the row pays for its bytes.
         let text = span.name.len()
             + span.service.len()
+            + span.service_type.len()
             + span.status_message.len()
             + span.trace_state.len()
             + span.scope_name.len()
@@ -3173,6 +3182,7 @@ impl SpoolEncode for TraceLandingRow {
                 "links": self.links.len() as u64,
                 "dropped_links": self.dropped_links,
                 "service": self.service,
+                "service_type": self.service_type,
                 "scope_schema_url": self.scope_schema_url,
                 "scope_dropped_attrs": self.scope_dropped_attrs,
                 "scope_attrs_other_bytes": self.scope_attrs_other.len() as u64,
@@ -3262,6 +3272,7 @@ impl SpoolEncode for TraceLandingRow {
                     .await?;
                 o.str_field("scope_version", &self.scope_version).await?;
                 o.str_field("service", &self.service).await?;
+                o.str_field("service_type", &self.service_type).await?;
                 o.str_field("span_id", &hex_lower(&self.span_id)).await?;
                 o.field("start_ns", &self.start_ns).await?;
                 o.field("status_code", &self.status_code).await?;
@@ -3364,6 +3375,9 @@ mod trace_landing_tests {
             }],
             dropped_links: 5,
             service: "checkout".to_string(),
+            // Empty, for the reason above: `W-14`'s seventh sub-case
+            // varies exactly this field from here (issue #589).
+            service_type: "",
             attrs: json("k", 4),
             attrs_other: vec![1, 2, 3],
             dropped_attrs: 2,
@@ -3386,7 +3400,7 @@ mod trace_landing_tests {
     }
 
     /// **The insert omits `event_id`, so the server fills it.** The table has
-    /// thirty-seven columns and the row type declares the other thirty-six;
+    /// thirty-eight columns and the row type declares the other thirty-seven;
     /// the landed event's own identity comes from the column's
     /// `DEFAULT generateUUIDv7()`.
     ///
@@ -3397,8 +3411,8 @@ mod trace_landing_tests {
         let names = <TraceLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
         assert_eq!(
             names.len(),
-            36,
-            "the table has 37 columns and the row type declares the other 36: {names:?}"
+            37,
+            "the table has 38 columns and the row type declares the other 37: {names:?}"
         );
         assert!(
             !names.contains(&"event_id"),
@@ -3408,9 +3422,9 @@ mod trace_landing_tests {
         // the first column is the one the DDL declares after `event_id`.
         assert_eq!(names[0], "received_ms");
         assert_eq!(names[1], "row_kind");
-        // And the five issue #587 appended, in the table's own order, which
-        // is what makes the positional encoding land them in the right
-        // columns.
+        // And the five issue #587 appended, then issue #589's one, in the
+        // table's own order, which is what makes the positional encoding
+        // land them in the right columns.
         assert_eq!(
             &names[31..],
             &[
@@ -3419,6 +3433,7 @@ mod trace_landing_tests {
                 "scope_attrs_other",
                 "end_ns",
                 "entity_refs",
+                "service_type",
             ]
         );
     }
@@ -3432,7 +3447,14 @@ mod trace_landing_tests {
     #[test]
     fn every_landing_column_is_the_value_its_kind_was_built_from() {
         let received_ms = 5i64;
-        let span = TraceLandingRow::span(received_ms, span_fixture());
+        // A non-empty `service_type`, so a row that drops it is visible.
+        let span = TraceLandingRow::span(
+            received_ms,
+            LandingSpan {
+                service_type: "int",
+                ..span_fixture()
+            },
+        );
         let resource = TraceLandingRow::resource(received_ms, resource_fixture());
         let tag_name = TraceLandingRow::tag_name(
             received_ms,
@@ -3501,6 +3523,7 @@ mod trace_landing_tests {
         assert_eq!(span.links[0].dropped_attrs, want.links[0].dropped_attrs);
         assert_eq!(span.dropped_links, want.dropped_links);
         assert_eq!(span.service, want.service);
+        assert_eq!(span.service_type, "int");
         assert_eq!(span.attrs, want.attrs);
         assert_eq!(span.attrs_other, want.attrs_other);
         assert_eq!(span.dropped_attrs, want.dropped_attrs);
@@ -3543,6 +3566,7 @@ mod trace_landing_tests {
         assert_eq!(resource.dropped_links, 0);
         assert_eq!(resource.tag_scope, "");
         assert_eq!(resource.tag_key, "");
+        assert_eq!(resource.service_type, "", "the type is the span row's");
 
         // The kind-2 row: two columns, and nothing else.
         assert_eq!(tag_name.tag_scope, "span");
@@ -3556,6 +3580,7 @@ mod trace_landing_tests {
         assert_eq!(tag_name.day, 0);
         assert_eq!(tag_name.resource_id, Fingerprint::from_raw(0));
         assert_eq!(tag_name.trace_id, [0u8; 16]);
+        assert_eq!(tag_name.service_type, "");
 
         // The kind-3 row: four columns, and nothing else.
         assert_eq!(tag_value.tag_scope, "event");
@@ -3567,6 +3592,7 @@ mod trace_landing_tests {
         assert_eq!(tag_value.day, 0);
         assert_eq!(tag_value.trace_id, [0u8; 16]);
         assert_eq!(tag_value.start_ns, 0);
+        assert_eq!(tag_value.service_type, "");
     }
 
     /// **Every row of every kind holds every slot.** The row type is the
@@ -3682,7 +3708,7 @@ mod trace_landing_tests {
     /// **W-14.** The queue charge grows by every heap field issue #587
     /// adds, **one field at a time** (§6.3).
     ///
-    /// Six sub-cases, each cloning [`charge_baseline`] and setting exactly
+    /// Seven sub-cases, each cloning [`charge_baseline`] and setting exactly
     /// one field. **A fixture that populates several at once lets one
     /// field's bytes pay for another's missing term**, which is the shape
     /// that hides exactly the defect this case exists for: a threshold of
@@ -3771,6 +3797,17 @@ mod trace_landing_tests {
             got >= base + 256,
             "the charge ({got}) must cover the 256 bytes of \
              `scope_attrs_other` it holds, over the baseline's ({base})"
+        );
+
+        // 7. the `service.name` arm (issue #589): the row owns these bytes
+        // once `span` converts the field to a `String`.
+        let mut varied = baseline.clone();
+        varied.service_type = "kvlist";
+        let got = TraceLandingRow::est_span_bytes(&varied);
+        assert!(
+            got >= base + 6,
+            "the charge ({got}) must cover the 6 bytes of `service_type` \
+             the row holds, over the baseline's ({base})"
         );
     }
 

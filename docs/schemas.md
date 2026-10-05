@@ -1228,7 +1228,8 @@ CREATE TABLE trace_landing (
     scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
     scope_attrs_other   String               CODEC(ZSTD(1)),
     end_ns              UInt64               CODEC(Delta, ZSTD(1)),
-    entity_refs         String               CODEC(ZSTD(1))
+    entity_refs         String               CODEC(ZSTD(1)),
+    service_type        LowCardinality(String)  CODEC(ZSTD(1))
 ) ENGINE = MergeTree
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
@@ -1261,7 +1262,8 @@ CREATE TABLE spans (
     scope_schema_url    String               CODEC(ZSTD(1)),
     scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
     scope_attrs_other   String               CODEC(ZSTD(1)),
-    end_ns              UInt64               CODEC(Delta, ZSTD(1))
+    end_ns              UInt64               CODEC(Delta, ZSTD(1)),
+    service_type        LowCardinality(String)  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
@@ -1321,7 +1323,8 @@ SELECT trace_id AS trace_id, span_id AS span_id, parent_span_id AS parent_span_i
        links AS links, dropped_links AS dropped_links,
        scope_schema_url AS scope_schema_url,
        scope_dropped_attrs AS scope_dropped_attrs,
-       scope_attrs_other AS scope_attrs_other, end_ns AS end_ns
+       scope_attrs_other AS scope_attrs_other, end_ns AS end_ns,
+       service_type AS service_type
 FROM trace_landing WHERE row_kind = 0;
 
 CREATE MATERIALIZED VIEW resources_mv TO resources AS

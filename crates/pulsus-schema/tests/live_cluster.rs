@@ -1681,7 +1681,8 @@ fn trace_landing_insert_sql(
         for s in 0..spans {
             rows.push(format!(
                 "(1, 0, unhex('{trace_hex}'), unhex('{:016x}'), unhex('0000000000000000'), \
-                 {}, 1000, {}, 'GET /api', 2, '{service}', '{attrs}', toDate(0), '', '', '', '')",
+                 {}, 1000, {}, 'GET /api', 2, '{service}', '{attrs}', toDate(0), '', '', '', '', \
+                 'string')",
                 0x100 + (i * spans + s),
                 t0 + (i * spans + s) as i64,
                 i + 1,
@@ -1690,26 +1691,26 @@ fn trace_landing_insert_sql(
         rows.push(format!(
             "(1, 1, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
              unhex('0000000000000000'), 0, 0, {}, '', 0, '{service}', '{attrs}', \
-             toDate(fromUnixTimestamp64Nano({t0})), '', '', '', '')",
+             toDate(fromUnixTimestamp64Nano({t0})), '', '', '', '', '')",
             i + 1,
         ));
     }
     rows.push(
         "(1, 2, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
          unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
-         'http.route', '', '')"
+         'http.route', '', '', '')"
             .to_string(),
     );
     rows.push(
         "(1, 3, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
          unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
-         'http.route', '/api', 'string')"
+         'http.route', '/api', 'string', '')"
             .to_string(),
     );
     format!(
         "INSERT INTO {db}.trace_landing (received_ms, row_kind, trace_id, span_id, \
          parent_span_id, start_ns, duration_ns, resource_id, name, kind, service, attrs, day, \
-         tag_scope, tag_key, tag_value, tag_type) VALUES {}",
+         tag_scope, tag_key, tag_value, tag_type, service_type) VALUES {}",
         rows.join(", ")
     )
 }

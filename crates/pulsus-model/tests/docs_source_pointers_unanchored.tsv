@@ -795,6 +795,8 @@ docs/query-to-sql.md	logql/pipeline.rs:1266	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:501	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:501-520	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:522	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:947	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:951	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/window.rs:148	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_plan.rs:398	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_sql.rs:1036	no_name_the_target_file_holds
@@ -837,8 +839,6 @@ docs/query-to-sql.md	plan.rs:2695	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3750	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3779	ambiguous_basename
 docs/query-to-sql.md	predicate.rs:1939	no_name_the_target_file_holds
-docs/query-to-sql.md	predicate.rs:947	no_name_the_target_file_holds
-docs/query-to-sql.md	predicate.rs:951	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-config/src/model.rs:510	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-config/src/model.rs:685	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	no_name_the_target_file_holds
@@ -849,8 +849,8 @@ docs/query-to-sql.md	query_lowering_doc_gate.rs:472	no_name_the_target_file_hold
 docs/query-to-sql.md	query_lowering_doc_gate.rs:545	no_name_the_target_file_holds
 docs/query-to-sql.md	querytext.rs:52	ambiguous_basename
 docs/query-to-sql.md	querytext.rs:53	ambiguous_basename
-docs/query-to-sql.md	schema/schema.sql:394	no_name_the_target_file_holds
-docs/query-to-sql.md	schema/schema.sql:482	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:395	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:484	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:2439	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:3127	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1091-1092	no_name_the_target_file_holds

@@ -306,7 +306,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
     scope_schema_url String CODEC(ZSTD(1)),
     scope_dropped_attrs UInt32 CODEC(ZSTD(1)),
     scope_attrs_other String CODEC(ZSTD(1)),
-    end_ns UInt64 CODEC(Delta(8), ZSTD(1))
+    end_ns UInt64 CODEC(Delta(8), ZSTD(1)),
+    service_type LowCardinality(String) CODEC(ZSTD(1))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.spans', '{replica}')
@@ -449,7 +450,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
     scope_dropped_attrs UInt32 CODEC(ZSTD(1)),
     scope_attrs_other String CODEC(ZSTD(1)),
     end_ns UInt64 CODEC(Delta(8), ZSTD(1)),
-    entity_refs String CODEC(ZSTD(1))
+    entity_refs String CODEC(ZSTD(1)),
+    service_type LowCardinality(String) CODEC(ZSTD(1))
 )
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_landing', '{replica}')
@@ -804,7 +806,8 @@ AS SELECT
     scope_schema_url AS scope_schema_url,
     scope_dropped_attrs AS scope_dropped_attrs,
     scope_attrs_other AS scope_attrs_other,
-    end_ns AS end_ns
+    end_ns AS end_ns,
+    service_type AS service_type
 FROM {{db}}.trace_landing
 WHERE row_kind = 0;
 

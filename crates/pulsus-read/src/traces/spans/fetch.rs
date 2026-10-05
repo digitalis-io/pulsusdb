@@ -629,8 +629,9 @@ SELECT sp.1 AS spans,
     #[test]
     fn each_projection_is_its_tables_column_list_minus_its_named_omissions() {
         /// The caller supplies the trace id; `duration_ns` is replaced by
-        /// the sender's own end.
-        const SPAN_PROJECTION_OMITS: [&str; 2] = ["trace_id", "duration_ns"];
+        /// the sender's own end; `service_type` is the predicate's
+        /// (issue #589) and the trace fetch does not return it.
+        const SPAN_PROJECTION_OMITS: [&str; 3] = ["trace_id", "duration_ns", "service_type"];
         /// `day` is the partition and `service` travels on the span row.
         const RESOURCE_PROJECTION_OMITS: [&str; 2] = ["day", "service"];
         /// `end_ns` is projected at index 3, where `duration_ns` stood,
